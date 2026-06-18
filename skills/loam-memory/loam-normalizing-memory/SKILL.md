@@ -1,5 +1,5 @@
 ---
-name: loam-normalizing-memory
+name: loam::normalizing-memory
 description: "Inspect an existing memory corpus (wiki substrate) and align it to this repo's Obsidian-friendly note-graph conventions. Use this when the user wants to import, normalize, retrofit, or clean up existing memory, notes folder, vault, docs tree, or mixed markdown knowledge base. In monorepos, also use it to align relevant AGENTS.md and CLAUDE.md files. Not for routine wiki maintenance; use /loam::linting-memory for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:

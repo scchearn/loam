@@ -1,5 +1,5 @@
 ---
-name: loam-scaffolding-wiki
+name: loam::scaffolding-wiki
 description: "Create or extend an Obsidian-friendly markdown wiki scaffold in the current workspace. Use this when the user wants to build a wiki, set up a knowledge base, create a research vault, or scaffold a living markdown note graph before adding sources with `/loam::adding-to-memory`. Not for importing or normalizing existing memory-like corpus; use /loam::normalizing-memory for that."
 allowed-tools: Read Glob Grep Write Edit AskUserQuestion Skill Bash
 metadata:

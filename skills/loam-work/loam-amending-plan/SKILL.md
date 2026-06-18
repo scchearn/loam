@@ -1,5 +1,5 @@
 ---
-name: loam-amending-plan
+name: loam::amending-plan
 description: "Amend an existing plan file — add tasks, modify pending or delegated tasks, and mark completed tasks that are invalidated by the change as [>] (needs re-run). Walks through analysis, cascading impact, and user confirmation before touching the file. When memory (wiki substrate) exists, it may also preserve durable amendment findings there."
 allowed-tools: Read Write Edit Glob Grep
 metadata:

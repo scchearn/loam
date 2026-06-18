@@ -57,16 +57,16 @@ The tense distinction (prospective vs settled) is the mental model, not the addr
 
 ## On-disk name mapping
 
-The CLI address `loam::<skill>` is the user-facing form. The on-disk directory basename and frontmatter `name` field use `loam-<skill>` with a hyphen — `npx skills` (vercel-labs/skills v1.5.11) sanitizes `::` to `-` on install, and dedupes by name (silently drops duplicates).
+The CLI address `loam::<skill>` is the user-facing form and the frontmatter `name:` field value. The on-disk directory basename uses `loam-<skill>` with a hyphen — `npx skills` (vercel-labs/skills v1.5.11) sanitizes `::` to `-` on install for the directory name only. The installed SKILL.md keeps `name: loam::<skill>` verbatim.
 
-| CLI address | On-disk name | Dir basename |
+| CLI address | Frontmatter `name` | Dir basename (source + install) |
 |---|---|---|
-| `loam::planning` | `loam-planning` | `loam-planning/` |
-| `loam::amending-plan` | `loam-amending-plan` | `loam-amending-plan/` |
-| `loam::querying-memory` | `loam-querying-memory` | `loam-querying-memory/` |
-| `loam::scaffolding-wiki` | `loam-scaffolding-wiki` | `loam-scaffolding-wiki/` |
+| `loam::planning` | `loam::planning` | `loam-planning/` |
+| `loam::amending-plan` | `loam::amending-plan` | `loam-amending-plan/` |
+| `loam::querying-memory` | `loam::querying-memory` | `loam-querying-memory/` |
+| `loam::scaffolding-wiki` | `loam::scaffolding-wiki` | `loam-scaffolding-wiki/` |
 
-Every loam `name` is globally unique by virtue of the `loam-` prefix. Dir basename must equal frontmatter `name` (required by `skills-ref validate`).
+Every loam `name` is globally unique by virtue of the `loam-` / `loam::` prefix. `npx skills` accepts `::` in the frontmatter `name:` field, sanitizes to `-` for the installed directory name, and dedupes by name (silently drops duplicates).
 
 Group folders are source-only — `npx skills add` flattens everything into per-agent dirs keyed by name. The catalog walk descends one extra level into `skills/<group>/<skill>/SKILL.md` with no manifest required. **Do not place a `SKILL.md` at the group-folder level** — it shadows everything nested below it.
 

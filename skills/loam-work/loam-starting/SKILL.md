@@ -1,5 +1,5 @@
 ---
-name: loam-starting
+name: loam::starting
 description: "Use when beginning or resuming a plan file, including mixed local and hcom-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
 allowed-tools: Read Write Edit Glob Grep Bash WebFetch
 metadata:

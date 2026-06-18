@@ -1,5 +1,5 @@
 ---
-name: loam-amending-memory
+name: loam::amending-memory
 description: "Correct or update existing wiki content when newer evidence shows the wiki is wrong, stale, incomplete, or contradicted. Use this when the agent discovers the wiki says X but we now know Y, when code or real-world changes invalidate a wiki claim, or when the user asks to fix or amend the wiki. Not for adding new sources, routine learnings capture, structural normalization, or health checks; use /loam::adding-to-memory, /loam::learning-from-session, /loam::normalizing-memory, or /loam::linting-memory."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:

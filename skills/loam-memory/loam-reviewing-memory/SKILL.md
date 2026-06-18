@@ -1,5 +1,5 @@
 ---
-name: loam-reviewing-memory
+name: loam::reviewing-memory
 description: "Surface and classify all open questions, unresolved contradictions, stale claims, and knowledge gaps from existing memory. Use this when the user wants to see what's still open, what needs attention, what's unresolved, or what still needs research or ingest. Not for answering questions, fixing issues, or adding new material; use /loam::querying-memory, /loam::linting-memory, /loam::amending-memory, /loam::adding-to-memory, or /loam::learning-from-session."
 allowed-tools: Read Glob Grep AskUserQuestion Bash
 metadata:

@@ -1,5 +1,5 @@
 ---
-name: loam-planning
+name: loam::planning
 description: "Use when an approved workspace spec needs an execution-ready implementation plan with ordered, verifiable steps. Specs are mandatory: this skill consumes design decisions, verifies that the spec still matches the codebase, and writes the repo-native plans/ artifacts."
 allowed-tools: Read Glob Grep Bash Write Edit Skill
 metadata:

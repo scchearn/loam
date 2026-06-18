@@ -1,5 +1,5 @@
 ---
-name: loam-configuring-agents
+name: loam::configuring-agents
 description: "Use when planning or configuring an hcom-based AI agent team for a real task, or when loading, starting, resuming, or reusing an existing `agents/<slug>.toml` with preserved runtime, model, routing, and reporting settings."
 compatibility: Repo-local OpenCode skill for hcom planning and configuration. Assumes markdown references, hcom concepts, and local model discovery with `opencode models`.
 metadata:

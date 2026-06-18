@@ -1,5 +1,5 @@
 ---
-name: loam-querying-memory
+name: loam::querying-memory
 description: "Answer questions against existing memory (the wiki substrate). Use this whenever the user is asking what is happening in the project, directory, codebase, architecture, workflow, decisions, or current state and the wiki likely contains the answer, even if they do not explicitly mention the wiki. Also use it for summaries, comparisons, and reusable analyses grounded in current wiki pages. Not for surfacing unresolved gaps; use /loam::reviewing-memory for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:

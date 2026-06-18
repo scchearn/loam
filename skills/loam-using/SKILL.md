@@ -1,5 +1,5 @@
 ---
-name: loam-using
+name: loam::using
 description: "The always-on protocol for the loam skill namespace. Use at session start and whenever a loam task appears. Routes to the right skill, explains the memory model (memory = umbrella; wiki, guidance, and checkpoints are substrates), and lists the cross-cutting rules. This is a routing/meta skill — delegate to a specific loam skill rather than performing work itself."
 metadata:
   version: "1.0.0"

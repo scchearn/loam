@@ -1,5 +1,5 @@
 ---
-name: loam-auditing-guidance
+name: loam::auditing-guidance
 description: "Audit and improve agent guidance markdown files in repositories. Use when the user asks to check, audit, update, improve, or fix AGENTS.md, CLAUDE.md, or related guidance files. Scan for guidance files, evaluate quality against templates, output a quality report, then make targeted updates after approval."
 allowed-tools: Read Glob Grep Bash Edit
 metadata:

@@ -1,5 +1,5 @@
 ---
-name: loam-resuming
+name: loam::resuming
 description: "Use when resuming work after a pause, reboot, or context switch and the workspace uses `wiki/checkpoints/` resumable notes. Read the latest relevant checkpoint chain, orient to the most likely in-flight scope, verify current files and tools before acting, and report the safest next step."
 allowed-tools: Read Glob Grep Bash
 metadata:
