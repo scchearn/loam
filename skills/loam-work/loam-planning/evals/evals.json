@@ -1,0 +1,165 @@
+{
+  "skill_name": "loam::planning",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Plan from an approved spec in a workspace where the superpowers bundle is installed, including using-superpowers. Keep the final plan compatible with this repo's workflow.",
+      "expected_output": "A planning response that treats superpowers as subordinate guidance, consumes the approved spec, and writes the final plan to plans/<slug>.md with plans/INDEX.md synchronized.",
+      "assertions": [
+        "The output preserves plans/<slug>.md as the plan artifact contract",
+        "The output preserves plans/INDEX.md synchronization as part of the contract",
+        "The output does not switch the artifact location to docs/superpowers/plans/",
+        "The output treats using-superpowers as optional process guidance rather than as a replacement artifact system"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Create a plan from specs/audit-logging.md, but assume using-superpowers is not installed and any lookup errors once.",
+      "expected_output": "A response that proceeds with the native spec-driven loam::planning workflow without blocking solely on skill availability.",
+      "assertions": [
+        "The output does not block on missing using-superpowers",
+        "The output treats a skill lookup or invocation error as unavailable and continues",
+        "The output does not retry the same failing skill probe repeatedly",
+        "The output continues with spec verification and plan generation using the native loam::planning workflow"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "I have an approved spec for adding audit logging for failed sign-ins. Please plan it quickly.",
+      "expected_output": "A planning-only response that resists pressure to implement and still produces a thorough, dependency-ordered plan from the spec.",
+      "assertions": [
+        "The output stays in planning scope and does not claim code was implemented",
+        "The output still requires explicit task fields rather than a shallow checklist",
+        "The output includes focused verification guidance instead of vague manual checking"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "The spec cites plans/research/webhook-validation.md. Create a plan for extending webhook retries.",
+      "expected_output": "A response that reads supporting research cited by the spec, but does not independently search all research memos.",
+      "assertions": [
+        "The output uses research memos only when the spec cites them",
+        "The output does not independently search or read every research memo",
+        "The output carries cited research into the Spec or supporting-context summary when relevant"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "The approved auth spec says the API uses Basic auth, but current repo code and tests show Bearer tokens. Create the plan.",
+      "expected_output": "A response that detects the spec is critically stale and stops instead of planning from invalid assumptions.",
+      "assertions": [
+        "The output prioritizes current repo evidence when validating spec currency",
+        "The output reports the stale spec mismatch clearly",
+        "The output stops and recommends updating research or the spec when the core decision is invalidated"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "Create a plan from a spec that changes persisted data, adds a migration, regenerates client types, and updates an API contract.",
+      "expected_output": "A response that breaks every required schema, migration, generation, contract, documentation, and validation step into explicit tasks.",
+      "assertions": [
+        "The output includes explicit tasks for schema or model updates when required",
+        "The output includes explicit tasks for migrations when required",
+        "The output includes explicit tasks for generated artifacts or client regeneration when required",
+        "The output includes explicit tasks for tests, validations, and any required contract or documentation updates"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "Write the kind of spec-driven plan that a smaller model with strong tool use could execute without guessing.",
+      "expected_output": "A response with explicit, atomic tasks that each specify dependencies, Outcome, Steps, Constraints, Watch for, concrete Files with role markers, Verify, and Passes when.",
+      "assertions": [
+        "Each task includes Status, Depends on, Outcome, Steps, Constraints, Watch for, Files, Verify, and Passes when",
+        "The output uses concrete workspace-relative file paths with role markers rather than vague placeholders",
+        "The output uses focused workspace-native automated verify commands rather than generic run tests wording",
+        "The output is detailed enough that another model does not need to guess the intended deliverable"
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "Create a plan for a feature, but no matching spec exists under specs/.",
+      "expected_output": "A response that stops before inventing a plan and recommends /loam::writing-spec <topic> to produce the required spec.",
+      "assertions": [
+        "The output does not invent missing implementation facts or requirements",
+        "The output states that specs are required before planning",
+        "The output recommends /loam::writing-spec <topic> to create specs/<slug>.md"
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "Create a brand new plan from specs/billing-export.md and make sure it is ready for /loam::starting without manual cleanup.",
+      "expected_output": "A response that preserves the exact repo-native spec-driven plan contract: YAML front matter with spec, required markdown sections, and synchronized plans/INDEX.md row.",
+      "assertions": [
+        "The output includes YAML front matter with title, slug, spec, description, status, task_count, created_at, started_at, and completed_at",
+        "The output sets new-plan metadata to status: pending, started_at: null, and completed_at: null",
+        "The output includes ## Spec, ## Goal, ## Acceptance criteria, ## Tasks, ## Decisions log, and ## Handoff notes",
+        "The output synchronizes plans/INDEX.md with the plan row using the slim Status | Title | Plan | Description | Tasks schema"
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "A repo already has an older plans/INDEX.md with timestamp-heavy columns. Create a new spec-driven plan without leaving the index in the legacy format.",
+      "expected_output": "A response that rewrites the legacy plans index to the slim schema before inserting or updating the new plan row.",
+      "assertions": [
+        "The output detects and rewrites legacy timestamp-heavy plans/INDEX.md layouts before updating rows",
+        "The output keeps plan rows ordered as in-progress, then pending, then done, then abandoned",
+        "The output mirrors the plan front matter fields into the updated index row",
+        "The output preserves the repo-native plans/INDEX.md migration behavior instead of inventing a new index format"
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "The current conversation already says using-superpowers is loaded. Create a plan from the approved spec without duplicating skill setup.",
+      "expected_output": "A response that recognizes using-superpowers as already active, avoids reinvoking it, and continues with the repo-native loam::planning workflow under that guidance.",
+      "assertions": [
+        "The output does not instruct the model to reload using-superpowers when it is already active",
+        "The output treats the already-loaded skill as sufficient process guidance",
+        "The output still preserves the repo-native plans/<slug>.md and plans/INDEX.md contract"
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "Create a plan in a non-Claude harness where ${CLAUDE_SKILL_DIR} is unavailable but skill-local reference files are still accessible.",
+      "expected_output": "A response that still reads the plan template through a harness-equivalent skill-local references/template.md path and preserves the normal repo-native plan output contract.",
+      "assertions": [
+        "The output does not fail planning solely because ${CLAUDE_SKILL_DIR} is unavailable",
+        "The output falls back to the harness-equivalent skill-local references/template.md path",
+        "The output preserves the same final plans/<slug>.md and plans/INDEX.md behavior"
+      ]
+    },
+    {
+      "id": 13,
+      "prompt": "Create a spec-driven plan from specs/customer-export.md. The plan should use the current spec-driven template.",
+      "expected_output": "A plan that uses spec: front matter and a ## Spec body section instead of the old Related research or Related specs sections.",
+      "assertions": [
+        "The output includes spec: in YAML front matter",
+        "The output includes a ## Spec body section",
+        "The output does not contain a ## Related research section",
+        "The output does not contain a ## Related specs section"
+      ]
+    },
+    {
+      "id": 14,
+      "prompt": "Create a plan from specs/audit-logging.md. The spec front matter says status: draft, and the user has not explicitly approved using the draft spec.",
+      "expected_output": "A response that stops before plan creation and asks for spec approval or an amended approved spec.",
+      "assertions": [
+        "The output does not create a plan from an unapproved draft spec",
+        "The output identifies the spec status as draft",
+        "The output asks for explicit spec approval or an approved spec before proceeding",
+        "The output preserves the mandatory spec gate instead of treating draft as approved"
+      ]
+    },
+    {
+      "id": 15,
+      "prompt": "Create a plan from specs/incomplete-feature.md. The spec is missing ## Decision and ## Acceptance criteria.",
+      "expected_output": "A response that stops with a completeness report naming the missing Decision and Acceptance criteria sections, then recommends /loam::writing-spec to fill the gaps.",
+      "assertions": [
+        "The output stops before task decomposition",
+        "The output names ## Decision as missing",
+        "The output names ## Acceptance criteria as missing",
+        "The output recommends /loam::writing-spec <topic> to complete or regenerate the spec",
+        "The output does not invent missing requirements or design decisions"
+      ]
+    }
+  ]
+}

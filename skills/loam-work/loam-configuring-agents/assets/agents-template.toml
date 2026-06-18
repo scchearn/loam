@@ -1,0 +1,93 @@
+# Replace placeholders with concrete values.
+# Remove blocks you do not need and repeat blocks you do need.
+# Keep one workflow thread for the whole run.
+
+[team]
+slug = "<slug>"
+objective = "<objective>"
+topology = "<single-agent | worker-reviewer | planner-executor-reviewer | hub-spoke | sequential-cascade | ensemble-with-judge>"
+
+[runtime]
+preferred_tool = "opencode"
+preferred_launch_mode = "headless"
+model_resolution = "use `opencode models` for exact provider-qualified IDs and `opencode models <provider>` to narrow candidates"
+provider_duplicate_policy = "surface top candidates and choose one explicit assumption"
+
+[communication]
+thread_strategy = "one unique thread per workflow"
+thread_bootstrap = "export WF_THREAD=\"<slug>-$(date +%Y%m%d%H%M%S)\""
+default_intent = "request"
+intent_examples = "request for action, inform for status or approval, ack for no-reply notification"
+group_routing = "use @<tag>- for role groups"
+group_routing_example = "hcom send @plan- --thread \"$WF_THREAD\" --intent request -- \"<kickoff message>\""
+direct_routing = "use exact launched names for targeted replies"
+direct_routing_example = "hcom send \"$AGENT1_NAME\" --thread \"$WF_THREAD\" --intent inform -- \"<status update>\""
+bundle_detail = "<normal | full | detailed>"
+review_contract = "<APPROVED/FIX or not applicable>"
+
+# Repeat [[agents]] once per agent in the chosen topology.
+[[agents]]
+name = "<agent-name-1>"
+tool = "opencode"
+model = "<provider/model>"
+role = "<role>"
+tag = "<tag>"
+sandboxed = false
+reviewer = false
+
+[[agents]]
+name = "<agent-name-2>"
+tool = "opencode"
+model = "<provider/model>"
+role = "<role>"
+tag = "<tag>"
+sandboxed = false
+reviewer = false
+
+# Optional: add more [[agents]] blocks as needed.
+
+# Repeat [[handoff]] once per important handoff.
+[[handoff]]
+from = "<agent-name-1>"
+to = "<agent-name-2>"
+intent = "request"
+bundle = "<normal | full | detailed>"
+purpose = "<why this handoff exists>"
+
+[[handoff]]
+from = "<agent-name-2>"
+to = "<agent-name-1>"
+intent = "inform"
+bundle = "normal"
+purpose = "<status, approval, or completion notification>"
+
+[[handoff]]
+from = "<agent-name-1>"
+to = "<agent-name-2>"
+intent = "ack"
+bundle = "normal"
+purpose = "<no-reply acknowledgment when needed>"
+
+[[launch]]
+command = "export WF_THREAD=\"<slug>-$(date +%Y%m%d%H%M%S)\""
+purpose = "initialize one workflow thread for the whole run"
+
+[[launch]]
+command = "AGENT1_OUT=$(HCOM_OPENCODE_ARGS=\"--model <provider/model>\" hcom opencode --tag <tag> --headless --go 2>&1)"
+purpose = "launch one OpenCode role headless and capture launch output; apply thread isolation on workflow messages and waits"
+
+[[launch]]
+command = "AGENT1_NAME=$(printf '%s\n' \"$AGENT1_OUT\" | grep '^Names: ' | sed 's/^Names: //' | tr -d ' ')"
+purpose = "parse the generated agent name from launch output for direct replies or cleanup"
+
+[[launch]]
+command = "hcom send @<tag>- --thread \"$WF_THREAD\" --intent request -- \"<kickoff or handoff message>\""
+purpose = "start or route the workflow using concrete group routing"
+
+[[launch]]
+command = "hcom events --thread \"$WF_THREAD\" --wait"
+purpose = "wait on workflow activity instead of sleeping"
+
+[[launch]]
+command = "hcom kill <exact-agent-name> --go"
+purpose = "clean up launched agents using exact names"

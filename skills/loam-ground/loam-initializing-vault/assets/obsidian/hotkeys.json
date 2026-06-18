@@ -1,0 +1,38 @@
+{
+  "workspace:close-window": [
+    {
+      "modifiers": ["Mod"],
+      "key": "Q"
+    }
+  ],
+  "editor:insert-wikilink": [
+    {
+      "modifiers": ["Mod"],
+      "key": "K"
+    }
+  ],
+  "editor:insert-link": [
+    {
+      "modifiers": ["Mod", "Shift"],
+      "key": "K"
+    }
+  ],
+  "app:toggle-left-sidebar": [
+    {
+      "modifiers": ["Mod"],
+      "key": "\\"
+    }
+  ],
+  "app:toggle-right-sidebar": [
+    {
+      "modifiers": ["Mod", "Shift"],
+      "key": "\\"
+    }
+  ],
+  "editor:cycle-list-checklist": [
+    {
+      "modifiers": ["Mod"],
+      "key": "-"
+    }
+  ]
+}

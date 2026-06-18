@@ -1,0 +1,153 @@
+{
+  "skill_name": "loam::configuring-agents",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I need an hcom setup for a code change workflow where one agent writes code and another reviews every round before I merge. Please plan the team and generate the config artifacts.",
+      "expected_output": "A worker-reviewer or hub-spoke plan that includes a dedicated reviewer, explicit thread strategy, and both agents/<slug>.toml and agents/<slug>.md artifacts.",
+      "assertions": [
+        "The output chooses a topology that includes a separate reviewer or evaluator",
+        "The output includes both planning artifacts",
+        "The output labels the artifacts with literal agents/<slug>.toml and agents/<slug>.md heading lines",
+        "The output includes an explicit thread strategy",
+        "The output stays in planning/configuration scope"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Help me design a mixed-model hcom team for risky implementation work. I want a strong planner, a sandboxed executor, and clear launch commands.",
+      "expected_output": "A mixed-model plan that recommends a strong OpenCode coordinator, a headless OpenCode executor by default unless stricter isolation is needed, launch commands, and risk notes.",
+      "assertions": [
+        "The output recommends an execution worker with explicit isolation guidance",
+        "The output explains why a mixed-model strategy is being used",
+        "The output includes both planning artifacts",
+        "The output labels the artifacts with literal agents/<slug>.toml and agents/<slug>.md heading lines",
+        "The output includes launch commands with explicit runtime or launch-mode guidance",
+        "The output includes risk or tradeoff notes"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Build the project for me and run the implementation.",
+      "expected_output": "A response that keeps the scope in planning/configuration and does not pretend to execute the project itself.",
+      "assertions": [
+        "The output does not claim the project was implemented",
+        "The output includes both planning artifacts",
+        "The output labels the artifacts with literal agents/<slug>.toml and agents/<slug>.md heading lines",
+        "The output keeps the task in planning/configuration scope",
+        "The output identifies that execution is out of scope for this skill"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Just give me the launch commands for a risky three-agent hcom setup. I do not need the config artifacts.",
+      "expected_output": "The response still includes both required planning artifacts, not only launch commands, and keeps thread, routing, and intent strategy explicit.",
+      "assertions": [
+        "The output includes both planning artifacts even though the user tried to narrow the output to launch commands only",
+        "The output labels the artifacts with literal agents/<slug>.toml and agents/<slug>.md heading lines",
+        "The output includes a single-thread strategy reused across the workflow",
+        "The output keeps routing syntax explicit",
+        "The output keeps the intent strategy explicit and uses only valid intent names",
+        "The output stays in planning/configuration scope"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "I want an hcom code-review loop for code changes, but I do not care which models or tools you use. Plan it and generate the artifacts.",
+      "expected_output": "A response that chooses sensible defaults, labels them as assumptions, and generates both required artifacts without blocking on non-critical preferences.",
+      "assertions": [
+        "The output chooses defaults instead of stopping on unspecified tool or model preferences",
+        "The output labels assumptions clearly",
+        "The output includes both planning artifacts",
+        "The output labels the artifacts with literal agents/<slug>.toml and agents/<slug>.md heading lines",
+        "The output includes a separate reviewer or evaluator"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "Design me an hcom team for a risky refactor. Keep it practical.",
+      "expected_output": "A practical team design that chooses sensible defaults, emits both required artifacts, and does not stall in design discussion when safe defaults are available.",
+      "assertions": [
+        "The output chooses a concrete topology",
+        "The output uses assumptions or defaults instead of unnecessary blocking questions",
+        "The output includes both planning artifacts",
+        "The output labels the artifacts with literal agents/<slug>.toml and agents/<slug>.md heading lines",
+        "The output stays in planning/configuration scope"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "I want GPT-5.5 for the planner, but use OpenCode and keep it practical if more than one provider offers it. Generate the artifacts.",
+      "expected_output": "A response that uses OpenCode model discovery, surfaces multiple exact provider-qualified GPT-5.5 candidates when available, chooses one as an explicit assumption, and writes provider-qualified IDs into the artifacts.",
+      "assertions": [
+        "The output surfaces multiple exact provider-qualified candidates when the same family exists under multiple providers",
+        "The output mentions provider-scoped narrowing such as opencode models <provider> when duplicate candidates need narrowing",
+        "The output chooses one exact provider-qualified ID as an explicit assumption",
+        "The output uses provider-qualified model IDs in launch guidance",
+        "The output includes both planning artifacts",
+        "The output stays in planning/configuration scope"
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "Plan me a risky hcom refactor team. Default the runtime for me, and include launch commands.",
+      "expected_output": "A response that defaults to headless OpenCode launch commands, keeps thread isolation on messaging commands, and avoids passing --thread to spawn commands.",
+      "assertions": [
+        "The output defaults the launch runtime to hcom opencode",
+        "The output uses --headless in the default spawn commands",
+        "The output keeps --thread on workflow messaging or wait commands rather than on spawn lines",
+        "The output uses HCOM_OPENCODE_ARGS for OpenCode model launch examples",
+        "The output includes both planning artifacts"
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "I do not know the exact model IDs available in OpenCode. Please pick sensible ones and generate the artifacts.",
+      "expected_output": "A response that names OpenCode model discovery as the source of exact IDs, records provider-qualified model names, and still chooses defaults without blocking.",
+      "assertions": [
+        "The output mentions opencode models as the discovery source for exact IDs and provider-scoped narrowing when useful",
+        "The output records provider-qualified model IDs rather than bare family names",
+        "The output chooses defaults instead of blocking on unspecified model preferences",
+        "The output includes both planning artifacts",
+        "The output labels the artifacts with literal agents/<slug>.toml and agents/<slug>.md heading lines"
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "I need OpenCode artifacts now for a GPT-5.5-led team, but assume you cannot actually run opencode models from here. Keep it practical.",
+      "expected_output": "A response that keeps OpenCode defaults, labels provider-qualified IDs as assumptions or likely candidates rather than confirmed availability, and mentions provider-scoped narrowing as the next verification step.",
+      "assertions": [
+        "The output labels provider-qualified IDs as assumptions or likely candidates rather than confirmed local availability",
+        "The output mentions opencode models as the discovery source and opencode models <provider> as a narrowing step",
+        "The output uses provider-qualified model IDs rather than bare family names",
+        "The output includes both planning artifacts",
+        "The output stays in planning/configuration scope"
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "Load and run the existing saved team config `agents/existing-team.toml` for this task: \"review the current branch for merge risks and report back to the spawning agent\". Reuse the saved configuration instead of redesigning it. Existing config content: [team] slug=\"existing-team\" objective=\"Review the current branch for merge risks and report back to the spawning agent\" topology=\"worker-reviewer\" [runtime] preferred_tool=\"opencode\" preferred_launch_mode=\"headless\" reporting_model=\"agents report to the spawning agent\" [communication] thread_strategy=\"single workflow thread from config\" thread_bootstrap=\"export WF_THREAD=\\\"existing-team-main\\\"\" default_intent=\"request\" [[agents]] name=\"implementer\" tool=\"opencode\" model=\"openai/gpt-5.4\" role=\"worker\" tag=\"worker\" [[agents]] name=\"reviewer\" tool=\"opencode\" model=\"anthropic/claude-sonnet-4.5\" role=\"reviewer\" tag=\"review\" [[handoff]] from=\"reviewer\" to=\"spawning-agent\" intent=\"inform\" bundle=\"normal\" purpose=\"report final review outcome to the spawning agent\" [browser] enabled=true profile=\"persistent\" session=\"keep-auth\" safety=\"no destructive browsing without explicit approval\"",
+      "expected_output": "A response that treats the request as config loading, preserves the saved config values, and provides loader instructions instead of regenerating the design artifacts.",
+      "assertions": [
+        "The output treats the request as config loading rather than new team design",
+        "The output preserves the saved runtime, provider-qualified model IDs, tags, thread strategy, and reporting model",
+        "The output preserves the saved browser, session, and safety rules when they are present in the config",
+        "The output provides an exact loader command or explicit loader steps instead of emitting fresh agents/<slug>.toml and agents/<slug>.md blocks",
+        "The output keeps tags as stable addresses and does not rely on generated hcom names as stable addresses",
+        "The output uses only request, inform, and ack for intent guidance"
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "Show me the generic way to resume or reuse any saved `agents/<slug>.toml` for a task without redesigning the team first.",
+      "expected_output": "A generic loader contract that uses hcom run agent-config <slug> \"<task>\", explains that the saved config stays authoritative, and avoids hardcoding a specific team name.",
+      "assertions": [
+        "The output uses a generic loader invocation rather than hardcoding a specific team",
+        "The output explains that the loader reads agents/<slug>.toml first",
+        "The output preserves runtime, model, tag, thread, intent, and reporting settings from the saved config",
+        "The output distinguishes loader instructions from design artifacts",
+        "The output only offers script generation if executable automation is explicitly requested"
+      ]
+    }
+  ]
+}

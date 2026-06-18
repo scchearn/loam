@@ -1,0 +1,12 @@
+{
+  "promptDelete": false,
+  "spellcheck": true,
+  "livePreview": true,
+  "vimMode": true,
+  "alwaysUpdateLinks": true,
+  "showLineNumber": false,
+  "trashOption": "local",
+  "propertiesInDocument": "hidden",
+  "openBehavior": "last",
+  "restrictedMode": false
+}

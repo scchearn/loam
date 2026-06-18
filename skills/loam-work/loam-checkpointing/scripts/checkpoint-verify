@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# checkpoint-verify — contract-as-code parser for loam-checkpointing notes
+# Usage: checkpoint-verify <note.md>
+# Exits 0 always; never blocks a save.
+set -uo pipefail
+
+if [ $# -eq 0 ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    echo "Usage: checkpoint-verify <note.md>"
+    exit 0
+fi
+
+NOTE="$1"
+
+if [ ! -f "$NOTE" ]; then
+    echo "NOTE: not found: $NOTE"
+    exit 0
+fi
+
+RAW=$(<"$NOTE")
+
+# ---------------------------------------------------------------------------
+# Helpers: extract a frontmatter field from bullet-list format:
+#   - Key: value
+# Scans lines after the first "# " heading line, before any ## heading.
+# ---------------------------------------------------------------------------
+get_fm() {
+    local field="$1"
+    echo "$RAW" | awk -v f="$field" '
+        /^# /{ if(seen) exit; seen=1 }
+        seen && match($0, "^[[:space:]]*-[[:space:]]*" f "[[:space:]]*:(.*)$", a) {
+            val = a[1]
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+            print val
+        }
+    '
+}
+
+CAPTURED=$(get_fm "Captured")
+REASON=$(get_fm "Reason")
+SCOPE=$(get_fm "Scope")
+FORMAT=$(get_fm "Format")
+
+# ---------------------------------------------------------------------------
+# 1) Format gate  (non-blocking — always continues)
+# ---------------------------------------------------------------------------
+if [ -z "$FORMAT" ]; then
+    echo "FORMAT: unknown — got \"\" (expected v1)"
+elif [ "$FORMAT" != "v1" ]; then
+    echo "FORMAT: unknown — got \"$FORMAT\" (expected v1)"
+else
+    echo "FRONTMATTER Format: PASS"
+fi
+
+# ---------------------------------------------------------------------------
+# 2) Frontmatter lint
+# ---------------------------------------------------------------------------
+[ -n "$CAPTURED" ] && echo "FRONTMATTER Captured: PASS" || echo "FRONTMATTER Captured: FAIL: missing"
+
+if [ -z "$REASON" ]; then
+    echo "FRONTMATTER Reason: FAIL: missing"
+else
+    case "$REASON" in
+        shutdown|pause|handoff|context-switch)
+            echo "FRONTMATTER Reason: PASS"
+            ;;
+        *)
+            echo "FRONTMATTER Reason: FAIL: not in {shutdown,pause,handoff,context-switch}"
+            echo "  WARN: $REASON"
+            ;;
+    esac
+fi
+
+if [ -z "$SCOPE" ]; then
+    echo "FRONTMATTER Scope: FAIL: missing"
+else
+    scrubbed="${SCOPE#"${SCOPE%%[![:space:]]*}"}"
+    scrubbed="${scrubbed%"${scrubbed##*[![:space:]]}"}"
+    [ -n "$scrubbed" ] && echo "FRONTMATTER Scope: PASS" || echo "FRONTMATTER Scope: WARN: empty"
+fi
+
+# ---------------------------------------------------------------------------
+# 3) "Previous: none" / "Supersedes: none" anti-patterns
+# ---------------------------------------------------------------------------
+if echo "$RAW" | grep -qi '^-\s*Previous:\s*none'; then
+    echo 'WARN: "Previous: none" literal — should be omitted, not written'
+fi
+if echo "$RAW" | grep -qi '^-\s*Supersedes:\s*none'; then
+    echo 'WARN: "Supersedes: none" literal — should be omitted, not written'
+fi
+
+# ---------------------------------------------------------------------------
+# 4) Workstream lint — extract blocks under ## Workstreams
+# ---------------------------------------------------------------------------
+ws_tmp=$(mktemp -t checkpoint-verify-XXXXXX)
+trap 'rm -f "$ws_tmp"' EXIT
+
+echo "$RAW" | awk '
+    /^## Workstreams/ { in_ws=1; next }
+    in_ws && /^## / && !/^## Workstreams/ { in_ws=0 }
+    in_ws && /^### / {
+        title = substr($0, 5)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", title)
+        print "TITLE:" title
+        next
+    }
+    in_ws && /^- Status:/ {
+        val = substr($0, index($0, ":") + 2)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+        print "STATUS:" val
+        next
+    }
+    in_ws && /^- Next:/ {
+        val = substr($0, index($0, ":") + 2)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+        print "NEXT:" val
+        next
+    }
+    in_ws && /^- Pointers:/ {
+        val = substr($0, index($0, ":") + 2)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+        if (val != "") print "PTR:" val
+        next
+    }
+    in_ws && /^  - / {
+        val = substr($0, 5)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+        if (val != "") print "PTR:" val
+        next
+    }
+' > "$ws_tmp"
+
+current_ws=""
+have_status_for_ws=0
+pointer_lines=""
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    tag="${line%%:*}"
+    val="${line#*:}"
+    case "$tag" in
+        TITLE)
+            # If previous workstream had no status, flag it
+            if [ -n "$current_ws" ] && [ "$have_status_for_ws" -eq 0 ]; then
+                echo "  WORKSTREAM $current_ws (no status field found)"
+            fi
+            current_ws="$val"
+            have_status_for_ws=0
+            echo "WORKSTREAM $current_ws"
+            ;;
+        STATUS)
+            have_status_for_ws=1
+            case "$val" in
+                active|blocked|waiting|ready-to-resume|done)
+                    echo "  WORKSTREAM $current_ws Status: PASS"
+                    ;;
+                "")
+                    echo "  WORKSTREAM $current_ws Status: FAIL: missing"
+                    ;;
+                *)
+                    echo "  WORKSTREAM $current_ws Status: FAIL: $val not in enum"
+                    ;;
+            esac
+            ;;
+        NEXT)
+            [ -n "$val" ] && echo "  WORKSTREAM $current_ws Next: PASS" \
+                         || echo "  WORKSTREAM $current_ws Next: FAIL: empty or missing"
+            ;;
+        PTR)
+            # Split comma-separated pointer values within a single line
+            # Pointers may be comma-separated: "file1, file2, file3"
+            # or a single item.
+            IFS=',' read -ra parts <<< "$val"
+            for part in "${parts[@]}"; do
+                # Trim whitespace
+                trimmed="${part#"${part%%[![:space:]]*}"}"
+                trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+                [ -n "$trimmed" ] && pointer_lines="${pointer_lines}${trimmed}"$'\n'
+            done
+            ;;
+    esac
+done < "$ws_tmp"
+
+# Check the last workstream too
+if [ -n "$current_ws" ] && [ "$have_status_for_ws" -eq 0 ]; then
+    echo "  WORKSTREAM $current_ws (no status field found)"
+fi
+
+rm -f "$ws_tmp"
+trap - EXIT
+
+# ---------------------------------------------------------------------------
+# 5) Pointer lint — check each pointer line against known patterns
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Pointer checks ==="
+
+pointer_count=0
+while IFS= read -r pointer; do
+    [ -z "$pointer" ] && continue
+    pointer_count=$((pointer_count + 1))
+
+    # Strip trailing parenthetical context "(events X-Y)" "(pending: #N)"
+    cleaned_pointer=$(echo "$pointer" | sed 's/[[:space:]]*(events [^)]*)[[:space:]]*$//;s/[[:space:]]*(pending:[^)]*)[[:space:]]*$//;s/[[:space:]]*$//')
+
+    # --- Pattern A: Absolute or relative filesystem path ---
+    if echo "$cleaned_pointer" | grep -qE '^/|^\.\.?/|^~'; then
+        full_path="$cleaned_pointer"
+        if echo "$cleaned_pointer" | grep -qE '^\.\.?/'; then
+            note_dir=$(dirname "$NOTE")
+            full_path="$note_dir/$cleaned_pointer"
+        elif echo "$cleaned_pointer" | grep -qE '^~'; then
+            full_path="${cleaned_pointer/#\~/$HOME}"
+        fi
+
+        if [ -e "$full_path" ]; then
+            echo "  POINTER $cleaned_pointer: OK"
+        else
+            echo "  POINTER $cleaned_pointer: MISSING: $cleaned_pointer"
+        fi
+
+        # Volatile hint for /tmp and /run paths
+        if echo "$full_path" | grep -qE '^/tmp|^/run'; then
+            echo "  POINTER $cleaned_pointer: VOLATILE — may not survive into resumed session"
+        fi
+        if echo "$cleaned_pointer" | grep -qE '\$TMPDIR'; then
+            echo "  POINTER $cleaned_pointer: VOLATILE — may not survive into resumed session"
+        fi
+
+    # --- Pattern B: hcom thread <name> (also handles backtick-quoted names) ---
+    elif echo "$cleaned_pointer" | grep -qE 'hcom thread\s+`?[A-Za-z0-9_-]+`?'; then
+        # Extract thread name, stripping backticks
+        thread_name=$(echo "$cleaned_pointer" | sed 's/.*hcom thread[[:space:]]\+`\?\([A-Za-z0-9_-]*\)`\?.*/\1/')
+        if command -v hcom >/dev/null 2>&1; then
+            recent=$(hcom events --last 500 --type message --thread "$thread_name" 2>/dev/null | head -1)
+            if [ -n "$recent" ] && [ "$recent" != "[]" ]; then
+                echo "  POINTER hcom thread $thread_name: OK"
+            else
+                echo "  POINTER hcom thread $thread_name: STALE: $thread_name"
+            fi
+        else
+            echo "  POINTER hcom thread $thread_name: HCOM: not available"
+        fi
+
+    # --- Pattern C: TaskWarrior UUID (full UUID with dashes) ---
+    elif echo "$cleaned_pointer" | grep -qE '\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'; then
+        task_uuid=$(echo "$cleaned_pointer" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+        if command -v task >/dev/null 2>&1; then
+            if task "$task_uuid" info 2>/dev/null >/dev/null; then
+                echo "  POINTER task $task_uuid: OK"
+            else
+                echo "  POINTER task $task_uuid: NOT FOUND"
+            fi
+        else
+            echo "  POINTER task $task_uuid: TASK: not available"
+        fi
+
+    # --- Pattern D: Contains "/" but no leading path prefix — try relative to note dir ---
+    elif echo "$cleaned_pointer" | grep -qE '/[A-Za-z0-9_.-]+$' && ! echo "$cleaned_pointer" | grep -qE '^hcom|^task\b'; then
+        note_dir=$(dirname "$NOTE")
+        full_path="$note_dir/$cleaned_pointer"
+        if [ -e "$full_path" ]; then
+            echo "  POINTER $cleaned_pointer: OK (resolved to $full_path)"
+            if echo "$full_path" | grep -qE '^/tmp|^/run'; then
+                echo "  POINTER $cleaned_pointer: VOLATILE — may not survive into resumed session"
+            fi
+        else
+            # Try resolving from WORKSPACE or PWD
+            ws_full="${WORKSPACE:-$PWD}/$cleaned_pointer"
+            if [ -e "$ws_full" ]; then
+                echo "  POINTER $cleaned_pointer: OK (resolved to $ws_full)"
+            else
+                echo "  POINTER $cleaned_pointer: MISSING (tried $full_path and $ws_full)"
+            fi
+        fi
+
+    # --- Pattern E: Any path-ish thing that actually exists on disk ---
+    elif [ -e "$cleaned_pointer" ]; then
+        echo "  POINTER $cleaned_pointer: OK"
+        if echo "$cleaned_pointer" | grep -qE '^/tmp|^/run'; then
+            echo "  POINTER $cleaned_pointer: VOLATILE — may not survive into resumed session"
+        fi
+
+    # --- Fallback: unrecognized format ---
+    else
+        echo "  POINTER $cleaned_pointer: (unrecognized format, not checked by verify)"
+    fi
+done <<< "$pointer_lines"
+
+[ "$pointer_count" -eq 0 ] && echo "  (no pointers found)"
+
+exit 0
