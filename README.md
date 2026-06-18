@@ -57,6 +57,10 @@ When you start a session, the agent loads **Using** — a router skill that
 recognizes what you're trying to do and invokes the right skill for it.
 You don't need to memorize the list above; the agent routes itself.
 
+loam works fully on its own. If your wiki grows large, [qmd](https://github.com/tobilu/qmd) (`npm install -g @tobilu/qmd`) speeds up search across memory — the skills detect it automatically and fall back to built-in search when it's absent.
+
+Agents can install `/checkpoint` and `/resume` slash-command shortcuts — see `docs/commands-install.md`.
+
 ## Usage
 
 Skills are invoked through your agent's skill loader. For example,

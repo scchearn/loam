@@ -124,10 +124,23 @@ One line per skill. The decision graph is the primary router; this is for quick 
 - `loam-scaffolding-wiki` — instantiate a new wiki substrate scaffold
 - `loam-initializing-vault` — set up an Obsidian vault with config
 
+## Installing slash commands
+
+If the user wants `/checkpoint` and `/resume` as shortcut commands (instead of typing `/loam::checkpointing` and `/loam::resuming`), you can install them. The command files ship in the loam repo under `commands/`.
+
+**Read `docs/commands-install.md` for the full protocol.** It covers:
+- Which harness you are running in (detection signals)
+- Which command format your harness expects (markdown vs TOML)
+- Where to install (global vs project-local)
+- The ask-permission-before-copying protocol
+
+Do not install commands without asking the user first. Do not guess the harness — detect it, and if ambiguous, ask. Default to project-local scope; global changes are surprising.
+
 ## When in doubt
 
 - **Can't find the wiki?** If no `wiki/SCHEMA.md` or `wiki/index.md` exists, the workspace has no memory substrate yet. Recommend `/loam::scaffolding-wiki <topic>`.
 - **Two skills seem relevant?** Apply the conflict rules above. Process/work skills win before memory-maintenance skills.
 - **A learning could go to wiki OR guidance?** Route through `loam-learning-from-session` — the classification is itself a feature of that skill.
 - **Not sure if something is durable enough for memory?** If it's about how to work here (command, pattern, quirk), it's guidance. If it's about what is true here (fact, decision, architecture), it's wiki. If it's transient work-state, it's a checkpoint — use `loam-checkpointing`, not a memory write.
+- **User wants /checkpoint or /resume shortcuts?** Read `docs/commands-install.md` and follow the protocol. Ask permission before copying.
 - **If no skill fits and the task is non-trivial, ask before guessing.**

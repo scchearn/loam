@@ -1,0 +1,70 @@
+# loam command installation reference (for agents)
+
+This document is for agents, not humans. If you are an agent running in a loam-equipped workspace and the user wants slash-command shortcuts (e.g. `/checkpoint`, `/resume`), read this document to learn how to install them for your harness, then ask the user for permission before copying.
+
+## Available commands
+
+| Command | Delegates to | Source file (markdown) | Source file (TOML) |
+|---|---|---|---|
+| `/checkpoint` | `loam::checkpointing` | `commands/checkpoint.md` | `commands/gemini/checkpoint.toml` |
+| `/resume` | `loam::resuming` | `commands/resume.md` | `commands/gemini/resume.toml` |
+
+Source: `commands/` at the loam repo root.
+
+## Compatibility matrix
+
+Split by command format, not just harness. One format does not fit all.
+
+| Harness | Format | Global location | Project location | Invoke as | Notes |
+|---|---|---|---|---|---|
+| **OpenCode** | Markdown | `~/.config/opencode/commands/` | `.opencode/commands/` | `/checkpoint` | Copy `commands/*.md` |
+| **Claude Code** | Markdown | `~/.claude/commands/` | `.claude/commands/` | `/checkpoint` | Copy `commands/*.md` |
+| **Gemini CLI** | TOML | `~/.gemini/commands/` | `.gemini/commands/` | `/checkpoint` | Copy `commands/gemini/*.toml`. Run `/commands reload` after install. |
+| **Codex** | Markdown (deprecated) | `~/.codex/prompts/` | (none) | `/prompts:checkpoint` | Deprecated in favor of skills. Prefer direct `/loam::checkpointing` unless user explicitly wants the shortcut. |
+| **Copilot CLI** | (not supported) | — | — | — | No prompt slash-command equivalent. Use `/loam::checkpointing` and `/loam::resuming` directly. Custom agents (`.agent.md`) are a different feature and overkill for thin wrappers. |
+
+## Harness detection signals
+
+Config dirs are hints only — multiple tools can be installed on the same machine. Active harness beats installed-dir detection.
+
+| Signal | Indicates | Reliability |
+|---|---|---|
+| `$HCOM_TOOL` env var (e.g. `opencode`, `claude`, `codex`) | The hcom-managed harness | High — hcom sets this explicitly |
+| `$OPENCODE_PERMISSION` env var | OpenCode | High — only opencode sets this |
+| `HCOM_PANE_TITLE` contains `[opencode]` / `[claude]` / `[codex]` | The hcom-managed harness | Medium — parse the bracketed name |
+| `~/.config/opencode/` dir exists | OpenCode installed | Low — installed ≠ active |
+| `~/.claude/` dir exists | Claude Code installed | Low — installed ≠ active |
+| `~/.gemini/` dir exists | Gemini CLI installed | Low — installed ≠ active |
+| `~/.codex/` dir exists | Codex installed | Low — installed ≠ active |
+
+**If detection is ambiguous** (multiple harnesses installed, no active-harness signal), ask the user which harness they are running.
+
+## Protocol
+
+1. **Detect active harness.** Check env vars first (`$HCOM_TOOL`, `$OPENCODE_PERMISSION`), then config dirs. If ambiguous, ask the user.
+2. **Determine scope.** Default to **project-local** when in a workspace (global changes are surprising). If no workspace is active, use global. If unsure, ask the user.
+3. **Check if commands already installed.** Look for `checkpoint.md` (OpenCode/Claude Code), `checkpoint.toml` (Gemini), or `checkpoint.md` in `~/.codex/prompts/` (Codex) in the target dir.
+   - If already installed and identical: say "already installed", do nothing.
+   - If already installed and differs: ask the user before overwriting.
+   - If not installed: proceed to step 4.
+4. **Ask the user.** "Would you like me to install the `/checkpoint` and `/resume` slash commands for `<harness>` at `<location>`?"
+5. **If yes, copy the correct format files:**
+   - OpenCode / Claude Code: `cp commands/checkpoint.md commands/resume.md <target>/`
+   - Gemini CLI: `cp commands/gemini/checkpoint.toml commands/gemini/resume.toml <target>/`
+   - Codex (if user explicitly wants deprecated prompts): `cp commands/checkpoint.md commands/resume.md ~/.codex/prompts/` — note these invoke as `/prompts:checkpoint` and `/prompts:resume`, not `/checkpoint`
+   - Copilot CLI: explain that slash commands aren't supported; use `/loam::checkpointing` and `/loam::resuming` directly
+6. **Post-install actions:**
+   - Gemini CLI: instruct the user to run `/commands reload` (or run it if the harness supports agent-initiated reload)
+   - Codex: note that a new chat or restart may be needed for the prompt to be picked up
+   - OpenCode / Claude Code: available next session start (or immediately, depending on harness)
+7. **Confirm installation.** Tell the user which commands were installed, where, and how to invoke them.
+
+## What not to do
+
+- **Do not install without asking.** Always get user permission first.
+- **Do not install globally by default.** Global changes are surprising; prefer project-local.
+- **Do not overwrite silently.** If a command file exists and differs, ask first.
+- **Do not copy markdown files to Gemini.** Gemini expects TOML. Use `commands/gemini/*.toml`.
+- **Do not install Codex prompts by default.** They are deprecated. Only install if the user explicitly asks for them.
+- **Do not invent a Copilot CLI command path.** It doesn't have one for this purpose.
+- **Do not add more commands (e.g. `/plan`, `/spec`, `/learn`, `/query`).** Higher collision risk with existing harness commands. Ship checkpoint and resume only.

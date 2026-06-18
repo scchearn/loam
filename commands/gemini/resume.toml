@@ -1,0 +1,12 @@
+description = "Resume work from the most relevant recent checkpoint"
+prompt = """
+Use the `loam::resuming` skill now and follow it exactly.
+
+If the `loam::resuming` skill is unavailable in this workspace, tell the user that `/resume` requires that skill and stop. Do not attempt to recreate the resume workflow yourself.
+
+You were invoked via `/resume`.
+Treat `{{args}}` as an optional hint about the lane I want to resume.
+If `{{args}}` is empty, infer the most likely resume target from the current session and workspace state and proceed with the normal resume workflow.
+
+Do not summarize this command file. Execute the resume workflow.
+"""
