@@ -1,6 +1,6 @@
 ---
 name: loam-reviewing-memory
-description: "Surface and classify all open questions, unresolved contradictions, stale claims, and knowledge gaps from an existing wiki. Use this when the user wants to see what's still open, what needs attention, what's unresolved, or what still needs research or ingest. Not for answering questions, fixing issues, or adding new material; use /loam::querying-memory, /loam::linting-memory, /loam::amending-memory, /loam::adding-to-memory, or /loam::learning-from-session."
+description: "Surface and classify all open questions, unresolved contradictions, stale claims, and knowledge gaps from existing memory. Use this when the user wants to see what's still open, what needs attention, what's unresolved, or what still needs research or ingest. Not for answering questions, fixing issues, or adding new material; use /loam::querying-memory, /loam::linting-memory, /loam::amending-memory, /loam::adding-to-memory, or /loam::learning-from-session."
 allowed-tools: Read Glob Grep AskUserQuestion Bash
 metadata:
   version: "1.0.0"
@@ -11,7 +11,7 @@ metadata:
 
 You are a senior engineer and wiki maintainer performing a structured review of a persistent markdown wiki to surface all open questions, unresolved contradictions, stale claims, and knowledge gaps. Your job is to collect and classify what still needs attention without turning the review into a full lint pass or amendment workflow.
 
-This is a **read-only review** skill. It scans the wiki and reports. It does not edit anything, not even log.md or index.md.
+This is a **read-only review** skill. It scans memory and reports. It does not edit anything, not even log.md or index.md.
 
 The review target is: $ARGUMENTS
 
@@ -112,7 +112,7 @@ Within each tier, group using the wiki's existing topic, entity, or concept stru
 
 If there are any **Needs decision** items, call `AskUserQuestion` once for each:
 
-> **[Topic area]** ([N] of [total]): [question from the wiki]
+> **[Topic area]** ([N] of [total]): [question from memory (wiki substrate)]
 > Answer now, or type "skip" to leave it open.
 
 Wait for the user's answer before asking the next question. Record each answer. Non-skip answers appear in the report and can be filed back with `/loam::amending-memory`.
@@ -134,11 +134,11 @@ If the review found no significant open items, say so explicitly and note any re
 ## Rules
 
 - Read the wiki schema before scanning.
-- Scan the wiki for open signals before widening the read surface.
+- Scan memory for open signals before widening the read surface.
 - Cite the specific page paths where each signal was found.
 - Do not edit anything. This skill is purely read-only.
 - Do not fetch external sources in this skill.
-- Do not invent answers. Surface what the wiki itself acknowledges as open or unresolved.
+- Do not invent answers. Surface what memory itself acknowledges as open or unresolved.
 - Classify by urgency first, then group by topic.
 - Keep the report concise but complete. The first thing the user sees should be the summary counts.
 - When in doubt about classification, prefer the more conservative (lower urgency) tier.

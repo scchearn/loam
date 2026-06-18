@@ -195,7 +195,7 @@ Also include, using `none` when empty:
 
 ## Step 7 — Optional wiki write-back
 
-If a wiki exists, decide whether the research produced durable findings worth preserving there.
+If memory (wiki substrate) exists, decide whether the research produced durable findings worth preserving there.
 
 Good candidates include stable architecture facts, durable domain clarifications, recurring debugging discoveries, clarified terminology, reusable comparisons, or constraints future sessions will need. Also include durable requirements taxonomies, recurring product constraints, and external integration behavior discovered during research.
 

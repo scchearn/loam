@@ -1,6 +1,6 @@
 ---
 name: loam-amending-plan
-description: "Amend an existing plan file — add tasks, modify pending or delegated tasks, and mark completed tasks that are invalidated by the change as [>] (needs re-run). Walks through analysis, cascading impact, and user confirmation before touching the file. When a wiki exists, it may also preserve durable amendment findings there."
+description: "Amend an existing plan file — add tasks, modify pending or delegated tasks, and mark completed tasks that are invalidated by the change as [>] (needs re-run). Walks through analysis, cascading impact, and user confirmation before touching the file. When memory (wiki substrate) exists, it may also preserve durable amendment findings there."
 allowed-tools: Read Write Edit Glob Grep
 metadata:
   version: "1.0.0"
@@ -29,7 +29,7 @@ Read the plan file in full. Build a complete picture:
 4. **Dependency graph** — mentally map which tasks feed into which. A change to T2 may cascade to T4, T5, T7 even if T4 doesn't directly reference T2
 5. **Decisions log** — understand the history and what has already been decided
 6. **Current state** — how far along is execution? What's been done, what's locally in flight, and what's delegated externally via `[h]`?
-7. **Optional wiki context** — if a wiki exists, read the schema and only the notes directly relevant to the plan area or amendment. Treat the wiki as a durable memory layer, not the authority over current repo state.
+7. **Optional wiki context** — if memory (wiki substrate) exists, read the schema and only the notes directly relevant to the plan area or amendment. Treat memory as a durable memory layer, not the authority over current repo state.
 
 Do not modify anything yet.
 
@@ -55,7 +55,7 @@ Apply these lenses:
 
 **Plan metadata** — does the amendment change the short description, task count, or overall status that the YAML front matter and `plans/INDEX.md` should reflect?
 
-**Wiki impact** — if a wiki exists, does the amendment reveal a durable architecture, domain, or workflow change that should be preserved there after confirmation? Do not confuse this with task-management chatter.
+**Wiki impact** — if memory (wiki substrate) exists, does the amendment reveal a durable architecture, domain, or workflow change that should be preserved there after confirmation? Do not confuse this with task-management chatter.
 
 **Validation quality** — does the amendment require stronger automated tests or validations so the updated behavior can be checked independently later, not just during this session?
 
@@ -234,7 +234,7 @@ This ensures a previously-completed plan that gets amended doesn't falsely show 
 
 ### H. Optional wiki write-back
 
-If a wiki exists and the confirmed amendment reveals durable knowledge worth preserving:
+If memory (wiki substrate) exists and the confirmed amendment reveals durable knowledge worth preserving:
 
 1. Prefer updating an existing relevant topic, concept, entity, or analysis note
 2. If you create a new durable category note, use a canonical kebab-case filename and `[[kebab-case-note-name]]` links
@@ -273,6 +273,6 @@ Note: /loam::starting will detect the [>] tasks and will also respect any remain
 - **Never apply changes before user confirmation in Phase 4.**
 - **Preserve all task IDs.** Never renumber existing tasks.
 - **Do not execute any implementation work.** Your job is plan surgery only.
-- **If a wiki exists** — you may update it only with durable amendment findings. Current repo state wins if the wiki is stale or wrong.
+- **If memory (wiki substrate) exists** — you may update it only with durable amendment findings. Current repo state wins if memory is stale or wrong.
 - **Cascade aggressively, apply conservatively.** Flag every possibly-affected task in the proposal. Mark `[>]` only what the user confirms truly needs re-running.
 - **Prefer independently re-runnable validation.** When the amendment changes behavior, bias toward updating or adding tests that others can run later.

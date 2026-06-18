@@ -1,6 +1,6 @@
 ---
 name: loam-adding-to-memory
-description: "Read a local source file or synthesize conversation context, then integrate the content directly into topic, entity, concept, and analysis pages in an existing Obsidian-friendly markdown wiki. Use this when the user wants to add a source to the wiki, add a document, ingest a local note, transcript, article, report, or PDF, or explicitly preserve the current conversation as a topic note. Not for proposal-first session learnings that directly update existing pages; use /loam::learning-from-session."
+description: "Read a local source file or synthesize conversation context, then integrate the content directly into topic, entity, concept, and analysis pages in existing memory (the wiki substrate). Use this when the user wants to add a source to the wiki, add a document, ingest a local note, transcript, article, report, or PDF, or explicitly preserve the current conversation as a topic note. Not for proposal-first session learnings that directly update existing pages; use /loam::learning-from-session."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
   version: "1.0.0"
@@ -100,9 +100,9 @@ Always read the actual candidate pages before editing.
 
 ---
 
-## Step 2 — Update the wiki incrementally
+## Step 2 — Update memory incrementally
 
-Treat the wiki as a compiled artifact that must stay internally coherent.
+Treat memory as a compiled artifact that must stay internally coherent.
 
 ### A. Related pages
 
@@ -163,7 +163,7 @@ If qmd was ready and you wrote to the wiki, run `qmd update -c <collection> 2>/d
 - For file mode: note the source path in relevant pages where it materially aids retrieval.
 - For chat-context mode: note the conversation date in relevant pages where appropriate.
 - Make uncertainty explicit.
-- Separate the source's claims from the wiki's cross-source synthesis when they differ.
+- Separate the source's claims from memory (wiki substrate)'s cross-source synthesis when they differ.
 - Avoid overstating weak evidence.
 - Never rewrite raw-source files.
 

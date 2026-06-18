@@ -1,6 +1,6 @@
 ---
 name: loam-normalizing-memory
-description: "Inspect an existing wiki-like markdown corpus and align it to this repo's Obsidian-friendly note-graph conventions. Use this when the user wants to import, normalize, retrofit, or clean up an existing wiki, notes folder, vault, docs tree, or mixed markdown knowledge base. In monorepos, also use it to align relevant AGENTS.md and CLAUDE.md files. Not for routine wiki maintenance; use /loam::linting-memory for that."
+description: "Inspect an existing memory corpus (wiki substrate) and align it to this repo's Obsidian-friendly note-graph conventions. Use this when the user wants to import, normalize, retrofit, or clean up existing memory, notes folder, vault, docs tree, or mixed markdown knowledge base. In monorepos, also use it to align relevant AGENTS.md and CLAUDE.md files. Not for routine wiki maintenance; use /loam::linting-memory for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
   version: "1.0.0"
@@ -9,11 +9,11 @@ metadata:
   disable-model-invocation: true
 ---
 
-You are a senior engineer and wiki maintainer retrofitting an existing wiki-like markdown corpus to this repo's Obsidian-friendly conventions.
+You are a senior engineer and wiki maintainer retrofitting an existing memory corpus (wiki substrate) to this repo's Obsidian-friendly conventions.
 
 This skill is broader than `/loam::linting-memory`.
 
-- Use `/loam::linting-memory` for ongoing maintenance of a wiki that already largely follows the conventions.
+- Use `/loam::linting-memory` for ongoing maintenance of memory (wiki substrate) that already largely follows the conventions.
 - Use `/loam::normalizing-memory` when the structure, naming, link style, hub notes, or note graph need normalization or retrofit work.
 
 The target output is:
@@ -24,7 +24,7 @@ The target output is:
 - `index.md` functioning as the single root hub, with a concise `## Overview` section near the top
 - stronger reciprocal links and fewer isolated notes
 - an explicit `SCHEMA.md` when one is missing or materially incomplete
-- lean operational `AGENTS.md` / `CLAUDE.md` files that point into the wiki for durable deep reference instead of duplicating long, fast-aging technical knowledge
+- lean operational `AGENTS.md` / `CLAUDE.md` files that point into memory (wiki substrate) for durable deep reference instead of duplicating long, fast-aging technical knowledge
 
 ## Input
 
@@ -57,8 +57,8 @@ Parse the arguments like this:
 In `--guidance-only` mode:
 
 - inspect and update only relevant `AGENTS.md` and `CLAUDE.md` files
-- read the wiki so those guidance files can point to the right hub notes and durable pages
-- treat the wiki as read-only context only
+- read memory so those guidance files can point to the right hub notes and durable pages
+- treat memory as read-only context only
 - do not rename or move wiki notes
 - do not normalize links across the whole wiki corpus
 - do not restructure category directories
@@ -98,7 +98,7 @@ Use these scoping rules:
 1. Always inspect root-level `AGENTS.md` / `CLAUDE.md` when they exist.
 2. Always inspect `<wiki root>/AGENTS.md` / `<wiki root>/CLAUDE.md` when they exist.
 3. If the target names a subtree such as an app, package, service, or module, inspect the nearest relevant scoped guidance files in or above that subtree.
-4. If no explicit subtree is named, inspect additional scoped guidance files only when the wiki scope clearly covers them or when they likely contain duplicated or stale deep-reference material that should point into the wiki.
+4. If no explicit subtree is named, inspect additional scoped guidance files only when memory scope clearly covers them or when they likely contain duplicated or stale deep-reference material that should point into memory (wiki substrate).
 5. Treat mirror files such as `CLAUDE.md` files that only defer to `AGENTS.md` as mirrors. Keep them thin unless the workspace clearly intends otherwise.
 
 ---
@@ -131,7 +131,7 @@ Map the current state:
 - notes that should likely move into `topics/`, `entities/`, `concepts/`, or `analyses/`
 - existing `sources/` directories whose pages should be absorbed into topic/entity/concept pages
 - relevant `AGENTS.md` / `CLAUDE.md` files and whether each is canonical, scoped, or mirror-only
-- stale or duplicated deep-reference sections in guidance files that should instead point into the wiki
+- stale or duplicated deep-reference sections in guidance files that should instead point into memory (wiki substrate)
 - guidance sections that should stay local and operational, such as commands, hard rules, safety constraints, scope boundaries, and canonical source-of-truth pointers
 
 Treat the existing corpus with care. The goal is alignment, not a destructive rewrite.
@@ -173,7 +173,7 @@ Wait for explicit confirmation before editing files.
 
 ## Phase 4 — Apply the alignment
 
-Once the user confirms, apply the smallest safe set of changes needed to align the wiki.
+Once the user confirms, apply the smallest safe set of changes needed to align memory.
 
 Safe full-alignment work includes:
 
@@ -187,8 +187,8 @@ Safe full-alignment work includes:
 8. creating missing category directories when the current scope clearly benefits from them
 9. moving notes into clearer category locations when the destination is obvious and safe
 10. migrating source pages: when `<wiki root>/sources/` exists, read each source page, synthesize its claims into the most relevant topic/entity/concept pages, then remove the source page. Flag any source pages where the destination is not obvious rather than guessing.
-11. auditing and updating relevant `AGENTS.md` / `CLAUDE.md` files so they point to the wiki and keep operational guidance concise
-12. shortening duplicated deep-reference sections in guidance files into concise wiki pointers when the durable detail already belongs in the wiki
+11. auditing and updating relevant `AGENTS.md` / `CLAUDE.md` files so they point to memory (wiki substrate) and keep operational guidance concise
+12. shortening duplicated deep-reference sections in guidance files into concise wiki pointers when the durable detail already belongs in memory (wiki substrate)
 13. correcting clearly stale guidance after verifying against current repo state, guidance scope, and the wiki
 14. keeping mirror files thin when they intentionally defer to a canonical guidance file
 15. appending a parseable entry to `<wiki root>/log.md` like:
@@ -209,7 +209,7 @@ When renaming or moving notes:
 When updating guidance files:
 
 - preserve commands, hard rules, safety constraints, scope boundaries, and canonical source-of-truth pointers
-- prefer concise pointers into the wiki over long duplicated deep-reference prose
+- prefer concise pointers into memory (wiki substrate) over long duplicated deep-reference prose
 - verify stale-looking claims against current repo state before changing or removing them
 - keep mirror files like `CLAUDE.md` thin when they intentionally defer to `AGENTS.md`
 

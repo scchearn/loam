@@ -37,5 +37,5 @@ Use this checklist before marking an add pass complete.
 
 - The wiki is richer than before.
 - The path from raw source to synthesis is traceable through log entries and relevant page references.
-- A future session can answer related questions faster by reading the wiki first.
+- A future session can answer related questions faster by reading memory first.
 - In chat-context mode: uncertainty is explicit, not overstated.

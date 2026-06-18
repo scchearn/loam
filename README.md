@@ -4,6 +4,22 @@ Packaged agent workflow skills under a single flat namespace, designed for agent
 
 Each skill is addressed as `loam::<gerund>[-<object>]` and invoked through the host harness's skill loader (slash-prefixed invocation tokens such as `/loam::planning`).
 
+## Start here
+
+**`/loam::using`** is the meta-skill router. Load it at session start — it routes to the right skill for any loam intent, explains the memory model, and lists the cross-cutting rules. If you're new to loam, read `loam-using` first.
+
+## The memory model
+
+**Memory** is the umbrella concept for everything loam captures. Three substrates exist:
+
+| Substrate | What it is | Who maintains it |
+|---|---|---|
+| **wiki** | Durable Obsidian-friendly markdown notes under `wiki/`. Topic, entity, concept, analysis pages. | loam-memory group (most skills) |
+| **guidance** | `AGENTS.md`, `CLAUDE.md`, `.claude.local.md` — prompt-context files for future agent sessions. | loam-memory group (`auditing-guidance`, `learning-from-session` guidance path) |
+| **checkpoints** | Transient work-state under `wiki/checkpoints/`. Restart notes, not durable knowledge. | loam-work group (`checkpointing` writes, `resuming` reads) |
+
+Talk about "memory" first. Use "wiki" only when distinguishing the markdown substrate from the guidance or checkpoint substrates. The wiki is one substrate of memory, not the whole thing.
+
 ## What loam is
 
 loam is an **umbrella product**: a curated set of workflow skills for planning, research, memory maintenance, and substrate initialization. Skills are organized into three internal groups for maintainability and discoverability, but addressing is **flat** — the group never appears in the invocation token.
@@ -15,8 +31,8 @@ Every command is `/loam::<gerund>[-<object>]`. The internal group is never typed
 - `/loam::planning` — compile an approved spec into an execution-ready plan
 - `/loam::writing-spec` — research a question and produce `specs/<slug>.md`
 - `/loam::starting` — begin or resume execution of a plan
-- `/loam::adding-to-memory` — ingest a source or conversation into the wiki
-- `/loam::scaffolding-wiki` — instantiate a new wiki scaffold
+- `/loam::adding-to-memory` — ingest a source or conversation into memory (wiki substrate)
+- `/loam::scaffolding-wiki` — instantiate a new wiki substrate scaffold
 - ...full table below
 
 ## Internal groups (source-only)
@@ -25,8 +41,8 @@ Three groups organize skills in the source repo. On install via `npx skills`, ev
 
 | Group | Rationale |
 |---|---|
-| `loam-work` | Prospective / future-facing ops on work that hasn't happened yet. Plans, research, starting, resuming, checkpointing, configuring agent teams, amending plans. Reads the wiki for state but produces work artifacts (plans, task lists, checkpoints). |
-| `loam-memory` | Settled / past-facing ops on knowledge that's already true. Maintains the wiki and the agent-guidance surface. Source of truth for everything loam captures. |
+| `loam-work` | Prospective / future-facing ops on work that hasn't happened yet. Plans, research, starting, resuming, checkpointing, configuring agent teams, amending plans. Reads memory for state but produces work artifacts (plans, task lists, checkpoints). |
+| `loam-memory` | Settled / past-facing ops on knowledge that's already true. Maintains the wiki and guidance substrates of memory. Source of truth for everything loam captures. |
 | `loam-ground` | Substrate initialization. Brings the wiki substrate (Obsidian vault, qmd indexing) into existence. Two skills, one-time foundational acts. |
 
 The tense distinction (prospective vs settled) is the mental model, not the address axis — addressing is by domain. Tense survives as the help-output sort order.
@@ -62,14 +78,15 @@ With [vercel-labs/skills](https://github.com/vercel-labs/skills) (`npx skills`):
 npx skills add scchearn/loam
 ```
 
-This discovers all 17 skills under `skills/loam-work/`, `skills/loam-memory/`, `skills/loam-ground/` and installs them flat into your harness's per-agent skills directory (e.g. `~/.claude/skills/`, `~/.config/opencode/skills/`).
+This discovers all 18 skills (the router `loam-using` at the top level, plus the 17 skills under `loam-work/`, `loam-memory/`, `loam-ground/`) and installs them flat into your harness's per-agent skills directory (e.g. `~/.claude/skills/`, `~/.config/opencode/skills/`).
 
 No `.claude-plugin/marketplace.json` is required. It is only needed if you also want Claude plugin-marketplace discovery.
 
-## All 17 skills
+## All 18 skills
 
 | CLI address | Group | Source skill |
 |---|---|---|
+| `/loam::using` | (meta, top-level) | new — router for the namespace |
 | `/loam::planning` | loam-work | do-plan |
 | `/loam::writing-spec` | loam-work | do-research |
 | `/loam::starting` | loam-work | do-start |
@@ -88,7 +105,7 @@ No `.claude-plugin/marketplace.json` is required. It is only needed if you also 
 | `/loam::scaffolding-wiki` | loam-ground | do-wiki-build |
 | `/loam::initializing-vault` | loam-ground | setup-obsidian-vault |
 
-18 source skills → 17 loam skills. One merge (`learning-from-session`), zero splits, five renames.
+18 source skills → 18 loam skills. One merge (`learning-from-session`), zero splits, five renames, one new meta-skill (`loam-using`).
 
 ### Notes on the merge
 

@@ -45,7 +45,7 @@ For each candidate learning, choose the destination surface. Classification is i
 
 ### Route to the wiki-page path when:
 
-- The learning is a fact, decision, architecture note, or analysis that any future session (agent or human) reading the wiki would benefit from.
+- The learning is a fact, decision, architecture note, or analysis that any future session (agent or human) reading memory would benefit from.
 - The learning deserves a topic, entity, concept, or analysis page (or an update to one).
 - The learning is worth cross-linking into the wiki graph.
 - The learning is durable knowledge about the project, not about how to instruct an agent.
@@ -59,12 +59,12 @@ For each candidate learning, choose the destination surface. Classification is i
 
 ### Mixed routing is allowed and expected
 
-A single session may produce both kinds. Keep them separate in the proposal: wiki-bound learnings in one section, guidance-bound learnings in another. A learning that would fit both surfaces should default to the guidance-file path only if it is short and instruction-shaped; otherwise route to the wiki.
+A single session may produce both kinds. Keep them separate in the proposal: wiki-bound learnings in one section, guidance-bound learnings in another. A learning that would fit both surfaces should default to the guidance-file path only if it is short and instruction-shaped; otherwise route to memory (wiki substrate).
 
 ### Defer or route elsewhere when:
 
 - The learning is not durable enough — defer.
-- The learning reveals the wiki is wrong, stale, or contradicted — route to `/loam::amending-memory`.
+- The learning reveals memory is wrong, stale, or contradicted — route to `/loam::amending-memory`.
 - The learning is a new source to ingest (a file, article, transcript) — route to `/loam::adding-to-memory`.
 - The learning is an unresolved open question — preserve as such, do not settle it silently.
 
@@ -126,7 +126,7 @@ For each wiki-bound learning, decide whether it should:
 - create a small new durable page because no existing page is a good fit
 - be preserved as an open question rather than a settled fact
 - be deferred because it is not durable enough
-- be routed to `/loam::amending-memory` because it reveals the wiki is wrong or stale
+- be routed to `/loam::amending-memory` because it reveals memory is wrong or stale
 
 Rules:
 
@@ -134,7 +134,7 @@ Rules:
 2. **Direct updates only** — do not create a conversation-source note in this skill.
 3. Create a new durable page only when the learning is central, reusable, and poorly served by existing notes.
 4. Keep additions concise and durable. Do not dump session transcripts.
-5. If a learning contradicts an existing wiki claim, surface it and recommend `/loam::amending-memory`.
+5. If a learning contradicts existing memory claim, surface it and recommend `/loam::amending-memory`.
 6. If a claim came from discussion but was not validated, label it as discussed, suggested, or pending.
 
 ### 3B — Guidance-file path

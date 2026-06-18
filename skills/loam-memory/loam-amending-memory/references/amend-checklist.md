@@ -4,7 +4,7 @@ Use this checklist before marking an amendment pass complete.
 
 ## Before proposing
 
-- Confirm the wiki exists and you can locate its root.
+- Confirm memory exists and you can locate its root.
 - Confirm the specific content that needs correcting, superseding, completing, or surfacing.
 - Read the affected pages before proposing changes to them.
 - Classify the amendment type (correction, supersession, completion, contradiction).

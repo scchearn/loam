@@ -1,6 +1,6 @@
 # Guidance File Triage
 
-Use this guide when deciding what belongs in `AGENTS.md` / `CLAUDE.md` versus the wiki.
+Use this guide when deciding what belongs in `AGENTS.md` / `CLAUDE.md` versus memory.
 
 ## Keep
 
@@ -59,12 +59,12 @@ Keep these thin unless the workspace clearly expects something else.
 Leave a guidance file out of the current pass when:
 
 - the alignment scope does not meaningfully touch that subtree
-- the wiki scope does not yet cover that area
+- memory scope does not yet cover that area
 - updating it would require a broad repo-wide rewrite that was not requested
 
 ## Non-negotiable rules
 
 - Do not delete unique operational guidance unless the durable replacement clearly exists and is referenced.
 - Do not turn guidance files into shadow wiki pages.
-- Prefer concise pointers into the wiki over duplicated deep-reference prose.
+- Prefer concise pointers into memory (wiki substrate) over duplicated deep-reference prose.
 - Preserve commands, hard rules, and safety constraints.

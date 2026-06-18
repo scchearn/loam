@@ -1,6 +1,6 @@
 ---
 name: loam-querying-memory
-description: "Answer questions against an existing Obsidian-friendly markdown wiki. Use this whenever the user is asking what is happening in the project, directory, codebase, architecture, workflow, decisions, or current state and the wiki likely contains the answer, even if they do not explicitly mention the wiki. Also use it for summaries, comparisons, and reusable analyses grounded in current wiki pages. Not for surfacing unresolved gaps; use /loam::reviewing-memory for that."
+description: "Answer questions against existing memory (the wiki substrate). Use this whenever the user is asking what is happening in the project, directory, codebase, architecture, workflow, decisions, or current state and the wiki likely contains the answer, even if they do not explicitly mention the wiki. Also use it for summaries, comparisons, and reusable analyses grounded in current wiki pages. Not for surfacing unresolved gaps; use /loam::reviewing-memory for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
   version: "1.0.0"
@@ -28,7 +28,7 @@ The question is: $ARGUMENTS
 3. If qmd is still not ready: use Grep/Glob search.
 4. Runtime guard: if any qmd command fails or returns stale results, treat as degraded — fall back to Grep/Glob search.
 
-Classify the question internally (do not expose unless it helps the answer): **lookup** (answer from one or a few pages), **comparison** (differences/tradeoffs across pages), **synthesis** (higher-level explanation combining multiple parts), **gap check** (whether the wiki can answer something yet). Derive 3-8 search terms.
+Classify the question internally (do not expose unless it helps the answer): **lookup** (answer from one or a few pages), **comparison** (differences/tradeoffs across pages), **synthesis** (higher-level explanation combining multiple parts), **gap check** (whether memory can answer something yet). Derive 3-8 search terms.
 
 ### qmd search (when ready)
 
@@ -44,7 +44,7 @@ Use `--files` to get candidate file paths only (no snippets). Then Read the actu
 
 1. Locate wiki root by Glob for `SCHEMA.md`, `index.md`, or `log.md`. If no wiki exists, stop and recommend `/loam::scaffolding-wiki <topic>`. If multiple roots are ambiguous, ask a minimal follow-up.
 2. Derive 3-8 search terms from the question.
-3. Search immediately with Grep and Glob on the wiki directories.
+3. Search immediately with Grep and Glob on memory directories.
 4. Read SCHEMA.md/index.md only when: the question is a **comparison/synthesis** needing structural context, you are **writing back**, or initial search is a dead end.
 
 ### Verification (always required)
@@ -64,9 +64,9 @@ Rules:
 1. Cite the specific wiki page paths that support the answer.
 2. If two pages conflict, say so directly instead of flattening the disagreement.
 3. Distinguish between:
-   - what the wiki clearly supports
-   - what the wiki only suggests indirectly
-   - what the wiki does not yet establish
+   - what memory clearly supports
+   - what memory only suggests indirectly
+   - what memory does not yet establish
 4. If the question cannot be answered well from the current wiki, say that explicitly and identify the missing source, page, or ingest work that would help.
 
 Keep the answer concise but complete. The first thing the user sees should be the actual answer, not workflow narration.
@@ -75,7 +75,7 @@ Keep the answer concise but complete. The first thing the user sees should be th
 
 ## Step 3 — Write back (when durable)
 
-Some query outputs are durable and should become part of the wiki. Others are one-off answers and should stay in chat.
+Some query outputs are durable and should become part of memory. Others are one-off answers and should stay in chat.
 
 ### Write back when
 

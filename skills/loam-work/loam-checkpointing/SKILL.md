@@ -33,7 +33,7 @@ If no argument is given, derive the reason from the current situation.
 
 ---
 
-## Step 1 — Resolve the wiki checkpoint lane
+## Step 1 — Resolve memory checkpoint lane
 
 1. Locate the existing wiki root by looking for files such as `wiki/SCHEMA.md`, `wiki/index.md`, or `wiki/log.md`.
 2. If the workspace uses a different but clearly established wiki root, reuse it.

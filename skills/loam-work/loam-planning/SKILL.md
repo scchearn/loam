@@ -227,7 +227,7 @@ Resolution of these labels belongs to the execution skill. The plan states const
 
 ## Step 4 — Optional wiki write-back
 
-If a wiki exists, decide whether planning surfaced durable knowledge worth preserving. Good candidates include stable architecture constraints, durable workflow requirements, reusable domain distinctions, clarified system boundaries, or spec drift findings.
+If memory (wiki substrate) exists, decide whether planning surfaced durable knowledge worth preserving. Good candidates include stable architecture constraints, durable workflow requirements, reusable domain distinctions, clarified system boundaries, or spec drift findings.
 
 Do not write back the task list, temporary sequencing choices, or speculative ideas. If the finding is durable, prefer updating existing notes, update `index.md` only when discoverability changes, and append `log.md` with:
 

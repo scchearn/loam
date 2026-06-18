@@ -28,8 +28,8 @@ The target output is an Obsidian-friendly note graph:
 ### Schema
 
 - The operating contract for future sessions.
-- It defines page types, naming rules, linking rules, how `/loam::adding-to-memory` extends the wiki, and maintenance expectations.
-- Without this layer, each future session has to rediscover how the wiki is supposed to work.
+- It defines page types, naming rules, linking rules, how `/loam::adding-to-memory` extends memory, and maintenance expectations.
+- Without this layer, each future session has to rediscover how memory is supposed to work.
 
 ## Note identity and linking
 
@@ -43,7 +43,7 @@ The target output is an Obsidian-friendly note graph:
 
 ## Default scaffold
 
-Use the smallest structure that still makes the wiki operable. A good default is:
+Use the smallest structure that still makes memory operable. A good default is:
 
 ```text
 raw/
@@ -116,7 +116,7 @@ The scaffold pass should create the lanes, not drive every future workflow.
 During build:
 
 - define the raw-source location
-- define the wiki structure
+- define memory structure
 - define the schema
 - initialize `index.md` with a concise `## Overview` section and `log.md`
 - establish the canonical link and filename rules
@@ -134,8 +134,8 @@ During `/loam::adding-to-memory`:
 
 During research, planning, execution, and amendment:
 
-- consult the wiki when it exists, but do not require one
-- treat the wiki as a durable memory layer, not the authority over the current repo state
-- if current repo state or primary docs conflict with the wiki, trust the current repo state and update the wiki if the finding is durable
+- consult memory when it exists, but do not require one
+- treat memory as a durable memory layer, not the authority over the current repo state
+- if current repo state or primary docs conflict with memory, trust the current repo state and update memory if the finding is durable
 - file back only durable findings such as stable architecture facts, domain clarifications, recurring debugging discoveries, reusable comparisons, or established constraints
 - avoid writing back ephemeral task chatter, temporary dead ends, or narrow planning noise

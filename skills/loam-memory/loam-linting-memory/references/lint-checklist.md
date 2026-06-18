@@ -48,7 +48,7 @@ Use this checklist to health-check a markdown wiki without turning the pass into
 - add missing reciprocal backlinks
 - add short contradiction notes
 - add short stale-claim notes
-- create a minimal reusable page for an entity or concept already well established in the wiki
+- create a minimal reusable page for an entity or concept already well established in memory (wiki substrate)
 - normalize obvious internal links to canonical `[[kebab-case-note-name]]` form
 
 ## Avoid during lint

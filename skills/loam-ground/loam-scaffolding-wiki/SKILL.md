@@ -1,6 +1,6 @@
 ---
 name: loam-scaffolding-wiki
-description: "Create or extend an Obsidian-friendly markdown wiki scaffold in the current workspace. Use this when the user wants to build a wiki, set up a knowledge base, create a research vault, or scaffold a living markdown note graph before adding sources with `/loam::adding-to-memory`. Not for importing or normalizing an existing wiki-like corpus; use /loam::normalizing-memory for that."
+description: "Create or extend an Obsidian-friendly markdown wiki scaffold in the current workspace. Use this when the user wants to build a wiki, set up a knowledge base, create a research vault, or scaffold a living markdown note graph before adding sources with `/loam::adding-to-memory`. Not for importing or normalizing existing memory-like corpus; use /loam::normalizing-memory for that."
 allowed-tools: Read Glob Grep Write Edit AskUserQuestion Skill Bash
 metadata:
   version: "1.0.0"
@@ -15,7 +15,7 @@ Follow the framework closely:
 
 - **Raw sources** are immutable inputs the agent reads but never rewrites.
 - **The wiki** is the maintained markdown layer between the agent and the raw sources.
-- **The schema** is the operating contract that tells future sessions how to maintain the wiki consistently.
+- **The schema** is the operating contract that tells future sessions how to maintain memory consistently.
 
 Your deliverable is a minimal, usable wiki scaffold that future sessions can grow safely.
 
@@ -45,11 +45,11 @@ Read the most relevant files, including when present:
 
 Inspect structure first. Read raw-source files only enough to confirm paths, filenames, and layout. Do not summarize or synthesize their contents.
 
-Determine whether a wiki-like structure already exists, whether there is a clear raw-source directory, and whether there is an existing schema to extend.
+Determine whether memory (wiki substrate)-like structure already exists, whether there is a clear raw-source directory, and whether there is an existing schema to extend.
 
 Once you choose locations, treat them as `<raw root>` and `<wiki root>`.
 
-Prefer extending an existing wiki over creating a parallel one.
+Prefer extending existing memory over creating a parallel one.
 
 Use the current workspace conventions when they are clear. If not clear, default to:
 
@@ -131,7 +131,7 @@ Resolve `<obsidian vault root>` before asking. If `<wiki root>` is a subdirector
 
 Use `AskUserQuestion`:
 
-> "Would you like to set up an Obsidian vault at the project root (`<obsidian vault root>`) now? This will configure Obsidian settings and plugins so the wiki remains available as a folder inside the vault."
+> "Would you like to set up an Obsidian vault at the project root (`<obsidian vault root>`) now? This will configure Obsidian settings and plugins so memory remains available as a folder inside the vault."
 
 If yes: invoke the `loam::initializing-vault` skill with `<obsidian vault root>` as the argument, not `<wiki root>` when those paths differ.
 
@@ -177,13 +177,13 @@ Wiki scaffold ready at <wiki root>
 - `/loam::adding-to-memory <local source path or topic>`
 ```
 
-If you found an existing wiki and only refined it, say so explicitly.
+If you found existing memory and only refined it, say so explicitly.
 
 ---
 
 ## Rules
 
-- Prefer extending an existing wiki over creating a second one.
+- Prefer extending existing memory over creating a second one.
 - Keep the structure small and obvious.
 - Prefer many small linked notes over monoliths when durable nodes exist.
 - Raw-source files are immutable.
@@ -194,9 +194,9 @@ If you found an existing wiki and only refined it, say so explicitly.
 - `<wiki root>/log.md` is append-only.
 - `<wiki root>/index.md` must be useful immediately after this skill runs.
 - Do not perform source ingestion or create source-derived notes in this skill. That belongs to `/loam::adding-to-memory`.
-- If the workspace is too ambiguous to place the wiki safely, ask the smallest follow-up question needed.
+- If the workspace is too ambiguous to place memory safely, ask the smallest follow-up question needed.
 - qmd retrieval setup is optional. The wiki must work fully without it.
-- Obsidian vault setup should target the project/workspace root that contains the wiki, not the `wiki/` directory itself, unless the wiki is already the workspace root.
+- Obsidian vault setup should target the project/workspace root that contains memory, not the `wiki/` directory itself, unless memory is already the workspace root.
 - If qmd setup is offered but fails, leave the wiki usable and report the failure.
 - If qmd setup succeeds, record collection details in `.wiki-metadata.json` and reference it in `SCHEMA.md`.
 - Collection matching uses absolute path equality. Do not trust collection name alone.

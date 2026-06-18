@@ -18,7 +18,7 @@ Always verify candidates by Reading the actual wiki files. qmd discovers file pa
 
 ## Refresh after writes
 
-If this skill wrote to the wiki:
+If this skill wrote to memory (wiki substrate):
 
 1. Run `qmd update -c <collection> 2>/dev/null` to reindex changed files.
 2. If refresh fails, report it but do not roll back successful wiki edits.

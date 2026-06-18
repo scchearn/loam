@@ -87,7 +87,7 @@ Severity: **high** (could mislead future sessions), **medium** (misleading but u
 
 For each affected page, describe:
 
-1. What the wiki currently says
+1. What memory currently says
 2. What it should say instead (or what should be added alongside)
 3. The amendment type and severity
 4. Which other pages need updating as a consequence
@@ -187,7 +187,7 @@ Common signals: code/docs contradict a wiki page, command output invalidates a c
 
 When auto-triggering: briefly tell the user what you found, invoke this skill, follow the proposal-then-apply flow.
 
-Do not auto-trigger for: missing content that was never in the wiki (`/loam::adding-to-memory`), structural or naming issues (`/loam::normalizing-memory`), link health or convention drift (`/loam::linting-memory`), or answering a question (`/loam::querying-memory`).
+Do not auto-trigger for: missing content that was never in memory (wiki substrate) (`/loam::adding-to-memory`), structural or naming issues (`/loam::normalizing-memory`), link health or convention drift (`/loam::linting-memory`), or answering a question (`/loam::querying-memory`).
 
 ---
 

@@ -92,8 +92,8 @@ If the workspace contains a wiki root with files such as `SCHEMA.md`, `index.md`
 1. Read the schema and main hub notes first.
 2. Read any wiki notes already named in task `Files` entries or Learning checkpoints.
 3. If more wiki context is needed, use QMD first when available and Grep/Glob as fallback, scoped to the plan's spec domain and current task only.
-4. Treat the wiki as durable-memory acceleration, not authority over current repo state.
-5. If repo state, tests, or primary docs conflict with the wiki, trust the repo and record the possible correction as a learning delta.
+4. Treat memory as durable-memory acceleration, not authority over current repo state.
+5. If repo state, tests, or primary docs conflict with memory, trust the repo and record the possible correction as a learning delta.
 
 If no wiki exists, skip all wiki features and leave `Wiki updates: none` in handoff.
 
@@ -427,7 +427,7 @@ Do not commit during the execution loop. Committing is handled separately. Your 
 - **Respect the target set.** If a filter was given, do not execute tasks outside it.
 - **Never make destructive git operations** without explicit user instruction.
 - **If the plan is wrong, fix the plan.** Add or correct tasks, dependencies, or scope and log the change instead of silently working around it.
-- **If a wiki exists, write back only durable, reusable findings.** Current repo state wins if the wiki is stale.
+- **If memory (wiki substrate) exists, write back only durable, reusable findings.** Current repo state wins if memory is stale.
 - **YAML front matter is the only authoritative plan metadata.** Remove any legacy `updated_at` field or `## Plan summary` section when you edit the plan.
 - **Keep YAML front matter and `plans/INDEX.md` synchronized** on every plan edit. If task count changes, update `task_count` and the index `Tasks` column.
 - **Keep tasks atomic.** If a task grows beyond about 20 files, split it and log the split.

@@ -1,6 +1,6 @@
 # Wiki Alignment Rules
 
-Use this reference when normalizing an existing wiki-like corpus to the repo's target conventions.
+Use this reference when normalizing existing memory-like corpus to the repo's target conventions.
 
 ## Target conventions
 
@@ -11,7 +11,7 @@ Use this reference when normalizing an existing wiki-like corpus to the repo's t
 - `index.md` is the single root hub and should begin with a concise `## Overview` section
 - a separate root `overview.md` is legacy drift that should be folded into `index.md` and removed when safe
 - topic, entity, concept, and analysis notes should cross-link and, when appropriate, link back to each other
-- relevant `AGENTS.md` / `CLAUDE.md` files stay lean operational entrypoints and point into the wiki for durable deep reference
+- relevant `AGENTS.md` / `CLAUDE.md` files stay lean operational entrypoints and point into memory (wiki substrate) for durable deep reference
 - mirror files that intentionally defer to `AGENTS.md` should stay thin unless the workspace clearly intends otherwise
 
 ## Alignment goals
@@ -29,13 +29,13 @@ Use this reference when normalizing an existing wiki-like corpus to the repo's t
 - Do not assume there is only one `AGENTS.md` / `CLAUDE.md` pair in the repo.
 - For repo-wide alignment, inspect root guidance and wiki-local guidance first.
 - For scoped alignment, inspect root guidance plus the nearest relevant guidance files in or above the target subtree.
-- Only expand to sibling app, package, or module guidance files when the wiki scope clearly spans them or when their content is materially duplicated and stale.
+- Only expand to sibling app, package, or module guidance files when memory scope clearly spans them or when their content is materially duplicated and stale.
 - Treat one-line mirror files like `@AGENTS.md` as mirrors, not independent deep-reference documents.
 
 ## Guidance-only mode
 
 - `--guidance-only` is a hard scope restriction.
-- In that mode, the wiki is read-only context only.
+- In that mode, memory is read-only context only.
 - Do not create, rename, move, or rewrite wiki notes.
 - Do not modify `SCHEMA.md`, `index.md`, `log.md`, or any legacy root `overview.md` in that mode.
 - Only propose and apply edits to relevant `AGENTS.md` / `CLAUDE.md` files.
@@ -51,7 +51,7 @@ Use this reference when normalizing an existing wiki-like corpus to the repo's t
 - move notes into clearer category directories when the destination is obvious and safe
 - update hub notes so they actually help traversal
 - add concise pointers from `AGENTS.md` / `CLAUDE.md` files to relevant wiki hub notes or scoped wiki pages
-- shorten duplicated deep-reference sections in guidance files into concise wiki pointers when the durable detail is already or should already be in the wiki
+- shorten duplicated deep-reference sections in guidance files into concise wiki pointers when the durable detail is already or should already be in memory (wiki substrate)
 - correct clearly stale guidance after verifying against current repo state and the relevant wiki scope
 - keep mirror files thin when they intentionally defer to a canonical guidance file
 
@@ -62,7 +62,7 @@ Use this reference when normalizing an existing wiki-like corpus to the repo's t
 - reclassifying many notes at once when the taxonomy is not obvious
 - renaming notes with many inbound references when the canonical identity is still debatable
 - broad deletions or rewrites of guidance files
-- trimming operational guidance before the durable knowledge clearly exists in the wiki
+- trimming operational guidance before the durable knowledge clearly exists in memory (wiki substrate)
 - editing unrelated scoped guidance files in a large monorepo just because they exist
 
 When in doubt, propose the change but do not apply it silently.
@@ -74,7 +74,7 @@ When in doubt, propose the change but do not apply it silently.
 - when source pages exist in a `sources/` directory, absorb their content into topic/entity/concept pages and remove the source pages; flag ambiguous cases rather than guessing destinations
 - do not modify raw-source files
 - preserve commands, hard rules, safety constraints, scope boundaries, and canonical source-of-truth pointers in guidance files
-- guidance files should answer "how do I operate safely here?" while the wiki answers "what durable knowledge should future sessions reuse?"
+- guidance files should answer "how do I operate safely here?" while memory answers "what durable knowledge should future sessions reuse?"
 
 ## Graph quality checks after alignment
 
@@ -83,6 +83,6 @@ When in doubt, propose the change but do not apply it silently.
 - stronger hub notes
 - better consistency of filenames and link targets
 - improved reciprocal backlinks where relationships are material
-- guidance files point to the wiki instead of duplicating long, fast-aging technical reference material
+- guidance files point to memory (wiki substrate) instead of duplicating long, fast-aging technical reference material
 
 In `--guidance-only` mode, evaluate only the last bullet above plus stale-guidance correction. Do not treat missing graph repairs as in-scope edits.
