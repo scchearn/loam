@@ -1,6 +1,6 @@
 ---
 name: loam::auditing-guidance
-description: "Audit and improve agent guidance markdown files in repositories. Use when the user asks to check, audit, update, improve, or fix AGENTS.md, CLAUDE.md, or related guidance files. Scan for guidance files, evaluate quality against templates, output a quality report, then make targeted updates after approval."
+description: "Audit, prune, and improve agent guidance markdown files in repositories. Use when the user asks to check, audit, update, improve, or fix AGENTS.md, CLAUDE.md, or related guidance files. Adds missing commands and gotchas, removes stale entries, deduplicates, and keeps the file small and relevant. Scan for guidance files, evaluate quality against templates, output a quality report, then make targeted updates after approval."
 allowed-tools: Read Glob Grep Bash Edit
 metadata:
   version: "0.1.1"
@@ -95,7 +95,7 @@ Format:
 ...
 ```
 
-### Phase 4: Targeted Updates
+### Phase 4: Targeted Updates (Additions)
 
 After outputting the quality report, ask user for confirmation before updating.
 
@@ -136,6 +136,48 @@ After outputting the quality report, ask user for confirmation before updating.
 ```
 ```
 
+### Phase 4b: Prune (Removals)
+
+The audit is two-directional: add what's missing, remove what's stale. After proposing additions, scan the guidance file for content that should be removed or consolidated. See [references/update-guidelines.md](references/update-guidelines.md) "What to Remove" for the full criteria.
+
+**Prune checks:**
+
+1. **Validate commands.** For each documented command, check it still works:
+   - `which <tool>` for CLI tools
+   - `grep` in `package.json` scripts, `Makefile`, or equivalent
+   - Check referenced file paths exist (`ls <path>`)
+   - Flag any command that would fail
+
+2. **Flag stale gotchas.** One-off fixes unlikely to recur, workarounds for issues long since fixed in code, env vars no longer referenced in config.
+
+3. **Deduplicate.** Overlapping entries saying the same thing in different sections. Keep the better one, propose removing the other.
+
+4. **Propose consolidation.** When sections grew organically and overlap, propose a merged version. Show the before/after.
+
+5. **Size guard.** If a root `AGENTS.md` is over 150 lines (or a package-level one over 50), flag it. Suggest what to trim or move to the wiki / `references/` docs.
+
+**Prune diff format:**
+
+```markdown
+### Prune: ./AGENTS.md
+
+**Why:** `grunt serve` command no longer exists — project migrated to Vite.
+
+```diff
+- `grunt serve` - Start development server
+```
+
+### Prune: ./AGENTS.md
+
+**Why:** Gotcha for SSL issue was fixed in v2.1.0; no longer relevant.
+
+```diff
+- - SSL certificate errors on dev: set `NODE_TLS_REJECT_UNAUTHORIZED=0` (fixed in v2.1.0)
+```
+```
+
+**Do not remove without showing the prune diff and getting user approval.** Same proposal-first rule as additions.
+
 ### Phase 5: Apply Updates
 
 After user approval, apply changes using the Edit tool. Preserve existing content structure.
@@ -146,12 +188,14 @@ See [references/templates.md](references/templates.md) for guidance file templat
 
 ## Common Issues to Flag
 
-1. **Stale commands**: Build commands that no longer work
-2. **Missing dependencies**: Required tools not mentioned
-3. **Outdated architecture**: File structure that's changed
-4. **Missing environment setup**: Required env vars or config
-5. **Broken test commands**: Test scripts that have changed
-6. **Undocumented gotchas**: Non-obvious patterns not captured
+1. **Stale commands**: Build commands that no longer work → Phase 4b prune
+2. **Missing dependencies**: Required tools not mentioned → Phase 4 addition
+3. **Outdated architecture**: File structure that's changed → Phase 4b prune + Phase 4 addition
+4. **Missing environment setup**: Required env vars or config → Phase 4 addition
+5. **Broken test commands**: Test scripts that have changed → Phase 4b prune
+6. **Undocumented gotchas**: Non-obvious patterns not captured → Phase 4 addition
+7. **Duplicated info**: Same content in two places → Phase 4b deduplicate
+8. **Overgrown file**: AGENTS.md over 150 lines → Phase 4b size guard
 
 ## User Tips to Share
 

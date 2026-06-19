@@ -98,6 +98,39 @@
 5. List specific issues found
 6. Propose concrete improvements
 
+## Pruning Criteria
+
+The currency score (section 5) feeds directly into prune proposals. When currency score is low, the file has stale content that should be removed.
+
+### What counts as stale
+
+- Commands for tools no longer installed (`which <tool>` fails)
+- References to deleted files/dirs (`ls <path>` fails)
+- Gotchas for issues fixed in code (the workaround is no longer needed)
+- Env vars no longer referenced in any config file
+- Tech stack references that no longer match `package.json` / `go.mod` / equivalent
+
+### What counts as redundant
+
+- Same info in two sections of the same file
+- Same info in both `AGENTS.md` and `CLAUDE.md`
+- Generic advice restated from standard tooling docs
+- Info that's obvious from `package.json` or the repo README
+
+### What counts as overgrown
+
+- Root `AGENTS.md` over 150 lines — flag for trimming
+- Package-level guidance over 50 lines — flag for trimming
+- Sections that grew beyond their purpose (a one-liner list became paragraphs)
+- Multiple sections covering the same domain
+
+### Prune proposal rules
+
+1. Always show the removal as a diff (`-` lines)
+2. Give a one-line "why" for each removal
+3. User approves before anything is removed
+4. Never remove without showing what's being removed
+
 ## Red Flags
 
 - Commands that would fail (wrong paths, missing deps)

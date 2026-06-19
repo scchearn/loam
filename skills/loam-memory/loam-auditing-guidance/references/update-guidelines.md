@@ -106,6 +106,51 @@ Good:
 Auth: JWT with HS256, tokens in `Authorization: Bearer <token>` header.
 ```
 
+## What to Remove
+
+The audit is two-directional. Removing stale content is as important as adding missing content. A guidance file that only grows becomes noise.
+
+### 1. Commands That No Longer Exist
+
+Test each documented command. If it fails, propose removal.
+
+```bash
+which <tool>           # CLI tool no longer installed?
+grep <script> package.json  # npm script removed?
+ls <path>              # referenced path deleted?
+```
+
+### 2. Gotchas for Fixed Issues
+
+Workarounds for bugs that have been fixed in code. If the issue is resolved, the gotcha is dead weight.
+
+### 3. Env Vars No Longer Used
+
+Check if env vars referenced in the guidance file are still used in config files (`grep -r ENV_VAR .`). If not referenced anywhere, propose removal.
+
+### 4. References to Deleted Files/Dirs
+
+Any path mention that no longer exists. Run `ls` on each referenced path.
+
+### 5. Duplicated Info
+
+Same content in two sections, or same info in both `AGENTS.md` and `CLAUDE.md`. Keep the better version, remove the other.
+
+### 6. Generic Advice
+
+Anything an agent would know without the file. "Always write tests" or "Use meaningful variable names" — these don't earn their place in a project-specific guidance file.
+
+### 7. Verbose Explanations
+
+Paragraphs where a one-liner would do. Condense.
+
+### Size Guard
+
+If a root `AGENTS.md` exceeds 150 lines, or a package-level one exceeds 50, flag it. Suggest:
+- Trim sections that are no longer earning their place
+- Move deep reference material to the wiki / `references/` docs
+- Consolidate overlapping sections
+
 ## Diff Format for Updates
 
 For each suggested change:
