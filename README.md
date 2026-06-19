@@ -59,7 +59,7 @@ You don't need to memorize the list above; the agent routes itself.
 
 loam works fully on its own. If your wiki grows large, [qmd](https://github.com/tobilu/qmd) (`npm install -g @tobilu/qmd`) speeds up search across memory — the skills detect it automatically and fall back to built-in search when it's absent.
 
-Agents can install `/checkpoint` and `/resume` slash-command shortcuts — see `docs/commands-install.md`.
+Agents can install `/checkpoint` and `/resume` slash-command shortcuts — the `loam::using` skill bundles the command files and an install reference.
 
 ## Usage
 

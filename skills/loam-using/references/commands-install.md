@@ -2,14 +2,14 @@
 
 This document is for agents, not humans. If you are an agent running in a loam-equipped workspace and the user wants slash-command shortcuts (e.g. `/checkpoint`, `/resume`), read this document to learn how to install them for your harness, then ask the user for permission before copying.
 
+The command files are bundled as assets alongside this reference. Resolve them relative to the `loam-using` skill directory (the parent of `references/` and `assets/`).
+
 ## Available commands
 
 | Command | Delegates to | Source file (markdown) | Source file (TOML) |
 |---|---|---|---|
-| `/checkpoint` | `loam::checkpointing` | `commands/checkpoint.md` | `commands/gemini/checkpoint.toml` |
-| `/resume` | `loam::resuming` | `commands/resume.md` | `commands/gemini/resume.toml` |
-
-Source: `commands/` at the loam repo root.
+| `/checkpoint` | `loam::checkpointing` | `assets/commands/checkpoint.md` | `assets/commands/gemini/checkpoint.toml` |
+| `/resume` | `loam::resuming` | `assets/commands/resume.md` | `assets/commands/gemini/resume.toml` |
 
 ## Compatibility matrix
 
@@ -17,9 +17,9 @@ Split by command format, not just harness. One format does not fit all.
 
 | Harness | Format | Global location | Project location | Invoke as | Notes |
 |---|---|---|---|---|---|
-| **OpenCode** | Markdown | `~/.config/opencode/commands/` | `.opencode/commands/` | `/checkpoint` | Copy `commands/*.md` |
-| **Claude Code** | Markdown | `~/.claude/commands/` | `.claude/commands/` | `/checkpoint` | Copy `commands/*.md` |
-| **Gemini CLI** | TOML | `~/.gemini/commands/` | `.gemini/commands/` | `/checkpoint` | Copy `commands/gemini/*.toml`. Run `/commands reload` after install. |
+| **OpenCode** | Markdown | `~/.config/opencode/commands/` | `.opencode/commands/` | `/checkpoint` | Copy `assets/commands/*.md` |
+| **Claude Code** | Markdown | `~/.claude/commands/` | `.claude/commands/` | `/checkpoint` | Copy `assets/commands/*.md` |
+| **Gemini CLI** | TOML | `~/.gemini/commands/` | `.gemini/commands/` | `/checkpoint` | Copy `assets/commands/gemini/*.toml`. Run `/commands reload` after install. |
 | **Codex** | Markdown (deprecated) | `~/.codex/prompts/` | (none) | `/prompts:checkpoint` | Deprecated in favor of skills. Prefer direct `/loam::checkpointing` unless user explicitly wants the shortcut. |
 | **Copilot CLI** | (not supported) | — | — | — | No prompt slash-command equivalent. Use `/loam::checkpointing` and `/loam::resuming` directly. Custom agents (`.agent.md`) are a different feature and overkill for thin wrappers. |
 
@@ -48,10 +48,10 @@ Config dirs are hints only — multiple tools can be installed on the same machi
    - If already installed and differs: ask the user before overwriting.
    - If not installed: proceed to step 4.
 4. **Ask the user.** "Would you like me to install the `/checkpoint` and `/resume` slash commands for `<harness>` at `<location>`?"
-5. **If yes, copy the correct format files:**
-   - OpenCode / Claude Code: `cp commands/checkpoint.md commands/resume.md <target>/`
-   - Gemini CLI: `cp commands/gemini/checkpoint.toml commands/gemini/resume.toml <target>/`
-   - Codex (if user explicitly wants deprecated prompts): `cp commands/checkpoint.md commands/resume.md ~/.codex/prompts/` — note these invoke as `/prompts:checkpoint` and `/prompts:resume`, not `/checkpoint`
+5. **If yes, copy the correct format files from the skill's assets:**
+   - OpenCode / Claude Code: copy `assets/commands/checkpoint.md` and `assets/commands/resume.md` to `<target>/`
+   - Gemini CLI: copy `assets/commands/gemini/checkpoint.toml` and `assets/commands/gemini/resume.toml` to `<target>/`
+   - Codex (if user explicitly wants deprecated prompts): copy `assets/commands/checkpoint.md` and `assets/commands/resume.md` to `~/.codex/prompts/` — note these invoke as `/prompts:checkpoint` and `/prompts:resume`, not `/checkpoint`
    - Copilot CLI: explain that slash commands aren't supported; use `/loam::checkpointing` and `/loam::resuming` directly
 6. **Post-install actions:**
    - Gemini CLI: instruct the user to run `/commands reload` (or run it if the harness supports agent-initiated reload)
@@ -64,7 +64,7 @@ Config dirs are hints only — multiple tools can be installed on the same machi
 - **Do not install without asking.** Always get user permission first.
 - **Do not install globally by default.** Global changes are surprising; prefer project-local.
 - **Do not overwrite silently.** If a command file exists and differs, ask first.
-- **Do not copy markdown files to Gemini.** Gemini expects TOML. Use `commands/gemini/*.toml`.
+- **Do not copy markdown files to Gemini.** Gemini expects TOML. Use `assets/commands/gemini/*.toml`.
 - **Do not install Codex prompts by default.** They are deprecated. Only install if the user explicitly asks for them.
 - **Do not invent a Copilot CLI command path.** It doesn't have one for this purpose.
 - **Do not add more commands (e.g. `/plan`, `/spec`, `/learn`, `/query`).** Higher collision risk with existing harness commands. Ship checkpoint and resume only.

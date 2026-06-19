@@ -128,11 +128,13 @@ One line per skill. The decision graph is the primary router; this is for quick 
 
 If the user wants `/checkpoint` and `/resume` as shortcut commands (instead of typing `/loam::checkpointing` and `/loam::resuming`), you can install them. The command files ship in the loam repo under `commands/`.
 
-**Read `docs/commands-install.md` for the full protocol.** It covers:
+**Read `references/commands-install.md` for the full protocol.** It covers:
 - Which harness you are running in (detection signals)
 - Which command format your harness expects (markdown vs TOML)
 - Where to install (global vs project-local)
 - The ask-permission-before-copying protocol
+
+The command files are bundled as assets under `assets/commands/` (markdown) and `assets/commands/gemini/` (TOML). They travel with the skill on install.
 
 Do not install commands without asking the user first. Do not guess the harness — detect it, and if ambiguous, ask. Default to project-local scope; global changes are surprising.
 
@@ -142,5 +144,5 @@ Do not install commands without asking the user first. Do not guess the harness 
 - **Two skills seem relevant?** Apply the conflict rules above. Process/work skills win before memory-maintenance skills.
 - **A learning could go to wiki OR guidance?** Route through `loam-learning-from-session` — the classification is itself a feature of that skill.
 - **Not sure if something is durable enough for memory?** If it's about how to work here (command, pattern, quirk), it's guidance. If it's about what is true here (fact, decision, architecture), it's wiki. If it's transient work-state, it's a checkpoint — use `loam-checkpointing`, not a memory write.
-- **User wants /checkpoint or /resume shortcuts?** Read `docs/commands-install.md` and follow the protocol. Ask permission before copying.
+- **User wants /checkpoint or /resume shortcuts?** Read `references/commands-install.md` and follow the protocol. Ask permission before copying. Command files are in `assets/commands/`.
 - **If no skill fits and the task is non-trivial, ask before guessing.**
