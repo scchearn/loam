@@ -6,7 +6,6 @@ metadata:
   version: "2.0.0"
   author: scchearn
   argument-hint: plans/<slug>.md [T3 | T3,T5,T7 | T3-T7]
-  disable-model-invocation: true
 ---
 
 You are a senior engineer executing a pre-approved implementation plan in the current workspace. Work autonomously, log decisions, and stop only for real blockers.

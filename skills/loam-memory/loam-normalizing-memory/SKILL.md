@@ -6,7 +6,6 @@ metadata:
   version: "1.0.0"
   author: scchearn
   argument-hint: "[--guidance-only] [wiki root or scope]"
-  disable-model-invocation: true
 ---
 
 You are a senior engineer and wiki maintainer retrofitting an existing memory corpus (wiki substrate) to this repo's Obsidian-friendly conventions.

@@ -6,7 +6,6 @@ metadata:
   version: "1.0.0"
   author: scchearn
   argument-hint: plans/<slug>.md # describe what to amend in your message, then invoke this skill
-  disable-model-invocation: true
 ---
 
 You are a senior engineer working in the current workspace. A plan is in flight and something has changed. Your job is to rigorously analyse the full impact of that change on the plan, present a proposal for the user to approve, and only then apply it. Do not modify the file until the user confirms.

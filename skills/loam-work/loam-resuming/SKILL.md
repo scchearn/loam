@@ -6,7 +6,6 @@ metadata:
   version: "1.0.0"
   author: scchearn
   argument-hint: "[optional hint or focus]"
-  disable-model-invocation: true
 ---
 
 You are a senior engineer resuming work from checkpoint notes in the current workspace. Your job is to find the most relevant recent checkpoint chain, extract only restart-relevant state, verify the live workspace before taking action, and tell the user the safest next step.

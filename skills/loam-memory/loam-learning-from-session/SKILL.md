@@ -6,7 +6,6 @@ metadata:
   version: "1.0.0"
   author: scchearn
   argument-hint: [topic or session summary]
-  disable-model-invocation: true
 ---
 
 You are a senior engineer reviewing the current session for durable learnings. Two writing paths are available, and routing is itself a feature of this skill:

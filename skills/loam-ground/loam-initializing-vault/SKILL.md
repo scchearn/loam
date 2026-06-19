@@ -6,7 +6,6 @@ metadata:
   version: "1.0.0"
   author: scchearn
   argument-hint: <target-vault-path>
-  disable-model-invocation: true
 ---
 
 The skill file is at `$SKILL_PATH`. Derive the script path from it:

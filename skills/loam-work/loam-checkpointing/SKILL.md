@@ -6,7 +6,6 @@ metadata:
   version: "1.0.0"
   author: scchearn
   argument-hint: "[optional reason or hint]"
-  disable-model-invocation: true
 ---
 
 You are a senior engineer capturing a durable restart checkpoint for the current workspace. Your job is to write a compact, self-sufficient note that lets a future session pick up the work without reconstructing the whole conversation.

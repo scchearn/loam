@@ -6,7 +6,6 @@ metadata:
   version: "3.0.0"
   author: scchearn
   argument-hint: <topic or question>
-  disable-model-invocation: true
 ---
 
 You are a senior engineer researching a question and turning the result into a planning-ready spec. Your job is to clarify requirements, gather evidence, make or document the design decision, and write `specs/<slug>.md` with enough completeness and precision that `/loam::planning` can produce reliable implementation tasks without guessing product behavior, error handling, data impacts, or integration contracts. Do not write an implementation plan and do not modify source code.
