@@ -61,23 +61,27 @@ loam works fully on its own. If your wiki grows large, [qmd](https://github.com/
 
 Agents can install `/checkpoint` and `/resume` slash-command shortcuts — the `loam::using` skill bundles the command files and an install reference.
 
-## Usage
+## Ways to use loam
 
-Skills are invoked through your agent's skill loader. For example,
-to research a question and produce a spec:
+You don't need to memorize skill names. Say what you want in plain
+language — the **Using** router matches it to the right skill.
 
-```
-/loam::writing-spec <your question>
-```
-
-Or to add a document to the knowledge base:
-
-```
-/loam::adding-to-memory <path-to-file>
-```
-
-The agent loads the skill, follows its workflow, and produces the
-artifact (a spec, a plan, a memory entry, etc.).
+- "Write a spec for what we discussed" — researches and produces a spec
+- "Plan the work from that spec" — turns an approved spec into a plan
+- "Run the plan" — begins executing, task by task
+- "Set up an agent team for this" — configures a multi-agent team
+- "Stopping work" / "I need to step away" — saves a restart checkpoint
+- "Resume where I left off" — picks up from the last checkpoint
+- "The scope changed, update the plan" — walks the impact, proposes plan changes
+- "Add to memory" / "capture all into loam" — ingests a source or conversation
+- "What does memory say about X?" — answers from the knowledge base
+- "Memory is wrong about X" — corrects stale claims (proposal-first)
+- "What is unresolved" — surfaces open questions and gaps in memory
+- "Health-check the wiki" — finds orphans, broken links, drift
+- "This notes corpus is messy" — retrofits structure onto existing notes
+- "Save what we learned this session" — routes learnings to wiki or AGENTS.md
+- "Audit the AGENTS.md" — scores, prunes stale content, adds missing commands
+- "Set up loam" / "scaffold a knowledge base" — creates the wiki structure
 
 ## License
 
