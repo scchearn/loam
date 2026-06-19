@@ -1,0 +1,23 @@
+{
+  "name": "loam",
+  "skills": [
+    "./skills/loam-using",
+    "./skills/loam-work/loam-planning",
+    "./skills/loam-work/loam-writing-spec",
+    "./skills/loam-work/loam-starting",
+    "./skills/loam-work/loam-resuming",
+    "./skills/loam-work/loam-checkpointing",
+    "./skills/loam-work/loam-configuring-agents",
+    "./skills/loam-work/loam-amending-plan",
+    "./skills/loam-memory/loam-adding-to-memory",
+    "./skills/loam-memory/loam-querying-memory",
+    "./skills/loam-memory/loam-normalizing-memory",
+    "./skills/loam-memory/loam-amending-memory",
+    "./skills/loam-memory/loam-linting-memory",
+    "./skills/loam-memory/loam-reviewing-memory",
+    "./skills/loam-memory/loam-learning-from-session",
+    "./skills/loam-memory/loam-auditing-guidance",
+    "./skills/loam-ground/loam-scaffolding-wiki",
+    "./skills/loam-ground/loam-initializing-vault"
+  ]
+}
