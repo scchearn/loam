@@ -1,12 +1,11 @@
 ---
 name: loam::configuring-agents
-description: "Use when planning or configuring an hcom-based AI agent team for a real task, or when loading, starting, resuming, or reusing an existing `agents/<slug>.toml` with preserved runtime, model, routing, and reporting settings."
-compatibility: Repo-local OpenCode skill for hcom planning and configuration. Assumes markdown references, hcom concepts, and local model discovery with `opencode models`.
+description: "Use when planning or configuring an AI agent team for a real task, or when loading, starting, resuming, or reusing an existing agent config. Supports hcom as the primary orchestration backend; degrades to general agent-team planning advice when hcom is unavailable."
+compatibility: "Requires hcom for hcom-specific configuration (launch commands, TOML configs, thread routing). Works without hcom for general agent-team planning advice (topology selection, role assignment, model strategy, task decomposition)."
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: scchearn
   phase: planning
-  system: hcom
   outputs: agents-slug-artifacts-or-loader
 ---
 
@@ -14,7 +13,7 @@ metadata:
 
 ## Overview
 
-Plan an hcom team or reuse a saved config, and emit concrete outputs that match real hcom and OpenCode launch behavior.
+Plan an agent team or reuse a saved config, and emit concrete outputs that match real launch behavior. Supports hcom as the primary orchestration backend; when hcom is unavailable, produces general agent-team planning advice adapted from the dispatching-parallel-agents pattern.
 
 Core principle: produce a usable agent architecture package or loader path, not just advice. This skill exists to prevent five baseline failures:
 
@@ -28,14 +27,14 @@ Core principle: produce a usable agent architecture package or loader path, not 
 
 Use this skill when the user wants any of the following:
 
-- an hcom team design
+- an agent team design
 - agent topology selection
 - model or role assignment
 - a reviewer or evaluator loop
 - sandboxed execution planning
 - launch commands for a multi-agent workflow
-- generated `agents/<slug>.toml` and `agents/<slug>.md` outputs
-- loading, starting, running, resuming, or reusing an existing `agents/<slug>.toml`
+- generated `agents/<slug>.toml` and `agents/<slug>.md` outputs (hcom mode)
+- loading, starting, running, resuming, or reusing an existing `agents/<slug>.toml` (hcom mode)
 
 Do not use this skill for:
 
@@ -45,6 +44,19 @@ Do not use this skill for:
 - executing the planned workflow
 
 If the user needs hcom installation or delivery troubleshooting, prefer the dedicated hcom messaging skill when it is available. If it is not available, say that installation or troubleshooting is out of scope for this skill and keep the answer in planning/configuration scope.
+
+## Check hcom availability
+
+Before entering the hcom-specific workflow, check whether hcom is available:
+
+```bash
+which hcom 2>/dev/null
+```
+
+- **If hcom is available:** continue with the hcom workflow below (sections 1–7 + common mistakes). This is the primary mode.
+- **If hcom is not available:** skip to [General agent-team planning](#general-agent-team-planning-when-hcom-is-unavailable) at the bottom of this skill. Produce a general agent-team plan that works with any harness's task/delegation mechanism.
+
+This mirrors the degradation pattern in `loam::starting`, which checks hcom capability before branching between delegated and inline execution.
 
 ## Input
 
@@ -292,3 +304,113 @@ For a risky implementation request with no model preferences:
 - if the requested family appears under multiple providers, surface the top exact IDs and choose one assumption
 
 That should normally become a `planner-executor-reviewer` plan with a unique workflow thread, headless OpenCode launch commands, tag-based routing, and reviewer signoff before completion.
+
+---
+
+## General agent-team planning (when hcom is unavailable)
+
+When hcom is not installed, this skill produces a general agent-team plan instead of hcom-specific TOML configs and launch commands. The plan is a markdown document that works with any harness's task/delegation mechanism (Task tool, subagent dispatch, manual handoff, etc.).
+
+Adapted from the dispatching-parallel-agents pattern: dispatch one agent per independent problem domain, give each agent a focused scope, and verify results before integrating.
+
+### 1. Identify independent domains
+
+Group the work by what's independent:
+
+- Can each piece be understood without context from the others?
+- Is there shared state between pieces?
+- Would fixing one piece affect another?
+
+If pieces are independent → parallel dispatch. If they share state or depend on each other → sequential or single-agent.
+
+### 2. Select a topology
+
+| Signal | Topology |
+|---|---|
+| Small, low-risk task | single agent |
+| Code change with mandatory review | worker-reviewer |
+| Risky implementation or mixed roles | planner-executor-reviewer |
+| 3+ distinct responsibilities | hub-spoke |
+
+See `references/topologies.md` for tradeoff details (the topology descriptions are general; ignore hcom-specific launch commands in that reference).
+
+### 3. Assign roles and models
+
+For each role, choose:
+
+- **Scope:** one clear problem domain
+- **Model:** strongest available for planning/review, cheaper for execution
+- **Constraints:** what the agent must NOT touch
+- **Expected output:** what the agent should return
+
+See `references/roles-and-reviewers.md` for role boundaries and `references/model-selection.md` for cost/capability tradeoffs (ignore hcom-specific model ID resolution in those references; use whatever model selection mechanism your harness provides).
+
+### 4. Define agent task prompts
+
+Each agent gets a prompt that is:
+
+1. **Focused** — one clear problem domain, not "fix everything"
+2. **Self-contained** — all context needed to understand the problem, no inherited session history
+3. **Specific about output** — what should the agent return? (summary of changes, root cause, test results)
+
+Common mistakes to avoid:
+
+| Mistake | Fix |
+|---|---|
+| Too broad: "Fix all the tests" | Specific: "Fix agent-tool-abort.test.ts" |
+| No context: "Fix the race condition" | Context: paste error messages and test names |
+| No constraints: agent refactors everything | Constraints: "Do NOT change production code" |
+| Vague output: "Fix it" | Specific: "Return summary of root cause and changes" |
+
+### 5. Produce a plan document
+
+Output a markdown plan (not TOML) containing:
+
+```markdown
+## Agent Team Plan
+
+### Topology
+<chosen topology and why>
+
+### Roles
+
+| Role | Model | Scope | Constraints |
+|---|---|---|---|
+| <role> | <model> | <scope> | <constraints> |
+
+### Tasks
+
+#### Agent 1: <name>
+- Scope: <one problem domain>
+- Goal: <clear objective>
+- Constraints: <what not to touch>
+- Expected output: <what to return>
+
+#### Agent 2: <name>
+...
+
+### Verification
+- Review each agent's output
+- Check for conflicts (did agents edit same code?)
+- Run full test suite
+- Spot check for systematic errors
+
+### Assumptions
+- <any defaults chosen>
+```
+
+### 6. Verification
+
+After agents return:
+
+1. Review each summary — understand what changed
+2. Check for conflicts — did agents edit the same code?
+3. Run full test suite — verify all fixes work together
+4. Spot check — agents can make systematic errors
+
+### When NOT to use parallel agents
+
+- **Related failures:** fixing one might fix others — investigate together first
+- **Need full context:** understanding requires seeing the entire system
+- **Exploratory debugging:** you don't know what's broken yet
+- **Shared state:** agents would interfere (editing same files, using same resources)

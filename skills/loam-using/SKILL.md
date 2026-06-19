@@ -111,7 +111,7 @@ One line per skill. The decision graph is the primary router; this is for quick 
 - `loam-starting` — begin or resume execution of a plan
 - `loam-resuming` — resume from checkpoint notes
 - `loam-checkpointing` — write a resumable checkpoint before pausing
-- `loam-configuring-agents` — plan or reuse an hcom agent team config
+- `loam-configuring-agents` — plan or reuse an agent team config (hcom backend; general advice when hcom unavailable)
 - `loam-amending-plan` — update an in-flight plan after scope change
 - `loam-adding-to-memory` — ingest a source into memory (wiki substrate)
 - `loam-querying-memory` — answer a question from memory
