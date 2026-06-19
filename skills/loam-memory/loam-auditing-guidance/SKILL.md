@@ -33,7 +33,24 @@ find . \( -name "AGENTS.md" -o -name "CLAUDE.md" -o -name ".claude.local.md" \) 
 | Package-specific | `./packages/*/AGENTS.md` or `./packages/*/CLAUDE.md` | Module-level context in monorepos |
 | Subdirectory | Any nested location | Feature/domain-specific context |
 
-**Default update rule:** Prefer `AGENTS.md` for shared, harness-agnostic guidance. Update `CLAUDE.md` when the repo already uses it or the guidance is Claude-specific. Use `.claude.local.md` only for personal preferences.
+**Default update rule:** `AGENTS.md` is the canonical guidance file — all shared guidance goes there. `CLAUDE.md` must exist but contains only `@AGENTS.md` (Claude Code's import syntax). Never write content to `CLAUDE.md` — it is an import shim, not a content file. Use `.claude.local.md` for personal preferences only. If you find a `CLAUDE.md` with content beyond `@AGENTS.md`, flag it as drift (see Phase 1b below).
+
+### Phase 1b: CLAUDE.md Shim Check
+
+If a `CLAUDE.md` was found in Phase 1, read it and verify it contains only `@AGENTS.md` (Claude Code's import syntax). This is the canonical pattern:
+
+- `AGENTS.md` = canonical shared guidance (the single source of truth)
+- `CLAUDE.md` = thin import shim containing exactly one line: `@AGENTS.md`
+- `.claude.local.md` = personal/local overrides (gitignored)
+- `.claude/rules/` = Claude-specific path-scoped rules (if needed)
+
+**If CLAUDE.md has content beyond `@AGENTS.md`:**
+1. Check if the extra content is unique and valuable
+2. If yes: propose moving it to `AGENTS.md` (if shared) or `.claude/rules/` (if Claude-specific and path-scoped) or `.claude.local.md` (if personal)
+3. Then propose collapsing `CLAUDE.md` back to `@AGENTS.md` only
+4. Flag this as drift in the quality report
+
+**If CLAUDE.md is already just `@AGENTS.md`:** no action needed, it's compliant.
 
 ### Phase 2: Quality Assessment
 
@@ -99,6 +116,8 @@ Format:
 
 After outputting the quality report, ask user for confirmation before updating.
 
+**All additions go to `AGENTS.md`.** Never write content to `CLAUDE.md` — it is an import shim (`@AGENTS.md` only). If Claude-specific content is needed, use `.claude/rules/` (team-shared, path-scoped) or `.claude.local.md` (personal).
+
 **Update Guidelines (Critical):**
 
 1. **Propose targeted additions only** - Focus on genuinely useful info:
@@ -155,6 +174,8 @@ The audit is two-directional: add what's missing, remove what's stale. After pro
 4. **Propose consolidation.** When sections grew organically and overlap, propose a merged version. Show the before/after.
 
 5. **Size guard.** If a root `AGENTS.md` is over 150 lines (or a package-level one over 50), flag it. Suggest what to trim or move to the wiki / `references/` docs.
+
+6. **Collapse drifted CLAUDE.md.** If Phase 1b found CLAUDE.md with content beyond `@AGENTS.md`, and the extra content has been moved (to AGENTS.md, `.claude/rules/`, or `.claude.local.md`), propose collapsing CLAUDE.md back to `@AGENTS.md` only.
 
 **Prune diff format:**
 

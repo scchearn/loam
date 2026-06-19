@@ -243,6 +243,20 @@ For packages within a monorepo or distinct modules.
 
 ---
 
+## Template: CLAUDE.md (Import Shim)
+
+`CLAUDE.md` is not a content file. It contains exactly one line — the import that makes Claude Code read `AGENTS.md`:
+
+```markdown
+@AGENTS.md
+```
+
+That's it. No title, no sections, no commands, no gotchas. All shared guidance lives in `AGENTS.md`. Claude-specific additions (if any) go in `.claude/rules/*.md` (team-shared, path-scoped) or `.claude.local.md` (personal, gitignored).
+
+If you find a `CLAUDE.md` with content beyond `@AGENTS.md`, it has drifted. Propose collapsing it back to `@AGENTS.md` only (after moving any unique content to the right place).
+
+---
+
 ## Update Principles
 
 When updating any guidance file:

@@ -147,11 +147,13 @@ If the session produced any guidance-bound learnings, run the concise one-liner 
 find . \( -name "AGENTS.md" -o -name "CLAUDE.md" -o -name ".claude.local.md" \) 2>/dev/null | head -20
 ```
 
-Decide where each addition belongs:
+**Where to write:**
 
-- `AGENTS.md` — team-shared, harness-agnostic guidance
-- `CLAUDE.md` — team-shared Claude-specific guidance when the repo uses it
-- `.claude.local.md` — personal/local only (gitignored)
+- `AGENTS.md` — the canonical guidance file. All shared guidance goes here. This is where guidance-path learnings are written.
+- `CLAUDE.md` — an import shim containing only `@AGENTS.md`. Never write content to `CLAUDE.md`. If it has content beyond the import, flag it as drift.
+- `.claude.local.md` — personal/local only (gitignored). For preferences, not shared guidance.
+
+If no `AGENTS.md` exists but a `CLAUDE.md` does, check if `CLAUDE.md` has real content (beyond `@AGENTS.md`). If it does, propose moving that content to a new `AGENTS.md` and collapsing `CLAUDE.md` to `@AGENTS.md`. Write guidance learnings to `AGENTS.md`.
 
 #### Draft additions
 
@@ -251,7 +253,7 @@ Do not create a conversation-source note in this skill.
 
 ### 5B — Apply guidance-file path
 
-Only edit the files the user approved. Keep additions to one line per concept.
+Write all approved guidance additions to `AGENTS.md` only. Never write to `CLAUDE.md` (it is an `@AGENTS.md` import shim). Keep additions to one line per concept.
 
 ---
 

@@ -53,6 +53,7 @@
 - No filler or obvious info
 - Each line adds value
 - No redundancy with code comments
+- CLAUDE.md (if present) contains only `@AGENTS.md` — no duplicated content
 
 **10 points**: Mostly concise, some padding
 

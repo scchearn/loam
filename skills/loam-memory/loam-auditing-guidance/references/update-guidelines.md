@@ -4,6 +4,18 @@
 
 Only add information that will genuinely help future agent sessions. The context window is precious - every line must earn its place.
 
+## Where to Write
+
+**`AGENTS.md` is the canonical guidance file.** All shared guidance goes here. Every repo that uses agent guidance should have an `AGENTS.md`.
+
+**`CLAUDE.md` is an import shim, not a content file.** It contains exactly one line: `@AGENTS.md` (Claude Code's import syntax). Never write content to `CLAUDE.md`. If Claude-specific content is needed:
+- Team-shared, path-scoped: `.claude/rules/*.md` with `paths` frontmatter
+- Personal/local: `.claude.local.md` (gitignored)
+
+**`.claude.local.md`** is for personal preferences only (gitignored, not shared).
+
+If a repo has a `CLAUDE.md` with content beyond `@AGENTS.md`, flag it as drift. Propose moving the unique content to `AGENTS.md` (if shared) or `.claude/rules/` (if Claude-specific), then collapsing `CLAUDE.md` to `@AGENTS.md` only.
+
 ## What TO Add
 
 ### 1. Commands/Workflows Discovered

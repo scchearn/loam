@@ -27,7 +27,7 @@ Three rules with no exceptions. Violating any produces work that looks right but
 | Substrate | What it is | Who maintains it |
 |---|---|---|
 | **wiki** | Durable Obsidian-friendly markdown notes under `wiki/`. Topic, entity, concept, analysis pages. | loam-memory group (most skills) |
-| **guidance** | `AGENTS.md`, `CLAUDE.md`, `.claude.local.md` — prompt-context files for future agent sessions. | loam-memory group (`auditing-guidance`, `learning-from-session` guidance path) |
+| **guidance** | `AGENTS.md` is the canonical guidance file. `CLAUDE.md` is a thin import shim (`@AGENTS.md` only). `.claude.local.md` for personal overrides. | loam-memory group (`auditing-guidance`, `learning-from-session` guidance path) |
 | **checkpoints** | Transient work-state under `wiki/checkpoints/`. Restart notes, not durable knowledge. | loam-work group (`checkpointing` writes, `resuming` reads) |
 
 The wiki substrate is what `qmd` indexes. The guidance substrate is what harnesses load as prompt context. Checkpoints are work-state, not knowledge — they refuse to touch `index.md` or `log.md` and should not become durable claims.
