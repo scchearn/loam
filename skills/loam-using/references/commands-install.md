@@ -20,7 +20,7 @@ Split by command format, not just harness. One format does not fit all.
 | **OpenCode** | Markdown | `~/.config/opencode/commands/` | `.opencode/commands/` | `/checkpoint` | Copy `assets/commands/*.md` |
 | **Claude Code** | Markdown | `~/.claude/commands/` | `.claude/commands/` | `/checkpoint` | Copy `assets/commands/*.md` |
 | **Gemini CLI** | TOML | `~/.gemini/commands/` | `.gemini/commands/` | `/checkpoint` | Copy `assets/commands/gemini/*.toml`. Run `/commands reload` after install. |
-| **Codex** | Markdown (deprecated) | `~/.codex/prompts/` | (none) | `/prompts:checkpoint` | Deprecated in favor of skills. Prefer direct `/loam::checkpointing` unless user explicitly wants the shortcut. |
+| **Codex** | (not supported) | — | — | `$loam::checkpointing` | Custom prompts were removed in codex-cli 0.117.0 (March 2026). Skills are invoked with `$` prefix, not `/`. Use `$loam::checkpointing` and `$loam::resuming` directly. Do not install to `~/.codex/prompts/`. |
 | **Copilot CLI** | (not supported) | — | — | — | No prompt slash-command equivalent. Use `/loam::checkpointing` and `/loam::resuming` directly. Custom agents (`.agent.md`) are a different feature and overkill for thin wrappers. |
 
 ## Harness detection signals
@@ -51,11 +51,11 @@ Config dirs are hints only — multiple tools can be installed on the same machi
 5. **If yes, copy the correct format files from the skill's assets:**
    - OpenCode / Claude Code: copy `assets/commands/checkpoint.md` and `assets/commands/resume.md` to `<target>/`
    - Gemini CLI: copy `assets/commands/gemini/checkpoint.toml` and `assets/commands/gemini/resume.toml` to `<target>/`
-   - Codex (if user explicitly wants deprecated prompts): copy `assets/commands/checkpoint.md` and `assets/commands/resume.md` to `~/.codex/prompts/` — note these invoke as `/prompts:checkpoint` and `/prompts:resume`, not `/checkpoint`
+   - Codex: not supported — custom prompts were removed in codex-cli 0.117.0. Use `$loam::checkpointing` and `$loam::resuming` (the `$` prefix invokes skills) directly. Do not install to `~/.codex/prompts/`.
    - Copilot CLI: explain that slash commands aren't supported; use `/loam::checkpointing` and `/loam::resuming` directly
 6. **Post-install actions:**
    - Gemini CLI: instruct the user to run `/commands reload` (or run it if the harness supports agent-initiated reload)
-   - Codex: note that a new chat or restart may be needed for the prompt to be picked up
+   - Codex: note that custom prompts are removed (codex-cli 0.117.0+); skills are invoked with `$` prefix
    - OpenCode / Claude Code: available next session start (or immediately, depending on harness)
 7. **Confirm installation.** Tell the user which commands were installed, where, and how to invoke them.
 
@@ -65,6 +65,6 @@ Config dirs are hints only — multiple tools can be installed on the same machi
 - **Do not install globally by default.** Global changes are surprising; prefer project-local.
 - **Do not overwrite silently.** If a command file exists and differs, ask first.
 - **Do not copy markdown files to Gemini.** Gemini expects TOML. Use `assets/commands/gemini/*.toml`.
-- **Do not install Codex prompts by default.** They are deprecated. Only install if the user explicitly asks for them.
+- **Do not install Codex prompts.** Custom prompts were removed in codex-cli 0.117.0. Use `$loam::checkpointing` and `$loam::resuming` directly.
 - **Do not invent a Copilot CLI command path.** It doesn't have one for this purpose.
 - **Do not add more commands (e.g. `/plan`, `/spec`, `/learn`, `/query`).** Higher collision risk with existing harness commands. Ship checkpoint and resume only.
