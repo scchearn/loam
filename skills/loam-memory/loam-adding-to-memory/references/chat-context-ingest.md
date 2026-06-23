@@ -24,6 +24,23 @@ Examples of chat-context arguments:
 4. Produce a concise summary that captures the durable, reusable knowledge. Skip transient chatter, greetings, and procedural steps that don't encode lasting information.
 5. The synthesized content flows directly into the most relevant topic, entity, concept, or analysis pages (related pages, index, log).
 
+## Durability filter
+
+Before adding a conversation-sourced claim to the wiki, apply the same
+durability test as `/loam::learning-from-session` Step 1.5:
+
+- Strip dates, specific file paths, agent names of the day, version numbers
+  already shipped, thread/task IDs. Keep the reusable shape.
+- Pure incident reports ("what happened today and how we fixed it") do not
+  belong in the wiki — recommend `/loam::checkpointing` instead.
+- If stripping leaves nothing durable, do not add the claim. Say so in the
+  report.
+
+If the user asked to add a conversation and most of it is incident, tell
+them: most of this is incident, not durable memory — consider
+`/loam::checkpointing` for the work-state, and `/loam::learning-from-session`
+for the proposal-first review of any durable kernels.
+
 ## Provenance and uncertainty
 
 Conversation-sourced content has different authority than file-backed content:

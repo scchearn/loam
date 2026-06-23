@@ -3,7 +3,7 @@ name: loam::learning-from-session
 description: "Review the current session for durable learnings, then route each one to the right durable surface: a wiki page (proposal-first, via the wiki-page workflow) or an agent guidance file (concise one-liner edits, via the guidance-file workflow). Use when the session uncovered decisions, architecture facts, commands, conventions, gotchas, or open questions that future sessions should inherit. Not for source ingestion or correcting stale wiki claims; use /loam::adding-to-memory or /loam::amending-memory."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: scchearn
   argument-hint: [topic or session summary]
 ---
@@ -38,9 +38,83 @@ Ignore transient chatter, one-off dead ends, and speculative guesses that were n
 
 Distinguish: **facts** (supported by code, files, commands, or explicit user confirmation), **inferred conventions** (likely patterns not fully confirmed), **open questions** (unresolved items for future sessions).
 
+## Step 1.5 — Durability test
+
+Before classifying, test every candidate learning. Failing any test means the
+learning is not durable as written — either strip it to a reusable pattern
+(Step 2) or drop it.
+
+1. **Time test** — Would a fresh session 6 months from now benefit from this,
+   in a similar but not identical situation? If only "today's session"
+   benefits → not durable.
+2. **Identity test** — Does this reference session-specific identifiers
+   (agent names of the day, today's broken worktree, a version already
+   shipped, a symlink already chmod'd, a specific thread ID)? If yes → strip
+   them. If nothing durable remains after stripping → not durable.
+3. **Incident vs pattern** — Is this "what happened today and how we fixed
+   it" (incident) or "what is generally true and how to handle it" (pattern)?
+   Pure incidents → route to `/loam::checkpointing`, not memory or guidance.
+4. **Already-applied test** — Was the fix already applied and shipped? The
+   fix itself is done; only the *generalizable lesson* is durable.
+
+A learning that passes only after stripping is still durable — the stripped
+form is what enters the proposal.
+
 ## Step 2 — Classify each learning (the router)
 
 For each candidate learning, choose the destination surface. Classification is itself a feature: the right surface depends on **who consumes the learning** and **what shape it takes**.
+
+### Strip to reusable pattern (before routing)
+
+For every learning that passed the durability test by stripping, do the strip
+now, before choosing wiki vs guidance. Remove: dates, specific file paths,
+specific agent names, specific version numbers, specific error strings,
+specific thread or task IDs. Keep the reusable shape.
+
+Worked example — incident wrapped around a durable kernel:
+
+- ❌ as extracted: "On 2026-06-22 the integration broke; package x@1.19.2
+  fixed it — `dist/**/index.js` must use explicit `.js` extensions in
+  relative re-exports; Node native ESM rejects extensionless re-exports
+  with `ERR_MODULE_NOT_FOUND`."
+- ✅ after strip: "Node native ESM rejects extensionless relative
+  re-exports (`ERR_MODULE_NOT_FOUND`); published `dist` barrels must use
+  explicit `.js` extensions."
+
+The date, the integration, the package, and the version are incident. The
+Node ESM rule is the durable kernel.
+
+Worked example — already-durable, no strip needed:
+
+- ✅ "Provider list endpoints return bare arrays with no total-count
+  envelope; exact record-level progress is not realistic."
+- ✅ "Rate limits are not uniform across surfaces: the stats POST endpoint
+  has a much lower per-minute budget than the GET surfaces; retry/backoff
+  visibility matters for both UX and worker pacing."
+- ✅ "Real testing requires an admin-enabled API token; there is no
+  trustworthy sandbox path for end-to-end validation."
+
+These are facts about the system, not about today. They pass the durability
+test as written.
+
+If stripping leaves only a date and a version, the learning was an incident,
+not a pattern → route to `/loam::checkpointing` or drop.
+
+### What fails the durability test (examples)
+
+- ❌ "the `.worktrees/<feature>/.git/` directory is empty today" →
+  transient workspace state. Not durable. Checkpoint, not memory.
+- ❌ "agent foo and agent bar are general-purpose helpers" → agent names
+  rotate per session. Not durable. If the *routing rule* is durable, strip
+  the names: "general-purpose helpers vs repo-tagged workers — route repo
+  code to the tagged worker." That stripped form may pass.
+- ❌ "ran `sudo chmod 755` on the symlink at `/path/...`" → already applied.
+  The durable kernel is the general rule (e.g. "OpenSSH rejects
+  world-writable `Include`-d ssh_config files"); the specific chmod is done.
+- ❌ "today's push thread hit `attempt to write a readonly database`" →
+  incident. The durable kernel is the workaround pattern ("`hcom send` to a
+  new thread can fail with `readonly database`; fall back to
+  `hcom-mcp thread_seed`"), not the specific thread.
 
 ### Route to the wiki-page path when:
 
@@ -66,6 +140,9 @@ A single session may produce both kinds. Keep them separate in the proposal: wik
 - The learning reveals memory is wrong, stale, or contradicted — route to `/loam::amending-memory`.
 - The learning is a new source to ingest (a file, article, transcript) — route to `/loam::adding-to-memory`.
 - The learning is an unresolved open question — preserve as such, do not settle it silently.
+- The learning is a pure incident report (what happened today, how we fixed
+  it, no generalizable pattern) — route to `/loam::checkpointing`, not
+  memory or guidance.
 
 ---
 
@@ -182,6 +259,7 @@ Present a single unified proposal covering both paths. If only one path has entr
 - New wiki pages: <count>
 - Needs amend instead: <count or "none">
 - Deferred: <count or "none">
+- Routed to checkpointing (incidents): <count or "none">
 
 ### Wiki updates
 
@@ -217,7 +295,7 @@ Present a single unified proposal covering both paths. If only one path has entr
 ```
 
 ### Defer or route elsewhere
-- <item>: not durable enough | should use `/loam::amending-memory` | still unresolved
+- <item>: not durable enough | incident → `/loam::checkpointing` | should use `/loam::amending-memory` | still unresolved
 
 ### Open questions
 - <question or "none">
@@ -306,3 +384,7 @@ If the review found nothing durable enough to add, say so explicitly and do not 
 - Do not modify raw-source files.
 - Update `<wiki root>/log.md` on every approved wiki learnings pass.
 - After wiki writes, refresh qmd if the collection is ready. If refresh fails, report it but do not roll back.
+- Run the durability test (Step 1.5) on every candidate before classifying.
+  Incidents belong in `/loam::checkpointing`, not memory or guidance.
+- Strip session-specific identifiers (dates, paths, agent names, versions,
+  thread IDs) before routing. If stripping leaves nothing durable, drop it.

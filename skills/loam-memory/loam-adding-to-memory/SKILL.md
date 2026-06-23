@@ -3,7 +3,7 @@ name: loam::adding-to-memory
 description: "Read a local source file or synthesize conversation context, then integrate the content directly into topic, entity, concept, and analysis pages in existing memory (the wiki substrate). Use this when the user wants to add a source to the wiki, add a document, ingest a local note, transcript, article, report, or PDF, or explicitly preserve the current conversation as a topic note. Not for proposal-first session learnings that directly update existing pages; use /loam::learning-from-session."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: scchearn
   argument-hint: <local source path | topic or summary from chat>
 ---
@@ -115,7 +115,7 @@ Synthesize the source's content directly into the most relevant topic, entity, c
 6. Update reciprocal links under `Related pages` or `Mentioned in` when materially useful.
 7. Avoid isolated durable notes. Every new note should be reachable from `index.md` or another durable note.
 8. For file mode: note the source path in relevant pages where it materially aids retrieval (e.g., in a `## References` or `## Source material` section).
-9. For chat-context mode: mark conversation-sourced claims with appropriate uncertainty (discussed, suggested, agreed in conversation).
+9. For chat-context mode: mark conversation-sourced claims with appropriate uncertainty (discussed, suggested, agreed in conversation), AND apply the durability filter from `references/chat-context-ingest.md` — strip session-specific identifiers, route pure incidents to `/loam::checkpointing`, drop anything that is not durable after stripping.
 
 Minimal new-note shape:
 
@@ -220,4 +220,8 @@ If the source was already represented and you refreshed it, say so explicitly.
 - Make contradictions and stale claims explicit.
 - Prefer incremental linked updates over large rewrites.
 - In chat-context mode, conversation-sourced claims carry less authority. Mark uncertainty explicitly.
+- Chat-context mode: apply the durability filter before adding claims.
+  Incidents → `/loam::checkpointing`; durable kernels → wiki. If the
+  conversation is mostly incident, say so and recommend
+  `/loam::learning-from-session` instead.
 - After wiki writes, refresh qmd if the collection is ready. If refresh fails, report it but do not roll back.
