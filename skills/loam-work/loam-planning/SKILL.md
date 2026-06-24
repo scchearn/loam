@@ -3,7 +3,7 @@ name: loam::planning
 description: "Use when an approved workspace spec needs an execution-ready implementation plan with ordered, verifiable steps. Specs are mandatory: this skill consumes design decisions, verifies that the spec still matches the codebase, and writes the repo-native plans/ artifacts."
 allowed-tools: Read Glob Grep Bash Write Edit Skill
 metadata:
-  version: "2.1.0"
+  version: "2.2.0"
   author: scchearn
   argument-hint: <spec path or spec topic>
 ---
@@ -131,6 +131,8 @@ Read only the codebase context needed to turn the approved spec into tasks:
 
 This is a scoped codebase read, not broad research. Do not search `plans/research/` independently. Do not perform open-ended wiki exploration. If scoped reading reveals that the spec is incomplete or critically stale, stop and route upstream.
 
+If the resolved spec touches UI, frontend, or visual work (scan the spec for terms like `UI`, `frontend`, `visual`, `design`, or component names), also: (i) search the repo case-insensitively for `design.md` / `DESIGN.md` (typically repo root); (ii) scan available skills in the running harness whose names or descriptions match design, frontend, or taste. Read whatever is found into planning context. If neither `design.md` nor any design skill exists, note the gap in the plan's `Decisions log` and proceed without design governance — do not block.
+
 When a wiki exists, use QMD first and Grep/Glob as fallback for a narrowly scoped domain check keyed to the spec domain. Flow durable constraints, gotchas, or stale assumptions into task `Watch for:` fields when they affect execution. If the scoped wiki read reveals gaps that execution is likely to answer, add those to `## Learning checkpoints` with `After`, `Wiki target`, and `What to capture` columns. If no wiki exists, skip all wiki features entirely.
 
 ---
@@ -182,6 +184,7 @@ Use compact markers inside `Steps:` or `Constraints:` when execution should appl
 - `[tdd: <test-file> | <test-command>]` for implementation, bugfix, and behavior-changing refactor tasks. Absence of `[tdd]` is an approved exception for config-only, docs-only, generated artifact refresh, migrations, scaffolding, or other tasks where test-first does not apply.
 - `[worktree: <branch-name>]` for tasks with `needs-isolation`.
 - `[debug]` for tasks likely to surface unexpected behavior, or when systematic debugging should start after repeated verification failures.
+- `[design: <skill-name> | <design-source#section>]` for tasks touching UI, frontend, or visual work. `<design-source>` is a workspace-relative path with anchor to the authoritative `design.md` (e.g. `path/DESIGN.md#buttons`). Absence of `[design]` is an approved exception for non-UI tasks. When a named design/frontend skill should drive the work, also list it under `## Execution disciplines` with its scope.
 
 When any `superpowers:<name>` discipline is relevant, add `## Execution disciplines` with its scope and one-line fetch-fail fallback. Use canonical names only; do not put GitHub URLs in plan files.
 
