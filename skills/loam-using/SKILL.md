@@ -2,7 +2,7 @@
 name: loam::using
 description: "The always-on protocol for the loam skill namespace. Use at session start and whenever a loam task appears. Routes to the right skill, explains the memory model (memory = umbrella; wiki, guidance, and checkpoints are substrates), and lists the cross-cutting rules. This is a routing/meta skill — delegate to a specific loam skill rather than performing work itself."
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: scchearn
 ---
 
@@ -86,6 +86,8 @@ For any loam task:
 │  └─ change an in-flight plan ──────── /loam::amending-plan
 ├─ work with memory
 │  ├─ add a source ──────────────────── /loam::adding-to-memory
+│  ├─ ingest a codebase ─────────────── /loam::ingesting-codebase
+│  ├─ sync code graph drift ────────── /loam::syncing-code-graph
 │  ├─ ask a question ─────────────────── /loam::querying-memory
 │  ├─ fix what's wrong ─────────────── /loam::amending-memory
 │  ├─ health-check ──────────────────── /loam::linting-memory
@@ -114,6 +116,8 @@ One line per skill. The decision graph is the primary router; this is for quick 
 - `loam-configuring-agents` — plan or reuse an agent team config (hcom backend; general advice when hcom unavailable)
 - `loam-amending-plan` — update an in-flight plan after scope change
 - `loam-adding-to-memory` — ingest a source into memory (wiki substrate)
+- `loam-ingesting-codebase` — ingest codebase as entity pages with wikilink edges
+- `loam-syncing-code-graph` — reconcile code graph to repo at plan gate or on-demand
 - `loam-querying-memory` — answer a question from memory
 - `loam-amending-memory` — fix specific wrong or stale memory claims
 - `loam-linting-memory` — health-check the memory graph

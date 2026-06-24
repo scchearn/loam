@@ -90,6 +90,16 @@ completed_at: null
 
 ---
 
+## Touched files
+
+<!-- Populated by /loam::starting on task completion. Deduplicated, edit-marked.
+     The planner leaves this section empty. /loam::starting fills it during execution. -->
+
+| Path | Marker | Tasks |
+| ---- | ------ | ----- |
+
+---
+
 ## Handoff notes
 
 _No handoff yet._

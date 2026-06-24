@@ -3,7 +3,7 @@ name: loam::planning
 description: "Use when an approved workspace spec needs an execution-ready implementation plan with ordered, verifiable steps. Specs are mandatory: this skill consumes design decisions, verifies that the spec still matches the codebase, and writes the repo-native plans/ artifacts."
 allowed-tools: Read Glob Grep Bash Write Edit Skill
 metadata:
-  version: "2.2.0"
+  version: "2.3.0"
   author: scchearn
   argument-hint: <spec path or spec topic>
 ---
@@ -296,6 +296,7 @@ Use the skill-local `references/template.md`. New plans must contain:
 - optional `## Learning checkpoints`
 - optional `## Execution disciplines`
 - `## Decisions log` with initial entries for spec decisions and any minor staleness mappings
+- `## Touched files` — the planner leaves this section empty. `/loam::starting` populates it during execution with deduplicated edit-marked paths. `/loam::syncing-code-graph --touched` consumes it at plan completion to reconcile the code graph.
 - `## Handoff notes`
 
 Update `plans/INDEX.md` with the slim schema:

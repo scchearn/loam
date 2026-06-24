@@ -3,7 +3,7 @@ name: loam::starting
 description: "Use when beginning or resuming a plan file, including mixed local and hcom-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
 allowed-tools: Read Write Edit Glob Grep Bash WebFetch
 metadata:
-  version: "2.0.0"
+  version: "2.1.0"
   author: scchearn
   argument-hint: plans/<slug>.md [T3 | T3,T5,T7 | T3-T7]
 ---
@@ -339,6 +339,10 @@ For a **hub task**, edit the plan file: change `[~]` to `[x]`.
 
 For a **delegated group**, edit the plan file: change `[h]` to `[x]` for every task in the group that the hub just verified successfully.
 
+**Accumulate touched files.** Inspect the task's `Files:` entries. For each entry with an `(edit)` or `(read+edit)` marker, add the path to the session's running touched-files set (deduplicated by path). Read-only `(read)` entries are excluded — they were not modified. Track which task IDs touched each path (comma-separated).
+
+At session end (queue exhausted or handoff), write the accumulated rows to the plan's `## Touched files` section, overwriting the empty template table. Each row: `Path` (relative), `Marker` = `edit`, `Tasks` = comma-separated task IDs that touched it.
+
 If this was the **last remaining task** (all tasks in the plan are now `[x]`), also:
 
 - Update front matter `status` to `done`
@@ -362,6 +366,15 @@ During autonomous execution, do not pause for wiki confirmation after every task
 Example handoff delta: `wiki/topics/db-migrations.md +nullable defaults; wiki/concepts/auth-flow.md -stale session claim; T5 checkpoint open`.
 
 At handoff, recommend `/loam::learning-from-session <session focus>` when learning deltas exist. Use `/loam::amending-memory <what changed>` for stale claims and `/loam::adding-to-memory <source>` for source ingestion.
+
+If the workspace ingests codebases into memory (`/loam::ingesting-codebase`) and the plan touched code files, also recommend at handoff:
+
+```text
+Run /loam::syncing-code-graph <codebase-root> --touched <plan-path> to sync
+the code graph for the files this plan changed.
+```
+
+This is a recommendation, not an automatic invocation. The user runs the sync manually.
 
 ### 6. Log decisions
 

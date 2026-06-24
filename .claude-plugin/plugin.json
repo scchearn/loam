@@ -17,6 +17,8 @@
     "./skills/loam-memory/loam-reviewing-memory",
     "./skills/loam-memory/loam-learning-from-session",
     "./skills/loam-memory/loam-auditing-guidance",
+    "./skills/loam-memory/loam-ingesting-codebase",
+    "./skills/loam-memory/loam-syncing-code-graph",
     "./skills/loam-ground/loam-scaffolding-wiki",
     "./skills/loam-ground/loam-initializing-vault"
   ]
