@@ -22,10 +22,14 @@ The question is: $ARGUMENTS
 
 ## Step 1 — Discover candidates
 
-1. Glob for `.wiki-metadata.json`. If found, **read it immediately**. If `retrieval.status` is `"ready"`, qmd is ready — use `retrieval.collection_name` and **go straight to qmd search below**. Do not read SCHEMA.md, index.md, or run fallback checks.
-2. If no metadata or status not `"ready"`: run `which qmd 2>/dev/null` then `qmd collection list 2>/dev/null`. If both succeed and a collection path matches the wiki root (absolute path equality), qmd is ready — **go straight to qmd search below**.
-3. If qmd is still not ready: use Grep/Glob search.
-4. Runtime guard: if any qmd command fails or returns stale results, treat as degraded — fall back to Grep/Glob search.
+Run `loamstate` to probe the wiki and qmd in one shot:
+
+```bash
+bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+  || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+```
+
+Parse the JSON output. If `exists` is false, stop and recommend `/loam::scaffolding-wiki <topic>`. Use `wiki_root` as the resolved wiki root and `qmd_ready` + `collection` for qmd state. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks.
 
 Classify the question internally (do not expose unless it helps the answer): **lookup** (answer from one or a few pages), **comparison** (differences/tradeoffs across pages), **synthesis** (higher-level explanation combining multiple parts), **gap check** (whether memory can answer something yet). Derive 3-8 search terms.
 

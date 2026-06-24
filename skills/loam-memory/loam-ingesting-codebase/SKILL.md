@@ -20,23 +20,26 @@ The codebase root is: $ARGUMENTS
 
 ## Step 1 — Resolve wiki, codebase, and build the index
 
-### Wiki resolution
+### Wiki resolution and qmd readiness
 
-Find the existing wiki by locating `SCHEMA.md`, `index.md`, or `log.md` under a `wiki/` directory or the workspace root. If no wiki exists, stop and recommend:
+Run `loamstate` to probe the wiki and qmd in one shot:
+
+```bash
+bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+  || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+```
+
+Parse the JSON output. If `exists` is false, stop and recommend:
 
 ```text
 /loam::scaffolding-wiki <topic or wiki goal>
 ```
 
-If multiple wiki roots exist and the target is ambiguous, ask the smallest follow-up.
+Use `wiki_root` as the resolved wiki root. If `qmd_ready` is true, note the `collection` name for later refresh (`qmd update -c <collection>`). The skill works fully without qmd; it only accelerates post-ingest discovery. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md`.
 
 ### Codebase resolution
 
 Resolve `$ARGUMENTS` to an absolute path. If it does not exist or is not a directory, stop and report the error. Treat it as the codebase root for `source_path` front-matter values (paths are relative to this root).
-
-### Check qmd readiness
-
-Glob for `.wiki-metadata.json`. If found, read it. If `retrieval.status` is `"ready"`, qmd is ready — note `retrieval.collection_name` for later refresh. Otherwise proceed without qmd (the skill works fully without it; qmd only accelerates post-ingest discovery).
 
 ### Build the existing index
 

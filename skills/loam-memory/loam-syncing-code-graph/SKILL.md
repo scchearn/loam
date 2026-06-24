@@ -29,9 +29,16 @@ If both flags are given, error and stop.
 
 ## Step 1 — Resolve wiki, codebase, and load the index
 
-### Wiki resolution
+### Wiki resolution and qmd readiness
 
-Find the existing wiki by locating `SCHEMA.md`, `index.md`, or `log.md`. If no wiki exists, stop — there is nothing to sync.
+Run `loamstate` to probe the wiki and qmd in one shot:
+
+```bash
+bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+  || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+```
+
+Parse the JSON output. If `exists` is false, stop — there is nothing to sync. Use `wiki_root` as the resolved wiki root. If `qmd_ready` is true, note the `collection` name for later refresh. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md`.
 
 ### Codebase resolution
 

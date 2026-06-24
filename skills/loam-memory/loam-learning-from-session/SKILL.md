@@ -152,31 +152,24 @@ A single session may produce both kinds. Keep them separate in the proposal: wik
 
 If the session produced any wiki-bound learnings, run the proposal-first wiki workflow below. If none, skip 3A entirely.
 
-#### Find the wiki
+#### Find the wiki and probe state
 
-Look for files such as:
+Run `loamstate` to probe the wiki and qmd in one shot:
 
-- `wiki/SCHEMA.md`
-- `wiki/index.md`
-- `wiki/log.md`
-- `wiki/overview.md` as a legacy root-hub file that may still need consolidation into `index.md`
+```bash
+bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+  || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+```
 
-If the workspace uses a different but clearly established wiki root, reuse it.
-
-If no wiki exists yet, stop and recommend:
+Parse the JSON output. If `exists` is false, stop and recommend:
 
 ```text
 /loam::scaffolding-wiki <topic or wiki goal>
 ```
 
-#### Check qmd readiness
+Use `wiki_root` as the resolved wiki root. If `has_overview` is true, note it as a legacy root-hub file. Use `qmd_ready` + `collection` for qmd state. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks.
 
-1. Glob for `.wiki-metadata.json`. If found, **read it immediately**. If `retrieval.status` is `"ready"`, qmd is ready — use `retrieval.collection_name` and **skip to discovery below**. Do not run fallback checks.
-2. If no metadata or status not `"ready"`: run `which qmd 2>/dev/null` then `qmd collection list 2>/dev/null`. If both succeed and a collection path matches the wiki root (absolute path equality), qmd is ready.
-3. If qmd is still not ready: use Grep/Glob to find destination pages.
-4. Runtime guard: if any qmd command fails or returns stale results, treat as degraded — fall back to Grep/Glob.
-
-If qmd is ready, read `${CLAUDE_SKILL_DIR}/references/qmd-usage.md` for finding existing destination notes.
+If qmd is ready, read `${CLAUDE_SKILL_DIR}/references/qmd-usage.md` for finding existing destination notes. If qmd is not ready, use Grep/Glob to find existing pages.
 
 #### Read the wiki contract & discover destinations
 

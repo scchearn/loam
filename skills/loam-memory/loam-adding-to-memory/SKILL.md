@@ -40,39 +40,34 @@ Rules:
 3. If more than one candidate is plausible, ask the smallest follow-up question needed.
 4. If the user clearly requested a large batch, stop and ask them to narrow it or to run repeated adds. This skill is optimized for one source at a time.
 
-### Wiki resolution
+### Wiki resolution and qmd readiness
 
-Find the existing wiki by looking for files such as:
+Run `loamstate` to probe the wiki and qmd in one shot:
 
-- `wiki/SCHEMA.md`
-- `wiki/index.md`
-- `wiki/log.md`
-- `wiki/overview.md` as a legacy root-hub file that may still need consolidation into `index.md`
+```bash
+bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+  || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+```
 
-If the workspace uses a different but clearly established wiki root, reuse it.
-
-If multiple wiki roots are present and the target is ambiguous, ask the smallest possible follow-up question.
-
-If no existing wiki can be found, stop and recommend:
+Parse the JSON output. If `exists` is false, stop and recommend:
 
 ```text
 /loam::scaffolding-wiki <topic or wiki goal>
 ```
+
+If `exists` is true, use `wiki_root` as the resolved wiki root and `qmd_ready` + `collection` for qmd state. If `has_overview` is true, note it as a legacy root-hub file that may need consolidation into `index.md`.
+
+If multiple wiki roots are present and the target is ambiguous, ask the smallest possible follow-up question.
+
+If qmd is ready (`qmd_ready: true`), use the `collection` name and read `${CLAUDE_SKILL_DIR}/references/qmd-usage.md` for finding existing related notes. If qmd is not ready, use Grep/Glob to find existing notes.
+
+Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks (`which qmd` + `qmd collection list`).
 
 ### Mode detection
 
 1. If `$ARGUMENTS` resolves to an existing local file (or is clearly a file path with an extension), use **file mode**.
 2. If `$ARGUMENTS` does not resolve to a file and instead looks like a topic, question, or natural-language summary, use **chat-context mode**.
 3. If ambiguous, ask the user: "Did you mean a local file path, or should I synthesize from our conversation?"
-
-### Check qmd readiness
-
-1. Glob for `.wiki-metadata.json`. If found, **read it immediately**. If `retrieval.status` is `"ready"`, qmd is ready — use `retrieval.collection_name` and **skip to discovery below**. Do not run fallback checks.
-2. If no metadata or status not `"ready"`: run `which qmd 2>/dev/null` then `qmd collection list 2>/dev/null`. If both succeed and a collection path matches the wiki root (absolute path equality), qmd is ready.
-3. If qmd is still not ready: use Grep/Glob to find existing notes.
-4. Runtime guard: if any qmd command fails or returns stale results, treat as degraded — fall back to Grep/Glob.
-
-If qmd is ready, read `${CLAUDE_SKILL_DIR}/references/qmd-usage.md` for finding existing related notes.
 
 ### Read the wiki contract & discover related notes
 

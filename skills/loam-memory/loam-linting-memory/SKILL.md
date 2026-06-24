@@ -34,24 +34,26 @@ If no explicit target is provided, lint the whole wiki.
 
 ## Step 1 — Resolve wiki, read contract & audit
 
-### Locate the wiki
+### Locate the wiki and probe state
 
-Look for an existing wiki root by finding files such as:
+Run `loamstate` to probe the wiki and qmd in one shot:
 
-- `wiki/SCHEMA.md`
-- `wiki/index.md`
-- `wiki/log.md`
-- `wiki/overview.md` as a legacy root-hub file that lint should migrate into `index.md`
+```bash
+bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+  || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+```
 
-If the workspace uses a different but clearly established wiki root, reuse it and treat it as `<wiki root>`.
-
-Resolve the actual `<wiki root>` from the on-disk wiki contract files, not from qmd metadata. If multiple candidate wiki roots exist and the target is ambiguous, ask the smallest possible follow-up question. Then resolve the lint scope: if the user named a wiki root, subdirectory, topic, or entity, use that. If no scope given, lint the whole wiki.
-
-If no wiki exists yet, stop and recommend:
+Parse the JSON output. If `exists` is false, stop and recommend:
 
 ```text
 /loam::scaffolding-wiki <topic or wiki goal>
 ```
+
+Use `wiki_root` as the resolved wiki root (resolved from on-disk contract files, not qmd metadata). If `has_overview` is true, note it as a legacy root-hub file to fold into `index.md`. Then resolve the lint scope: if the user named a wiki root, subdirectory, topic, or entity, use that. If no scope given, lint the whole wiki.
+
+If multiple candidate wiki roots exist and the target is ambiguous, ask the smallest possible follow-up question.
+
+Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks.
 
 ### Read the wiki contract
 
@@ -69,15 +71,13 @@ Use `Glob` and `Grep` to map the pages in scope before reading deeply.
 
 Treat `index.md` as the authoritative root hub. The desired steady state is a single root-hub file: `index.md` with a concise `## Overview` section before the grouped page catalog.
 
-### Check qmd readiness and metadata health (secondary only)
+### qmd metadata health (secondary only)
 
-1. Glob for `<wiki root>/.wiki-metadata.json`. If found, **read it immediately**.
-2. Compare `retrieval.collection_path` to the actual resolved `<wiki root>` using absolute path equality. If they differ, mark qmd metadata as stale and plan a safe metadata reconciliation during fixes.
-3. If metadata exists, `retrieval.status` is `"ready"`, and `retrieval.collection_path` matches the actual resolved `<wiki root>`, qmd is ready — use `retrieval.collection_name`. Do not run fallback checks.
-4. If metadata is missing, stale, or status is not `"ready"`: run `which qmd 2>/dev/null` then `qmd collection list 2>/dev/null`. If both succeed and a collection path matches the actual resolved `<wiki root>` (absolute path equality), qmd is ready.
-5. If metadata is stale and qmd is available, validate the recorded `retrieval.collection_name` with `qmd collection show <collection-name> 2>/dev/null` when supported. If another collection is already registered for the actual `<wiki root>`, plan to update `retrieval.collection_name` to that collection. If no collection points at the actual `<wiki root>`, do not rename or move wiki directories; set `retrieval.status` to `"degraded"`, keep the actual `<wiki root>` in `retrieval.collection_path`, and report the collection/path mismatch.
-6. If qmd is still not ready: qmd not available, use Grep/Glob only.
-7. Runtime guard: if any qmd command fails or returns stale results, treat as degraded — fall back to Grep/Glob.
+The `loamstate` probe already resolved `qmd_ready`, `collection`, `metadata_status`, and `metadata_path`. If `metadata_path` is non-empty, compare its `retrieval.collection_path` to the actual resolved `<wiki root>` using absolute path equality. If they differ, mark qmd metadata as stale and plan a safe metadata reconciliation during fixes.
+
+If metadata is stale and qmd is available, validate the recorded `collection` with `qmd collection show <collection> 2>/dev/null` when supported. If another collection is already registered for the actual `<wiki root>`, plan to update `collection_name` to that collection. If no collection points at the actual `<wiki root>`, do not rename or move wiki directories; set `retrieval.status` to `"degraded"`, keep the actual `<wiki root>` in `retrieval.collection_path`, and report the collection/path mismatch.
+
+If `qmd_ready` is false, qmd is not available — use Grep/Glob only.
 
 qmd is **secondary only** in this skill: use it only to find related-note neighborhoods when a structural fix might need reciprocal links or nearby canonical notes. If ready, read `${CLAUDE_SKILL_DIR}/references/qmd-usage.md`.
 
