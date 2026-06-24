@@ -30,6 +30,23 @@ stat_size() {
   stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || echo 0
 }
 
+validate_wiki_root() {
+  local wiki_root="$1"
+  [[ -z "$wiki_root" || ! -d "$wiki_root" ]] && { echo "Error: wiki root not found: $wiki_root" >&2; exit 2; }
+
+  if [[ -f "$wiki_root/SCHEMA.md" || -f "$wiki_root/index.md" || -f "$wiki_root/log.md" ]]; then
+    return 0
+  fi
+
+  if [[ -f "$wiki_root/wiki/SCHEMA.md" || -f "$wiki_root/wiki/index.md" || -f "$wiki_root/wiki/log.md" ]]; then
+    echo "Error: wiki root contract not found: $wiki_root; did you mean: $wiki_root/wiki" >&2
+    exit 2
+  fi
+
+  echo "Error: wiki root contract not found: $wiki_root" >&2
+  exit 2
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -203,7 +220,7 @@ resolve_source_path() {
 
 collect_index() {
   local wiki_root="$1" codebase_root="${2:-}"
-  [[ -z "$wiki_root" || ! -d "$wiki_root" ]] && { echo "Error: wiki root not found: $wiki_root" >&2; exit 2; }
+  validate_wiki_root "$wiki_root"
 
   index_sources=()
   index_slugs=()

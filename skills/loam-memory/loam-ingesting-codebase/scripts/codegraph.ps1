@@ -24,6 +24,20 @@ Usage:
 
 function Format-JsonDate([datetime]$Date) { $Date.ToString('yyyy-MM-dd') }
 
+function Assert-WikiRoot([string]$WikiRoot) {
+  if (-not $WikiRoot -or -not (Test-Path $WikiRoot -PathType Container)) {
+    Write-Error "Error: wiki root not found: $WikiRoot"; exit 2
+  }
+  if ((Test-Path (Join-Path $WikiRoot 'SCHEMA.md') -PathType Leaf) -or (Test-Path (Join-Path $WikiRoot 'index.md') -PathType Leaf) -or (Test-Path (Join-Path $WikiRoot 'log.md') -PathType Leaf)) { return }
+
+  $nestedWiki = Join-Path $WikiRoot 'wiki'
+  if ((Test-Path (Join-Path $nestedWiki 'SCHEMA.md') -PathType Leaf) -or (Test-Path (Join-Path $nestedWiki 'index.md') -PathType Leaf) -or (Test-Path (Join-Path $nestedWiki 'log.md') -PathType Leaf)) {
+    Write-Error "Error: wiki root contract not found: $WikiRoot; did you mean: $nestedWiki"; exit 2
+  }
+
+  Write-Error "Error: wiki root contract not found: $WikiRoot"; exit 2
+}
+
 function Read-Exclusions([string]$Path) {
   if (-not (Test-Path $Path -PathType Leaf)) { Write-Error "Error: exclusions file not found: $Path"; exit 3 }
   $exclude = @()
@@ -117,7 +131,7 @@ function Resolve-Source([string]$SourcePath, [string]$CodebaseRoot) {
 }
 
 function Collect-Index([string]$WikiRoot, [string]$CodebaseRoot = '') {
-  if (-not $WikiRoot -or -not (Test-Path $WikiRoot -PathType Container)) { Write-Error "Error: wiki root not found: $WikiRoot"; exit 2 }
+  Assert-WikiRoot $WikiRoot
   $entitiesDir = Join-Path $WikiRoot 'entities'
   if (-not (Test-Path $entitiesDir -PathType Container)) { return @() }
 

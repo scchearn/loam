@@ -3,7 +3,7 @@ name: loam::syncing-code-graph
 description: "Reconcile the code graph in memory (wiki substrate) against the actual codebase. In --touched mode, re-summarizes only files a completed plan touched (cheap, post-plan gate). In --sweep mode, walks the whole repo and patches drift from out-of-band edits. Drift is accepted between gates; this skill is the only place the code graph is reconciled to the repo tree."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: scchearn
   argument-hint: <codebase root> [--touched <plan-path>] [--sweep]
 ---
@@ -38,7 +38,7 @@ bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/nu
   || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
 ```
 
-Parse the JSON output. If `exists` is false, stop — there is nothing to sync. Use `wiki_root` as the resolved wiki root. If `qmd_ready` is true, note the `collection` name for later refresh. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md`.
+Parse the JSON output. If `exists` is false, stop — there is nothing to sync. Use `wiki_root` from `loamstate` as the resolved wiki root; do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md`.
 
 ### Codebase resolution
 
@@ -55,6 +55,8 @@ Run the index subcommand from the ingestion skill's scripts:
 Parse the JSON output into an in-memory map: `{source_path → {slug, ingested_at, mtime, exists}}`. This is the current code graph in the wiki.
 
 If the script is missing or fails, fall back to Globbing `entities/*.md` and parsing front matter with Read.
+
+If `codegraph.sh index` or `codegraph.sh diff` reports `wiki root contract not found` or `did you mean: .../wiki`, stop and rerun the command with the actual `wiki_root`. Do not proceed from an empty index caused by a bad wiki-root path.
 
 ### Resolve the ingestion skill's references
 

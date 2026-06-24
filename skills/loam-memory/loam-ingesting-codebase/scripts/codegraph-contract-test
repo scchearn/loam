@@ -13,9 +13,16 @@ trap 'rm -rf "$tmp"' EXIT
 codebase="$tmp/codebase"
 wiki="$tmp/wiki"
 mkdir -p "$codebase/src" "$wiki/entities"
+mkdir -p "$codebase/wiki/entities"
 
 cat > "$codebase/.gitignore" <<'EOF'
 ignored.ts
+EOF
+cat > "$codebase/wiki/SCHEMA.md" <<'EOF'
+# Schema
+EOF
+cat > "$wiki/SCHEMA.md" <<'EOF'
+# Schema
 EOF
 
 if command -v git >/dev/null 2>&1; then
@@ -74,6 +81,20 @@ summary_json=$("$CODEGRAPH" walk "$codebase" --summary)
 index_json=$("$CODEGRAPH" index "$wiki" --codebase-root "$codebase")
 diff_json=$("$CODEGRAPH" diff "$codebase" "$wiki")
 
+wrong_root_output=""
+if wrong_root_output=$("$CODEGRAPH" index "$codebase" --codebase-root "$codebase" 2>&1); then
+  echo "index accepted workspace root as wiki root" >&2
+  exit 1
+fi
+grep -Fq "did you mean: $codebase/wiki" <<< "$wrong_root_output"
+
+wrong_diff_output=""
+if wrong_diff_output=$("$CODEGRAPH" diff "$codebase" "$codebase" 2>&1); then
+  echo "diff accepted workspace root as wiki root" >&2
+  exit 1
+fi
+grep -Fq "did you mean: $codebase/wiki" <<< "$wrong_diff_output"
+
 if command -v git >/dev/null 2>&1; then
   no_gitignore_json=$("$CODEGRAPH" walk "$codebase" --no-gitignore)
 else
@@ -130,5 +151,8 @@ PY
 
 grep -Fq 'Cap the work set at 200 files.' "$INGEST_SKILL"
 ! grep -Fq 'Cap the work set at 100 files.' "$INGEST_SKILL"
+grep -Fq 'Do not substitute the codebase root, workspace root, or parent directory.' "$INGEST_SKILL"
+grep -Fq 'never report the codebase as fully ingested' "$INGEST_SKILL"
+grep -Fq 'Do not proceed from an empty index caused by a bad wiki-root path.' "$INGEST_SKILL"
 
 echo "codegraph contract: PASS"

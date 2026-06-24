@@ -3,7 +3,7 @@ name: loam::ingesting-codebase
 description: "Ingest a codebase into memory as entity pages connected by wiki links. Walks the tree, classifies each code file by role, applies a role template, and writes an entity page per meaningful unit under <wiki root>/entities/. Resumable: skips files already ingested and current. Not for prose documents; use /loam::adding-to-memory for those."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: scchearn
   argument-hint: <codebase root path>
 ---
@@ -35,7 +35,7 @@ Parse the JSON output. If `exists` is false, stop and recommend:
 /loam::scaffolding-wiki <topic or wiki goal>
 ```
 
-Use `wiki_root` as the resolved wiki root. If `qmd_ready` is true, note the `collection` name for later refresh (`qmd update -c <collection>`). The skill works fully without qmd; it only accelerates post-ingest discovery. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md`.
+Use `wiki_root` from `loamstate` as the resolved wiki root. Do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh (`qmd update -c <collection>`). The skill works fully without qmd; it only accelerates post-ingest discovery. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md`.
 
 ### Codebase resolution
 
@@ -52,6 +52,8 @@ Run the index subcommand to get every code-ingested entity page already in the w
 Parse the JSON output into an in-memory map: `{source_path → {slug, ingested_at, mtime, exists}}`. Pages without `source_path:` front matter are prose entity pages and are skipped silently. This map is the set of already-ingested code nodes.
 
 If the script is missing or fails, fall back to Globbing `entities/*.md` and parsing front matter with Read. The script is an optimization, not a hard dependency.
+
+If `codegraph.sh index` or `codegraph.sh diff` reports `wiki root contract not found` or `did you mean: .../wiki`, stop and rerun the command with the actual `wiki_root`. Do not proceed from an empty index caused by a bad wiki-root path.
 
 ### Optional preflight summary
 
@@ -86,6 +88,8 @@ Parse the JSON output: `{path, mtime, reason, slug?}` where `reason` is `new` or
 **Cap the work set at 200 files.** If more remain, stop after 200 and report the pending count. The user re-invokes to continue; resumability (Step 1's index rebuild) means the next run picks up exactly where this one stopped.
 
 If the work set is empty, report that the codebase is fully ingested and current, then stop.
+
+If the work set is non-empty, never report the codebase as fully ingested. Process the capped work set, or if a remaining file appears too low-signal to ingest, report it as a concrete decision item with its path and reason. Do not claim it will be auto-skipped unless `codegraph diff` no longer returns it.
 
 Low-signal files are filtered before this step by `codegraph walk/diff`: files excluded by patterns or `.gitignore`, zero-byte files, whitespace-only files, binary/non-text files, likely generated files by header, and files over the default large-file guard. Do not classify or summarize filtered files.
 
