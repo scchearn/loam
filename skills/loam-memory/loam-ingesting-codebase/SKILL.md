@@ -3,7 +3,7 @@ name: loam::ingesting-codebase
 description: "Ingest a codebase into memory as entity pages connected by wiki links. Walks the tree, classifies each code file by role, applies a role template, and writes an entity page per meaningful unit under <wiki root>/entities/. Resumable: skips files already ingested and current. Not for prose documents; use /loam::adding-to-memory for those."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: scchearn
   argument-hint: <codebase root path>
 ---
@@ -46,23 +46,23 @@ Resolve `$ARGUMENTS` to an absolute path. If it does not exist or is not a direc
 Run the index subcommand to get every code-ingested entity page already in the wiki:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/codegraph.sh" index <wiki-root>
+"${CLAUDE_SKILL_DIR}/scripts/codegraph.sh" index <wiki-root> --codebase-root <codebase-root>
 ```
 
 Parse the JSON output into an in-memory map: `{source_path → {slug, ingested_at, mtime, exists}}`. Pages without `source_path:` front matter are prose entity pages and are skipped silently. This map is the set of already-ingested code nodes.
 
 If the script is missing or fails, fall back to Globbing `entities/*.md` and parsing front matter with Read. The script is an optimization, not a hard dependency.
 
-### Walk the codebase
+### Optional preflight summary
 
-Run the walk subcommand to get every candidate code file in the codebase:
+For a quick size check before ingesting, run:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/codegraph.sh" walk <codebase-root> \
+"${CLAUDE_SKILL_DIR}/scripts/codegraph.sh" walk <codebase-root> --summary \
   --exclusions "${CLAUDE_SKILL_DIR}/references/ingestion-exclusions.md"
 ```
 
-Parse the JSON output: a list of `{path, mtime}` for candidate code files, relative to the codebase root.
+This reports candidate counts by extension plus excluded low-signal counts (`pattern`, `gitignore`, `empty`, `large`, `generated_header`, `binary`). Use it to decide whether the run is likely to hit the cap; it is not required for correctness.
 
 If the script is missing or fails, fall back to Globbing the tree and applying the exclusion list manually (Read `references/ingestion-exclusions.md` for the patterns).
 
@@ -70,15 +70,24 @@ If the script is missing or fails, fall back to Globbing the tree and applying t
 
 ## Step 2 — Diff to find the work set
 
-For each walked file, compare against the in-memory index:
+Run the diff subcommand to get the files that need ingestion or re-summarization:
 
-- **In index AND `ingested_at >= file.mtime`** → skip (already current)
-- **In index AND file newer than `ingested_at`** → re-summarize (overwrite the same entity page)
-- **Not in index** → new ingest (create entity page)
+```bash
+"${CLAUDE_SKILL_DIR}/scripts/codegraph.sh" diff <codebase-root> <wiki-root> \
+  --exclusions "${CLAUDE_SKILL_DIR}/references/ingestion-exclusions.md"
+```
 
-**Cap the work set at 100 files.** If more remain, stop after 100 and report the pending count. The user re-invokes to continue; resumability (Step 1's index rebuild) means the next run picks up exactly where this one stopped.
+Parse the JSON output: `{path, mtime, reason, slug?}` where `reason` is `new` or `stale`.
+
+- **`reason: "new"`** → new ingest (create entity page)
+- **`reason: "stale"`** → re-summarize (overwrite the same entity page; `slug` is provided)
+- current files are omitted
+
+**Cap the work set at 200 files.** If more remain, stop after 200 and report the pending count. The user re-invokes to continue; resumability (Step 1's index rebuild) means the next run picks up exactly where this one stopped.
 
 If the work set is empty, report that the codebase is fully ingested and current, then stop.
+
+Low-signal files are filtered before this step by `codegraph walk/diff`: files excluded by patterns or `.gitignore`, zero-byte files, whitespace-only files, binary/non-text files, likely generated files by header, and files over the default large-file guard. Do not classify or summarize filtered files.
 
 ---
 
@@ -174,7 +183,7 @@ Add new entity pages to `index.md` under the `## Entities` group (create the gro
 ## [YYYY-MM-DD] ingest-code | <codebase root basename>
 ```
 
-Capture: root path, files ingested (count), files re-summarized (count), files skipped (count), external dependencies flagged, pending files (count if the cap was hit), any open questions.
+Capture: root path, files ingested (count), files re-summarized (count), skipped/current files if known from the preflight summary, external dependencies flagged, pending files (count if the cap was hit), any open questions.
 
 ### Refresh qmd
 
@@ -228,7 +237,7 @@ Codebase ingested from <codebase root>
 - Unresolved dependency names stay as plain text flagged `(external)`. Do not create broken wikilinks.
 - Code-ingested entity pages carry `source_path:` and `ingested_at:` front matter. Prose entity pages (from `/loam::adding-to-memory`) keep their existing front-matter-less shape.
 - Granularity: one entity page per file, keyed by the file's primary export or primary symbol. Do not split a single file into multiple pages unless it contains multiple independently-meaningful top-level declarations.
-- Respect the 100-file cap. Do not silently exceed it.
+- Respect the 200-file cap. Do not silently exceed it.
 - Resumability is automatic: the next invocation rebuilds the index from disk and skips current files.
 - After wiki writes, refresh qmd if ready. Failures are reported, not rolled back.
 - Read the wiki schema before editing the index or log.

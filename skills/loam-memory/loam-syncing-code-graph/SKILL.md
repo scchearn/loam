@@ -3,7 +3,7 @@ name: loam::syncing-code-graph
 description: "Reconcile the code graph in memory (wiki substrate) against the actual codebase. In --touched mode, re-summarizes only files a completed plan touched (cheap, post-plan gate). In --sweep mode, walks the whole repo and patches drift from out-of-band edits. Drift is accepted between gates; this skill is the only place the code graph is reconciled to the repo tree."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: scchearn
   argument-hint: <codebase root> [--touched <plan-path>] [--sweep]
 ---
@@ -49,7 +49,7 @@ Resolve the codebase root from the first argument. If it does not exist or is no
 Run the index subcommand from the ingestion skill's scripts:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/../loam-ingesting-codebase/scripts/codegraph.sh" index <wiki-root>
+"${CLAUDE_SKILL_DIR}/../loam-ingesting-codebase/scripts/codegraph.sh" index <wiki-root> --codebase-root <codebase-root>
 ```
 
 Parse the JSON output into an in-memory map: `{source_path → {slug, ingested_at, mtime, exists}}`. This is the current code graph in the wiki.
@@ -122,6 +122,15 @@ Run the walk subcommand from the ingestion skill:
 ```
 
 Parse the JSON output: a list of `{path, mtime}` for candidate code files.
+
+You may also run the diff subcommand to get `new` and `stale` sets directly:
+
+```bash
+"${CLAUDE_SKILL_DIR}/../loam-ingesting-codebase/scripts/codegraph.sh" diff <codebase-root> <wiki-root> \
+  --exclusions "${CLAUDE_SKILL_DIR}/../loam-ingesting-codebase/references/ingestion-exclusions.md"
+```
+
+Still use the walk output plus index to find orphaned nodes; `diff` intentionally returns only `new` and `stale` files.
 
 If the script is missing or fails, fall back to Globbing and manual exclusion filtering.
 

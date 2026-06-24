@@ -1,210 +1,207 @@
 #!/usr/bin/env pwsh
-# codegraph.ps1 — PowerShell twin of codegraph.sh
-# Helper for loam::ingesting-codebase and loam::syncing-code-graph on Windows.
-#
-# Subcommands:
-#   index <wiki-root>           Emit JSON of code-ingested entity pages in the wiki
-#   walk  <codebase-root>       Emit JSON of candidate code files under the codebase root
-#
-# Exit codes: 0 success, 1 bad args, 2 root not found, 3 exclusions file missing.
+# PowerShell twin of codegraph.sh.
 
 param(
-  [Parameter(Position = 0)]
-  [string]$Subcommand = '',
-  [Parameter(Position = 1, ValueFromRemainingArguments)]
-  [string[]$Rest = @()
+  [Parameter(Position = 0)] [string]$Subcommand = '',
+  [Parameter(Position = 1, ValueFromRemainingArguments)] [string[]]$Rest = @()
 )
 
 $ErrorActionPreference = 'Stop'
-
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $SkillDir = Split-Path -Parent $ScriptDir
 $DefaultExclusions = Join-Path $SkillDir 'references/ingestion-exclusions.md'
-
-function Format-JsonDate([datetime]$dt) {
-  return $dt.ToString('yyyy-MM-dd')
-}
+$MaxBytes = 500 * 1024
 
 function Show-Usage {
   Write-Host @"
 Usage:
-  codegraph.ps1 index <wiki-root>
-  codegraph.ps1 walk  <codebase-root> [--exclusions <exclusions.md>]
-
-  index  - Globs <wiki-root>/entities/*.md, parses front matter (source_path, ingested_at),
-           stats each source_path for current mtime, emits JSON.
-
-  walk   - Walks <codebase-root> recursively, applies exclusion globs, lists candidate
-           code files (by extension) with mtime. --exclusions defaults to the bundled
-           references/ingestion-exclusions.md.
-
-Exit codes: 0 ok, 1 bad args, 2 root not found, 3 exclusions file missing.
+  codegraph.ps1 index <wiki-root> [--codebase-root <codebase-root>]
+  codegraph.ps1 walk  <codebase-root> [--exclusions <exclusions.md>] [--summary] [--no-gitignore]
+  codegraph.ps1 diff  <codebase-root> <wiki-root> [--exclusions <exclusions.md>] [--no-gitignore]
 "@
   exit 1
 }
 
-function Invoke-Index {
-  param([string]$WikiRoot)
+function Format-JsonDate([datetime]$Date) { $Date.ToString('yyyy-MM-dd') }
 
-  if (-not $WikiRoot -or -not (Test-Path $WikiRoot -PathType Container)) {
-    Write-Error "Error: wiki root not found: $WikiRoot"; exit 2
+function Read-Exclusions([string]$Path) {
+  if (-not (Test-Path $Path -PathType Leaf)) { Write-Error "Error: exclusions file not found: $Path"; exit 3 }
+  $exclude = @()
+  $include = @()
+  $section = ''
+  $inCode = $false
+  foreach ($raw in Get-Content $Path) {
+    $line = $raw
+    if ($line -notmatch '^##') {
+      $hash = $line.IndexOf('#')
+      if ($hash -ge 0) { $line = $line.Substring(0, $hash) }
+    }
+    $line = $line.Trim()
+    if (-not $line) { continue }
+    if ($line -eq '```') { $inCode = -not $inCode; continue }
+    if ($line -match '^##\s*(.*)$') { $section = $matches[1]; continue }
+    if (-not $inCode) { continue }
+    if ($section -match 'Include') {
+      foreach ($ext in ($line -split '\s+')) { if ($ext) { $include += $ext.TrimStart('.') } }
+    } else { $exclude += $line }
+  }
+  @{ Exclude = $exclude; Include = $include }
+}
+
+function Test-Excluded([string]$RelPath, [string[]]$Patterns) {
+  $base = Split-Path -Leaf $RelPath
+  foreach ($pat in $Patterns) {
+    if (-not $pat) { continue }
+    $match = $pat -replace '\*\*', '*'
+    if ($RelPath -like $match -or $base -like $match) { return $true }
+  }
+  $false
+}
+
+function Test-GitIgnored([string]$Root, [string]$RelPath) {
+  & git -C $Root check-ignore --quiet -- $RelPath 2>$null
+  $LASTEXITCODE -eq 0
+}
+
+function Test-BinaryFile([string]$Path) {
+  $bytes = [System.IO.File]::ReadAllBytes($Path)
+  foreach ($b in $bytes) { if ($b -eq 0) { return $true } }
+  $false
+}
+
+function Test-WhitespaceOnly([string]$Path) {
+  $text = Get-Content $Path -Raw -ErrorAction SilentlyContinue
+  if ($null -eq $text) { return $true }
+  $text -notmatch '\S'
+}
+
+function Test-GeneratedHeader([string]$Path) {
+  $header = (Get-Content $Path -TotalCount 5 -ErrorAction SilentlyContinue) -join "`n"
+  $header -match '(?i)generated|auto-generated|do not edit|@generated|Code generated|This file was generated'
+}
+
+function Collect-Walk([string]$CodebaseRoot, [string]$ExclusionsFile, [bool]$RespectGitignore) {
+  if (-not $CodebaseRoot -or -not (Test-Path $CodebaseRoot -PathType Container)) { Write-Error "Error: codebase root not found: $CodebaseRoot"; exit 2 }
+  $rules = Read-Exclusions $ExclusionsFile
+  $entries = @()
+  $byExt = @{}
+  $excluded = [ordered]@{ pattern = 0; gitignore = 0; empty = 0; large = 0; generated_header = 0; binary = 0 }
+  $useGit = $false
+  if ($RespectGitignore -and (Get-Command git -ErrorAction SilentlyContinue)) {
+    & git -C $CodebaseRoot rev-parse --is-inside-work-tree *> $null
+    $useGit = ($LASTEXITCODE -eq 0)
   }
 
+  foreach ($file in Get-ChildItem -Path $CodebaseRoot -Recurse -File -Force) {
+    $rel = $file.FullName.Substring($CodebaseRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+    $ext = $file.Extension.TrimStart('.')
+    if ($rules.Include -notcontains $ext) { continue }
+    if (Test-Excluded $rel $rules.Exclude) { $excluded.pattern++; continue }
+    if ($useGit -and (Test-GitIgnored $CodebaseRoot $rel)) { $excluded.gitignore++; continue }
+    if ($file.Length -eq 0) { $excluded.empty++; continue }
+    if (Test-WhitespaceOnly $file.FullName) { $excluded.empty++; continue }
+    if (Test-BinaryFile $file.FullName) { $excluded.binary++; continue }
+    if ($file.Length -gt $MaxBytes) { $excluded.large++; continue }
+    if (Test-GeneratedHeader $file.FullName) { $excluded.generated_header++; continue }
+
+    $entries += [PSCustomObject]@{ path = $rel; mtime = (Format-JsonDate $file.LastWriteTime) }
+    $byExt[$ext] = 1 + ($byExt[$ext] ?? 0)
+  }
+  @{ Entries = $entries; ByExt = $byExt; Excluded = $excluded }
+}
+
+function Resolve-Source([string]$SourcePath, [string]$CodebaseRoot) {
+  if ([System.IO.Path]::IsPathRooted($SourcePath)) { return $SourcePath }
+  if ($CodebaseRoot) { return (Join-Path $CodebaseRoot $SourcePath) }
+  $SourcePath
+}
+
+function Collect-Index([string]$WikiRoot, [string]$CodebaseRoot = '') {
+  if (-not $WikiRoot -or -not (Test-Path $WikiRoot -PathType Container)) { Write-Error "Error: wiki root not found: $WikiRoot"; exit 2 }
   $entitiesDir = Join-Path $WikiRoot 'entities'
-  if (-not (Test-Path $entitiesDir -PathType Container)) {
-    Write-Host '[]'; exit 0
-  }
+  if (-not (Test-Path $entitiesDir -PathType Container)) { return @() }
 
   $entries = @()
-
-  Get-ChildItem -Path $entitiesDir -Filter '*.md' -File | ForEach-Object {
-    $content = Get-Content $_.FullName -Raw
+  foreach ($page in Get-ChildItem -Path $entitiesDir -Filter '*.md' -File) {
     $sourcePath = ''
     $ingestedAt = ''
-
-    # Parse front matter (between first two --- lines)
-    $lines = $content -split "`n"
     $inFm = $false
-    foreach ($line in $lines) {
+    foreach ($line in (Get-Content $page.FullName)) {
       $trimmed = $line.Trim()
-      if ($trimmed -eq '---') {
-        if ($inFm) { break } else { $inFm = $true; continue }
-      }
+      if ($trimmed -eq '---') { if ($inFm) { break } else { $inFm = $true; continue } }
       if ($inFm) {
         if ($trimmed -match '^source_path:\s*(.*)$') { $sourcePath = $matches[1].Trim('"') }
         if ($trimmed -match '^ingested_at:\s*(.*)$') { $ingestedAt = $matches[1].Trim('"') }
       }
     }
-
-    # Skip prose entity pages without code-graph front matter
-    if (-not $sourcePath -or -not $ingestedAt) { return }
-
-    $slug = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
-
-    $exists = $false
-    $mtimeStr = ''
-    if (Test-Path $sourcePath -PathType Leaf) {
-      $mtime = (Get-Item $sourcePath).LastWriteTime
-      $mtimeStr = Format-JsonDate $mtime
-      $exists = $true
-    }
-
-    $entries += [PSCustomObject]@{
-      source_path = $sourcePath
-      slug = $slug
-      ingested_at = $ingestedAt
-      mtime = $mtimeStr
-      exists = $exists
-    }
+    if (-not $sourcePath -or -not $ingestedAt) { continue }
+    $resolved = Resolve-Source $sourcePath $CodebaseRoot
+    $exists = Test-Path $resolved -PathType Leaf
+    $mtime = ''
+    if ($exists) { $mtime = Format-JsonDate (Get-Item $resolved).LastWriteTime }
+    $entries += [PSCustomObject]@{ source_path = $sourcePath; slug = [System.IO.Path]::GetFileNameWithoutExtension($page.Name); ingested_at = $ingestedAt; mtime = $mtime; exists = $exists }
   }
-
-  $json = $entries | ConvertTo-Json -Depth 2 -Compress
-  if (-not $json -or $json -eq '') { $json = '[]' }
-  elseif ($entries.Count -eq 1) { $json = "[$json]" }
-  Write-Host $json
+  $entries
 }
 
-function Invoke-Walk {
-  param(
-    [string]$CodebaseRoot,
-    [string]$ExclusionsFile
-  )
-
-  if (-not $CodebaseRoot -or -not (Test-Path $CodebaseRoot -PathType Container)) {
-    Write-Error "Error: codebase root not found: $CodebaseRoot"; exit 2
-  }
-  if (-not (Test-Path $ExclusionsFile -PathType Leaf)) {
-    Write-Error "Error: exclusions file not found: $ExclusionsFile"; exit 3
-  }
-
-  # Parse exclusions
-  $excludePatterns = @()
-  $includeExts = @()
-  $section = ''
-  $inCode = $false
-
-  foreach ($line in (Get-Content $ExclusionsFile)) {
-    $trimmed = $line.Trim()
-    if ($trimmed -eq '') { continue }
-
-    # Toggle code-block state
-    if ($trimmed -eq '```') { $inCode = -not $inCode; continue }
-
-    # Section headers (always processed)
-    if ($trimmed -match '^##\s*(.*)$') { $section = $matches[1]; continue }
-
-    # Only process lines inside code blocks
-    if (-not $inCode) { continue }
-
-    # Strip inline comments (but not ## headings)
-    if ($trimmed -notmatch '^##') {
-      $hashIdx = $trimmed.IndexOf('#')
-      if ($hashIdx -ge 0) { $trimmed = $trimmed.Substring(0, $hashIdx).Trim() }
-      if ($trimmed -eq '') { continue }
-    }
-
-    if ($section -match 'Include') {
-      foreach ($ext in ($trimmed -split '\s+')) {
-        $cleanExt = $ext -replace '^\.', ''
-        if ($cleanExt) { $includeExts += $cleanExt }
-      }
-    } else {
-      $excludePatterns += $trimmed
-    }
-  }
-
-  # Collect candidate files
-  $entries = @()
-  $allFiles = Get-ChildItem -Path $CodebaseRoot -Recurse -File
-  foreach ($file in $allFiles) {
-    $relPath = $file.FullName.Substring($CodebaseRoot.Length).TrimStart('\', '/')
-
-    # Check extension
-    $ext = $file.Extension.TrimStart('.')
-    if ($includeExts -notcontains $ext) { continue }
-
-    # Apply exclusion patterns
-    $skip = $false
-    foreach ($pat in $excludePatterns) {
-      $matchPat = $pat -replace '\*\*', '*'
-      if ($relPath -like $matchPat) { $skip = $true; break }
-      $matchPat2 = $pat -replace '\*\*', '\*'
-      if ($relPath -like $matchPat2) { $skip = $true; break }
-    }
-    if ($skip) { continue }
-
-    $mtimeStr = Format-JsonDate $file.LastWriteTime
-    $entries += [PSCustomObject]@{
-      path = $relPath
-      mtime = $mtimeStr
-    }
-  }
-
-  $json = $entries | ConvertTo-Json -Depth 2 -Compress
-  if (-not $json -or $json -eq '') { $json = '[]' }
-  elseif ($entries.Count -eq 1) { $json = "[$json]" }
+function Write-Json($Value) {
+  $json = $Value | ConvertTo-Json -Depth 5 -Compress
+  if (-not $json) { $json = '[]' }
+  if ($Value -is [array] -and $Value.Count -eq 1) { $json = "[$json]" }
   Write-Host $json
 }
-
-# --- main ---
-
-if (-not $Subcommand) { Show-Usage }
 
 switch ($Subcommand) {
   'index' {
     if ($Rest.Count -lt 1) { Show-Usage }
-    Invoke-Index -WikiRoot $Rest[0]
+    $wikiRoot = $Rest[0]
+    $codebaseRoot = ''
+    for ($i = 1; $i -lt $Rest.Count; $i++) {
+      if ($Rest[$i] -eq '--codebase-root' -and ($i + 1) -lt $Rest.Count) { $codebaseRoot = $Rest[$i + 1]; $i++ }
+      else { Write-Error "Error: unknown flag: $($Rest[$i])"; exit 1 }
+    }
+    Write-Json @(Collect-Index $wikiRoot $codebaseRoot)
   }
   'walk' {
     if ($Rest.Count -lt 1) { Show-Usage }
     $codebaseRoot = $Rest[0]
     $exclusions = $DefaultExclusions
+    $summary = $false
+    $respectGitignore = $true
     for ($i = 1; $i -lt $Rest.Count; $i++) {
-      if ($Rest[$i] -eq '--exclusions' -and ($i + 1) -lt $Rest.Count) {
-        $exclusions = $Rest[$i + 1]; $i++
+      switch ($Rest[$i]) {
+        '--exclusions' { $exclusions = $Rest[$i + 1]; $i++ }
+        '--summary' { $summary = $true }
+        '--no-gitignore' { $respectGitignore = $false }
+        default { Write-Error "Error: unknown flag: $($Rest[$i])"; exit 1 }
       }
     }
-    Invoke-Walk -CodebaseRoot $codebaseRoot -ExclusionsFile $exclusions
+    $walk = Collect-Walk $codebaseRoot $exclusions $respectGitignore
+    if ($summary) { Write-Json ([PSCustomObject]@{ total = $walk.Entries.Count; by_ext = $walk.ByExt; excluded = $walk.Excluded }) }
+    else { Write-Json @($walk.Entries) }
+  }
+  'diff' {
+    if ($Rest.Count -lt 2) { Show-Usage }
+    $codebaseRoot = $Rest[0]
+    $wikiRoot = $Rest[1]
+    $exclusions = $DefaultExclusions
+    $respectGitignore = $true
+    for ($i = 2; $i -lt $Rest.Count; $i++) {
+      switch ($Rest[$i]) {
+        '--exclusions' { $exclusions = $Rest[$i + 1]; $i++ }
+        '--no-gitignore' { $respectGitignore = $false }
+        default { Write-Error "Error: unknown flag: $($Rest[$i])"; exit 1 }
+      }
+    }
+    $walk = Collect-Walk $codebaseRoot $exclusions $respectGitignore
+    $index = @{}
+    foreach ($entry in (Collect-Index $wikiRoot $codebaseRoot)) { $index[$entry.source_path] = $entry }
+    $diff = @()
+    foreach ($entry in $walk.Entries) {
+      if (-not $index.ContainsKey($entry.path)) { $diff += [PSCustomObject]@{ path = $entry.path; mtime = $entry.mtime; reason = 'new' } }
+      elseif ($entry.mtime -gt $index[$entry.path].ingested_at) { $diff += [PSCustomObject]@{ path = $entry.path; mtime = $entry.mtime; reason = 'stale'; slug = $index[$entry.path].slug } }
+    }
+    Write-Json @($diff)
   }
   default { Show-Usage }
 }

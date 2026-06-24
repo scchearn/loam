@@ -2,6 +2,8 @@
 
 Applied during the `walk` phase to filter the codebase tree. The ingestion skill loads this file and excludes any path matching a pattern below. Files not matched by any exclusion and whose extension is in the include list become ingestion candidates.
 
+The helper also applies low-signal filters before emitting candidates: `.gitignore` ignored paths when Git is available, zero-byte files, whitespace-only files, binary/non-text files, likely generated files by header (`generated`, `auto-generated`, `do not edit`, `@generated`, `Code generated`, `This file was generated`), and files over the default large-file guard.
+
 ## Format
 
 - One glob per line.
@@ -136,4 +138,6 @@ Files with these extensions are ingestion candidates (after exclusions pass):
 - If unsure whether a file is code or config, include it. Downstream summarization handles misclassification gracefully (the role template captures whatever is there).
 - SQL migrations and GraphQL schemas are code — include them.
 - Generated code (e.g. `*.generated.*`) is excluded by default. If generated code is semantically important (e.g. generated protobuf types that other code depends on), the user can override by removing the pattern from their local exclusions or ingesting those files explicitly.
-- Monorepo roots: walk all sub-projects. The 100-file cap handles large monorepos; the user re-invokes to continue.
+- Git ignore: when the codebase root is inside a Git worktree, ignored files are skipped by default. Use `--no-gitignore` only when intentionally ingesting ignored local source.
+- Empty or whitespace-only files are skipped before classification. Non-empty package markers, barrel files, and re-export files remain candidates because they can describe meaningful graph edges.
+- Monorepo roots: walk all sub-projects. The 200-file cap handles large monorepos; the user re-invokes to continue.

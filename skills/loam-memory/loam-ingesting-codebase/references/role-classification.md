@@ -56,5 +56,6 @@ Test and spec files. Captures: what is being tested, which cases are covered (co
 
 - **Mixed file** (types + utilities in one file): classify by the primary export. If `export type User` and `export function getUser` coexist and `getUser` is the main export, classify as `utility` and note the type in the `## Depends on` section.
 - **Barrel file** (re-exports only): classify as `utility`. The summary notes it is a barrel/index file listing what it re-exports.
-- **Empty or trivial file** (license header, single re-export): still ingest. The summary notes the file is minimal.
+- **Empty or whitespace-only file**: excluded before classification by `codegraph walk/diff`; do not summarize it by hand.
+- **Trivial but semantic file** (license header plus exports, barrel file, single re-export): still ingest. The summary notes the file is minimal and captures what graph edge it provides.
 - **Generated code that slipped past exclusions**: classify normally. The summary notes the file appears generated.
