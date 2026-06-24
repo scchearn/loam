@@ -39,6 +39,7 @@ CAPTURED=$(get_fm "Captured")
 REASON=$(get_fm "Reason")
 SCOPE=$(get_fm "Scope")
 FORMAT=$(get_fm "Format")
+INTENDED_RETURN=$(get_fm "Intended return")
 
 # ---------------------------------------------------------------------------
 # 1) Format gate  (non-blocking — always continues)
@@ -76,6 +77,12 @@ else
     scrubbed="${SCOPE#"${SCOPE%%[![:space:]]*}"}"
     scrubbed="${scrubbed%"${scrubbed##*[![:space:]]}"}"
     [ -n "$scrubbed" ] && echo "FRONTMATTER Scope: PASS" || echo "FRONTMATTER Scope: WARN: empty"
+fi
+
+if [ -n "$INTENDED_RETURN" ]; then
+    echo "FRONTMATTER Intended return: PRESENT"
+else
+    echo "FRONTMATTER Intended return: none recorded"
 fi
 
 # ---------------------------------------------------------------------------

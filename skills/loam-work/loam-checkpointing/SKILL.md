@@ -3,9 +3,9 @@ name: loam::checkpointing
 description: "Use when pausing, shutting down, handing off, or context-switching active work and future sessions need a compact resumable checkpoint derived from the current session context. Writes a small checkpoint note under wiki/checkpoints/ and then optionally records the user's intended return step. Not for durable learnings capture, wiki correction, or source ingestion."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: scchearn
-  argument-hint: "[optional reason or hint]"
+  argument-hint: "[optional intended return]"
 ---
 
 You are a senior engineer capturing a durable restart checkpoint for the current workspace. Your job is to write a compact, self-sufficient note that lets a future session pick up the work without reconstructing the whole conversation.
@@ -26,9 +26,9 @@ A checkpoint is an operational restart artifact, not a transcript, diary, or dur
 
 ## Input
 
-Optional reason or hint: $ARGUMENTS
+Optional intended return: $ARGUMENTS
 
-If no argument is given, derive the reason from the current situation.
+If an argument is given, treat it as guidance for what the user expects to do first when they return. If no argument is given, derive the reason from the current situation.
 
 ---
 
@@ -51,7 +51,7 @@ Checkpoint from the **current session first**:
 
 - current conversation state
 - files, plans, notes, or threads already in play
-- the optional reason/hint, if provided
+- the optional intended-return argument, if provided
 
 Do not browse widely. Read only what is immediately relevant to produce a trustworthy restart artifact.
 
@@ -110,10 +110,10 @@ Write the checkpoint note **before** any further reads or questions.
 Filename pattern:
 
 ```text
-<wiki root>/checkpoints/checkpoint-YYYY-MM-DD-HHMM-<scope-slug>.md
+<wiki root>/checkpoints/checkpoint-YYYY-MM-DD-HHMM.md
 ```
 
-If that filename already exists, append a short suffix rather than overwriting.
+If that filename already exists, append the smallest suffix needed rather than overwriting, for example `checkpoint-YYYY-MM-DD-HHMM-2.md`.
 
 Use this shape:
 
@@ -144,7 +144,7 @@ Do not add `Intended return` yet. That comes only after the note is safely writt
 
 ## Step 4 — Link to a recent related checkpoint when justified
 
-Glob the newest 1–2 existing checkpoints by filename (`checkpoint-YYYY-MM-DD-HHMM-*.md`). If one covers the same work lane (same plan/files/thread, not just topic words), add `- Previous: [[note]]`; add `- Supersedes: [[note]]` too if the old note can be skipped on normal resume. Never link more than one. Omit the fields entirely when unused — never write "none".
+Glob the newest 1-2 existing checkpoints by filename (`checkpoint-YYYY-MM-DD-HHMM.md`, `checkpoint-YYYY-MM-DD-HHMM-2.md`, and legacy `checkpoint-YYYY-MM-DD-HHMM-<slug>.md`). If one covers the same work lane (same plan/files/thread, not just topic words), add `- Previous: [[note]]`; add `- Supersedes: [[note]]` too if the old note can be skipped on normal resume. Never link more than one. Omit the fields entirely when unused — never write "none". Treat slugged filenames as legacy only; never infer scope from the slug.
 
 The previous-note matching is best-effort: do not block the write on it.
 
@@ -152,7 +152,13 @@ The previous-note matching is best-effort: do not block the write on it.
 
 ## Step 5 — Ask one optional follow-up question
 
-After the note is written, ask the user exactly one short question — via the harness's interactive question tool if one exists, otherwise as plain text at the end of the turn:
+After the note is written, if `$ARGUMENTS` is non-empty, update the same note by adding one short top-level field near the header and skip the question:
+
+```md
+- Intended return: <argument text>
+```
+
+If `$ARGUMENTS` is empty, ask the user exactly one short question — via the harness's interactive question tool if one exists, otherwise as plain text at the end of the turn:
 
 > "When you come back, what do you think you'll do first? Press enter to keep my inferred next step."
 

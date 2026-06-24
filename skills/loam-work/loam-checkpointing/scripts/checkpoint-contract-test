@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../../.." && pwd)
+VERIFY="$SCRIPT_DIR/checkpoint-verify"
+CHECKPOINTING="$REPO_ROOT/skills/loam-work/loam-checkpointing/SKILL.md"
+RESUMING="$REPO_ROOT/skills/loam-work/loam-resuming/SKILL.md"
+LINTING="$REPO_ROOT/skills/loam-memory/loam-linting-memory/SKILL.md"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+cat > "$tmp/with-intent.md" <<'NOTE'
+# Checkpoint
+
+- Captured: 2026-06-23 15:04 SAST
+- Reason: pause
+- Scope: sample scope
+- Format: v1
+- Intended return: pick up the thing I named
+
+## Workstreams
+
+### Sample
+- Status: ready-to-resume
+- Next: Do the next operational step.
+- Pointers: README.md
+NOTE
+
+cat > "$tmp/without-intent.md" <<'NOTE'
+# Checkpoint
+
+- Captured: 2026-06-23 15:04 SAST
+- Reason: pause
+- Scope: sample scope
+- Format: v1
+
+## Workstreams
+
+### Sample
+- Status: ready-to-resume
+- Next: Do the next operational step.
+- Pointers: README.md
+NOTE
+
+with_output=$("$VERIFY" "$tmp/with-intent.md")
+without_output=$("$VERIFY" "$tmp/without-intent.md")
+
+grep -Fq 'FRONTMATTER Intended return: PRESENT' <<< "$with_output"
+grep -Fq 'FRONTMATTER Intended return: none recorded' <<< "$without_output"
+
+grep -Fq 'checkpoint-YYYY-MM-DD-HHMM.md' "$CHECKPOINTING"
+! grep -Fq 'checkpoint-YYYY-MM-DD-HHMM-<scope-slug>.md' "$CHECKPOINTING"
+
+grep -Fq 'Return intent: <intent | none recorded>.' "$RESUMING"
+grep -Fq 'Pick up `<scope>` by <single next action>.' "$RESUMING"
+! grep -Fq '### Resume target' "$RESUMING"
+
+grep -Fq 'checkpoint-YYYY-MM-DD-HHMM-<slug>.md' "$LINTING"
+grep -Fq 'checkpoint-YYYY-MM-DD-HHMM.md' "$LINTING"
+
+echo "checkpoint contract: PASS"

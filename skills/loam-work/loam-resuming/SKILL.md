@@ -3,7 +3,7 @@ name: loam::resuming
 description: "Use when resuming work after a pause, reboot, or context switch and the workspace uses `wiki/checkpoints/` resumable notes. Read the latest relevant checkpoint chain, orient to the most likely in-flight scope, verify current files and tools before acting, and report the safest next step."
 allowed-tools: Read Glob Grep Bash
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: scchearn
   argument-hint: "[optional hint or focus]"
 ---
@@ -24,7 +24,7 @@ If no hint is provided, derive the likely resume target from the current session
 
 1. Find the wiki root by locating `**/checkpoints/checkpoint-*.md` (the newest match by filename-timestamp sort). If multiple roots match, prefer the one with the most-recent checkpoint.
 2. When no `wiki/checkpoints/` exists, create it (or fall back to `notes/checkpoints/` if wiki is undesired) so a future loam::checkpointing call has a place to land. If the glob still returns no checkpoint files, stop and say there is nothing to resume.
-3. Read only the newest **3-5** checkpoint notes, sorted by filename `checkpoint-YYYY-MM-DD-HHMM-*.md` (not by mtime — sync clients rewrite mtimes).
+3. Read only the newest **3-5** checkpoint notes, sorted by the filename timestamp prefix (`checkpoint-YYYY-MM-DD-HHMM.md`, suffixed collision files, and legacy slugged files), not by mtime — sync clients rewrite mtimes.
 4. Derive the current resume context from:
    - the current conversation/session
    - the optional hint, if present
@@ -73,13 +73,13 @@ Do not turn the chain into history reconstruction. Read only enough to restart s
 From the chosen checkpoint chain, extract only:
 
 - the inferred scope
-- the user's intended return, when present
+- the user's intended return, or exactly `none recorded` when absent
 - workstreams with Status: active, blocked, or ready-to-resume. Also surface any Status: waiting blockers prominently in the report.
 - the immediate `Next` action
 - the concrete pointers worth opening first
 - blockers or uncertainty that still matter
 
-Treat checkpoint notes as orientation, not authority. They say where work likely stopped, not whether the current world still matches.
+Treat checkpoint notes as orientation, not authority. They say where work likely stopped, not whether the current world still matches. Do not infer return intent from workstream `Next`; if `Intended return` is absent, say so and use `Next` only as the operational restart action.
 
 ---
 
@@ -89,7 +89,7 @@ Before recommending action, verify the checkpoint against current evidence.
 
 Verify only what the checkpoint would cause you to act on, such as:
 
-- does `Intended return` still fit the live workspace state
+- does `Intended return` still fit the live workspace state, when one was recorded
 - do referenced files still exist
 - does the cited plan/spec/note still match the checkpoint summary
 - do named tools, services, or threads still appear current. Treat empty `hcom events --thread <name>` results as "thread idle/expired — re-open or re-delegate," not as an error. The thread may have been pruned or never persisted; do not fail the resume.
@@ -104,28 +104,20 @@ If the live state conflicts with the checkpoint, say so directly and prefer the 
 Output a compact restart brief in this shape:
 
 ```md
-### Resume target
-- Scope: <scope>
-- Confidence: high | medium | low
-- Checkpoints read: <path>, <path>
-- Intended return: <top-level intended return, or "none recorded">
+### Resume
 
-### Restart brief
-- Current status: <1-3 bullets>
-- First next step: <single concrete action>
-- Open first: <paths / notes / tools>
+Return intent: <intent | none recorded>.
 
-### Verification
-- Confirmed: <what matched live state>
-- Mismatch: <what did not match, or "none">
+Pick up `<scope>` by <single next action>.
 
-### Safe recommendation
-- <continue here | checkpoint appears stale | need user confirmation>
+Open first: <1-3 paths/tools/threads>.
+
+Note: <only blocker/mismatch/uncertainty, or omit if none>
 ```
 
 If confidence is low, or the checkpoint chain is stale or ambiguous, say that before suggesting action.
 
-If `Intended return` exists, surface it before the restart brief and treat it as the preferred statement of what the user expected to do first, unless live verification clearly contradicts it.
+If `Intended return` exists, surface it as `Return intent:` and treat it as the preferred statement of what the user expected to do first, unless live verification clearly contradicts it. If it is absent, write `Return intent: none recorded.` and use the checkpoint `Next:` value for `Pick up ... by ...`; mention that basis in `Note:` when it prevents confusion.
 
 ---
 
@@ -134,7 +126,7 @@ If `Intended return` exists, surface it before the restart brief and treat it as
 - Read only the newest 3-5 checkpoint notes when choosing a candidate.
 - Use semantic scope matching, but require at least one concrete overlap for a strong match.
 - Default to the latest checkpoint plus one `Previous` note; never read more than 3 notes total.
-- When a checkpoint records `Intended return`, surface it explicitly and verify it before using it as the first next step.
+- Always surface `Return intent:`. If no checkpoint records `Intended return`, say `none recorded` rather than inferring it from `Next:`.
 - Verify live files and tools before recommending action.
 - Trust live workspace state over checkpoint notes when they conflict.
 - Never edit checkpoint notes, plans, or source files. Directory creation for empty checkpoint lanes is allowed when no lane exists.

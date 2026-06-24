@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate). Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, or consolidate a legacy root `overview.md` into `index.md`. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: scchearn
   argument-hint: [wiki root or focus area]
 ---
@@ -83,7 +83,7 @@ qmd is **secondary only** in this skill: use it only to find related-note neighb
 
 ### Audit for health issues
 
-**A. Structure and inventory** — Check for: `index.md` missing `## Overview` section; legacy `overview.md` still present; content stranded in `overview.md` instead of `index.md`; duplicated root-hub content; pages on disk but missing from index; index entries pointing to non-existent pages; duplicate note identities; filename convention drift; near-duplicate pages; empty or placeholder pages.
+**A. Structure and inventory** — Check for: `index.md` missing `## Overview` section; legacy `overview.md` still present; content stranded in `overview.md` instead of `index.md`; duplicated root-hub content; pages on disk but missing from index; index entries pointing to non-existent pages; duplicate note identities; filename convention drift; legacy checkpoint filenames like `checkpoint-YYYY-MM-DD-HHMM-<slug>.md` that should become `checkpoint-YYYY-MM-DD-HHMM.md`; near-duplicate pages; empty or placeholder pages.
 
 **B. Link health** — Check for: unresolved `[[wikilinks]]`; orphan pages; pages with no meaningful inbound or outbound links; pages only discoverable from `index.md`; pages that should link but don't; missing reciprocal backlinks; repeated entity/concept mentions without a dedicated page.
 
@@ -131,6 +131,14 @@ When `<wiki root>/.wiki-metadata.json` has a stale `retrieval.collection_path`:
 5. if no qmd collection points at the actual `<wiki root>`, or validation cannot be completed, set `retrieval.status` to `"degraded"`, keep the corrected `retrieval.collection_path`, and report the qmd collection repair needed
 6. record the metadata reconciliation in `<wiki root>/log.md`
 
+When `<wiki root>/checkpoints/` contains legacy slugged checkpoint filenames:
+
+1. identify files matching `checkpoint-YYYY-MM-DD-HHMM-<slug>.md`
+2. propose renames to `checkpoint-YYYY-MM-DD-HHMM.md`, using the smallest suffix only when a collision exists
+3. update checkpoint wikilinks that reference renamed notes
+4. apply the migration only through lint's normal proposal/approval path; do not rename checkpoint files silently
+5. record the checkpoint filename migration in `<wiki root>/log.md`
+
 Allowed direct fixes:
 
 1. updating `index.md` to match actual durable pages with `## Overview`
@@ -144,6 +152,7 @@ Allowed direct fixes:
 9. normalizing internal links to canonical `[[kebab-case-note-name]]` form
 10. moving only a misplaced nested `<wiki root>/.obsidian/` directory to the parent directory root when the destination has no `.obsidian/` directory
 11. reconciling stale `<wiki root>/.wiki-metadata.json` paths to the actual resolved wiki root
+12. after explicit approval, renaming legacy checkpoint files from `checkpoint-YYYY-MM-DD-HHMM-<slug>.md` to `checkpoint-YYYY-MM-DD-HHMM.md` and updating their checkpoint wikilinks
 
 Do not: ingest new raw sources, invent facts, silently merge/rename notes, silently delete disagreement/uncertainty, leave redundant `overview.md`, overwrite or merge an existing parent `.obsidian/`, move or rename `<wiki root>` or any wiki content directory, perform broad rewrites, or modify raw-source files.
 
@@ -155,7 +164,7 @@ Append to `<wiki root>/log.md`:
 ## [YYYY-MM-DD] lint | <scope>
 ```
 
-Capture: scope, pages created/updated/removed, issues fixed, unresolved contradictions/gaps, legacy root-hub consolidation, `.obsidian/` placement fixes or unresolved conflicts, qmd metadata reconciliation or degraded state, suggested next ingests.
+Capture: scope, pages created/updated/removed, issues fixed, unresolved contradictions/gaps, legacy root-hub consolidation, checkpoint filename migrations, `.obsidian/` placement fixes or unresolved conflicts, qmd metadata reconciliation or degraded state, suggested next ingests.
 
 Keep `log.md` append-only. Ensure `index.md` reflects the final state before finishing.
 
@@ -203,6 +212,7 @@ If the pass found no significant issues, say so explicitly and still note any re
 - Treat a separate root `overview.md` as legacy drift. Consolidate into `index.md` and remove during lint.
 - Treat `<wiki root>/.obsidian/` as misplaced Obsidian config when `<wiki root>` is a subdirectory. Move only `.obsidian/` to the parent directory root when that destination has no `.obsidian/` directory.
 - Reconcile stale `.wiki-metadata.json` to the actual resolved wiki root. Lint updates metadata to match the on-disk wiki; it never moves the on-disk wiki to match metadata.
+- Own checkpoint filename migration. New checkpoints should be named `checkpoint-YYYY-MM-DD-HHMM.md`; lint may propose and, after approval, rename legacy slugged checkpoint files and update checkpoint wikilinks.
 - Never move or rename `<wiki root>` or any wiki content directory as part of `.obsidian/` placement or qmd metadata repair.
 - Update `<wiki root>/log.md` on every lint pass.
 - Keep the note graph traversable, not just the index accurate.
