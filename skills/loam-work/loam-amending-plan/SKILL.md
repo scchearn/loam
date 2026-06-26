@@ -3,7 +3,7 @@ name: loam::amending-plan
 description: "Amend an existing plan file — add tasks, modify pending or delegated tasks, and mark completed tasks that are invalidated by the change as [>] (needs re-run). Walks through analysis, cascading impact, and user confirmation before touching the file. When memory (wiki substrate) exists, it may also preserve durable amendment findings there."
 allowed-tools: Read Write Edit Glob Grep
 metadata:
-  version: "1.0.0"
+  version: "1.0.1"
   author: scchearn
   argument-hint: plans/<slug>.md # describe what to amend in your message, then invoke this skill
 ---
@@ -194,7 +194,7 @@ Append new tasks after the last existing task, continuing the ID sequence (last 
 - **Verify:** `<workspace-native automated check>`
 - **Files to read:** <!-- research memos, docs, existing source files, contracts, tests, or external references to consult -->
 - **Files to modify:** <!-- source files, tests, docs, or generated artifacts this task will change -->
-- **Notes:** Added by amendment YYYY-MM-DD: <reason>
+- **Notes:** Added by amendment YYYY-MM-DD — <reason> (em-dash, per `loam-using/references/date-formats.md`)
 ```
 
 If the new task should be delegated later, use the same structured `Execution` format the plan already uses.

@@ -3,7 +3,7 @@ name: loam::scaffolding-wiki
 description: "Create or extend an Obsidian-friendly markdown wiki scaffold in the current workspace. Use this when the user wants to build a wiki, set up a knowledge base, create a research vault, or scaffold a living markdown note graph before adding sources with `/loam::adding-to-memory`. Not for importing or normalizing existing memory-like corpus; use /loam::normalizing-memory for that."
 allowed-tools: Read Glob Grep Write Edit AskUserQuestion Skill Bash
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: scchearn
   argument-hint: <topic, corpus, or wiki goal>
 ---
@@ -75,6 +75,7 @@ Rules:
 5. `<wiki root>/index.md` is the home hub with a concise `## Overview` section near the top.
 6. `<wiki root>/log.md` is the append-only chronological record. Rotate when it exceeds 500 lines: move entries older than the most recent 50 to `log-archive/YYYY-MM.md`, keep a `## [YYYY-MM-DD] rotate | archived <N> entries to log-archive/YYYY-MM.md` pointer line. Active `log.md` stays under ~250 lines.
 7. `<wiki root>/SCHEMA.md` is the maintenance contract.
+8. All timestamps follow `loam-using/references/date-formats.md`. Point-in-time fields (front matter, checkpoint `Captured:`) include a timezone offset (`±HH:MM`); daily-granularity surfaces (log headings, decisions, inline dates) do not.
 
 Do not create a separate root `overview.md`. Only create category directories that are justified.
 

@@ -3,7 +3,7 @@ name: loam::writing-spec
 description: "Research workspace context, APIs, implementation options, or external evidence before planning. The terminal artifact is always a spec at specs/<slug>.md; a plans/research/<slug>.md memo is optional supporting evidence when substantial investigation was needed."
 allowed-tools: Read Glob Grep Bash WebFetch Write Edit
 metadata:
-  version: "3.0.0"
+  version: "3.0.1"
   author: scchearn
   argument-hint: <topic or question>
 ---

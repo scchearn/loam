@@ -2,8 +2,8 @@
 title: <Spec Title>
 slug: <spec-slug>
 status: draft # draft | approved | superseded
-created_at: YYYY-MM-DD HH:MM
-updated_at: YYYY-MM-DD HH:MM
+created_at: YYYY-MM-DD HH:MM ±HH:MM
+updated_at: YYYY-MM-DD HH:MM ±HH:MM
 approved_at: null
 research: [] # optional: plans/research/<slug>.md
 ---

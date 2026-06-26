@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate). Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, or consolidate a legacy root `overview.md` into `index.md`. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.2.0"
+  version: "1.3.0"
   author: scchearn
   argument-hint: [wiki root or focus area]
 ---
@@ -166,6 +166,26 @@ Check `<wiki root>/log.md` line count. If it exceeds 500 lines:
 
 This is the only log mutation lint performs. Lint is otherwise read-only with respect to `log.md` — it does not append a per-pass entry, because lint is a health check, not a content change.
 
+### Check date format drift
+
+Run `datecheck` to scan all markdown files for date-format drift:
+
+```bash
+bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/datecheck.sh" check "$WIKI_ROOT" 2>/dev/null \
+  || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/datecheck.ps1" check "$WIKI_ROOT" 2>/dev/null
+```
+
+The script reports drift as JSON: front matter point-in-time fields missing timezone offsets, legacy TZ labels (`SAST`, `GMT+N`, `UTC`), and decisions-log entries using non-em-dash separators.
+
+Canonical formats are defined in `loam-using/references/date-formats.md`.
+
+If drift is found:
+1. Report the findings to the user.
+2. After approval, run `datecheck.sh fix "$WIKI_ROOT" --offset <local-offset>` to apply normalizations.
+3. Re-run `datecheck.sh check` to confirm zero drift.
+
+This check is read-only — `check` mode never writes. `fix` mode is only run after explicit approval, same as checkpoint filename migration.
+
 ### Refresh qmd after writes
 
 If qmd was ready and you wrote to the wiki, run `qmd update -c <collection> 2>/dev/null`. If refresh fails, report it but do not roll back wiki edits.
@@ -213,6 +233,7 @@ If the pass found no significant issues, say so explicitly and still note any re
 - Own checkpoint filename migration. New checkpoints should be named `checkpoint-YYYY-MM-DD-HHMM.md`; lint may propose and, after approval, rename legacy slugged checkpoint files and update checkpoint wikilinks.
 - Never move or rename `<wiki root>` or any wiki content directory as part of `.obsidian/` placement or qmd metadata repair.
 - Rotate `<wiki root>/log.md` when it exceeds 500 lines; lint does not append per-pass entries to `log.md`.
+- Check date format drift with `datecheck.sh check`; canonical formats are in `loam-using/references/date-formats.md`. Fix only after approval, same as checkpoint filename migration.
 - Keep the note graph traversable, not just the index accurate.
 - Keep `index.md` aligned with the durable pages that exist after the pass.
 - qmd is secondary. Structural checks remain Glob- and Grep-led. Use qmd only to find related-note neighborhoods.

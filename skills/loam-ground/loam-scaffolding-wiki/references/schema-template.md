@@ -77,6 +77,7 @@ The wiki layer is stored in `<wiki path>`. Those files are maintained by the age
 
 - `log.md` is append-only.
 - Use parseable headings such as `## [YYYY-MM-DD] build | Initial wiki scaffold`, `## [YYYY-MM-DD] add (file) | <source title>`, and `## [YYYY-MM-DD] add (chat) | <topic>`.
+- All timestamps follow `loam-using/references/date-formats.md`. Log headings use `YYYY-MM-DD` (no TZ); point-in-time fields include `±HH:MM` offset.
 - Record builds, `/loam::adding-to-memory` runs, query write-backs, amendments, and durable write-backs from research, planning, execution, and amendment workflows.
 - **Rotation:** when `log.md` exceeds 500 lines, move entries older than the most recent 50 to `<wiki root>/log-archive/YYYY-MM.md`. Replace the moved content with a `## [YYYY-MM-DD] rotate | archived <N> entries to log-archive/YYYY-MM.md` pointer line. Active `log.md` stays under ~250 lines. `/loam::linting-memory` performs rotation as a health-check fix.
 

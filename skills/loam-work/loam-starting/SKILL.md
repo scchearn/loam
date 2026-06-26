@@ -3,7 +3,7 @@ name: loam::starting
 description: "Use when beginning or resuming a plan file, including mixed local and hcom-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
 allowed-tools: Read Write Edit Glob Grep Bash WebFetch
 metadata:
-  version: "2.1.0"
+  version: "2.1.1"
   author: scchearn
   argument-hint: plans/<slug>.md [T3 | T3,T5,T7 | T3-T7]
 ---
@@ -259,7 +259,7 @@ For a **delegation group**:
 If this is the **first task or delegation** of the session and front matter `status` is still `pending`, update metadata before doing any code work:
 
 - Set front matter `status` to `in-progress`
-- Set front matter `started_at` to the current local date and time, format `YYYY-MM-DD HH:MM`, if it is currently `null`
+- Set front matter `started_at` to the current local date and time, format `YYYY-MM-DD HH:MM ±HH:MM` (per `loam-using/references/date-formats.md`), if it is currently `null`
 - Keep front matter `task_count` equal to the number of `### T...` task blocks currently in the plan
 - Sync the corresponding row in `plans/INDEX.md` so `Status`, `Title`, `Plan`, `Description`, and `Tasks` mirror the front matter, and move the row if the status ordering changed
 
@@ -346,7 +346,7 @@ At session end (queue exhausted or handoff), write the accumulated rows to the p
 If this was the **last remaining task** (all tasks in the plan are now `[x]`), also:
 
 - Update front matter `status` to `done`
-- Set front matter `completed_at` to the current local date and time, format `YYYY-MM-DD HH:MM`
+- Set front matter `completed_at` to the current local date and time, format `YYYY-MM-DD HH:MM ±HH:MM` (per `loam-using/references/date-formats.md`)
 - Keep front matter `task_count` equal to the number of task blocks in the plan
 - Sync the row in `plans/INDEX.md` so `Status`, `Title`, `Plan`, `Description`, and `Tasks` reflect the completed plan
 
@@ -380,7 +380,7 @@ This is a recommendation, not an automatic invocation. The user runs the sync ma
 
 If you made any non-obvious implementation decision during this task or delegated group, append an entry to the Decisions log:
 
-`YYYY-MM-DD — <decision and rationale>`
+`YYYY-MM-DD — <decision and rationale>` (em-dash separator, per `loam-using/references/date-formats.md`)
 
 The Decisions log is **append-only**. Never edit or delete existing entries.
 

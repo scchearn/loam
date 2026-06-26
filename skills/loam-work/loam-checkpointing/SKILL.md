@@ -3,7 +3,7 @@ name: loam::checkpointing
 description: "Use when pausing, shutting down, handing off, or context-switching active work and future sessions need a compact resumable checkpoint derived from the current session context. Writes a small checkpoint note under wiki/checkpoints/ and then optionally records the user's intended return step. Not for durable learnings capture, wiki correction, or source ingestion."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.1.0"
+  version: "1.1.1"
   author: scchearn
   argument-hint: "[optional intended return]"
 ---
@@ -120,7 +120,7 @@ Use this shape:
 ```md
 # Checkpoint
 
-- Captured: YYYY-MM-DD HH:MM TZ
+- Captured: YYYY-MM-DD HH:MM ±HH:MM
 - Reason: shutdown | pause | handoff | context-switch
 - Scope: <short scope>
 - Format: v1

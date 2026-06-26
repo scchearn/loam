@@ -5,7 +5,7 @@ spec: <spec-slug>
 description: <Short plan summary, 70 tokens max>
 status: pending # pending | in-progress | done | abandoned
 task_count: 0
-created_at: YYYY-MM-DD HH:MM
+created_at: YYYY-MM-DD HH:MM ±HH:MM
 started_at: null
 completed_at: null
 ---
