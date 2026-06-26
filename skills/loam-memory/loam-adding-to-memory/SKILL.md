@@ -3,7 +3,7 @@ name: loam::adding-to-memory
 description: "Read a local source file or synthesize conversation context, then integrate the content directly into topic, entity, concept, and analysis pages in existing memory (the wiki substrate). Use this when the user wants to add a source to the wiki, add a document, ingest a local note, transcript, article, report, or PDF, or explicitly preserve the current conversation as a topic note. Not for proposal-first session learnings that directly update existing pages; use /loam::learning-from-session."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: scchearn
   argument-hint: <local source path | topic or summary from chat>
 ---

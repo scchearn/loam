@@ -3,7 +3,7 @@ name: loam::learning-from-session
 description: "Review the current session for durable learnings, then route each one to the right durable surface: a wiki page (proposal-first, via the wiki-page workflow) or an agent guidance file (concise one-liner edits, via the guidance-file workflow). Use when the session uncovered decisions, architecture facts, commands, conventions, gotchas, or open questions that future sessions should inherit. Not for source ingestion or correcting stale wiki claims; use /loam::adding-to-memory or /loam::amending-memory."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: scchearn
   argument-hint: [topic or session summary]
 ---
