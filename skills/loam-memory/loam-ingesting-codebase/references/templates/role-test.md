@@ -5,7 +5,7 @@ Use this template for test and spec files. Captures what is being tested and whi
 ```md
 ---
 source_path: <relative-path-from-codebase-root>
-ingested_at: <YYYY-MM-DD>
+ingested_at: <source-file-mtime-epoch>
 ---
 
 # <TestSuiteName>

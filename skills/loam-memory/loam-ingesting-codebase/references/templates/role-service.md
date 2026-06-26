@@ -5,7 +5,7 @@ Use this template for files that expose an API surface: Express routes, Django v
 ```md
 ---
 source_path: <relative-path-from-codebase-root>
-ingested_at: <YYYY-MM-DD>
+ingested_at: <source-file-mtime-epoch>
 ---
 
 # <PrimaryExportOrRouteName>

@@ -5,7 +5,7 @@ Use this template for files defining semantic constants, configuration objects, 
 ```md
 ---
 source_path: <relative-path-from-codebase-root>
-ingested_at: <YYYY-MM-DD>
+ingested_at: <source-file-mtime-epoch>
 ---
 
 # <ConfigName>

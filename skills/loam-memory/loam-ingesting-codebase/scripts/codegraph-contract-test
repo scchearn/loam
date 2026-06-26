@@ -7,6 +7,10 @@ REPO_ROOT=$(cd -- "$SKILL_DIR/../../.." && pwd)
 CODEGRAPH="$SCRIPT_DIR/codegraph.sh"
 INGEST_SKILL="$SKILL_DIR/SKILL.md"
 
+stat_epoch() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
+}
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -35,6 +39,9 @@ EOF
 cat > "$codebase/src/stale.ts" <<'EOF'
 export const stale = 1;
 EOF
+cat > "$codebase/src/legacy.ts" <<'EOF'
+export const legacy = 1;
+EOF
 cat > "$codebase/src/new.ts" <<'EOF'
 export const fresh = 1;
 EOF
@@ -58,22 +65,36 @@ root.joinpath('binary.ts').write_bytes(b'abc\x00def')
 PY
 
 touch -d '2026-06-20 10:00:00' "$codebase/src/current.ts"
-touch -d '2026-06-24 10:00:00' "$codebase/src/stale.ts"
+touch -d '2026-06-24 16:53:00' "$codebase/src/stale.ts"
+touch -d '2026-06-24 12:00:00' "$codebase/src/legacy.ts"
 touch -d '2026-06-24 10:00:00' "$codebase/src/new.ts"
+
+current_epoch=$(stat_epoch "$codebase/src/current.ts")
+stale_ingested_epoch=$(date -d '2026-06-24 14:33:00' '+%s')
+stale_epoch=$(stat_epoch "$codebase/src/stale.ts")
 
 cat > "$wiki/entities/current.md" <<'EOF'
 ---
 source_path: src/current.ts
-ingested_at: 2026-06-24
+ingested_at: CURRENT_EPOCH
 ---
 # Current
 EOF
+sed -i "s/CURRENT_EPOCH/$current_epoch/" "$wiki/entities/current.md"
 cat > "$wiki/entities/stale.md" <<'EOF'
 ---
 source_path: src/stale.ts
-ingested_at: 2026-06-20
+ingested_at: STALE_INGESTED_EPOCH
 ---
 # Stale
+EOF
+sed -i "s/STALE_INGESTED_EPOCH/$stale_ingested_epoch/" "$wiki/entities/stale.md"
+cat > "$wiki/entities/legacy.md" <<'EOF'
+---
+source_path: src/legacy.ts
+ingested_at: 2026-06-24
+---
+# Legacy
 EOF
 
 walk_json=$("$CODEGRAPH" walk "$codebase")
@@ -101,7 +122,7 @@ else
   no_gitignore_json='[]'
 fi
 
-WALK_JSON="$walk_json" SUMMARY_JSON="$summary_json" INDEX_JSON="$index_json" DIFF_JSON="$diff_json" NO_GITIGNORE_JSON="$no_gitignore_json" python3 - <<'PY'
+WALK_JSON="$walk_json" SUMMARY_JSON="$summary_json" INDEX_JSON="$index_json" DIFF_JSON="$diff_json" NO_GITIGNORE_JSON="$no_gitignore_json" STALE_EPOCH="$stale_epoch" python3 - <<'PY'
 import json, os
 
 walk = json.loads(os.environ['WALK_JSON'])
@@ -113,6 +134,7 @@ no_gitignore = json.loads(os.environ['NO_GITIGNORE_JSON'])
 paths = {item['path'] for item in walk}
 assert 'src/current.ts' in paths
 assert 'src/stale.ts' in paths
+assert 'src/legacy.ts' in paths
 assert 'src/new.ts' in paths
 assert 'src/semantic.py' in paths
 assert 'src/empty.ts' not in paths
@@ -135,15 +157,16 @@ assert excluded['gitignore'] >= 1
 
 by_source = {item['source_path']: item for item in index}
 assert by_source['src/current.ts']['exists'] is True
-assert by_source['src/current.ts']['mtime'] == '2026-06-20'
+assert by_source['src/current.ts']['mtime'].isdigit()
 assert by_source['src/stale.ts']['exists'] is True
-assert by_source['src/stale.ts']['mtime'] == '2026-06-24'
+assert by_source['src/stale.ts']['mtime'] == os.environ['STALE_EPOCH']
 
 by_path = {item['path']: item for item in diff}
 assert 'src/new.ts' in by_path and by_path['src/new.ts']['reason'] == 'new'
 assert 'src/semantic.py' in by_path and by_path['src/semantic.py']['reason'] == 'new'
 assert 'src/stale.ts' in by_path and by_path['src/stale.ts']['reason'] == 'stale'
 assert by_path['src/stale.ts']['slug'] == 'stale'
+assert 'src/legacy.ts' in by_path and by_path['src/legacy.ts']['reason'] == 'stale'
 assert 'src/current.ts' not in by_path
 assert 'src/empty.ts' not in by_path
 assert 'ignored.ts' not in by_path
@@ -154,5 +177,8 @@ grep -Fq 'Cap the work set at 200 files.' "$INGEST_SKILL"
 grep -Fq 'Do not substitute the codebase root, workspace root, or parent directory.' "$INGEST_SKILL"
 grep -Fq 'never report the codebase as fully ingested' "$INGEST_SKILL"
 grep -Fq 'Do not proceed from an empty index caused by a bad wiki-root path.' "$INGEST_SKILL"
+grep -Fq 'ingested_at: <source-file-mtime-epoch>' "$INGEST_SKILL"
+grep -Fq 'Legacy pages with date-only `ingested_at` are stale once' "$INGEST_SKILL"
+grep -R -Fq 'ingested_at: <source-file-mtime-epoch>' "$SKILL_DIR/references/templates"
 
 echo "codegraph contract: PASS"

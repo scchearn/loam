@@ -3,12 +3,12 @@ name: loam::syncing-code-graph
 description: "Reconcile the code graph in memory (wiki substrate) against the actual codebase. In --touched mode, re-summarizes only files a completed plan touched (cheap, post-plan gate). In --sweep mode, walks the whole repo and patches drift from out-of-band edits. Drift is accepted between gates; this skill is the only place the code graph is reconciled to the repo tree."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.2.0"
+  version: "1.3.0"
   author: scchearn
   argument-hint: <codebase root> [--touched <plan-path>] [--sweep]
 ---
 
-You are a senior engineer reconciling the code graph in memory against the actual codebase. The wiki holds entity pages (ingested by `/loam::ingesting-codebase`) with `source_path:` and `ingested_at:` front matter. This skill patches drift — it does not do first-time ingestion (that's the ingestion skill's job) and it does not health-check the wiki's internal graph (that's `/loam::linting-memory`).
+You are a senior engineer reconciling the code graph in memory against the actual codebase. The wiki holds entity pages (ingested by `/loam::ingesting-codebase`) with `source_path:` and `ingested_at:` front matter. `ingested_at` is the source file's Unix epoch mtime, not a wall-clock ingest date. This skill patches drift — it does not do first-time ingestion (that's the ingestion skill's job) and it does not health-check the wiki's internal graph (that's `/loam::linting-memory`).
 
 Drift between the wiki and the codebase is inevitable and accepted. This skill is invoked at natural gates (plan completion, on-demand sweep) and touches only what changed.
 
@@ -88,8 +88,8 @@ For each touched path:
 
 1. **File no longer exists** → its entity page is now orphaned. Find the entity page whose `source_path:` matches (from the index). Remove the page. Find all pages that link to it (`[[slug]]`) and remove those links. Record the removal.
 
-2. **File exists** → compare its `mtime` (from `stat`) against the entity page's `ingested_at`:
-   - **File newer** → re-summarize. Read the file, classify role (using the ingestion skill's `role-classification.md` rubric), load the matching role template, extract fields, generate the entity page markdown, and overwrite the page. Update `ingested_at:` to today. Update `source_path:` if the path changed (rename).
+2. **File exists** → compare its Unix epoch `mtime` (from `stat`) against the entity page's `ingested_at`:
+   - **File newer** → re-summarize. Read the file, classify role (using the ingestion skill's `role-classification.md` rubric), load the matching role template, extract fields, generate the entity page markdown, and overwrite the page. Update `ingested_at:` to the file's current mtime epoch. Update `source_path:` if the path changed (rename).
    - **File unchanged or older** → skip. No re-summarization needed.
 
 3. **File exists but not in the index** → new file created by the plan. Flag it for ingestion. Do NOT auto-ingest in touched mode — recommend `/loam::ingesting-codebase <codebase-root>` to the user. Record the new file.
@@ -123,7 +123,7 @@ Run the walk subcommand from the ingestion skill:
   --exclusions "${CLAUDE_SKILL_DIR}/../loam-ingesting-codebase/references/ingestion-exclusions.md"
 ```
 
-Parse the JSON output: a list of `{path, mtime}` for candidate code files.
+Parse the JSON output: a list of `{path, mtime}` for candidate code files, where `mtime` is Unix epoch seconds.
 
 You may also run the diff subcommand to get `new` and `stale` sets directly:
 
@@ -143,8 +143,8 @@ Build three sets:
 1. **Orphaned nodes** — entity pages in the index whose `source_path` does NOT appear in the walk output. These correspond to deleted files.
    - For each: remove the entity page. Find all pages linking to it and remove the links. Record the removal.
 
-2. **Stale nodes** — entity pages whose `source_path` IS in the walk output but the file's `mtime` is newer than the page's `ingested_at`.
-   - For each: re-summarize (read, classify, template, write). Update `ingested_at:` to today. Re-wire edges.
+2. **Stale nodes** — entity pages whose `source_path` IS in the walk output but the file's epoch `mtime` is newer than the page's `ingested_at`, or whose legacy `ingested_at` is not numeric.
+   - For each: re-summarize (read, classify, template, write). Update `ingested_at:` to the file's current mtime epoch. Re-wire edges.
 
 3. **New files** — walked files not in the index.
    - Do NOT auto-ingest. Flag them and recommend `/loam::ingesting-codebase <codebase-root>` to the user. Record the count.
@@ -217,7 +217,7 @@ Code graph synced from <codebase root>
 - Never auto-ingest new files. Sweep reconciles drift; first-time ingest is `/loam::ingesting-codebase`'s job.
 - `--touched` mode requires a valid plan path with a populated `## Touched files` section. If absent or empty, stop and tell the user.
 - Drift is accepted. Do not attempt to prevent it; only patch it when invoked.
-- Code-ingested entity pages carry `source_path:` and `ingested_at:` front matter. Use them; do not recompute from the body.
+- Code-ingested entity pages carry `source_path:` and numeric `ingested_at:` front matter. Use them; do not recompute from the body.
 - After wiki writes, refresh qmd if ready. Failures are reported, not rolled back.
 - Read the wiki schema before editing the index or log.
 - When re-summarizing, reuse the ingestion skill's role templates and classification rubric — do not improvise a different node format.

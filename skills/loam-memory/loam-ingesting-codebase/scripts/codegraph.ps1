@@ -22,7 +22,11 @@ Usage:
   exit 1
 }
 
-function Format-JsonDate([datetime]$Date) { $Date.ToString('yyyy-MM-dd') }
+function Format-JsonMtime([datetime]$Date) {
+  ([DateTimeOffset]$Date.ToUniversalTime()).ToUnixTimeSeconds().ToString()
+}
+
+function Test-EpochString([string]$Value) { $Value -match '^\d+$' }
 
 function Assert-WikiRoot([string]$WikiRoot) {
   if (-not $WikiRoot -or -not (Test-Path $WikiRoot -PathType Container)) {
@@ -118,7 +122,7 @@ function Collect-Walk([string]$CodebaseRoot, [string]$ExclusionsFile, [bool]$Res
     if ($file.Length -gt $MaxBytes) { $excluded.large++; continue }
     if (Test-GeneratedHeader $file.FullName) { $excluded.generated_header++; continue }
 
-    $entries += [PSCustomObject]@{ path = $rel; mtime = (Format-JsonDate $file.LastWriteTime) }
+    $entries += [PSCustomObject]@{ path = $rel; mtime = (Format-JsonMtime $file.LastWriteTime) }
     $byExt[$ext] = 1 + ($byExt[$ext] ?? 0)
   }
   @{ Entries = $entries; ByExt = $byExt; Excluded = $excluded }
@@ -152,7 +156,7 @@ function Collect-Index([string]$WikiRoot, [string]$CodebaseRoot = '') {
     $resolved = Resolve-Source $sourcePath $CodebaseRoot
     $exists = Test-Path $resolved -PathType Leaf
     $mtime = ''
-    if ($exists) { $mtime = Format-JsonDate (Get-Item $resolved).LastWriteTime }
+    if ($exists) { $mtime = Format-JsonMtime (Get-Item $resolved).LastWriteTime }
     $entries += [PSCustomObject]@{ source_path = $sourcePath; slug = [System.IO.Path]::GetFileNameWithoutExtension($page.Name); ingested_at = $ingestedAt; mtime = $mtime; exists = $exists }
   }
   $entries
@@ -213,7 +217,7 @@ switch ($Subcommand) {
     $diff = @()
     foreach ($entry in $walk.Entries) {
       if (-not $index.ContainsKey($entry.path)) { $diff += [PSCustomObject]@{ path = $entry.path; mtime = $entry.mtime; reason = 'new' } }
-      elseif ($entry.mtime -gt $index[$entry.path].ingested_at) { $diff += [PSCustomObject]@{ path = $entry.path; mtime = $entry.mtime; reason = 'stale'; slug = $index[$entry.path].slug } }
+      elseif (-not (Test-EpochString $index[$entry.path].ingested_at) -or ([int64]$entry.mtime -gt [int64]$index[$entry.path].ingested_at)) { $diff += [PSCustomObject]@{ path = $entry.path; mtime = $entry.mtime; reason = 'stale'; slug = $index[$entry.path].slug } }
     }
     Write-Json @($diff)
   }

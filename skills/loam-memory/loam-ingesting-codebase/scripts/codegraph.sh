@@ -16,14 +16,12 @@ json_escape() {
   printf '%s' "$s"
 }
 
-format_date() {
-  local epoch="$1"
-  [[ -z "$epoch" || "$epoch" == "0" ]] && { printf ''; return; }
-  date -d "@$epoch" '+%Y-%m-%d' 2>/dev/null || date -r "$epoch" '+%Y-%m-%d' 2>/dev/null || printf ''
-}
-
 stat_epoch() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+}
+
+is_epoch() {
+  [[ "$1" =~ ^[0-9]+$ ]]
 }
 
 stat_size() {
@@ -156,7 +154,7 @@ collect_walk() {
     use_gitignore=true
   fi
 
-  local file rel_path ext size mtime_epoch mtime_str
+  local file rel_path ext size mtime_epoch
   while IFS= read -r -d '' file; do
     rel_path="${file#"$codebase_root"/}"
     has_included_extension "$rel_path" || continue
@@ -172,9 +170,8 @@ collect_walk() {
     if is_generated_header "$file"; then excluded_generated_header=$((excluded_generated_header + 1)); continue; fi
 
     mtime_epoch=$(stat_epoch "$file")
-    mtime_str=$(format_date "$mtime_epoch")
     walk_paths+=("$rel_path")
-    walk_mtimes["$rel_path"]="$mtime_str"
+    walk_mtimes["$rel_path"]="$mtime_epoch"
     ext="${rel_path##*.}"
     by_ext["$ext"]=$(( ${by_ext["$ext"]:-0} + 1 ))
   done < <(find "$codebase_root" -type f -print0 2>/dev/null)
@@ -255,7 +252,7 @@ collect_index() {
     resolved="$(resolve_source_path "$source_path" "$codebase_root")"
     if [[ -f "$resolved" ]]; then
       mtime_epoch=$(stat_epoch "$resolved")
-      index_mtimes["$source_path"]="$(format_date "$mtime_epoch")"
+      index_mtimes["$source_path"]="$mtime_epoch"
       index_exists["$source_path"]="true"
     else
       index_mtimes["$source_path"]=""
@@ -322,7 +319,7 @@ cmd_diff() {
     slug=""
     if [[ -z "${index_ingested[$path]:-}" ]]; then
       reason="new"
-    elif [[ "${walk_mtimes[$path]}" > "${index_ingested[$path]}" ]]; then
+    elif ! is_epoch "${index_ingested[$path]}" || (( ${walk_mtimes[$path]} > ${index_ingested[$path]} )); then
       reason="stale"
       slug="${index_slugs[$path]}"
     fi

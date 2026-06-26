@@ -3,7 +3,7 @@ name: loam::ingesting-codebase
 description: "Ingest a codebase into memory as entity pages connected by wiki links. Walks the tree, classifies each code file by role, applies a role template, and writes an entity page per meaningful unit under <wiki root>/entities/. Resumable: skips files already ingested and current. Not for prose documents; use /loam::adding-to-memory for those."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.2.0"
+  version: "1.3.0"
   author: scchearn
   argument-hint: <codebase root path>
 ---
@@ -79,7 +79,7 @@ Run the diff subcommand to get the files that need ingestion or re-summarization
   --exclusions "${CLAUDE_SKILL_DIR}/references/ingestion-exclusions.md"
 ```
 
-Parse the JSON output: `{path, mtime, reason, slug?}` where `reason` is `new` or `stale`.
+Parse the JSON output: `{path, mtime, reason, slug?}` where `mtime` is the source file's Unix epoch mtime and `reason` is `new` or `stale`. Legacy pages with date-only `ingested_at` are stale once so they migrate to epoch precision.
 
 - **`reason: "new"`** → new ingest (create entity page)
 - **`reason: "stale"`** → re-summarize (overwrite the same entity page; `slug` is provided)
@@ -142,11 +142,11 @@ Fill the loaded role template with the extracted fields. The resulting markdown 
 ```yaml
 ---
 source_path: <relative-path-from-codebase-root>
-ingested_at: <YYYY-MM-DD>
+ingested_at: <source-file-mtime-epoch>
 ---
 ```
 
-Use today's date for `ingested_at`. For re-summarized files, update `ingested_at` to today.
+Use the source file's Unix epoch mtime for `ingested_at`. For re-summarized files, update `ingested_at` to the file's current mtime, not today's date.
 
 ### Write the page
 
@@ -157,7 +157,7 @@ Write to `<wiki root>/entities/<slug>.md`. Overwrite if re-summarizing. Create i
 Add or update the entry in the in-memory index so subsequent files in this run can link to it:
 
 ```
-<source_path> → {slug, ingested_at: <today>, mtime: <file mtime>}
+<source_path> → {slug, ingested_at: <file mtime epoch>, mtime: <file mtime epoch>}
 ```
 
 ---
