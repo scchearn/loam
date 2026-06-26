@@ -75,7 +75,7 @@ Read before editing:
 
 1. `<wiki root>/SCHEMA.md`
 2. `<wiki root>/index.md`
-3. the most recent relevant parts of `<wiki root>/log.md`
+3. scoped log read: `grep -i "<topic or entity keywords>" <wiki root>/log.md` for prior entries touching this subject; plus `grep "^## \[" <wiki root>/log.md | tail -2` for the last 2 entries. Never read the full log.
 4. any existing topic/entity/concept pages that look directly related to the source
 5. `${CLAUDE_SKILL_DIR}/references/ingest-checklist.md`
 6. if chat-context mode: `${CLAUDE_SKILL_DIR}/references/chat-context-ingest.md`

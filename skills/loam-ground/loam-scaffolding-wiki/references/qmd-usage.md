@@ -57,7 +57,7 @@ This wiki optionally uses qmd for candidate discovery during wiki skill operatio
 - When qmd is unavailable, unmapped, or degraded, all skills fall back to Grep and Glob without breaking
 - SCHEMA.md and index.md are always direct reads
 - After wiki edits, skills refresh qmd if the collection is ready
-- `log.md` is deprioritized in factual retrieval; it records maintenance history, not primary evidence
+- `log.md` is deprioritized in factual retrieval; it records maintenance history, not primary evidence. It rotates to `log-archive/` at 500 lines, so the active file stays small.
 ```
 
 3. Append a setup entry to `<wiki root>/log.md`:

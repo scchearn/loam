@@ -63,7 +63,7 @@ Before touching any wiki page, read:
 
 1. `<wiki root>/SCHEMA.md`
 2. `<wiki root>/index.md`
-3. the most recent relevant parts of `<wiki root>/log.md`
+3. scoped log read: `grep -i "<page or subject being amended>" <wiki root>/log.md` for prior entries touching this subject; plus `grep "^## \[" <wiki root>/log.md | tail -2` for the last 2 entries. Never read the full log.
 4. `${CLAUDE_SKILL_DIR}/references/amendment-triage.md`
 5. `${CLAUDE_SKILL_DIR}/references/amend-checklist.md`
 

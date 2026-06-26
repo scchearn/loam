@@ -177,7 +177,7 @@ Read before proposing:
 
 1. `<wiki root>/SCHEMA.md`
 2. `<wiki root>/index.md`
-3. the most recent relevant parts of `<wiki root>/log.md`
+3. scoped log read: `grep -i "<session focus keywords>" <wiki root>/log.md` for prior entries touching the session focus; plus `grep "^## \[" <wiki root>/log.md | tail -2` for the last 2 entries. Never read the full log.
 4. `<wiki root>/overview.md` when it exists and may still contain legacy root-hub context
 5. the existing pages directly related to the learnings you want to capture
 

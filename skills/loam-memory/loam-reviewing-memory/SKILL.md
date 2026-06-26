@@ -45,7 +45,7 @@ Read before scanning:
 
 1. `<wiki root>/SCHEMA.md`
 2. `<wiki root>/index.md`
-3. the most recent relevant parts of `<wiki root>/log.md`
+3. scoped log read: `grep "^## \[" <wiki root>/log.md | tail -5` for the last 5 entries. Never read the full log. Follow-up markers are handled separately in step E below.
 4. `<wiki root>/overview.md` when it exists and may still contain legacy root-hub context
 
 Use `Glob` and `Grep` to map the pages in scope before reading deeply.
@@ -69,7 +69,7 @@ qmd is **secondary only** in this skill: use it only to expand from a discovered
 
 **D. Unresolved structural signals** — Grep for: unresolved `[[wikilinks]]`, obviously thin or placeholder content, "expected source", "candidate source", "future ingest", "planned ingest"
 
-**E. Log follow-ups** — Read `<wiki root>/log.md` for: `follow up` entries, `unresolved` entries, `next ingest`, `pending ingest`, lint entries noting unresolved contradictions or gaps
+**E. Log follow-ups** — `grep -i "follow up\|unresolved\|next ingest\|pending ingest\|needs evidence\|TODO\|FIXME" <wiki root>/log.md`. Read only the matched lines and their surrounding entry (the `## [date]` heading block they fall under). Do not read the full log.
 
 ### Expand from issues with qmd (secondary, if ready)
 

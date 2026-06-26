@@ -73,7 +73,7 @@ Rules:
 3. Internal note links use `[[kebab-case-note-name]]`.
 4. Each durable concept, entity, topic, or analysis gets one canonical note.
 5. `<wiki root>/index.md` is the home hub with a concise `## Overview` section near the top.
-6. `<wiki root>/log.md` is the append-only chronological record.
+6. `<wiki root>/log.md` is the append-only chronological record. Rotate when it exceeds 500 lines: move entries older than the most recent 50 to `log-archive/YYYY-MM.md`, keep a `## [YYYY-MM-DD] rotate | archived <N> entries to log-archive/YYYY-MM.md` pointer line. Active `log.md` stays under ~250 lines.
 7. `<wiki root>/SCHEMA.md` is the maintenance contract.
 
 Do not create a separate root `overview.md`. Only create category directories that are justified.
@@ -190,7 +190,7 @@ If you found existing memory and only refined it, say so explicitly.
 - Durable category notes use canonical kebab-case filenames. Special root files keep their fixed names.
 - Keep root-level orientation in `index.md`; do not create a separate root `overview.md`.
 - Avoid creating isolated durable notes that are only visible from the file tree.
-- `<wiki root>/log.md` is append-only.
+- `<wiki root>/log.md` is append-only. Rotate when it exceeds 500 lines (see rotation rule above).
 - `<wiki root>/index.md` must be useful immediately after this skill runs.
 - Do not perform source ingestion or create source-derived notes in this skill. That belongs to `/loam::adding-to-memory`.
 - If the workspace is too ambiguous to place memory safely, ask the smallest follow-up question needed.

@@ -75,8 +75,9 @@ A separate root `overview.md` is legacy drift. If one exists, fold its still-use
 ### `log.md`
 
 - chronological, append-only history
-- record scaffold creation, `/loam::adding-to-memory` runs, query write-backs, and lint passes
+- record scaffold creation, `/loam::adding-to-memory` runs, query write-backs, and amendments
 - parseable headings make this searchable with simple tools later
+- **Rotation:** when `log.md` exceeds 500 lines, move entries older than the most recent 50 to `<wiki root>/log-archive/YYYY-MM.md`. Replace the moved content with a single `## [YYYY-MM-DD] rotate | archived <N> entries to log-archive/YYYY-MM.md` pointer line. The active `log.md` stays under ~250 lines. Rotation is performed by `/loam::linting-memory` as part of its health-check fixes.
 
 Recommended heading formats:
 

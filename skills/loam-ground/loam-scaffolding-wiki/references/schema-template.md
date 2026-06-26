@@ -16,7 +16,8 @@ The wiki layer is stored in `<wiki path>`. Those files are maintained by the age
 
 - `<raw path>` — immutable source documents
 - `<wiki path>/index.md` — root hub with a concise `## Overview` section plus page catalog with one-line summaries
-- `<wiki path>/log.md` — append-only activity log
+- `<wiki path>/log.md` — append-only activity log (rotates to `log-archive/` at 500 lines)
+- `<wiki path>/log-archive/YYYY-MM.md` — rotated log archives (created by `/loam::linting-memory`)
 - `<wiki path>/topics/<topic-slug>.md` — topic synthesis pages
 - `<wiki path>/entities/<entity-slug>.md` — entity pages
 - `<wiki path>/concepts/<concept-slug>.md` — concept pages
@@ -76,7 +77,8 @@ The wiki layer is stored in `<wiki path>`. Those files are maintained by the age
 
 - `log.md` is append-only.
 - Use parseable headings such as `## [YYYY-MM-DD] build | Initial wiki scaffold`, `## [YYYY-MM-DD] add (file) | <source title>`, and `## [YYYY-MM-DD] add (chat) | <topic>`.
-- Record builds, `/loam::adding-to-memory` runs, query write-backs, lint passes, and durable write-backs from research, planning, execution, and amendment workflows.
+- Record builds, `/loam::adding-to-memory` runs, query write-backs, amendments, and durable write-backs from research, planning, execution, and amendment workflows.
+- **Rotation:** when `log.md` exceeds 500 lines, move entries older than the most recent 50 to `<wiki root>/log-archive/YYYY-MM.md`. Replace the moved content with a `## [YYYY-MM-DD] rotate | archived <N> entries to log-archive/YYYY-MM.md` pointer line. Active `log.md` stays under ~250 lines. `/loam::linting-memory` performs rotation as a health-check fix.
 
 ## `/loam::adding-to-memory` rules
 
@@ -123,6 +125,7 @@ Periodically check for:
 - missing reciprocal backlinks where the relationship is clearly material
 - outdated index entries
 - a legacy root `overview.md` that should be consolidated into `index.md`
+- `log.md` exceeding 500 lines (rotate per the Log rules above)
 
 ## Non-negotiable rules
 
@@ -142,7 +145,7 @@ This wiki optionally uses qmd for candidate discovery during wiki skill operatio
 - When metadata is missing or status is not `"ready"`, skills fall back to `which qmd` + `qmd collection list` and match by absolute path equality
 - Any qmd command that fails or returns stale results at runtime triggers a degrade to Grep/Glob
 - After wiki edits, skills refresh qmd if the collection is ready
-- `log.md` is deprioritized in factual retrieval; it records maintenance history, not primary evidence
+- `log.md` is deprioritized in factual retrieval; it records maintenance history, not primary evidence. It rotates to `log-archive/` at 500 lines.
 - If qmd refresh fails after wiki edits, report it but do not roll back successful wiki edits
 
 ### .wiki-metadata.json

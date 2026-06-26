@@ -61,7 +61,7 @@ Before editing, read:
 
 1. `<wiki root>/SCHEMA.md`
 2. `<wiki root>/index.md`
-3. the most recent relevant parts of `<wiki root>/log.md`
+3. scoped log read: `grep "^## \[" <wiki root>/log.md | tail -5` for the last 5 entries (recent maintenance context). If a specific lint scope is named, also `grep -i "<scope keywords>" <wiki root>/log.md`. Never read the full log.
 4. `<wiki root>/overview.md` when it exists, so you can fold its useful root-hub content into `index.md` and remove it
 5. the files inside the lint scope most relevant to the current health check
 6. `${CLAUDE_SKILL_DIR}/references/lint-checklist.md`
@@ -156,17 +156,15 @@ Allowed direct fixes:
 
 Do not: ingest new raw sources, invent facts, silently merge/rename notes, silently delete disagreement/uncertainty, leave redundant `overview.md`, overwrite or merge an existing parent `.obsidian/`, move or rename `<wiki root>` or any wiki content directory, perform broad rewrites, or modify raw-source files.
 
-### Record the lint pass
+### Rotate log.md if needed
 
-Append to `<wiki root>/log.md`:
+Check `<wiki root>/log.md` line count. If it exceeds 500 lines:
 
-```md
-## [YYYY-MM-DD] lint | <scope>
-```
+1. Move entries older than the most recent 50 to `<wiki root>/log-archive/YYYY-MM.md` (create the directory if missing).
+2. Replace the moved content in `log.md` with a single pointer line: `## [YYYY-MM-DD] rotate | archived <N> entries to log-archive/YYYY-MM.md`
+3. The active `log.md` should stay under ~250 lines after rotation.
 
-Capture: scope, pages created/updated/removed, issues fixed, unresolved contradictions/gaps, legacy root-hub consolidation, checkpoint filename migrations, `.obsidian/` placement fixes or unresolved conflicts, qmd metadata reconciliation or degraded state, suggested next ingests.
-
-Keep `log.md` append-only. Ensure `index.md` reflects the final state before finishing.
+This is the only log mutation lint performs. Lint is otherwise read-only with respect to `log.md` — it does not append a per-pass entry, because lint is a health check, not a content change.
 
 ### Refresh qmd after writes
 
@@ -214,7 +212,7 @@ If the pass found no significant issues, say so explicitly and still note any re
 - Reconcile stale `.wiki-metadata.json` to the actual resolved wiki root. Lint updates metadata to match the on-disk wiki; it never moves the on-disk wiki to match metadata.
 - Own checkpoint filename migration. New checkpoints should be named `checkpoint-YYYY-MM-DD-HHMM.md`; lint may propose and, after approval, rename legacy slugged checkpoint files and update checkpoint wikilinks.
 - Never move or rename `<wiki root>` or any wiki content directory as part of `.obsidian/` placement or qmd metadata repair.
-- Update `<wiki root>/log.md` on every lint pass.
+- Rotate `<wiki root>/log.md` when it exceeds 500 lines; lint does not append per-pass entries to `log.md`.
 - Keep the note graph traversable, not just the index accurate.
 - Keep `index.md` aligned with the durable pages that exist after the pass.
 - qmd is secondary. Structural checks remain Glob- and Grep-led. Use qmd only to find related-note neighborhoods.
