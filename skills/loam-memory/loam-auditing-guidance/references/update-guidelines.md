@@ -73,6 +73,18 @@ Why: Establishes patterns that work.
 
 Why: Environment-specific knowledge.
 
+### 6. Cross-references to canonical files
+
+When the audit (Phase 1c) finds a repo-root `DESIGN.md` that AGENTS.md does
+not reference, surface the gap in the report. The user decides whether to add
+a pointer; the canonical one-liner (when approved) is:
+
+```markdown
+## Design system
+
+- If a `DESIGN.md` exists at the repo root, read it before any frontend or UI work — it's the canonical design system (Stitch/open spec, `github.com/google-labs-code/design.md`). Lint with `npx @google/design.md lint DESIGN.md`.
+```
+
 ## What NOT to Add
 
 ### 1. Obvious Code Info

@@ -3,7 +3,7 @@ name: loam::auditing-guidance
 description: "Audit, prune, and improve agent guidance markdown files in repositories. Use when the user asks to check, audit, update, improve, or fix AGENTS.md, CLAUDE.md, or related guidance files. Adds missing commands and gotchas, removes stale entries, deduplicates, and keeps the file small and relevant. Scan for guidance files, evaluate quality against templates, output a quality report, then make targeted updates after approval."
 allowed-tools: Read Glob Grep Bash Edit
 metadata:
-  version: "0.1.1"
+  version: "0.2.0"
   author: scchearn
 ---
 
@@ -51,6 +51,20 @@ If a `CLAUDE.md` was found in Phase 1, read it and verify it contains only `@AGE
 4. Flag this as drift in the quality report
 
 **If CLAUDE.md is already just `@AGENTS.md`:** no action needed, it's compliant.
+
+### Phase 1c: Design-system file cross-reference
+
+Check whether a `DESIGN.md` exists at the repo root (case-insensitive; also
+check `.stitch/DESIGN.md`). If one exists, verify `AGENTS.md` references it
+(grep for `DESIGN.md` in the guidance file).
+
+- **If DESIGN.md exists and AGENTS.md references it:** no action — compliant.
+- **If DESIGN.md exists but AGENTS.md does not reference it:** flag as a
+  cross-reference gap in the Phase 3 quality report (under "Non-Obvious
+  Patterns"). Do not auto-propose the fix text — surface the gap and let the
+  user decide what to add.
+- **If no DESIGN.md exists:** no action — the check is conditional on the
+  file being present.
 
 ### Phase 2: Quality Assessment
 

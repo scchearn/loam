@@ -40,6 +40,7 @@
 - Workarounds explained
 - Edge cases noted
 - "Why we do it this way" for unusual patterns
+- Cross-references to repo-level canonical files (e.g., a root `DESIGN.md`) when one exists but isn't mentioned in AGENTS.md
 
 **10 points**: Some patterns documented
 
@@ -141,3 +142,4 @@ The currency score (section 5) feeds directly into prune proposals. When currenc
 - Generic advice not specific to the project
 - "TODO" items never completed
 - Duplicate info across multiple guidance files
+- A repo-root `DESIGN.md` exists but AGENTS.md does not mention it (agents miss the canonical design system)
