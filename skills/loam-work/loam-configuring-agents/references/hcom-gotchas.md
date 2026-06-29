@@ -32,7 +32,7 @@ Prefer:
 
 - stable tags for groups
 - exact names for direct replies
-- a documented roster in the generated artifacts
+- a documented roster in the prepared debate plan
 
 ## Risk reminders
 

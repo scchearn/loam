@@ -2,116 +2,67 @@
 
 ## Required outputs
 
-The required output depends on the request type.
+The skill always produces a prepared debate plan. If the user approves running it, the convergence result is appended on-thread.
 
-For a new design or redesign request, the skill must produce:
+### Prepared debate plan (always produced)
 
-- `agents/<slug>.toml`
-- `agents/<slug>.md`
+- the goal or deliverable
+- the tension axis and the positions being argued
+- the agents (by tag or name), their assigned positions, and their role briefs
+- the hub stance (neutral / partisan-for-synthesis / participant)
+- the round count and the stopping rule
+- the convergence prompt
+- the forcing-field deliverable spec
+- scope facts the debate must respect
+- assumptions, if defaults were chosen
+- the **exact first hcom action** that would fire if approved — a verbatim `hcom send` or spawn command, not a placeholder
 
-If the user requested a plan, the answer still must contain both design artifacts.
+If the skill cannot produce any of these, it has not finished gathering parameters — go back to the interview, do not emit a partial plan.
 
-For a config-loading request, the skill must produce:
+### Convergence result (only if approved)
 
-- config-loading instructions
-- an exact loader command or a generic loader invocation
-- a preserved-values summary covering the saved config fields that remain authoritative
+- the forcing-field deliverable, produced by the hub or the synthesizer role
+- reported on-thread with `--intent inform`
 
-Do not replace a saved-config load request with freshly generated artifacts unless the user explicitly asked to redesign or update the config.
+## Approval gate
+
+The prepared plan is the proposal. Present it, then ask explicit approval to run. The gate is per-debate, not per-session.
+
+- If approved: run the rounds, converge, report on-thread.
+- If denied or absent: the prepared plan is the deliverable. Stop. Do not send, spawn, seed, or launch anything.
+
+"No" means stop, not renegotiate. Renegotiation is a fresh invocation with new `$ARGUMENTS`.
 
 ## Defaulting rule
 
-If one preference is missing but the topology and safety model are still clear, choose the recommended default and label it as an assumption.
+If one preference is missing but the tension axis and agent roster are still clear, choose the recommended default and label it as an assumption.
 
 If the same model family is available from multiple providers, surface the top exact provider-qualified IDs and choose one explicit assumption.
 If `opencode models` was not actually run, label provider-qualified IDs as assumptions or likely candidates instead of confirmed local availability.
 
-Ask a follow-up only when the missing information would materially change topology, risk, or feasibility.
+Ask a follow-up only when the missing information would materially change the tension axis, agent roster, convergence rule, or forcing-field deliverable.
 
-## Design mode: `agents/<slug>.toml`
+## Formatting
 
-Must include:
-
-- team slug
-- objective
-- topology
-- agent roster
-- per-agent tool choice
-- per-agent exact provider-qualified model choice
-- runtime choice and launch mode
-- role definitions
-- communication defaults
-- thread strategy
-- explicit group-routing syntax when tags are used
-- direct-routing strategy when exact names matter
-- intent examples using only `request`, `inform`, or `ack`
-- launch commands
-
-Thread strategy must use one workflow thread per run, not a different thread expression on each launch line.
-Intent strategy must use only `request`, `inform`, or `ack`.
-OpenCode launch examples should use `HCOM_OPENCODE_ARGS="--model <provider/model>"` and should not put `--thread` on spawn commands.
-
-## Design mode: `agents/<slug>.md`
-
-Must include:
-
-- goal
-- assumptions when defaults were chosen
-- assumptions when live model discovery could not be confirmed
-- why this topology was chosen
-- role-by-role rationale
-- model rationale
-- exact provider-qualified model IDs, including shortlisted candidates when one family appears under multiple providers
-- reviewer or evaluator design
-- communication plan
-- runtime choice and launch mode
-- explicit group-routing syntax when tags are used
-- direct-routing strategy when exact names matter
-- intent examples using only `request`, `inform`, or `ack`
-- bundle strategy
-- launch sequence
-- risks and tradeoffs
-
-## Scope control
-
-Design outputs are planning/configuration artifacts.
-Loading outputs are loader instructions that reuse an existing config.
-Neither mode may claim the project work has already been done.
-
-## Loading mode
-
-When the user asks to load, start, run, resume, or reuse an existing `agents/<slug>.toml`:
-
-- read the existing config first
-- preserve runtime, launch mode, provider-qualified model IDs, tags, thread strategy, intent strategy, reporting model, and browser/session/safety rules when present
-- only redesign the config if the user explicitly asks to change it
-- provide `hcom run agent-config <slug> "<task>"` when a generic loader invocation is appropriate
-- provide the exact loader command when the user named a specific slug
-- provide optional executable automation only if the user explicitly asked for a script
-- keep tags as stable routing addresses
-- do not rely on generated hcom names as stable addresses
-- use `--intent request` for initial assignments, `--intent inform` for agent reports, and `--intent ack` only for explicit no-reply acknowledgments
-- use `--thread` on workflow messages and waits, but never on `hcom opencode` spawn commands
-
-## Extraction-friendly formatting
-
-In design mode, place each artifact name on its own line before the fenced block:
-
-- `agents/<slug>.toml`
-- `agents/<slug>.md`
-
-This makes the outputs easier to scan and extract.
-
-In loading mode, include a short `Config loading instructions` heading before the loader invocation.
+Place the prepared debate plan under a literal heading line `## Prepared debate plan`, followed by the plan block. Place the approval prompt under a literal heading line `## Approval gate`. If approved, place the convergence result under `## Convergence result`.
 
 ## Forbidden substitutions
 
-Do not replace the required artifacts with:
+Do not replace the prepared debate plan with:
 
-- prose-only design notes
-- shell scripts only in design mode
+- prose-only design notes without the exact first hcom action
+- a saved `agents/<slug>.toml` or `agents/<slug>.md` — that contract is retired
+- shell scripts (unless the user explicitly asked for executable automation, and even then only alongside the prepared plan)
 - repo setup tasks
 - build output
 - implementation claims
 
-Do not replace a config-loading answer with regenerated design artifacts unless the user explicitly asked for redesign or artifact refresh.
+Do not emit `agents/<slug>` artifacts. The saved-config contract is retired.
+
+## Retired contract
+
+The previous output contract produced `agents/<slug>.toml` and `agents/<slug>.md` plus a saved-config loader. That contract is retired. Do not generate those artifacts, do not provide loader instructions, and do not treat a request for saved configs as a request for this skill. Compose the debate inline instead.
+
+## Scope control
+
+The prepared plan is a debate/consensus artifact. The convergence result is the debate output. Neither may claim the project work has already been done. The skill runs a debate about the goal; it does not implement the goal.

@@ -17,7 +17,7 @@ and are available the next time you start a session.
 
 ## What you get
 
-18 skills, grouped by what they're for:
+20 skills, grouped by what they're for:
 
 ### Planning and execution
 
@@ -27,7 +27,7 @@ and are available the next time you start a session.
 - **Resuming** — pick up work after a pause, using saved checkpoints
 - **Checkpointing** — save a restart point before pausing or handing off
 - **Amending-plan** — update an in-flight plan when scope changes
-- **Configuring-agents** — set up a team of AI agents for a task
+- **Configuring-agents** — run a structured debate or conference between agents to reach consensus on a goal
 
 ### Memory
 
@@ -69,7 +69,7 @@ language — the **Using** router matches it to the right skill.
 - "Write a spec for what we discussed" — researches and produces a spec
 - "Plan the work from that spec" — turns an approved spec into a plan
 - "Run the plan" — begins executing, task by task
-- "Set up an agent team for this" — configures a multi-agent team
+- "Have agents debate this decision" — runs an approval-gated consensus debate
 - "Stopping work" / "I need to step away" — saves a restart checkpoint
 - "Resume where I left off" — picks up from the last checkpoint
 - "The scope changed, update the plan" — walks the impact, proposes plan changes

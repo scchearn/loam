@@ -1,146 +1,106 @@
-# Agent Topologies
+# Debate Topologies
 
 ## Default recommendation
 
-Start with one agent unless the task clearly benefits from separation of concerns, review gates, or sandbox isolation.
+Start with `position-vs-position-with-synthesizer` when bias reduction matters. Use `position-vs-position` when the tension is strictly binary and no synthesis is needed. The topology must match the tension axis — if there is no real tension, there is no debate.
 
-## Single agent
-
-Use when:
-
-- the task is small or medium
-- the work does not need parallelism
-- the user values simplicity over throughput
-
-Tradeoffs:
-
-- lowest coordination cost
-- weakest review isolation
-
-## Worker-reviewer
+## Position-vs-position
 
 Use when:
 
-- implementation quality matters
-- one agent writes and one agent validates
-- the user wants review on every round before merge
+- the tension is strictly binary (two positions, no middle ground needed)
+- the deliverable is one of the two positions, refined
+- no third-party synthesis is required
 
 Tradeoffs:
 
-- simple quality gate
-- moderate coordination overhead
+- lowest coordination cost among multi-agent shapes
+- no bias reduction beyond the two positions arguing
+- convergence must come from one position winning or both moving
 
-Recommended output shape:
+Recommended shape:
 
-- one worker
-- one reviewer
-- explicit `APPROVED` or `FIX` contract
-- same workflow thread for each round
-
-## Planner-executor-reviewer (`planner-executor-reviewer`)
-
-Use when:
-
-- the task is risky enough to justify both planning and review isolation
-- execution should be sandboxed or tightly constrained
-- the user asked for implementation plus a quality gate
-
-Tradeoffs:
-
-- stronger safety and coherence than worker-reviewer
-- more coordination overhead than a two-agent loop
-
-Recommended output shape:
-
-- one planner/coordinator
-- one executor, often sandboxed
-- one reviewer or evaluator
+- 2 agents, distinct positions
 - one shared workflow thread
-- explicit handoff order from planner to executor to reviewer
+- 2 rounds default
+- stop rule: positions converge or stalemate after round 2
 
-## Hub-spoke
-
-Use when:
-
-- one coordinator should route work
-- several specialist agents have distinct roles
-- you need clear observability and central state
-
-Tradeoffs:
-
-- strong coordination clarity
-- hub is a single point of failure
-
-Recommended output shape:
-
-- one coordinator
-- 2+ workers or specialists
-- tag-based group routing
-- explicit bundle handoff rules
-
-## Sequential cascade (`sequential-cascade`)
+## Position-vs-position-with-synthesizer
 
 Use when:
 
-- planning must happen before execution
-- later agents need the earlier transcript
-- staged refinement matters more than speed
+- 2 distinct positions plus bias reduction matter
+- a neutral third agent can synthesize the final deliverable
+- the user wants a convergence artifact neither position would produce alone
 
 Tradeoffs:
 
-- high handoff clarity
-- slower than parallel work
+- simple quality gate for bias
+- moderate coordination overhead
+- the synthesizer must be neutral — if it has a position, use `position-vs-position` instead
 
-Recommended output shape:
+Recommended shape:
 
-- planner -> executor -> reviewer
-- transcript or bundle transfer at each stage
-- narrow responsibilities per stage
+- 2 agents arguing distinct positions
+- 1 synthesizer (neutral, no position)
+- one shared workflow thread
+- 2 rounds default, synthesizer converges after rounds end
+- stop rule: rounds end, synthesizer issues the forcing-field deliverable
 
-## Ensemble with judge (`ensemble-with-judge`)
+## Multi-position-roundtable
 
 Use when:
 
-- multiple independent answers are valuable
-- bias reduction matters
-- a judge can synthesize the final result
+- 3 or more distinct positions exist
+- multi-stakeholder consensus is the goal
+- no single synthesizer can represent all positions
 
 Tradeoffs:
 
-- expensive
-- best for ambiguous or high-judgment tasks
+- strongest coverage of divergent views
+- highest coordination overhead
+- convergence is harder — the forcing-field deliverable must do more work
 
-Recommended output shape:
+Recommended shape:
 
-- N workers
-- one judge
+- N agents (N >= 3), each a distinct position
+- hub orchestrates and converges (or a designated synthesizer role)
+- one shared workflow thread
+- 2 rounds default, optional 3rd when the hub states a reason
+- stop rule: positions converge, or the hub forces convergence via the forcing-field deliverable
+
+## Ensemble-with-judge (as debate topology)
+
+Use when:
+
+- independent answers are valuable before any cross-examination
+- bias reduction matters and a judge can synthesize
+- the tension is about which answer is best, not which position wins
+
+Tradeoffs:
+
+- expensive (N workers + 1 judge)
+- best for ambiguous or high-judgment goals
+- rounds are optional — the judge may converge after openings
+
+Recommended shape:
+
+- N agents produce independent openings (no cross-view until judge)
+- 1 judge synthesizes the convergence deliverable
 - common prompt and thread strategy
-- evidence synthesis by the judge
+- stop rule: judge issues the forcing-field deliverable after reviewing openings
 
-## Executor-isolation exceptions
+## Choosing agents for distinct positions
 
-Use when:
-
-- risky execution should be isolated
-- the default headless OpenCode executor is not enough
-- another agent should coordinate or review
-
-Recommended default:
-
-- coordinator: OpenCode
-- executor: headless OpenCode by default
-- reviewer: separate strong reviewer when quality gates matter
-
-Exception:
-
-- use Codex or another non-default runtime only when the user explicitly asks for it or a real isolation or capability requirement justifies it
+- Distinct models or distinct prompts. Never clones.
+- Disagreement is mandated: each role brief must require the agent to argue its assigned position, not to find consensus prematurely.
+- The hub stance (neutral / partisan-for-synthesis / participant) changes which agents argue and which synthesize. State it in the prepared plan.
 
 ## Quick chooser
 
 | Situation | Default topology |
 |---|---|
-| quick low-risk work | single agent |
-| code changes with review on every round | worker-reviewer |
-| risky implementation with planning and review | planner-executor-reviewer |
-| many specialist roles | hub-spoke |
-| competing independent answers | ensemble with judge |
+| binary tension, no synthesis needed | position-vs-position |
+| binary tension + bias reduction | position-vs-position-with-synthesizer |
+| 3+ positions or multi-stakeholder | multi-position-roundtable |
+| independent-answer aggregation | ensemble-with-judge |

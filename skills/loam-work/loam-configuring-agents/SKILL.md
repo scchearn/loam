@@ -1,49 +1,57 @@
 ---
 name: loam::configuring-agents
-description: "Use when planning or configuring an AI agent team for a real task, or when loading, starting, resuming, or reusing an existing agent config. Supports hcom as the primary orchestration backend; degrades to general agent-team planning advice when hcom is unavailable."
-compatibility: "Requires hcom for hcom-specific configuration (launch commands, TOML configs, thread routing). Works without hcom for general agent-team planning advice (topology selection, role assignment, model strategy, task decomposition)."
+description: "Use when agents must debate, conference, deliberate, or reach consensus on a goal — competing positions argue and converge on one deliverable, adversarial review with synthesis, multi-stakeholder deliberation, structured disagreement with a forcing-field deliverable. Triggers: 'have agents debate X', 'reach consensus on Y', 'argue distinct positions and converge'. Not for saved team configs, agents/<slug> artifacts, implementation, or open-ended research."
+compatibility: "Requires hcom for live agent coordination. The prepared plan can be returned without hcom when approval is denied or hcom is unavailable."
 metadata:
-  version: "1.1.0"
+  version: "2.0.0"
   author: scchearn
-  phase: planning
-  outputs: agents-slug-artifacts-or-loader
+  phase: execution
+  outputs: prepared-debate-plan-and-convergence-result
 ---
 
 # loam::configuring-agents
 
 ## Overview
 
-Plan an agent team or reuse a saved config, and emit concrete outputs that match real launch behavior. Supports hcom as the primary orchestration backend; when hcom is unavailable, produces general agent-team planning advice adapted from the dispatching-parallel-agents pattern.
+Run a structured debate, conference, or deliberation between agents so they reach consensus on a goal. The skill produces a prepared debate plan — hub prompt, distinct role briefs, convergence prompt, round count, stopping rule, forcing-field deliverable, and the exact first hcom action — and presents it for human approval. No agent contact happens before approval. If approval is denied or absent, the prepared plan is the deliverable and the skill stops.
 
-Core principle: produce a usable agent architecture package or loader path, not just advice. This skill exists to prevent five baseline failures:
+Core principle: produce a runnable consensus protocol, not just advice. This skill exists to prevent five baseline failures:
 
-- stopping at design discussion or a clarifying question when safe defaults would work
-- returning launch commands or repo changes without the requested `agents/<slug>` artifacts
-- drifting into actual project implementation instead of staying in planning/configuration scope
+- stopping at the parameter interview when safe defaults would compose a complete prepared plan
+- firing any hcom send, spawn, thread seed, or launch before explicit per-debate human approval
+- drifting into project implementation instead of staying in debate/consensus scope
 - emitting launch guidance with invalid OpenCode spawn flags or ambiguous bare model names
-- treating a saved-config load request like a brand new team design instead of reusing the existing config and loader path
+- treating a one-off debate as a reusable saved team config — that contract is retired
 
 ## When To Use
 
 Use this skill when the user wants any of the following:
 
-- an agent team design
-- agent topology selection
-- model or role assignment
-- a reviewer or evaluator loop
-- sandboxed execution planning
-- launch commands for a multi-agent workflow
-- generated `agents/<slug>.toml` and `agents/<slug>.md` outputs (hcom mode)
-- loading, starting, running, resuming, or reusing an existing `agents/<slug>.toml` (hcom mode)
+- a structured debate between agents arguing distinct positions
+- a conference or roundtable to work out a goal
+- deliberation that converges on a single deliverable
+- agents to reach consensus on a decision, design, or direction
+- an adversarial review where two or more positions must argue and converge
 
 Do not use this skill for:
 
+- producing `agents/<slug>.toml` or `agents/<slug>.md` artifacts — that contract is retired
+- loading, reusing, or running saved team configs — that behavior is retired
 - installing or troubleshooting hcom itself
-- open-ended research
-- building the target project
-- executing the planned workflow
+- open-ended research without a convergence goal
+- building the target project — the skill runs a debate about the goal, it does not implement the goal
 
-If the user needs hcom installation or delivery troubleshooting, prefer the dedicated hcom messaging skill when it is available. If it is not available, say that installation or troubleshooting is out of scope for this skill and keep the answer in planning/configuration scope.
+If the user asks for saved team artifacts or a saved-config loader, state that the contract is retired and offer to compose the debate inline instead. Do not regenerate the old artifacts.
+
+## Non-negotiables
+
+Three rules with no exceptions. Violating any produces work that looks right but bypasses the gate.
+
+1. **Proposal-first on agent coordination.** The skill produces the complete prepared debate plan — hub prompt, role briefs for each position, convergence prompt, round count, stopping rule, forcing-field deliverable, and the exact first hcom action that would fire — and presents it to the user. No hcom send, no agent spawn, no thread seed, no launch command runs until the user explicitly approves. If approval is denied or absent, the skill returns the prepared plan and stops. The prepared plan is a valid deliverable in that case; it is not a failure state.
+
+2. **The gate is per-debate, not per-session.** Approval covers this debate only. A new debate needs new approval. Approval is not transferable to a later run, a different tension axis, or a different agent roster.
+
+3. **"No" means stop, not renegotiate.** If the user denies approval, the skill returns the prepared plan and stops. It does not loop back to re-open parameters. Renegotiation is a fresh invocation with new `$ARGUMENTS`, not a continuation of this one. The gate is a confirmation step, not a clarification loop.
 
 ## Check hcom availability
 
@@ -53,30 +61,28 @@ Before entering the hcom-specific workflow, check whether hcom is available:
 which hcom 2>/dev/null
 ```
 
-- **If hcom is available:** continue with the hcom workflow below (sections 1–7 + common mistakes). This is the primary mode.
-- **If hcom is not available:** skip to [General agent-team planning](#general-agent-team-planning-when-hcom-is-unavailable) at the bottom of this skill. Produce a general agent-team plan that works with any harness's task/delegation mechanism.
-
-This mirrors the degradation pattern in `loam::starting`, which checks hcom capability before branching between delegated and inline execution.
+- **If hcom is available:** continue with the workflow below (sections 1–7 + common mistakes). This is the primary mode.
+- **If hcom is not available:** see [When hcom is unavailable](#when-hcom-is-unavailable) at the bottom. The interview, gate, and mechanics are identical; only the dispatch mechanism differs.
 
 ## Input
 
-The planning request is: $ARGUMENTS
+The consensus request is: $ARGUMENTS
 
 ## Quick Reference
 
-| Signal | Default |
+| Signal | Default debate topology |
 |---|---|
-| Small, low-risk task | single agent |
-| Code change with mandatory review | worker-reviewer |
-| Risky implementation or mixed roles | planner-executor-reviewer |
-| 3+ distinct responsibilities | hub-spoke |
+| 2 distinct positions, no synthesis needed | position-vs-position |
+| 2 distinct positions + bias reduction | position-vs-position-with-synthesizer |
+| 3+ distinct positions or multi-stakeholder | multi-position-roundtable |
+| independent-answer aggregation with judgment | ensemble-with-judge |
 | User does not specify runtime | `hcom opencode --headless` |
 | User does not specify models | resolve exact OpenCode IDs with `opencode models`; narrow with `opencode models <provider>` when needed |
 | Same family appears under multiple providers | surface top exact IDs and choose one assumption |
-| User does not specify thread strategy | one unique thread per workflow |
+| User does not specify round count | 2 rounds |
+| User does not specify convergence rule | forcing-field deliverable; rounds end when positions converge or stop rule fires |
+| User does not specify hub stance | neutral |
 | Missing non-critical preference | choose recommended default and label assumption |
-| User asks to load/start/reuse a saved config | read the existing `agents/<slug>.toml` first and keep it as the source of truth |
-| User asks for executable automation | provide a script only if they explicitly request automation; otherwise give the loader invocation |
 
 ## Workflow
 
@@ -84,333 +90,146 @@ The planning request is: $ARGUMENTS
 
 Decide whether the user is asking for:
 
-- a new single-agent plan
-- a new multi-agent team plan
-- generated planning artifacts
-- loading or reusing an existing config
-- immediate implementation
+- a structured debate or conference to reach consensus on a goal
+- a one-off deliberation with a convergence deliverable
+- something else (implementation, research, saved config)
 
-This skill only handles the planning/configuration layer and the config-loading layer.
+This skill handles only the consensus/debate layer. If the user asks to build or run the project, do **not** pretend to execute it. Reframe the request into a debate about the goal, or route them to the matching skill (`loam::planning`, `loam::starting`, `loam::writing-spec`).
 
-If the user asks to build or run the project, do **not** pretend to execute it. Reframe the request into either:
+If the user asks for saved `agents/<slug>` artifacts or a saved-config loader, state that the contract is retired and offer to compose the debate inline.
 
-- the hcom planning deliverable for a new design, or
-- the loader path for a saved config that would be used for execution
+### 2. Gather parameters via interview
 
-### 2. Branch by request type
+Resolve these decisions before composing the prepared plan:
 
-If the user says any of these, treat the request as config loading instead of team redesign:
+1. **Goal or deliverable** — what consensus output the debate produces. Must be concrete enough to force convergence.
+2. **Tension axis** — the actual disagreement the debate explores. If there is no real tension, there is no debate; route the user elsewhere.
+3. **Agents and roles** — which agents argue which positions. At least 2 distinct positions. No clones: distinct models, distinct prompts, or both. Disagreement is mandated, not optional.
+4. **Hub stance** — neutral (orchestrates only), partisan-for-synthesis (argues a position and synthesizes), or participant (argues a position, no synthesis privilege).
+5. **Convergence rule** — when the debate ends. Default: rounds end when positions converge or the stop rule fires.
+6. **Forcing field** — the structural constraint in the deliverable that makes faking agreement harder than agreeing. Every debate has one; if none is visible, design one before proceeding.
+7. **Scope facts** — the evidence, constraints, or context the debate must respect.
+8. **Round count** — default 2. Override only when the user states a count.
 
-- `load`
-- `start`
-- `run`
-- `resume`
-- `reuse`
-- `existing config`
-- a direct reference to `agents/<slug>.toml`
-
-For config-loading requests:
-
-- read the existing config first
-- keep the saved config as the source of truth for runtime, launch mode, provider-qualified model IDs, tags, thread strategy, intent strategy, and reporting model
-- preserve browser automation, session, and safety rules from the config when they exist
-- only redesign the config if the user explicitly asks to change the team or values inside it
-- ask only for blocking information that the saved config and user request do not supply
-- otherwise use safe defaults, state the assumptions, and keep the existing config intact
-- read `references/loading-configs.md` and `references/hcom-gotchas.md` before composing loader guidance
-
-For new design requests, continue with the planning path below.
-
-### 3. Ask only when truly blocked
-
-Ask a follow-up question only if the missing detail would materially change topology or safety.
-
-Do **not** stop for preferences that have a sensible default.
-
-If a user does not specify a tool pairing or reviewer model, choose a recommended default and record it as an assumption.
-
-Default assumptions:
-
-- code change with review gate: `worker-reviewer`
-- risky implementation: `planner-executor-reviewer`
-- mixed-model risky work: strong OpenCode planner, headless OpenCode executor, separate reviewer
-- runtime: `hcom opencode --headless`
-- exact model IDs: resolve with `opencode models`, narrow with `opencode models <provider>` when needed, and record provider-qualified IDs; if live discovery is unavailable, label chosen IDs as assumptions
-- duplicate provider families: surface top candidates and choose one explicit assumption
-- group routing: stable tags
-- workflow isolation: one unique thread per workflow
-
-### 4. Gather the architecture decisions for new designs
-
-Always resolve these decisions before producing the artifacts:
-
-1. task complexity
-2. topology
-3. runtime and launch mode
-4. model strategy
-5. exact model resolution
-6. role assignments
-7. reviewer/evaluator requirement
-8. sandbox requirement
-9. communication and routing strategy
-10. bundle depth and handoff points
-11. launch sequence
+Ask a follow-up only if the missing detail would materially change the tension axis, agent roster, or convergence rule. Do not stop for preferences that have a sensible default.
 
 Read references only when needed:
 
-- `references/topologies.md` for topology tradeoffs
-- `references/model-selection.md` for cost/capability tradeoffs
-- `references/roles-and-reviewers.md` for role boundaries and quality gates
-- `references/loading-configs.md` for saved-config loader behavior
-- `references/hcom-primitives.md` for messaging, bundles, transcript, and launch primitives
-- `references/hcom-gotchas.md` before finalizing any launch guidance
-- `references/output-contract.md` immediately before generating outputs
+- `references/topologies.md` for debate topology tradeoffs
+- `references/model-selection.md` for cost/capability tradeoffs across positions
+- `references/roles-and-reviewers.md` for role-brief design and mandate-disagreement rules
+- `references/output-contract.md` immediately before composing the prepared plan
+- `references/hcom-primitives.md` for messaging, transcript, events, and launch primitives
+- `references/hcom-gotchas.md` before finalizing any launch or send guidance
 
-### 5. Produce the right output for the request type
+### 3. Compose the prepared debate plan
 
-For new design or redesign requests, you must generate both outputs:
+Produce, in one block:
 
-- `agents/<slug>.toml`
-- `agents/<slug>.md`
+- the goal or deliverable
+- the tension axis and the positions being argued
+- the agents (by tag or name), their assigned positions, and their role briefs
+- the hub stance
+- the round count and the stopping rule
+- the convergence prompt
+- the forcing-field deliverable spec
+- scope facts the debate must respect
+- assumptions, if defaults were chosen
+- the **exact first hcom action** that would fire if approved — a verbatim `hcom send` or spawn command, not a placeholder
 
-Use these templates:
+The prepared plan is the proposal. It must be complete enough that approval is a yes/no decision, not a clarification round.
 
-- `assets/agents-template.toml`
-- `references/agents-template.md`
+### 4. Present the plan and ask explicit approval
 
-For config-loading requests, do **not** replace the saved config with freshly generated artifacts unless the user explicitly asked to redesign or update them.
+Show the prepared plan to the user in one block. Then ask:
 
-Instead, return config-loading instructions:
+> "Run this debate now? (y/n)"
 
-- the exact command to load the saved config, or the generic loader invocation when the user did not name a slug
-- the preserved values that the loader must keep from the config
-- any assumptions or blocking gaps that still matter
+or the host harness's explicit-confirmation equivalent. Do not phrase this as a rhetorical question, a status update, or an FYI.
 
-Optional script generation is allowed only when the user explicitly asks for executable automation.
+- If **yes**: proceed to Step 5. The approval covers this debate only.
+- If **no**, or no answer: return the prepared debate plan as the output. Do not send, spawn, seed, or launch anything. State that the plan is ready and can be run later by re-invoking the skill or by the user issuing the prepared sends manually.
 
-Do not substitute any of these with:
+The gate is per-debate, not per-session. Approval is not transferable.
 
-- a prose-only answer
-- launch commands alone for new design requests
-- a `.hcom/` directory design
-- a shell script unless the user explicitly asked for automation
-- repo documentation
+### 5. Run the rounds
 
-If the user asked for a plan, return the plan **and** the design artifacts.
+After approval, execute the prepared plan:
 
-Derive `<slug>` from the task as short kebab-case, for example:
+1. **Brief the agents** — send each role brief to its assigned agent on the workflow thread. Use `--intent request` for assignments.
+2. **Collect openings** — each agent argues its opening position on-thread.
+3. **Run rounds** — default 2 rounds. Each round: agents respond to the other positions, then the hub advances or closes.
+4. **Apply the stopping rule** — when the stop condition fires, rounds end. Do not add a round without a stated reason.
+5. **Converge** — issue the convergence prompt. The hub (or the synthesizer role, if the topology includes one) produces the forcing-field deliverable.
 
-- `review-loop`
-- `risky-implementation`
-- `migration-squad`
+Report the convergence deliverable on-thread per loam reporting norms. Use `--intent inform` for the final outcome.
 
 ### 6. Output rules
 
-In design mode, the TOML must be machine-readable and the markdown must explain the rationale.
+The skill always produces the prepared debate plan. If approved, the convergence result is appended on-thread.
 
-In loading mode, the response must explain how to load the saved config without redesigning it.
+If assumptions were chosen, include them under `## Assumptions` in the prepared plan.
 
-If assumptions were needed:
+When the prepared plan includes a launch sequence:
 
-- include them under `## Assumptions` in the markdown artifact
-- reflect them in the TOML values instead of leaving blanks
-- for config loading, state them next to the loader instructions and keep the saved config as the source of truth
-
-Always include the relevant equivalents of:
-
-- runtime choice and launch mode
-- provider-qualified model IDs
-- thread strategy
-- intent strategy
-- launch commands or loader invocation
-- reviewer/evaluator guidance when quality matters
-- sandbox notes when risky execution is proposed
-- concrete routing examples when tags are part of the design
-- reporting path when the config routes reports back to the spawning agent
-
-Intent values are limited to:
-
-- `request`
-- `inform`
-- `ack`
-
-Do not invent new intent names.
-
-When you show a launch sequence:
-
-- initialize the workflow thread once, or reuse the configured thread when the saved config already defines it
-- reuse the same thread value across the workflow
-- only generate a new thread when the config explicitly allows generated threads
-- do not regenerate the thread separately per launch command
+- initialize the workflow thread once and reuse it across the debate
 - do not pass `--thread` to `hcom opencode` spawn commands
-- if you use tag routing, show it in the real `@<tag>-` form such as `@plan-`
-- for OpenCode launch examples, prefer `HCOM_OPENCODE_ARGS="--model <provider/model>"` and `--headless` unless the user asked for another runtime or a visible terminal
-- do not use bare model family names like `gpt-5.5`; record full provider-qualified IDs such as `openai/gpt-5.5`
+- use tags as stable addresses for group routing, in the real `@<tag>-` form such as `@pro-` or `@con-`
+- for OpenCode launch examples, prefer `HCOM_OPENCODE_ARGS="--model <provider/model>"` and `--headless` unless the user asked for a visible terminal
+- do not use bare model family names; record full provider-qualified IDs such as `openai/gpt-5.5`
 - use `--intent request` for initial assignments and handoffs that require action
-- use `--intent inform` for status updates, reports, and final outcomes
+- use `--intent inform` for status updates, reports, and the final convergence deliverable
 - use `--intent ack` only for explicit no-reply acknowledgments
-- use `--thread` on messages, waits, listeners, and other workflow coordination commands
-- use tags as the stable addresses for group routing
-- do not hardcode generated hcom agent names as stable addresses
-- when multiple providers offer similar IDs, mention `opencode models <provider>` as the narrowing step
-- if you could not actually run `opencode models`, say the provider-qualified IDs are assumptions or likely candidates rather than confirmed local availability
-- if browser automation is configured, preserve the config's browser, session, and safety rules
+- if you could not actually run `opencode models`, label provider-qualified IDs as assumptions or likely candidates rather than confirmed local availability
+
+Intent values are limited to `request`, `inform`, and `ack`. Do not invent new intent names.
 
 ### 7. Final response format
 
-For a new design or redesign request, return the answer in this order:
+Return the answer in this order:
 
-1. short summary of the chosen topology and why it fits
+1. short summary of the chosen debate topology and why it fits the tension axis
 2. short assumptions list if defaults were chosen
-3. a literal heading line containing `agents/<slug>.toml`, followed by a fenced `toml` block
-4. a literal heading line containing `agents/<slug>.md`, followed by a fenced `md` block
-5. short risks or follow-up notes
+3. the prepared debate plan (hub prompt, role briefs, convergence prompt, round count, stopping rule, forcing-field deliverable, exact first hcom action)
+4. the approval gate prompt
+5. if approved: the convergence result, reported on-thread
+6. short risks or follow-up notes
 
-For a config-loading request, return the answer in this order:
-
-1. short summary of which saved config is being loaded and why redesign is unnecessary
-2. short preserved-values list covering runtime, model IDs, tags, thread strategy, intent strategy, and reporting model, plus browser/session/safety rules when present
-3. a short `Config loading instructions` section with the exact command or generic loader invocation, such as `hcom run agent-config <slug> "<task>"`
-4. concise loader notes covering thread handling, routing, intents, and report flow
-5. short assumptions or blocking gaps
-6. an optional script only if the user explicitly asked for executable automation
+If approval was denied or absent, stop at step 3. The prepared plan is the deliverable.
 
 ## Common Mistakes
 
 | Failure pattern | Counter-rule |
 |---|---|
-| "I need the exact tool pairing before I can generate artifacts" | Choose the recommended pairing and label it as an assumption unless safety truly depends on the choice. |
-| "I will give launch guidance but not the artifacts yet" | In design mode, always emit both `agents/<slug>` artifacts in the same answer. |
-| Treating "load this config" as a new team design | Read the existing config and provide or run the loader path instead. |
-| "I should set up `.hcom/` scripts and docs instead" | This skill produces planning/configuration artifacts, not repo changes. |
-| "The user asked to build the project, so I should start inspecting it" | Stay in planning scope and provide the hcom team/config that would enable execution. |
-| "Threading is obvious, I can omit it" | Always include explicit thread and intent strategy. |
-| "I can invent my own intent label like `review`" | Only use the actual hcom intent values: `request`, `inform`, or `ack`. |
+| "I'll fire the first send and confirm as we go" | No. All sends wait on the gate. Confirmation is not retroactive. |
+| "The user said 'set up a debate,' that implies run it" | No. "Set up" is preparation. Running is a separate explicit approval. |
+| "I got approval for debate A, so debate B is pre-approved" | No. The gate is per-debate. |
+| "I'll seed the thread now and wait for approval before the first round" | No. Thread seeding is an hcom send. It waits with everything else. |
+| "The prepared plan is just a draft, I don't need to show the first send" | Show the exact first send. The user is approving a concrete action, not a vibe. |
+| "Clones are fine if the prompt is good" | No. Distinct models or distinct prompts. Disagreement is mandated. |
+| "No explicit stop rule, we'll know when we're done" | No. State the stop rule in the prepared plan. |
 | "I can put `--thread` on every `hcom` command, including agent spawn" | Use `--thread` on workflow messaging and wait commands, not on `hcom opencode` spawn lines. |
-| "I can create a fresh thread inside every launch command" | Create the workflow thread once, then reuse it across launches, sends, waits, and cleanup. |
-| "The tag syntax is obvious, I can write `@tag-plan` or another made-up form" | Use the real hcom group-routing syntax: `@<tag>-`, such as `@plan-` or `@review-`. |
-| "I can use generated hcom names as stable addresses in the loader" | Use tags as stable addresses and only resolve generated names ephemerally when absolutely necessary. |
-| "I can write just `gpt-5.5` or `glm-5.1` and the runtime will know what I mean" | Resolve and record the exact provider-qualified OpenCode model ID. |
-| "If multiple providers expose the same family, I should silently pick one" | Surface the top exact IDs, then choose one explicit assumption in the artifacts. |
+| "I can invent my own intent label like `review`" | Only use the actual hcom intent values: `request`, `inform`, or `ack`. |
+| "I can write just `gpt-5.5` and the runtime will know what I mean" | Resolve and record the exact provider-qualified OpenCode model ID. |
 | "I can present provider-qualified IDs as confirmed even when I did not run discovery" | If `opencode models` was not actually run, label the IDs as assumptions or likely candidates. |
+| "If multiple providers expose the same family, I should silently pick one" | Surface the top exact IDs, then choose one explicit assumption in the prepared plan. |
+| "The user asked for saved team configs, so I should generate them" | No. The saved-config contract is retired. Compose the debate inline. |
+| "I'll emit both a prepared plan and a fresh agents/<slug>.toml just in case" | No. Do not emit `agents/<slug>` artifacts. That contract is retired. |
 
-## Example Default
+## When hcom is unavailable
 
-For a risky implementation request with no model preferences:
+When hcom is not installed, the skill still produces the prepared debate plan via the same interview and gate. The only difference is dispatch: compose the hub prompt, role briefs, and convergence prompt inline and dispatch via your harness's subagent mechanism (Task tool, subagent dispatch, manual handoff). The interview, gate, and mechanics are identical. No saved-config fallback exists; the saved-config contract is retired.
 
-- planner: strong OpenCode reasoning model resolved from `opencode models`
-- executor: headless OpenCode worker by default
-- reviewer: separate strong reviewer
-- if the requested family appears under multiple providers, surface the top exact IDs and choose one assumption
+Output a markdown prepared plan containing:
 
-That should normally become a `planner-executor-reviewer` plan with a unique workflow thread, headless OpenCode launch commands, tag-based routing, and reviewer signoff before completion.
+- the goal or deliverable
+- the tension axis and positions
+- the role briefs (one per position, distinct, mandate disagreement)
+- the hub stance
+- the round count and stopping rule
+- the convergence prompt
+- the forcing-field deliverable spec
+- scope facts
+- assumptions
 
----
-
-## General agent-team planning (when hcom is unavailable)
-
-When hcom is not installed, this skill produces a general agent-team plan instead of hcom-specific TOML configs and launch commands. The plan is a markdown document that works with any harness's task/delegation mechanism (Task tool, subagent dispatch, manual handoff, etc.).
-
-Adapted from the dispatching-parallel-agents pattern: dispatch one agent per independent problem domain, give each agent a focused scope, and verify results before integrating.
-
-### 1. Identify independent domains
-
-Group the work by what's independent:
-
-- Can each piece be understood without context from the others?
-- Is there shared state between pieces?
-- Would fixing one piece affect another?
-
-If pieces are independent → parallel dispatch. If they share state or depend on each other → sequential or single-agent.
-
-### 2. Select a topology
-
-| Signal | Topology |
-|---|---|
-| Small, low-risk task | single agent |
-| Code change with mandatory review | worker-reviewer |
-| Risky implementation or mixed roles | planner-executor-reviewer |
-| 3+ distinct responsibilities | hub-spoke |
-
-See `references/topologies.md` for tradeoff details (the topology descriptions are general; ignore hcom-specific launch commands in that reference).
-
-### 3. Assign roles and models
-
-For each role, choose:
-
-- **Scope:** one clear problem domain
-- **Model:** strongest available for planning/review, cheaper for execution
-- **Constraints:** what the agent must NOT touch
-- **Expected output:** what the agent should return
-
-See `references/roles-and-reviewers.md` for role boundaries and `references/model-selection.md` for cost/capability tradeoffs (ignore hcom-specific model ID resolution in those references; use whatever model selection mechanism your harness provides).
-
-### 4. Define agent task prompts
-
-Each agent gets a prompt that is:
-
-1. **Focused** — one clear problem domain, not "fix everything"
-2. **Self-contained** — all context needed to understand the problem, no inherited session history
-3. **Specific about output** — what should the agent return? (summary of changes, root cause, test results)
-
-Common mistakes to avoid:
-
-| Mistake | Fix |
-|---|---|
-| Too broad: "Fix all the tests" | Specific: "Fix agent-tool-abort.test.ts" |
-| No context: "Fix the race condition" | Context: paste error messages and test names |
-| No constraints: agent refactors everything | Constraints: "Do NOT change production code" |
-| Vague output: "Fix it" | Specific: "Return summary of root cause and changes" |
-
-### 5. Produce a plan document
-
-Output a markdown plan (not TOML) containing:
-
-```markdown
-## Agent Team Plan
-
-### Topology
-<chosen topology and why>
-
-### Roles
-
-| Role | Model | Scope | Constraints |
-|---|---|---|---|
-| <role> | <model> | <scope> | <constraints> |
-
-### Tasks
-
-#### Agent 1: <name>
-- Scope: <one problem domain>
-- Goal: <clear objective>
-- Constraints: <what not to touch>
-- Expected output: <what to return>
-
-#### Agent 2: <name>
-...
-
-### Verification
-- Review each agent's output
-- Check for conflicts (did agents edit same code?)
-- Run full test suite
-- Spot check for systematic errors
-
-### Assumptions
-- <any defaults chosen>
-```
-
-### 6. Verification
-
-After agents return:
-
-1. Review each summary — understand what changed
-2. Check for conflicts — did agents edit the same code?
-3. Run full test suite — verify all fixes work together
-4. Spot check — agents can make systematic errors
-
-### When NOT to use parallel agents
-
-- **Related failures:** fixing one might fix others — investigate together first
-- **Need full context:** understanding requires seeing the entire system
-- **Exploratory debugging:** you don't know what's broken yet
-- **Shared state:** agents would interfere (editing same files, using same resources)
+Present it for approval. If approved, dispatch the role briefs via your harness's subagent mechanism, collect responses, run rounds, and converge. If denied, return the prepared plan and stop.

@@ -16,7 +16,7 @@ This is the router for the loam skill namespace. It does not perform work itself
 
 Three rules with no exceptions. Violating any produces work that looks right but drifts from the loam model.
 
-1. **Invoke the relevant skill before any loam action.** Not just tool calls. Before planning, researching, starting, resuming, checkpointing, configuring agents, amending a plan, adding to memory, querying memory, amending memory, linting memory, normalizing memory, reviewing memory, capturing learnings, auditing guidance, scaffolding the wiki, or initializing a vault: invoke the matching skill. This document is a router. The skill body has the actual rules. The responsibility is yours on everything else. Err on the side of invoking.
+1. **Invoke the relevant skill before any loam action.** Not just tool calls. Before planning, researching, starting, resuming, checkpointing, debating or reaching consensus, amending a plan, adding to memory, querying memory, amending memory, linting memory, normalizing memory, reviewing memory, capturing learnings, auditing guidance, scaffolding the wiki, or initializing a vault: invoke the matching skill. This document is a router. The skill body has the actual rules. The responsibility is yours on everything else. Err on the side of invoking.
 2. **Memory first, substrate second.** Talk about "memory" first. Use "wiki" only when distinguishing the markdown substrate from the guidance or checkpoint substrates. Never say "the wiki" when you mean "memory" — the wiki is one substrate of memory, not the whole thing.
 3. **Proposal-first on memory writes.** Never edit memory without showing a proposal and getting explicit user approval. Applies to every skill that writes: `loam-adding-to-memory`, `loam-amending-memory`, `loam-learning-from-session`, `loam-normalizing-memory`, `loam-linting-memory` (for its safe-local-fixes path). Direct edits without a proposal shown to the user are forbidden.
 
@@ -41,7 +41,8 @@ These rationalizations cause skills to be skipped. If you catch yourself thinkin
 | Thought | Action |
 |---|---|
 | "I'll just write this to the wiki" | Invoke `loam-adding-to-memory`. Memory writes are proposal-first. |
-| "This is simple, I'll just plan it" | Invoke `loam-writing-spec`. Specs are required before `loam-planning`. |
+| "I'll just plan it, this is simple" | Invoke `loam-writing-spec`. Specs are required before `loam-planning`. |
+| "I'll just run a quick debate between agents" | Invoke `loam-configuring-agents`. Debates are approval-gated; no sends before the gate. |
 | "I'll just edit this plan directly" | Invoke `loam-amending-plan`. Plan changes cascade; the skill walks the impact. |
 | "I'll skip the proposal, just write it" | STOP. All memory writes are proposal-first. No exceptions. |
 | "The wiki is out of date, I'll fix it inline" | Invoke `loam-amending-memory`. Corrections are proposal-first. |
@@ -78,7 +79,7 @@ For any loam task:
 ├─ start something new
 │  ├─ research a question ──────────── /loam::writing-spec
 │  ├─ plan approved work ────────────── /loam::planning
-│  └─ set up agent team ─────────────── /loam::configuring-agents
+│  └─ debate / reach consensus ─────── /loam::configuring-agents
 ├─ execute work
 │  ├─ begin a plan ──────────────────── /loam::starting
 │  ├─ pause / hand off ──────────────── /loam::checkpointing
@@ -113,7 +114,7 @@ One line per skill. The decision graph is the primary router; this is for quick 
 - `loam-starting` — begin or resume execution of a plan
 - `loam-resuming` — resume from checkpoint notes
 - `loam-checkpointing` — write a resumable checkpoint before pausing
-- `loam-configuring-agents` — plan or reuse an agent team config (hcom backend; general advice when hcom unavailable)
+- `loam-configuring-agents` — run an approval-gated structured debate or conference between agents with distinct positions and a convergence deliverable
 - `loam-amending-plan` — update an in-flight plan after scope change
 - `loam-adding-to-memory` — ingest a source into memory (wiki substrate)
 - `loam-ingesting-codebase` — ingest codebase as entity pages with wikilink edges

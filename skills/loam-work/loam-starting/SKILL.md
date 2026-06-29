@@ -113,7 +113,7 @@ Constraint resolution:
 | `risk:data-destructive` | use planner-executor-reviewer style delegation and hub confirmation | require explicit user confirmation before destructive action |
 | `needs-parallel` | dispatch runnable tasks concurrently in the current wave | run sequentially in listed order |
 
-Run `/loam::configuring-agents <slug>` separately when detailed launch config is needed. If hcom is unavailable or unsafe, keep execution inline and log the fallback.
+
 
 
 ## Step 0.8 — External discipline fetch and cache

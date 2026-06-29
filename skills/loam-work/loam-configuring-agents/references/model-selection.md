@@ -24,7 +24,7 @@ When the requested or implied family exists under multiple providers:
 
 - surface the top 2-3 exact IDs
 - briefly note why they are viable candidates
-- choose one exact ID as an explicit assumption in the generated artifacts
+- choose one exact ID as an explicit assumption in the prepared debate plan
 - if provider choice materially changes cost, latency, or safety, call that out in risks or tradeoffs
 
 If only one viable exact ID is available, use it directly.
