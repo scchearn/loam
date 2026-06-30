@@ -1,19 +1,22 @@
 ---
 name: loam::learning-from-session
-description: "Review the current session for durable learnings, then route each one to the right durable surface: a wiki page (proposal-first, via the wiki-page workflow) or an agent guidance file (concise one-liner edits, via the guidance-file workflow). Use when the session uncovered decisions, architecture facts, commands, conventions, gotchas, or open questions that future sessions should inherit. Not for source ingestion or correcting stale wiki claims; use /loam::adding-to-memory or /loam::amending-memory."
+description: "Review the current session for durable learnings, then route each one through the five-way matrix: wiki page, guidance file, checkpoint, task annotation/plan, or discard. Use when the session uncovered decisions, architecture facts, commands, conventions, gotchas, or open questions that future sessions should inherit. Not for source ingestion or correcting stale wiki claims; use /loam::adding-to-memory or /loam::amending-memory."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.2.0"
+  version: "1.3.0"
   author: scchearn
   argument-hint: [topic or session summary]
 ---
 
-You are a senior engineer reviewing the current session for durable learnings. Two writing paths are available, and routing is itself a feature of this skill:
+You are a senior engineer reviewing the current session for durable learnings. Five destinations are available, and routing is itself a feature of this skill:
 
-- **wiki-page path** — for learnings that belong in the durable Obsidian-friendly wiki (topic, entity, concept, analysis pages). Proposal-first; reads the wiki schema, qmd graph, index, and log before editing.
+- **wiki-page path** — for learnings that pass the canonical `loam-using` Durable-memory admission rubric and belong in the durable Obsidian-friendly wiki.
 - **guidance-file path** — for learnings about how to work in this repo that belong in `AGENTS.md`, `CLAUDE.md`, or `.claude.local.md` as concise one-liners that future agent sessions will inherit as prompt context.
+- **checkpoint path** — for resumable session state that belongs under `wiki/checkpoints/` via `/loam::checkpointing`.
+- **task annotation / plan path** — for per-task context that belongs on the active unit of work.
+- **discard path** — for build output, branch state, one-offs, unverifiable claims, and rubric failures.
 
-This skill is a **proposal-first** router. It does not write until the user approves.
+This skill routes and writes directly. The agent owns classification and does not ask for pre-approval.
 
 ## Input
 
@@ -57,8 +60,16 @@ learning is not durable as written — either strip it to a reusable pattern
 4. **Already-applied test** — Was the fix already applied and shipped? The
    fix itself is done; only the *generalizable lesson* is durable.
 
+Reusable gotchas have a stricter capture bar: they must be written as
+`Trigger → Mistake → Fix`, be reproducible from the description by a future
+agent, and not be environment-specific. Operational session reports,
+host/PATH/toolchain incidents, and one-off local failures do not enter durable
+capture; checkpoint them if they matter for resumption. When a gotcha passes,
+route the candidate gotcha to the skill that tripped the agent, either its `Common
+Mistakes` section or `references/gotchas.md`.
+
 A learning that passes only after stripping is still durable — the stripped
-form is what enters the proposal.
+form is what gets routed.
 
 ## Step 2 — Classify each learning (the router)
 
@@ -118,6 +129,7 @@ not a pattern → route to `/loam::checkpointing` or drop.
 
 ### Route to the wiki-page path when:
 
+- The learning passes the canonical `loam-using` Durable-memory admission rubric.
 - The learning is a fact, decision, architecture note, or analysis that any future session (agent or human) reading memory would benefit from.
 - The learning deserves a topic, entity, concept, or analysis page (or an update to one).
 - The learning is worth cross-linking into the wiki graph.
@@ -129,20 +141,37 @@ not a pattern → route to `/loam::checkpointing` or drop.
 - The right shape is a concise one-liner that lives in prompt context, not a wiki paragraph.
 - The destination is `AGENTS.md` (team-shared, harness-agnostic), `CLAUDE.md` (team-shared Claude-specific), or `.claude.local.md` (personal/local, gitignored).
 - The learning is about **how to work here**, not about **what is true here**.
+- The candidate gotcha passes the `Trigger → Mistake → Fix` capture bar but no tripped skill is available to update directly.
+
+### Route to the checkpoint path when:
+
+- The learning is session state needed for resume or handoff.
+- The learning is a pure incident report with no generalizable pattern, but future resumption needs it.
+
+### Route to the task annotation / plan path when:
+
+- The learning is per-task context attached to an active unit of work.
+- The information is useful only while executing or reviewing that task.
+
+### Route to discard when:
+
+- The learning is build output, branch state, one-off, unverifiable, reconstructable with one command or file read, or fails the admission rubric.
 
 ### Mixed routing is allowed and expected
 
-A single session may produce both kinds. Keep them separate in the proposal: wiki-bound learnings in one section, guidance-bound learnings in another. A learning that would fit both surfaces should default to the guidance-file path only if it is short and instruction-shaped; otherwise route to memory (wiki substrate).
+A single session may produce multiple destination types. Keep destinations separate in the report. A learning that would fit both wiki and guidance should default to guidance only if it is short and instruction-shaped; otherwise route to memory (wiki substrate) if it passes the admission rubric.
 
 ### Defer or route elsewhere when:
 
-- The learning is not durable enough — defer.
+- The learning is not durable enough — discard, checkpoint, or attach to the active task if useful there.
 - The learning reveals memory is wrong, stale, or contradicted — route to `/loam::amending-memory`.
 - The learning is a new source to ingest (a file, article, transcript) — route to `/loam::adding-to-memory`.
 - The learning is an unresolved open question — preserve as such, do not settle it silently.
 - The learning is a pure incident report (what happened today, how we fixed
   it, no generalizable pattern) — route to `/loam::checkpointing`, not
   memory or guidance.
+- The learning is an environment-specific failure — keep it in the operational
+  report or checkpoint only; do not add it to `Common Mistakes` or gotchas.
 
 ---
 
@@ -150,7 +179,7 @@ A single session may produce both kinds. Keep them separate in the proposal: wik
 
 ### 3A — Wiki-page path
 
-If the session produced any wiki-bound learnings, run the proposal-first wiki workflow below. If none, skip 3A entirely.
+If the session produced any wiki-bound learnings, run the wiki workflow below. If none, skip 3A entirely.
 
 #### Find the wiki and probe state
 
@@ -173,7 +202,7 @@ If qmd is ready, read `${CLAUDE_SKILL_DIR}/references/qmd-usage.md` for finding 
 
 #### Read the wiki contract & discover destinations
 
-Read before proposing:
+Read before editing:
 
 1. `<wiki root>/SCHEMA.md`
 2. `<wiki root>/index.md`
@@ -203,7 +232,7 @@ Rules:
 2. **Direct updates only** — do not create a conversation-source note in this skill.
 3. Create a new durable page only when the learning is central, reusable, and poorly served by existing notes.
 4. Keep additions concise and durable. Do not dump session transcripts.
-5. If a learning contradicts existing memory claim, surface it and recommend `/loam::amending-memory`.
+5. If a learning contradicts an existing memory claim, archive the superseded durable page, write the correction, log it, and continue.
 6. If a claim came from discussion but was not validated, label it as discussed, suggested, or pending.
 
 ### 3B — Guidance-file path
@@ -238,76 +267,14 @@ Avoid:
 
 ---
 
-## Step 4 — Show the proposal (do not edit yet)
+## Step 4 — Apply routed learnings
 
-Present a single unified proposal covering both paths. If only one path has entries, show only that one.
+Apply each routed learning to its destination.
 
-```md
-## Session Learnings Proposal
-
-### Summary
-- Learnings reviewed: <count>
-- Wiki-page path: <count>
-- Guidance-file path: <count>
-- New wiki pages: <count>
-- Needs amend instead: <count or "none">
-- Deferred: <count or "none">
-- Routed to checkpointing (incidents): <count or "none">
-
-### Wiki updates
-
-#### Update: <page path>
-
-**Why:** <one-line reason>
-
-```diff
-+ <concise proposed addition>
-```
-
-#### New page: <page path>
-
-**Why:** <one-line reason>
-
-```md
-# <title>
-...
-```
-
-#### Index and log
-- `index.md`: <what will change, or "unchanged">
-- `log.md`: append `## [YYYY-MM-DD] learnings | <session focus>`
-
-### Guidance-file updates
-
-#### Update: ./AGENTS.md
-
-**Why:** <one-line reason>
-
-```diff
-+ <the addition - keep it brief>
-```
-
-### Defer or route elsewhere
-- <item>: not durable enough | incident → `/loam::checkpointing` | should use `/loam::amending-memory` | still unresolved
-
-### Open questions
-- <question or "none">
-```
-
-Then ask:
-
-> "Does this learnings proposal look right? If yes, I'll apply it. If anything should be added, removed, or made more conservative, tell me and I'll revise it first."
-
-Wait for explicit confirmation.
-
----
-
-## Step 5 — Apply the approved learnings
-
-### 5A — Apply wiki-page path
+### 4A — Apply wiki-page path
 
 1. Update the existing relevant pages.
-2. Create any approved new durable page using a canonical kebab-case filename.
+2. Create any admitted new durable page using a canonical kebab-case filename.
 3. Update `index.md` if durable pages changed or discoverability improved materially.
 4. Append `<wiki root>/log.md`:
 
@@ -315,19 +282,31 @@ Wait for explicit confirmation.
 ## [YYYY-MM-DD] learnings | <session focus>
 ```
 
-Capture: session focus, pages updated or created, important learnings preserved, contradictions or items deferred, open questions left unresolved.
+Capture: session focus, pages updated or created, important learnings preserved, contradictions corrected, open questions left unresolved.
 
 5. **Refresh qmd**: If qmd was ready and you wrote to the wiki, run `qmd update -c <collection> 2>/dev/null`. If refresh fails, report it but do not roll back wiki edits.
 
 Do not create a conversation-source note in this skill.
 
-### 5B — Apply guidance-file path
+### 4B — Apply guidance-file path
 
-Write all approved guidance additions to `AGENTS.md` only. Never write to `CLAUDE.md` (it is an `@AGENTS.md` import shim). Keep additions to one line per concept.
+Write guidance additions to `AGENTS.md` only. Never write to `CLAUDE.md` (it is an `@AGENTS.md` import shim). Keep additions to one line per concept.
+
+### 4C — Apply checkpoint path
+
+Invoke `/loam::checkpointing` for resumable state. Do not write checkpoint content into durable wiki pages.
+
+### 4D — Apply task annotation / plan path
+
+Attach per-task context to the active task, plan, or task tracker entry using that tool's native format.
+
+### 4E — Discard
+
+Discard material that fails routing. Optionally mention discarded classes in the report when helpful.
 
 ---
 
-## Step 6 — Report back
+## Step 5 — Report back
 
 ```md
 Session learnings applied for <session focus>
@@ -348,6 +327,11 @@ Session learnings applied for <session focus>
 ### Deferred or needs amend
 - <item or "none">
 
+### Routed elsewhere or discarded
+- Checkpoint: <count or "none">
+- Task annotation / plan: <count or "none">
+- Discarded: <count or "none">
+
 ### Open questions
 - <question or "none">
 
@@ -362,22 +346,25 @@ If the review found nothing durable enough to add, say so explicitly and do not 
 ## Rules
 
 - Review the current session before scanning either surface.
-- Read the wiki schema before proposing wiki edits.
-- Read existing guidance files before proposing guidance edits.
-- Proposal first, apply second — always.
-- The classification (wiki vs guidance) is a feature. Do not collapse the two paths into one.
+- Read the wiki schema before wiki edits.
+- Read existing guidance files before guidance edits.
+- Route through the five-way matrix before writing.
+- The classification is a feature. Do not collapse the destinations into one.
 - Wiki path: direct page updates only. Never create a conversation-source note in this skill.
 - Wiki path: prefer existing pages over new pages. Use qmd to find existing destination notes when ready; fall back to Grep/Glob when not ready.
 - Wiki path: never edit a wiki page based only on qmd output. Always read the actual wiki files first.
 - Wiki path: keep additions concise, durable, and attributable to the session.
-- Wiki path: route corrections and supersessions to `/loam::amending-memory` instead of silently fixing them here.
+- Wiki path: corrections and supersessions use archive + correct + log; do not silently replace stale claims.
 - Guidance path: keep it concise — one line per concept. Guidance files are part of the prompt.
 - Guidance path: avoid verbose explanations, obvious information, and one-off fixes unlikely to recur.
 - Do not fetch external sources in this skill.
 - Do not modify raw-source files.
-- Update `<wiki root>/log.md` on every approved wiki learnings pass.
+- Update `<wiki root>/log.md` on every wiki learnings pass.
 - After wiki writes, refresh qmd if the collection is ready. If refresh fails, report it but do not roll back.
 - Run the durability test (Step 1.5) on every candidate before classifying.
   Incidents belong in `/loam::checkpointing`, not memory or guidance.
+- Capture durable gotchas only as `Trigger → Mistake → Fix` entries in the
+  tripped skill's `Common Mistakes` or `references/gotchas.md`; see
+  `references/gotchas.md` for examples.
 - Strip session-specific identifiers (dates, paths, agent names, versions,
   thread IDs) before routing. If stripping leaves nothing durable, drop it.

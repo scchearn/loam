@@ -1,9 +1,9 @@
 ---
 name: loam::auditing-guidance
-description: "Audit, prune, and improve agent guidance markdown files in repositories. Use when the user asks to check, audit, update, improve, or fix AGENTS.md, CLAUDE.md, or related guidance files. Adds missing commands and gotchas, removes stale entries, deduplicates, and keeps the file small and relevant. Scan for guidance files, evaluate quality against templates, output a quality report, then make targeted updates after approval."
+description: "Audit, prune, and improve agent guidance markdown files in repositories. Use when the user asks to check, audit, update, improve, or fix AGENTS.md, CLAUDE.md, or related guidance files. Adds missing commands and gotchas, removes stale entries, deduplicates, and keeps the file small and relevant. Scan for guidance files, evaluate quality against templates, output a quality report, then make targeted updates."
 allowed-tools: Read Glob Grep Bash Edit
 metadata:
-  version: "0.2.0"
+  version: "0.3.0"
   author: scchearn
 ---
 
@@ -11,7 +11,7 @@ metadata:
 
 Audit, evaluate, and improve agent guidance markdown files across a codebase so future agent sessions have better project context.
 
-**This skill can write to guidance files.** After presenting a quality report and getting user approval, it updates `AGENTS.md`, `CLAUDE.md`, or `.claude.local.md` with targeted improvements.
+**This skill can write to guidance files.** After presenting a quality report, it updates `AGENTS.md`, `CLAUDE.md`, or `.claude.local.md` with targeted improvements and direct stale/duplicate pruning.
 
 ## Workflow
 
@@ -128,7 +128,7 @@ Format:
 
 ### Phase 4: Targeted Updates (Additions)
 
-After outputting the quality report, ask user for confirmation before updating.
+After outputting the quality report, make targeted additions only when they are clearly supported by the audit. Leave ambiguous additions as recommendations.
 
 **All additions go to `AGENTS.md`.** Never write content to `CLAUDE.md` — it is an import shim (`@AGENTS.md` only). If Claude-specific content is needed, use `.claude/rules/` (team-shared, path-scoped) or `.claude.local.md` (personal).
 
@@ -211,11 +211,11 @@ The audit is two-directional: add what's missing, remove what's stale. After pro
 ```
 ```
 
-**Do not remove without showing the prune diff and getting user approval.** Same proposal-first rule as additions.
+Apply stale or duplicate pruning directly after showing the prune diff in the quality report. Removed content is noted in the report.
 
 ### Phase 5: Apply Updates
 
-After user approval, apply changes using the Edit tool. Preserve existing content structure.
+Apply changes using the Edit tool. Preserve existing content structure.
 
 ## Templates
 

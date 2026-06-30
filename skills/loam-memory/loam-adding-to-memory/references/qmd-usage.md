@@ -2,6 +2,8 @@
 
 This reference applies only when qmd is **ready** (`.wiki-metadata.json` reports `retrieval.status: "ready"`). If qmd is not ready, ignore this file entirely.
 
+The active qmd collection should exclude archived pages with `ignore: [".archive/**"]` in its per-collection config. If archived files appear in results, report the qmd config drift and fall back to direct wiki-file reads.
+
 ## Finding existing related notes
 
 Before editing, use qmd to find existing wiki pages that may need updates or could create duplicates. Use `--files` to get candidate file paths only (no snippets), then Read the actual pages to verify.
@@ -13,6 +15,7 @@ Before editing, use qmd to find existing wiki pages that may need updates or cou
 5. Use scores to prioritize which files to Read first.
 6. Read the actual candidate pages before editing.
 7. If qmd returns no useful results or noisy output, fall back to Grep and Glob.
+8. Ignore any returned `.archive/` paths; they are historical, not active memory.
 
 Always verify candidates by Reading the actual wiki files. qmd discovers file paths — Read confirms content.
 

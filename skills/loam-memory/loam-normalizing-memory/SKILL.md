@@ -3,7 +3,7 @@ name: loam::normalizing-memory
 description: "Inspect an existing memory corpus (wiki substrate) and align it to this repo's Obsidian-friendly note-graph conventions. Use this when the user wants to import, normalize, retrofit, or clean up existing memory, notes folder, vault, docs tree, or mixed markdown knowledge base. In monorepos, also use it to align relevant AGENTS.md and CLAUDE.md files. Not for routine wiki maintenance; use /loam::linting-memory for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: scchearn
   argument-hint: "[--guidance-only] [wiki root or scope]"
 ---
@@ -104,10 +104,10 @@ Use these scoping rules:
 
 ## Phase 2 — Inspect the current shape
 
-Before proposing changes, read:
+Before changing files, read:
 
 1. `${CLAUDE_SKILL_DIR}/references/alignment-rules.md`
-2. `${CLAUDE_SKILL_DIR}/references/proposal-template.md`
+2. `${CLAUDE_SKILL_DIR}/references/proposal-template.md` as the report shape for unresolved or ambiguous work
 3. `${CLAUDE_SKILL_DIR}/references/guidance-file-triage.md`
 4. `<wiki root>/SCHEMA.md` when it exists
 5. `<wiki root>/index.md` when it exists
@@ -137,19 +137,15 @@ Treat the existing corpus with care. The goal is alignment, not a destructive re
 
 ---
 
-## Phase 3 — Build the proposal and stop
+## Phase 3 — Classify fixes
 
-Do not change any files yet.
+Classify the alignment work before editing. Distinguish clearly between:
 
-Use `${CLAUDE_SKILL_DIR}/references/proposal-template.md` as the exact structure for your proposal.
+- changes that are safe and obvious, which you apply directly
+- changes that are likely right but still somewhat judgmental, which you report instead of guessing
+- ambiguous duplicates or restructures, which remain unresolved
 
-The proposal should distinguish clearly between:
-
-- changes that are safe and obvious
-- changes that are likely right but still somewhat judgmental
-- ambiguous duplicates or restructures that should not be applied silently
-
-Important proposal requirements:
+Important report requirements:
 
 1. Call out every file you expect to create or update.
 2. Call out every file you expect to rename or move.
@@ -160,19 +156,14 @@ Important proposal requirements:
 7. Call out any guidance sections you expect to shorten and replace with wiki pointers.
 8. Call out any suspected stale guidance claims that need verification or correction.
 9. Call out mirror files you will intentionally leave thin or untouched.
-10. In `--guidance-only` mode, set all wiki-structure proposal sections such as create/update, rename/move, link normalization, and backlink repairs to `None` unless a guidance file itself is the item being updated.
-
-After presenting the proposal, ask:
-
-> "Does this alignment proposal look right? If yes, I'll apply it. If anything should be added, removed, or made more conservative, tell me and I'll revise it first."
-
-Wait for explicit confirmation before editing files.
+10. In `--guidance-only` mode, set all wiki-structure report sections such as create/update, rename/move, link normalization, and backlink repairs to `None` unless a guidance file itself is the item being updated.
+11. Before creating any new wiki page, apply the canonical `loam-using` admission rubric by reference; route or discard material that fails it.
 
 ---
 
 ## Phase 4 — Apply the alignment
 
-Once the user confirms, apply the smallest safe set of changes needed to align memory.
+Apply the smallest safe set of changes needed to align memory.
 
 Safe full-alignment work includes:
 
@@ -218,6 +209,7 @@ Do not:
 - flatten meaningful disagreements
 - rewrite raw-source files
 - perform broad speculative synthesis during alignment
+- create wiki pages that fail the canonical `loam-using` admission rubric
 - turn `AGENTS.md` / `CLAUDE.md` files into shadow wiki pages
 - rewrite every scoped guidance file in a monorepo when the target scope does not require it
 
@@ -265,7 +257,7 @@ In `--guidance-only` mode, the `Created or updated`, `Renamed or moved`, and oth
 
 ## Rules
 
-- Proposal first. Do not edit anything before explicit confirmation.
+- Apply safe structural fixes directly and report ambiguous work instead of guessing.
 - Prefer the smallest safe alignment over a broad rewrite.
 - Durable category-note filenames use kebab-case. Special root files keep their fixed names.
 - Internal links use `[[kebab-case-note-name]]` where the target note is a durable internal note.

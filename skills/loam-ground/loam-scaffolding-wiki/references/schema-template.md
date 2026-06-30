@@ -10,7 +10,7 @@ Adapt this template into `<wiki root>/SCHEMA.md`. Keep it specific to the worksp
 This wiki exists to maintain a persistent, incrementally refined knowledge base about <topic or corpus>.
 
 The raw-source layer is stored in `<raw path>`. Those files are immutable.
-The wiki layer is stored in `<wiki path>`. Those files are maintained by the agent.
+The wiki layer is stored in `<wiki path>`. The agent owns and maintains those files, writes without pre-approval, and soft-deletes superseded durable pages to `.archive/` instead of hard-deleting them.
 
 ## Directory layout
 
@@ -18,6 +18,7 @@ The wiki layer is stored in `<wiki path>`. Those files are maintained by the age
 - `<wiki path>/index.md` — root hub with a concise `## Overview` section plus page catalog with one-line summaries
 - `<wiki path>/log.md` — append-only activity log (rotates to `log-archive/` at 500 lines)
 - `<wiki path>/log-archive/YYYY-MM.md` — rotated log archives (created by `/loam::linting-memory`)
+- `<wiki path>/.archive/` — soft-deleted durable pages, excluded from qmd, never hard-deleted
 - `<wiki path>/topics/<topic-slug>.md` — topic synthesis pages
 - `<wiki path>/entities/<entity-slug>.md` — entity pages
 - `<wiki path>/concepts/<concept-slug>.md` — concept pages
@@ -63,6 +64,7 @@ The wiki layer is stored in `<wiki path>`. Those files are maintained by the age
 - When a topic, entity, or concept note links to another note, update the linked note with a reciprocal backlink under `Mentioned in` or `Related pages` when the relationship is materially useful.
 - Avoid isolated durable notes. New notes should be reachable from a hub note or a closely related note.
 - Do not create links to pages that are unlikely to be used.
+- Archived pages live under `.archive/` with a pointer to the current page when one exists.
 
 ## Index rules
 
@@ -131,6 +133,7 @@ Periodically check for:
 ## Non-negotiable rules
 
 - Never rewrite raw-source files.
+- Never hard-delete wiki content; move superseded durable pages to `.archive/` with an archival header.
 - Never create a second canonical note for the same durable identity when an appropriate note already exists.
 - Do not silently delete contradictions; explain them.
 - Prefer incremental updates over large rewrites.
@@ -147,6 +150,7 @@ This wiki optionally uses qmd for candidate discovery during wiki skill operatio
 - Any qmd command that fails or returns stale results at runtime triggers a degrade to Grep/Glob
 - After wiki edits, skills refresh qmd if the collection is ready
 - `log.md` is deprioritized in factual retrieval; it records maintenance history, not primary evidence. It rotates to `log-archive/` at 500 lines.
+- qmd collection config must exclude archived pages with `ignore: [".archive/**"]`
 - If qmd refresh fails after wiki edits, report it but do not roll back successful wiki edits
 
 ### .wiki-metadata.json

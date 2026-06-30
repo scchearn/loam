@@ -2,6 +2,8 @@
 
 This reference applies only when qmd is **ready** (`.wiki-metadata.json` reports `retrieval.status: "ready"`). If qmd is not ready, ignore this file entirely.
 
+The active qmd collection should exclude archived pages with `ignore: [".archive/**"]` in its per-collection config. If archived files appear in results, report the qmd config drift and fall back to direct wiki-file reads.
+
 ## Finding the best destination note
 
 Before proposing a new page, use qmd to find existing pages that may already cover the learning. Use `--files` to get candidate file paths only (no snippets), then Read the actual pages to verify.
@@ -11,8 +13,9 @@ Before proposing a new page, use qmd to find existing pages that may already cov
 3. For ambiguous or natural-language queries, use `qmd query "<learning topic>" --files -n 5 -c <collection>`.
 4. Strip the `qmd://<collection>/` prefix from file paths to get relative wiki paths.
 5. Use scores to prioritize which files to Read first.
-6. If qmd finds a clear canonical page, prefer updating that page over creating a new one.
-7. If qmd returns no useful results or noisy output, fall back to Grep and Glob.
+6. Ignore any returned `.archive/` paths; they are historical, not active memory.
+7. If qmd finds a clear canonical page, prefer updating that page over creating a new one.
+8. If qmd returns no useful results or noisy output, fall back to Grep and Glob.
 
 Read the actual candidate pages before deciding. qmd discovers file paths — Read confirms content.
 

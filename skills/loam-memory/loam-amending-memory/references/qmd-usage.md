@@ -2,6 +2,8 @@
 
 This reference applies only when qmd is **ready** (`.wiki-metadata.json` reports `retrieval.status: "ready"`). If qmd is not ready, ignore this file entirely.
 
+The active qmd collection should exclude archived pages with `ignore: [".archive/**"]` in its per-collection config. If archived files appear in results, report the qmd config drift and fall back to direct wiki-file reads.
+
 ## Finding affected pages
 
 Use qmd to broaden affected-page discovery beyond exact string matches. Use `--files` to get candidate file paths only (no snippets), then Read the actual pages to verify.
@@ -11,8 +13,9 @@ Use qmd to broaden affected-page discovery beyond exact string matches. Use `--f
 3. Strip the `qmd://<collection>/` prefix from file paths to get relative wiki paths.
 4. Use scores to prioritize which files to Read first.
 5. This helps discover pages that mention the affected topic but do not contain the exact stale wording.
-6. Read each candidate page to confirm it actually contains the issue before proposing changes.
-7. If qmd results are noisy or irrelevant, ignore them and rely on Grep and Glob.
+6. Read each candidate page to confirm it actually contains the issue before changing it.
+7. Ignore any returned `.archive/` paths; they are historical, not active memory.
+8. If qmd results are noisy or irrelevant, ignore them and rely on Grep and Glob.
 
 Always verify candidates by Reading the actual wiki files. qmd discovers file paths — Read confirms content.
 

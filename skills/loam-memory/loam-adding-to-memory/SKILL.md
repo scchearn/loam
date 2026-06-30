@@ -1,9 +1,9 @@
 ---
 name: loam::adding-to-memory
-description: "Read a local source file or synthesize conversation context, then integrate the content directly into topic, entity, concept, and analysis pages in existing memory (the wiki substrate). Use this when the user wants to add a source to the wiki, add a document, ingest a local note, transcript, article, report, or PDF, or explicitly preserve the current conversation as a topic note. Not for proposal-first session learnings that directly update existing pages; use /loam::learning-from-session."
+description: "Read a local source file or synthesize conversation context, then integrate admitted content directly into topic, entity, concept, and analysis pages in existing memory (the wiki substrate). Use this when the user wants to add a source to the wiki, add a document, ingest a local note, transcript, article, report, or PDF, or explicitly preserve the current conversation as a topic note. For session-learning routing across wiki, guidance, checkpoint, task annotation, or discard, use /loam::learning-from-session."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.2.0"
+  version: "1.3.0"
   author: scchearn
   argument-hint: <local source path | topic or summary from chat>
 ---
@@ -19,7 +19,7 @@ The target output is an Obsidian-friendly note graph:
 
 This skill supports two modes: **file mode** (local file ingestion) and **chat-context mode** (synthesize from the current conversation into topic/entity/concept pages). Do not fetch URLs directly in this skill.
 
-If the user wants a **proposal-first review of session learnings** that directly updates existing pages, use `/loam::learning-from-session` instead.
+If the user wants session learnings routed across memory substrates, use `/loam::learning-from-session` instead.
 
 ## Input
 
@@ -98,15 +98,17 @@ Always read the actual candidate pages before editing.
 
 Treat memory as a compiled artifact that must stay internally coherent.
 
+Before creating any wiki page, apply the canonical `loam-using` Durable-memory admission rubric and routing matrix. Route non-durable material to guidance, checkpoints, task annotations, or discard; never archive material that was never durable.
+
 ### A. Related pages
 
 Synthesize the source's content directly into the most relevant topic, entity, concept, or analysis pages. Graph fan-out is required, not optional.
 
 1. Only touch pages materially affected by the source.
-2. If an important entity, concept, or topic lacks a dedicated page, create a minimal canonical note.
+2. If an important entity, concept, or topic lacks a dedicated page and passes the `loam-using` admission rubric, create a minimal canonical note.
 3. Prefer small linked updates over copying the same summary text into many pages.
-4. If the new source contradicts an existing page, make the conflict explicit.
-5. If the new source supersedes an old claim, say so clearly.
+4. If the new source contradicts an existing durable page, move the superseded page to `wiki/.archive/` with an archival header, write the corrected page in the live location, and log the correction.
+5. If the new source supersedes an old durable claim, archive the old durable page or section only when it no longer belongs live; otherwise mark the supersession clearly in-place.
 6. Update reciprocal links under `Related pages` or `Mentioned in` when materially useful.
 7. Avoid isolated durable notes. Every new note should be reachable from `index.md` or another durable note.
 8. For file mode: note the source path in relevant pages where it materially aids retrieval (e.g., in a `## References` or `## Source material` section).

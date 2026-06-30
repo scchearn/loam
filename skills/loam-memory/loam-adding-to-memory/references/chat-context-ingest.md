@@ -39,7 +39,7 @@ durability test as `/loam::learning-from-session` Step 1.5:
 If the user asked to add a conversation and most of it is incident, tell
 them: most of this is incident, not durable memory — consider
 `/loam::checkpointing` for the work-state, and `/loam::learning-from-session`
-for the proposal-first review of any durable kernels.
+for routing of any durable kernels.
 
 ## Provenance and uncertainty
 

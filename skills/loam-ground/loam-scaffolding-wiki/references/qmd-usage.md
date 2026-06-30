@@ -24,8 +24,20 @@ If the user wants a new collection:
 
 1. Choose a collection name. Recommended default: `<workspace-slug>-<wiki-root-name>`.
 2. Run `qmd collection add <wiki root> --name <collection-name>`.
-3. Run `qmd update -c <collection-name>` to index the wiki files.
-4. Run `qmd embed` if vector search is desired (requires a local embedding model).
+3. Add `ignore: [".archive/**"]` to the per-collection qmd config so archived pages stay out of retrieval.
+4. Run `qmd update -c <collection-name>` to index the wiki files.
+5. Run `qmd embed` if vector search is desired (requires a local embedding model).
+
+Example collection config:
+
+```yaml
+collections:
+  <collection-name>:
+    path: <wiki root>
+    pattern: "**/*.md"
+    ignore:
+      - ".archive/**"
+```
 
 ## Record collection details
 
@@ -58,6 +70,7 @@ This wiki optionally uses qmd for candidate discovery during wiki skill operatio
 - SCHEMA.md and index.md are always direct reads
 - After wiki edits, skills refresh qmd if the collection is ready
 - `log.md` is deprioritized in factual retrieval; it records maintenance history, not primary evidence. It rotates to `log-archive/` at 500 lines, so the active file stays small.
+- The qmd collection config excludes archived pages with `ignore: [".archive/**"]`
 ```
 
 3. Append a setup entry to `<wiki root>/log.md`:

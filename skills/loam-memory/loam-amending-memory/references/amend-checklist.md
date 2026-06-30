@@ -2,19 +2,17 @@
 
 Use this checklist before marking an amendment pass complete.
 
-## Before proposing
+## Before applying
 
 - Confirm memory exists and you can locate its root.
 - Confirm the specific content that needs correcting, superseding, completing, or surfacing.
-- Read the affected pages before proposing changes to them.
+- Read the affected pages before changing them.
 - Classify the amendment type (correction, supersession, completion, contradiction).
 - Classify the severity (high, medium, low).
 - Identify cascading pages that need updating.
 
-## Before applying
-
-- Wait for user confirmation of the proposal.
 - Re-read the wiki schema if the amendment touches structural conventions.
+- Decide whether superseded durable pages move to `wiki/.archive/` before writing corrected live pages.
 
 ## During the amendment
 
@@ -28,6 +26,7 @@ Use this checklist before marking an amendment pass complete.
 
 - Update `index.md` if page descriptions changed or pages were added.
 - Append `log.md` with: `## [YYYY-MM-DD] amend | <summary>`
+- Refresh qmd when the collection is ready.
 - Confirm every touched durable page is still discoverable from the index or inbound links.
 - Check that no new broken `[[wikilinks]]` were introduced.
 

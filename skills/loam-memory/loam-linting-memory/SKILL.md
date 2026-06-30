@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate). Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, or consolidate a legacy root `overview.md` into `index.md`. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.3.0"
+  version: "1.4.0"
   author: scchearn
   argument-hint: [wiki root or focus area]
 ---
@@ -22,7 +22,7 @@ Use the LLM Wiki maintenance model:
 - identify concepts or entities repeatedly mentioned but lacking their own page
 - preserve unresolved gaps so future sessions know what still needs evidence
 
-Apply safe, local fixes directly. For issues that need new evidence or substantive judgment, annotate and report them instead of guessing.
+Apply safe fixes directly. For issues that need new evidence or substantive judgment, annotate and report them instead of guessing.
 
 ## Input
 
@@ -95,6 +95,10 @@ qmd is **secondary only** in this skill: use it only to find related-note neighb
 
 **F. qmd metadata integrity** — Check whether `<wiki root>/.wiki-metadata.json` reflects the actual resolved `<wiki root>`. Lint reconciles metadata to the on-disk wiki; it must never rename, move, or recreate the wiki directory to match stale metadata.
 
+**G. qmd archive exclusion** — Check whether the active qmd collection config excludes archived pages with `ignore: [".archive/**"]` or an equivalent list item. If `.archive/**` is missing, flag it as a health issue; archived pages must not appear in qmd retrieval.
+
+**H. Freshness re-validation** — Flag pages whose `updated_at` is older than 90 days and that cite volatile surfaces such as APIs, configs, versions, external docs, or code paths. This is a re-validation warning only; lint does not auto-archive stale volatile pages.
+
 Distinguish: **fix now** (safe from existing wiki evidence) vs **annotate now** (mark but don't resolve) vs **follow-up** (needs future evidence/research/user direction).
 
 **Expand with qmd (secondary, if ready)**: Follow `references/qmd-usage.md` to find related-note neighborhoods for orphan pages or missing cross-links.
@@ -106,6 +110,8 @@ Distinguish: **fix now** (safe from existing wiki evidence) vs **annotate now** 
 ### Apply safe fixes
 
 Make the smallest correct edits that improve wiki health.
+
+Safe fixes apply directly inside the boundaries below. Missing `.archive/**` qmd exclusion and 90-day volatile-surface staleness are reported health issues unless the current wiki-local metadata can be corrected safely without changing external qmd config.
 
 When a legacy `<wiki root>/overview.md` exists:
 
@@ -152,7 +158,7 @@ Allowed direct fixes:
 9. normalizing internal links to canonical `[[kebab-case-note-name]]` form
 10. moving only a misplaced nested `<wiki root>/.obsidian/` directory to the parent directory root when the destination has no `.obsidian/` directory
 11. reconciling stale `<wiki root>/.wiki-metadata.json` paths to the actual resolved wiki root
-12. after explicit approval, renaming legacy checkpoint files from `checkpoint-YYYY-MM-DD-HHMM-<slug>.md` to `checkpoint-YYYY-MM-DD-HHMM.md` and updating their checkpoint wikilinks
+12. renaming legacy checkpoint files from `checkpoint-YYYY-MM-DD-HHMM-<slug>.md` to `checkpoint-YYYY-MM-DD-HHMM.md` and updating their checkpoint wikilinks when the mapping is collision-free and local
 
 Do not: ingest new raw sources, invent facts, silently merge/rename notes, silently delete disagreement/uncertainty, leave redundant `overview.md`, overwrite or merge an existing parent `.obsidian/`, move or rename `<wiki root>` or any wiki content directory, perform broad rewrites, or modify raw-source files.
 
@@ -230,10 +236,12 @@ If the pass found no significant issues, say so explicitly and still note any re
 - Treat a separate root `overview.md` as legacy drift. Consolidate into `index.md` and remove during lint.
 - Treat `<wiki root>/.obsidian/` as misplaced Obsidian config when `<wiki root>` is a subdirectory. Move only `.obsidian/` to the parent directory root when that destination has no `.obsidian/` directory.
 - Reconcile stale `.wiki-metadata.json` to the actual resolved wiki root. Lint updates metadata to match the on-disk wiki; it never moves the on-disk wiki to match metadata.
-- Own checkpoint filename migration. New checkpoints should be named `checkpoint-YYYY-MM-DD-HHMM.md`; lint may propose and, after approval, rename legacy slugged checkpoint files and update checkpoint wikilinks.
+- Own checkpoint filename migration. New checkpoints should be named `checkpoint-YYYY-MM-DD-HHMM.md`; lint may rename legacy slugged checkpoint files and update checkpoint wikilinks when the mapping is collision-free and local.
 - Never move or rename `<wiki root>` or any wiki content directory as part of `.obsidian/` placement or qmd metadata repair.
 - Rotate `<wiki root>/log.md` when it exceeds 500 lines; lint does not append per-pass entries to `log.md`.
-- Check date format drift with `datecheck.sh check`; canonical formats are in `loam-using/references/date-formats.md`. Fix only after approval, same as checkpoint filename migration.
+- Check date format drift with `datecheck.sh check`; canonical formats are in `loam-using/references/date-formats.md`. Apply only unambiguous local normalizations and report ambiguous drift.
+- Check that qmd excludes `.archive/**`; flag missing archive exclusion as a health issue.
+- Flag pages older than 90 days that cite volatile surfaces for re-validation; do not auto-archive them.
 - Keep the note graph traversable, not just the index accurate.
 - Keep `index.md` aligned with the durable pages that exist after the pass.
 - qmd is secondary. Structural checks remain Glob- and Grep-led. Use qmd only to find related-note neighborhoods.

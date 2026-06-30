@@ -3,7 +3,7 @@ name: loam::amending-memory
 description: "Correct or update existing wiki content when newer evidence shows the wiki is wrong, stale, incomplete, or contradicted. Use this when the agent discovers the wiki says X but we now know Y, when code or real-world changes invalidate a wiki claim, or when the user asks to fix or amend the wiki. Not for adding new sources, routine learnings capture, structural normalization, or health checks; use /loam::adding-to-memory, /loam::learning-from-session, /loam::normalizing-memory, or /loam::linting-memory."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: scchearn
   argument-hint: <what changed or what needs correcting>
 ---
@@ -52,7 +52,7 @@ If qmd is ready, read `${CLAUDE_SKILL_DIR}/references/qmd-usage.md` for broadeni
 2. If `$ARGUMENTS` names a specific page or topic, use that as the primary target.
 3. If `$ARGUMENTS` is descriptive, search `index.md` and use `Grep` to find pages that contain the stale or wrong content.
 4. **If qmd is ready**, follow `references/qmd-usage.md` to find all notes likely influenced by the stale or wrong claim.
-5. Read each candidate page to confirm it actually contains the issue before proposing changes.
+5. Read each candidate page to confirm it actually contains the issue before changing it.
 6. If qmd results are noisy or irrelevant, ignore them and rely on Grep and Glob.
 
 Do not amend pages you have not read.
@@ -69,7 +69,7 @@ Before touching any wiki page, read:
 
 ---
 
-## Step 2 — Triage, propose & apply
+## Step 2 — Triage, archive & apply
 
 ### Triage the amendment
 
@@ -82,47 +82,30 @@ Classify using `${CLAUDE_SKILL_DIR}/references/amendment-triage.md`:
 
 Severity: **high** (could mislead future sessions), **medium** (misleading but unlikely to cause harm), **low** (minor imprecision).
 
-### Build the proposal (do not edit yet)
+### Build the amendment plan
 
-For each affected page, describe:
+For each affected page, decide:
 
 1. What memory currently says
-2. What it should say instead (or what should be added alongside)
+2. What it should say instead, or what should be added alongside
 3. The amendment type and severity
 4. Which other pages need updating as a consequence
+5. Whether the existing durable page must move to `wiki/.archive/` before the correction is written
 
-Present in this format:
+Apply the plan directly once the evidence supports it.
+
+### Apply the amendment
+
+**Archive superseded durable content**: Move durable pages that became wrong, stale, or superseded to `wiki/.archive/<slug>.md` with:
 
 ```md
-## Amendment proposal
-
-### T1 — <page path>
-
-**Current content:** <quote or summary>
-
-**Proposed change:** <what you will do>
-
-**Type:** correction | supersession | completion | contradiction
-
-**Severity:** high | medium | low
-
-**Cascading updates:**
-- <other page path>: <what changes there>
-
-### Index and log updates
-- `index.md`: <what changes, if anything>
-- `log.md`: entry will be appended
+> Archived YYYY-MM-DD. Superseded by [[corrected-page-name]].
+> Reason: <one-line reason>
 ```
 
-Then ask:
+Never archive material that failed the admission rubric and was never durable.
 
-> "Does this amendment proposal look right? If yes, I'll apply it. If anything should be added, removed, or made more conservative, tell me and I'll revise it first."
-
-Wait for explicit confirmation.
-
-### Apply the amendment (after confirmation)
-
-**Correct factual errors**: Replace the incorrect claim. Preserve old claim as strikethrough for high-severity: `~~Old claim~~ — corrected YYYY-MM-DD: new claim`. Add correction note: `> Corrected YYYY-MM-DD: <reason>`.
+**Correct factual errors**: Write the corrected page in the live location. For small in-place corrections, replace the incorrect claim and add correction note: `> Corrected YYYY-MM-DD: <reason>`.
 
 **Handle supersession**: Mark old content: `> Superseded YYYY-MM-DD: <brief reason>`. Add new content. Do not delete old content if it explains how a decision was reached.
 
@@ -184,7 +167,7 @@ This skill auto-triggers when the agent recognizes that wiki content no longer m
 
 Common signals: code/docs contradict a wiki page, command output invalidates a claim, user says "that's no longer accurate" / "the wiki is wrong about X", or a code/config/real-world change makes a wiki claim stale.
 
-When auto-triggering: briefly tell the user what you found, invoke this skill, follow the proposal-then-apply flow.
+When auto-triggering: briefly tell the user what you found, invoke this skill, read evidence, archive old durable content, write the correction, log it, refresh qmd when ready, and report.
 
 Do not auto-trigger for: missing content that was never in memory (wiki substrate) (`/loam::adding-to-memory`), structural or naming issues (`/loam::normalizing-memory`), link health or convention drift (`/loam::linting-memory`), or answering a question (`/loam::querying-memory`).
 
@@ -192,7 +175,7 @@ Do not auto-trigger for: missing content that was never in memory (wiki substrat
 
 ## Rules
 
-- Proposal first. Do not edit anything before explicit confirmation.
+- Read evidence before editing; proceed once the correction is supported.
 - Preserve history for high-severity corrections and supersessions.
 - Make contradictions explicit. Never silently replace one view with another.
 - Raw-source files are immutable.
@@ -200,7 +183,7 @@ Do not auto-trigger for: missing content that was never in memory (wiki substrat
 - Update `index.md` and `log.md` on every amendment.
 - Do not leave avoidable broken `[[wikilinks]]` after the amendment pass.
 - Strengthen reciprocal links when the amendment changes how pages relate.
-- When auto-triggering, still follow the proposal-then-apply flow.
+- When auto-triggering, still archive + correct + log + report.
 - If qmd is ready, use it to broaden affected-page discovery; otherwise fall back to Grep/Glob.
 - Never amend a page based only on qmd output. Always read the actual wiki files first.
 - After wiki writes, refresh qmd if the collection is ready. If refresh fails, report it but do not roll back.
