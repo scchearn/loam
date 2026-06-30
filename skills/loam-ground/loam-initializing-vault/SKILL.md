@@ -3,7 +3,7 @@ name: loam::initializing-vault
 description: "Scaffold a new Obsidian vault with pre-configured settings, keymaps, and core plugins. Use when the user wants to \"set up a new Obsidian vault\", \"create an Obsidian vault\", or \"replicate my Obsidian setup\"."
 allowed-tools: Bash
 metadata:
-  version: "1.0.0"
+  version: "1.0.1"
   author: scchearn
   argument-hint: <target-vault-path>
 ---

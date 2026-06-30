@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(dirname "$SCRIPT_DIR")"
 ASSETS="$SKILL_DIR/assets/obsidian"
 
-REGISTRY_URL="https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/community-plugins.json"
+REGISTRY_URL="https://raw.githubusercontent.com/obsidianmd/obsidian-releases/v1.9.14/community-plugins.json"
 
 usage() {
   echo "Usage: setup.sh <vault-path>"

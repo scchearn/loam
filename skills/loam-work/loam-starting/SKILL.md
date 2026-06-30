@@ -3,7 +3,7 @@ name: loam::starting
 description: "Use when beginning or resuming a plan file, including mixed local and hcom-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
 allowed-tools: Read Write Edit Glob Grep Bash WebFetch
 metadata:
-  version: "2.1.1"
+  version: "2.1.2"
   author: scchearn
   argument-hint: plans/<slug>.md [T3 | T3,T5,T7 | T3-T7]
 ---
@@ -121,7 +121,7 @@ Constraint resolution:
 If the plan contains `## Execution disciplines`, resolve each `superpowers:<skill-name>` reference through canonical name resolution:
 
 ```text
-superpowers:<skill-name> -> https://raw.githubusercontent.com/obra/superpowers/main/skills/<skill-name>/SKILL.md
+superpowers:<skill-name> -> https://raw.githubusercontent.com/obra/superpowers/v6.0.3/skills/<skill-name>/SKILL.md
 ```
 
 Use WebFetch to read referenced SKILL.md files at session start, cache fetched content in working memory for this run, and apply only the parts mapped by `/loam::starting` to the current task phase. Full URLs do not appear in plan files. If fetch fails, log the failure and use the row's one-line fetch-fail fallback.
