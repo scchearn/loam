@@ -117,13 +117,15 @@ startup, while the body is only loaded when the skill activates.
 | loam::configuring-agents | 459 | 91 | 225 | 3,176 |
 | loam::planning | 267 | 48 | 311 | 3,992 |
 | loam::resuming | 288 | 60 | 140 | 1,708 |
-| loam::starting | 166 | 34 | 440 | 5,886 |
+| loam::starting | 166 | 34 | 378 | 5,179 |
 | loam::writing-spec | 261 | 48 | 243 | 2,596 |
 <!-- END skill-metrics -->
 
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
+
 
 
 

@@ -3,7 +3,7 @@ name: loam::starting
 description: "Use when beginning or resuming a plan file, including mixed local and hcom-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
 allowed-tools: Read Write Edit Glob Grep Bash WebFetch
 metadata:
-  version: "2.1.2"
+  version: "2.2.0"
   author: scchearn
   argument-hint: plans/<slug>.md [T3 | T3,T5,T7 | T3-T7]
 ---
@@ -143,45 +143,7 @@ Proceed directly to Orientation below.
 
 ### If there ARE relevant `[>]` tasks
 
-Before touching code:
-
-1. Map downstream tasks in the target set for each relevant `[>]` task — every `[ ]`, `[~]`, `[h]`, or `[>]` task that depends on it directly or transitively.
-2. Classify each `[>]` task:
-
-- **Blocking**: the `[>]` task is in the dependency chain of the next runnable task in the target set. Cannot proceed without resolving this first.
-- **Non-blocking**: the `[>]` task is not in the dependency chain of the next runnable task (parallel branch, or later). Execution could proceed without it, but it may cause problems later.
-
-STOP. Do not execute any tasks yet. Present to the user:
-
-```text
-Amendment check: plans/<slug>.md has [>] tasks that need re-running.
-
-[>] BLOCKING (must resolve before continuing):
-  Tx — <title>
-    Re-run reason: <from task notes>
-    Blocks: Ty, Tz (downstream tasks)
-
-[>] NON-BLOCKING (parallel or later — can defer):
-  Tx — <title>
-    Re-run reason: <from task notes>
-    Would affect: Ty (downstream, but not the immediate next task)
-
-Next runnable task (ignoring [>]): Tx — <title>
-
-What would you like to do?
-  a) Re-run all [>] tasks first (recommended — ensures consistency)
-  b) Re-run blocking [>] tasks only, then continue
-  c) Skip all [>] tasks for now and continue to the next [ ] task
-     (WARNING: downstream tasks may need re-running again later)
-  d) Tell me which specific [>] tasks to address
-```
-
-Wait for the user's choice before proceeding. Then:
-
-- **Choice a**: prepend all `[>]` tasks to the front of the target set queue, in dependency order
-- **Choice b**: prepend only blocking `[>]` tasks to the front of the queue
-- **Choice c**: remove all `[>]` tasks from the queue entirely. Note in the Decisions log: `User chose to defer [>] tasks (Tx, Ty) — these re-runs are still pending.`
-- **Choice d**: follow the user's specific direction
+Read `references/amendment-check.md` and follow the user-choice flow (Blocking/Non-blocking classification, options a/b/c/d). Stop for the user's choice before any execution.
 
 ---
 
@@ -228,12 +190,7 @@ Determine the next **action** from the active queue (target set, filtered and or
 
 ### Delegation group resolution
 
-When Orientation selects one or more runnable tasks in the same execution wave and hcom is available, build a **delegation group** from the wave and constraint labels:
-
-1. Group only tasks whose dependencies are already satisfied and whose Files/constraints do not conflict.
-2. Use `needs-independent-review`, `risk:data-destructive`, and `needs-isolation` to choose the safest delegation pattern.
-3. Preserve task order inside each delegated assignment. The worker may execute sequentially, but the hub still verifies before anything is marked `[x]`.
-4. If labels are insufficient to launch safely, execute inline as hub tasks for this session and log the fallback.
+When Orientation selects runnable tasks in the same execution wave and hcom is available, build the delegation group and orchestrate via `references/hcom-orchestration.md` (group selection, launch, wait, verify, cleanup). Hub verifies before any task is marked `[x]`. If labels are insufficient to launch safely, execute inline as hub tasks and log the fallback.
 
 ---
 
@@ -299,18 +256,7 @@ Implement the task after reading the relevant source files. Follow applicable wo
 
 #### 2b. Delegated hcom groups
 
-Before launching anything, read `references/hcom-orchestration.md`.
-
-For the selected delegation group:
-
-1. Read every file named under `Files to read` across the group and distill the context the worker needs.
-2. Follow the reference file for worktree prep, thread bootstrap, spawn, assignment, wait, FIX loops, and cleanup.
-3. The assignment must include task IDs and titles, internal task order, `Files to read`, `Files to modify`, every verify command the hub will run, the `rules:` text from `Execution`, and the required `DONE:` / `APPROVED:` / `FIX:` / `BLOCKED:` vocabulary.
-4. If `hcom` is unavailable or the group lacks the concrete metadata needed to launch safely (`agent`, `model`, and any required `worktree` or `branch` info), execute the tasks inline as hub tasks for this session and log the fallback.
-
-#### 2c. Waiting on active delegated groups
-
-If Orientation selected an existing `[h]` group rather than a fresh task, wait on its workflow thread with `hcom events --wait`, accept `DONE:` or `APPROVED:` as completion signals, and treat `BLOCKED:` as a blocker. Write a handoff note, and mark the first unresolved task `[!]` if needed.
+Read `references/hcom-orchestration.md` for worktree prep, thread bootstrap, spawn, assignment, wait, and FIX loop. The assignment must include task IDs/titles, internal order, `Files to read`/`Files to modify`, every verify command the hub will run, `rules:` text, and the `DONE:`/`APPROVED:`/`FIX:`/`BLOCKED:` vocabulary. For active `[h]` groups, wait on the workflow thread, accept `DONE:`/`APPROVED:` as handoff signals, treat `BLOCKED:` as a blocker, write a handoff note, and mark `[!]` if needed. If hcom is unavailable or the group lacks concrete metadata (`agent`, `model`, worktree/branch), execute inline as hub tasks and log the fallback.
 
 ### 3. Verify
 
@@ -325,13 +271,7 @@ Run the task's verify command. If none is specified, infer the smallest workspac
 
 #### 3b. Delegated groups
 
-When a worker reports `DONE:` or `APPROVED:` for the selected group, the hub must verify the work itself.
-
-1. Run every delegated task's verify command in task order.
-2. If multiple tasks share one verify command and it truly proves all of them, you may run it once.
-3. If verification **passes** for the whole group, proceed to step 4.
-4. If verification **fails**, send `FIX:` back to the same worker on the same thread with the concrete error details, keep the tasks `[h]`, and wait again. Maximum 3 hub verify rounds.
-5. If the worker reports `BLOCKED:`, or the hub verify loop still fails after 3 rounds, mark the first unresolved task `[!]`, revert later unresolved tasks to `[ ]` if they never truly started, append to the Decisions log, write a handoff note, and stop.
+Hub verifies via the loop in `references/hcom-orchestration.md`: run every delegated task's verify command in task order; shared verify may run once only if it truly proves all tasks. Pass → step 4. Fail → send `FIX:` back on the same thread, keep tasks `[h]`, wait again. Maximum 3 hub verify rounds. `BLOCKED:` or 3-round fail → mark first unresolved `[!]`, revert later unresolved `[ ]` if never started, Decisions log, handoff, stop.
 
 ### 4. Mark done
 
@@ -444,6 +384,4 @@ Do not commit during the execution loop. Committing is handled separately. Your 
 - **Keep YAML front matter and `plans/INDEX.md` synchronized** on every plan edit. If task count changes, update `task_count` and the index `Tasks` column.
 - **Keep tasks atomic.** If a task grows beyond about 20 files, split it and log the split.
 - **Prefer independently re-runnable evidence.** Favor tests or validations others can re-run later.
-- **Never use `sleep` for hcom flows.** Use `hcom events --wait` or equivalent thread-aware waiting.
-- **Never hardcode launched agent names.** Parse the `Names:` line from launch output and prefer stable tags for routing.
 - **Today's date for log entries:** use the actual current date from the system.

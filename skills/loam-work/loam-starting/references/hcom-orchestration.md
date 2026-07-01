@@ -79,6 +79,19 @@ AGENT_NAME=$(printf '%s\n' "$AGENT_OUT" | grep '^Names: ' | sed 's/^Names: //' |
 
 Never hardcode the launched name. Parse it from the `Names:` line every time.
 
+## Delegation group selection
+
+When `loam::starting` Orientation selects runnable tasks in the same execution wave and hcom is available, build the delegation group:
+
+1. Group only tasks whose dependencies are already satisfied and whose Files/constraints do not conflict.
+2. Use `needs-independent-review`, `risk:data-destructive`, and `needs-isolation` to choose the safest delegation pattern.
+3. Preserve task order inside each delegated assignment. The worker may execute sequentially, but the hub still verifies before anything is marked `[x]`.
+4. If labels are insufficient to launch safely, execute inline as hub tasks for this session and log the fallback.
+
+## Active `[h]` group handling
+
+If Orientation selected an existing `[h]` group rather than a fresh task, wait on its workflow thread with `hcom events --wait`, accept `DONE:` or `APPROVED:` as handoff signals, and treat `BLOCKED:` as a blocker. Write a handoff note, and mark the first unresolved task `[!]` if needed.
+
 ## Assignment message
 
 Send the worker everything it needs in one request:
@@ -131,6 +144,8 @@ hcom send @<tag>- --thread "$WF_THREAD" --intent request -- "FIX: pnpm check fai
 ```
 
 Keep the delegated tasks `[h]` until hub verification passes.
+
+5. If the worker reports `BLOCKED:`, or the hub verify loop still fails after 3 rounds, mark the first unresolved task `[!]`, revert later unresolved tasks to `[ ]` if they never truly started, append to the Decisions log, write a handoff note, and stop.
 
 ## Cleanup
 
