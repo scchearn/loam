@@ -11,6 +11,14 @@ stat_epoch() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
 }
 
+stat_size() {
+  stat -c %s "$1" 2>/dev/null || stat -f %z "$1"
+}
+
+file_hash() {
+  sha256sum "$1" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+}
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -235,6 +243,172 @@ assert len(dups) == 1, f"expected 1 entry for src/dup.ts, got {len(dups)}"
 print("precedence: PASS")
 PY
 
+# --- Hash-secondary contract tests ---
+
+hash_wiki="$tmp/hash-wiki"
+mkdir -p "$hash_wiki/code"
+cat > "$hash_wiki/SCHEMA.md" <<'EOF'
+# Schema
+EOF
+
+# Fixture: legacy-epoch.ts — page with ingested_at (epoch) only, no source_size/content_hash
+cat > "$codebase/src/legacy-epoch.ts" <<'EOF'
+export const legacy_epoch = 1;
+EOF
+cat > "$codebase/src/legacy-current.ts" <<'EOF'
+export const legacy_current = 1;
+EOF
+
+# Fixture: false-stale.ts — content will NOT change, only mtime bumps
+cat > "$codebase/src/false-stale.ts" <<'EOF'
+export const false_stale = 1;
+EOF
+
+# Fixture: changed-size.ts — content will change (size grows)
+cat > "$codebase/src/changed-size.ts" <<'EOF'
+export const changed_size = 1;
+EOF
+
+# Fixture: false-fresh.ts — content will change, mtime stays the same
+cat > "$codebase/src/false-fresh.ts" <<'EOF'
+export const false_fresh = 1;
+EOF
+
+# Compute hashes and sizes for the fixtures
+fs_hash=$(file_hash "$codebase/src/false-stale.ts")
+fs_size=$(stat_size "$codebase/src/false-stale.ts")
+cs_hash=$(file_hash "$codebase/src/changed-size.ts")
+cs_size=$(stat_size "$codebase/src/changed-size.ts")
+ff_hash=$(file_hash "$codebase/src/false-fresh.ts")
+ff_size=$(stat_size "$codebase/src/false-fresh.ts")
+
+# Set mtime on legacy-epoch.ts to a known old time, legacy-current.ts to current
+touch -d '2026-06-20 10:00:00' "$codebase/src/legacy-epoch.ts"
+legacy_epoch_current=$(stat_epoch "$codebase/src/legacy-epoch.ts")
+legacy_current_epoch=$(stat_epoch "$codebase/src/legacy-current.ts")
+
+# false-stale.ts: touch to newer mtime (content unchanged)
+touch -d '2026-06-28 12:00:00' "$codebase/src/false-stale.ts"
+fs_mtime=$(stat_epoch "$codebase/src/false-stale.ts")
+# Page ingested_at is OLDER than fs_mtime → mtime says stale, but hash matches → suppress
+
+# changed-size.ts: overwrite with larger content, set mtime to now (newer than page)
+cat > "$codebase/src/changed-size.ts" <<'EOF'
+export const changed_size = 1;
+export const changed_size_extra = 2;
+EOF
+touch -d '2026-06-28 12:00:00' "$codebase/src/changed-size.ts"
+cs_mtime=$(stat_epoch "$codebase/src/changed-size.ts")
+
+# false-fresh.ts: overwrite content (same size), keep mtime at old value
+ff_old_epoch=$(date -d '2026-06-20 10:00:00' '+%s')
+cat > "$codebase/src/false-fresh.ts" <<'EOF'
+export const false_fresh = 2;
+EOF
+touch -d '2026-06-20 10:00:00' "$codebase/src/false-fresh.ts"
+
+# Wiki pages
+# 1. legacy-epoch: epoch ingested_at, no source_size/content_hash, mtime bumped → stale
+cat > "$hash_wiki/code/legacy-epoch.md" <<EOF
+---
+source_path: src/legacy-epoch.ts
+ingested_at: $(date -d '2026-06-18 10:00:00' '+%s')
+---
+# Legacy Epoch
+EOF
+
+# 2. legacy-current: epoch ingested_at, no source_size/content_hash, mtime equal → not stale
+cat > "$hash_wiki/code/legacy-current.md" <<EOF
+---
+source_path: src/legacy-current.ts
+ingested_at: $legacy_current_epoch
+---
+# Legacy Current
+EOF
+
+# 3. false-stale: all three fields, mtime bumped, size same, hash same → not stale
+cat > "$hash_wiki/code/false-stale.md" <<EOF
+---
+source_path: src/false-stale.ts
+ingested_at: $(date -d '2026-06-24 10:00:00' '+%s')
+source_size: $fs_size
+content_hash: $fs_hash
+---
+# False Stale
+EOF
+
+# Same as false-stale, but with uppercase stored hash for Windows parity.
+cat > "$hash_wiki/code/false-stale-uppercase.md" <<EOF
+---
+source_path: src/false-stale-uppercase.ts
+ingested_at: $(date -d '2026-06-24 10:00:00' '+%s')
+source_size: $fs_size
+content_hash: $(printf '%s' "$fs_hash" | tr '[:lower:]' '[:upper:]')
+---
+# False Stale Uppercase
+EOF
+cp "$codebase/src/false-stale.ts" "$codebase/src/false-stale-uppercase.ts"
+touch -d '2026-06-28 12:00:00' "$codebase/src/false-stale-uppercase.ts"
+
+# 4. changed-size: all three fields, size changed → stale
+cat > "$hash_wiki/code/changed-size.md" <<EOF
+---
+source_path: src/changed-size.ts
+ingested_at: $(date -d '2026-06-24 10:00:00' '+%s')
+source_size: $cs_size
+content_hash: $cs_hash
+---
+# Changed Size
+EOF
+
+# 5. false-fresh: content_hash points to old content, mtime matches → default not stale, strict stale
+cat > "$hash_wiki/code/false-fresh.md" <<EOF
+---
+source_path: src/false-fresh.ts
+ingested_at: $ff_old_epoch
+source_size: $ff_size
+content_hash: $ff_hash
+---
+# False Fresh
+EOF
+
+hash_diff_json=$("$CODEGRAPH" diff "$codebase" "$hash_wiki")
+hash_strict_json=$("$CODEGRAPH" diff "$codebase" "$hash_wiki" --strict)
+
+HASH_DIFF_JSON="$hash_diff_json" HASH_STRICT_JSON="$hash_strict_json" python3 - <<'PY'
+import json, os
+
+diff = json.loads(os.environ['HASH_DIFF_JSON'])
+strict = json.loads(os.environ['HASH_STRICT_JSON'])
+by_path_diff = {item['path']: item for item in diff}
+by_path_strict = {item['path']: item for item in strict}
+
+# 1. legacy-mtime-fallback: epoch ingested_at, no size/hash, mtime bumped → stale
+assert 'src/legacy-epoch.ts' in by_path_diff, "legacy-epoch should be stale (mtime bumped, no hash)"
+assert by_path_diff['src/legacy-epoch.ts']['reason'] == 'stale', "legacy-epoch reason should be stale"
+print("legacy-mtime-fallback: PASS")
+
+# 2. legacy-current-not-stale: epoch ingested_at, no size/hash, mtime equal → not stale
+assert 'src/legacy-current.ts' not in by_path_diff, "legacy-current should not be stale (mtime equal, no size/hash regression)"
+print("legacy-current-not-stale: PASS")
+
+# 3. false-stale-suppression: all three fields, mtime bumped, size same, hash same → not stale
+assert 'src/false-stale.ts' not in by_path_diff, "false-stale should be suppressed (hash matches)"
+assert 'src/false-stale-uppercase.ts' not in by_path_diff, "uppercase stored hash should be normalized and suppressed"
+print("false-stale-suppression: PASS")
+
+# 4. changed-size-stale: all three fields, size changed → stale
+assert 'src/changed-size.ts' in by_path_diff, "changed-size should be stale (size mismatch)"
+assert by_path_diff['src/changed-size.ts']['reason'] == 'stale', "changed-size reason should be stale"
+print("changed-size-stale: PASS")
+
+# 5. strict-false-fresh: content_hash mismatch, mtime matches → default not stale, strict stale
+assert 'src/false-fresh.ts' not in by_path_diff, "false-fresh should NOT be stale in default diff (mtime matches)"
+assert 'src/false-fresh.ts' in by_path_strict, "false-fresh should be stale in --strict (hash mismatch)"
+assert by_path_strict['src/false-fresh.ts']['reason'] == 'stale', "false-fresh strict reason should be stale"
+print("strict-false-fresh: PASS")
+PY
+
 grep -Fq 'Cap the work set at 200 files.' "$INGEST_SKILL"
 ! grep -Fq 'Cap the work set at 100 files.' "$INGEST_SKILL"
 grep -Fq 'Do not substitute the codebase root, workspace root, or parent directory.' "$INGEST_SKILL"
@@ -242,6 +416,8 @@ grep -Fq 'never report the codebase as fully ingested' "$INGEST_SKILL"
 grep -Fq 'Do not proceed from an empty index caused by a bad wiki-root path.' "$INGEST_SKILL"
 grep -Fq 'ingested_at: <source-file-mtime-epoch>' "$INGEST_SKILL"
 grep -Fq 'Legacy pages with date-only `ingested_at` are stale once' "$INGEST_SKILL"
+grep -Fq 'source_size: <bytes>' "$INGEST_SKILL"
+grep -Fq 'content_hash: <sha256-hex>' "$INGEST_SKILL"
 grep -R -Fq 'ingested_at: <source-file-mtime-epoch>' "$SKILL_DIR/references/templates"
 
 echo "codegraph contract: PASS"

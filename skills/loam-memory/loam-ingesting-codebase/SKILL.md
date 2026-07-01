@@ -3,7 +3,7 @@ name: loam::ingesting-codebase
 description: "Ingest a codebase into memory as code pages connected by wiki links. Walks the tree, classifies each code file by role, applies a role template, and writes a code page per meaningful unit under <wiki root>/code/. Resumable: skips files already ingested and current. Not for prose documents; use /loam::adding-to-memory for those."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.4.0"
+  version: "1.5.0"
   author: scchearn
   argument-hint: <codebase root path>
 ---
@@ -143,10 +143,14 @@ Fill the loaded role template with the extracted fields. The resulting markdown 
 ---
 source_path: <relative-path-from-codebase-root>
 ingested_at: <source-file-mtime-epoch>
+source_size: <bytes>
+content_hash: <sha256-hex>
 ---
 ```
 
-Use the source file's Unix epoch mtime for `ingested_at`. For re-summarized files, update `ingested_at` to the file's current mtime, not today's date.
+Use the source file's Unix epoch mtime for `ingested_at`. For re-summarized files, update `ingested_at` to the file's current mtime, not today's date. Populate `source_size` with the file's byte size and `content_hash` with the lowercase SHA-256 hash (from `sha256sum` on POSIX, lowercase-normalized `Get-FileHash` on Windows).
+
+Legacy pages (written before this version) may have only `source_path` and `ingested_at`. Treat missing `source_size` and `content_hash` as legacy, not errors. Populate all three fields on write. Do not backfill all pages in a single pass — let it happen incrementally as files drift and get re-summarized.
 
 ### Write the page
 
@@ -157,7 +161,7 @@ Write to `<wiki root>/code/<slug>.md`. Overwrite if re-summarizing. Create if ne
 Add or update the entry in the in-memory index so subsequent files in this run can link to it:
 
 ```
-<source_path> → {slug, ingested_at: <file mtime epoch>, mtime: <file mtime epoch>}
+<source_path> → {slug, ingested_at: <file mtime epoch>, source_size: <file size>, content_hash: <file hash>, mtime: <file mtime epoch>}
 ```
 
 ---

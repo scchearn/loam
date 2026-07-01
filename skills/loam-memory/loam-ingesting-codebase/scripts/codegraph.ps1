@@ -17,7 +17,7 @@ function Show-Usage {
 Usage:
   codegraph.ps1 index <wiki-root> [--codebase-root <codebase-root>]
   codegraph.ps1 walk  <codebase-root> [--exclusions <exclusions.md>] [--summary] [--no-gitignore]
-  codegraph.ps1 diff  <codebase-root> <wiki-root> [--exclusions <exclusions.md>] [--no-gitignore]
+  codegraph.ps1 diff  <codebase-root> <wiki-root> [--exclusions <exclusions.md>] [--no-gitignore] [--strict]
 "@
   exit 1
 }
@@ -122,7 +122,7 @@ function Collect-Walk([string]$CodebaseRoot, [string]$ExclusionsFile, [bool]$Res
     if ($file.Length -gt $MaxBytes) { $excluded.large++; continue }
     if (Test-GeneratedHeader $file.FullName) { $excluded.generated_header++; continue }
 
-    $entries += [PSCustomObject]@{ path = $rel; mtime = (Format-JsonMtime $file.LastWriteTime) }
+    $entries += [PSCustomObject]@{ path = $rel; mtime = (Format-JsonMtime $file.LastWriteTime); size = $file.Length }
     $byExt[$ext] = 1 + ($byExt[$ext] ?? 0)
   }
   @{ Entries = $entries; ByExt = $byExt; Excluded = $excluded }
@@ -144,6 +144,8 @@ function Collect-Index([string]$WikiRoot, [string]$CodebaseRoot = '') {
     foreach ($page in Get-ChildItem -Path $entitiesDir -Filter '*.md' -File) {
       $sourcePath = ''
       $ingestedAt = ''
+      $sourceSize = ''
+      $contentHash = ''
       $inFm = $false
       foreach ($line in (Get-Content $page.FullName)) {
         $trimmed = $line.Trim()
@@ -151,6 +153,8 @@ function Collect-Index([string]$WikiRoot, [string]$CodebaseRoot = '') {
         if ($inFm) {
           if ($trimmed -match '^source_path:\s*(.*)$') { $sourcePath = $matches[1].Trim('"') }
           if ($trimmed -match '^ingested_at:\s*(.*)$') { $ingestedAt = $matches[1].Trim('"') }
+          if ($trimmed -match '^source_size:\s*(.*)$') { $sourceSize = $matches[1].Trim('"') }
+          if ($trimmed -match '^content_hash:\s*(.*)$') { $contentHash = $matches[1].Trim('"').ToLowerInvariant() }
         }
       }
       if (-not $sourcePath -or -not $ingestedAt) { continue }
@@ -161,7 +165,7 @@ function Collect-Index([string]$WikiRoot, [string]$CodebaseRoot = '') {
       $exists = Test-Path $resolved -PathType Leaf
       $mtime = ''
       if ($exists) { $mtime = Format-JsonMtime (Get-Item $resolved).LastWriteTime }
-      $entries += [PSCustomObject]@{ source_path = $sourcePath; slug = [System.IO.Path]::GetFileNameWithoutExtension($page.Name); ingested_at = $ingestedAt; mtime = $mtime; exists = $exists }
+      $entries += [PSCustomObject]@{ source_path = $sourcePath; slug = [System.IO.Path]::GetFileNameWithoutExtension($page.Name); ingested_at = $ingestedAt; source_size = $sourceSize; content_hash = $contentHash; mtime = $mtime; exists = $exists }
     }
   }
   $entries
@@ -209,10 +213,12 @@ switch ($Subcommand) {
     $wikiRoot = $Rest[1]
     $exclusions = $DefaultExclusions
     $respectGitignore = $true
+    $strict = $false
     for ($i = 2; $i -lt $Rest.Count; $i++) {
       switch ($Rest[$i]) {
         '--exclusions' { $exclusions = $Rest[$i + 1]; $i++ }
         '--no-gitignore' { $respectGitignore = $false }
+        '--strict' { $strict = $true }
         default { Write-Error "Error: unknown flag: $($Rest[$i])"; exit 1 }
       }
     }
@@ -221,8 +227,30 @@ switch ($Subcommand) {
     foreach ($entry in (Collect-Index $wikiRoot $codebaseRoot)) { $index[$entry.source_path] = $entry }
     $diff = @()
     foreach ($entry in $walk.Entries) {
-      if (-not $index.ContainsKey($entry.path)) { $diff += [PSCustomObject]@{ path = $entry.path; mtime = $entry.mtime; reason = 'new' } }
-      elseif (-not (Test-EpochString $index[$entry.path].ingested_at) -or ([int64]$entry.mtime -gt [int64]$index[$entry.path].ingested_at)) { $diff += [PSCustomObject]@{ path = $entry.path; mtime = $entry.mtime; reason = 'stale'; slug = $index[$entry.path].slug } }
+      if (-not $index.ContainsKey($entry.path)) {
+        $diff += [PSCustomObject]@{ path = $entry.path; mtime = $entry.mtime; reason = 'new' }
+        continue
+      }
+      $idx = $index[$entry.path]
+      $reason = ''
+      if ($strict) {
+        if ($idx.content_hash) {
+          $fileHash = (Get-FileHash -Path (Join-Path $codebaseRoot $entry.path) -Algorithm SHA256).Hash.ToLower()
+          if ($fileHash -eq $idx.content_hash) { $reason = '' } else { $reason = 'stale' }
+        } else { $reason = 'stale' }
+      } elseif (-not (Test-EpochString $idx.ingested_at)) {
+        $reason = 'stale'
+      } elseif ([int64]$entry.mtime -gt [int64]$idx.ingested_at) {
+        if ($idx.source_size -and ($idx.source_size -match '^\d+$')) {
+          if ([string]$entry.size -ne $idx.source_size) {
+            $reason = 'stale'
+          } elseif ($idx.content_hash) {
+            $fileHash = (Get-FileHash -Path (Join-Path $codebaseRoot $entry.path) -Algorithm SHA256).Hash.ToLower()
+            if ($fileHash -eq $idx.content_hash) { $reason = '' } else { $reason = 'stale' }
+          } else { $reason = 'stale' }
+        } else { $reason = 'stale' }
+      }
+      if ($reason) { $diff += [PSCustomObject]@{ path = $entry.path; mtime = $entry.mtime; reason = $reason; slug = $idx.slug } }
     }
     Write-Json @($diff)
   }

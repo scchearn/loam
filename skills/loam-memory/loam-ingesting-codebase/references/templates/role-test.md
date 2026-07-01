@@ -6,6 +6,8 @@ Use this template for test and spec files. Captures what is being tested and whi
 ---
 source_path: <relative-path-from-codebase-root>
 ingested_at: <source-file-mtime-epoch>
+source_size: <bytes>
+content_hash: <sha256-hex>
 ---
 
 # <TestSuiteName>

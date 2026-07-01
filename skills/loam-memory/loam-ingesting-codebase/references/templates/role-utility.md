@@ -6,6 +6,8 @@ Use this template for files containing pure functions, helpers, or business logi
 ---
 source_path: <relative-path-from-codebase-root>
 ingested_at: <source-file-mtime-epoch>
+source_size: <bytes>
+content_hash: <sha256-hex>
 ---
 
 # <PrimaryExportName>

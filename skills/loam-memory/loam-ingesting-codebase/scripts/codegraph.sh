@@ -28,6 +28,10 @@ stat_size() {
   stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || echo 0
 }
 
+compute_hash() {
+  sha256sum "$1" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$1" 2>/dev/null | awk '{print $1}' || echo ""
+}
+
 validate_wiki_root() {
   local wiki_root="$1"
   [[ -z "$wiki_root" || ! -d "$wiki_root" ]] && { echo "Error: wiki root not found: $wiki_root" >&2; exit 2; }
@@ -50,7 +54,7 @@ usage() {
 Usage:
   codegraph.sh index <wiki-root> [--codebase-root <codebase-root>]
   codegraph.sh walk  <codebase-root> [--exclusions <exclusions.md>] [--summary] [--no-gitignore]
-  codegraph.sh diff  <codebase-root> <wiki-root> [--exclusions <exclusions.md>] [--no-gitignore]
+  codegraph.sh diff  <codebase-root> <wiki-root> [--exclusions <exclusions.md>] [--no-gitignore] [--strict]
 
 Exit codes: 0 ok, 1 bad args, 2 root not found, 3 exclusions file missing.
 EOF
@@ -126,6 +130,7 @@ is_generated_header() {
 
 declare -a walk_paths=()
 declare -A walk_mtimes=()
+declare -A walk_sizes=()
 declare -A by_ext=()
 excluded_pattern=0
 excluded_gitignore=0
@@ -141,6 +146,7 @@ collect_walk() {
 
   walk_paths=()
   walk_mtimes=()
+  walk_sizes=()
   by_ext=()
   excluded_pattern=0
   excluded_gitignore=0
@@ -172,6 +178,7 @@ collect_walk() {
     mtime_epoch=$(stat_epoch "$file")
     walk_paths+=("$rel_path")
     walk_mtimes["$rel_path"]="$mtime_epoch"
+    walk_sizes["$rel_path"]="$size"
     ext="${rel_path##*.}"
     by_ext["$ext"]=$(( ${by_ext["$ext"]:-0} + 1 ))
   done < <(find "$codebase_root" -type f -print0 2>/dev/null)
@@ -181,7 +188,7 @@ emit_walk_json() {
   local out="[" first=true path
   for path in "${walk_paths[@]}"; do
     if $first; then first=false; else out+=","; fi
-    out+="$(printf '{"path":"%s","mtime":"%s"}' "$(json_escape "$path")" "$(json_escape "${walk_mtimes[$path]}")")"
+    out+="$(printf '{"path":"%s","mtime":"%s","size":"%s"}' "$(json_escape "$path")" "$(json_escape "${walk_mtimes[$path]}")" "$(json_escape "${walk_sizes[$path]}")")"
   done
   echo "$out]"
 }
@@ -201,6 +208,8 @@ emit_summary_json() {
 declare -a index_sources=()
 declare -A index_slugs=()
 declare -A index_ingested=()
+declare -A index_sizes=()
+declare -A index_hashes=()
 declare -A index_mtimes=()
 declare -A index_exists=()
 
@@ -222,16 +231,20 @@ collect_index() {
   index_sources=()
   index_slugs=()
   index_ingested=()
+  index_sizes=()
+  index_hashes=()
   index_mtimes=()
   index_exists=()
 
-  local page source_path ingested_at slug resolved mtime_epoch
+  local page source_path ingested_at source_size content_hash slug resolved mtime_epoch
   # Dual scan: code/ (primary) and entities/ (legacy transition for stranded source_path: pages)
   for entities_dir in "$wiki_root/code" "$wiki_root/entities"; do
     [[ ! -d "$entities_dir" ]] && continue
     while IFS= read -r -d '' page; do
       source_path=""
       ingested_at=""
+      source_size=""
+      content_hash=""
       local in_fm=false line
       while IFS= read -r line; do
         if [[ "$line" =~ ^---$ ]]; then
@@ -240,9 +253,12 @@ collect_index() {
         if $in_fm; then
           [[ "$line" =~ ^source_path:[[:space:]]*(.*)$ ]] && source_path="${BASH_REMATCH[1]//\"/}"
           [[ "$line" =~ ^ingested_at:[[:space:]]*(.*)$ ]] && ingested_at="${BASH_REMATCH[1]//\"/}"
+          [[ "$line" =~ ^source_size:[[:space:]]*(.*)$ ]] && source_size="${BASH_REMATCH[1]//\"/}"
+          [[ "$line" =~ ^content_hash:[[:space:]]*(.*)$ ]] && content_hash="${BASH_REMATCH[1]//\"/}"
         fi
       done < "$page"
 
+      content_hash=$(printf '%s' "$content_hash" | tr '[:upper:]' '[:lower:]')
       [[ -z "$source_path" || -z "$ingested_at" ]] && continue
       [[ -n "${index_slugs[$source_path]:-}" ]] && continue
       slug="$(basename "$page")"
@@ -250,6 +266,8 @@ collect_index() {
       index_sources+=("$source_path")
       index_slugs["$source_path"]="$slug"
       index_ingested["$source_path"]="$ingested_at"
+      index_sizes["$source_path"]="$source_size"
+      index_hashes["$source_path"]="$content_hash"
       resolved="$(resolve_source_path "$source_path" "$codebase_root")"
       if [[ -f "$resolved" ]]; then
         mtime_epoch=$(stat_epoch "$resolved")
@@ -267,8 +285,8 @@ emit_index_json() {
   local out="[" first=true source
   for source in "${index_sources[@]}"; do
     if $first; then first=false; else out+=","; fi
-    out+="$(printf '{"source_path":"%s","slug":"%s","ingested_at":"%s","mtime":"%s","exists":%s}' \
-      "$(json_escape "$source")" "$(json_escape "${index_slugs[$source]}")" "$(json_escape "${index_ingested[$source]}")" "$(json_escape "${index_mtimes[$source]}")" "${index_exists[$source]}")"
+    out+="$(printf '{"source_path":"%s","slug":"%s","ingested_at":"%s","source_size":"%s","content_hash":"%s","mtime":"%s","exists":%s}' \
+      "$(json_escape "$source")" "$(json_escape "${index_slugs[$source]}")" "$(json_escape "${index_ingested[$source]}")" "$(json_escape "${index_sizes[$source]}")" "$(json_escape "${index_hashes[$source]}")" "$(json_escape "${index_mtimes[$source]}")" "${index_exists[$source]}")"
   done
   echo "$out]"
 }
@@ -302,12 +320,13 @@ cmd_walk() {
 }
 
 cmd_diff() {
-  local codebase_root="${1:-}" wiki_root="${2:-}" exclusions_file="$DEFAULT_EXCLUSIONS" respect_gitignore=true
+  local codebase_root="${1:-}" wiki_root="${2:-}" exclusions_file="$DEFAULT_EXCLUSIONS" respect_gitignore=true strict=false
   shift 2 || true
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --exclusions) exclusions_file="$2"; shift 2 ;;
       --no-gitignore) respect_gitignore=false; shift ;;
+      --strict) strict=true; shift ;;
       *) echo "Error: unknown flag: $1" >&2; exit 1 ;;
     esac
   done
@@ -315,15 +334,48 @@ cmd_diff() {
   collect_walk "$codebase_root" "$exclusions_file" "$respect_gitignore"
   collect_index "$wiki_root" "$codebase_root"
 
-  local out="[" first=true path reason slug
+  local out="[" first=true path reason slug idx_size file_hash
   for path in "${walk_paths[@]}"; do
     reason=""
     slug=""
     if [[ -z "${index_ingested[$path]:-}" ]]; then
       reason="new"
-    elif ! is_epoch "${index_ingested[$path]}" || (( ${walk_mtimes[$path]} > ${index_ingested[$path]} )); then
-      reason="stale"
+    else
       slug="${index_slugs[$path]}"
+      if $strict; then
+        # --strict overlay: compute hash on every file regardless of mtime/size
+        if [[ -n "${index_hashes[$path]:-}" ]]; then
+          file_hash=$(compute_hash "$codebase_root/$path")
+          if [[ -n "$file_hash" && "$file_hash" == "${index_hashes[$path]}" ]]; then
+            reason=""
+          else
+            reason="stale"
+          fi
+        else
+          reason="stale"
+        fi
+      elif ! is_epoch "${index_ingested[$path]}"; then
+        reason="stale"
+      elif (( ${walk_mtimes[$path]} > ${index_ingested[$path]} )); then
+        # mtime newer → candidate stale
+        idx_size="${index_sizes[$path]:-}"
+        if [[ -n "$idx_size" && "$idx_size" =~ ^[0-9]+$ ]]; then
+          if [[ "${walk_sizes[$path]}" != "$idx_size" ]]; then
+            reason="stale"
+          elif [[ -n "${index_hashes[$path]:-}" ]]; then
+            file_hash=$(compute_hash "$codebase_root/$path")
+            if [[ -n "$file_hash" && "$file_hash" == "${index_hashes[$path]}" ]]; then
+              reason=""
+            else
+              reason="stale"
+            fi
+          else
+            reason="stale"
+          fi
+        else
+          reason="stale"
+        fi
+      fi
     fi
     [[ -z "$reason" ]] && continue
     if $first; then first=false; else out+=","; fi

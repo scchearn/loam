@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate). Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, or consolidate a legacy root `overview.md` into `index.md`. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.5.0"
+  version: "1.6.0"
   author: scchearn
   argument-hint: [wiki root or focus area]
 ---
@@ -100,6 +100,8 @@ qmd is **secondary only** in this skill: use it only to find related-note neighb
 **H. Freshness re-validation** — Flag pages whose `updated_at` is older than 90 days and that cite volatile surfaces such as APIs, configs, versions, external docs, or code paths. This is a re-validation warning only; lint does not auto-archive stale volatile pages.
 
 **I. Stranded code pages in `entities/`** — Check whether `entities/` contains pages with `source_path:` front matter. These are code-graph pages that belong in `code/`, not `entities/`. Prose entity pages never carry `source_path:`. See Step 2 for the migration procedure.
+
+**J. Legacy code hash fields** — Check code-graph pages under `code/` and legacy `entities/` pages with `source_path:` front matter for missing `source_size:` or `content_hash:`. Flag as `legacy-hash-fields` (low/informational). Missing fields mean hash-secondary false-stale suppression will not fire for that page yet. Do not backfill during lint; ingest/sync will populate the fields on the next re-summarize.
 
 Distinguish: **fix now** (safe from existing wiki evidence) vs **annotate now** (mark but don't resolve) vs **follow-up** (needs future evidence/research/user direction).
 
