@@ -3,7 +3,7 @@ name: loam::querying-memory
 description: "Answer questions against existing memory (the wiki substrate). Use this whenever the user is asking what is happening in the project, directory, codebase, architecture, workflow, decisions, or current state and the wiki likely contains the answer, even if they do not explicitly mention the wiki. Also use it for summaries, comparisons, and reusable analyses grounded in current wiki pages. Not for surfacing unresolved gaps; use /loam::reviewing-memory for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: scchearn
   argument-hint: <question>
 ---
@@ -39,7 +39,7 @@ Use `--files` to get candidate file paths only (no snippets). Then Read the actu
 
 - **Lookup**: `qmd search "<keywords>" --files -n 8 -c <collection>`
 - **Comparison/synthesis**: `qmd query "<natural language question>" --files -n 8 -c <collection>`
-- Skip the `qmd://<collection>/` prefix in file paths to get the relative wiki path (e.g. `entities/omf-programme-areas.md`)
+- Skip the `qmd://<collection>/` prefix in file paths to get the relative wiki path (e.g. `code/validate-token.md`)
 - Noisy results: retry with different terms or add `intent:` to disambiguate
 - Use scores to prioritize which files to Read first
 

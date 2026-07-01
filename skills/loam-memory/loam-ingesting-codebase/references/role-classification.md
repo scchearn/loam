@@ -55,6 +55,7 @@ Test and spec files. Captures: what is being tested, which cases are covered (co
 ## Edge cases
 
 - **Mixed file** (types + utilities in one file): classify by the primary export. If `export type User` and `export function getUser` coexist and `getUser` is the main export, classify as `utility` and note the type in the `## Depends on` section.
+- **Component file** (Svelte/Vue/Astro/MDX/Razor/Liquid/Njk): if it primarily defines a reusable UI component, classify as `type`. Shape captures props/slots/events/frontmatter/context; Relations captures imports; Summary notes that it renders UI. If it exposes a route/page/view surface, classify as `service`.
 - **Barrel file** (re-exports only): classify as `utility`. The summary notes it is a barrel/index file listing what it re-exports.
 - **Empty or whitespace-only file**: excluded before classification by `codegraph walk/diff`; do not summarize it by hand.
 - **Trivial but semantic file** (license header plus exports, barrel file, single re-export): still ingest. The summary notes the file is minimal and captures what graph edge it provides.

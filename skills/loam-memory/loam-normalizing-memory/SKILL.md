@@ -3,7 +3,7 @@ name: loam::normalizing-memory
 description: "Inspect an existing memory corpus (wiki substrate) and align it to this repo's Obsidian-friendly note-graph conventions. Use this when the user wants to import, normalize, retrofit, or clean up existing memory, notes folder, vault, docs tree, or mixed markdown knowledge base. In monorepos, also use it to align relevant AGENTS.md and CLAUDE.md files. Not for routine wiki maintenance; use /loam::linting-memory for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: scchearn
   argument-hint: "[--guidance-only] [wiki root or scope]"
 ---
@@ -127,7 +127,7 @@ Map the current state:
 - obvious duplicate note identities
 - broken or unresolved internal links
 - missing reciprocal backlinks where relationships are material
-- notes that should likely move into `topics/`, `entities/`, `concepts/`, or `analyses/`
+- notes that should likely move into `topics/`, `entities/`, `concepts/`, `analyses/`, or `code/`
 - existing `sources/` directories whose pages should be absorbed into topic/entity/concept pages
 - relevant `AGENTS.md` / `CLAUDE.md` files and whether each is canonical, scoped, or mirror-only
 - stale or duplicated deep-reference sections in guidance files that should instead point into memory (wiki substrate)

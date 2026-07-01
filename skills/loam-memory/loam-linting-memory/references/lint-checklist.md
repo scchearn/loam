@@ -13,6 +13,7 @@ Use this checklist to health-check a markdown wiki without turning the pass into
 - Are there obvious duplicate note identities under different filenames?
 - Are there duplicate or overlapping pages that should likely be consolidated later?
 - Are there obvious placeholder pages with no useful content?
+- Are there code-graph pages (with `source_path:` front matter) stranded in `entities/` instead of `code/`?
 
 ## Links
 
@@ -50,6 +51,7 @@ Use this checklist to health-check a markdown wiki without turning the pass into
 - add short stale-claim notes
 - create a minimal reusable page for an entity or concept already well established in memory (wiki substrate)
 - normalize obvious internal links to canonical `[[kebab-case-note-name]]` form
+- move stranded code pages (with `source_path:` front matter) from `entities/` to `code/`, update `index.md` grouping, and append a migration log entry
 
 ## Avoid during lint
 

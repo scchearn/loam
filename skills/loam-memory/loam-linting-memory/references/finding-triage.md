@@ -16,6 +16,7 @@ Examples:
 - two pages obviously should cross-link based on current content
 - a topic or entity note links to another note but the reciprocal backlink is obviously missing
 - a page should contain a brief contradiction note because the conflict already exists elsewhere in memory (wiki substrate)
+- code-graph pages (with `source_path:` front matter) are stranded in `entities/` instead of `code/` — move to `code/` and update `index.md` grouping
 
 ## Annotate now
 

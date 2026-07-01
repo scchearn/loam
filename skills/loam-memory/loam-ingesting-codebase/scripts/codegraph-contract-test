@@ -16,7 +16,7 @@ trap 'rm -rf "$tmp"' EXIT
 
 codebase="$tmp/codebase"
 wiki="$tmp/wiki"
-mkdir -p "$codebase/src" "$wiki/entities"
+mkdir -p "$codebase/src" "$wiki/code"
 mkdir -p "$codebase/wiki/entities"
 
 cat > "$codebase/.gitignore" <<'EOF'
@@ -48,6 +48,12 @@ EOF
 cat > "$codebase/src/semantic.py" <<'EOF'
 VALUE = 1
 EOF
+cat > "$codebase/src/Button.svelte" <<'EOF'
+<script>
+  export let label;
+</script>
+<button>{label}</button>
+EOF
 cat > "$codebase/ignored.ts" <<'EOF'
 export const ignored = true;
 EOF
@@ -73,23 +79,23 @@ current_epoch=$(stat_epoch "$codebase/src/current.ts")
 stale_ingested_epoch=$(date -d '2026-06-24 14:33:00' '+%s')
 stale_epoch=$(stat_epoch "$codebase/src/stale.ts")
 
-cat > "$wiki/entities/current.md" <<'EOF'
+cat > "$wiki/code/current.md" <<'EOF'
 ---
 source_path: src/current.ts
 ingested_at: CURRENT_EPOCH
 ---
 # Current
 EOF
-sed -i "s/CURRENT_EPOCH/$current_epoch/" "$wiki/entities/current.md"
-cat > "$wiki/entities/stale.md" <<'EOF'
+sed -i "s/CURRENT_EPOCH/$current_epoch/" "$wiki/code/current.md"
+cat > "$wiki/code/stale.md" <<'EOF'
 ---
 source_path: src/stale.ts
 ingested_at: STALE_INGESTED_EPOCH
 ---
 # Stale
 EOF
-sed -i "s/STALE_INGESTED_EPOCH/$stale_ingested_epoch/" "$wiki/entities/stale.md"
-cat > "$wiki/entities/legacy.md" <<'EOF'
+sed -i "s/STALE_INGESTED_EPOCH/$stale_ingested_epoch/" "$wiki/code/stale.md"
+cat > "$wiki/code/legacy.md" <<'EOF'
 ---
 source_path: src/legacy.ts
 ingested_at: 2026-06-24
@@ -137,6 +143,7 @@ assert 'src/stale.ts' in paths
 assert 'src/legacy.ts' in paths
 assert 'src/new.ts' in paths
 assert 'src/semantic.py' in paths
+assert 'src/Button.svelte' in paths
 assert 'src/empty.ts' not in paths
 assert 'src/blank.ts' not in paths
 assert 'src/generated.ts' not in paths
@@ -149,6 +156,7 @@ if no_gitignore:
 excluded = summary['excluded']
 assert summary['total'] == len(walk)
 assert summary['by_ext']['ts'] >= 3
+assert summary['by_ext']['svelte'] == 1
 assert excluded['empty'] >= 2
 assert excluded['large'] >= 1
 assert excluded['generated_header'] >= 1
@@ -170,6 +178,61 @@ assert 'src/legacy.ts' in by_path and by_path['src/legacy.ts']['reason'] == 'sta
 assert 'src/current.ts' not in by_path
 assert 'src/empty.ts' not in by_path
 assert 'ignored.ts' not in by_path
+PY
+
+# Dual-scan legacy test: stranded source_path: page in entities/ is visible to index
+legacy_wiki="$tmp/legacy-wiki"
+mkdir -p "$legacy_wiki/entities" "$legacy_wiki/SCHEMA.md.d"
+cat > "$legacy_wiki/SCHEMA.md" <<'EOF'
+# Schema
+EOF
+cat > "$legacy_wiki/entities/stranded.ts.md" <<'EOF'
+---
+source_path: src/stranded.ts
+ingested_at: 1700000000
+---
+# Stranded
+EOF
+legacy_index_json=$("$CODEGRAPH" index "$legacy_wiki" --codebase-root "$codebase")
+LEGACY_INDEX_JSON="$legacy_index_json" python3 - <<'PY'
+import json, os
+index = json.loads(os.environ['LEGACY_INDEX_JSON'])
+by_source = {item['source_path']: item for item in index}
+assert 'src/stranded.ts' in by_source, "stranded entities/ page not visible to dual-scan index"
+assert by_source['src/stranded.ts']['slug'] == 'stranded.ts'
+print("dual-scan legacy: PASS")
+PY
+
+# Precedence test: same source_path in both code/ and entities/ — index prefers code/
+prec_wiki="$tmp/prec-wiki"
+mkdir -p "$prec_wiki/code" "$prec_wiki/entities"
+cat > "$prec_wiki/SCHEMA.md" <<'EOF'
+# Schema
+EOF
+cat > "$prec_wiki/code/dup.ts.md" <<'EOF'
+---
+source_path: src/dup.ts
+ingested_at: 1800000000
+---
+# Dup (code)
+EOF
+cat > "$prec_wiki/entities/dup.ts.md" <<'EOF'
+---
+source_path: src/dup.ts
+ingested_at: 1700000000
+---
+# Dup (entities legacy)
+EOF
+prec_index_json=$("$CODEGRAPH" index "$prec_wiki" --codebase-root "$codebase")
+PREC_INDEX_JSON="$prec_index_json" python3 - <<'PY'
+import json, os
+index = json.loads(os.environ['PREC_INDEX_JSON'])
+by_source = {item['source_path']: item for item in index}
+assert 'src/dup.ts' in by_source, "dup source_path missing from index"
+assert by_source['src/dup.ts']['ingested_at'] == '1800000000', "index did not prefer code/ over entities/ for same source_path"
+dups = [item for item in index if item['source_path'] == 'src/dup.ts']
+assert len(dups) == 1, f"expected 1 entry for src/dup.ts, got {len(dups)}"
+print("precedence: PASS")
 PY
 
 grep -Fq 'Cap the work set at 200 files.' "$INGEST_SKILL"

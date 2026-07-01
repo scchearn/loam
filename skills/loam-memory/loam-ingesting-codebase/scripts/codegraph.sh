@@ -225,40 +225,42 @@ collect_index() {
   index_mtimes=()
   index_exists=()
 
-  local entities_dir="$wiki_root/entities"
-  [[ ! -d "$entities_dir" ]] && return 0
-
   local page source_path ingested_at slug resolved mtime_epoch
-  while IFS= read -r -d '' page; do
-    source_path=""
-    ingested_at=""
-    local in_fm=false line
-    while IFS= read -r line; do
-      if [[ "$line" =~ ^---$ ]]; then
-        if $in_fm; then break; else in_fm=true; continue; fi
-      fi
-      if $in_fm; then
-        [[ "$line" =~ ^source_path:[[:space:]]*(.*)$ ]] && source_path="${BASH_REMATCH[1]//\"/}"
-        [[ "$line" =~ ^ingested_at:[[:space:]]*(.*)$ ]] && ingested_at="${BASH_REMATCH[1]//\"/}"
-      fi
-    done < "$page"
+  # Dual scan: code/ (primary) and entities/ (legacy transition for stranded source_path: pages)
+  for entities_dir in "$wiki_root/code" "$wiki_root/entities"; do
+    [[ ! -d "$entities_dir" ]] && continue
+    while IFS= read -r -d '' page; do
+      source_path=""
+      ingested_at=""
+      local in_fm=false line
+      while IFS= read -r line; do
+        if [[ "$line" =~ ^---$ ]]; then
+          if $in_fm; then break; else in_fm=true; continue; fi
+        fi
+        if $in_fm; then
+          [[ "$line" =~ ^source_path:[[:space:]]*(.*)$ ]] && source_path="${BASH_REMATCH[1]//\"/}"
+          [[ "$line" =~ ^ingested_at:[[:space:]]*(.*)$ ]] && ingested_at="${BASH_REMATCH[1]//\"/}"
+        fi
+      done < "$page"
 
-    [[ -z "$source_path" || -z "$ingested_at" ]] && continue
-    slug="$(basename "$page")"
-    slug="${slug%.md}"
-    index_sources+=("$source_path")
-    index_slugs["$source_path"]="$slug"
-    index_ingested["$source_path"]="$ingested_at"
-    resolved="$(resolve_source_path "$source_path" "$codebase_root")"
-    if [[ -f "$resolved" ]]; then
-      mtime_epoch=$(stat_epoch "$resolved")
-      index_mtimes["$source_path"]="$mtime_epoch"
-      index_exists["$source_path"]="true"
-    else
-      index_mtimes["$source_path"]=""
-      index_exists["$source_path"]="false"
-    fi
-  done < <(find "$entities_dir" -maxdepth 1 -name '*.md' -print0 2>/dev/null)
+      [[ -z "$source_path" || -z "$ingested_at" ]] && continue
+      [[ -n "${index_slugs[$source_path]:-}" ]] && continue
+      slug="$(basename "$page")"
+      slug="${slug%.md}"
+      index_sources+=("$source_path")
+      index_slugs["$source_path"]="$slug"
+      index_ingested["$source_path"]="$ingested_at"
+      resolved="$(resolve_source_path "$source_path" "$codebase_root")"
+      if [[ -f "$resolved" ]]; then
+        mtime_epoch=$(stat_epoch "$resolved")
+        index_mtimes["$source_path"]="$mtime_epoch"
+        index_exists["$source_path"]="true"
+      else
+        index_mtimes["$source_path"]=""
+        index_exists["$source_path"]="false"
+      fi
+    done < <(find "$entities_dir" -maxdepth 1 -name '*.md' -print0 2>/dev/null)
+  done
 }
 
 emit_index_json() {

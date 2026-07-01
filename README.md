@@ -104,17 +104,17 @@ startup, while the body is only loaded when the skill activates.
 | Skill | Desc chars (max 1,024) | Desc tokens (~100) | Body lines (max 500) | Body tokens (< 5,000) |
 |-------|---:|---:|---:|---:|
 | loam::initializing-vault | 206 | 51 | 9 | 73 |
-| loam::scaffolding-wiki | 379 | 78 | 195 | 2,120 |
+| loam::scaffolding-wiki | 379 | 78 | 196 | 2,123 |
 | loam::adding-to-memory | 514 | 103 | 215 | 2,159 |
 | loam::amending-memory | 505 | 114 | 180 | 1,856 |
 | loam::auditing-guidance | 410 | 85 | 252 | 2,528 |
-| loam::ingesting-codebase | 338 | 76 | 241 | 2,660 |
+| loam::ingesting-codebase | 329 | 76 | 241 | 2,702 |
 | loam::learning-from-session | 432 | 88 | 361 | 4,051 |
-| loam::linting-memory | 423 | 93 | 240 | 3,602 |
-| loam::normalizing-memory | 421 | 94 | 260 | 2,606 |
-| loam::querying-memory | 463 | 91 | 173 | 1,529 |
+| loam::linting-memory | 423 | 93 | 260 | 4,104 |
+| loam::normalizing-memory | 421 | 94 | 260 | 2,610 |
+| loam::querying-memory | 463 | 91 | 173 | 1,525 |
 | loam::reviewing-memory | 459 | 104 | 136 | 1,656 |
-| loam::syncing-code-graph | 363 | 84 | 216 | 2,393 |
+| loam::syncing-code-graph | 363 | 84 | 216 | 2,439 |
 | loam::using | 365 | 76 | 192 | 3,792 |
 | loam::amending-plan | 340 | 68 | 268 | 2,920 |
 | loam::checkpointing | 365 | 69 | 176 | 1,855 |
@@ -128,6 +128,7 @@ startup, while the body is only loaded when the skill activates.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
 
 
 

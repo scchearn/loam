@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate). Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, or consolidate a legacy root `overview.md` into `index.md`. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.4.0"
+  version: "1.5.0"
   author: scchearn
   argument-hint: [wiki root or focus area]
 ---
@@ -99,6 +99,8 @@ qmd is **secondary only** in this skill: use it only to find related-note neighb
 
 **H. Freshness re-validation** — Flag pages whose `updated_at` is older than 90 days and that cite volatile surfaces such as APIs, configs, versions, external docs, or code paths. This is a re-validation warning only; lint does not auto-archive stale volatile pages.
 
+**I. Stranded code pages in `entities/`** — Check whether `entities/` contains pages with `source_path:` front matter. These are code-graph pages that belong in `code/`, not `entities/`. Prose entity pages never carry `source_path:`. See Step 2 for the migration procedure.
+
 Distinguish: **fix now** (safe from existing wiki evidence) vs **annotate now** (mark but don't resolve) vs **follow-up** (needs future evidence/research/user direction).
 
 **Expand with qmd (secondary, if ready)**: Follow `references/qmd-usage.md` to find related-note neighborhoods for orphan pages or missing cross-links.
@@ -145,6 +147,22 @@ When `<wiki root>/checkpoints/` contains legacy slugged checkpoint filenames:
 4. apply the migration only through lint's normal proposal/approval path; do not rename checkpoint files silently
 5. record the checkpoint filename migration in `<wiki root>/log.md`
 
+When `<wiki root>/entities/` contains stranded code pages (pages with `source_path:` front matter):
+
+1. identify all `entities/*.md` files that have `source_path:` front matter (these are code-graph pages, not prose entity pages)
+2. create `<wiki root>/code/` if it does not exist
+3. for each stranded page, check if `<wiki root>/code/<slug>.md` already exists:
+   - **No collision** → move `entities/<slug>.md` to `code/<slug>.md`
+   - **Collision** → do NOT overwrite; report the collision as an unresolved finding and leave `entities/<slug>.md` in place for manual resolution
+4. wikilinks stay `[[slug]]` — Obsidian resolves by filename, not path, so no link rewrites are needed
+5. update `index.md`: move affected entries from the `## Entities` group to the `## Code` group (create `## Code` if absent)
+6. append a migration entry to `<wiki root>/log.md`:
+   ```md
+   ## [YYYY-MM-DD] migrate | code entities → code/
+   ```
+   Capture: count of pages moved, count of collisions reported as unresolved.
+7. refresh qmd if ready (the page paths changed)
+
 Allowed direct fixes:
 
 1. updating `index.md` to match actual durable pages with `## Overview`
@@ -159,6 +177,7 @@ Allowed direct fixes:
 10. moving only a misplaced nested `<wiki root>/.obsidian/` directory to the parent directory root when the destination has no `.obsidian/` directory
 11. reconciling stale `<wiki root>/.wiki-metadata.json` paths to the actual resolved wiki root
 12. renaming legacy checkpoint files from `checkpoint-YYYY-MM-DD-HHMM-<slug>.md` to `checkpoint-YYYY-MM-DD-HHMM.md` and updating their checkpoint wikilinks when the mapping is collision-free and local
+13. moving stranded code pages (with `source_path:` front matter) from `entities/` to `code/`, updating `index.md` grouping, and appending a migration log entry
 
 Do not: ingest new raw sources, invent facts, silently merge/rename notes, silently delete disagreement/uncertainty, leave redundant `overview.md`, overwrite or merge an existing parent `.obsidian/`, move or rename `<wiki root>` or any wiki content directory, perform broad rewrites, or modify raw-source files.
 
@@ -170,7 +189,7 @@ Check `<wiki root>/log.md` line count. If it exceeds 500 lines:
 2. Replace the moved content in `log.md` with a single pointer line: `## [YYYY-MM-DD] rotate | archived <N> entries to log-archive/YYYY-MM.md`
 3. The active `log.md` should stay under ~250 lines after rotation.
 
-This is the only log mutation lint performs. Lint is otherwise read-only with respect to `log.md` — it does not append a per-pass entry, because lint is a health check, not a content change.
+This is the only routine log mutation lint performs. Lint is otherwise read-only with respect to `log.md` — it does not append a per-pass entry, because lint is a health check, not a content change. Structural exceptions already defined above (code-page migration, metadata reconciliation, vault placement, checkpoint filename migration) may append structural log entries.
 
 ### Check date format drift
 
@@ -237,6 +256,7 @@ If the pass found no significant issues, say so explicitly and still note any re
 - Treat `<wiki root>/.obsidian/` as misplaced Obsidian config when `<wiki root>` is a subdirectory. Move only `.obsidian/` to the parent directory root when that destination has no `.obsidian/` directory.
 - Reconcile stale `.wiki-metadata.json` to the actual resolved wiki root. Lint updates metadata to match the on-disk wiki; it never moves the on-disk wiki to match metadata.
 - Own checkpoint filename migration. New checkpoints should be named `checkpoint-YYYY-MM-DD-HHMM.md`; lint may rename legacy slugged checkpoint files and update checkpoint wikilinks when the mapping is collision-free and local.
+- Own code-page migration. Lint may move `entities/*.md` pages with `source_path:` front matter to `code/` and update `index.md` grouping. Wikilinks need no change (Obsidian resolves by filename). On collision with an existing `code/<slug>.md`, do not overwrite; report unresolved. Append a `## [YYYY-MM-DD] migrate | code entities → code/` log entry (structural change exception to the no-per-pass-entry rule).
 - Never move or rename `<wiki root>` or any wiki content directory as part of `.obsidian/` placement or qmd metadata repair.
 - Rotate `<wiki root>/log.md` when it exceeds 500 lines; lint does not append per-pass entries to `log.md`.
 - Check date format drift with `datecheck.sh check`; canonical formats are in `loam-using/references/date-formats.md`. Apply only unambiguous local normalizations and report ambiguous drift.

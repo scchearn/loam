@@ -57,6 +57,7 @@ wiki/
   entities/
   concepts/
   analyses/
+  code/
 ```
 
 ## Special files
@@ -95,6 +96,7 @@ These are common categories, not mandatory ones:
 - `entities/` — people, companies, products, places, projects, or systems
 - `concepts/` — ideas, methods, claims, frameworks, recurring patterns
 - `analyses/` — query outputs worth preserving as first-class wiki pages
+- `code/` — code-graph nodes ingested by `/loam::ingesting-codebase` (functions, types, routes, components)
 
 Use only the categories the domain actually needs.
 

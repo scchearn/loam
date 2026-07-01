@@ -1,16 +1,16 @@
 ---
 name: loam::ingesting-codebase
-description: "Ingest a codebase into memory as entity pages connected by wiki links. Walks the tree, classifies each code file by role, applies a role template, and writes an entity page per meaningful unit under <wiki root>/entities/. Resumable: skips files already ingested and current. Not for prose documents; use /loam::adding-to-memory for those."
+description: "Ingest a codebase into memory as code pages connected by wiki links. Walks the tree, classifies each code file by role, applies a role template, and writes a code page per meaningful unit under <wiki root>/code/. Resumable: skips files already ingested and current. Not for prose documents; use /loam::adding-to-memory for those."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.3.0"
+  version: "1.4.0"
   author: scchearn
   argument-hint: <codebase root path>
 ---
 
 You are a senior engineer and disciplined wiki maintainer ingesting a codebase into the persistent wiki so future sessions inherit a compressed semantic map of the code instead of re-reading source.
 
-The codebase becomes a graph of entity pages under `<wiki root>/entities/`, connected by wiki links. The wiki *is* the code graph — no separate database, no parallel representation.
+The codebase becomes a graph of code pages under `<wiki root>/code/`, connected by wiki links. The wiki *is* the code graph — no separate database, no parallel representation.
 
 ## Input
 
@@ -43,15 +43,15 @@ Resolve `$ARGUMENTS` to an absolute path. If it does not exist or is not a direc
 
 ### Build the existing index
 
-Run the index subcommand to get every code-ingested entity page already in the wiki:
+Run the index subcommand to get every code-ingested page already in the wiki:
 
 ```bash
 "${CLAUDE_SKILL_DIR}/scripts/codegraph.sh" index <wiki-root> --codebase-root <codebase-root>
 ```
 
-Parse the JSON output into an in-memory map: `{source_path → {slug, ingested_at, mtime, exists}}`. Pages without `source_path:` front matter are prose entity pages and are skipped silently. This map is the set of already-ingested code nodes.
+Parse the JSON output into an in-memory map: `{source_path → {slug, ingested_at, mtime, exists}}`. Pages without `source_path:` front matter are prose entity pages and are skipped silently. This map is the set of already-ingested code nodes. The index scans both `code/` and `entities/` (for legacy stranded `source_path:` pages during the transition to the `code/` namespace).
 
-If the script is missing or fails, fall back to Globbing `entities/*.md` and parsing front matter with Read. The script is an optimization, not a hard dependency.
+If the script is missing or fails, fall back to Globbing `code/*.md` and `entities/*.md` and parsing front matter with Read. The script is an optimization, not a hard dependency.
 
 If `codegraph.sh index` or `codegraph.sh diff` reports `wiki root contract not found` or `did you mean: .../wiki`, stop and rerun the command with the actual `wiki_root`. Do not proceed from an empty index caused by a bad wiki-root path.
 
@@ -81,8 +81,8 @@ Run the diff subcommand to get the files that need ingestion or re-summarization
 
 Parse the JSON output: `{path, mtime, reason, slug?}` where `mtime` is the source file's Unix epoch mtime and `reason` is `new` or `stale`. Legacy pages with date-only `ingested_at` are stale once so they migrate to epoch precision.
 
-- **`reason: "new"`** → new ingest (create entity page)
-- **`reason: "stale"`** → re-summarize (overwrite the same entity page; `slug` is provided)
+- **`reason: "new"`** → new ingest (create code page)
+- **`reason: "stale"`** → re-summarize (overwrite the same code page; `slug` is provided)
 - current files are omitted
 
 **Cap the work set at 200 files.** If more remain, stop after 200 and report the pending count. The user re-invokes to continue; resumability (Step 1's index rebuild) means the next run picks up exactly where this one stopped.
@@ -111,7 +111,7 @@ Load the matching role template from `references/templates/role-<role>.md`.
 
 ---
 
-## Step 4 — Read, extract, and generate the entity page
+## Step 4 — Read, extract, and generate the code page
 
 ### Read the file
 
@@ -119,7 +119,7 @@ Read the file in full. Distinguish: the primary export or symbol (becomes the pa
 
 ### Derive the slug
 
-Derive the entity-page slug from the file's primary export name or primary symbol, lowercased and kebab-cased. If no clear primary export, use the filename sans extension, kebab-cased. Examples:
+Derive the code-page slug from the file's primary export name or primary symbol, lowercased and kebab-cased. If no clear primary export, use the filename sans extension, kebab-cased. Examples:
 
 - `src/auth/validateToken.ts` exporting `validateToken` → `validate-token`
 - `src/utils/helpers.ts` exporting multiple utilities → `helpers` (one page per file)
@@ -130,14 +130,14 @@ Derive the entity-page slug from the file's primary export name or primary symbo
 For each dependency name found in the file:
 
 1. Check the in-memory index (built in Step 1, augmented with new ingests this run) for a matching `source_path` or slug.
-2. If it resolves to an entity page in the wiki → render as `[[slug]]`.
+2. If it resolves to a code page in the wiki → render as `[[slug]]`.
 3. If it does not resolve → flag as an external dependency (plain text, not a wikilink). Note it in the `## Dependencies` section with an `(external)` marker.
 
 Do not create broken wikilinks. Unresolved names stay as text.
 
-### Generate the entity page
+### Generate the code page
 
-Fill the loaded role template with the extracted fields. The resulting markdown is the entity page. Include front matter:
+Fill the loaded role template with the extracted fields. The resulting markdown is the code page. Include front matter:
 
 ```yaml
 ---
@@ -150,7 +150,7 @@ Use the source file's Unix epoch mtime for `ingested_at`. For re-summarized file
 
 ### Write the page
 
-Write to `<wiki root>/entities/<slug>.md`. Overwrite if re-summarizing. Create if new.
+Write to `<wiki root>/code/<slug>.md`. Overwrite if re-summarizing. Create if new.
 
 ### Update the in-memory index
 
@@ -164,9 +164,9 @@ Add or update the entry in the in-memory index so subsequent files in this run c
 
 ## Step 5 — Wire reciprocal links
 
-After all files in the work set are written, wire reciprocal links. For each newly written or updated entity page:
+After all files in the work set are written, wire reciprocal links. For each newly written or updated code page:
 
-1. Read the `## Dependencies` section to find which entity pages it links to.
+1. Read the `## Dependencies` or `## Relations` section to find which code pages it links to.
 2. For each linked page, append a reciprocal backlink to its `## Callers` or `## Mentioned in` section if the relationship is materially useful and the link is not already present.
 3. Prefer small targeted edits (append one line) over rewrites.
 4. Skip reciprocal links to external dependencies (they have no page to link back from).
@@ -179,7 +179,7 @@ Do not re-write pages whose links are unchanged. Only touch pages that gained or
 
 ### Update index.md
 
-Add new entity pages to `index.md` under the `## Entities` group (create the group if absent) with one-line descriptions. Update descriptions for re-summarized pages if the summary changed meaningfully.
+Add new code pages to `index.md` under the `## Code` group (create the group if absent) with one-line descriptions. Update descriptions for re-summarized pages if the summary changed meaningfully.
 
 ### Append to log.md
 
@@ -239,8 +239,8 @@ Codebase ingested from <codebase root>
 - One role per file. When ambiguous, pick the role matching the file's primary export or primary intent.
 - Edge links are untyped `[[slug]]`. Do not annotate edge type in the link itself.
 - Unresolved dependency names stay as plain text flagged `(external)`. Do not create broken wikilinks.
-- Code-ingested entity pages carry `source_path:` and `ingested_at:` front matter. Prose entity pages (from `/loam::adding-to-memory`) keep their existing front-matter-less shape.
-- Granularity: one entity page per file, keyed by the file's primary export or primary symbol. Do not split a single file into multiple pages unless it contains multiple independently-meaningful top-level declarations.
+- Code-ingested pages carry `source_path:` and `ingested_at:` front matter. Prose entity pages (from `/loam::adding-to-memory`) keep their existing front-matter-less shape.
+- Granularity: one code page per file, keyed by the file's primary export or primary symbol. Do not split a single file into multiple pages unless it contains multiple independently-meaningful top-level declarations.
 - Respect the 200-file cap. Do not silently exceed it.
 - Resumability is automatic: the next invocation rebuilds the index from disk and skips current files.
 - After wiki writes, refresh qmd if ready. Failures are reported, not rolled back.

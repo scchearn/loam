@@ -131,6 +131,7 @@ Files with these extensions are ingestion candidates (after exclusions pass):
 .graphql .gql
 .proto
 .sh
+.svelte .vue .astro .mdx .razor .liquid .njk
 ```
 
 ## Notes

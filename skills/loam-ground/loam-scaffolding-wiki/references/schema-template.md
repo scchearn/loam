@@ -20,7 +20,8 @@ The wiki layer is stored in `<wiki path>`. The agent owns and maintains those fi
 - `<wiki path>/log-archive/YYYY-MM.md` — rotated log archives (created by `/loam::linting-memory`)
 - `<wiki path>/.archive/` — soft-deleted durable pages, excluded from qmd, never hard-deleted
 - `<wiki path>/topics/<topic-slug>.md` — topic synthesis pages
-- `<wiki path>/entities/<entity-slug>.md` — entity pages
+- `<wiki path>/entities/<entity-slug>.md` — entity pages (people, companies, products, places, projects, or systems)
+- `<wiki path>/code/<code-slug>.md` — code pages (ingested code-graph nodes: functions, types, routes, components)
 - `<wiki path>/concepts/<concept-slug>.md` — concept pages
 - `<wiki path>/analyses/<analysis-slug>.md` — preserved query outputs and cross-source analyses
 

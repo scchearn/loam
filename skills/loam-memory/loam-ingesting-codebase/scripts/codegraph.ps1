@@ -136,28 +136,33 @@ function Resolve-Source([string]$SourcePath, [string]$CodebaseRoot) {
 
 function Collect-Index([string]$WikiRoot, [string]$CodebaseRoot = '') {
   Assert-WikiRoot $WikiRoot
-  $entitiesDir = Join-Path $WikiRoot 'entities'
-  if (-not (Test-Path $entitiesDir -PathType Container)) { return @() }
-
   $entries = @()
-  foreach ($page in Get-ChildItem -Path $entitiesDir -Filter '*.md' -File) {
-    $sourcePath = ''
-    $ingestedAt = ''
-    $inFm = $false
-    foreach ($line in (Get-Content $page.FullName)) {
-      $trimmed = $line.Trim()
-      if ($trimmed -eq '---') { if ($inFm) { break } else { $inFm = $true; continue } }
-      if ($inFm) {
-        if ($trimmed -match '^source_path:\s*(.*)$') { $sourcePath = $matches[1].Trim('"') }
-        if ($trimmed -match '^ingested_at:\s*(.*)$') { $ingestedAt = $matches[1].Trim('"') }
+  # Dual scan: code/ (primary) and entities/ (legacy transition for stranded source_path: pages)
+  foreach ($scanDir in @('code', 'entities')) {
+    $entitiesDir = Join-Path $WikiRoot $scanDir
+    if (-not (Test-Path $entitiesDir -PathType Container)) { continue }
+    foreach ($page in Get-ChildItem -Path $entitiesDir -Filter '*.md' -File) {
+      $sourcePath = ''
+      $ingestedAt = ''
+      $inFm = $false
+      foreach ($line in (Get-Content $page.FullName)) {
+        $trimmed = $line.Trim()
+        if ($trimmed -eq '---') { if ($inFm) { break } else { $inFm = $true; continue } }
+        if ($inFm) {
+          if ($trimmed -match '^source_path:\s*(.*)$') { $sourcePath = $matches[1].Trim('"') }
+          if ($trimmed -match '^ingested_at:\s*(.*)$') { $ingestedAt = $matches[1].Trim('"') }
+        }
       }
+      if (-not $sourcePath -or -not $ingestedAt) { continue }
+      $skip = $false
+      foreach ($e in $entries) { if ($e.source_path -eq $sourcePath) { $skip = $true; break } }
+      if ($skip) { continue }
+      $resolved = Resolve-Source $sourcePath $CodebaseRoot
+      $exists = Test-Path $resolved -PathType Leaf
+      $mtime = ''
+      if ($exists) { $mtime = Format-JsonMtime (Get-Item $resolved).LastWriteTime }
+      $entries += [PSCustomObject]@{ source_path = $sourcePath; slug = [System.IO.Path]::GetFileNameWithoutExtension($page.Name); ingested_at = $ingestedAt; mtime = $mtime; exists = $exists }
     }
-    if (-not $sourcePath -or -not $ingestedAt) { continue }
-    $resolved = Resolve-Source $sourcePath $CodebaseRoot
-    $exists = Test-Path $resolved -PathType Leaf
-    $mtime = ''
-    if ($exists) { $mtime = Format-JsonMtime (Get-Item $resolved).LastWriteTime }
-    $entries += [PSCustomObject]@{ source_path = $sourcePath; slug = [System.IO.Path]::GetFileNameWithoutExtension($page.Name); ingested_at = $ingestedAt; mtime = $mtime; exists = $exists }
   }
   $entries
 }
