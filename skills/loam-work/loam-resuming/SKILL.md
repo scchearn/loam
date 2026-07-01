@@ -3,7 +3,7 @@ name: loam::resuming
 description: "Use when resuming work after a pause, reboot, or context switch and the workspace uses `wiki/checkpoints/` resumable notes. Read the latest relevant checkpoint chain, orient to the most likely in-flight scope, verify current files and tools before acting, and report the safest next step."
 allowed-tools: Read Glob Grep Bash
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: scchearn
   argument-hint: "[optional hint or focus]"
 ---
@@ -22,15 +22,31 @@ If no hint is provided, derive the likely resume target from the current session
 
 ## Step 1 — Locate checkpoints and derive the current resume context
 
-1. Find the wiki root by locating `**/checkpoints/checkpoint-*.md` (the newest match by filename-timestamp sort). If multiple roots match, prefer the one with the most-recent checkpoint.
-2. When no `wiki/checkpoints/` exists, create it (or fall back to `notes/checkpoints/` if wiki is undesired) so a future loam::checkpointing call has a place to land. If the glob still returns no checkpoint files, stop and say there is nothing to resume.
-3. Read only the newest **3-5** checkpoint notes, sorted by the filename timestamp prefix (`checkpoint-YYYY-MM-DD-HHMM.md`, suffixed collision files, and legacy slugged files), not by mtime — sync clients rewrite mtimes.
-4. Derive the current resume context from:
+1. **Resolve the wiki root via `loamstate`** (git-agnostic; Glob respects `.gitignore` and `.git/info/exclude`, so `wiki/`, `specs/`, `plans/` are invisible to Glob when projects locally ignore them):
+
+   ```bash
+   bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+     || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+   ```
+
+   Parse the JSON `wiki_root`. Treat empty `wiki_root` as "no wiki," not as an error. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to testing `wiki/SCHEMA.md`, `wiki/index.md`, `wiki/log.md` with `Read` (filesystem open, git-agnostic) — **do not use Glob to discover the wiki root**.
+
+2. **List checkpoints with `ls`, not Glob** (same gitignore caveat applies to checkpoint files). From the resolved `<wiki_root>`:
+
+   ```bash
+   ls -1 "$WIKI_ROOT/checkpoints/checkpoint-"*.md 2>/dev/null | sort -r | head -5
+   ```
+
+   `ls` is a direct filesystem call and ignores git ignore state. Sort is by filename-timestamp prefix, not mtime (sync clients rewrite mtimes). If the glob expands to nothing, also try `ls -1 "$WIKI_ROOT/checkpoints/" | grep '^checkpoint-' | sort -r | head -5` to catch slugged legacy filenames like `checkpoint-YYYY-MM-DD-HHMM-<slug>.md`.
+
+3. When no `<wiki_root>/checkpoints/` directory exists, create it (or fall back to `notes/checkpoints/` if wiki is undesired) so a future loam::checkpointing call has a place to land. If both `ls` attempts return no checkpoint files, stop and say there is nothing to resume.
+4. Read only the newest **3-5** checkpoint notes from the `ls` output (sorted by the filename timestamp prefix: `checkpoint-YYYY-MM-DD-HHMM.md`, suffixed collision files like `checkpoint-YYYY-MM-DD-HHMM-2.md`, and legacy slugged files), not by mtime.
+5. Derive the current resume context from:
    - the current conversation/session
    - the optional hint, if present
    - the concrete files, plans, specs, notes, or tools already in play
 
-Do not scan the whole wiki. Resume is a recent-state workflow, not an archive search.
+Do not scan the whole wiki. Resume is a recent-state workflow, not an archive search. Do not use Glob for checkpoint or wiki-root discovery — git-ignored wikis silently return zero matches.
 
 ---
 

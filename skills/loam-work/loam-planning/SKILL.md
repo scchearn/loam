@@ -3,7 +3,7 @@ name: loam::planning
 description: "Use when an approved workspace spec needs an execution-ready implementation plan with ordered, verifiable steps. Specs are mandatory: this skill consumes design decisions, verifies that the spec still matches the codebase, and writes the repo-native plans/ artifacts."
 allowed-tools: Read Glob Grep Bash Write Edit Skill
 metadata:
-  version: "2.3.1"
+  version: "2.3.2"
   author: scchearn
   argument-hint: <spec path or spec topic>
 ---
@@ -61,7 +61,7 @@ Resolution rules:
 
 1. If a direct path is provided, read that file.
 2. Otherwise slugify the topic and look for `specs/<slug>.md`.
-3. If there is no exact match, search `specs/*.md` front matter and headings for a single close match.
+3. If there is no exact match, search `specs/*.md` front matter and headings for a single close match. **Use `ls specs/*.md 2>/dev/null` via Bash, not Glob** — `specs/` is commonly excluded via `.gitignore` or `.git/info/exclude` (so the agent workspace can hold local-only research artifacts), and Glob silently returns zero hits for ignored paths. Grep may then be used on the resolved filenames.
 4. If no spec is found, STOP with:
 
 ```text
