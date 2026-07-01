@@ -3,7 +3,7 @@ name: loam::starting
 description: "Use when beginning or resuming a plan file, including mixed local and hcom-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
 allowed-tools: Read Write Edit Glob Grep Bash WebFetch
 metadata:
-  version: "2.2.0"
+  version: "2.2.1"
   author: scchearn
   argument-hint: plans/<slug>.md [T3 | T3,T5,T7 | T3-T7]
 ---
@@ -215,18 +215,9 @@ For a **delegation group**:
 
 If this is the **first task or delegation** of the session and front matter `status` is still `pending`, update metadata before doing any code work:
 
-- Set front matter `status` to `in-progress`
-- Set front matter `started_at` to the current local date and time, format `YYYY-MM-DD HH:MM ±HH:MM` (per `loam-using/references/date-formats.md`), if it is currently `null`
-- Keep front matter `task_count` equal to the number of `### T...` task blocks currently in the plan
-- Sync the corresponding row in `plans/INDEX.md` so `Status`, `Title`, `Plan`, `Description`, and `Tasks` mirror the front matter, and move the row if the status ordering changed
+- Set `status` to `in-progress`; set `started_at` to `YYYY-MM-DD HH:MM ±HH:MM` (per `loam-using/references/date-formats.md`) if currently `null`; keep `task_count` equal to the number of `### T...` task blocks; sync the `plans/INDEX.md` row so `Status`, `Title`, `Plan`, `Description`, and `Tasks` mirror the front matter.
 
-On any plan edit, clean up legacy metadata if present:
-
-- Remove front matter `updated_at`
-- Remove the entire `## Plan summary` section
-- If `plans/INDEX.md` still uses the older timestamp-heavy schema, rewrite it to the slim `Status | Title | Plan | Description | Tasks` schema before updating rows
-
-Even when the plan is already `in-progress`, keep `plans/INDEX.md` synchronized whenever mirrored metadata changes. If you add tasks while splitting or correcting the plan, update `task_count` and the index `Tasks` column.
+On any plan edit, remove legacy `updated_at` and the entire `## Plan summary` section. If `plans/INDEX.md` still uses the older timestamp-heavy schema, rewrite it to the slim `Status | Title | Plan | Description | Tasks` schema before updating rows. Keep `plans/INDEX.md` synchronized whenever mirrored metadata changes; update `task_count` and the index `Tasks` column if tasks are added or split.
 
 ### 2. Do the work
 
@@ -245,14 +236,7 @@ Before editing files for a task, scan its Steps and Constraints for intent marke
 
 Markers are scoped to the task that contains them. Mandatory language inside fetched skills applies only inside that marker scope.
 
-Implement the task after reading the relevant source files. Follow applicable workspace guidance from files such as `AGENTS.md`, `CLAUDE.md`, `README.md`, `CONTRIBUTING.md`, manifests, lockfiles, scripts, and adjacent code.
-
-- Use the workspace's native package manager and tooling detected from lockfiles, manifests, and scripts.
-- Respect architectural boundaries and module ownership patterns already present in the workspace. Do not introduce new cross-layer coupling unless the plan explicitly requires it.
-- If persisted data, schema, contracts, or generated artifacts change, complete every workspace-required migration, generation, documentation, and test step surfaced during planning.
-- Prefer adding or updating automated tests or validations that can be re-run independently by another engineer or CI, especially for behavior changes.
-- Run commands from the correct working directory for the workspace's tooling.
-- If the task is blocked by unresolved workspace context or ambiguous external behavior that cannot be settled locally, stop and recommend `/loam::writing-spec <topic>` rather than guessing.
+Implement the task after reading the relevant source files. Follow workspace conventions from `AGENTS.md`, `CLAUDE.md`, lockfiles, and adjacent code: use native tooling, respect architectural boundaries, complete migrations/artifacts when persisted data changes, add re-runnable tests for behavior changes, run commands from the correct working directory. If blocked by unresolved context or ambiguous external behavior, stop and recommend `/loam::writing-spec <topic>`.
 
 #### 2b. Delegated hcom groups
 
@@ -294,27 +278,16 @@ If this was the **last remaining task** (all tasks in the plan are now `[x]`), a
 
 Run the learnings gate only when a wiki exists and at least one of these is true: the plan has Learning checkpoints, the task read wiki pages, or execution contradicted expected behavior.
 
-Classify each candidate finding:
+| Finding | Route | Handoff prefix |
+|---|---|---|
+| Durable fact, command, gotcha, or constraint | `/loam::learning-from-session` | `+` |
+| Stale wiki claim contradicted by code/verification | `/loam::amending-memory` | `-` |
+| Source document needing ingestion | `/loam::adding-to-memory` | — |
+| Temporary progress or one-off minutiae | skip | — |
 
-- Durable fact, command, workflow, gotcha, or constraint -> record a learning delta for `/loam::learning-from-session` confirmation at handoff.
-- Stale wiki claim contradicted by current code or verification -> record an amendment delta for `/loam::amending-memory`.
-- Source document that needs ingestion -> record an ingest delta for `/loam::adding-to-memory`.
-- Temporary progress, dead ends, or one-off implementation minutiae -> skip.
+During autonomous execution, update the plan's `## Learning checkpoints` table with concise deltas instead of pausing. Example: `wiki/topics/db-migrations.md +nullable defaults; wiki/concepts/auth-flow.md -stale session claim; T5 checkpoint open`.
 
-During autonomous execution, do not pause for wiki confirmation after every task. Instead, update the plan's `## Learning checkpoints` table or session tracking with concise deltas. Use prefixes in the handoff line: `+` for additions/learnings, `-` for amendments, and `open` for unanswered checkpoints.
-
-Example handoff delta: `wiki/topics/db-migrations.md +nullable defaults; wiki/concepts/auth-flow.md -stale session claim; T5 checkpoint open`.
-
-At handoff, recommend `/loam::learning-from-session <session focus>` when learning deltas exist. Use `/loam::amending-memory <what changed>` for stale claims and `/loam::adding-to-memory <source>` for source ingestion.
-
-If the workspace ingests codebases into memory (`/loam::ingesting-codebase`) and the plan touched code files, also recommend at handoff:
-
-```text
-Run /loam::syncing-code-graph <codebase-root> --touched <plan-path> to sync
-the code graph for the files this plan changed.
-```
-
-This is a recommendation, not an automatic invocation. The user runs the sync manually.
+At handoff, recommend the matching `/loam::*` skill when deltas exist. If the workspace ingests codebases and the plan touched code, also recommend running `/loam::syncing-code-graph <codebase-root> --touched <plan-path>` (manual, not automatic).
 
 ### 6. Log decisions
 
