@@ -1,5 +1,9 @@
 # loam
 
+<p align="center">
+  <img src="loam.svg" alt="loam" width="120">
+</p>
+
 loam is a collection of workflow skills for AI coding agents.
 It gives an agent a structured way to plan work, research questions,
 execute plans, and maintain a persistent knowledge base — so
@@ -124,6 +128,7 @@ startup, while the body is only loaded when the skill activates.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
 
 
 
