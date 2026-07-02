@@ -78,6 +78,15 @@ root.joinpath('large.ts').write_text('x' * 600000)
 root.joinpath('binary.ts').write_bytes(b'abc\x00def')
 PY
 
+# Root-level excluded directories — **/dir/** must match dir at codebase root, not only nested
+mkdir -p "$codebase/node_modules/dummy" "$codebase/dist"
+cat > "$codebase/node_modules/dummy/index.js" <<'EOF'
+export const dummy = 1;
+EOF
+cat > "$codebase/dist/build.js" <<'EOF'
+export const built = 1;
+EOF
+
 touch -d '2026-06-20 10:00:00' "$codebase/src/current.ts"
 touch -d '2026-06-24 16:53:00' "$codebase/src/stale.ts"
 touch -d '2026-06-24 12:00:00' "$codebase/src/legacy.ts"
@@ -170,6 +179,9 @@ assert excluded['large'] >= 1
 assert excluded['generated_header'] >= 1
 assert excluded['binary'] >= 1
 assert excluded['gitignore'] >= 1
+assert excluded['pattern'] >= 2, f"root-level node_modules/dist should be pattern-excluded, got {excluded['pattern']}"
+assert 'node_modules/dummy/index.js' not in paths, "root-level node_modules leaked past **/node_modules/**"
+assert 'dist/build.js' not in paths, "root-level dist leaked past **/dist/**"
 
 by_source = {item['source_path']: item for item in index}
 assert by_source['src/current.ts']['exists'] is True
@@ -184,6 +196,8 @@ assert 'src/stale.ts' in by_path and by_path['src/stale.ts']['reason'] == 'stale
 assert by_path['src/stale.ts']['slug'] == 'stale'
 assert 'src/legacy.ts' in by_path and by_path['src/legacy.ts']['reason'] == 'stale'
 assert 'src/current.ts' not in by_path
+assert 'node_modules/dummy/index.js' not in by_path, "root-level node_modules leaked into diff"
+assert 'dist/build.js' not in by_path, "root-level dist leaked into diff"
 assert 'src/empty.ts' not in by_path
 assert 'ignored.ts' not in by_path
 PY

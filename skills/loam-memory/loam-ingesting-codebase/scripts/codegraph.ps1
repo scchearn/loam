@@ -72,6 +72,11 @@ function Test-Excluded([string]$RelPath, [string[]]$Patterns) {
     if (-not $pat) { continue }
     $match = $pat -replace '\*\*', '*'
     if ($RelPath -like $match -or $base -like $match) { return $true }
+    # ponytail: **/ prefix means "any depth incl root"; */X/* misses root-level X/*, so also test stripped
+    if ($pat.StartsWith('**/')) {
+      $root = $match.Substring(2)
+      if ($RelPath -like $root) { return $true }
+    }
   }
   $false
 }

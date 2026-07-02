@@ -106,7 +106,7 @@ has_included_extension() {
 }
 
 matches_exclusion() {
-  local rel_path="$1" basename pat match_pat
+  local rel_path="$1" basename pat match_pat root_pat
   basename="$(basename "$rel_path")"
   for pat in "${exclude_patterns[@]}"; do
     [[ -z "$pat" ]] && continue
@@ -115,6 +115,12 @@ matches_exclusion() {
     case "$rel_path" in $match_pat) return 0 ;; esac
     # shellcheck disable=SC2254
     case "$basename" in $match_pat) return 0 ;; esac
+    # ponytail: **/ prefix means "any depth incl root"; */X/* misses root-level X/*, so also test stripped
+    if [[ "$pat" == \*\*/* ]]; then
+      root_pat="${match_pat#*/}"
+      # shellcheck disable=SC2254
+      case "$rel_path" in $root_pat) return 0 ;; esac
+    fi
   done
   return 1
 }
