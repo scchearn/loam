@@ -3,7 +3,7 @@ name: loam::ingesting-codebase
 description: "Ingest a codebase into memory as code pages connected by wiki links. Walks the tree, classifies each code file by role, applies a role template, and writes a code page per meaningful unit under <wiki root>/code/. Resumable: skips files already ingested and current. Not for prose documents; use /loam::adding-to-memory for those."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.5.0"
+  version: "1.5.1"
   author: scchearn
   argument-hint: <codebase root path>
 ---

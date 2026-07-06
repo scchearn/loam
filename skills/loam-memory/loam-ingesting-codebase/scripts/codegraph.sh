@@ -9,6 +9,11 @@ SKILL_DIR="$(dirname "$SCRIPT_DIR")"
 DEFAULT_EXCLUSIONS="$SKILL_DIR/references/ingestion-exclusions.md"
 MAX_BYTES=$((500 * 1024))
 
+# Shared helpers (validate_wiki_root). Single source of truth in loam-using.
+LOAM_COMMON="$SCRIPT_DIR/../../../loam-using/scripts/loam-common.sh"
+[[ -f "$LOAM_COMMON" ]] || { echo "Error: loam-common.sh not found: $LOAM_COMMON" >&2; exit 1; }
+source "$LOAM_COMMON"
+
 json_escape() {
   local s="$1"
   s=${s//\\/\\\\}
@@ -30,23 +35,6 @@ stat_size() {
 
 compute_hash() {
   sha256sum "$1" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$1" 2>/dev/null | awk '{print $1}' || echo ""
-}
-
-validate_wiki_root() {
-  local wiki_root="$1"
-  [[ -z "$wiki_root" || ! -d "$wiki_root" ]] && { echo "Error: wiki root not found: $wiki_root" >&2; exit 2; }
-
-  if [[ -f "$wiki_root/SCHEMA.md" || -f "$wiki_root/index.md" || -f "$wiki_root/log.md" ]]; then
-    return 0
-  fi
-
-  if [[ -f "$wiki_root/wiki/SCHEMA.md" || -f "$wiki_root/wiki/index.md" || -f "$wiki_root/wiki/log.md" ]]; then
-    echo "Error: wiki root contract not found: $wiki_root; did you mean: $wiki_root/wiki" >&2
-    exit 2
-  fi
-
-  echo "Error: wiki root contract not found: $wiki_root" >&2
-  exit 2
 }
 
 usage() {
@@ -232,7 +220,7 @@ resolve_source_path() {
 
 collect_index() {
   local wiki_root="$1" codebase_root="${2:-}"
-  validate_wiki_root "$wiki_root"
+  validate_wiki_root "$wiki_root" || exit $?
 
   index_sources=()
   index_slugs=()

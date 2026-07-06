@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Smoke test for loamstate.sh aggregate output under adversarial input.
+# Proves the JSON stays valid when checkpoint titles contain quotes, git_status
+# is multi-line, and a checkpoint is malformed (missing heading / scope).
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+LOAMSTATE="$SCRIPT_DIR/loamstate.sh"
+
+command -v python3 >/dev/null 2>&1 || { echo "loamstate contract: SKIP (python3 not found)"; exit 0; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# Workspace is a git repo so git_status populates.
+git -C "$tmp" init -q
+git -C "$tmp" config user.email test@test
+git -C "$tmp" config user.name test
+
+mkdir -p "$tmp/wiki/checkpoints"
+: > "$tmp/wiki/SCHEMA.md"
+
+# Newest (latest_checkpoint): real checkpoint shape — `# Checkpoint` constant
+# header, descriptive title under `### ` (primary workstream), Captured, but
+# NO Scope → title populated from `### `, scope:null.
+# Exercises the missing-Scope degrade AND the `### `-primary extraction.
+cat > "$tmp/wiki/checkpoints/checkpoint-2026-07-03-1100.md" <<'NOTE'
+# Checkpoint
+
+- Captured: 2026-07-03 11:00 +02:00
+- Reason: pause
+
+## Workstreams
+
+### Worker Cancellation Guard
+- Status: ready-to-resume
+- Next: add a guard at the start of run_pipeline_task
+NOTE
+
+# Fixture 5 (middle): heading contains a literal double-quote.
+# `### ` carries the descriptive title; `# ` is the constant "Checkpoint".
+# → recent_checkpoints[1].title round-trips the quote through JSON.
+cat > "$tmp/wiki/checkpoints/checkpoint-2026-07-02-1000.md" <<'NOTE'
+# Checkpoint
+
+- Captured: 2026-07-02 10:00 +02:00
+- Reason: pause
+- Scope: worker/tasks/run_pipeline.py
+
+## Workstreams
+
+### Pipeline "cancel" bug
+- Status: ready-to-resume
+- Next: fix it
+NOTE
+
+# Fixture 7 (oldest): malformed — no "# " or "### " heading marker at all.
+# → title:null, no crash. (Field extraction is gated on the heading, matching
+#   the checkpoint-verify contract, so captured_at is null too — that's fine.)
+cat > "$tmp/wiki/checkpoints/checkpoint-2026-07-01-0900.md" <<'NOTE'
+Checkpoint (no heading marker)
+
+- Captured: 2026-07-01 09:00 +02:00
+- Reason: pause
+NOTE
+
+# Fixture 6: multi-line git_status — two untracked files (plus wiki/).
+: > "$tmp/file-a.txt"
+: > "$tmp/file-b.txt"
+
+out=$("$LOAMSTATE" "$tmp")
+
+python3 - "$out" <<'PY'
+import json, sys
+raw = sys.argv[1]
+data = json.loads(raw)  # fixtures 5 & 6: throws if escaping broke the JSON
+
+lc = data["latest_checkpoint"]
+assert lc is not None, "latest_checkpoint should not be null"
+assert lc["title"] == "Worker Cancellation Guard", f"latest title should come from ### not #: {lc['title']!r}"
+assert lc["scope"] is None, f"missing Scope should be null, got {lc['scope']!r}"
+assert lc["captured_at"] == "2026-07-03 11:00 +02:00", f"captured_at wrong: {lc['captured_at']!r}"
+
+rc = data["recent_checkpoints"]
+assert len(rc) == 3, f"expected 3 recent checkpoints, got {len(rc)}"
+assert rc[1]["title"] == 'Pipeline "cancel" bug', f"quote-in-title did not round-trip from ###: {rc[1]['title']!r}"
+assert "scope" not in rc[1], "recent_checkpoints entries must not carry scope"
+assert rc[2]["title"] is None, f"headingless checkpoint title should be null, got {rc[2]['title']!r}"
+
+assert data["checkpoint_count"] == 3, f"checkpoint_count wrong: {data['checkpoint_count']}"
+
+gs = data["git_status"]
+assert isinstance(gs, str) and "\n" in gs, f"git_status should be a multi-line string, got {gs!r}"
+
+print("loamstate contract: PASS")
+PY
