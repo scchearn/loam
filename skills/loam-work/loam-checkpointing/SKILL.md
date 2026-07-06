@@ -3,7 +3,7 @@ name: loam::checkpointing
 description: "Use when pausing, shutting down, handing off, or context-switching active work and future sessions need a compact resumable checkpoint derived from the current session context. Writes a small checkpoint note under wiki/checkpoints/ and then optionally records the user's intended return step. Not for durable learnings capture, wiki correction, or source ingestion."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.1.1"
+  version: "1.1.2"
   author: scchearn
   argument-hint: "[optional intended return]"
 ---
@@ -40,6 +40,7 @@ If an argument is given, treat it as guidance for what the user expects to do fi
 
 4. Read `<wiki root>/SCHEMA.md` when present so naming and wiki conventions stay aligned.
 5. Ensure `<wiki root>/checkpoints/` exists. Create it if the wiki root exists but the checkpoints directory does not.
+6. If the workspace is a git repo and `<wiki root>/checkpoints/` is not already gitignored, add `checkpoints/` (relative to the wiki root) to the workspace `.gitignore`. Checkpoints are session state for the current machine, not durable project history; committing them pollutes `git log` with pause/resume noise and floods `git status` every session. A user who wants cross-machine resume via git can remove the entry — but the default is local-only.
 
 Treat `<wiki root>/checkpoints/` as the checkpoint lane for this skill.
 

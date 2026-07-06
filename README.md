@@ -117,7 +117,7 @@ startup, while the body is only loaded when the skill activates.
 | loam::syncing-code-graph | 363 | 84 | 221 | 2,874 |
 | loam::using | 365 | 76 | 192 | 3,792 |
 | loam::amending-plan | 340 | 68 | 268 | 2,920 |
-| loam::checkpointing | 365 | 69 | 176 | 1,855 |
+| loam::checkpointing | 365 | 69 | 177 | 1,957 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,176 |
 | loam::planning | 267 | 48 | 311 | 3,992 |
 | loam::resuming | 288 | 60 | 140 | 1,708 |
@@ -128,6 +128,7 @@ startup, while the body is only loaded when the skill activates.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
 
 
 
