@@ -6,6 +6,7 @@ SKILL_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
 REPO_ROOT=$(cd -- "$SKILL_DIR/../../.." && pwd)
 CODEGRAPH="$SCRIPT_DIR/codegraph.sh"
 INGEST_SKILL="$SKILL_DIR/SKILL.md"
+LOAM_COMMON="$REPO_ROOT/skills/loam-using/scripts/loam-common.sh"
 
 stat_epoch() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
@@ -92,6 +93,15 @@ touch -d '2026-06-24 16:53:00' "$codebase/src/stale.ts"
 touch -d '2026-06-24 12:00:00' "$codebase/src/legacy.ts"
 touch -d '2026-06-24 10:00:00' "$codebase/src/new.ts"
 
+# Installed skills are flat siblings (loam-ingesting-codebase next to loam-using),
+# unlike the repo source layout where this skill lives under skills/loam-memory/.
+flat="$tmp/flat-skills"
+mkdir -p "$flat/loam-ingesting-codebase/scripts" "$flat/loam-ingesting-codebase/references" "$flat/loam-using/scripts"
+cp "$CODEGRAPH" "$flat/loam-ingesting-codebase/scripts/codegraph.sh"
+cp "$SKILL_DIR/references/ingestion-exclusions.md" "$flat/loam-ingesting-codebase/references/ingestion-exclusions.md"
+cp "$LOAM_COMMON" "$flat/loam-using/scripts/loam-common.sh"
+flat_summary_json=$("$flat/loam-ingesting-codebase/scripts/codegraph.sh" walk "$codebase" --summary)
+
 current_epoch=$(stat_epoch "$codebase/src/current.ts")
 stale_ingested_epoch=$(date -d '2026-06-24 14:33:00' '+%s')
 stale_epoch=$(stat_epoch "$codebase/src/stale.ts")
@@ -145,11 +155,12 @@ else
   no_gitignore_json='[]'
 fi
 
-WALK_JSON="$walk_json" SUMMARY_JSON="$summary_json" INDEX_JSON="$index_json" DIFF_JSON="$diff_json" NO_GITIGNORE_JSON="$no_gitignore_json" STALE_EPOCH="$stale_epoch" python3 - <<'PY'
+WALK_JSON="$walk_json" SUMMARY_JSON="$summary_json" FLAT_SUMMARY_JSON="$flat_summary_json" INDEX_JSON="$index_json" DIFF_JSON="$diff_json" NO_GITIGNORE_JSON="$no_gitignore_json" STALE_EPOCH="$stale_epoch" python3 - <<'PY'
 import json, os
 
 walk = json.loads(os.environ['WALK_JSON'])
 summary = json.loads(os.environ['SUMMARY_JSON'])
+flat_summary = json.loads(os.environ['FLAT_SUMMARY_JSON'])
 index = json.loads(os.environ['INDEX_JSON'])
 diff = json.loads(os.environ['DIFF_JSON'])
 no_gitignore = json.loads(os.environ['NO_GITIGNORE_JSON'])
@@ -182,6 +193,7 @@ assert excluded['gitignore'] >= 1
 assert excluded['pattern'] >= 2, f"root-level node_modules/dist should be pattern-excluded, got {excluded['pattern']}"
 assert 'node_modules/dummy/index.js' not in paths, "root-level node_modules leaked past **/node_modules/**"
 assert 'dist/build.js' not in paths, "root-level dist leaked past **/dist/**"
+assert flat_summary['total'] == summary['total'], "flat installed layout could not load shared helpers"
 
 by_source = {item['source_path']: item for item in index}
 assert by_source['src/current.ts']['exists'] is True
@@ -425,6 +437,8 @@ PY
 
 grep -Fq 'Cap the work set at 200 files.' "$INGEST_SKILL"
 ! grep -Fq 'Cap the work set at 100 files.' "$INGEST_SKILL"
+grep -Fq 'If `$ARGUMENTS` is empty, default the codebase root to `$(pwd)`.' "$INGEST_SKILL"
+grep -Fq 'Default mode is diff-guided ingest: process `new` and `stale` entries from `codegraph diff`.' "$INGEST_SKILL"
 grep -Fq 'Do not substitute the codebase root, workspace root, or parent directory.' "$INGEST_SKILL"
 grep -Fq 'never report the codebase as fully ingested' "$INGEST_SKILL"
 grep -Fq 'Do not proceed from an empty index caused by a bad wiki-root path.' "$INGEST_SKILL"

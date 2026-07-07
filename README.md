@@ -108,7 +108,7 @@ startup, while the body is only loaded when the skill activates.
 | loam::adding-to-memory | 514 | 103 | 215 | 2,159 |
 | loam::amending-memory | 505 | 114 | 180 | 1,856 |
 | loam::auditing-guidance | 410 | 85 | 252 | 2,528 |
-| loam::ingesting-codebase | 329 | 76 | 245 | 2,847 |
+| loam::ingesting-codebase | 329 | 76 | 249 | 2,940 |
 | loam::learning-from-session | 432 | 88 | 361 | 4,051 |
 | loam::linting-memory | 423 | 93 | 262 | 4,200 |
 | loam::normalizing-memory | 421 | 94 | 260 | 2,610 |
@@ -128,6 +128,7 @@ startup, while the body is only loaded when the skill activates.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
 
 
 

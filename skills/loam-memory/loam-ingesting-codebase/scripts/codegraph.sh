@@ -10,8 +10,16 @@ DEFAULT_EXCLUSIONS="$SKILL_DIR/references/ingestion-exclusions.md"
 MAX_BYTES=$((500 * 1024))
 
 # Shared helpers (validate_wiki_root). Single source of truth in loam-using.
-LOAM_COMMON="$SCRIPT_DIR/../../../loam-using/scripts/loam-common.sh"
-[[ -f "$LOAM_COMMON" ]] || { echo "Error: loam-common.sh not found: $LOAM_COMMON" >&2; exit 1; }
+LOAM_COMMON=""
+for candidate in \
+  "$SCRIPT_DIR/../../../loam-using/scripts/loam-common.sh" \
+  "$SCRIPT_DIR/../../loam-using/scripts/loam-common.sh"; do
+  if [[ -f "$candidate" ]]; then
+    LOAM_COMMON="$candidate"
+    break
+  fi
+done
+[[ -n "$LOAM_COMMON" ]] || { echo "Error: loam-common.sh not found near: $SCRIPT_DIR" >&2; exit 1; }
 source "$LOAM_COMMON"
 
 json_escape() {

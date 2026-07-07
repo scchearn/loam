@@ -3,7 +3,7 @@ name: loam::ingesting-codebase
 description: "Ingest a codebase into memory as code pages connected by wiki links. Walks the tree, classifies each code file by role, applies a role template, and writes a code page per meaningful unit under <wiki root>/code/. Resumable: skips files already ingested and current. Not for prose documents; use /loam::adding-to-memory for those."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.5.1"
+  version: "1.5.2"
   author: scchearn
   argument-hint: <codebase root path>
 ---
@@ -41,6 +41,8 @@ Use `wiki_root` from `loamstate` as the resolved wiki root. Do not substitute th
 
 Resolve `$ARGUMENTS` to an absolute path. If it does not exist or is not a directory, stop and report the error. Treat it as the codebase root for `source_path` front-matter values (paths are relative to this root).
 
+If `$ARGUMENTS` is empty, default the codebase root to `$(pwd)`. Do not ask for scope confirmation just because the workspace contains multiple subprojects; the caller can pass a narrower path when they want one.
+
 ### Build the existing index
 
 Run the index subcommand to get every code-ingested page already in the wiki:
@@ -71,6 +73,8 @@ If the script is missing or fails, fall back to Globbing the tree and applying t
 ---
 
 ## Step 2 — Diff to find the work set
+
+Default mode is diff-guided ingest: process `new` and `stale` entries from `codegraph diff`. Do not ask the user to choose between ingest and re-ingest when the diff already classifies each file.
 
 Run the diff subcommand to get the files that need ingestion or re-summarization:
 
