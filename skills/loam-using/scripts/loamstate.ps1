@@ -37,7 +37,7 @@ foreach ($candidate in @((Join-Path $WorkspaceRoot 'wiki'), $WorkspaceRoot)) {
 }
 
 if (-not $WikiRoot) {
-  Write-Host '{"wiki_root":"","exists":false,"qmd_ready":false}'
+  Write-Host '{"wiki_root":"","exists":false,"qmd_ready":false,"hints":[{"kind":"memory_missing","group":"maintenance","severity":"info","message":"No memory substrate found; scaffold a wiki to begin.","command":"/loam::scaffolding-wiki <goal>","evidence":{}}]}'
   exit 0
 }
 
@@ -100,7 +100,9 @@ $result = [PSCustomObject]@{
   collection      = $Collection
   metadata_status = $MetaStatus
   metadata_path   = $MetaPath
+  hints           = @()  # ponytail: empty parity; bash twin owns hint probes for now
 }
 
-$json = $result | ConvertTo-Json -Compress -Depth 2
+# -Depth 3 so nested hint evidence objects serialize once hints land here.
+$json = $result | ConvertTo-Json -Compress -Depth 3
 Write-Host $json

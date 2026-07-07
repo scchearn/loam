@@ -3,7 +3,7 @@ name: loam::planning
 description: "Use when an approved workspace spec needs an execution-ready implementation plan with ordered, verifiable steps. Specs are mandatory: this skill consumes design decisions, verifies that the spec still matches the codebase, and writes the repo-native plans/ artifacts."
 allowed-tools: Read Glob Grep Bash Write Edit Skill
 metadata:
-  version: "2.3.2"
+  version: "2.3.3"
   author: scchearn
   argument-hint: <spec path or spec topic>
 ---
@@ -22,6 +22,8 @@ You are a senior engineer compiling an approved spec into a rigorous implementat
 ## Input
 
 The spec path or topic is: $ARGUMENTS
+
+A `spec_ready_for_plan` hint in `loamstate` output (an approved spec with no matching plan) is the advisory signal for this skill; see the hint contract in `loam::using`.
 
 ---
 

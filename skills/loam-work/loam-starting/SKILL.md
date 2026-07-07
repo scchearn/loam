@@ -3,7 +3,7 @@ name: loam::starting
 description: "Use when beginning or resuming a plan file, including mixed local and hcom-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
 allowed-tools: Read Write Edit Glob Grep Bash WebFetch
 metadata:
-  version: "2.2.1"
+  version: "2.2.2"
   author: scchearn
   argument-hint: plans/<slug>.md [T3 | T3,T5,T7 | T3-T7]
 ---
@@ -66,6 +66,8 @@ graph TD
 ---
 
 ## Step 0 — Parse arguments and load the plan
+
+A `plan_ready_to_start` (status `pending`) or `plan_in_progress` hint in `loamstate` output is the advisory signal for this skill; see the hint contract in `loam::using`.
 
 `$ARGUMENTS` is `<plan-path> [task-filter]`.
 

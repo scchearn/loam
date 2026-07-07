@@ -3,7 +3,7 @@ name: loam::checkpointing
 description: "Use when pausing, shutting down, handing off, or context-switching active work and future sessions need a compact resumable checkpoint derived from the current session context. Writes a small checkpoint note under wiki/checkpoints/ and then optionally records the user's intended return step. Not for durable learnings capture, wiki correction, or source ingestion."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.1.3"
+  version: "1.1.4"
   author: scchearn
   argument-hint: "[optional intended return]"
 ---
@@ -43,6 +43,8 @@ If an argument is given, treat it as guidance for what the user expects to do fi
 6. If the workspace is a git repo and `<wiki root>/checkpoints/` is not already ignored, create or append to `<wiki root>/.gitignore` with a `checkpoints/` line. Verify with `git check-ignore -q <wiki root>/checkpoints/` (returns 0 if already ignored, including via inherited/global ignores) — do not grep `.gitignore`, which misses inherited ignores and double-adds on textual variants. The wiki-root-scoped `.gitignore` is self-contained and travels with the wiki if it moves; an unanchored pattern in the workspace `.gitignore` would collide with unrelated `checkpoints/` dirs (e.g. ML model weights). Checkpoints are session state for the current machine, not durable project history; committing them pollutes `git log` with pause/resume noise and floods `git status` every session. A user who wants cross-machine resume via git can remove the entry — but the default is local-only.
 
 Treat `<wiki root>/checkpoints/` as the checkpoint lane for this skill.
+
+Writing a checkpoint here satisfies the `checkpoint_stale` hint that `loamstate` emits when the worktree is dirty and the last checkpoint is missing or 30+ min old (see the hint contract in `loam::using`).
 
 ---
 

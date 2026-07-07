@@ -3,7 +3,7 @@ name: loam::ingesting-codebase
 description: "Ingest a codebase into memory as code pages connected by wiki links. Walks the tree, classifies each code file by role, applies a role template, and writes a code page per meaningful unit under <wiki root>/code/. Resumable: skips files already ingested and current. Not for prose documents; use /loam::adding-to-memory for those."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.5.2"
+  version: "1.5.3"
   author: scchearn
   argument-hint: <codebase root path>
 ---
@@ -36,6 +36,8 @@ Parse the JSON output. If `exists` is false, stop and recommend:
 ```
 
 Use `wiki_root` from `loamstate` as the resolved wiki root. Do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh (`qmd update -c <collection>`). The skill works fully without qmd; it only accelerates post-ingest discovery. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md`.
+
+A `code_ingest_pending` hint in the `loamstate` output is the advisory signal for this skill (see the hint contract in `loam::using`); its `evidence.pending_count` previews the diff work set resolved in Step 2.
 
 ### Codebase resolution
 

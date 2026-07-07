@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate). Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, or consolidate a legacy root `overview.md` into `index.md`. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.6.0"
+  version: "1.6.1"
   author: scchearn
   argument-hint: [wiki root or focus area]
 ---
@@ -54,6 +54,8 @@ Use `wiki_root` as the resolved wiki root (resolved from on-disk contract files,
 If multiple candidate wiki roots exist and the target is ambiguous, ask the smallest possible follow-up question.
 
 Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks.
+
+This skill satisfies the `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, and `legacy_structure_pending` hints (see the hint contract in `loam::using`); treat them as advisory scope, not extra mandatory work.
 
 ### Read the wiki contract
 
@@ -191,7 +193,17 @@ Check `<wiki root>/log.md` line count. If it exceeds 500 lines:
 2. Replace the moved content in `log.md` with a single pointer line: `## [YYYY-MM-DD] rotate | archived <N> entries to log-archive/YYYY-MM.md`
 3. The active `log.md` should stay under ~250 lines after rotation.
 
-This is the only routine log mutation lint performs. Lint is otherwise read-only with respect to `log.md` — it does not append a per-pass entry, because lint is a health check, not a content change. Structural exceptions already defined above (code-page migration, metadata reconciliation, vault placement, checkpoint filename migration) may append structural log entries.
+Beyond rotation, the only per-pass `log.md` write lint performs is the completion marker below. Lint is otherwise read-only with respect to `log.md`. Structural exceptions already defined above (code-page migration, metadata reconciliation, vault placement, checkpoint filename migration) may append structural log entries.
+
+### Record the lint-check marker
+
+On successful completion of the pass, append one line to `<wiki root>/log.md`:
+
+```md
+## [YYYY-MM-DD] lint-check | <scope>
+```
+
+This is the stable evidence `loamstate` reads for the `memory_lint_stale` hint (stale after 7 days). Write it even when the pass found nothing to fix — the marker records that the check ran.
 
 ### Check date format drift
 

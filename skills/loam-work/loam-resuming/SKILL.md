@@ -3,7 +3,7 @@ name: loam::resuming
 description: "Use when resuming work after a pause, reboot, or context switch and the workspace uses `wiki/checkpoints/` resumable notes. Read the latest relevant checkpoint chain, orient to the most likely in-flight scope, verify current files and tools before acting, and report the safest next step."
 allowed-tools: Read Glob Grep Bash
 metadata:
-  version: "1.2.0"
+  version: "1.2.1"
   author: scchearn
   argument-hint: "[optional hint or focus]"
 ---
@@ -30,6 +30,8 @@ If no hint is provided, derive the likely resume target from the current session
    ```
 
    Parse the JSON `wiki_root`. Treat empty `wiki_root` as "no wiki," not as an error. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to testing `wiki/SCHEMA.md`, `wiki/index.md`, `wiki/log.md` with `Read` (filesystem open, git-agnostic) — **do not use Glob to discover the wiki root**.
+
+   A `resume_available` or `resume_stale` hint in the `loamstate` output is the advisory signal for this skill (see the hint contract in `loam::using`); `resume_stale` means the latest checkpoint is over 24h old, so verify live state extra carefully.
 
 2. **List checkpoints with `ls`, not Glob** (same gitignore caveat applies to checkpoint files). From the resolved `<wiki_root>`:
 

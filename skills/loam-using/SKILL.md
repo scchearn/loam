@@ -2,7 +2,7 @@
 name: loam::using
 description: "The always-on protocol for the loam skill namespace. Use at session start and whenever a loam task appears. Routes to the right skill, explains the memory model (memory = umbrella; wiki, guidance, and checkpoints are substrates), and lists the cross-cutting rules. This is a routing/meta skill — delegate to a specific loam skill rather than performing work itself."
 metadata:
-  version: "1.3.0"
+  version: "1.4.0"
   author: scchearn
 ---
 
@@ -149,6 +149,26 @@ For any loam task:
 ### Precedence note for ambiguous cases
 
 If an intent maps to two skills, the tree above is the primary router. When the tree doesn't disambiguate, apply the conflict rules in the lifecycle section. When still uncertain: ask the user which intent is closer.
+
+## loamstate hints
+
+`loamstate.sh <workspace-root>` (the orientation probe every loam skill runs at startup) emits a top-level `hints` array of advisory routing signals derived from the same cheap probes. This section is the canonical contract; other skills do not restate it.
+
+Each hint is a JSON object:
+
+```json
+{"kind":"checkpoint_stale","group":"maintenance","severity":"info",
+ "message":"...","command":"/loam::checkpointing","evidence":{"age_minutes":34}}
+```
+
+- `group` — `maintenance` (upkeep drift) or `workflow` (a next step is available).
+- `severity` — `info`, `warn`, or `action`.
+- `command` — a literal loam skill invocation with `<placeholders>` (e.g. `<workspace-root>`, `plans/<file>`) you substitute from `evidence` before acting; `null` when there is no single safe command.
+- `evidence` — the cheap facts that fired the hint.
+
+**Hints are advisory. They never authorize bypassing a skill.** A hint points you at the relevant loam skill; you still invoke that skill and follow its contract. Do not auto-run a hinted command as a side effect. Absent or omitted hints mean "no cheap signal", not "nothing to do".
+
+v1 kinds — maintenance: `memory_missing`, `checkpoint_stale`, `code_ingest_pending`, `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, `legacy_structure_pending`, `retrieval_not_ready`; workflow: `resume_available`, `resume_stale`, `spec_ready_for_plan`, `plan_ready_to_start`, `plan_in_progress`. Deferred (not emitted): `code_graph_orphans`, `session_learning_candidate`, `code_sync_after_plan`.
 
 ## Compact skill reference
 
