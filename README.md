@@ -115,7 +115,7 @@ startup, while the body is only loaded when the skill activates.
 | loam::querying-memory | 463 | 91 | 173 | 1,525 |
 | loam::reviewing-memory | 459 | 104 | 136 | 1,656 |
 | loam::syncing-code-graph | 363 | 84 | 221 | 2,874 |
-| loam::using | 365 | 76 | 212 | 4,170 |
+| loam::using | 365 | 76 | 100 | 1,969 |
 | loam::amending-plan | 340 | 68 | 268 | 2,920 |
 | loam::checkpointing | 365 | 69 | 179 | 2,108 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,176 |
@@ -128,6 +128,7 @@ startup, while the body is only loaded when the skill activates.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
 
 
 
