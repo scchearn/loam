@@ -125,9 +125,14 @@ startup, while the body is only loaded when the skill activates.
 | loam::writing-spec | 261 | 48 | 243 | 2,596 |
 <!-- END skill-metrics -->
 
+## Documentation
+
+- [Why loam](./WHY.md) — why this exists: the rediscovery-cost problem and the substrate bet
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
 
 
 
