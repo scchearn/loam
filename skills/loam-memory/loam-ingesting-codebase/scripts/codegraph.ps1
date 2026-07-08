@@ -46,6 +46,7 @@ function Read-Exclusions([string]$Path) {
   if (-not (Test-Path $Path -PathType Leaf)) { Write-Error "Error: exclusions file not found: $Path"; exit 3 }
   $exclude = @()
   $include = @()
+  $pruneDirs = @()
   $section = ''
   $inCode = $false
   foreach ($raw in Get-Content $Path) {
@@ -61,9 +62,20 @@ function Read-Exclusions([string]$Path) {
     if (-not $inCode) { continue }
     if ($section -match 'Include') {
       foreach ($ext in ($line -split '\s+')) { if ($ext) { $include += $ext.TrimStart('.') } }
-    } else { $exclude += $line }
+    } else {
+      $exclude += $line
+      # ponytail: derive prune dir names from **/DIR/** and DIR/** subtree patterns so
+      # the enumerator never descends into them; case-loop stays as second pass for globs.
+      $dirName = $null
+      if ($line -match '^\*\*/([^/]+)/\*\*$') {
+        $dirName = $matches[1]
+      } elseif ($line -match '^([^/]+)/\*\*$') {
+        $dirName = $matches[1]
+      }
+      if ($dirName -and $pruneDirs -notcontains $dirName) { $pruneDirs += $dirName }
+    }
   }
-  @{ Exclude = $exclude; Include = $include }
+  @{ Exclude = $exclude; Include = $include; PruneDirs = $pruneDirs }
 }
 
 function Test-Excluded([string]$RelPath, [string[]]$Patterns) {
@@ -93,18 +105,20 @@ function Test-BinaryFile([string]$Path) {
 }
 
 function Test-WhitespaceOnly([string]$Path) {
-  $text = Get-Content $Path -Raw -ErrorAction SilentlyContinue
+  $text = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
   if ($null -eq $text) { return $true }
   $text -notmatch '\S'
 }
 
 function Test-GeneratedHeader([string]$Path) {
-  $header = (Get-Content $Path -TotalCount 5 -ErrorAction SilentlyContinue) -join "`n"
+  $header = (Get-Content -LiteralPath $Path -TotalCount 5 -ErrorAction SilentlyContinue) -join "`n"
   $header -match '(?i)generated|auto-generated|do not edit|@generated|Code generated|This file was generated'
 }
 
 function Collect-Walk([string]$CodebaseRoot, [string]$ExclusionsFile, [bool]$RespectGitignore) {
   if (-not $CodebaseRoot -or -not (Test-Path $CodebaseRoot -PathType Container)) { Write-Error "Error: codebase root not found: $CodebaseRoot"; exit 2 }
+  # ponytail: normalize to absolute path so rel-path Substring works in both branches
+  $CodebaseRoot = (Resolve-Path -LiteralPath $CodebaseRoot).Path
   $rules = Read-Exclusions $ExclusionsFile
   $entries = @()
   $byExt = @{}
@@ -115,19 +129,43 @@ function Collect-Walk([string]$CodebaseRoot, [string]$ExclusionsFile, [bool]$Res
     $useGit = ($LASTEXITCODE -eq 0)
   }
 
-  foreach ($file in Get-ChildItem -Path $CodebaseRoot -Recurse -File -Force) {
-    $rel = $file.FullName.Substring($CodebaseRoot.Length).TrimStart('\', '/') -replace '\\', '/'
-    $ext = $file.Extension.TrimStart('.')
+  # ponytail: collect file paths from fd (preferred) or manual recursive enum, then process in one loop.
+  # Manual enum skips prune dirs at descent time — Get-ChildItem -Recurse would fully descend node_modules.
+  $allFiles = [System.Collections.Generic.List[string]]::new()
+  $fdCmd = Get-Command fd -ErrorAction SilentlyContinue
+  if ($fdCmd) {
+    $fdArgs = @('--type', 'f', '--hidden', '--no-ignore')
+    foreach ($d in $rules.PruneDirs) { $fdArgs += '--exclude', $d }
+    foreach ($f in & fd @fdArgs . $CodebaseRoot 2>$null) { $allFiles.Add($f) }
+  } else {
+    # ponytail: Stack-based DFS — avoids O(n²) array realloc; skips prune dirs and symlinked dirs at descent.
+    $stack = [System.Collections.Generic.Stack[string]]::new()
+    $stack.Push($CodebaseRoot)
+    while ($stack.Count -gt 0) {
+      $dir = $stack.Pop()
+      foreach ($item in (Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) {
+        if ($item.PSIsContainer) {
+          # ponytail: skip reparse points/symlinks to avoid cycles; skip prune dirs
+          if (-not $item.LinkType -and $rules.PruneDirs -notcontains $item.Name) { $stack.Push($item.FullName) }
+        } else { $allFiles.Add($item.FullName) }
+      }
+    }
+  }
+
+  foreach ($File in $allFiles) {
+    $rel = $File.Substring($CodebaseRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+    $ext = [System.IO.Path]::GetExtension($File).TrimStart('.')
     if ($rules.Include -notcontains $ext) { continue }
     if (Test-Excluded $rel $rules.Exclude) { $excluded.pattern++; continue }
     if ($useGit -and (Test-GitIgnored $CodebaseRoot $rel)) { $excluded.gitignore++; continue }
-    if ($file.Length -eq 0) { $excluded.empty++; continue }
-    if (Test-WhitespaceOnly $file.FullName) { $excluded.empty++; continue }
-    if (Test-BinaryFile $file.FullName) { $excluded.binary++; continue }
-    if ($file.Length -gt $MaxBytes) { $excluded.large++; continue }
-    if (Test-GeneratedHeader $file.FullName) { $excluded.generated_header++; continue }
-
-    $entries += [PSCustomObject]@{ path = $rel; mtime = (Format-JsonMtime $file.LastWriteTime); size = $file.Length }
+    # ponytail: single stat per file — cache FileInfo, reuse for size + mtime
+    $fi = Get-Item -LiteralPath $File -Force
+    if ($fi.Length -eq 0) { $excluded.empty++; continue }
+    if (Test-WhitespaceOnly $File) { $excluded.empty++; continue }
+    if (Test-BinaryFile $File) { $excluded.binary++; continue }
+    if ($fi.Length -gt $MaxBytes) { $excluded.large++; continue }
+    if (Test-GeneratedHeader $File) { $excluded.generated_header++; continue }
+    $entries += [PSCustomObject]@{ path = $rel; mtime = (Format-JsonMtime $fi.LastWriteTime); size = $fi.Length }
     $byExt[$ext] = 1 + ($byExt[$ext] ?? 0)
   }
   @{ Entries = $entries; ByExt = $byExt; Excluded = $excluded }
@@ -169,7 +207,7 @@ function Collect-Index([string]$WikiRoot, [string]$CodebaseRoot = '') {
       $resolved = Resolve-Source $sourcePath $CodebaseRoot
       $exists = Test-Path $resolved -PathType Leaf
       $mtime = ''
-      if ($exists) { $mtime = Format-JsonMtime (Get-Item $resolved).LastWriteTime }
+      if ($exists) { $mtime = Format-JsonMtime (Get-Item -LiteralPath $resolved).LastWriteTime }
       $entries += [PSCustomObject]@{ source_path = $sourcePath; slug = [System.IO.Path]::GetFileNameWithoutExtension($page.Name); ingested_at = $ingestedAt; source_size = $sourceSize; content_hash = $contentHash; mtime = $mtime; exists = $exists }
     }
   }
@@ -240,7 +278,7 @@ switch ($Subcommand) {
       $reason = ''
       if ($strict) {
         if ($idx.content_hash) {
-          $fileHash = (Get-FileHash -Path (Join-Path $codebaseRoot $entry.path) -Algorithm SHA256).Hash.ToLower()
+          $fileHash = (Get-FileHash -LiteralPath (Join-Path $codebaseRoot $entry.path) -Algorithm SHA256).Hash.ToLower()
           if ($fileHash -eq $idx.content_hash) { $reason = '' } else { $reason = 'stale' }
         } else { $reason = 'stale' }
       } elseif (-not (Test-EpochString $idx.ingested_at)) {
@@ -250,7 +288,7 @@ switch ($Subcommand) {
           if ([string]$entry.size -ne $idx.source_size) {
             $reason = 'stale'
           } elseif ($idx.content_hash) {
-            $fileHash = (Get-FileHash -Path (Join-Path $codebaseRoot $entry.path) -Algorithm SHA256).Hash.ToLower()
+            $fileHash = (Get-FileHash -LiteralPath (Join-Path $codebaseRoot $entry.path) -Algorithm SHA256).Hash.ToLower()
             if ($fileHash -eq $idx.content_hash) { $reason = '' } else { $reason = 'stale' }
           } else { $reason = 'stale' }
         } else { $reason = 'stale' }

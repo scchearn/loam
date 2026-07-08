@@ -59,6 +59,7 @@ EOF
 
 declare -a exclude_patterns=()
 declare -a include_exts=()
+declare -a prune_dirs=()
 
 parse_exclusions() {
   local exclusions_file="$1"
@@ -66,6 +67,7 @@ parse_exclusions() {
 
   exclude_patterns=()
   include_exts=()
+  prune_dirs=()
   local section="" in_code=false line
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" =~ ^## ]]; then :; else line="${line%%#*}"; fi
@@ -87,6 +89,19 @@ parse_exclusions() {
       done
     else
       exclude_patterns+=("$line")
+      # ponytail: derive prune dir names from **/DIR/** and DIR/** subtree patterns so find
+      # never descends into them; case-loop stays as second pass for globs find can't express.
+      local dir_name
+      if [[ "$line" == \*\*/*/\*\* ]]; then
+        dir_name="${line#\*\*/}"
+        dir_name="${dir_name%%/\*\*}"
+        # Only bare dir names (no slashes) are safe to prune at find level
+        [[ "$dir_name" != */* && -n "$dir_name" && " ${prune_dirs[*]} " != *" $dir_name "* ]] && prune_dirs+=("$dir_name")
+      elif [[ "$line" == */\*\* ]]; then
+        dir_name="${line%%/\*\*}"
+        # Only bare dir names (no slashes) are safe to prune at find level
+        [[ "$dir_name" != */* && -n "$dir_name" && " ${prune_dirs[*]} " != *" $dir_name "* ]] && prune_dirs+=("$dir_name")
+      fi
     fi
   done < "$exclusions_file"
 }
@@ -103,7 +118,7 @@ has_included_extension() {
 
 matches_exclusion() {
   local rel_path="$1" basename pat match_pat root_pat
-  basename="$(basename "$rel_path")"
+  basename="${rel_path##*/}"
   for pat in "${exclude_patterns[@]}"; do
     [[ -z "$pat" ]] && continue
     match_pat="${pat//\*\*/\*}"
@@ -163,27 +178,72 @@ collect_walk() {
   fi
 
   local file rel_path ext size mtime_epoch
-  while IFS= read -r -d '' file; do
-    rel_path="${file#"$codebase_root"/}"
-    has_included_extension "$rel_path" || continue
+  # ponytail: prefer fd (faster, respects .gitignore by default, parallel); fall back to find.
+  # No new hard dependency — command -v guard makes fd optional.
+  local find_prune_args=()
+  if [[ ${#prune_dirs[@]} -gt 0 ]]; then
+    local d
+    find_prune_args+=(\()
+    for d in "${prune_dirs[@]}"; do
+      find_prune_args+=(-name "$d" -o)
+    done
+    unset 'find_prune_args[-1]'
+    find_prune_args+=(\) -prune -o)
+  fi
 
-    if matches_exclusion "$rel_path"; then excluded_pattern=$((excluded_pattern + 1)); continue; fi
-    if $use_gitignore && is_gitignored "$codebase_root" "$rel_path"; then excluded_gitignore=$((excluded_gitignore + 1)); continue; fi
+  if command -v fd >/dev/null 2>&1; then
+    # ponytail: --hidden so dotfiles/dot-dirs reach the walk (find shows them).
+    # --no-ignore (-I) so .gitignore/.ignore/.fdignore don't silently drop files
+    # before the bash is_gitignored counter runs.
+    local _fd_args=(--type f --print0 --hidden --no-ignore)
+    local _pd
+    for _pd in "${prune_dirs[@]}"; do
+      _fd_args+=(--exclude "$_pd")
+    done
+    while IFS= read -r -d '' file; do
+      rel_path="${file#"$codebase_root"/}"
+      has_included_extension "$rel_path" || continue
 
-    size=$(stat_size "$file")
-    if [[ "$size" -eq 0 ]]; then excluded_empty=$((excluded_empty + 1)); continue; fi
-    if ! LC_ALL=C grep -q '[^[:space:]]' "$file" 2>/dev/null; then excluded_empty=$((excluded_empty + 1)); continue; fi
-    if ! LC_ALL=C grep -Iq . "$file" 2>/dev/null; then excluded_binary=$((excluded_binary + 1)); continue; fi
-    if [[ "$size" -gt "$MAX_BYTES" ]]; then excluded_large=$((excluded_large + 1)); continue; fi
-    if is_generated_header "$file"; then excluded_generated_header=$((excluded_generated_header + 1)); continue; fi
+      if matches_exclusion "$rel_path"; then excluded_pattern=$((excluded_pattern + 1)); continue; fi
+      if $use_gitignore && is_gitignored "$codebase_root" "$rel_path"; then excluded_gitignore=$((excluded_gitignore + 1)); continue; fi
 
-    mtime_epoch=$(stat_epoch "$file")
-    walk_paths+=("$rel_path")
-    walk_mtimes["$rel_path"]="$mtime_epoch"
-    walk_sizes["$rel_path"]="$size"
-    ext="${rel_path##*.}"
-    by_ext["$ext"]=$(( ${by_ext["$ext"]:-0} + 1 ))
-  done < <(find "$codebase_root" -type f -print0 2>/dev/null)
+      size=$(stat_size "$file")
+      if [[ "$size" -eq 0 ]]; then excluded_empty=$((excluded_empty + 1)); continue; fi
+      if ! LC_ALL=C grep -q '[^[:space:]]' "$file" 2>/dev/null; then excluded_empty=$((excluded_empty + 1)); continue; fi
+      if ! LC_ALL=C grep -Iq . "$file" 2>/dev/null; then excluded_binary=$((excluded_binary + 1)); continue; fi
+      if [[ "$size" -gt "$MAX_BYTES" ]]; then excluded_large=$((excluded_large + 1)); continue; fi
+      if is_generated_header "$file"; then excluded_generated_header=$((excluded_generated_header + 1)); continue; fi
+
+      mtime_epoch=$(stat_epoch "$file")
+      walk_paths+=("$rel_path")
+      walk_mtimes["$rel_path"]="$mtime_epoch"
+      walk_sizes["$rel_path"]="$size"
+      ext="${rel_path##*.}"
+      by_ext["$ext"]=$(( ${by_ext["$ext"]:-0} + 1 ))
+    done < <(fd "${_fd_args[@]}" . "$codebase_root" 2>/dev/null)
+  else
+    while IFS= read -r -d '' file; do
+      rel_path="${file#"$codebase_root"/}"
+      has_included_extension "$rel_path" || continue
+
+      if matches_exclusion "$rel_path"; then excluded_pattern=$((excluded_pattern + 1)); continue; fi
+      if $use_gitignore && is_gitignored "$codebase_root" "$rel_path"; then excluded_gitignore=$((excluded_gitignore + 1)); continue; fi
+
+      size=$(stat_size "$file")
+      if [[ "$size" -eq 0 ]]; then excluded_empty=$((excluded_empty + 1)); continue; fi
+      if ! LC_ALL=C grep -q '[^[:space:]]' "$file" 2>/dev/null; then excluded_empty=$((excluded_empty + 1)); continue; fi
+      if ! LC_ALL=C grep -Iq . "$file" 2>/dev/null; then excluded_binary=$((excluded_binary + 1)); continue; fi
+      if [[ "$size" -gt "$MAX_BYTES" ]]; then excluded_large=$((excluded_large + 1)); continue; fi
+      if is_generated_header "$file"; then excluded_generated_header=$((excluded_generated_header + 1)); continue; fi
+
+      mtime_epoch=$(stat_epoch "$file")
+      walk_paths+=("$rel_path")
+      walk_mtimes["$rel_path"]="$mtime_epoch"
+      walk_sizes["$rel_path"]="$size"
+      ext="${rel_path##*.}"
+      by_ext["$ext"]=$(( ${by_ext["$ext"]:-0} + 1 ))
+    done < <(find "$codebase_root" "${find_prune_args[@]}" -type f -print0 2>/dev/null)
+  fi
 }
 
 emit_walk_json() {

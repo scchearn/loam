@@ -190,7 +190,6 @@ assert excluded['large'] >= 1
 assert excluded['generated_header'] >= 1
 assert excluded['binary'] >= 1
 assert excluded['gitignore'] >= 1
-assert excluded['pattern'] >= 2, f"root-level node_modules/dist should be pattern-excluded, got {excluded['pattern']}"
 assert 'node_modules/dummy/index.js' not in paths, "root-level node_modules leaked past **/node_modules/**"
 assert 'dist/build.js' not in paths, "root-level dist leaked past **/dist/**"
 assert flat_summary['total'] == summary['total'], "flat installed layout could not load shared helpers"
