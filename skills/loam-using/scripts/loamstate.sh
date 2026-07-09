@@ -75,20 +75,33 @@ ckpt_obj() {
 
 usage() {
   cat <<'EOF'
-Usage: loamstate.sh <workspace-root>
+Usage: loamstate.sh [--fast] <workspace-root>
 
 Probes for a wiki under <workspace-root> (checks wiki/ subdir and root itself).
 Resolves qmd readiness from .wiki-metadata.json, falling back to `which qmd`
 and `qmd collection list` when metadata is absent or stale.
 
 Emits one JSON line. Always exits 0 when args are valid.
+
+  --fast  Skip codegraph diff and datecheck (drift_count=null, code_ingest_pending
+          and date_drift_pending hints omitted). Use for session-start injection
+          where speed matters more than complete drift detection.
 EOF
   exit 1
 }
 
 [[ $# -lt 1 ]] && usage
 
-WORKSPACE="$1"
+FAST=false
+WORKSPACE=""
+for _arg in "$@"; do
+  case "$_arg" in
+    --fast) FAST=true ;;
+    --*) usage ;;
+    *) [[ -z "$WORKSPACE" ]] && WORKSPACE="$_arg" ;;
+  esac
+done
+[[ -z "$WORKSPACE" ]] && usage
 [[ ! -d "$WORKSPACE" ]] && {
   echo "{\"error\":\"workspace not found: $WORKSPACE\"}"
   exit 0
@@ -203,18 +216,21 @@ fi
 
 # date drift count — optional, never fatal. datecheck exits 0 (clean) or 2
 # (drift found); both are success for counting. Anything else → null.
+# Skipped in --fast mode (drift_count stays null, date_drift_pending hint omitted).
 DRIFT_JSON="null"
-DATECHECK="$SCRIPT_DIR/datecheck.sh"
-if [[ -f "$DATECHECK" ]]; then
-  set +e
-  DC_OUT=$(bash "$DATECHECK" check "$WIKI_ROOT" 2>/dev/null)
-  DC_RC=$?
-  set -e
-  if [[ $DC_RC -eq 0 || $DC_RC -eq 2 ]]; then
-    if [[ -n "$DC_OUT" ]]; then
-      DRIFT_JSON=$(printf '%s\n' "$DC_OUT" | grep -c '^{' || true)
-    else
-      DRIFT_JSON=0
+if ! $FAST; then
+  DATECHECK="$SCRIPT_DIR/datecheck.sh"
+  if [[ -f "$DATECHECK" ]]; then
+    set +e
+    DC_OUT=$(bash "$DATECHECK" check "$WIKI_ROOT" 2>/dev/null)
+    DC_RC=$?
+    set -e
+    if [[ $DC_RC -eq 0 || $DC_RC -eq 2 ]]; then
+      if [[ -n "$DC_OUT" ]]; then
+        DRIFT_JSON=$(printf '%s\n' "$DC_OUT" | grep -c '^{' || true)
+      else
+        DRIFT_JSON=0
+      fi
     fi
   fi
 fi
@@ -314,26 +330,27 @@ fi
 
 # code_ingest_pending: only when a code graph already exists (wiki/code). Gated
 # to avoid nagging prose-only wikis and to skip the tree walk otherwise.
-# ponytail: codegraph diff walks the tree — O(files); gated by wiki/code and
-# run best-effort. If cost bites on huge repos, gate behind a cheap marker.
+# Skipped in --fast mode (codegraph diff is the dominant cost — 9.6s on 51K files).
 # Resolve codegraph.sh in both repo layout (grouped under loam-memory/) and
 # flat installed layout (sibling of loam-using/), mirroring loam-common.
 CODEGRAPH=""
-for _cg in \
-  "$SCRIPT_DIR/../../loam-memory/loam-ingesting-codebase/scripts/codegraph.sh" \
-  "$SCRIPT_DIR/../../loam-ingesting-codebase/scripts/codegraph.sh"; do
-  [[ -f "$_cg" ]] && { CODEGRAPH="$_cg"; break; }
-done
-if [[ -d "$WIKI_ROOT/code" && -n "$CODEGRAPH" ]]; then
-  set +e
-  CG_OUT=$(bash "$CODEGRAPH" diff "$WORKSPACE" "$WIKI_ROOT" 2>/dev/null)
-  CG_RC=$?
-  set -e
-  if [[ $CG_RC -eq 0 && -n "$CG_OUT" ]]; then
-    CG_COUNT=$( { printf '%s' "$CG_OUT" | grep -o '"reason"' || true; } | wc -l | tr -d ' ')
-    if [[ "$CG_COUNT" =~ ^[0-9]+$ && "$CG_COUNT" -gt 0 ]]; then
-      add_hint code_ingest_pending maintenance info "$CG_COUNT source file(s) new or changed since last ingest." \
-        "/loam::ingesting-codebase <workspace-root>" "$(printf '{"pending_count":%s}' "$CG_COUNT")"
+if ! $FAST; then
+  for _cg in \
+    "$SCRIPT_DIR/../../loam-memory/loam-ingesting-codebase/scripts/codegraph.sh" \
+    "$SCRIPT_DIR/../../loam-ingesting-codebase/scripts/codegraph.sh"; do
+    [[ -f "$_cg" ]] && { CODEGRAPH="$_cg"; break; }
+  done
+  if [[ -d "$WIKI_ROOT/code" && -n "$CODEGRAPH" ]]; then
+    set +e
+    CG_OUT=$(bash "$CODEGRAPH" diff "$WORKSPACE" "$WIKI_ROOT" 2>/dev/null)
+    CG_RC=$?
+    set -e
+    if [[ $CG_RC -eq 0 && -n "$CG_OUT" ]]; then
+      CG_COUNT=$( { printf '%s' "$CG_OUT" | grep -o '"reason"' || true; } | wc -l | tr -d ' ')
+      if [[ "$CG_COUNT" =~ ^[0-9]+$ && "$CG_COUNT" -gt 0 ]]; then
+        add_hint code_ingest_pending maintenance info "$CG_COUNT source file(s) new or changed since last ingest." \
+          "/loam::ingesting-codebase <workspace-root>" "$(printf '{"pending_count":%s}' "$CG_COUNT")"
+      fi
     fi
   fi
 fi

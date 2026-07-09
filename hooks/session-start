@@ -77,7 +77,7 @@ done
 WORKSPACE_STATE=""
 if [ -n "$LOAMSTATE_PATH" ] && command -v python3 >/dev/null 2>&1; then
   LOAMSTATE_JSON=""
-  LOAMSTATE_JSON=$(timeout 15 bash "$LOAMSTATE_PATH" "$PWD" 2>/dev/null || true)
+  LOAMSTATE_JSON=$(timeout 5 bash "$LOAMSTATE_PATH" --fast "$PWD" 2>/dev/null || true)
   if [ -n "$LOAMSTATE_JSON" ]; then
     WORKSPACE_STATE=$(printf '%s' "$LOAMSTATE_JSON" | python3 -c '
 import sys, json

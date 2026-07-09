@@ -107,8 +107,8 @@ const getWorkspaceState = () => {
 
   let stdout;
   try {
-    stdout = execSync(`bash "${loamstatePath}" "${process.cwd()}"`, {
-      timeout: 15000,
+    stdout = execSync(`bash "${loamstatePath}" --fast "${process.cwd()}"`, {
+      timeout: 5000,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
