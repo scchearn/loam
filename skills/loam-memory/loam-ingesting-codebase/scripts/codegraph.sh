@@ -191,11 +191,19 @@ collect_walk() {
     find_prune_args+=(\) -prune -o)
   fi
 
+  # --- Batch pre-computation of per-file filters ---
+  # Instead of forking stat/grep/git/sed per file (~5 forks × 553 files = 2765 forks),
+  # collect all candidate files first, then run batch operations in single passes.
+
+  # Step 1: collect all files from fd/find into an array (extension + exclusion filtered)
+  local -a _all_files=()
+  local -A _file_set=()
+
   if command -v fd >/dev/null 2>&1; then
-    # ponytail: --hidden so dotfiles/dot-dirs reach the walk (find shows them).
-    # --no-ignore (-I) so .gitignore/.ignore/.fdignore don't silently drop files
-    # before the bash is_gitignored counter runs.
-    local _fd_args=(--type f --print0 --hidden --no-ignore)
+    local _fd_args=(--type f --print0 --hidden)
+    if ! $use_gitignore; then
+      _fd_args+=(--no-ignore)
+    fi
     local _pd
     for _pd in "${prune_dirs[@]}"; do
       _fd_args+=(--exclude "$_pd")
@@ -203,47 +211,89 @@ collect_walk() {
     while IFS= read -r -d '' file; do
       rel_path="${file#"$codebase_root"/}"
       has_included_extension "$rel_path" || continue
-
       if matches_exclusion "$rel_path"; then excluded_pattern=$((excluded_pattern + 1)); continue; fi
-      if $use_gitignore && is_gitignored "$codebase_root" "$rel_path"; then excluded_gitignore=$((excluded_gitignore + 1)); continue; fi
-
-      size=$(stat_size "$file")
-      if [[ "$size" -eq 0 ]]; then excluded_empty=$((excluded_empty + 1)); continue; fi
-      if ! LC_ALL=C grep -q '[^[:space:]]' "$file" 2>/dev/null; then excluded_empty=$((excluded_empty + 1)); continue; fi
-      if ! LC_ALL=C grep -Iq . "$file" 2>/dev/null; then excluded_binary=$((excluded_binary + 1)); continue; fi
-      if [[ "$size" -gt "$MAX_BYTES" ]]; then excluded_large=$((excluded_large + 1)); continue; fi
-      if is_generated_header "$file"; then excluded_generated_header=$((excluded_generated_header + 1)); continue; fi
-
-      mtime_epoch=$(stat_epoch "$file")
-      walk_paths+=("$rel_path")
-      walk_mtimes["$rel_path"]="$mtime_epoch"
-      walk_sizes["$rel_path"]="$size"
-      ext="${rel_path##*.}"
-      by_ext["$ext"]=$(( ${by_ext["$ext"]:-0} + 1 ))
+      _all_files+=("$file")
+      _file_set["$rel_path"]=1
     done < <(fd "${_fd_args[@]}" . "$codebase_root" 2>/dev/null)
   else
     while IFS= read -r -d '' file; do
       rel_path="${file#"$codebase_root"/}"
       has_included_extension "$rel_path" || continue
-
       if matches_exclusion "$rel_path"; then excluded_pattern=$((excluded_pattern + 1)); continue; fi
-      if $use_gitignore && is_gitignored "$codebase_root" "$rel_path"; then excluded_gitignore=$((excluded_gitignore + 1)); continue; fi
-
-      size=$(stat_size "$file")
-      if [[ "$size" -eq 0 ]]; then excluded_empty=$((excluded_empty + 1)); continue; fi
-      if ! LC_ALL=C grep -q '[^[:space:]]' "$file" 2>/dev/null; then excluded_empty=$((excluded_empty + 1)); continue; fi
-      if ! LC_ALL=C grep -Iq . "$file" 2>/dev/null; then excluded_binary=$((excluded_binary + 1)); continue; fi
-      if [[ "$size" -gt "$MAX_BYTES" ]]; then excluded_large=$((excluded_large + 1)); continue; fi
-      if is_generated_header "$file"; then excluded_generated_header=$((excluded_generated_header + 1)); continue; fi
-
-      mtime_epoch=$(stat_epoch "$file")
-      walk_paths+=("$rel_path")
-      walk_mtimes["$rel_path"]="$mtime_epoch"
-      walk_sizes["$rel_path"]="$size"
-      ext="${rel_path##*.}"
-      by_ext["$ext"]=$(( ${by_ext["$ext"]:-0} + 1 ))
+      _all_files+=("$file")
+      _file_set["$rel_path"]=1
     done < <(find "$codebase_root" "${find_prune_args[@]}" -type f -print0 2>/dev/null)
   fi
+
+  [[ ${#_all_files[@]} -eq 0 ]] && return
+
+  # Step 2: batch gitignore check — single git call instead of per-file
+  # When fd respects .gitignore, gitignored files never enter _all_files.
+  # We still need the excluded_gitignore count for the summary, so we count
+  # gitignored files with included extensions from the git ignored set.
+  local -A _gitignored=()
+  if $use_gitignore; then
+    local _gi_ext_regex
+    _gi_ext_regex=$(printf '|\.%s' "${include_exts[@]}")
+    _gi_ext_regex="(${_gi_ext_regex#|})$"
+    excluded_gitignore=$(git -C "$codebase_root" ls-files --others --ignored --exclude-standard 2>/dev/null | grep -cE "$_gi_ext_regex" || true)
+  fi
+
+  # Step 3: batch stat — single stat call for size + mtime
+  local -A _stat_size=() _stat_mtime=()
+  if [[ ${#_all_files[@]} -gt 0 ]]; then
+    local _stat_out
+    _stat_out=$(stat -c '%s %Y %n' "${_all_files[@]}" 2>/dev/null || stat -f '%z %m %N' "${_all_files[@]}" 2>/dev/null || true)
+    while IFS=' ' read -r _sz _mt _rest; do
+      _stat_size["$_rest"]="${_sz}"
+      _stat_mtime["$_rest"]="${_mt}"
+    done <<< "$_stat_out"
+  fi
+
+  # Step 4: batch binary/empty check
+  # grep -l (without -I) lists ALL files with non-whitespace content (including binary)
+  # grep -Il (with -I) lists only non-binary files with non-whitespace content
+  # Files in first set but not second = binary. Files in neither = empty/blank.
+  local -A _has_content=() _text_nonempty=()
+  if [[ ${#_all_files[@]} -gt 0 ]]; then
+    while IFS= read -r _hc; do
+      [[ -n "$_hc" ]] && _has_content["$_hc"]=1
+    done < <(LC_ALL=C grep -l '[^[:space:]]' "${_all_files[@]}" 2>/dev/null || true)
+    while IFS= read -r _tn; do
+      [[ -n "$_tn" ]] && _text_nonempty["$_tn"]=1
+    done < <(LC_ALL=C grep -Il '[^[:space:]]' "${_all_files[@]}" 2>/dev/null || true)
+  fi
+
+  # Step 5: batch generated-header check — grep -rlE matches generated markers
+  local -A _generated=()
+  if [[ ${#_all_files[@]} -gt 0 ]]; then
+    while IFS= read -r _gen; do
+      [[ -n "$_gen" ]] && _generated["$_gen"]=1
+    done < <(LC_ALL=C grep -rlE 'generated|auto-generated|do not edit|@generated|Code generated|This file was generated' "${_all_files[@]}" 2>/dev/null || true)
+  fi
+
+  # Step 6: filter using pre-computed sets — no subprocess forks
+  for file in "${_all_files[@]}"; do
+    rel_path="${file#"$codebase_root"/}"
+
+    if $use_gitignore && [[ -n "${_gitignored["$rel_path"]:-}" ]]; then
+      excluded_gitignore=$((excluded_gitignore + 1)); continue
+    fi
+
+    size="${_stat_size["$file"]:-0}"
+    if [[ "$size" -eq 0 ]]; then excluded_empty=$((excluded_empty + 1)); continue; fi
+    if [[ -z "${_has_content["$file"]:-}" ]]; then excluded_empty=$((excluded_empty + 1)); continue; fi
+    if [[ -z "${_text_nonempty["$file"]:-}" ]]; then excluded_binary=$((excluded_binary + 1)); continue; fi
+    if [[ "$size" -gt "$MAX_BYTES" ]]; then excluded_large=$((excluded_large + 1)); continue; fi
+    if [[ -n "${_generated["$file"]:-}" ]]; then excluded_generated_header=$((excluded_generated_header + 1)); continue; fi
+
+    mtime_epoch="${_stat_mtime["$file"]:-0}"
+    walk_paths+=("$rel_path")
+    walk_mtimes["$rel_path"]="$mtime_epoch"
+    walk_sizes["$rel_path"]="$size"
+    ext="${rel_path##*.}"
+    by_ext["$ext"]=$(( ${by_ext["$ext"]:-0} + 1 ))
+  done
 }
 
 emit_walk_json() {
