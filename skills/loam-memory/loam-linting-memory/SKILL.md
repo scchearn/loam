@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate). Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, or consolidate a legacy root `overview.md` into `index.md`. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.6.1"
+  version: "1.7.0"
   author: scchearn
   argument-hint: [wiki root or focus area]
 ---
@@ -81,7 +81,7 @@ If metadata is stale and qmd is available, validate the recorded `collection` wi
 
 If `qmd_ready` is false, qmd is not available — use Grep/Glob only.
 
-qmd is **secondary only** in this skill: use it only to find related-note neighborhoods when a structural fix might need reciprocal links or nearby canonical notes. If ready, read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/qmd-usage.md`.
+qmd is **secondary only** in this skill: use it only for *content* discovery — finding related-note neighborhoods when a structural fix might need reciprocal links or nearby canonical notes, or surfacing stale claims and contradictions. If ready, follow the qmd search protocol in `loam::using` (structural checks stay Glob/Grep-led — qmd does not replace inventory, orphan, or wikilink checks).
 
 ### Audit for health issues
 
@@ -107,7 +107,7 @@ qmd is **secondary only** in this skill: use it only to find related-note neighb
 
 Distinguish: **fix now** (safe from existing wiki evidence) vs **annotate now** (mark but don't resolve) vs **follow-up** (needs future evidence/research/user direction).
 
-**Expand with qmd (secondary, if ready)**: Follow `references/qmd-usage.md` to find related-note neighborhoods for orphan pages or missing cross-links.
+**Expand with qmd (content, if ready)**: Follow the qmd search protocol in `loam::using` to find related-note neighborhoods for orphan pages, missing cross-links, stale claims, and contradictions (structural steps A, B, E above stay Glob/Grep-led).
 
 ---
 
@@ -278,6 +278,6 @@ If the pass found no significant issues, say so explicitly and still note any re
 - Flag pages older than 90 days that cite volatile surfaces for re-validation; do not auto-archive them.
 - Keep the note graph traversable, not just the index accurate.
 - Keep `index.md` aligned with the durable pages that exist after the pass.
-- qmd is secondary. Structural checks remain Glob- and Grep-led. Use qmd only to find related-note neighborhoods.
+- qmd is secondary. Structural checks (inventory, orphans, wikilinks, .obsidian placement, checkpoint filenames) remain Glob- and Grep-led. Use qmd (the protocol in `loam::using`) only for content discovery: stale claims, contradictions, and related-note neighborhoods.
 - After wiki edits, refresh qmd if the collection is ready. If refresh fails, report it but do not roll back.
 - If qmd is unavailable, unmapped, or degraded, continue without it. The skill must not fail.

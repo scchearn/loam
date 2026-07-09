@@ -3,7 +3,7 @@ name: loam::starting
 description: "Use when beginning or resuming a plan file, including mixed local and hcom-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
 allowed-tools: Read Write Edit Glob Grep Bash WebFetch
 metadata:
-  version: "2.2.2"
+  version: "2.3.0"
   author: scchearn
   argument-hint: plans/<slug>.md [T3 | T3,T5,T7 | T3-T7]
 ---
@@ -92,7 +92,7 @@ If the workspace contains a wiki root with files such as `SCHEMA.md`, `index.md`
 
 1. Read the schema and main hub notes first.
 2. Read any wiki notes already named in task `Files` entries or Learning checkpoints.
-3. If more wiki context is needed, use QMD first when available and Grep/Glob as fallback, scoped to the plan's spec domain and current task only.
+3. If more wiki context is needed, use the qmd search protocol in `loam::using` (with its code-graph precedence) when qmd is ready and Grep/Glob as fallback, scoped to the plan's spec domain and current task only. For code-specific call sites or symbol usages in source, after qmd orientation prefer `ast-grep` (fallback `rg`/`grep`) scoped to the modules qmd flagged.
 4. Treat memory as durable-memory acceleration, not authority over current repo state.
 5. If repo state, tests, or primary docs conflict with memory, trust the repo and record the possible correction as a learning delta.
 

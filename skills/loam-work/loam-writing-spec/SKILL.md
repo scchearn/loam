@@ -3,7 +3,7 @@ name: loam::writing-spec
 description: "Research workspace context, APIs, implementation options, or external evidence before planning. The terminal artifact is always a spec at specs/<slug>.md; a plans/research/<slug>.md memo is optional supporting evidence when substantial investigation was needed."
 allowed-tools: Read Glob Grep Bash WebFetch Write Edit
 metadata:
-  version: "3.0.1"
+  version: "3.1.0"
   author: scchearn
   argument-hint: <topic or question>
 ---
@@ -58,7 +58,7 @@ If a blocking question cannot be resolved, stop before writing a planning-ready 
 
 Collect evidence in this order, using the best sources available:
 
-1. Relevant workspace files: guidance files, README, local docs, source, tests, configs, scripts, schemas, and examples.
+1. Relevant workspace files: guidance files, README, local docs, source, tests, configs, scripts, schemas, and examples. When `wiki/code/` exists and qmd is ready, prefer the code-graph-first directive from `loam::using` — qmd-search the code map (compressed summaries under `code/`) before Globbing raw source for orientation; after qmd, use `ast-grep` for source-level call sites or symbol usages scoped to the modules qmd flagged (fallback `rg`/`grep` when `ast-grep` is unavailable).
 2. Existing wiki notes when a wiki is present and relevant.
 3. Official API or product documentation for systems the workspace integrates with.
 4. Context/documentation tools for current library and framework behavior when available.

@@ -172,24 +172,24 @@ startup, while the body is only loaded when the skill activates.
 |-------|---:|---:|---:|---:|
 | loam::initializing-vault | 206 | 51 | 9 | 73 |
 | loam::scaffolding-wiki | 379 | 78 | 196 | 2,147 |
-| loam::adding-to-memory | 514 | 103 | 215 | 2,197 |
-| loam::amending-memory | 505 | 114 | 180 | 1,888 |
+| loam::adding-to-memory | 514 | 103 | 215 | 2,265 |
+| loam::amending-memory | 505 | 114 | 180 | 1,951 |
 | loam::auditing-guidance | 410 | 85 | 252 | 2,528 |
 | loam::ingesting-codebase | 329 | 76 | 251 | 3,048 |
-| loam::learning-from-session | 432 | 88 | 361 | 4,073 |
-| loam::linting-memory | 423 | 93 | 274 | 4,384 |
+| loam::learning-from-session | 432 | 88 | 361 | 4,142 |
+| loam::linting-memory | 423 | 93 | 274 | 4,470 |
 | loam::normalizing-memory | 421 | 94 | 260 | 2,634 |
 | loam::querying-memory | 463 | 91 | 173 | 1,539 |
-| loam::reviewing-memory | 459 | 104 | 136 | 1,664 |
+| loam::reviewing-memory | 459 | 104 | 136 | 1,732 |
 | loam::syncing-code-graph | 363 | 84 | 221 | 2,944 |
-| loam::using | 365 | 76 | 121 | 2,381 |
+| loam::using | 365 | 76 | 146 | 2,933 |
 | loam::amending-plan | 340 | 68 | 268 | 2,920 |
 | loam::checkpointing | 365 | 69 | 179 | 2,108 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,176 |
-| loam::planning | 267 | 48 | 313 | 4,035 |
+| loam::planning | 267 | 48 | 313 | 4,092 |
 | loam::resuming | 288 | 60 | 142 | 1,786 |
-| loam::starting | 166 | 34 | 353 | 4,915 |
-| loam::writing-spec | 261 | 48 | 243 | 2,596 |
+| loam::starting | 166 | 34 | 353 | 4,973 |
+| loam::writing-spec | 261 | 48 | 243 | 2,689 |
 <!-- END skill-metrics -->
 
 ## Documentation
@@ -199,6 +199,7 @@ startup, while the body is only loaded when the skill activates.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
 
 
 

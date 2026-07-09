@@ -2,7 +2,7 @@
 name: loam::using
 description: "The always-on protocol for the loam skill namespace. Use at session start and whenever a loam task appears. Routes to the right skill, explains the memory model (memory = umbrella; wiki, guidance, and checkpoints are substrates), and lists the cross-cutting rules. This is a routing/meta skill — delegate to a specific loam skill rather than performing work itself."
 metadata:
-  version: "1.5.0"
+  version: "1.6.0"
   author: scchearn
 ---
 
@@ -122,6 +122,31 @@ Rules:
 - **`evidence` summary.** When the hint's `evidence` object carries a count (e.g. `pending_count`, `drift_count`, `log_lines`, `age_minutes`), include it parenthetically: `code_ingest_pending — 3 source file(s) new or changed (pending_count: 3)`. Omit the parenthetical when `evidence` is empty.
 
 This makes `loamstate` a closed loop: the script signals, the skill acts, and the next-most-pressing signal surfaces to the user instead of dying in the JSON.
+
+## qmd and code-graph discovery
+
+When `loamstate` reports `qmd_ready: true` and `collection: <name>`, prefer qmd over Glob/Grep for content discovery in the wiki.
+
+- **Lookup**: `qmd search "<keywords>" --files -n 8 -c <collection>`
+- **Comparison/synthesis**: `qmd query "<natural-language question>" --files -n 8 -c <collection>`
+- Strip the `qmd://<collection>/` prefix from paths to get the relative wiki path (e.g. `code/validate-token.md`)
+- Verify candidates by Reading the actual wiki files — qmd discovers paths, Read confirms content
+- Ignore `.archive/` paths (historical, not active memory)
+- After wiki writes, refresh: `qmd update -c <collection> 2>/dev/null`
+- On qmd degradation (command fails or returns stale/noisy output): fall back to Grep/Glob for the rest of the session
+
+### Code graph precedence (all code discovery)
+
+When `wiki/code/` exists and qmd is ready, prefer code pages over raw source for **all** code discovery — orientation AND exact-pattern search. The code graph maps which modules exist and where symbols live before you scan raw bytes.
+
+1. qmd first: `qmd search "<symbol or topic>" --files -n 8 -c <collection>`, Read the returned `code/<slug>.md` pages for the compressed map
+2. Source pattern search (call sites, symbol usages): prefer **ast-grep** (`ast_grep_search` MCP tool, or `ast-grep`/`sg` CLI) — AST-aware, skips comments/strings, handles formatting. Scope to the files/modules the graph flagged
+3. Fall back to `rg`/`grep` on raw source when `ast-grep` is unavailable (probe once; on failure use `rg`/`grep`)
+4. Skip the code-graph-first step only if `code_ingest_pending` hint is set and flagged files overlap your target — then verify against raw source directly
+
+`grep`/`Glob` remain correct for markdown/prose structural checks (inventory, orphans, wikilinks) and as the raw-source fallback.
+
+**Wrong assumption to reject:** "qmd is only for memory; grep is correct for concrete code call sites." qmd indexes `wiki/code/` summaries, so qmd-first applies to code too. After qmd, `ast-grep` (not `grep`) is the source-pattern tool; `grep` only wins for non-code and the ast-grep-unavailable fallback.
 
 ## Installing slash commands
 

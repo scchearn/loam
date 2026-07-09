@@ -3,7 +3,7 @@ name: loam::reviewing-memory
 description: "Surface and classify all open questions, unresolved contradictions, stale claims, and knowledge gaps from existing memory. Use this when the user wants to see what's still open, what needs attention, what's unresolved, or what still needs research or ingest. Not for answering questions, fixing issues, or adding new material; use /loam::querying-memory, /loam::linting-memory, /loam::amending-memory, /loam::adding-to-memory, or /loam::learning-from-session."
 allowed-tools: Read Glob Grep AskUserQuestion Bash
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: scchearn
   argument-hint: [wiki root or focus area]
 ---
@@ -57,7 +57,7 @@ Use `Glob` and `Grep` to map the pages in scope before reading deeply.
 3. If qmd is still not ready: qmd not available, use Grep/Glob only.
 4. Runtime guard: if any qmd command fails or returns stale results, treat as degraded — fall back to Grep/Glob.
 
-qmd is **secondary only** in this skill: use it only to expand from a discovered issue into nearby related notes. If ready, read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/qmd-usage.md`.
+qmd is **secondary only** in this skill: use it only for *content* discovery — expanding from a discovered issue into nearby related notes, surfacing neighborhoods of related open signals. If ready, follow the qmd search protocol in `loam::using` (structural steps A–E above stay Grep/Glob-led — qmd does not replace the primary scan).
 
 ### Scan for open signals
 
@@ -71,15 +71,15 @@ qmd is **secondary only** in this skill: use it only to expand from a discovered
 
 **E. Log follow-ups** — `grep -i "follow up\|unresolved\|next ingest\|pending ingest\|needs evidence\|TODO\|FIXME" <wiki root>/log.md`. Read only the matched lines and their surrounding entry (the `## [date]` heading block they fall under). Do not read the full log.
 
-### Expand from issues with qmd (secondary, if ready)
+### Expand from issues with qmd (content, if ready)
 
-If qmd is ready, you may use it to expand from a discovered issue into nearby notes:
+If qmd is ready, follow the qmd search protocol in `loam::using` to expand from a discovered issue into nearby notes:
 
 1. Run `qmd search "<topic or entity from the signal>" --files -n 3 -c <collection>` for each significant signal. Strip the `qmd://<collection>/` prefix to get relative wiki paths.
 2. Read candidate files to confirm they are related.
 3. Include confirmed related pages in the classification.
 
-Do not let qmd replace the primary scan. Use it only to widen the net around specific issues already discovered.
+Do not let qmd replace the primary scan (steps A–E stay Grep/Glob-led). Use it only to widen the net around specific issues already discovered.
 
 ---
 
@@ -141,5 +141,5 @@ If the review found no significant open items, say so explicitly and note any re
 - Classify by urgency first, then group by topic.
 - Keep the report concise but complete. The first thing the user sees should be the summary counts.
 - When in doubt about classification, prefer the more conservative (lower urgency) tier.
-- qmd is secondary. Use it only to expand from discovered issues. Do not let qmd drive the primary scan.
+- qmd is secondary. Structural scan (steps A–E) stays Grep/Glob-led. Use qmd (the protocol in `loam::using`) only for content discovery: expanding from discovered issues into related-note neighborhoods.
 - If qmd is unavailable, unmapped, or degraded, continue without it. The skill must not fail.
