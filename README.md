@@ -37,7 +37,13 @@ for details. Coexists with superpowers (distinct wrapper tags).
 
 ### Claude Code (auto-injection)
 
-Install loam as a Claude Code plugin (via `/plugin install` or the marketplace).
+Register the loam marketplace and install the plugin:
+
+```bash
+/plugin marketplace add scchearn/loam
+/plugin install loam@loam
+```
+
 The `hooks/hooks.json` SessionStart hook injects `loam::using` at session start
 (startup, clear, compact). `.claude-plugin/plugin.json` drives skill discovery.
 
@@ -182,6 +188,7 @@ startup, while the body is only loaded when the skill activates.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
 
 
 
