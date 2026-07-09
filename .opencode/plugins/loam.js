@@ -59,6 +59,14 @@ export const LoamPlugin = async ({ client, directory }) => {
     const fullContent = fs.readFileSync(skillPath, 'utf8');
     const { content } = extractAndStripFrontmatter(fullContent);
 
+    // Read plugin version from package.json (the installed plugin version)
+    let version = '';
+    try {
+      const pkgPath = path.resolve(__dirname, '../../package.json');
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      version = pkg.version || '';
+    } catch {}
+
     const toolMapping = `**Tool Mapping for OpenCode:**
 When skills reference tools you don't have, substitute OpenCode equivalents:
 - \`TodoWrite\` → \`todowrite\`
@@ -69,7 +77,7 @@ When skills reference tools you don't have, substitute OpenCode equivalents:
 Use OpenCode's native \`skill\` tool to list and load skills.`;
 
     return `<LOAM_IMPORTANT>
-You have loam.
+You have loam${version ? ` (v${version})` : ''}.
 
 **IMPORTANT: The loam::using skill content is included below. It is ALREADY LOADED - you are currently following it. Do NOT use the skill tool to load 'loam::using' again - that would be redundant.**
 

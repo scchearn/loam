@@ -16,6 +16,16 @@
 
 set -euo pipefail
 
+# Determine plugin root directory from script location (for package.json version).
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Read plugin version from package.json.
+PLUGIN_VERSION=""
+if [ -f "${PLUGIN_ROOT}/package.json" ]; then
+  PLUGIN_VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${PLUGIN_ROOT}/package.json" | head -1)
+fi
+
 # Find loam::using SKILL.md: project-scoped first, then global.
 SKILL_PATH=""
 for candidate in "${PWD}/.agents/skills/loam-using/SKILL.md" "${HOME}/.agents/skills/loam-using/SKILL.md"; do
@@ -65,7 +75,11 @@ escape_for_json() {
 }
 
 using_loam_escaped=$(escape_for_json "$using_loam_content")
-session_context="<LOAM_IMPORTANT>\nYou have loam.\n\n**IMPORTANT: The loam::using skill content is included below. It is ALREADY LOADED - you are currently following it. Do NOT use the skill tool to load 'loam::using' again - that would be redundant.**\n\n${using_loam_escaped}\n</LOAM_IMPORTANT>"
+VERSION_SUFFIX=""
+if [ -n "$PLUGIN_VERSION" ]; then
+  VERSION_SUFFIX=" (v${PLUGIN_VERSION})"
+fi
+session_context="<LOAM_IMPORTANT>\nYou have loam${VERSION_SUFFIX}.\n\n**IMPORTANT: The loam::using skill content is included below. It is ALREADY LOADED - you are currently following it. Do NOT use the skill tool to load 'loam::using' again - that would be redundant.**\n\n${using_loam_escaped}\n</LOAM_IMPORTANT>"
 
 # Emit only the field the current platform consumes.
 # Claude Code reads BOTH additional_context and hookSpecificOutput without
