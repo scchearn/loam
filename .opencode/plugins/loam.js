@@ -5,9 +5,13 @@
  * Skill content is read from the npx skills install path (single source of
  * truth). No config hook — OpenCode discovers ~/.agents/skills/ natively.
  *
- * At session start, checks if the local git clone is behind origin/main
- * and injects an update notice if so. OpenCode-only (Claude Code and Cursor
- * use marketplace install with /reload-plugins).
+ * At session start:
+ * - Checks if the local git clone is behind origin/main (update notice)
+ * - Runs loamstate.sh and injects a workspace state summary (wiki, checkpoints,
+ *   drift, signals)
+ *
+ * Both checks fail silently — core injection works even if bash/git/loamstate
+ * are absent (e.g. native Windows without Git Bash).
  *
  * Uses <LOAM_IMPORTANT> wrapper and "You have loam" dedup marker to avoid
  * collision with superpowers.
@@ -52,9 +56,22 @@ const findSkillPath = () => {
   return null;
 };
 
+// Find loamstate.sh in the npx skills install path.
+// Returns absolute path or null.
+const findLoamstatePath = () => {
+  const candidates = [
+    path.join(process.cwd(), '.agents/skills/loam-using/scripts/loamstate.sh'),
+    path.join(os.homedir(), '.agents/skills/loam-using/scripts/loamstate.sh'),
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+};
+
 // Check if the local git clone is behind origin/main.
 // Returns update notice string or empty string.
-// Fails silently (returns '') on any error (offline, not a git repo, timeout).
+// Fails silently on any error (offline, not a git repo, timeout).
 const checkForUpdate = (pluginRoot) => {
   try {
     const localHead = execSync('git rev-parse HEAD', {
@@ -72,6 +89,76 @@ const checkForUpdate = (pluginRoot) => {
     }
   } catch {}
   return '';
+};
+
+// Run loamstate.sh and format a compact workspace state block.
+// Returns formatted string or empty string on any failure.
+// Requires bash — skips silently if bash is not available (native Windows).
+const getWorkspaceState = () => {
+  const loamstatePath = findLoamstatePath();
+  if (!loamstatePath) return '';
+
+  try {
+    // Check bash availability (skip on native Windows without Git Bash)
+    execSync('bash --version', { timeout: 2000, encoding: 'utf8', stdio: 'pipe' });
+  } catch {
+    return '';
+  }
+
+  let stdout;
+  try {
+    stdout = execSync(`bash "${loamstatePath}" "${process.cwd()}"`, {
+      timeout: 15000,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch {
+    return '';
+  }
+
+  let state;
+  try {
+    state = JSON.parse(stdout);
+  } catch {
+    return '';
+  }
+
+  const lines = [];
+
+  // Wiki line
+  if (state.exists && state.wiki_root) {
+    const parts = [`Wiki: ${state.wiki_root}`];
+    parts.push(state.qmd_ready ? 'qmd: ready' : 'qmd: not installed');
+    if (state.qmd_ready && state.collection) parts.push(`collection: ${state.collection}`);
+    lines.push(parts.join(' · '));
+  } else {
+    lines.push('Wiki: none');
+  }
+
+  // Checkpoints line
+  if (state.checkpoint_count > 0 && state.latest_checkpoint) {
+    const cp = state.latest_checkpoint;
+    lines.push(`Checkpoints: ${state.checkpoint_count} (latest: "${cp.title}" — ${cp.captured_at})`);
+  }
+
+  // Drift line
+  if (state.drift_count != null && state.drift_count > 0) {
+    lines.push(`Code graph drift: ${state.drift_count}`);
+  }
+
+  // Signals (hints)
+  if (state.hints && state.hints.length > 0) {
+    lines.push('');
+    lines.push('Signals:');
+    for (const h of state.hints) {
+      const cmd = h.command ? ` → ${h.command}` : '';
+      lines.push(`- ${h.kind} — ${h.message}${cmd}`);
+    }
+  }
+
+  if (lines.length === 0) return '';
+
+  return `\n## Workspace state\n\n${lines.join('\n')}\n`;
 };
 
 export const LoamPlugin = async ({ client, directory }) => {
@@ -100,6 +187,9 @@ export const LoamPlugin = async ({ client, directory }) => {
     // Check if the local clone is behind origin/main (OpenCode-only update check)
     const updateNotice = checkForUpdate(pluginRoot);
 
+    // Get workspace state from loamstate.sh (skips silently if bash/loamstate absent)
+    const workspaceState = getWorkspaceState();
+
     const toolMapping = `**Tool Mapping for OpenCode:**
 When skills reference tools you don't have, substitute OpenCode equivalents:
 - \`TodoWrite\` → \`todowrite\`
@@ -115,7 +205,7 @@ You have loam${version ? ` (v${version})` : ''}.${updateNotice}
 **IMPORTANT: The loam::using skill content is included below. It is ALREADY LOADED - you are currently following it. Do NOT use the skill tool to load 'loam::using' again - that would be redundant.**
 
 ${content}
-
+${workspaceState}
 ${toolMapping}
 </LOAM_IMPORTANT>`;
   };

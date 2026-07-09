@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Workflow skills for AI coding agents: planning, specs, memory, checkpoints",
-    "version": "0.3.0"
+    "version": "0.4.0"
   },
   "plugins": [
     {
@@ -16,7 +16,7 @@
         "url": "https://github.com/scchearn/loam.git"
       },
       "description": "Workflow skills for AI coding agents: planning, specs, memory, checkpoints, and agent debates",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "strict": true
     }
   ]

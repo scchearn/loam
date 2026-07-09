@@ -63,6 +63,70 @@ strip_frontmatter() {
 
 using_loam_content=$(strip_frontmatter "$using_loam_content")
 
+# Find loamstate.sh in the npx skills install path.
+LOAMSTATE_PATH=""
+for candidate in "${PWD}/.agents/skills/loam-using/scripts/loamstate.sh" "${HOME}/.agents/skills/loam-using/scripts/loamstate.sh"; do
+  if [ -f "$candidate" ]; then
+    LOAMSTATE_PATH="$candidate"
+    break
+  fi
+done
+
+# Run loamstate.sh and format a compact workspace state block.
+# Skips silently if loamstate.sh not found, python3 absent, or timeout.
+WORKSPACE_STATE=""
+if [ -n "$LOAMSTATE_PATH" ] && command -v python3 >/dev/null 2>&1; then
+  LOAMSTATE_JSON=""
+  LOAMSTATE_JSON=$(timeout 15 bash "$LOAMSTATE_PATH" "$PWD" 2>/dev/null || true)
+  if [ -n "$LOAMSTATE_JSON" ]; then
+    WORKSPACE_STATE=$(printf '%s' "$LOAMSTATE_JSON" | python3 -c '
+import sys, json
+try:
+    s = json.load(sys.stdin)
+except:
+    sys.exit(0)
+
+lines = []
+
+# Wiki line
+if s.get("exists") and s.get("wiki_root"):
+    parts = ["Wiki: " + s["wiki_root"]]
+    parts.append("qmd: ready" if s.get("qmd_ready") else "qmd: not installed")
+    if s.get("qmd_ready") and s.get("collection"):
+        parts.append("collection: " + s["collection"])
+    lines.append(" · ".join(parts))
+else:
+    lines.append("Wiki: none")
+
+# Checkpoints line
+cc = s.get("checkpoint_count", 0)
+if cc > 0 and s.get("latest_checkpoint"):
+    cp = s["latest_checkpoint"]
+    lines.append("Checkpoints: {} (latest: \"{}\" — {})".format(cc, cp.get("title",""), cp.get("captured_at","")))
+
+# Drift line
+dc = s.get("drift_count")
+if dc is not None and dc > 0:
+    lines.append("Code graph drift: {}".format(dc))
+
+# Signals (hints)
+hints = s.get("hints", [])
+if hints:
+    lines.append("")
+    lines.append("Signals:")
+    for h in hints:
+        cmd = h.get("command","")
+        cmd_part = " → " + cmd if cmd else ""
+        lines.append("- {} — {}{}".format(h.get("kind",""), h.get("message",""), cmd_part))
+
+if lines:
+    print("\n## Workspace state\n")
+    print("\n".join(lines))
+    print()
+' 2>/dev/null || true)
+  fi
+fi
+
 # Escape string for JSON embedding using bash parameter substitution.
 escape_for_json() {
   local s="$1"
@@ -79,7 +143,13 @@ VERSION_SUFFIX=""
 if [ -n "$PLUGIN_VERSION" ]; then
   VERSION_SUFFIX=" (v${PLUGIN_VERSION})"
 fi
-session_context="<LOAM_IMPORTANT>\nYou have loam${VERSION_SUFFIX}.\n\n**IMPORTANT: The loam::using skill content is included below. It is ALREADY LOADED - you are currently following it. Do NOT use the skill tool to load 'loam::using' again - that would be redundant.**\n\n${using_loam_escaped}\n</LOAM_IMPORTANT>"
+# Escape workspace state for JSON if present
+WORKSPACE_STATE_ESCAPED=""
+if [ -n "$WORKSPACE_STATE" ]; then
+  WORKSPACE_STATE_ESCAPED=$(escape_for_json "$WORKSPACE_STATE")
+fi
+
+session_context="<LOAM_IMPORTANT>\nYou have loam${VERSION_SUFFIX}.\n\n**IMPORTANT: The loam::using skill content is included below. It is ALREADY LOADED - you are currently following it. Do NOT use the skill tool to load 'loam::using' again - that would be redundant.**\n\n${using_loam_escaped}\n${WORKSPACE_STATE_ESCAPED}\n</LOAM_IMPORTANT>"
 
 # Emit only the field the current platform consumes.
 # Claude Code reads BOTH additional_context and hookSpecificOutput without
