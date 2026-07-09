@@ -1,0 +1,26 @@
+{
+  "name": "loam",
+  "displayName": "loam",
+  "description": "Workflow skills for AI coding agents: planning, specs, memory, checkpoints, and agent debates",
+  "version": "0.1.0",
+  "author": {
+    "name": "scchearn",
+    "url": "https://github.com/scchearn"
+  },
+  "homepage": "https://github.com/scchearn/loam",
+  "repository": "https://github.com/scchearn/loam",
+  "license": "MIT",
+  "keywords": [
+    "skills",
+    "planning",
+    "memory",
+    "checkpoints",
+    "specs",
+    "workflow",
+    "knowledge-base"
+  ],
+  "skills": "./skills/",
+  "agents": "./agents/",
+  "commands": "./commands/",
+  "hooks": "./hooks/hooks-cursor.json"
+}

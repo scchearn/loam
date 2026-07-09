@@ -11,13 +11,63 @@ sessions build on each other instead of starting from scratch.
 
 ## Install
 
+### All harnesses (skill discovery)
+
 ```bash
 npx skills add scchearn/loam
 ```
 
 Skills install into your agent's skills directory
 (`~/.claude/skills/`, `~/.config/opencode/skills/`, etc.)
-and are available the next time you start a session.
+and are available the next time you start a session. This is the baseline
+path — it works on every supported harness.
+
+### OpenCode (auto-injection)
+
+Register loam as an opencode plugin in your `opencode.json`:
+
+```json
+{ "plugin": ["loam@git+https://github.com/scchearn/loam.git"] }
+```
+
+Restart OpenCode. The plugin auto-registers the skills directory **and**
+injects the `loam::using` router into the first user message of each session,
+so the protocol is always in context. See [`.opencode/INSTALL.md`](./.opencode/INSTALL.md)
+for details. Coexists with superpowers (distinct wrapper tags).
+
+### Claude Code (auto-injection)
+
+Install loam as a Claude Code plugin (via `/plugin install` or the marketplace).
+The `hooks/hooks.json` SessionStart hook injects `loam::using` at session start
+(startup, clear, compact). `.claude-plugin/plugin.json` drives skill discovery.
+
+### Cursor (auto-injection)
+
+Install loam as a Cursor plugin. The `hooks/hooks-cursor.json` sessionStart hook
+injects `loam::using` at session start. `.cursor-plugin/plugin.json` drives
+plugin discovery.
+
+### Codex (skill discovery only)
+
+Codex has no session-start injection. Clone and symlink for skill discovery:
+
+```bash
+git clone https://github.com/scchearn/loam.git ~/.codex/loam
+mkdir -p ~/.agents/skills
+ln -s ~/.codex/loam/skills ~/.agents/skills/loam
+```
+
+See [`.codex/INSTALL.md`](./.codex/INSTALL.md) for details. Invoke
+`loam::using` on demand at session start.
+
+### Antigravity (skill discovery only)
+
+```bash
+npx skills add scchearn/loam
+```
+
+No auto-injection. Skills are discovered via `~/.agents/skills/loam-*`;
+invoke `loam::using` on demand.
 
 ## What you get
 
@@ -132,6 +182,7 @@ startup, while the body is only loaded when the skill activates.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
 
 
 

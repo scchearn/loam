@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# SessionStart hook for loam plugin.
+#
+# Reads skills/loam-using/SKILL.md, strips frontmatter, wraps in <LOAM_IMPORTANT>,
+# and emits platform-specific JSON additionalContext.
+#
+# Mirrors superpowers/hooks/session-start. Uses <LOAM_IMPORTANT> wrapper and
+# "You have loam" marker to avoid collision with superpowers' injection.
+#
+# Output formats:
+#   Cursor  -> additional_context (snake_case)
+#   Claude  -> hookSpecificOutput.additionalContext (nested)
+#   Copilot -> additionalContext (top-level, SDK standard)
+
+set -euo pipefail
+
+# Determine plugin root directory from script location (not env vars).
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Read loam::using content
+using_loam_content=$(cat "${PLUGIN_ROOT}/skills/loam-using/SKILL.md" 2>&1 || echo "Error reading loam::using skill")
+
+# Strip YAML frontmatter (---\n...\n---\n) if present.
+strip_frontmatter() {
+  local s="$1"
+  # Match leading ---\n...---\n and drop it.
+  if [[ "$s" =~ ^---$'\n'(.*)$'\n'---$'\n'(.*)$ ]]; then
+    printf '%s' "${BASH_REMATCH[2]}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+using_loam_content=$(strip_frontmatter "$using_loam_content")
+
+# Escape string for JSON embedding using bash parameter substitution.
+escape_for_json() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+using_loam_escaped=$(escape_for_json "$using_loam_content")
+session_context="<LOAM_IMPORTANT>\nYou have loam.\n\n**IMPORTANT: The loam::using skill content is included below. It is ALREADY LOADED - you are currently following it. Do NOT use the skill tool to load 'loam::using' again - that would be redundant.**\n\n${using_loam_escaped}\n</LOAM_IMPORTANT>"
+
+# Emit only the field the current platform consumes.
+# Claude Code reads BOTH additional_context and hookSpecificOutput without
+# deduplication, so we must emit only one.
+if [ -n "${CURSOR_PLUGIN_ROOT:-}" ]; then
+  # Cursor sets CURSOR_PLUGIN_ROOT (may also set CLAUDE_PLUGIN_ROOT)
+  printf '{\n  "additional_context": "%s"\n}\n' "$session_context"
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -z "${COPILOT_CLI:-}" ]; then
+  # Claude Code sets CLAUDE_PLUGIN_ROOT without COPILOT_CLI
+  printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "%s"\n  }\n}\n' "$session_context"
+else
+  # Copilot CLI (sets COPILOT_CLI=1) or unknown platform — SDK standard format
+  printf '{\n  "additionalContext": "%s"\n}\n' "$session_context"
+fi
+
+exit 0
