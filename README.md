@@ -31,14 +31,19 @@ plugin reads skill content from the `npx skills` install — no second copy.
 
 ### OpenCode (auto-injection)
 
-Register loam as an opencode plugin in your `opencode.json`:
+Clone the repo and add the plugin entry point directly to your `opencode.json`:
 
-```json
-{ "plugin": ["loam@git+https://github.com/scchearn/loam.git"] }
+```bash
+git clone https://github.com/scchearn/loam.git ~/.config/opencode/loam
 ```
 
-Restart OpenCode. The plugin injects `loam::using` into the first user
-message of each session. See [`.opencode/INSTALL.md`](./.opencode/INSTALL.md)
+```json
+{ "plugin": ["/home/YOU/.config/opencode/loam/.opencode/plugins/loam.js"] }
+```
+
+Restart OpenCode. The plugin injects `loam::using` into the first user message
+of each session and auto-checks for updates (warns in-session if the local
+clone is behind `origin/main`). See [`.opencode/INSTALL.md`](./.opencode/INSTALL.md)
 for details.
 
 ### Claude Code (auto-injection)
@@ -194,6 +199,7 @@ startup, while the body is only loaded when the skill activates.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
 
 
 

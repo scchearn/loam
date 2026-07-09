@@ -5,6 +5,10 @@
  * Skill content is read from the npx skills install path (single source of
  * truth). No config hook — OpenCode discovers ~/.agents/skills/ natively.
  *
+ * At session start, checks if the local git clone is behind origin/main
+ * and injects an update notice if so. OpenCode-only (Claude Code and Cursor
+ * use marketplace install with /reload-plugins).
+ *
  * Uses <LOAM_IMPORTANT> wrapper and "You have loam" dedup marker to avoid
  * collision with superpowers.
  */
@@ -12,6 +16,7 @@
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { execSync } from 'child_process';
 
 // Simple frontmatter extraction (avoid dependency on skills-core for bootstrap)
 const extractAndStripFrontmatter = (content) => {
@@ -47,7 +52,32 @@ const findSkillPath = () => {
   return null;
 };
 
+// Check if the local git clone is behind origin/main.
+// Returns update notice string or empty string.
+// Fails silently (returns '') on any error (offline, not a git repo, timeout).
+const checkForUpdate = (pluginRoot) => {
+  try {
+    const localHead = execSync('git rev-parse HEAD', {
+      cwd: pluginRoot,
+      timeout: 5000,
+      encoding: 'utf8',
+    }).trim();
+    const remoteHead = execSync('git ls-remote -h origin main', {
+      cwd: pluginRoot,
+      timeout: 5000,
+      encoding: 'utf8',
+    }).trim().split('\t')[0];
+    if (localHead !== remoteHead) {
+      return ` **Update available — run: cd ${pluginRoot} && git pull**`;
+    }
+  } catch {}
+  return '';
+};
+
 export const LoamPlugin = async ({ client, directory }) => {
+  // Plugin root = clone root (where .git lives), two levels up from loam.js
+  const pluginRoot = path.resolve(__dirname, '../..');
+
   // Helper to generate bootstrap content
   const getBootstrapContent = () => {
     const skillPath = findSkillPath();
@@ -62,10 +92,13 @@ export const LoamPlugin = async ({ client, directory }) => {
     // Read plugin version from package.json (the installed plugin version)
     let version = '';
     try {
-      const pkgPath = path.resolve(__dirname, '../../package.json');
+      const pkgPath = path.join(pluginRoot, 'package.json');
       const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
       version = pkg.version || '';
     } catch {}
+
+    // Check if the local clone is behind origin/main (OpenCode-only update check)
+    const updateNotice = checkForUpdate(pluginRoot);
 
     const toolMapping = `**Tool Mapping for OpenCode:**
 When skills reference tools you don't have, substitute OpenCode equivalents:
@@ -77,7 +110,7 @@ When skills reference tools you don't have, substitute OpenCode equivalents:
 Use OpenCode's native \`skill\` tool to list and load skills.`;
 
     return `<LOAM_IMPORTANT>
-You have loam${version ? ` (v${version})` : ''}.
+You have loam${version ? ` (v${version})` : ''}.${updateNotice}
 
 **IMPORTANT: The loam::using skill content is included below. It is ALREADY LOADED - you are currently following it. Do NOT use the skill tool to load 'loam::using' again - that would be redundant.**
 
