@@ -102,6 +102,27 @@ If you catch yourself rationalizing a shortcut, invoke the skill instead — eve
 
 `loamstate.sh <workspace-root>` may emit advisory `hints[]` with `maintenance` or `workflow` signals. Hints point at the relevant loam skill; they never authorize bypassing that skill or auto-running commands. Missing hints mean "no cheap signal," not "nothing to do." For schema and kinds, inspect `loamstate.sh` output or the script header.
 
+### Consuming hints
+
+After completing the primary task of any loam skill that ran `loamstate` (including `loam::resuming`, which reads `loamstate` during orientation), scan the `hints[]` array from that output and surface unsatisfied hints to the user as suggested next actions. This is mandatory — hints that go unread are signals wasted.
+
+For each hint, emit one line in this form:
+
+```text
+loamstate also flagged: <kind> — <message> (<evidence summary>)
+Suggested next: <command>
+```
+
+Rules:
+
+- **Suppress satisfied hints.** Skip any hint whose `kind` your skill body names as one it satisfies. A skill may satisfy more than one (e.g. `linting-memory` satisfies `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, and `legacy_structure_pending`); suppress all of them.
+- **Only surface hints with a non-null `command`.** Hints without a command (e.g. `retrieval_not_ready`) are informational; mention them only if the user asks for state.
+- **Do not auto-run the suggested skill.** Hints are advisory; the user decides whether to act. End your turn or hand back to the user after surfacing.
+- **Empty `hints[]` → say nothing.** Do not invent suggestions or pad the report.
+- **`evidence` summary.** When the hint's `evidence` object carries a count (e.g. `pending_count`, `drift_count`, `log_lines`, `age_minutes`), include it parenthetically: `code_ingest_pending — 3 source file(s) new or changed (pending_count: 3)`. Omit the parenthetical when `evidence` is empty.
+
+This makes `loamstate` a closed loop: the script signals, the skill acts, and the next-most-pressing signal surfaces to the user instead of dying in the JSON.
+
 ## Installing slash commands
 
 To install `/checkpoint` and `/resume` shortcuts, read `references/commands-install.md` and follow it. Detect the harness (don't guess), default to project-local scope, and ask before copying.
