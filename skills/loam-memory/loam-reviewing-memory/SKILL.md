@@ -57,7 +57,7 @@ Use `Glob` and `Grep` to map the pages in scope before reading deeply.
 3. If qmd is still not ready: qmd not available, use Grep/Glob only.
 4. Runtime guard: if any qmd command fails or returns stale results, treat as degraded — fall back to Grep/Glob.
 
-qmd is **secondary only** in this skill: use it only to expand from a discovered issue into nearby related notes. If ready, read `${CLAUDE_SKILL_DIR}/references/qmd-usage.md`.
+qmd is **secondary only** in this skill: use it only to expand from a discovered issue into nearby related notes. If ready, read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/qmd-usage.md`.
 
 ### Scan for open signals
 

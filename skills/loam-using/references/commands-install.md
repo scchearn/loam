@@ -4,6 +4,10 @@ This document is for agents, not humans. If you are an agent running in a loam-e
 
 The command files are bundled as assets alongside this reference. Resolve them relative to the `loam-using` skill directory (the parent of `references/` and `assets/`).
 
+## Skill directory env var
+
+loam skills reference sibling scripts and references via `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}`. Harnesses that export a per-skill directory env var should set `LOAM_SKILL_DIR` to the skill's own directory (the folder containing `SKILL.md`). `CLAUDE_SKILL_DIR` is retained as a fallback because Claude Code exports it natively; on harnesses that don't, the model is expected to substitute the equivalent path or rely on a wrapper that sets `LOAM_SKILL_DIR`. This keeps the skills harness-agnostic by format while remaining compatible with the original authoring harness.
+
 ## Available commands
 
 | Command | Delegates to | Source file (markdown) | Source file (TOML) |

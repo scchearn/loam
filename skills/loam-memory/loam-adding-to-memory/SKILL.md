@@ -45,8 +45,8 @@ Rules:
 Run `loamstate` to probe the wiki and qmd in one shot:
 
 ```bash
-bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
-  || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+  || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
 ```
 
 Parse the JSON output. If `exists` is false, stop and recommend:
@@ -59,7 +59,7 @@ If `exists` is true, use `wiki_root` as the resolved wiki root and `qmd_ready` +
 
 If multiple wiki roots are present and the target is ambiguous, ask the smallest possible follow-up question.
 
-If qmd is ready (`qmd_ready: true`), use the `collection` name and read `${CLAUDE_SKILL_DIR}/references/qmd-usage.md` for finding existing related notes. If qmd is not ready, use Grep/Glob to find existing notes.
+If qmd is ready (`qmd_ready: true`), use the `collection` name and read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/qmd-usage.md` for finding existing related notes. If qmd is not ready, use Grep/Glob to find existing notes.
 
 Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks (`which qmd` + `qmd collection list`).
 
@@ -77,8 +77,8 @@ Read before editing:
 2. `<wiki root>/index.md`
 3. scoped log read: `grep -i "<topic or entity keywords>" <wiki root>/log.md` for prior entries touching this subject; plus `grep "^## \[" <wiki root>/log.md | tail -2` for the last 2 entries. Never read the full log.
 4. any existing topic/entity/concept pages that look directly related to the source
-5. `${CLAUDE_SKILL_DIR}/references/ingest-checklist.md`
-6. if chat-context mode: `${CLAUDE_SKILL_DIR}/references/chat-context-ingest.md`
+5. `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/ingest-checklist.md`
+6. if chat-context mode: `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/chat-context-ingest.md`
 
 **If qmd is ready**, follow `references/qmd-usage.md` to find existing related notes before editing.
 

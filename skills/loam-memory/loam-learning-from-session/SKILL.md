@@ -186,8 +186,8 @@ If the session produced any wiki-bound learnings, run the wiki workflow below. I
 Run `loamstate` to probe the wiki and qmd in one shot:
 
 ```bash
-bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
-  || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+  || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
 ```
 
 Parse the JSON output. If `exists` is false, stop and recommend:
@@ -198,7 +198,7 @@ Parse the JSON output. If `exists` is false, stop and recommend:
 
 Use `wiki_root` as the resolved wiki root. If `has_overview` is true, note it as a legacy root-hub file. Use `qmd_ready` + `collection` for qmd state. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks.
 
-If qmd is ready, read `${CLAUDE_SKILL_DIR}/references/qmd-usage.md` for finding existing destination notes. If qmd is not ready, use Grep/Glob to find existing pages.
+If qmd is ready, read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/qmd-usage.md` for finding existing destination notes. If qmd is not ready, use Grep/Glob to find existing pages.
 
 #### Read the wiki contract & discover destinations
 

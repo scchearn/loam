@@ -36,8 +36,8 @@ If both flags are given, error and stop.
 Run `loamstate` to probe the wiki and qmd in one shot:
 
 ```bash
-bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
-  || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+  || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
 ```
 
 Parse the JSON output. If `exists` is false, stop — there is nothing to sync. Use `wiki_root` from `loamstate` as the resolved wiki root; do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md`.
@@ -51,7 +51,7 @@ Resolve the codebase root from the first argument. If it does not exist or is no
 Run the index subcommand from the ingestion skill's scripts:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/../loam-ingesting-codebase/scripts/codegraph.sh" index <wiki-root> --codebase-root <codebase-root>
+"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-ingesting-codebase/scripts/codegraph.sh" index <wiki-root> --codebase-root <codebase-root>
 ```
 
 Parse the JSON output into an in-memory map: `{source_path → {slug, ingested_at, source_size, content_hash, mtime, exists}}`. This is the current code graph in the wiki. The index scans both `code/` and `entities/` (for legacy stranded `source_path:` pages during the transition to the `code/` namespace).
@@ -63,9 +63,9 @@ If `codegraph.sh index` or `codegraph.sh diff` reports `wiki root contract not f
 ### Resolve the ingestion skill's references
 
 Note the path to the ingestion skill's references for later use:
-- Exclusions: `${CLAUDE_SKILL_DIR}/../loam-ingesting-codebase/references/ingestion-exclusions.md`
-- Role classification: `${CLAUDE_SKILL_DIR}/../loam-ingesting-codebase/references/role-classification.md`
-- Role templates: `${CLAUDE_SKILL_DIR}/../loam-ingesting-codebase/references/templates/`
+- Exclusions: `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-ingesting-codebase/references/ingestion-exclusions.md`
+- Role classification: `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-ingesting-codebase/references/role-classification.md`
+- Role templates: `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-ingesting-codebase/references/templates/`
 
 ---
 
@@ -122,8 +122,8 @@ Capture: plan path, files re-summarized (count), files removed (count), files sk
 Run the walk subcommand from the ingestion skill:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/../loam-ingesting-codebase/scripts/codegraph.sh" walk <codebase-root> \
-  --exclusions "${CLAUDE_SKILL_DIR}/../loam-ingesting-codebase/references/ingestion-exclusions.md"
+"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-ingesting-codebase/scripts/codegraph.sh" walk <codebase-root> \
+  --exclusions "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-ingesting-codebase/references/ingestion-exclusions.md"
 ```
 
 Parse the JSON output: a list of `{path, mtime, size}` for candidate code files, where `mtime` is Unix epoch seconds and `size` is the file's byte size.
@@ -131,8 +131,8 @@ Parse the JSON output: a list of `{path, mtime, size}` for candidate code files,
 You may also run the diff subcommand to get `new` and `stale` sets directly:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/../loam-ingesting-codebase/scripts/codegraph.sh" diff <codebase-root> <wiki-root> \
-  --exclusions "${CLAUDE_SKILL_DIR}/../loam-ingesting-codebase/references/ingestion-exclusions.md" [--strict]
+"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-ingesting-codebase/scripts/codegraph.sh" diff <codebase-root> <wiki-root> \
+  --exclusions "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-ingesting-codebase/references/ingestion-exclusions.md" [--strict]
 ```
 
 The diff uses mtime+size as primary and content hash as secondary: when mtime says stale but size is unchanged and `content_hash` exists, it computes the file's SHA-256 and suppresses the stale flag if the hash matches (false-stale suppression). Add `--strict` to force full-hash verification on every file (catches false-fresh where content changed but mtime was backdated). Missing or nonnumeric `source_size` disables size comparison and uses mtime-only fallback; missing `content_hash` only disables secondary suppression.

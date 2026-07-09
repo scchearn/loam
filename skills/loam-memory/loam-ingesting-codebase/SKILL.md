@@ -25,8 +25,8 @@ The codebase root is: $ARGUMENTS
 Run `loamstate` to probe the wiki and qmd in one shot:
 
 ```bash
-bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
-  || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+  || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
 ```
 
 Parse the JSON output. If `exists` is false, stop and recommend:
@@ -50,7 +50,7 @@ If `$ARGUMENTS` is empty, default the codebase root to `$(pwd)`. Do not ask for 
 Run the index subcommand to get every code-ingested page already in the wiki:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/codegraph.sh" index <wiki-root> --codebase-root <codebase-root>
+"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/scripts/codegraph.sh" index <wiki-root> --codebase-root <codebase-root>
 ```
 
 Parse the JSON output into an in-memory map: `{source_path → {slug, ingested_at, mtime, exists}}`. Pages without `source_path:` front matter are prose entity pages and are skipped silently. This map is the set of already-ingested code nodes. The index scans both `code/` and `entities/` (for legacy stranded `source_path:` pages during the transition to the `code/` namespace).
@@ -64,8 +64,8 @@ If `codegraph.sh index` or `codegraph.sh diff` reports `wiki root contract not f
 For a quick size check before ingesting, run:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/codegraph.sh" walk <codebase-root> --summary \
-  --exclusions "${CLAUDE_SKILL_DIR}/references/ingestion-exclusions.md"
+"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/scripts/codegraph.sh" walk <codebase-root> --summary \
+  --exclusions "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/ingestion-exclusions.md"
 ```
 
 This reports candidate counts by extension plus excluded low-signal counts (`pattern`, `gitignore`, `empty`, `large`, `generated_header`, `binary`). Use it to decide whether the run is likely to hit the cap; it is not required for correctness.
@@ -81,8 +81,8 @@ Default mode is diff-guided ingest: process `new` and `stale` entries from `code
 Run the diff subcommand to get the files that need ingestion or re-summarization:
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/codegraph.sh" diff <codebase-root> <wiki-root> \
-  --exclusions "${CLAUDE_SKILL_DIR}/references/ingestion-exclusions.md"
+"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/scripts/codegraph.sh" diff <codebase-root> <wiki-root> \
+  --exclusions "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/ingestion-exclusions.md"
 ```
 
 Parse the JSON output: `{path, mtime, reason, slug?}` where `mtime` is the source file's Unix epoch mtime and `reason` is `new` or `stale`. Legacy pages with date-only `ingested_at` are stale once so they migrate to epoch precision.

@@ -9,6 +9,7 @@
 - To install the local hook, create `.git/hooks/pre-commit` that runs the three commands above, then `chmod +x .git/hooks/pre-commit`.
 - Windows hook users need Git Bash or WSL; no PowerShell twin is shipped.
 - No new dependencies for repo hygiene; use Bash, standard Unix tools, and git.
+- Skills locate sibling scripts via `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}`; prefer `LOAM_SKILL_DIR` when adding new references. `CLAUDE_SKILL_DIR` is the Claude Code fallback only.
 - Do not byte-sync same-named skill reference files unless they are explicitly marked shared.
 - Durable gotchas belong in the tripped skill as `Trigger → Mistake → Fix`; environment-specific incidents stay operational.
 - Keep guidance edits concise; avoid session reports, changelog ceremony, and speculative scaffolding.

@@ -106,9 +106,9 @@ Use these scoping rules:
 
 Before changing files, read:
 
-1. `${CLAUDE_SKILL_DIR}/references/alignment-rules.md`
-2. `${CLAUDE_SKILL_DIR}/references/proposal-template.md` as the report shape for unresolved or ambiguous work
-3. `${CLAUDE_SKILL_DIR}/references/guidance-file-triage.md`
+1. `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/alignment-rules.md`
+2. `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/proposal-template.md` as the report shape for unresolved or ambiguous work
+3. `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/guidance-file-triage.md`
 4. `<wiki root>/SCHEMA.md` when it exists
 5. `<wiki root>/index.md` when it exists
 6. `<wiki root>/overview.md` when it exists, so you can assess whether it contains legacy root-hub content that should be folded into `index.md`

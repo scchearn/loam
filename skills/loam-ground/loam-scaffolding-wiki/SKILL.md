@@ -88,8 +88,8 @@ Do not create a separate root `overview.md`. Only create category directories th
 
 Read before writing:
 
-1. `${CLAUDE_SKILL_DIR}/references/wiki-architecture.md`
-2. `${CLAUDE_SKILL_DIR}/references/schema-template.md`
+1. `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/wiki-architecture.md`
+2. `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/schema-template.md`
 
 Use them as templates, but adapt to the current workspace and the user's stated wiki goal.
 
@@ -146,7 +146,7 @@ Use `AskUserQuestion`:
 
 If no: skip. Wiki runs in fallback-only mode.
 
-If yes: read `${CLAUDE_SKILL_DIR}/references/qmd-usage.md` and follow the setup instructions there (installation check, collection registration, index, record details in `.wiki-metadata.json` and `SCHEMA.md`, log entry).
+If yes: read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/qmd-usage.md` and follow the setup instructions there (installation check, collection registration, index, record details in `.wiki-metadata.json` and `SCHEMA.md`, log entry).
 
 If setup fails at any point: the wiki remains fully functional. Do not roll back the scaffold. Report the failure. Set `retrieval.status` in `.wiki-metadata.json` to `"degraded"` or `"unmapped"`.
 

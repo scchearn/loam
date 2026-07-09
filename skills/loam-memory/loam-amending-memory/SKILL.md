@@ -44,7 +44,7 @@ If no wiki exists, stop. There is nothing to amend.
 3. If qmd is still not ready: use Grep/Glob to find affected pages.
 4. Runtime guard: if any qmd command fails or returns stale results, treat as degraded — fall back to Grep/Glob.
 
-If qmd is ready, read `${CLAUDE_SKILL_DIR}/references/qmd-usage.md` for broadening affected-page discovery.
+If qmd is ready, read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/qmd-usage.md` for broadening affected-page discovery.
 
 ### Identify affected pages
 
@@ -64,8 +64,8 @@ Before touching any wiki page, read:
 1. `<wiki root>/SCHEMA.md`
 2. `<wiki root>/index.md`
 3. scoped log read: `grep -i "<page or subject being amended>" <wiki root>/log.md` for prior entries touching this subject; plus `grep "^## \[" <wiki root>/log.md | tail -2` for the last 2 entries. Never read the full log.
-4. `${CLAUDE_SKILL_DIR}/references/amendment-triage.md`
-5. `${CLAUDE_SKILL_DIR}/references/amend-checklist.md`
+4. `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/amendment-triage.md`
+5. `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/amend-checklist.md`
 
 ---
 
@@ -73,7 +73,7 @@ Before touching any wiki page, read:
 
 ### Triage the amendment
 
-Classify using `${CLAUDE_SKILL_DIR}/references/amendment-triage.md`:
+Classify using `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/amendment-triage.md`:
 
 - **Correction**: factually wrong claim now known to be wrong
 - **Supersession**: older state overtaken by newer events or decisions

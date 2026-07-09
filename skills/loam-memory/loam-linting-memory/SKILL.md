@@ -39,8 +39,8 @@ If no explicit target is provided, lint the whole wiki.
 Run `loamstate` to probe the wiki and qmd in one shot:
 
 ```bash
-bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
-  || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+  || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
 ```
 
 Parse the JSON output. If `exists` is false, stop and recommend:
@@ -66,8 +66,8 @@ Before editing, read:
 3. scoped log read: `grep "^## \[" <wiki root>/log.md | tail -5` for the last 5 entries (recent maintenance context). If a specific lint scope is named, also `grep -i "<scope keywords>" <wiki root>/log.md`. Never read the full log.
 4. `<wiki root>/overview.md` when it exists, so you can fold its useful root-hub content into `index.md` and remove it
 5. the files inside the lint scope most relevant to the current health check
-6. `${CLAUDE_SKILL_DIR}/references/lint-checklist.md`
-7. `${CLAUDE_SKILL_DIR}/references/finding-triage.md`
+6. `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/lint-checklist.md`
+7. `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/finding-triage.md`
 
 Use `Glob` and `Grep` to map the pages in scope before reading deeply.
 
@@ -81,7 +81,7 @@ If metadata is stale and qmd is available, validate the recorded `collection` wi
 
 If `qmd_ready` is false, qmd is not available — use Grep/Glob only.
 
-qmd is **secondary only** in this skill: use it only to find related-note neighborhoods when a structural fix might need reciprocal links or nearby canonical notes. If ready, read `${CLAUDE_SKILL_DIR}/references/qmd-usage.md`.
+qmd is **secondary only** in this skill: use it only to find related-note neighborhoods when a structural fix might need reciprocal links or nearby canonical notes. If ready, read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/qmd-usage.md`.
 
 ### Audit for health issues
 
@@ -210,8 +210,8 @@ This is the stable evidence `loamstate` reads for the `memory_lint_stale` hint (
 Run `datecheck` to scan all markdown files for date-format drift:
 
 ```bash
-bash "${CLAUDE_SKILL_DIR}/../loam-using/scripts/datecheck.sh" check "$WIKI_ROOT" 2>/dev/null \
-  || powershell "${CLAUDE_SKILL_DIR}/../loam-using/scripts/datecheck.ps1" check "$WIKI_ROOT" 2>/dev/null
+bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/datecheck.sh" check "$WIKI_ROOT" 2>/dev/null \
+  || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/datecheck.ps1" check "$WIKI_ROOT" 2>/dev/null
 ```
 
 The script reports drift as JSON: front matter point-in-time fields missing timezone offsets, legacy TZ labels (`SAST`, `GMT+N`, `UTC`), and decisions-log entries using non-em-dash separators.
