@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# SessionStart hook for loam plugin.
+# SessionStart hook for loam plugin (Claude Code, Cursor, Copilot).
 #
-# Reads skills/loam-using/SKILL.md, strips frontmatter, wraps in <LOAM_IMPORTANT>,
+# Reads loam::using SKILL.md from the npx skills install path (single source
+# of truth): project-scoped first ($PWD/.agents/skills/), then global
+# ($HOME/.agents/skills/). Strips frontmatter, wraps in <LOAM_IMPORTANT>,
 # and emits platform-specific JSON additionalContext.
 #
-# Mirrors superpowers/hooks/session-start. Uses <LOAM_IMPORTANT> wrapper and
-# "You have loam" marker to avoid collision with superpowers' injection.
+# Uses <LOAM_IMPORTANT> wrapper and "You have loam" marker to avoid
+# collision with superpowers' injection.
 #
 # Output formats:
 #   Cursor  -> additional_context (snake_case)
@@ -14,17 +16,34 @@
 
 set -euo pipefail
 
-# Determine plugin root directory from script location (not env vars).
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Find loam::using SKILL.md: project-scoped first, then global.
+SKILL_PATH=""
+for candidate in "${PWD}/.agents/skills/loam-using/SKILL.md" "${HOME}/.agents/skills/loam-using/SKILL.md"; do
+  if [ -f "$candidate" ]; then
+    SKILL_PATH="$candidate"
+    break
+  fi
+done
+
+if [ -z "$SKILL_PATH" ]; then
+  echo '[loam] loam::using not found — run: npx skills add scchearn/loam' >&2
+  # Emit empty valid JSON so the session doesn't break.
+  if [ -n "${CURSOR_PLUGIN_ROOT:-}" ]; then
+    printf '{\n  "additional_context": ""\n}\n'
+  elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -z "${COPILOT_CLI:-}" ]; then
+    printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": ""\n  }\n}\n'
+  else
+    printf '{\n  "additionalContext": ""\n}\n'
+  fi
+  exit 0
+fi
 
 # Read loam::using content
-using_loam_content=$(cat "${PLUGIN_ROOT}/skills/loam-using/SKILL.md" 2>&1 || echo "Error reading loam::using skill")
+using_loam_content=$(cat "$SKILL_PATH" 2>&1 || echo "Error reading loam::using skill")
 
 # Strip YAML frontmatter (---\n...\n---\n) if present.
 strip_frontmatter() {
   local s="$1"
-  # Match leading ---\n...---\n and drop it.
   if [[ "$s" =~ ^---$'\n'(.*)$'\n'---$'\n'(.*)$ ]]; then
     printf '%s' "${BASH_REMATCH[2]}"
   else

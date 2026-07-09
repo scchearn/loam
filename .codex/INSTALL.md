@@ -1,12 +1,22 @@
 # Installing loam for Codex
 
-Enable loam skills in Codex via native skill discovery. Just clone and symlink.
+Enable loam skills in Codex via native skill discovery.
 
 ## Prerequisites
 
 - Git
 
 ## Installation
+
+**Option A — npx skills (recommended):**
+
+```bash
+npx skills add scchearn/loam
+```
+
+Skills install to `~/.agents/skills/loam-*` and are discovered automatically by Codex on the next session.
+
+**Option B — clone and symlink (manual):**
 
 1. **Clone the loam repository:**
    ```bash
@@ -30,26 +40,26 @@ Enable loam skills in Codex via native skill discovery. Just clone and symlink.
 ## Verify
 
 ```bash
-ls -la ~/.agents/skills/loam
+npx skills list -g | grep loam
 ```
 
-You should see a symlink (or junction on Windows) pointing to your loam skills directory.
+You should see all 20 loam skills listed.
 
 ## Updating
 
 ```bash
-cd ~/.codex/loam && git pull
+npx skills update
 ```
 
-Skills update instantly through the symlink.
+Or if you used the clone+symlink path: `cd ~/.codex/loam && git pull`
 
 ## Uninstalling
 
 ```bash
-rm ~/.agents/skills/loam
+npx skills remove loam
 ```
 
-Optionally delete the clone: `rm -rf ~/.codex/loam`.
+Or if you used the clone+symlink path: `rm ~/.agents/skills/loam` and `rm -rf ~/.codex/loam`.
 
 ## Note on auto-injection
 

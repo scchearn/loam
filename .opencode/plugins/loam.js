@@ -2,18 +2,16 @@
  * loam plugin for OpenCode.ai
  *
  * Injects loam::using bootstrap context via first-user-message transform.
- * Auto-registers skills directory via config hook (no symlinks needed).
+ * Skill content is read from the npx skills install path (single source of
+ * truth). No config hook — OpenCode discovers ~/.agents/skills/ natively.
  *
- * Mirrors superpowers.js structure. Uses <LOAM_IMPORTANT> wrapper and
- * "You have loam" dedup marker to avoid collision with superpowers.
+ * Uses <LOAM_IMPORTANT> wrapper and "You have loam" dedup marker to avoid
+ * collision with superpowers.
  */
 
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { fileURLToPath } from 'url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Simple frontmatter extraction (avoid dependency on skills-core for bootstrap)
 const extractAndStripFrontmatter = (content) => {
@@ -36,30 +34,27 @@ const extractAndStripFrontmatter = (content) => {
   return { frontmatter, content: body };
 };
 
-// Normalize a path: trim whitespace, expand ~, resolve to absolute
-const normalizePath = (p, homeDir) => {
-  if (!p || typeof p !== 'string') return null;
-  let normalized = p.trim();
-  if (!normalized) return null;
-  if (normalized.startsWith('~/')) {
-    normalized = path.join(homeDir, normalized.slice(2));
-  } else if (normalized === '~') {
-    normalized = homeDir;
+// Find loam::using SKILL.md: project-scoped first, then global.
+// Returns absolute path or null.
+const findSkillPath = () => {
+  const candidates = [
+    path.join(process.cwd(), '.agents/skills/loam-using/SKILL.md'),
+    path.join(os.homedir(), '.agents/skills/loam-using/SKILL.md'),
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
   }
-  return path.resolve(normalized);
+  return null;
 };
 
 export const LoamPlugin = async ({ client, directory }) => {
-  const homeDir = os.homedir();
-  const loamSkillsDir = path.resolve(__dirname, '../../skills');
-  const envConfigDir = normalizePath(process.env.OPENCODE_CONFIG_DIR, homeDir);
-  const configDir = envConfigDir || path.join(homeDir, '.config/opencode');
-
   // Helper to generate bootstrap content
   const getBootstrapContent = () => {
-    // Try to load loam::using skill
-    const skillPath = path.join(loamSkillsDir, 'loam-using', 'SKILL.md');
-    if (!fs.existsSync(skillPath)) return null;
+    const skillPath = findSkillPath();
+    if (!skillPath) {
+      console.error('[loam] loam::using not found — run: npx skills add scchearn/loam');
+      return null;
+    }
 
     const fullContent = fs.readFileSync(skillPath, 'utf8');
     const { content } = extractAndStripFrontmatter(fullContent);
@@ -76,7 +71,7 @@ Use OpenCode's native \`skill\` tool to list and load skills.`;
     return `<LOAM_IMPORTANT>
 You have loam.
 
-**IMPORTANT: The loam::using skill content is included below. It is ALREADY LOADED - you are currently following it. Do NOT use the skill tool to load "loam::using" again - that would be redundant.**
+**IMPORTANT: The loam::using skill content is included below. It is ALREADY LOADED - you are currently following it. Do NOT use the skill tool to load 'loam::using' again - that would be redundant.**
 
 ${content}
 
@@ -85,16 +80,6 @@ ${toolMapping}
   };
 
   return {
-    // Inject skills path into live config so OpenCode discovers loam skills
-    // without requiring manual symlinks or config file edits.
-    config: async (config) => {
-      config.skills = config.skills || {};
-      config.skills.paths = config.skills.paths || [];
-      if (!config.skills.paths.includes(loamSkillsDir)) {
-        config.skills.paths.push(loamSkillsDir);
-      }
-    },
-
     // Inject bootstrap into the first user message of each session.
     // Using a user message instead of a system message avoids:
     //   1. Token bloat from system messages repeated every turn

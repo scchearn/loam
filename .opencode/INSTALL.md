@@ -3,6 +3,7 @@
 ## Prerequisites
 
 - [OpenCode.ai](https://opencode.ai) installed
+- loam skills installed via `npx skills add scchearn/loam` (the plugin reads skill content from here — there is no bundled copy)
 
 ## Installation
 
@@ -22,9 +23,12 @@ For local development, point at your clone path:
 }
 ```
 
-Restart OpenCode. That's it — the plugin auto-registers all loam skills and injects `loam::using` into the first user message of each session.
+Restart OpenCode. The plugin injects `loam::using` into the first user message
+of each session. Skill discovery is handled by OpenCode natively scanning
+`~/.agents/skills/` (where `npx skills add` installed them).
 
-Verify by asking: "Tell me about loam" — the session should already have the `loam::using` router context (look for `<LOAM_IMPORTANT>`).
+Verify by asking: "Tell me about loam" — the session should already have the
+`loam::using` router context (look for `<LOAM_IMPORTANT>`).
 
 ## Usage
 
@@ -37,14 +41,14 @@ use skill tool to load loam::planning
 
 ## Updating
 
-If you pointed at a local path, `git pull` the repo and restart OpenCode.
-If you pointed at the remote, OpenCode updates automatically on restart.
+Skill content: `npx skills update` keeps skills fresh.
+Plugin code: if you pointed at a local path, `git pull` the repo and restart OpenCode. If you pointed at the remote, OpenCode updates automatically on restart.
 
 To pin a specific version:
 
 ```json
 {
-  "plugin": ["loam@git+https://github.com/scchearn/loam.git#v0.1.0"]
+  "plugin": ["loam@git+https://github.com/scchearn/loam.git#v0.2.0"]
 }
 ```
 
@@ -58,9 +62,9 @@ To pin a specific version:
 
 ### Skills not found
 
-1. Use the `skill` tool to list what's discovered
-2. Check that the plugin is loading (see above)
-3. Skills are also available via `npx skills add scchearn/loam` as a fallback discovery path
+1. Run `npx skills add scchearn/loam` to install skill content
+2. Use the `skill` tool to list what's discovered
+3. Check that the plugin is loading (see above)
 
 ### Tool mapping
 

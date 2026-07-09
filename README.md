@@ -11,16 +11,23 @@ sessions build on each other instead of starting from scratch.
 
 ## Install
 
-### All harnesses (skill discovery)
+### Step 1 — all harnesses (skill discovery)
 
 ```bash
 npx skills add scchearn/loam
 ```
 
 Skills install into your agent's skills directory
-(`~/.claude/skills/`, `~/.config/opencode/skills/`, etc.)
-and are available the next time you start a session. This is the baseline
-path — it works on every supported harness.
+(`~/.agents/skills/loam-*`, symlinked from `~/.claude/skills/`,
+`~/.config/opencode/skills/`, etc.) and are available the next time you
+start a session. This is the single source of truth for skill content —
+the plugin bootstrap (step 2) reads from here.
+
+### Step 2 — injection harnesses only (optional, auto-injection)
+
+On OpenCode, Claude Code, and Cursor, you can optionally register loam as a
+plugin to auto-inject the `loam::using` router into every session start. The
+plugin reads skill content from the `npx skills` install — no second copy.
 
 ### OpenCode (auto-injection)
 
@@ -30,10 +37,9 @@ Register loam as an opencode plugin in your `opencode.json`:
 { "plugin": ["loam@git+https://github.com/scchearn/loam.git"] }
 ```
 
-Restart OpenCode. The plugin auto-registers the skills directory **and**
-injects the `loam::using` router into the first user message of each session,
-so the protocol is always in context. See [`.opencode/INSTALL.md`](./.opencode/INSTALL.md)
-for details. Coexists with superpowers (distinct wrapper tags).
+Restart OpenCode. The plugin injects `loam::using` into the first user
+message of each session. See [`.opencode/INSTALL.md`](./.opencode/INSTALL.md)
+for details.
 
 ### Claude Code (auto-injection)
 
@@ -45,7 +51,7 @@ Register the loam marketplace and install the plugin:
 ```
 
 The `hooks/hooks.json` SessionStart hook injects `loam::using` at session start
-(startup, clear, compact). `.claude-plugin/plugin.json` drives skill discovery.
+(startup, clear, compact).
 
 ### Cursor (auto-injection)
 
@@ -188,6 +194,7 @@ startup, while the body is only loaded when the skill activates.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
 
 
 
