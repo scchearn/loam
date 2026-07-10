@@ -3,7 +3,7 @@ name: loam::querying-memory
 description: "Answer questions against existing memory (the wiki substrate). Use this whenever the user is asking what is happening in the project, directory, codebase, architecture, workflow, decisions, or current state and the wiki likely contains the answer, even if they do not explicitly mention the wiki. Also use it for summaries, comparisons, and reusable analyses grounded in current wiki pages. Routes authoritative goal-state questions to /loam::setting-goals. Not for surfacing unresolved gaps; use /loam::reviewing-memory for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.2.0"
+  version: "1.2.1"
   author: scchearn
   argument-hint: <question>
 ---
@@ -22,14 +22,16 @@ The question is: $ARGUMENTS
 
 ## Step 1 — Discover candidates
 
-Run `loamstate` to probe the wiki and qmd in one shot:
+First reuse the injected `Workspace state` under the reuse contract in `loam::using`. For a non-code query, do not rerun `loamstate` when that block supplies wiki existence/root, qmd readiness, collection, and hints.
+
+If the injected state cannot be reused, run a fast probe:
 
 ```bash
-bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" --fast "$(pwd)" 2>/dev/null \
   || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
 ```
 
-Parse the JSON output. If `exists` is false, stop and recommend `/loam::scaffolding-wiki <topic>`. Use `wiki_root` as the resolved wiki root and `qmd_ready` + `collection` for qmd state. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks.
+If the question needs the code graph, run the full probe (omit `--fast`) before trusting it because fast state omits `code_ingest_pending`. On a PowerShell-only fallback that cannot supply that signal, treat graph freshness as unknown and verify against raw source. If `exists` is false, stop and recommend `/loam::scaffolding-wiki <topic>`. Use `wiki_root` as the resolved wiki root and `qmd_ready` + `collection` for qmd state. Runtime guard: if a required probe fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks.
 
 Classify the question internally (do not expose unless it helps the answer): **lookup** (answer from one or a few pages), **comparison** (differences/tradeoffs across pages), **synthesis** (higher-level explanation combining multiple parts), **gap check** (whether memory can answer something yet). Derive 3-8 search terms.
 

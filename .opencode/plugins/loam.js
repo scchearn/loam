@@ -123,7 +123,7 @@ const getWorkspaceState = () => {
     return '';
   }
 
-  const lines = [];
+  const lines = [`Workspace: ${process.cwd()} · Probe: loamstate --fast`];
 
   // Wiki line
   if (state.exists && state.wiki_root) {
@@ -151,12 +151,14 @@ const getWorkspaceState = () => {
     lines.push('');
     lines.push('Signals:');
     for (const h of state.hints) {
+      const evidence = Object.entries(h.evidence || {})
+        .map(([key, value]) => `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`)
+        .join(', ');
+      const evidencePart = evidence ? ` (${evidence})` : '';
       const cmd = h.command ? ` → ${h.command}` : '';
-      lines.push(`- ${h.kind} — ${h.message}${cmd}`);
+      lines.push(`- ${h.kind} — ${h.message}${evidencePart}${cmd}`);
     }
   }
-
-  if (lines.length === 0) return '';
 
   return `\n## Workspace state\n\n${lines.join('\n')}\n`;
 };
@@ -216,12 +218,13 @@ ${toolMapping}
     //   1. Token bloat from system messages repeated every turn
     //   2. Multiple system messages breaking Qwen and other models
     'experimental.chat.messages.transform': async (_input, output) => {
-      const bootstrap = getBootstrapContent();
-      if (!bootstrap || !output.messages.length) return;
+      if (!output.messages.length) return;
       const firstUser = output.messages.find(m => m.info.role === 'user');
       if (!firstUser || !firstUser.parts.length) return;
       // Only inject once — dedup on loam's own marker, not superpowers'
       if (firstUser.parts.some(p => p.type === 'text' && p.text.includes('You have loam'))) return;
+      const bootstrap = getBootstrapContent();
+      if (!bootstrap) return;
       const ref = firstUser.parts[0];
       firstUser.parts.unshift({ ...ref, type: 'text', text: bootstrap });
     }

@@ -3,7 +3,7 @@ name: loam::syncing-code-graph
 description: "Reconcile the code graph in memory (wiki substrate) against the actual codebase. In --touched mode, re-summarizes only files a completed plan touched (cheap, post-plan gate). In --sweep mode, walks the whole repo and patches drift from out-of-band edits. Drift is accepted between gates; this skill is the only place the code graph is reconciled to the repo tree."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.5.0"
+  version: "1.5.1"
   author: scchearn
   argument-hint: <codebase root> [--touched <plan-path>] [--sweep]
 ---
@@ -33,14 +33,16 @@ If both flags are given, error and stop.
 
 ### Wiki resolution and qmd readiness
 
-Run `loamstate` to probe the wiki and qmd in one shot:
+First reuse the injected `Workspace state` under the reuse contract in `loam::using`. Do not rerun `loamstate` when that block supplies wiki existence/root, qmd readiness, collection, and hints; the codegraph commands below are authoritative for current drift.
+
+If the injected state cannot be reused, run a fast probe:
 
 ```bash
-bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" --fast "$(pwd)" 2>/dev/null \
   || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
 ```
 
-Parse the JSON output. If `exists` is false, stop — there is nothing to sync. Use `wiki_root` from `loamstate` as the resolved wiki root; do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md`.
+If `exists` is false, stop — there is nothing to sync. Use `wiki_root` from the resolved state; do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh. Runtime guard: if a required probe fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md`.
 
 ### Codebase resolution
 

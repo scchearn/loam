@@ -2,7 +2,7 @@
 name: loam::using
 description: "The always-on protocol for the loam skill namespace. Use at session start and whenever a loam task appears. Routes goals and other loam work, explains the memory model (memory = umbrella; wiki, guidance, and checkpoints are substrates), and lists cross-cutting rules. This is a routing/meta skill — delegate to a specific loam skill rather than performing work itself."
 metadata:
-  version: "1.7.0"
+  version: "1.7.1"
   author: scchearn
 ---
 
@@ -110,11 +110,30 @@ If you catch yourself rationalizing a shortcut, invoke the skill instead — eve
 
 ## loamstate hints
 
-`loamstate.sh <workspace-root>` may emit advisory `hints[]` with `maintenance` or `workflow` signals. Hints point at the relevant loam skill; they never authorize bypassing that skill or auto-running commands. Missing hints mean "no cheap signal," not "nothing to do." For schema and kinds, inspect `loamstate.sh` output or the script header.
+`loamstate.sh [--fast] <workspace-root>` may emit advisory `hints[]` with `maintenance` or `workflow` signals. Hints point at the relevant loam skill; they never authorize bypassing that skill or auto-running commands. Missing hints mean "no cheap signal," not "nothing to do." For schema and kinds, inspect `loamstate.sh` output or the script header.
+
+### Reuse before probing
+
+The injected `## Workspace state` block is a compact `loamstate --fast` result. Reuse it when its `Workspace` matches the current workspace, it contains the fields the active skill needs, and no later operation changed the relevant wiki, qmd, checkpoint, or metadata state. Do not rerun `loamstate` merely to rediscover the same state.
+
+Run a fresh `--fast` probe when the block is absent, belongs to another workspace, lacks required fields, or relevant state changed after injection. Run the full probe only when omitted checks such as date drift or `code_ingest_pending` are required. When a skill performs a newer authoritative check itself, use that result instead of rerunning `loamstate`.
+
+The injected block uses these stable line forms; checkpoint and signal lines are optional:
+
+```text
+Workspace: <absolute workspace> · Probe: loamstate --fast
+Wiki: <absolute wiki root> · qmd: <ready|not installed> [· collection: <name>]
+Wiki: none
+Checkpoints: <count> (latest: "<title>" — <captured_at>)
+Signals:
+- <kind> — <message> [(<evidence key>: <value>, ...)] [→ <command>]
+```
+
+The PowerShell twin is fast-equivalent and currently omits full-only checks. If bash is unavailable when a full-only signal is required, treat that signal as unknown and use the active skill's conservative fallback.
 
 ### Consuming hints
 
-After completing the primary task of any loam skill that ran `loamstate` (including `loam::resuming`, which reads `loamstate` during orientation), scan the `hints[]` array from that output and surface unsatisfied hints to the user as suggested next actions. This is mandatory — hints that go unread are signals wasted.
+After completing the primary task of any loam skill that consumed injected or freshly probed loamstate, scan its hints and surface unsatisfied hints to the user as suggested next actions. This is mandatory — hints that go unread are signals wasted.
 
 For each hint, emit one line in this form:
 

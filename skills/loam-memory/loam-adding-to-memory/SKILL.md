@@ -3,7 +3,7 @@ name: loam::adding-to-memory
 description: "Read a local source file or synthesize conversation context, then integrate admitted content directly into topic, entity, concept, and analysis pages in existing memory (the wiki substrate). Use this when the user wants to add a source to the wiki, add a document, ingest a local note, transcript, article, report, or PDF, or explicitly preserve the current conversation as a topic note. For session-learning routing across wiki, guidance, checkpoint, task annotation, or discard, use /loam::learning-from-session. Must not ingest a goal wholesale; admit only independently reusable findings."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.5.0"
+  version: "1.5.1"
   author: scchearn
   argument-hint: <local source path | topic or summary from chat>
 ---
@@ -42,14 +42,16 @@ Rules:
 
 ### Wiki resolution and qmd readiness
 
-Run `loamstate` to probe the wiki and qmd in one shot:
+First reuse the injected `Workspace state` under the reuse contract in `loam::using`. Do not rerun `loamstate` when that block supplies wiki existence/root, qmd readiness, collection, and hints. A `legacy_structure_pending` hint is equivalent to `has_overview: true` for this workflow.
+
+If the injected state cannot be reused, run a fast probe:
 
 ```bash
-bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" --fast "$(pwd)" 2>/dev/null \
   || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
 ```
 
-Parse the JSON output. If `exists` is false, stop and recommend:
+If `exists` is false, stop and recommend:
 
 ```text
 /loam::scaffolding-wiki <topic or wiki goal>
@@ -61,7 +63,7 @@ If multiple wiki roots are present and the target is ambiguous, ask the smallest
 
 If qmd is ready (`qmd_ready: true`), use the `collection` name and follow the **qmd and code-graph discovery** protocol in `loam::using` (the router) to find existing related notes — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (deriving search terms, archive exclusion) if you want it. If qmd is not ready, use Grep/Glob to find existing notes.
 
-Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks (`which qmd` + `qmd collection list`).
+Runtime guard: if a required probe fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks (`which qmd` + `qmd collection list`).
 
 ### Mode detection
 

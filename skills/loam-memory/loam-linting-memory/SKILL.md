@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate) and goal artifacts. Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, consolidate a legacy root `overview.md` into `index.md`, or health-check goal artifacts. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.8.0"
+  version: "1.8.1"
   author: scchearn
   argument-hint: [wiki root, goal path, or focus area]
 ---
@@ -38,14 +38,14 @@ If the target is a `goals/<slug>.md` path, run only the goal-health pass (Step 2
 
 ### Locate the wiki and probe state
 
-Run `loamstate` to probe the wiki and qmd in one shot:
+The injected summary omits `metadata_status` and `metadata_path`, and lint must inspect current state. Run a fresh fast probe rather than reusing it:
 
 ```bash
-bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" --fast "$(pwd)" 2>/dev/null \
   || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
 ```
 
-Parse the JSON output. If `exists` is false, check whether `goals/` exists (`ls goals/*.md 2>/dev/null`). If `goals/` exists, skip all wiki-only steps (Steps 1 "Read the wiki contract" through Step 2 "Apply safe fixes") and jump directly to the goal-health pass (Step 2G). If neither a wiki nor goals exist, stop and recommend:
+If `exists` is false, check whether `goals/` exists (`ls goals/*.md 2>/dev/null`). If `goals/` exists, skip all wiki-only steps (Steps 1 "Read the wiki contract" through Step 2 "Apply safe fixes") and jump directly to the goal-health pass (Step 2G). If neither a wiki nor goals exist, stop and recommend:
 
 ```text
 /loam::scaffolding-wiki <topic or wiki goal>
@@ -55,7 +55,7 @@ If the target was a single `goals/<slug>.md` path, skip all wiki-only steps and 
 
 Use `wiki_root` as the resolved wiki root (resolved from on-disk contract files, not qmd metadata). If `has_overview` is true, note it as a legacy root-hub file to fold into `index.md`. Then resolve the lint scope: if the user named a wiki root, subdirectory, topic, or entity, use that. If no scope given, lint the whole wiki.
 
-This skill satisfies the `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, and `legacy_structure_pending` hints (see the hint contract in `loam::using`); treat them as advisory scope, not extra mandatory work.
+This skill satisfies the `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, and `legacy_structure_pending` hints (see the hint contract in `loam::using`); treat them as advisory scope, not extra mandatory work. Fast state omits date drift, which the lint pass checks directly later.
 
 ### Read the wiki contract
 

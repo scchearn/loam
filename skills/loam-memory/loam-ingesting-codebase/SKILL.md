@@ -3,7 +3,7 @@ name: loam::ingesting-codebase
 description: "Ingest a codebase into memory as code pages connected by wiki links. Walks the tree, classifies each code file by role, applies a role template, and writes a code page per meaningful unit under <wiki root>/code/. Resumable: skips files already ingested and current. Not for prose documents; use /loam::adding-to-memory for those."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.5.3"
+  version: "1.5.4"
   author: scchearn
   argument-hint: <codebase root path>
 ---
@@ -22,22 +22,24 @@ The codebase root is: $ARGUMENTS
 
 ### Wiki resolution and qmd readiness
 
-Run `loamstate` to probe the wiki and qmd in one shot:
+First reuse the injected `Workspace state` under the reuse contract in `loam::using`. Do not rerun `loamstate` when that block supplies wiki existence/root, qmd readiness, collection, and hints; Step 2 computes the authoritative codegraph diff.
+
+If the injected state cannot be reused, run a fast probe:
 
 ```bash
-bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" "$(pwd)" 2>/dev/null \
+bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" --fast "$(pwd)" 2>/dev/null \
   || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
 ```
 
-Parse the JSON output. If `exists` is false, stop and recommend:
+If `exists` is false, stop and recommend:
 
 ```text
 /loam::scaffolding-wiki <topic or wiki goal>
 ```
 
-Use `wiki_root` from `loamstate` as the resolved wiki root. Do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh (`qmd update -c <collection>`). The skill works fully without qmd; it only accelerates post-ingest discovery. Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md`.
+Use `wiki_root` from the resolved state as the wiki root. Do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh (`qmd update -c <collection>`). The skill works fully without qmd; it only accelerates post-ingest discovery. Runtime guard: if a required probe fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md`.
 
-A `code_ingest_pending` hint in the `loamstate` output is the advisory signal for this skill (see the hint contract in `loam::using`); its `evidence.pending_count` previews the diff work set resolved in Step 2.
+A `code_ingest_pending` hint, when present, previews the work set; Step 2 remains authoritative when fast injected state omits that hint.
 
 ### Codebase resolution
 

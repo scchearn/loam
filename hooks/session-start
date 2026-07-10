@@ -80,13 +80,13 @@ if [ -n "$LOAMSTATE_PATH" ] && command -v python3 >/dev/null 2>&1; then
   LOAMSTATE_JSON=$(timeout 5 bash "$LOAMSTATE_PATH" --fast "$PWD" 2>/dev/null || true)
   if [ -n "$LOAMSTATE_JSON" ]; then
     WORKSPACE_STATE=$(printf '%s' "$LOAMSTATE_JSON" | python3 -c '
-import sys, json
+import sys, json, os
 try:
     s = json.load(sys.stdin)
 except:
     sys.exit(0)
 
-lines = []
+lines = ["Workspace: {} · Probe: loamstate --fast".format(os.getcwd())]
 
 # Wiki line
 if s.get("exists") and s.get("wiki_root"):
@@ -115,9 +115,18 @@ if hints:
     lines.append("")
     lines.append("Signals:")
     for h in hints:
+        evidence = h.get("evidence", {})
+        evidence_values = []
+        for key, value in evidence.items():
+            if isinstance(value, str):
+                rendered = value
+            else:
+                rendered = json.dumps(value, separators=(",", ":"))
+            evidence_values.append("{}: {}".format(key, rendered))
+        evidence_part = " (" + ", ".join(evidence_values) + ")" if evidence_values else ""
         cmd = h.get("command","")
         cmd_part = " → " + cmd if cmd else ""
-        lines.append("- {} — {}{}".format(h.get("kind",""), h.get("message",""), cmd_part))
+        lines.append("- {} — {}{}{}".format(h.get("kind",""), h.get("message",""), evidence_part, cmd_part))
 
 if lines:
     print("\n## Workspace state\n")

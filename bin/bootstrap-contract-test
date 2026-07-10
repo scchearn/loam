@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+WORKSPACE="$TMP/workspace"
+SKILL_DIR="$WORKSPACE/.agents/skills/loam-using"
+COUNTER="$TMP/loamstate-count"
+mkdir -p "$SKILL_DIR/scripts" "$TMP/bin" "$WORKSPACE/wiki"
+
+cat > "$SKILL_DIR/SKILL.md" <<'EOF'
+---
+name: loam::using
+description: test fixture
+---
+# Test loam router
+EOF
+
+cat > "$SKILL_DIR/scripts/loamstate.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'run\n' >> "$LOAM_TEST_COUNTER"
+workspace="${@: -1}"
+printf '{"wiki_root":"%s/wiki","exists":true,"qmd_ready":true,"collection":"test-wiki","checkpoint_count":1,"latest_checkpoint":{"title":"Test checkpoint","captured_at":"2026-07-10"},"drift_count":null,"hints":[{"kind":"checkpoint_stale","message":"Checkpoint needs refresh.","command":"/loam::checkpointing","evidence":{"age_minutes":42,"checkpoint_count":1}}]}\n' "$workspace"
+EOF
+chmod +x "$SKILL_DIR/scripts/loamstate.sh"
+
+cat > "$TMP/bin/git" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  rev-parse) printf 'abc123\n' ;;
+  ls-remote) printf 'abc123\trefs/heads/main\n' ;;
+esac
+EOF
+chmod +x "$TMP/bin/git"
+
+export LOAM_TEST_COUNTER="$COUNTER"
+export PATH="$TMP/bin:$PATH"
+export PLUGIN_URL="file://$ROOT/.opencode/plugins/loam.js"
+export TEST_WORKSPACE="$WORKSPACE"
+export INJECTED_CONTEXT="$TMP/injected-context"
+
+(
+  cd "$WORKSPACE"
+  bun --eval '
+    const { LoamPlugin } = await import(process.env.PLUGIN_URL);
+    const hooks = await LoamPlugin({ client: {}, directory: process.cwd() });
+    const output = {
+      messages: [{ info: { role: "user" }, parts: [{ type: "text", text: "question" }] }],
+    };
+    await hooks["experimental.chat.messages.transform"]({}, output);
+    await hooks["experimental.chat.messages.transform"]({}, output);
+    await Bun.write(process.env.INJECTED_CONTEXT, output.messages[0].parts[0].text);
+  '
+)
+
+[[ "$(wc -l < "$COUNTER")" -eq 1 ]] || {
+  printf 'FAIL: OpenCode transform ran loamstate more than once\n' >&2
+  exit 1
+}
+
+grep -Fq "Workspace: $WORKSPACE · Probe: loamstate --fast" "$INJECTED_CONTEXT" || {
+  printf 'FAIL: injected state lacks workspace/probe provenance\n' >&2
+  exit 1
+}
+grep -Fq 'age_minutes: 42' "$INJECTED_CONTEXT" || {
+  printf 'FAIL: injected state lacks hint evidence\n' >&2
+  exit 1
+}
+
+check_hook() {
+  local mode="$1" output
+  case "$mode" in
+    claude) output=$(cd "$WORKSPACE" && CLAUDE_PLUGIN_ROOT="$ROOT" bash "$ROOT/hooks/session-start") ;;
+    cursor) output=$(cd "$WORKSPACE" && CURSOR_PLUGIN_ROOT="$ROOT" bash "$ROOT/hooks/session-start") ;;
+    copilot) output=$(cd "$WORKSPACE" && COPILOT_CLI=1 bash "$ROOT/hooks/session-start") ;;
+  esac
+
+  HOOK_MODE="$mode" HOOK_OUTPUT="$output" python3 - <<'PY'
+import json
+import os
+
+data = json.loads(os.environ["HOOK_OUTPUT"])
+mode = os.environ["HOOK_MODE"]
+if mode == "claude":
+    context = data["hookSpecificOutput"]["additionalContext"]
+elif mode == "cursor":
+    context = data["additional_context"]
+else:
+    context = data["additionalContext"]
+
+expected = f'Workspace: {os.environ["TEST_WORKSPACE"]} · Probe: loamstate --fast'
+assert expected in context, f"{mode}: missing workspace/probe provenance"
+assert "age_minutes: 42" in context, f"{mode}: missing hint evidence"
+PY
+}
+
+check_hook claude
+check_hook cursor
+check_hook copilot
+
+printf 'OK: bootstrap contract passed\n'
