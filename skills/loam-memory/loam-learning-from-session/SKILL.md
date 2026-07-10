@@ -1,9 +1,9 @@
 ---
 name: loam::learning-from-session
-description: "Review the current session for durable learnings, then route each one through the five-way matrix: wiki page, guidance file, checkpoint, task annotation/plan, or discard. Use when the session uncovered decisions, architecture facts, commands, conventions, gotchas, or open questions that future sessions should inherit. Not for source ingestion or correcting stale wiki claims; use /loam::adding-to-memory or /loam::amending-memory."
+description: "Review the current session for durable learnings, then route each one through the five-way matrix: wiki page, guidance file, checkpoint, task annotation/plan, or discard. Use when the session uncovered decisions, architecture facts, commands, conventions, gotchas, or open questions that future sessions should inherit. Not for source ingestion or correcting stale wiki claims; use /loam::adding-to-memory or /loam::amending-memory. Routes goal-specific progress to /loam::setting-goals."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.4.0"
+  version: "1.5.0"
   author: scchearn
   argument-hint: [topic or session summary]
 ---
@@ -153,9 +153,14 @@ not a pattern → route to `/loam::checkpointing` or drop.
 - The learning is per-task context attached to an active unit of work.
 - The information is useful only while executing or reviewing that task.
 
-### Route to discard when:
+### Route to the discard when:
 
 - The learning is build output, branch state, one-off, unverifiable, reconstructable with one command or file read, or fails the admission rubric.
+
+### Route goal-specific state to /loam::setting-goals when:
+
+- The learning is goal-specific progress, evidence, blockers, or next actions. These belong in the goal document, not the wiki. Independently reusable findings that pass the durable-memory rubric may still enter the wiki; operational goal state stays in `goals/<slug>.md`.
+- Recommend the relevant `/loam::setting-goals` invocation; do not edit the goal from this skill.
 
 ### Mixed routing is allowed and expected
 

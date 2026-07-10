@@ -8,6 +8,7 @@ task_count: 0
 created_at: YYYY-MM-DD HH:MM ±HH:MM
 started_at: null
 completed_at: null
+goal: # optional: goals/<slug>.md provenance; omit when not goal-backed
 ---
 
 # <Feature Name>
@@ -18,7 +19,7 @@ completed_at: null
 
 ## Goal
 
-<One sentence: what does done look like? What is the observable end state?>
+<One sentence: what does done look like? When `goal:` is present, align this plan contribution with the goal artifact's `## Intent`.>
 
 ## Acceptance criteria
 

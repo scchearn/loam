@@ -1,9 +1,9 @@
 ---
 name: loam::adding-to-memory
-description: "Read a local source file or synthesize conversation context, then integrate admitted content directly into topic, entity, concept, and analysis pages in existing memory (the wiki substrate). Use this when the user wants to add a source to the wiki, add a document, ingest a local note, transcript, article, report, or PDF, or explicitly preserve the current conversation as a topic note. For session-learning routing across wiki, guidance, checkpoint, task annotation, or discard, use /loam::learning-from-session."
+description: "Read a local source file or synthesize conversation context, then integrate admitted content directly into topic, entity, concept, and analysis pages in existing memory (the wiki substrate). Use this when the user wants to add a source to the wiki, add a document, ingest a local note, transcript, article, report, or PDF, or explicitly preserve the current conversation as a topic note. For session-learning routing across wiki, guidance, checkpoint, task annotation, or discard, use /loam::learning-from-session. Must not ingest a goal wholesale; admit only independently reusable findings."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.4.0"
+  version: "1.5.0"
   author: scchearn
   argument-hint: <local source path | topic or summary from chat>
 ---
@@ -222,3 +222,4 @@ If the source was already represented and you refreshed it, say so explicitly.
   conversation is mostly incident, say so and recommend
   `/loam::learning-from-session` instead.
 - After wiki writes, refresh qmd if the collection is ready. If refresh fails, report it but do not roll back.
+- Do not ingest a goal (`goals/<slug>.md`) wholesale. Goals are operational workflow artifacts, not wiki content. Admit only independently reusable findings that pass the durable-memory rubric.

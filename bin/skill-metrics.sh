@@ -100,11 +100,6 @@ if [[ "$saw_block" == "0" ]]; then
   exit 1
 fi
 
-# Preserve trailing-newline state of README
-if [[ -s "$README" && "$(tail -c1 "$README" 2>/dev/null)" == "" ]]; then
-  printf '\n' >>"$tmp"
-fi
-
 mv "$tmp" "$README"
 git add "$README"
 printf 'OK: skill-metrics table updated in %s (staged)\n' "$README"

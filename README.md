@@ -88,7 +88,7 @@ invoke `loam::using` on demand.
 
 ## What you get
 
-20 skills, grouped by what they're for:
+21 skills, grouped by what they're for:
 
 ### Planning and execution
 
@@ -99,6 +99,7 @@ invoke `loam::using` on demand.
 - **Checkpointing** — save a restart point before pausing or handing off
 - **Amending-plan** — update an in-flight plan when scope changes
 - **Configuring-agents** — run a structured debate or conference between agents to reach consensus on a goal
+- **Setting-goals** — turn a broad ambition into an externally verifiable goal
 
 ### Memory
 
@@ -141,6 +142,8 @@ language — the **Using** router matches it to the right skill.
 - "Plan the work from that spec" — turns an approved spec into a plan
 - "Run the plan" — begins executing, task by task
 - "Have agents debate this decision" — runs an approval-gated consensus debate
+- "Set a goal" / "I want to achieve X" — creates a verifiable goal artifact
+- "Review this goal" — runs the goal's validation procedure
 - "Stopping work" / "I need to step away" — saves a restart checkpoint
 - "Resume where I left off" — picks up from the last checkpoint
 - "The scope changed, update the plan" — walks the impact, proposes plan changes
@@ -171,25 +174,26 @@ startup, while the body is only loaded when the skill activates.
 | Skill | Desc chars (max 1,024) | Desc tokens (~100) | Body lines (max 500) | Body tokens (< 5,000) |
 |-------|---:|---:|---:|---:|
 | loam::initializing-vault | 206 | 51 | 9 | 73 |
-| loam::scaffolding-wiki | 379 | 78 | 196 | 2,147 |
-| loam::adding-to-memory | 514 | 103 | 215 | 2,265 |
+| loam::scaffolding-wiki | 445 | 90 | 198 | 2,196 |
+| loam::adding-to-memory | 592 | 116 | 216 | 2,304 |
 | loam::amending-memory | 505 | 114 | 180 | 1,951 |
 | loam::auditing-guidance | 410 | 85 | 252 | 2,528 |
 | loam::ingesting-codebase | 329 | 76 | 251 | 3,048 |
-| loam::learning-from-session | 432 | 88 | 361 | 4,142 |
-| loam::linting-memory | 423 | 93 | 274 | 4,470 |
-| loam::normalizing-memory | 421 | 94 | 260 | 2,634 |
-| loam::querying-memory | 463 | 91 | 173 | 1,539 |
-| loam::reviewing-memory | 459 | 104 | 136 | 1,732 |
+| loam::learning-from-session | 487 | 101 | 366 | 4,237 |
+| loam::linting-memory | 471 | 102 | 289 | 4,916 |
+| loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
+| loam::querying-memory | 530 | 105 | 174 | 1,577 |
+| loam::reviewing-memory | 510 | 113 | 137 | 1,787 |
 | loam::syncing-code-graph | 363 | 84 | 221 | 2,944 |
-| loam::using | 365 | 76 | 146 | 2,933 |
-| loam::amending-plan | 340 | 68 | 268 | 2,920 |
-| loam::checkpointing | 365 | 69 | 179 | 2,108 |
+| loam::using | 368 | 77 | 156 | 3,172 |
+| loam::amending-plan | 437 | 88 | 271 | 3,032 |
+| loam::checkpointing | 365 | 69 | 180 | 2,140 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,176 |
-| loam::planning | 267 | 48 | 313 | 4,092 |
-| loam::resuming | 288 | 60 | 142 | 1,786 |
-| loam::starting | 166 | 34 | 353 | 4,973 |
-| loam::writing-spec | 261 | 48 | 243 | 2,689 |
+| loam::planning | 327 | 62 | 323 | 4,317 |
+| loam::resuming | 376 | 77 | 143 | 1,837 |
+| loam::setting-goals | 473 | 101 | 184 | 1,853 |
+| loam::starting | 166 | 34 | 355 | 4,983 |
+| loam::writing-spec | 332 | 66 | 252 | 2,892 |
 <!-- END skill-metrics -->
 
 ## Documentation
@@ -199,44 +203,3 @@ startup, while the body is only loaded when the skill activates.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

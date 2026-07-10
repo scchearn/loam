@@ -24,7 +24,7 @@ loam is the smallest useful step in front of that gap.
 
 ## What success looks like
 
-Not "we shipped 20 skills." Three observable outcomes:
+Not "we shipped a skill pack." Three observable outcomes:
 
 | Outcome | Signal | Why it matters |
 |---|---|---|
@@ -42,7 +42,7 @@ If real sessions don't show these, the project failed and we should say so out l
 - **It's runtime-agnostic by format.** The skills are `SKILL.md` markdown; any harness that loads skills can install and run them — Claude Code, OpenCode, Codex, Gemini. How a given model picks up and orients on the skills varies by harness, but a small "loam" mention in a question or task prompt is enough to orient the model onto the loam skill set. No runtime owns the plan or the memory; the substrate is plain markdown.
 - **It separates durable from transient.** Wiki notes and `AGENTS.md` are durable. Checkpoints under `wiki/checkpoints/` are transient — one restart, then superseded. Conflating these is how memory becomes garbage.
 - **It degrades gracefully.** `qmd` accelerates memory search when installed; built-in search covers the gap when it isn't. The substrate is plain markdown — readable in any editor, diffable in git, survivable past any vendor.
-- **It routes itself.** The `loam::using` skill recognizes plain-language intent ("the wiki is wrong about X", "stopping work", "add to memory") and dispatches the right skill. Users never memorize 20 skill names.
+- **It routes itself.** The `loam::using` skill recognizes plain-language intent ("the wiki is wrong about X", "stopping work", "add to memory") and dispatches the right skill. Users never memorize skill names.
 
 ---
 
@@ -58,7 +58,7 @@ If real sessions don't show these, the project failed and we should say so out l
 
 The hard part isn't storage — markdown and git solve that. It isn't picking between known options. The hard part is **finding the gaps**: discovering what an agent or harness needs that the substrate doesn't yet provide, then closing those gaps with the smallest useful skill.
 
-That's why loam grows with real need, not a roadmap. A new skill appears when a recurring pain demands one. The 20-skill set is what's been demanded so far. It is not the final set, and it is not trying to be.
+That's why loam grows with real need, not a roadmap. A new skill appears when a recurring pain demands one. The current set reflects what's been demanded so far; it is not final.
 
 ---
 
@@ -80,6 +80,6 @@ A skills pack is not impact. Sessions that spend tokens on novel work instead of
 - Every skill needs a trigger a human can recognize in plain language. If the user has to learn the skill's name, the skill failed.
 - Memory must be queryable cold, by any agent, without the original writer present. A wiki only the authoring agent can search is a trap.
 - Plans must be portable. A plan that only resumes under the harness that wrote it has recreated the problem it claimed to solve. A "loam" mention should be enough to orient any model onto the skill set and pick up the plan.
-- The launch isn't "we shipped 20 skills." It's "Tuesday's session learned X, Wednesday's session reached for X instead of re-deriving it, and a different harness would have found the same X." Specific. Concrete. Useful before any install.
+- The launch isn't "we shipped a skill pack." It's "Tuesday's session learned X, Wednesday's session reached for X instead of re-deriving it, and a different harness would have found the same X." Specific. Concrete. Useful before any install.
 
 If you read this and disagree, [open an issue](https://github.com/scchearn/loam/issues). The project gets better when users push back on what memory should carry. That's the whole point.

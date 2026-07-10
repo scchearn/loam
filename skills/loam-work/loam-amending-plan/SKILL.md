@@ -1,9 +1,9 @@
 ---
 name: loam::amending-plan
-description: "Amend an existing plan file — add tasks, modify pending or delegated tasks, and mark completed tasks that are invalidated by the change as [>] (needs re-run). Walks through analysis, cascading impact, and user confirmation before touching the file. When memory (wiki substrate) exists, it may also preserve durable amendment findings there."
+description: "Amend an existing plan file — add tasks, modify pending or delegated tasks, and mark completed tasks that are invalidated by the change as [>] (needs re-run). Walks through analysis, cascading impact, and user confirmation before touching the file. When memory (wiki substrate) exists, it may also preserve durable amendment findings there. Reports goal impact and routes intent, boundaries, or validation changes to loam::setting-goals."
 allowed-tools: Read Write Edit Glob Grep
 metadata:
-  version: "1.0.1"
+  version: "1.1.0"
   author: scchearn
   argument-hint: plans/<slug>.md # describe what to amend in your message, then invoke this skill
 ---
@@ -29,6 +29,7 @@ Read the plan file in full. Build a complete picture:
 5. **Decisions log** — understand the history and what has already been decided
 6. **Current state** — how far along is execution? What's been done, what's locally in flight, and what's delegated externally via `[h]`?
 7. **Optional wiki context** — if memory (wiki substrate) exists, read the schema and only the notes directly relevant to the plan area or amendment. Treat memory as a durable memory layer, not the authority over current repo state.
+8. **Goal provenance** — if the plan has `goal:`, report and stop when the linked file is missing or unreadable. Otherwise note its `status`; for `draft`, `paused`, `achieved`, or `abandoned`, normal amendment stops unless explicitly authorized.
 
 Do not modify anything yet.
 
@@ -57,6 +58,8 @@ Apply these lenses:
 **Wiki impact** — if memory (wiki substrate) exists, does the amendment reveal a durable architecture, domain, or workflow change that should be preserved there after confirmation? Do not confuse this with task-management chatter.
 
 **Validation quality** — does the amendment require stronger automated tests or validations so the updated behavior can be checked independently later, not just during this session?
+
+**Goal impact** — if the plan has a `goal:` field, does the amendment affect the goal's intent, boundaries, or validation criteria? If so, report the impact and route the change through `/loam::setting-goals` instead of altering the goal here.
 
 Be critical. Do not under-scope the impact. It is better to flag a task as potentially affected than to miss a cascade.
 
@@ -141,9 +144,9 @@ If the user asks for changes to the proposal, revise it and ask again. Repeat un
 
 Once confirmed, apply changes to the plan file in this exact order:
 
-### A. Update goal / acceptance criteria / related research / specs / plan metadata (if needed)
+### A. Update plan goal / acceptance criteria / related research / specs / metadata (if needed)
 
-Edit the Goal and Acceptance criteria sections if the amendment changes the observable end state. Keep the acceptance criteria checkable, and prefer independently re-runnable tests or validations where appropriate.
+Edit the plan's `## Goal` and acceptance criteria if the amendment changes its observable end state. Keep them aligned with any linked goal artifact without changing that artifact here.
 
 If the observable scope changes materially, also update front matter `description`. The description must stay within 70 tokens.
 

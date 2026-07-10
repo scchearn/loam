@@ -6,6 +6,7 @@ created_at: YYYY-MM-DD HH:MM ±HH:MM
 updated_at: YYYY-MM-DD HH:MM ±HH:MM
 approved_at: null
 research: [] # optional: plans/research/<slug>.md
+goal: # optional: goals/<slug>.md provenance; omit when not goal-backed
 ---
 
 # <Spec Title>

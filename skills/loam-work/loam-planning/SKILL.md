@@ -1,9 +1,9 @@
 ---
 name: loam::planning
-description: "Use when an approved workspace spec needs an execution-ready implementation plan with ordered, verifiable steps. Specs are mandatory: this skill consumes design decisions, verifies that the spec still matches the codebase, and writes the repo-native plans/ artifacts."
+description: "Use when an approved workspace spec needs an execution-ready implementation plan with ordered, verifiable steps. Specs are mandatory: this skill consumes design decisions, verifies that the spec still matches the codebase, and writes the repo-native plans/ artifacts. Inherits optional goal provenance; see loam::setting-goals."
 allowed-tools: Read Glob Grep Bash Write Edit Skill
 metadata:
-  version: "2.4.0"
+  version: "2.5.0"
   author: scchearn
   argument-hint: <spec path or spec topic>
 ---
@@ -73,6 +73,16 @@ No spec found. Specs are required before planning. Run /loam::writing-spec <topi
 5. If multiple specs could match, STOP and ask the user to choose the exact spec path.
 
 The resolved spec path becomes the plan front matter `spec:` value and the `## Spec` body link.
+
+### Optional goal provenance
+
+If the spec front matter contains a `goal:` field pointing to `goals/<slug>.md`:
+1. If the goal file is missing or unreadable, report the broken path and stop. Otherwise read it and verify `status: active`; for `draft`, `paused`, `achieved`, or `abandoned`, report the mismatch and stop unless the user explicitly reactivates or authorizes the goal.
+2. Carry the `goal:` field into the plan front matter.
+3. Keep the plan's `## Goal` sentence aligned with the goal artifact's `## Intent` while expressing this plan's observable contribution.
+4. Identify task outputs that may support a later goal review (test artifacts, validation commands, observable evidence). Note them in task `Watch for` or `Passes when` fields.
+5. Do not treat plan acceptance as goal validation. Only `/loam::setting-goals` may change goal status.
+6. After writing the plan, register it under the goal's `## Linked work` → `### Plans` list.
 
 ---
 
@@ -289,7 +299,7 @@ Do not begin executing tasks.
 
 Use the skill-local `references/template.md`. New plans must contain:
 
-- YAML front matter with `title`, `slug`, `spec`, `description`, `status`, `task_count`, `created_at`, `started_at`, and `completed_at`
+- YAML front matter with `title`, `slug`, `spec`, `description`, `status`, `task_count`, `created_at`, `started_at`, `completed_at`, and optional `goal`
 - `## Spec` with the consumed spec link and status/date summary
 - `## Goal`
 - `## Acceptance criteria` copied or directly derived from the spec

@@ -1,9 +1,9 @@
 ---
 name: loam::reviewing-memory
-description: "Surface and classify all open questions, unresolved contradictions, stale claims, and knowledge gaps from existing memory. Use this when the user wants to see what's still open, what needs attention, what's unresolved, or what still needs research or ingest. Not for answering questions, fixing issues, or adding new material; use /loam::querying-memory, /loam::linting-memory, /loam::amending-memory, /loam::adding-to-memory, or /loam::learning-from-session."
+description: "Surface and classify all open questions, unresolved contradictions, stale claims, and knowledge gaps from existing memory. Use this when the user wants to see what's still open, what needs attention, what's unresolved, or what still needs research or ingest. Does not classify incomplete goals as memory gaps. Not for answering questions, fixing issues, or adding new material; use /loam::querying-memory, /loam::linting-memory, /loam::amending-memory, /loam::adding-to-memory, or /loam::learning-from-session."
 allowed-tools: Read Glob Grep AskUserQuestion Bash
 metadata:
-  version: "1.2.0"
+  version: "1.3.0"
   author: scchearn
   argument-hint: [wiki root or focus area]
 ---
@@ -141,5 +141,6 @@ If the review found no significant open items, say so explicitly and note any re
 - Classify by urgency first, then group by topic.
 - Keep the report concise but complete. The first thing the user sees should be the summary counts.
 - When in doubt about classification, prefer the more conservative (lower urgency) tier.
+- Do not classify incomplete goals (`goals/*.md` with `status: draft` or open questions) as memory gaps. Goals are workflow artifacts, not memory. Goal health is handled by `/loam::linting-memory` and `/loam::setting-goals`.
 - qmd is secondary. Structural scan (steps A–E) stays Grep/Glob-led. Use qmd (the protocol in `loam::using`) only for content discovery: expanding from discovered issues into related-note neighborhoods.
 - If qmd is unavailable, unmapped, or degraded, continue without it. The skill must not fail.

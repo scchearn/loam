@@ -9,6 +9,7 @@
     "./skills/loam-work/loam-checkpointing",
     "./skills/loam-work/loam-configuring-agents",
     "./skills/loam-work/loam-amending-plan",
+    "./skills/loam-work/loam-setting-goals",
     "./skills/loam-memory/loam-adding-to-memory",
     "./skills/loam-memory/loam-querying-memory",
     "./skills/loam-memory/loam-normalizing-memory",

@@ -1,11 +1,11 @@
 ---
 name: loam::linting-memory
-description: "Run a health check on existing memory (the wiki substrate). Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, or consolidate a legacy root `overview.md` into `index.md`. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
+description: "Run a health check on existing memory (the wiki substrate) and goal artifacts. Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, consolidate a legacy root `overview.md` into `index.md`, or health-check goal artifacts. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.7.0"
+  version: "1.8.0"
   author: scchearn
-  argument-hint: [wiki root or focus area]
+  argument-hint: [wiki root, goal path, or focus area]
 ---
 
 You are a senior engineer and wiki maintainer performing a structured health-check on a persistent markdown wiki. Your job is to improve wiki integrity without turning the lint pass into a full ingest or a speculative rewrite.
@@ -28,7 +28,9 @@ Apply safe fixes directly. For issues that need new evidence or substantive judg
 
 The lint target is: $ARGUMENTS
 
-If no explicit target is provided, lint the whole wiki.
+If no explicit target is provided, lint the whole wiki and any goals directory.
+
+If the target is a `goals/<slug>.md` path, run only the goal-health pass (Step 2G) for that single goal file. Skip all wiki-only steps.
 
 ---
 
@@ -43,17 +45,15 @@ bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh"
   || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
 ```
 
-Parse the JSON output. If `exists` is false, stop and recommend:
+Parse the JSON output. If `exists` is false, check whether `goals/` exists (`ls goals/*.md 2>/dev/null`). If `goals/` exists, skip all wiki-only steps (Steps 1 "Read the wiki contract" through Step 2 "Apply safe fixes") and jump directly to the goal-health pass (Step 2G). If neither a wiki nor goals exist, stop and recommend:
 
 ```text
 /loam::scaffolding-wiki <topic or wiki goal>
 ```
 
+If the target was a single `goals/<slug>.md` path, skip all wiki-only steps and run only the goal-health pass for that file.
+
 Use `wiki_root` as the resolved wiki root (resolved from on-disk contract files, not qmd metadata). If `has_overview` is true, note it as a legacy root-hub file to fold into `index.md`. Then resolve the lint scope: if the user named a wiki root, subdirectory, topic, or entity, use that. If no scope given, lint the whole wiki.
-
-If multiple candidate wiki roots exist and the target is ambiguous, ask the smallest possible follow-up question.
-
-Runtime guard: if `loamstate` fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks.
 
 This skill satisfies the `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, and `legacy_structure_pending` hints (see the hint contract in `loam::using`); treat them as advisory scope, not extra mandatory work.
 
@@ -231,29 +231,43 @@ If qmd was ready and you wrote to the wiki, run `qmd update -c <collection> 2>/d
 
 ---
 
+## Step 2G — Goal-health pass (report-only)
+
+The goal pass runs when `goals/` exists (`ls goals/*.md 2>/dev/null`), even if `loamstate` reports no wiki. It is structurally separate from wiki linting, report-only, and does not alter files or append a wiki lint log entry solely for goal checks.
+
+Read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/lint-checklist.md` and apply the **Goal health** section. It checks: missing required front matter or sections, invalid lifecycle status, stale drafts (30 days), overdue or stale active goals (`next_review_at`, otherwise `reviewed_at` or fallback `updated_at` at 90 days), broken linked spec/plan paths, inconsistent `goals/INDEX.md` rows, achieved without a passing review, and `reviewed_at` inconsistent with the newest review entry (compare date portion only).
+
+Paused, achieved, and abandoned goals are exempt from staleness checks. Report goal findings in a separate section. Do not alter goal files. Route corrections through `/loam::setting-goals`.
+
+---
+
 ## Step 3 — Report back
 
 ```md
-Wiki lint completed for <scope>
+<Wiki lint | Goal lint> completed for <scope>
 
 ### Fixed now
 
-- <issue>
+- <issue or "none">
 
 ### Annotated but unresolved
 
 - <issue or "none">
 
+### Goal health findings
+
+- <goal finding or "none — no goals directory" or "none — goals healthy">
+
 ### Touched pages
 
-- <path>
+- <path or "none — goals-only workspace">
 
 ### Next useful command
 
-- `/loam::adding-to-memory <local source path or topic>`
+- `/loam::adding-to-memory <local source path or topic>` or `/loam::setting-goals <goal path>` when goal findings exist
 ```
 
-If the pass found no significant issues, say so explicitly and still note any residual risks or thin areas.
+If the pass found no significant issues, say so explicitly and still note any residual risks or thin areas. In a goals-only workspace, report as "Goal lint completed for <scope>" with wiki-only sections set to "none."
 
 ---
 
@@ -281,3 +295,4 @@ If the pass found no significant issues, say so explicitly and still note any re
 - qmd is secondary. Structural checks (inventory, orphans, wikilinks, .obsidian placement, checkpoint filenames) remain Glob- and Grep-led. Use qmd (the protocol in `loam::using`) only for content discovery: stale claims, contradictions, and related-note neighborhoods.
 - After wiki edits, refresh qmd if the collection is ready. If refresh fails, report it but do not roll back.
 - If qmd is unavailable, unmapped, or degraded, continue without it. The skill must not fail.
+- Goal lint is report-only. It runs when `goals/` exists, even without a wiki. It does not alter goal files or append a wiki lint log entry. Route corrections through `/loam::setting-goals`.

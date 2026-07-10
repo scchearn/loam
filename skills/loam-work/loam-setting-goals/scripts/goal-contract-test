@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
+
+require() {
+  local file=$1 pattern=$2 label=$3
+  if ! grep -Eq "$pattern" "$ROOT/$file"; then
+    printf 'FAIL: %s (%s)\n' "$label" "$file" >&2
+    exit 1
+  fi
+}
+
+require_absent() {
+  local file=$1 pattern=$2 label=$3
+  if grep -Eq "$pattern" "$ROOT/$file"; then
+    printf 'FAIL: %s (%s)\n' "$label" "$file" >&2
+    exit 1
+  fi
+}
+
+require skills/loam-work/loam-setting-goals/SKILL.md 'maximum 6 words' 'goal slug rule missing'
+require skills/loam-work/loam-setting-goals/SKILL.md 'distinct agent.*blocked|distinct reviewer.*blocked' 'unavailable independent reviewer must block'
+require skills/loam-work/loam-setting-goals/SKILL.md 'front matter.*status.*achieved|status: achieved.*front matter' 'passing review must update front matter status'
+
+for skill in \
+  skills/loam-work/loam-writing-spec/SKILL.md \
+  skills/loam-work/loam-planning/SKILL.md \
+  skills/loam-work/loam-starting/SKILL.md \
+  skills/loam-work/loam-amending-plan/SKILL.md \
+  skills/loam-work/loam-resuming/SKILL.md; do
+  require "$skill" 'missing or unreadable.*stop|does not exist.*stop' 'broken goal provenance must stop'
+done
+
+require skills/loam-work/loam-planning/SKILL.md '## Goal.*## Intent|plan.*Goal.*goal.*Intent' 'plan goal must align with goal intent'
+require skills/loam-using/SKILL.md '\(`wiki/`, `goals/`, `specs/`, `plans/`\)' 'router precedence must list goals'
+require skills/loam-using/SKILL.md 'debate.*wins|debate.*goal.*configuring-agents' 'goal versus debate precedence missing'
+require skills/loam-memory/loam-linting-memory/references/lint-checklist.md 'timezone|offset|YYYY-MM-DD HH:MM' 'goal timestamp format lint missing'
+
+require .claude-plugin/marketplace.json 'goals' 'marketplace descriptions omit goals'
+require .cursor-plugin/plugin.json 'goals' 'Cursor description omits goals'
+require .codex-plugin/plugin.json 'goals' 'Codex description omits goals'
+require_absent WHY.md '20 skill' 'WHY.md contains stale skill count'
+require_absent skills/loam-using/scripts/loamstate.sh 'goal_ready_for_spec|goal_review_due|goal_missing|goal_stale|goal_progress' 'loamstate must not emit goal hints'
+
+python3 -m json.tool "$ROOT/skills/loam-work/loam-setting-goals/evals/evals.json" >/dev/null
+printf 'goal contract: PASS\n'

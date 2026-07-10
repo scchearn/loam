@@ -1,0 +1,88 @@
+{
+  "skill_name": "loam::setting-goals",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Set a goal from: make onboarding much better.",
+      "expected_output": "The skill asks only consequential questions, proposes a concise kebab-case goal, and waits for confirmation before writing it.",
+      "assertions": [
+        "The goal requires intent and a validation contract",
+        "The slug is lowercase kebab-case with no special characters and at most six words",
+        "The skill does not create a spec or plan",
+        "The skill does not write the goal before confirmation"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Review goals/auth-reliability.md; its automated validation passes.",
+      "expected_output": "A passing explicit review appends concise evidence and sets front matter status to achieved.",
+      "assertions": [
+        "The validation checks observable reality",
+        "The review entry records procedure, result, evidence, and decision",
+        "The front matter status is set to achieved",
+        "The goals index is synchronized"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Review goals/auth-reliability.md; the check runs but the expected result is not met.",
+      "expected_output": "A failed review records concise evidence, leaves the goal active, and records one next action.",
+      "assertions": [
+        "The result is fail rather than blocked",
+        "The goal remains active",
+        "Exactly one next action is recorded",
+        "No retry or loop starts automatically"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Review a visual goal, but no distinct reviewer agent is available.",
+      "expected_output": "The independent-review procedure is blocked rather than self-evaluated.",
+      "assertions": [
+        "The worker does not review its own output",
+        "The review is recorded as blocked",
+        "Lifecycle status is unchanged",
+        "No substitute self-assessment is treated as evidence"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "Continue goal-backed work whose goal path is goals/missing.md, but that file does not exist.",
+      "expected_output": "The workflow reports the broken provenance path and stops.",
+      "assertions": [
+        "The missing goal path is named",
+        "The workflow does not silently treat the work as goal-free",
+        "The workflow stops until the path is corrected or explicitly detached"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "Lint goals/stale-goal.md; its timestamps lack timezone offsets and it has not been reviewed in 100 days.",
+      "expected_output": "Goal lint reports both malformed timestamps and staleness without modifying the goal.",
+      "assertions": [
+        "Point-in-time fields are checked for numeric timezone offsets",
+        "The stale active goal is reported",
+        "The goal file is not modified",
+        "No proactive goal hint is emitted"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "Have agents debate whether this ambition should become a goal.",
+      "expected_output": "Debate intent routes to loam::configuring-agents rather than creating a goal.",
+      "assertions": [
+        "Explicit debate intent wins over goal setting",
+        "No goal artifact is created before the debate concludes"
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "A regular approved spec has no goal provenance. Continue through planning and execution.",
+      "expected_output": "The existing goal-free workflow remains unchanged.",
+      "assertions": [
+        "No goal file is required or fabricated",
+        "The normal spec-plan-execution workflow proceeds"
+      ]
+    }
+  ]
+}

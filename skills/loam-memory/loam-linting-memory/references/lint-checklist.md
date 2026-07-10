@@ -54,6 +54,22 @@ Use this checklist to health-check a markdown wiki without turning the pass into
 - normalize obvious internal links to canonical `[[kebab-case-note-name]]` form
 - move stranded code pages (with `source_path:` front matter) from `entities/` to `code/`, update `index.md` grouping, and append a migration log entry
 
+## Goal health (report-only)
+
+- Does each `goals/*.md` (excluding `INDEX.md`) have the required front matter (`title`, `slug`, `status`, `created_at`, `updated_at`, `reviewed_at`, `next_review_at`) and body sections (`## Intent`, `## Validation contract`, `## Linked work`, `## Current state`, `## Reviews`)?
+- Do goal point-in-time fields use `YYYY-MM-DD HH:MM ±HH:MM` with a numeric timezone offset, or `null` where allowed?
+- Is `status` one of `draft`, `active`, `paused`, `achieved`, `abandoned`?
+- Are draft goals stale (no `updated_at` update for 30 days)?
+- Are active goals overdue (`next_review_at` has passed)?
+- Are active goals stale when no explicit `next_review_at` applies (`reviewed_at` older than 90 days, or `updated_at` older than 90 days when never reviewed)?
+- Do linked spec or plan paths under `## Linked work` exist on disk?
+- Is `goals/INDEX.md` consistent with the goal files on disk (no missing or extra rows)?
+- Does an `achieved` goal have at least one `Result: pass` review entry?
+- Is `reviewed_at` consistent with the date of the newest `### YYYY-MM-DD` review entry (compare date portion only)?
+- Are paused, achieved, and abandoned goals exempt from staleness checks?
+
+Goal lint findings are report-only. Do not alter goal files. Route corrections through `/loam::setting-goals`.
+
 ## Avoid during lint
 
 - new source ingestion

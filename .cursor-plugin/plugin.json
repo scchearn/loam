@@ -1,7 +1,7 @@
 {
   "name": "loam",
   "displayName": "loam",
-  "description": "Workflow skills for AI coding agents: planning, specs, memory, checkpoints, and agent debates",
+  "description": "Workflow skills for AI coding agents: goals, planning, specs, memory, checkpoints, and agent debates",
   "version": "0.1.0",
   "author": {
     "name": "scchearn",
@@ -13,6 +13,7 @@
   "keywords": [
     "skills",
     "planning",
+    "goals",
     "memory",
     "checkpoints",
     "specs",

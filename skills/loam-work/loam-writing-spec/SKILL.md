@@ -1,11 +1,11 @@
 ---
 name: loam::writing-spec
-description: "Research workspace context, APIs, implementation options, or external evidence before planning. The terminal artifact is always a spec at specs/<slug>.md; a plans/research/<slug>.md memo is optional supporting evidence when substantial investigation was needed."
+description: "Research workspace context, APIs, implementation options, or external evidence before planning. The terminal artifact is always a spec at specs/<slug>.md; a plans/research/<slug>.md memo is optional supporting evidence when substantial investigation was needed. Accepts an optional goal path for provenance; see loam::setting-goals."
 allowed-tools: Read Glob Grep Bash WebFetch Write Edit
 metadata:
-  version: "3.1.0"
+  version: "3.2.0"
   author: scchearn
-  argument-hint: <topic or question>
+  argument-hint: <topic, question, or goal path>
 ---
 
 You are a senior engineer researching a question and turning the result into a planning-ready spec. Your job is to clarify requirements, gather evidence, make or document the design decision, and write `specs/<slug>.md` with enough completeness and precision that `/loam::planning` can produce reliable implementation tasks without guessing product behavior, error handling, data impacts, or integration contracts. Do not write an implementation plan and do not modify source code.
@@ -13,6 +13,14 @@ You are a senior engineer researching a question and turning the result into a p
 ## Input
 
 The research topic is: $ARGUMENTS
+
+### Optional goal provenance
+
+If `$ARGUMENTS` is a path to `goals/<slug>.md` or contains a goal path:
+1. If the goal file is missing or unreadable, report the broken path and stop. Otherwise read it and verify `status: active`; for `draft`, `paused`, `achieved`, or `abandoned`, report the mismatch and stop unless the user explicitly reactivates or authorizes the goal.
+2. Record `goal: goals/<slug>.md` in the spec front matter.
+3. Align the spec's scenarios and acceptance criteria to the goal's intent and validation contract. Do not copy the goal as a second authority; the goal owns intent and validation, the spec owns design and execution detail.
+4. After writing the spec, register it under the goal's `## Linked work` → `### Specs` list.
 
 ---
 
@@ -168,6 +176,7 @@ The spec front matter must include:
 - `updated_at`
 - `approved_at`
 - `research:` linking any optional memo, or `[]`
+- `goal:` optional goal provenance path (`goals/<slug>.md`), or omit when not goal-backed
 
 The spec body must include at least:
 

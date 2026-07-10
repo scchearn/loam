@@ -160,6 +160,37 @@
         "The output recommends /loam::writing-spec <topic> to complete or regenerate the spec",
         "The output does not invent missing requirements or design decisions"
       ]
+    },
+    {
+      "id": 16,
+      "prompt": "Create a plan from specs/goal-backed-feature.md. The spec front matter includes goal: goals/feature-goal.md pointing to an active goal.",
+      "expected_output": "A plan that preserves goal provenance in front matter, identifies validation outputs in task fields, and does not treat plan acceptance as goal validation.",
+      "assertions": [
+        "The output includes goal: in the plan YAML front matter",
+        "The output does not change the goal status",
+        "The output identifies task outputs that may support a later goal review",
+        "The output does not treat plan completion as goal achievement"
+      ]
+    },
+    {
+      "id": 17,
+      "prompt": "Create a plan from specs/goal-backed-feature.md. The spec front matter says goal: goals/paused-goal.md, but the goal file has status: paused.",
+      "expected_output": "A response that detects the non-active goal state, reports the mismatch, and stops unless the user explicitly reactivates or authorizes the goal.",
+      "assertions": [
+        "The output reads the live goal status",
+        "The output reports that the goal is paused",
+        "The output stops and does not proceed with planning unless the user reactivates the goal"
+      ]
+    },
+    {
+      "id": 18,
+      "prompt": "Create a plan from specs/regular-feature.md. The spec has no goal field in front matter.",
+      "expected_output": "A standard plan with no goal provenance, preserving backward compatibility for non-goal-backed specs.",
+      "assertions": [
+        "The output does not add a goal field to the plan front matter",
+        "The output produces the standard plan without goal-related checks",
+        "The output preserves the existing spec-to-plan workflow behavior"
+      ]
     }
   ]
 }

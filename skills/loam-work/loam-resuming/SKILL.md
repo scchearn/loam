@@ -1,9 +1,9 @@
 ---
 name: loam::resuming
-description: "Use when resuming work after a pause, reboot, or context switch and the workspace uses `wiki/checkpoints/` resumable notes. Read the latest relevant checkpoint chain, orient to the most likely in-flight scope, verify current files and tools before acting, and report the safest next step."
+description: "Use when resuming work after a pause, reboot, or context switch and the workspace uses `wiki/checkpoints/` resumable notes. Read the latest relevant checkpoint chain, orient to the most likely in-flight scope, verify current files and tools before acting, and report the safest next step. Treats a goal path as concrete context; checks live goal status over stale checkpoints."
 allowed-tools: Read Glob Grep Bash
 metadata:
-  version: "1.2.1"
+  version: "1.3.0"
   author: scchearn
   argument-hint: "[optional hint or focus]"
 ---
@@ -112,6 +112,7 @@ Verify only what the checkpoint would cause you to act on, such as:
 - does the cited plan/spec/note still match the checkpoint summary
 - do named tools, services, or threads still appear current. Treat empty `hcom events --thread <name>` results as "thread idle/expired — re-open or re-delegate," not as an error. The thread may have been pruned or never persisted; do not fail the resume.
 - is the claimed blocker or next step still plausible from live workspace state
+- if the checkpoint or plan references a goal path and the file is missing or unreadable, report the path and stop. Otherwise read live status; do not resume a `paused`, `achieved`, or `abandoned` goal unless explicitly authorized
 
 If the live state conflicts with the checkpoint, say so directly and prefer the live state.
 

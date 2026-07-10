@@ -3,7 +3,7 @@ name: loam::starting
 description: "Use when beginning or resuming a plan file, including mixed local and hcom-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
 allowed-tools: Read Write Edit Glob Grep Bash WebFetch
 metadata:
-  version: "2.3.0"
+  version: "2.4.0"
   author: scchearn
   argument-hint: plans/<slug>.md [T3 | T3,T5,T7 | T3-T7]
 ---
@@ -67,7 +67,7 @@ graph TD
 
 ## Step 0 — Parse arguments and load the plan
 
-A `plan_ready_to_start` (status `pending`) or `plan_in_progress` hint in `loamstate` output is the advisory signal for this skill; see the hint contract in `loam::using`.
+Consume `plan_ready_to_start` and `plan_in_progress` as advisory hints per `loam::using`.
 
 `$ARGUMENTS` is `<plan-path> [task-filter]`.
 
@@ -76,11 +76,13 @@ A `plan_ready_to_start` (status `pending`) or `plan_in_progress` hint in `loamst
 - `plans/foo.md T3,T5,T7` — run exactly those tasks (comma-separated, no spaces)
 - `plans/foo.md T3-T7` — run T3 through T7 inclusive (by numeric sequence)
 
-Parse everything before the first space as the **plan path**, and everything after it as the optional **task filter**. Read only the plan path; never try to read the filter as a file.
+Before the first space is the **plan path**; the remainder is the optional **task filter**. Read only the path.
 
 If a filter is present, build the **target set** from those task IDs only. Otherwise the target set is the whole plan.
 
 Read the plan in full. YAML front matter is the only authoritative plan metadata. Remove any legacy `updated_at` field or `## Plan summary` section the next time you edit the plan.
+
+For a plan with `goal:` provenance, report and stop if the goal file is missing or unreadable. Otherwise stop unless active or explicitly authorized. Note review evidence in the Decisions log; never change goal status.
 
 If the plan contains `## Execution groups` or constraint labels such as `needs-isolation`, `needs-independent-review`, `risk:data-destructive`, or `needs-parallel`, use those sections during orientation. Read `references/hcom-orchestration.md` before delegating through hcom.
 

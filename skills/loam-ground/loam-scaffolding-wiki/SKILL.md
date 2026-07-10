@@ -1,9 +1,9 @@
 ---
 name: loam::scaffolding-wiki
-description: "Create or extend an Obsidian-friendly markdown wiki scaffold in the current workspace. Use this when the user wants to build a wiki, set up a knowledge base, create a research vault, or scaffold a living markdown note graph before adding sources with `/loam::adding-to-memory`. Not for importing or normalizing existing memory-like corpus; use /loam::normalizing-memory for that."
+description: "Create or extend an Obsidian-friendly markdown wiki scaffold in the current workspace. Use this when the user wants to build a wiki, set up a knowledge base, create a research vault, or scaffold a living markdown note graph before adding sources with `/loam::adding-to-memory`. Identifies goals as sibling workflow artifacts, not wiki content. Not for importing or normalizing existing memory-like corpus; use /loam::normalizing-memory for that."
 allowed-tools: Read Glob Grep Write Edit AskUserQuestion Skill Bash
 metadata:
-  version: "1.4.0"
+  version: "1.5.0"
   author: scchearn
   argument-hint: <topic, corpus, or wiki goal>
 ---
@@ -45,6 +45,8 @@ Read the most relevant files, including when present:
 Inspect structure first. Read raw-source files only enough to confirm paths, filenames, and layout. Do not summarize or synthesize their contents.
 
 Determine whether memory (wiki substrate)-like structure already exists, whether there is a clear raw-source directory, and whether there is an existing schema to extend.
+
+If `goals/` exists, identify it as a sibling workflow artifact directory, not wiki content. Do not create wiki pages for goals; do not link goals into the wiki graph. Goals are maintained by `/loam::setting-goals`.
 
 Once you choose locations, treat them as `<raw root>` and `<wiki root>`.
 

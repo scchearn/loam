@@ -1,7 +1,7 @@
 {
   "name": "loam",
   "version": "0.1.0",
-  "description": "Workflow skills for AI coding agents: planning, specs, memory, checkpoints, and agent debates.",
+  "description": "Workflow skills for AI coding agents: goals, planning, specs, memory, checkpoints, and agent debates.",
   "author": {
     "name": "scchearn",
     "url": "https://github.com/scchearn"
@@ -12,6 +12,7 @@
   "keywords": [
     "skills",
     "planning",
+    "goals",
     "memory",
     "checkpoints",
     "specs",
@@ -21,8 +22,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "loam",
-    "shortDescription": "Planning, memory, and checkpoint skills for coding agents",
-    "longDescription": "Use loam to give an agent a structured way to plan work, research questions, execute plans, and maintain a persistent knowledge base — so sessions build on each other instead of starting from scratch.",
+    "shortDescription": "Goal, planning, memory, and checkpoint skills for coding agents",
+    "longDescription": "Use loam to set verifiable goals, plan and execute work, research questions, and maintain persistent memory so sessions build on each other instead of starting from scratch.",
     "developerName": "scchearn",
     "category": "Coding",
     "capabilities": [
@@ -32,6 +33,7 @@
     ],
     "defaultPrompt": [
       "Let's plan this feature before building it.",
+      "Turn this ambition into a verifiable goal.",
       "Save what we learned this session to memory."
     ],
     "brandColor": "#4A7C59",

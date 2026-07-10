@@ -26,6 +26,10 @@ if [ "$readme_count" != "$plugin_count" ] || [ "$plugin_count" != "$disk_count" 
   fail "skill count mismatch: README.md count ($readme_count) != .claude-plugin/plugin.json count ($plugin_count) != disk SKILL.md count ($disk_count)"
 fi
 
+if [ -z "$(tail -n 1 README.md)" ]; then
+  fail "README.md has a trailing blank line; skill-metrics update must be idempotent"
+fi
+
 metadata_version() {
   awk '
     BEGIN { fm = 0; meta = 0 }

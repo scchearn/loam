@@ -1,9 +1,9 @@
 ---
 name: loam::querying-memory
-description: "Answer questions against existing memory (the wiki substrate). Use this whenever the user is asking what is happening in the project, directory, codebase, architecture, workflow, decisions, or current state and the wiki likely contains the answer, even if they do not explicitly mention the wiki. Also use it for summaries, comparisons, and reusable analyses grounded in current wiki pages. Not for surfacing unresolved gaps; use /loam::reviewing-memory for that."
+description: "Answer questions against existing memory (the wiki substrate). Use this whenever the user is asking what is happening in the project, directory, codebase, architecture, workflow, decisions, or current state and the wiki likely contains the answer, even if they do not explicitly mention the wiki. Also use it for summaries, comparisons, and reusable analyses grounded in current wiki pages. Routes authoritative goal-state questions to /loam::setting-goals. Not for surfacing unresolved gaps; use /loam::reviewing-memory for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: scchearn
   argument-hint: <question>
 ---
@@ -180,3 +180,4 @@ If nothing was written back, say `none` under `Filed back into wiki`.
 - Do not fetch external sources in this skill.
 - Do not modify raw-source files.
 - Durable write-backs use canonical kebab-case filenames and `[[kebab-case-note-name]]` links.
+- Route authoritative goal-state and readiness questions to `/loam::setting-goals`. The wiki may reference goals, but the goal document is authoritative for lifecycle, validation, and review history.

@@ -1,9 +1,9 @@
 ---
 name: loam::normalizing-memory
-description: "Inspect an existing memory corpus (wiki substrate) and align it to this repo's Obsidian-friendly note-graph conventions. Use this when the user wants to import, normalize, retrofit, or clean up existing memory, notes folder, vault, docs tree, or mixed markdown knowledge base. In monorepos, also use it to align relevant AGENTS.md and CLAUDE.md files. Not for routine wiki maintenance; use /loam::linting-memory for that."
+description: "Inspect an existing memory corpus (wiki substrate) and align it to this repo's Obsidian-friendly note-graph conventions. Use this when the user wants to import, normalize, retrofit, or clean up existing memory, notes folder, vault, docs tree, or mixed markdown knowledge base. In monorepos, also use it to align relevant AGENTS.md and CLAUDE.md files. Excludes goals/ from normalization. Not for routine wiki maintenance; use /loam::linting-memory for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.2.0"
+  version: "1.3.0"
   author: scchearn
   argument-hint: "[--guidance-only] [wiki root or scope]"
 ---
@@ -267,3 +267,4 @@ In `--guidance-only` mode, the `Created or updated`, `Renamed or moved`, and oth
 - In `--guidance-only` mode, edit only `AGENTS.md` / `CLAUDE.md` files. The wiki is read-only context in that mode.
 - Do not silently merge ambiguous duplicates.
 - Do not modify raw-source files.
+- Exclude `goals/` from wiki normalization. Goals are workflow artifacts maintained by `/loam::setting-goals`, not wiki content to be normalized.

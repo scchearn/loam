@@ -1,8 +1,8 @@
 ---
 name: loam::using
-description: "The always-on protocol for the loam skill namespace. Use at session start and whenever a loam task appears. Routes to the right skill, explains the memory model (memory = umbrella; wiki, guidance, and checkpoints are substrates), and lists the cross-cutting rules. This is a routing/meta skill — delegate to a specific loam skill rather than performing work itself."
+description: "The always-on protocol for the loam skill namespace. Use at session start and whenever a loam task appears. Routes goals and other loam work, explains the memory model (memory = umbrella; wiki, guidance, and checkpoints are substrates), and lists cross-cutting rules. This is a routing/meta skill — delegate to a specific loam skill rather than performing work itself."
 metadata:
-  version: "1.6.0"
+  version: "1.7.0"
   author: scchearn
 ---
 
@@ -15,7 +15,7 @@ This is the router for the loam skill namespace. It tells you which loam skill t
 1. **Invoke the matching skill before any loam action** — planning, researching, starting, resuming, checkpointing, debating, amending a plan, or any memory/guidance operation. This document only routes; the skill body has the rules. Err on the side of invoking, even if you "already read it" this session.
 2. **Memory first, substrate second.** Say "memory" by default; use "wiki" only to distinguish the markdown substrate from guidance or checkpoints. The wiki is one substrate of memory, not the whole thing.
 3. **Agent-owned memory writes.** The agent writes, corrects, routes, and archives memory without pre-approval. A human flagging a page as wrong/stale triggers the same correction flow as an agent-found contradiction.
-4. **Domain-router precedence.** In a workspace with a loam substrate (`wiki/`, `specs/`, `plans/`), `loam::using` is the domain router for loam-shaped work: memory, specs, plans, checkpoints, and agent debates. Route those tasks through it rather than any generic skill router. Non-loam work is unaffected.
+4. **Domain-router precedence.** In a workspace with loam artifacts (`wiki/`, `goals/`, `specs/`, `plans/`), `loam::using` routes memory, goals, specs, plans, checkpoints, and agent debates before generic skill routers. Non-loam work is unaffected.
 
 ## The memory model
 
@@ -26,6 +26,8 @@ This is the router for the loam skill namespace. It tells you which loam skill t
 | **wiki** | Durable Obsidian-friendly markdown notes under `wiki/` (topic, entity, concept, analysis pages). What `qmd` indexes. | loam-memory group |
 | **guidance** | `AGENTS.md` (canonical); `CLAUDE.md` is a thin `@AGENTS.md` shim; `.claude.local.md` for personal overrides. What harnesses load as prompt context. | `auditing-guidance`, `learning-from-session` |
 | **checkpoints** | Transient work-state under `wiki/checkpoints/`. Restart notes, not durable knowledge — they never touch `index.md`/`log.md`. | `checkpointing` writes, `resuming` reads |
+
+Goals (`goals/<slug>.md`) are optional workflow artifacts, not a fourth substrate. They own intent, validation, lifecycle, and review history. `loam::setting-goals` maintains them; downstream skills maintain traceability links only.
 
 ## Durable-memory admission rubric
 
@@ -46,6 +48,7 @@ Disqualifiers override: **D1 ephemeral** (build state, current branch, "today I 
 | Session state for resume/handoff | `wiki/checkpoints/<slug>.md` | `checkpointing` |
 | Per-task context on a unit of work | task annotation / plan file | `planning`, `starting` |
 | Build output, one-off, unverifiable, rubric failure | discard (optional `log.md` audit line) | none |
+| Broad ambition with verifiable outcome | `goals/<slug>.md` | `setting-goals` |
 
 ## Correction and freshness
 
@@ -66,9 +69,10 @@ If you catch yourself rationalizing a shortcut, invoke the skill instead — eve
 ```
 "I want to..."
 ├─ start something new
+│  ├─ set a verifiable goal ─────────── /loam::setting-goals
 │  ├─ research a question ──────────── /loam::writing-spec
 │  ├─ plan approved work ────────────── /loam::planning
-│  └─ debate / reach consensus ─────── /loam::configuring-agents
+│  └─ debate / reach consensus ────── /loam::configuring-agents
 ├─ execute work
 │  ├─ begin a plan ──────────────────── /loam::starting
 │  ├─ pause / hand off ──────────────── /loam::checkpointing
@@ -85,6 +89,10 @@ If you catch yourself rationalizing a shortcut, invoke the skill instead — eve
 │  ├─ see what's unresolved ─────────── /loam::reviewing-memory
 │  ├─ capture session learnings ─────── /loam::learning-from-session
 │  └─ audit agent guidance ──────────── /loam::auditing-guidance
+├─ work with goals
+│  ├─ create or review a goal ────────── /loam::setting-goals
+│  ├─ pause, reactivate, achieve ────── /loam::setting-goals
+│  └─ change what a goal means ──────── /loam::setting-goals
 └─ set up the substrate
    ├─ scaffold the wiki ─────────────── /loam::scaffolding-wiki
    └─ init Obsidian vault ───────────── /loam::initializing-vault
@@ -96,7 +104,9 @@ If you catch yourself rationalizing a shortcut, invoke the skill instead — eve
 - **Amend vs lint:** specific wrong claim → `amending-memory`; whole-graph check → `linting-memory`.
 - **Query vs review:** want an answer → `querying-memory`; want open gaps → `reviewing-memory`.
 - **Add vs learn:** have a source → `adding-to-memory`; session produced insight → `learning-from-session` (it classifies wiki vs guidance).
-- **Durable enough?** How-to-work-here (command, pattern, quirk) = guidance; what-is-true-here (fact, decision, architecture) = wiki; transient work-state = checkpoint. When still unsure, ask before guessing.
+- **Goal vs spec:** broad ambition with verifiable outcome → `setting-goals`; research a question → `writing-spec`. A goal may produce multiple specs; a spec may optionally record goal provenance.
+- **Goal vs debate:** explicit debate, conference, or consensus intent wins → `configuring-agents`; use `setting-goals` when the user wants the goal artifact created or changed.
+- **Durable enough?** How-to-work-here (command, pattern, quirk) = guidance; what-is-true-here (fact, decision, architecture) = wiki; transient work-state = checkpoint; operational lifecycle = goal. When still unsure, ask before guessing.
 
 ## loamstate hints
 
