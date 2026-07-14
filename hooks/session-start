@@ -126,7 +126,7 @@ if hints:
         evidence_part = " (" + ", ".join(evidence_values) + ")" if evidence_values else ""
         cmd = h.get("command","")
         cmd_part = " → " + cmd if cmd else ""
-        lines.append("- {} — {}{}{}".format(h.get("kind",""), h.get("message",""), evidence_part, cmd_part))
+        lines.append("- [loam:hint] {} — {}{}{}".format(h.get("kind",""), h.get("message",""), evidence_part, cmd_part))
 
 if lines:
     print("\n## Workspace state\n")

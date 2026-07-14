@@ -156,7 +156,7 @@ const getWorkspaceState = () => {
         .join(', ');
       const evidencePart = evidence ? ` (${evidence})` : '';
       const cmd = h.command ? ` → ${h.command}` : '';
-      lines.push(`- ${h.kind} — ${h.message}${evidencePart}${cmd}`);
+      lines.push(`- [loam:hint] ${h.kind} — ${h.message}${evidencePart}${cmd}`);
     }
   }
 

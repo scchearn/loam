@@ -185,7 +185,7 @@ startup, while the body is only loaded when the skill activates.
 | loam::querying-memory | 530 | 105 | 176 | 1,673 |
 | loam::reviewing-memory | 510 | 113 | 137 | 1,787 |
 | loam::syncing-code-graph | 363 | 84 | 223 | 2,984 |
-| loam::using | 368 | 77 | 175 | 3,461 |
+| loam::using | 368 | 77 | 174 | 3,477 |
 | loam::amending-plan | 437 | 88 | 271 | 3,032 |
 | loam::checkpointing | 365 | 69 | 180 | 2,140 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,176 |

@@ -2,7 +2,7 @@
 name: loam::using
 description: "The always-on protocol for the loam skill namespace. Use at session start and whenever a loam task appears. Routes goals and other loam work, explains the memory model (memory = umbrella; wiki, guidance, and checkpoints are substrates), and lists cross-cutting rules. This is a routing/meta skill — delegate to a specific loam skill rather than performing work itself."
 metadata:
-  version: "1.7.1"
+  version: "1.7.2"
   author: scchearn
 ---
 
@@ -126,7 +126,7 @@ Wiki: <absolute wiki root> · qmd: <ready|not installed> [· collection: <name>]
 Wiki: none
 Checkpoints: <count> (latest: "<title>" — <captured_at>)
 Signals:
-- <kind> — <message> [(<evidence key>: <value>, ...)] [→ <command>]
+- [loam:hint] <kind> — <message> [(<evidence key>: <value>, ...)] [→ <command>]
 ```
 
 The PowerShell twin is fast-equivalent and currently omits full-only checks. If bash is unavailable when a full-only signal is required, treat that signal as unknown and use the active skill's conservative fallback.
@@ -135,11 +135,10 @@ The PowerShell twin is fast-equivalent and currently omits full-only checks. If 
 
 After completing the primary task of any loam skill that consumed injected or freshly probed loamstate, scan its hints and surface unsatisfied hints to the user as suggested next actions. This is mandatory — hints that go unread are signals wasted.
 
-For each hint, emit one line in this form:
+For each hint, emit one Markdown list item in this form:
 
 ```text
-loamstate also flagged: <kind> — <message> (<evidence summary>)
-Suggested next: <command>
+- [loam:hint] <kind> — <message> [(<evidence summary>)] [→ <command>]
 ```
 
 Rules:
@@ -148,7 +147,7 @@ Rules:
 - **Only surface hints with a non-null `command`.** Hints without a command (e.g. `retrieval_not_ready`) are informational; mention them only if the user asks for state.
 - **Do not auto-run the suggested skill.** Hints are advisory; the user decides whether to act. End your turn or hand back to the user after surfacing.
 - **Empty `hints[]` → say nothing.** Do not invent suggestions or pad the report.
-- **`evidence` summary.** When the hint's `evidence` object carries a count (e.g. `pending_count`, `drift_count`, `log_lines`, `age_minutes`), include it parenthetically: `code_ingest_pending — 3 source file(s) new or changed (pending_count: 3)`. Omit the parenthetical when `evidence` is empty.
+- **`evidence` summary.** When the hint's `evidence` object carries a count (e.g. `pending_count`, `drift_count`, `log_lines`, `age_minutes`), include it parenthetically: `- [loam:hint] code_ingest_pending — 3 source file(s) new or changed (pending_count: 3)`. Omit the parenthetical when `evidence` is empty.
 
 This makes `loamstate` a closed loop: the script signals, the skill acts, and the next-most-pressing signal surfaces to the user instead of dying in the JSON.
 

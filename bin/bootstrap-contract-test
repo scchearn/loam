@@ -22,7 +22,7 @@ cat > "$SKILL_DIR/scripts/loamstate.sh" <<'EOF'
 #!/usr/bin/env bash
 printf 'run\n' >> "$LOAM_TEST_COUNTER"
 workspace="${@: -1}"
-printf '{"wiki_root":"%s/wiki","exists":true,"qmd_ready":true,"collection":"test-wiki","checkpoint_count":1,"latest_checkpoint":{"title":"Test checkpoint","captured_at":"2026-07-10"},"drift_count":null,"hints":[{"kind":"checkpoint_stale","message":"Checkpoint needs refresh.","command":"/loam::checkpointing","evidence":{"age_minutes":42,"checkpoint_count":1}}]}\n' "$workspace"
+printf '{"wiki_root":"%s/wiki","exists":true,"qmd_ready":true,"collection":"test-wiki","checkpoint_count":1,"latest_checkpoint":{"title":"Test checkpoint","captured_at":"2026-07-10"},"drift_count":null,"hints":[{"kind":"checkpoint_stale","message":"Checkpoint needs refresh.","command":"/loam::checkpointing","evidence":{"age_minutes":42,"checkpoint_count":1}},{"kind":"retrieval_not_ready","message":"Retrieval metadata is not ready.","command":null,"evidence":{}}]}\n' "$workspace"
 EOF
 chmod +x "$SKILL_DIR/scripts/loamstate.sh"
 
@@ -68,6 +68,23 @@ grep -Fq 'age_minutes: 42' "$INJECTED_CONTEXT" || {
   printf 'FAIL: injected state lacks hint evidence\n' >&2
   exit 1
 }
+grep -Fq -- '- [loam:hint] checkpoint_stale — Checkpoint needs refresh. (age_minutes: 42, checkpoint_count: 1) → /loam::checkpointing' "$INJECTED_CONTEXT" || {
+  printf 'FAIL: OpenCode hint lacks canonical marked format\n' >&2
+  exit 1
+}
+grep -Fq -- '- [loam:hint] retrieval_not_ready — Retrieval metadata is not ready.' "$INJECTED_CONTEXT" || {
+  printf 'FAIL: OpenCode hint with optional fields lacks canonical marked format\n' >&2
+  exit 1
+}
+
+grep -Fq -- '- [loam:hint] <kind> — <message>' "$ROOT/skills/loam-using/SKILL.md" || {
+  printf 'FAIL: loam::using lacks canonical marked hint contract\n' >&2
+  exit 1
+}
+if grep -Fq 'loamstate also flagged:' "$ROOT/skills/loam-using/SKILL.md" || grep -Fq 'Suggested next:' "$ROOT/skills/loam-using/SKILL.md"; then
+  printf 'FAIL: loam::using retains legacy two-line hint format\n' >&2
+  exit 1
+fi
 
 check_hook() {
   local mode="$1" output
@@ -93,6 +110,10 @@ else:
 expected = f'Workspace: {os.environ["TEST_WORKSPACE"]} · Probe: loamstate --fast'
 assert expected in context, f"{mode}: missing workspace/probe provenance"
 assert "age_minutes: 42" in context, f"{mode}: missing hint evidence"
+expected_hint = "- [loam:hint] checkpoint_stale — Checkpoint needs refresh. (age_minutes: 42, checkpoint_count: 1) → /loam::checkpointing"
+assert expected_hint in context, f"{mode}: hint lacks canonical marked format"
+expected_bare_hint = "- [loam:hint] retrieval_not_ready — Retrieval metadata is not ready."
+assert expected_bare_hint in context, f"{mode}: hint with optional fields lacks canonical marked format"
 PY
 }
 
