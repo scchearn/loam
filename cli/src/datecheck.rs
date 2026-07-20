@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const TZ_FIELDS: &[&str] = &[
     "created_at",
@@ -437,22 +436,7 @@ fn canonical_base(value: &str) -> Option<&str> {
 }
 
 fn default_offset() -> String {
-    let raw = Command::new("date")
-        .arg("+%z")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .unwrap_or_default();
-    let bytes = raw.as_bytes();
-    if bytes.len() == 5
-        && matches!(bytes[0], b'+' | b'-')
-        && bytes[1..].iter().all(u8::is_ascii_digit)
-    {
-        format!("{}{}:{}", &raw[0..1], &raw[1..3], &raw[3..5])
-    } else {
-        "+00:00".to_owned()
-    }
+    chrono::Local::now().format("%:z").to_string()
 }
 
 fn json_escape(value: &str) -> String {
@@ -471,4 +455,30 @@ fn json_escape(value: &str) -> String {
         }
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_offset;
+
+    #[test]
+    fn default_offset_matches_the_local_zone_in_hh_mm_form() {
+        // ponytail: bracket the call so a DST transition mid-test cannot flake it
+        let before = chrono::Local::now().format("%:z").to_string();
+        let offset = default_offset();
+        let after = chrono::Local::now().format("%:z").to_string();
+        assert!(
+            offset == before || offset == after,
+            "expected {before} or {after}, got {offset}"
+        );
+
+        let bytes = offset.as_bytes();
+        assert_eq!(bytes.len(), 6, "expected +HH:MM, got {offset}");
+        assert!(matches!(bytes[0], b'+' | b'-'));
+        assert_eq!(bytes[3], b':');
+        assert!(bytes[1..3]
+            .iter()
+            .chain(&bytes[4..6])
+            .all(u8::is_ascii_digit));
+    }
 }
