@@ -5,7 +5,7 @@ Use this checklist to health-check a markdown wiki without turning the pass into
 ## Structure
 
 - Does `index.md` contain a concise `## Overview` section near the top?
-- Are all durable pages represented in `index.md`?
+- Are all durable prose pages in root `index.md`, with ordinary code pages only in the complete generated hub?
 - Does `index.md` reference any missing pages?
 - Is a legacy root `overview.md` still present?
 - If `overview.md` exists, does it duplicate or conflict with the root-hub content already in `index.md`?
@@ -52,7 +52,7 @@ Use this checklist to health-check a markdown wiki without turning the pass into
 - add short stale-claim notes
 - create a minimal reusable page for an entity or concept already well established in memory (wiki substrate)
 - normalize obvious internal links to canonical `[[kebab-case-note-name]]` form
-- move stranded code pages (with `source_path:` front matter) from `entities/` to `code/`, update `index.md` grouping, and append a migration log entry
+- move stranded code pages (with `source_path:` front matter) from `entities/` to `code/`, rebuild the code hub, and append a migration log entry
 
 ## Goal health (report-only)
 

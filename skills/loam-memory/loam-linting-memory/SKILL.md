@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate) and goal artifacts. Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, consolidate a legacy root `overview.md` into `index.md`, or health-check goal artifacts. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.8.1"
+  version: "1.9.0"
   author: scchearn
   argument-hint: [wiki root, goal path, or focus area]
 ---
@@ -71,7 +71,9 @@ Before editing, read:
 
 Use `Glob` and `Grep` to map the pages in scope before reading deeply.
 
-Treat `index.md` as the authoritative root hub. The desired steady state is a single root-hub file: `index.md` with a concise `## Overview` section before the grouped page catalog.
+When ordinary `code/*.md` pages exist or migration will create them, read and apply `references/code-hub.md`.
+
+Treat `index.md` as the root hub for durable prose, with a concise `## Overview` and one code-hub link.
 
 ### qmd metadata health (secondary only)
 
@@ -85,7 +87,7 @@ qmd is **secondary only** in this skill: use it only for *content* discovery —
 
 ### Audit for health issues
 
-**A. Structure and inventory** — Check for: `index.md` missing `## Overview` section; legacy `overview.md` still present; content stranded in `overview.md` instead of `index.md`; duplicated root-hub content; pages on disk but missing from index; index entries pointing to non-existent pages; duplicate note identities; filename convention drift; legacy checkpoint filenames like `checkpoint-YYYY-MM-DD-HHMM-<slug>.md` that should become `checkpoint-YYYY-MM-DD-HHMM.md`; near-duplicate pages; empty or placeholder pages.
+**A. Structure and inventory** — Check for: `index.md` missing `## Overview` section; legacy `overview.md` still present; content stranded in `overview.md` instead of `index.md`; duplicated root-hub content; durable prose missing from the root index; generated code-hub drift; index entries pointing to non-existent pages; duplicate note identities; filename convention drift; legacy checkpoint filenames like `checkpoint-YYYY-MM-DD-HHMM-<slug>.md` that should become `checkpoint-YYYY-MM-DD-HHMM.md`; near-duplicate pages; empty or placeholder pages.
 
 **B. Link health** — Check for: unresolved `[[wikilinks]]`; orphan pages; pages with no meaningful inbound or outbound links; pages only discoverable from `index.md`; pages that should link but don't; missing reciprocal backlinks; repeated entity/concept mentions without a dedicated page.
 
@@ -159,7 +161,7 @@ When `<wiki root>/entities/` contains stranded code pages (pages with `source_pa
    - **No collision** → move `entities/<slug>.md` to `code/<slug>.md`
    - **Collision** → do NOT overwrite; report the collision as an unresolved finding and leave `entities/<slug>.md` in place for manual resolution
 4. wikilinks stay `[[slug]]` — Obsidian resolves by filename, not path, so no link rewrites are needed
-5. update `index.md`: move affected entries from the `## Entities` group to the `## Code` group (create `## Code` if absent)
+5. rebuild the generated code hub; remove affected direct root-index entries
 6. append a migration entry to `<wiki root>/log.md`:
    ```md
    ## [YYYY-MM-DD] migrate | code entities → code/
@@ -169,7 +171,7 @@ When `<wiki root>/entities/` contains stranded code pages (pages with `source_pa
 
 Allowed direct fixes:
 
-1. updating `index.md` to match actual durable pages with `## Overview`
+1. updating `index.md` to match actual durable prose with `## Overview`
 2. consolidating safe structural content from legacy `overview.md` into `index.md`
 3. deleting legacy `overview.md` after useful content preserved
 4. resolving obvious broken `[[wikilinks]]`
@@ -181,7 +183,7 @@ Allowed direct fixes:
 10. moving only a misplaced nested `<wiki root>/.obsidian/` directory to the parent directory root when the destination has no `.obsidian/` directory
 11. reconciling stale `<wiki root>/.wiki-metadata.json` paths to the actual resolved wiki root
 12. renaming legacy checkpoint files from `checkpoint-YYYY-MM-DD-HHMM-<slug>.md` to `checkpoint-YYYY-MM-DD-HHMM.md` and updating their checkpoint wikilinks when the mapping is collision-free and local
-13. moving stranded code pages (with `source_path:` front matter) from `entities/` to `code/`, updating `index.md` grouping, and appending a migration log entry
+13. moving stranded code pages from `entities/` to `code/`, rebuilding the hub, and logging the migration
 
 Do not: ingest new raw sources, invent facts, silently merge/rename notes, silently delete disagreement/uncertainty, leave redundant `overview.md`, overwrite or merge an existing parent `.obsidian/`, move or rename `<wiki root>` or any wiki content directory, perform broad rewrites, or modify raw-source files.
 
@@ -275,7 +277,7 @@ If the pass found no significant issues, say so explicitly and still note any re
 
 - Read the wiki schema before editing.
 - Prefer direct fixes for objective structural drift.
-- Maintain `index.md` as the single authoritative root hub with a concise `## Overview` section near the top.
+- Maintain `index.md` as the root hub for durable prose, with a concise `## Overview` near the top and one generated code-hub link.
 - Prefer canonical `[[kebab-case-note-name]]` links for durable internal references.
 - Preserve contradictions and uncertainty unless existing wiki evidence genuinely settles them.
 - Do not modify raw-source files.
@@ -284,14 +286,13 @@ If the pass found no significant issues, say so explicitly and still note any re
 - Treat `<wiki root>/.obsidian/` as misplaced Obsidian config when `<wiki root>` is a subdirectory. Move only `.obsidian/` to the parent directory root when that destination has no `.obsidian/` directory.
 - Reconcile stale `.wiki-metadata.json` to the actual resolved wiki root. Lint updates metadata to match the on-disk wiki; it never moves the on-disk wiki to match metadata.
 - Own checkpoint filename migration. New checkpoints should be named `checkpoint-YYYY-MM-DD-HHMM.md`; lint may rename legacy slugged checkpoint files and update checkpoint wikilinks when the mapping is collision-free and local.
-- Own code-page migration. Lint may move `entities/*.md` pages with `source_path:` front matter to `code/` and update `index.md` grouping. Wikilinks need no change (Obsidian resolves by filename). On collision with an existing `code/<slug>.md`, do not overwrite; report unresolved. Append a `## [YYYY-MM-DD] migrate | code entities → code/` log entry (structural change exception to the no-per-pass-entry rule).
+- Own code-page migration. Lint may move `entities/*.md` pages with `source_path:` front matter to `code/` and rebuild the generated hub. Wikilinks need no change (Obsidian resolves by filename). On collision with an existing `code/<slug>.md`, do not overwrite; report unresolved. Append a `## [YYYY-MM-DD] migrate | code entities → code/` log entry (structural change exception to the no-per-pass-entry rule).
 - Never move or rename `<wiki root>` or any wiki content directory as part of `.obsidian/` placement or qmd metadata repair.
 - Rotate `<wiki root>/log.md` when it exceeds 500 lines; lint does not append per-pass entries to `log.md`.
 - Check date format drift with `datecheck.sh check`; canonical formats are in `loam-using/references/date-formats.md`. Apply only unambiguous local normalizations and report ambiguous drift.
 - Check that qmd excludes `.archive/**`; flag missing archive exclusion as a health issue.
 - Flag pages older than 90 days that cite volatile surfaces for re-validation; do not auto-archive them.
 - Keep the note graph traversable, not just the index accurate.
-- Keep `index.md` aligned with the durable pages that exist after the pass.
 - qmd is secondary. Structural checks (inventory, orphans, wikilinks, .obsidian placement, checkpoint filenames) remain Glob- and Grep-led. Use qmd (the protocol in `loam::using`) only for content discovery: stale claims, contradictions, and related-note neighborhoods.
 - After wiki edits, refresh qmd if the collection is ready. If refresh fails, report it but do not roll back.
 - If qmd is unavailable, unmapped, or degraded, continue without it. The skill must not fail.

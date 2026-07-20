@@ -180,7 +180,7 @@ startup, while the body is only loaded when the skill activates.
 | loam::auditing-guidance | 410 | 85 | 252 | 2,528 |
 | loam::ingesting-codebase | 329 | 76 | 271 | 3,229 |
 | loam::learning-from-session | 487 | 101 | 366 | 4,264 |
-| loam::linting-memory | 471 | 102 | 289 | 4,943 |
+| loam::linting-memory | 471 | 102 | 290 | 4,917 |
 | loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
 | loam::querying-memory | 530 | 105 | 176 | 1,673 |
 | loam::reviewing-memory | 510 | 113 | 137 | 1,787 |

@@ -113,6 +113,17 @@ for reference in \
   fi
 done
 
+lint_skill="skills/loam-memory/loam-linting-memory/SKILL.md"
+lint_hub_reference="skills/loam-memory/loam-linting-memory/references/code-hub.md"
+if ! grep -Fq 'references/code-hub.md' "$lint_skill"; then
+  fail "memory lint must conditionally load the code-hub reference"
+fi
+if [ ! -f "$lint_hub_reference" ]; then
+  fail "memory lint code-hub reference is missing"
+elif ! grep -Fq 'Do not add individual code pages to root `index.md`.' "$lint_hub_reference"; then
+  fail "memory lint code-hub reference must forbid direct root entries"
+fi
+
 if [ "$failures" -ne 0 ]; then
   exit 1
 fi
