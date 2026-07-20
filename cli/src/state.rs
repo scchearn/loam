@@ -565,8 +565,8 @@ fn lint_age(content: &str) -> Option<(String, i64)> {
             is_iso_date(date).then(|| date.to_owned())
         })
         .max()?;
-    let epoch = epoch_of(&format!("{date} 00:00 +00:00"))?;
-    Some((date, (now_epoch() - epoch) / 86400))
+    let day = days_since_unix_epoch(&date)?;
+    Some((date, now_epoch() / 86400 - day))
 }
 
 fn codegraph_pending(workspace: &Path, wiki_root: &Path) -> Option<usize> {
@@ -600,15 +600,67 @@ fn optional_json(value: Option<&str>) -> String {
         .unwrap_or_else(|| "null".to_owned())
 }
 
-fn epoch_of(value: &str) -> Option<i64> {
-    let output = Command::new("date")
-        .args(["-d", value, "+%s"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+fn days_since_unix_epoch(value: &str) -> Option<i64> {
+    if !is_iso_date(value) {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    let year: i64 = value[0..4].parse().ok()?;
+    let month: i64 = value[5..7].parse().ok()?;
+    let day: i64 = value[8..10].parse().ok()?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = [
+        31,
+        28 + i64::from(leap),
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if year == 0
+        || !(1..=12).contains(&month)
+        || !(1..=month_days[(month - 1) as usize]).contains(&day)
+    {
+        return None;
+    }
+
+    // Howard Hinnant's civil-calendar conversion, offset to 1970-01-01.
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
+}
+
+fn epoch_of(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 23
+        || bytes[10] != b' '
+        || bytes[13] != b':'
+        || bytes[16] != b' '
+        || !matches!(bytes[17], b'+' | b'-')
+        || bytes[20] != b':'
+    {
+        return None;
+    }
+    let day = days_since_unix_epoch(&value[..10])?;
+    let hour: i64 = value[11..13].parse().ok()?;
+    let minute: i64 = value[14..16].parse().ok()?;
+    let offset_hour: i64 = value[18..20].parse().ok()?;
+    let offset_minute: i64 = value[21..23].parse().ok()?;
+    if hour > 23 || minute > 59 || offset_hour > 23 || offset_minute > 59 {
+        return None;
+    }
+    let offset = (offset_hour * 60 + offset_minute) * 60;
+    let offset = if bytes[17] == b'+' { offset } else { -offset };
+    Some(day * 86_400 + hour * 3_600 + minute * 60 - offset)
 }
 
 fn now_epoch() -> i64 {
@@ -647,7 +699,16 @@ fn json_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::lint_age;
+    use super::{days_since_unix_epoch, epoch_of, lint_age};
+
+    #[test]
+    fn civil_dates_convert_without_platform_tools() {
+        assert_eq!(days_since_unix_epoch("1970-01-01"), Some(0));
+        assert_eq!(days_since_unix_epoch("2000-02-29"), Some(11016));
+        assert_eq!(days_since_unix_epoch("2026-07-20"), Some(20654));
+        assert_eq!(days_since_unix_epoch("2026-02-29"), None);
+        assert_eq!(epoch_of("1970-01-01 02:30 +02:30"), Some(0));
+    }
 
     #[test]
     fn lint_check_parser_accepts_trailing_annotation() {
