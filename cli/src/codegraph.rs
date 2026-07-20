@@ -77,11 +77,18 @@ const DEFAULT_PATTERNS: &[&str] = &[
 ];
 
 pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
-    if args.next().as_deref() != Some("walk") {
-        usage();
-        return 1;
+    match args.next().as_deref() {
+        Some("walk") => run_walk(args),
+        Some("index") => run_index(args),
+        Some("diff") => run_diff(args),
+        _ => {
+            usage();
+            1
+        }
     }
+}
 
+fn run_walk(mut args: impl Iterator<Item = String>) -> i32 {
     let Some(codebase) = args.next() else {
         usage();
         return 1;
@@ -128,59 +135,304 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     }
 }
 
-pub fn pending_count(codebase: &Path, wiki_root: &Path) -> Option<usize> {
-    let walk = collect(codebase, &Options::default()).ok()?;
-    let index = read_code_index(wiki_root);
-    let mut pending = 0;
-
-    for item in walk.items {
-        let Some(record) = index.get(&item.path) else {
-            pending += 1;
-            continue;
-        };
-        if !is_epoch(&record.ingested_at) || item.mtime <= record.ingested_at.parse().unwrap_or(0) {
-            continue;
-        }
-
-        let same_size = record
-            .source_size
-            .as_deref()
-            .and_then(|size| size.parse::<u64>().ok())
-            .is_some_and(|size| size == item.size);
-        let same_hash = same_size
-            && !record.content_hash.is_empty()
-            && compute_hash(&codebase.join(&item.path)) == record.content_hash;
-        if !same_hash {
-            pending += 1;
+fn run_index(mut args: impl Iterator<Item = String>) -> i32 {
+    let Some(wiki_root) = args.next() else {
+        usage();
+        return 1;
+    };
+    let mut codebase_root = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--codebase-root" => {
+                let Some(path) = args.next() else {
+                    eprintln!("Error: --codebase-root requires a directory");
+                    return 1;
+                };
+                codebase_root = Some(PathBuf::from(path));
+            }
+            _ => {
+                eprintln!("Error: unknown flag: {arg}");
+                return 1;
+            }
         }
     }
-    Some(pending)
+
+    let wiki_root = Path::new(&wiki_root);
+    if let Err(code) = validate_wiki_root(wiki_root) {
+        return code;
+    }
+    println!(
+        "{}",
+        index_json(&index_records(wiki_root, codebase_root.as_deref()))
+    );
+    0
+}
+
+fn run_diff(mut args: impl Iterator<Item = String>) -> i32 {
+    let Some(codebase_root) = args.next() else {
+        usage();
+        return 1;
+    };
+    // The wiki root is optional: it is almost always <codebase-root>/wiki, and
+    // requiring it again is friction. A leading flag means it was omitted.
+    let mut next = args.next();
+    let explicit_wiki_root = match next.as_deref() {
+        Some(value) if !value.starts_with('-') => next.take(),
+        _ => None,
+    };
+
+    let mut options = Options::default();
+    let mut strict = false;
+    let mut pending = next;
+    while let Some(arg) = pending.take().or_else(|| args.next()) {
+        match arg.as_str() {
+            "--no-gitignore" => options.no_gitignore = true,
+            "--strict" => strict = true,
+            "--exclusions" => {
+                let Some(path) = args.next() else {
+                    eprintln!("Error: --exclusions requires a file");
+                    return 1;
+                };
+                options.exclusions = Some(PathBuf::from(path));
+            }
+            _ => {
+                eprintln!("Error: unknown flag: {arg}");
+                return 1;
+            }
+        }
+    }
+
+    let codebase_root = PathBuf::from(codebase_root);
+    if !codebase_root.is_dir() {
+        eprintln!(
+            "Error: codebase root not found: {}",
+            codebase_root.display()
+        );
+        return 2;
+    }
+
+    // An empty index is indistinguishable from "nothing is stale", so a wiki
+    // root that cannot be resolved must fail loudly either way.
+    let wiki_root = match explicit_wiki_root {
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if let Err(code) = validate_wiki_root(&path) {
+                return code;
+            }
+            path
+        }
+        None => match crate::state::resolve_wiki_root(&codebase_root) {
+            Some(path) => path,
+            None => {
+                eprintln!(
+                    "Error: no wiki root found under {}; pass it explicitly: loam codegraph diff <codebase-root> <wiki-root>",
+                    codebase_root.display()
+                );
+                return 2;
+            }
+        },
+    };
+
+    let walk = match collect(&codebase_root, &options) {
+        Ok(walk) => walk,
+        Err((code, message)) => {
+            eprintln!("Error: {message}");
+            return code;
+        }
+    };
+    let index = index_records(&wiki_root, Some(&codebase_root));
+    let by_source: HashMap<&str, &IndexEntry> = index
+        .iter()
+        .map(|entry| (entry.source_path.as_str(), entry))
+        .collect();
+
+    let mut entries = Vec::new();
+    for item in &walk.items {
+        let Some(record) = by_source.get(item.path.as_str()) else {
+            entries.push(format!(
+                "{{\"path\":\"{}\",\"mtime\":\"{}\",\"reason\":\"new\"}}",
+                json_escape(&item.path),
+                item.mtime
+            ));
+            continue;
+        };
+        if !is_stale(&codebase_root, item, record, strict) {
+            continue;
+        }
+        entries.push(format!(
+            "{{\"path\":\"{}\",\"mtime\":\"{}\",\"reason\":\"stale\",\"slug\":\"{}\"}}",
+            json_escape(&item.path),
+            item.mtime,
+            json_escape(&record.slug)
+        ));
+    }
+    println!("[{}]", entries.join(","));
+    0
+}
+
+/// Mirrors codegraph.sh's staleness ladder: strict re-hashes everything, otherwise
+/// mtime gates the check and size/hash decide.
+fn is_stale(codebase_root: &Path, item: &WalkItem, record: &IndexEntry, strict: bool) -> bool {
+    if strict {
+        return record.content_hash.is_empty()
+            || compute_hash(&codebase_root.join(&item.path)) != record.content_hash;
+    }
+    if !is_epoch(&record.ingested_at) {
+        return true;
+    }
+    if item.mtime <= record.ingested_at.parse().unwrap_or(0) {
+        return false;
+    }
+    let Some(size) = record
+        .source_size
+        .as_deref()
+        .filter(|value| is_epoch(value))
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return true;
+    };
+    if size != item.size || record.content_hash.is_empty() {
+        return true;
+    }
+    compute_hash(&codebase_root.join(&item.path)) != record.content_hash
+}
+
+/// 0 when the root holds the wiki contract, otherwise exit code 2 with the
+/// `did you mean .../wiki` hint that loam-common.sh used to emit.
+fn validate_wiki_root(wiki_root: &Path) -> Result<(), i32> {
+    const CONTRACT: [&str; 3] = ["SCHEMA.md", "index.md", "log.md"];
+    if !wiki_root.is_dir() {
+        eprintln!("Error: wiki root not found: {}", wiki_root.display());
+        return Err(2);
+    }
+    if CONTRACT.iter().any(|name| wiki_root.join(name).is_file()) {
+        return Ok(());
+    }
+    if CONTRACT
+        .iter()
+        .any(|name| wiki_root.join("wiki").join(name).is_file())
+    {
+        eprintln!(
+            "Error: wiki root contract not found: {}; did you mean: {}/wiki",
+            wiki_root.display(),
+            wiki_root.display()
+        );
+        return Err(2);
+    }
+    eprintln!(
+        "Error: wiki root contract not found: {}",
+        wiki_root.display()
+    );
+    Err(2)
+}
+
+struct IndexEntry {
+    source_path: String,
+    slug: String,
+    ingested_at: String,
+    source_size: Option<String>,
+    content_hash: String,
+    mtime: Option<u64>,
+}
+
+fn index_records(wiki_root: &Path, codebase_root: Option<&Path>) -> Vec<IndexEntry> {
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+    for directory in [wiki_root.join("code"), wiki_root.join("entities")] {
+        let Ok(read_dir) = fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut pages: Vec<PathBuf> = read_dir
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("md")
+            })
+            .collect();
+        pages.sort();
+        for page in pages {
+            let Some((source_path, record)) = parse_index_page(&page) else {
+                continue;
+            };
+            if !seen.insert(source_path.clone()) {
+                continue;
+            }
+            let resolved = resolve_source(&source_path, codebase_root);
+            let mtime = fs::metadata(&resolved).ok().and_then(|metadata| {
+                metadata
+                    .modified()
+                    .ok()?
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_secs())
+            });
+            entries.push(IndexEntry {
+                source_path,
+                slug: page
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                ingested_at: record.ingested_at,
+                source_size: record.source_size,
+                content_hash: record.content_hash,
+                mtime,
+            });
+        }
+    }
+    entries
+}
+
+fn resolve_source(source_path: &str, codebase_root: Option<&Path>) -> PathBuf {
+    match codebase_root {
+        Some(root) if !Path::new(source_path).is_absolute() => root.join(source_path),
+        _ => PathBuf::from(source_path),
+    }
+}
+
+fn index_json(entries: &[IndexEntry]) -> String {
+    let records = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{{\"source_path\":\"{}\",\"slug\":\"{}\",\"ingested_at\":\"{}\",\"source_size\":\"{}\",\"content_hash\":\"{}\",\"mtime\":\"{}\",\"exists\":{}}}",
+                json_escape(&entry.source_path),
+                json_escape(&entry.slug),
+                json_escape(&entry.ingested_at),
+                json_escape(entry.source_size.as_deref().unwrap_or_default()),
+                json_escape(&entry.content_hash),
+                entry.mtime.map(|value| value.to_string()).unwrap_or_default(),
+                entry.mtime.is_some()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{records}]")
+}
+
+pub fn pending_count(codebase: &Path, wiki_root: &Path) -> Option<usize> {
+    let walk = collect(codebase, &Options::default()).ok()?;
+    let index = index_records(wiki_root, Some(codebase));
+    let by_source: HashMap<&str, &IndexEntry> = index
+        .iter()
+        .map(|entry| (entry.source_path.as_str(), entry))
+        .collect();
+
+    Some(
+        walk.items
+            .iter()
+            .filter(|item| match by_source.get(item.path.as_str()) {
+                Some(record) => is_stale(codebase, item, record, false),
+                None => true,
+            })
+            .count(),
+    )
 }
 
 struct IndexRecord {
     ingested_at: String,
     source_size: Option<String>,
     content_hash: String,
-}
-
-fn read_code_index(wiki_root: &Path) -> HashMap<String, IndexRecord> {
-    let mut index = HashMap::new();
-    for directory in [wiki_root.join("code"), wiki_root.join("entities")] {
-        let Ok(entries) = fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("md") {
-                continue;
-            }
-            let Some((source_path, record)) = parse_index_page(&path) else {
-                continue;
-            };
-            index.entry(source_path).or_insert(record);
-        }
-    }
-    index
 }
 
 fn parse_index_page(path: &Path) -> Option<(String, IndexRecord)> {
@@ -228,30 +480,17 @@ fn is_epoch(value: &str) -> bool {
 }
 
 fn compute_hash(path: &Path) -> String {
-    for command in ["sha256sum", "shasum"] {
-        let mut process = Command::new(command);
-        if command == "shasum" {
-            process.args(["-a", "256"]);
-        }
-        let Ok(output) = process.arg(path).output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        if let Some(hash) = String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .next()
-        {
-            return hash.to_ascii_lowercase();
-        }
-    }
-    String::new()
+    crate::sha256::file_hex(path)
 }
 
 fn usage() {
+    eprintln!("Usage:");
+    eprintln!("  loam codegraph index <wiki-root> [--codebase-root <codebase-root>]");
     eprintln!(
-        "Usage: loam codegraph walk <codebase-root> [--exclusions <file>] [--summary] [--no-gitignore]"
+        "  loam codegraph walk  <codebase-root> [--exclusions <file>] [--summary] [--no-gitignore]"
+    );
+    eprintln!(
+        "  loam codegraph diff  <codebase-root> [<wiki-root>] [--exclusions <file>] [--no-gitignore] [--strict]"
     );
 }
 

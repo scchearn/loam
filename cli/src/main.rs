@@ -3,6 +3,7 @@ mod datecheck;
 mod lint;
 mod markdown;
 mod memory;
+mod sha256;
 mod state;
 
 use std::env;
@@ -27,6 +28,6 @@ fn run(mut args: impl Iterator<Item = String>) -> i32 {
 
 fn usage() {
     eprintln!(
-        "Usage:\n  loam state [--fast] <workspace-root>\n  loam codegraph walk <codebase-root> [--exclusions <file>] [--summary] [--no-gitignore]\n  loam datecheck <check|fix> <wiki-root> [--offset +HH:MM]\n  loam lint [--only markdown|memory|work] <workspace-root> [--now 'YYYY-MM-DD HH:MM ±HH:MM']\n\n  lint runs all three domains by default; --only runs exactly one.\n  --now overrides the clock for date-relative rules; it exists for\n  deterministic tests and replay, not for routine use."
+        "Usage:\n  loam state [--fast] <workspace-root>\n  loam codegraph index <wiki-root> [--codebase-root <codebase-root>]\n  loam codegraph walk <codebase-root> [--exclusions <file>] [--summary] [--no-gitignore]\n  loam codegraph diff <codebase-root> [<wiki-root>] [--exclusions <file>] [--no-gitignore] [--strict]\n  loam datecheck <check|fix> <wiki-root> [--offset +HH:MM]\n  loam lint [--only markdown|memory|work] <workspace-root> [--now 'YYYY-MM-DD HH:MM ±HH:MM']\n\n  lint runs all three domains by default; --only runs exactly one.\n  --now overrides the clock for date-relative rules; it exists for\n  deterministic tests and replay, not for routine use."
     );
 }

@@ -1,0 +1,58 @@
+name: CLI
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - cli/**
+      - .github/workflows/cli.yml
+  push:
+    branches: [main, feat/cli]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - cli/**
+      - .github/workflows/cli.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust
+        run: rustup toolchain install 1.94.1 --profile minimal --component clippy,rustfmt
+      - run: cargo +1.94.1 fmt --all -- --check
+      - run: cargo +1.94.1 clippy --locked --workspace --all-targets -- -D warnings
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: loam-ubuntu
+            binary: target/release/loam
+          - os: macos-14
+            artifact: loam-macos
+            binary: target/release/loam
+          - os: windows-2022
+            artifact: loam-windows
+            binary: target/release/loam.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - run: cargo +1.94.1 test --workspace --locked
+      - run: cargo +1.94.1 build --release --locked --package loam
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 7

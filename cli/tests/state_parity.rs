@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::fs;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,6 +12,16 @@ fn temporary_workspace() -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("loam-state-parity-{nonce}"));
     fs::create_dir_all(path.join("wiki")).expect("temporary workspace should be created");
     path
+}
+
+fn state_script(repo_root: &std::path::Path) -> std::path::PathBuf {
+    let scripts = repo_root.join("skills/loam-using/scripts");
+    let legacy = scripts.join("loamstate-legacy.sh");
+    if legacy.is_file() {
+        legacy
+    } else {
+        scripts.join("loamstate.sh")
+    }
 }
 
 #[test]
@@ -70,12 +82,7 @@ fn native_fast_state_matches_bash_on_qmd_and_workflow_fixture() {
             .output()
             .expect("native state should run");
         let shell = Command::new("bash")
-            .arg(
-                repo_root
-                    .join("skills/loam-using/scripts/loamstate.sh")
-                    .to_str()
-                    .unwrap(),
-            )
+            .arg(state_script(repo_root))
             .args(args.iter().skip(1))
             .output()
             .expect("bash state should run");
@@ -115,12 +122,10 @@ fn native_fast_state_matches_bash_on_adversarial_checkpoint_fixture() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("cli should be under the repository root");
+    let script = state_script(repo_root);
     let shell = Command::new("bash")
         .args([
-            repo_root
-                .join("skills/loam-using/scripts/loamstate.sh")
-                .to_str()
-                .unwrap(),
+            script.to_str().unwrap(),
             "--fast",
             workspace.to_str().unwrap(),
         ])
