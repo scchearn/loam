@@ -58,6 +58,7 @@ wiki/
   concepts/
   analyses/
   code/
+    _index.md
 ```
 
 ## Special files
@@ -66,12 +67,20 @@ wiki/
 
 - home map-of-content, content-oriented catalog, and top-level orientation page
 - begin with a concise `## Overview` section covering wiki scope and intended corpus, current state and open questions, and a starting topic map with `[[wikilinks]]` when those notes exist
-- each page should have a link and one-line description
+- each durable prose page should have a link and one-line description
 - organize by section so future sessions can quickly identify relevant pages
 - keep this current on every `/loam::adding-to-memory` run and any other durable write-back that changes discoverability
 - do not rely on it as the only navigation layer; the note graph should still be traversable from the notes themselves
+- when code pages exist, link exactly once to `[[code/_index|Code graph]]`; never list ordinary code pages directly
 
 A separate root `overview.md` is legacy drift. If one exists, fold its still-useful root-level content into `index.md` and remove it.
+
+### `code/_index.md`
+
+- generated complete catalogue of every active `code/*.md` page except itself
+- rebuilt by `/loam::ingesting-codebase` and `/loam::syncing-code-graph`, sorted by slug, and never edited by hand
+- carries no `source_path:` front matter and is not a code node
+- provides two-hop reachability from root `index.md` to every derived code page
 
 ### `log.md`
 
@@ -96,7 +105,7 @@ These are common categories, not mandatory ones:
 - `entities/` — people, companies, products, places, projects, or systems
 - `concepts/` — ideas, methods, claims, frameworks, recurring patterns
 - `analyses/` — query outputs worth preserving as first-class wiki pages
-- `code/` — code-graph nodes ingested by `/loam::ingesting-codebase` (functions, types, routes, components)
+- `code/` — derived code-graph nodes ingested by `/loam::ingesting-codebase` (functions, types, routes, components), catalogued through `code/_index.md` rather than listed individually in the root index
 
 Use only the categories the domain actually needs.
 

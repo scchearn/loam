@@ -87,6 +87,32 @@ find skills -type f -name SKILL.md | sort | while IFS= read -r skill; do
   printf 'INFO: git freshness: %s %s\n' "$last" "$skill"
 done
 
+ingest_skill="skills/loam-memory/loam-ingesting-codebase/SKILL.md"
+sync_skill="skills/loam-memory/loam-syncing-code-graph/SKILL.md"
+
+for skill in "$ingest_skill" "$sync_skill"; do
+  if ! grep -Fq '<wiki root>/code/_index.md' "$skill"; then
+    fail "code graph skill must maintain the generated code hub: $skill"
+  fi
+  if ! grep -Fq '[[code/_index|Code graph]]' "$skill"; then
+    fail "code graph skill must link the code hub from root index.md: $skill"
+  fi
+  if ! grep -Fq 'Do not add individual code pages to root `index.md`.' "$skill"; then
+    fail "code graph skill must forbid direct code-page entries in root index.md: $skill"
+  fi
+done
+
+for reference in \
+  "skills/loam-ground/loam-scaffolding-wiki/references/schema-template.md" \
+  "skills/loam-ground/loam-scaffolding-wiki/references/wiki-architecture.md"; do
+  if ! grep -Fq 'code/_index.md' "$reference"; then
+    fail "wiki architecture must document the generated code hub: $reference"
+  fi
+  if ! grep -Fq '[[code/_index|Code graph]]' "$reference"; then
+    fail "wiki architecture must document the root-to-code-hub link: $reference"
+  fi
+done
+
 if [ "$failures" -ne 0 ]; then
   exit 1
 fi

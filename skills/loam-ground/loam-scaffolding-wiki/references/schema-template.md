@@ -21,6 +21,7 @@ The wiki layer is stored in `<wiki path>`. The agent owns and maintains those fi
 - `<wiki path>/.archive/` — soft-deleted durable pages, excluded from qmd, never hard-deleted
 - `<wiki path>/topics/<topic-slug>.md` — topic synthesis pages
 - `<wiki path>/entities/<entity-slug>.md` — entity pages (people, companies, products, places, projects, or systems)
+- `<wiki path>/code/_index.md` — generated complete code-graph hub; root `index.md` links here once instead of listing code pages
 - `<wiki path>/code/<code-slug>.md` — code pages (ingested code-graph nodes: functions, types, routes, components)
 - `<wiki path>/concepts/<concept-slug>.md` — concept pages
 - `<wiki path>/analyses/<analysis-slug>.md` — preserved query outputs and cross-source analyses
@@ -28,7 +29,7 @@ The wiki layer is stored in `<wiki path>`. The agent owns and maintains those fi
 ## Naming rules
 
 - Durable category-note filenames are kebab-case.
-- Special root files such as `index.md`, `log.md`, and `SCHEMA.md` keep their fixed names.
+- Special files such as root `index.md`, `log.md`, `SCHEMA.md`, and generated `code/_index.md` keep their fixed names.
 - Internal note links use `[[kebab-case-note-name]]`.
 - H1 titles can be human-readable.
 - One durable identity gets one canonical note. Do not create a second note for the same concept, entity, topic, or analysis when an appropriate canonical note already exists.
@@ -58,6 +59,13 @@ The wiki layer is stored in `<wiki path>`. The agent owns and maintains those fi
 - Preserve valuable query outputs that should not disappear into chat history.
 - Include `Related pages` wikilinks so analyses strengthen the graph instead of becoming isolated files.
 
+### Code pages and generated hub
+
+- Code pages are derived from source and reconstructable; they are not durable prose and do not appear individually in root `index.md`.
+- `/loam::ingesting-codebase` and `/loam::syncing-code-graph` rebuild `code/_index.md` as a complete slug-sorted catalogue of active code pages.
+- Root `index.md` contains exactly one `[[code/_index|Code graph]]` entry. Every code page is therefore reachable from the root in two hops.
+- `_index.md` is generated, carries no `source_path:`, and is never treated as a code node or edited by hand.
+
 ## Linking rules
 
 - Prefer internal `[[wikilinks]]` whenever a page already exists.
@@ -66,6 +74,7 @@ The wiki layer is stored in `<wiki path>`. The agent owns and maintains those fi
 - Avoid isolated durable notes. New notes should be reachable from a hub note or a closely related note.
 - Do not create links to pages that are unlikely to be used.
 - Archived pages live under `.archive/` with a pointer to the current page when one exists.
+- Keep derived code pages reachable through `[[code/_index|Code graph]]`, not through individual root-index entries.
 
 ## Index rules
 
@@ -73,6 +82,7 @@ The wiki layer is stored in `<wiki path>`. The agent owns and maintains those fi
 - `index.md` is the single root hub and a map-of-content, not just a flat catalog.
 - Near the top, `index.md` should contain a concise `## Overview` section covering the wiki's scope, intended corpus, major topic areas, and any durable open questions worth surfacing.
 - Every durable page in the wiki should appear there with a one-line description.
+- Derived code pages are the exception: list only `[[code/_index|Code graph]]` in root `index.md`; the generated code hub catalogues every code page.
 - Use `[[wikilinks]]` in grouped sections so the index acts as a hub note.
 - Keep entries grouped by section.
 

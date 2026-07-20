@@ -3,7 +3,7 @@ name: loam::syncing-code-graph
 description: "Reconcile the code graph in memory (wiki substrate) against the actual codebase. In --touched mode, re-summarizes only files a completed plan touched (cheap, post-plan gate). In --sweep mode, walks the whole repo and patches drift from out-of-band edits. Drift is accepted between gates; this skill is the only place the code graph is reconciled to the repo tree."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.5.1"
+  version: "1.6.0"
   author: scchearn
   argument-hint: <codebase root> [--touched <plan-path>] [--sweep]
 ---
@@ -103,9 +103,7 @@ For each touched path:
 
 For each re-summarized node, re-resolve dependencies to wiki links (using the updated in-memory index). Update the `## Dependencies` section. Patch reciprocal links on pages that gained or lost a dependency link from this sync.
 
-### Update index and log
-
-Update `index.md` if any code pages were added, removed, or had their descriptions change meaningfully.
+### Update the log
 
 Append to `log.md`:
 
@@ -162,9 +160,7 @@ Build three sets:
 
 Apply orphan removals first (so stale-node re-summarization doesn't try to link to removed pages). Then apply stale-node re-summarizations. Re-wire edges after all writes.
 
-### Update index and log
-
-Update `index.md` for removed and re-summarized pages.
+### Update the log
 
 Append to `log.md`:
 
@@ -176,7 +172,9 @@ Capture: nodes removed (count), nodes re-summarized (count), new files flagged f
 
 ---
 
-## Step 3 — Refresh qmd
+## Step 3 — Reconcile the code hub and refresh qmd
+
+After either mode, apply `/loam::ingesting-codebase` Step 6: rebuild `code/_index.md` from every active ordinary code page, keep exactly one root `[[code/_index|Code graph]]` link, and remove direct root entries. Do this even when no nodes changed. Do not add individual code pages to root `index.md`.
 
 If qmd was ready and you wrote to the wiki, run `qmd update -c <collection> 2>/dev/null`. If refresh fails, report it but do not roll back wiki edits.
 
@@ -206,7 +204,7 @@ Code graph synced from <codebase root>
 - <count or "none">
 
 ### Index and log
-- Index: <path>
+- Hub: <wiki root>/code/_index.md (root: [[code/_index|Code graph]])
 - Log: <path>
 
 ### Open questions
