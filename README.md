@@ -178,13 +178,13 @@ startup, while the body is only loaded when the skill activates.
 | loam::adding-to-memory | 592 | 116 | 218 | 2,361 |
 | loam::amending-memory | 505 | 114 | 180 | 1,951 |
 | loam::auditing-guidance | 410 | 85 | 252 | 2,528 |
-| loam::ingesting-codebase | 329 | 76 | 253 | 3,068 |
+| loam::ingesting-codebase | 329 | 76 | 271 | 3,229 |
 | loam::learning-from-session | 487 | 101 | 366 | 4,264 |
 | loam::linting-memory | 471 | 102 | 289 | 4,943 |
 | loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
 | loam::querying-memory | 530 | 105 | 176 | 1,673 |
 | loam::reviewing-memory | 510 | 113 | 137 | 1,787 |
-| loam::syncing-code-graph | 363 | 84 | 223 | 2,984 |
+| loam::syncing-code-graph | 363 | 84 | 221 | 3,043 |
 | loam::using | 368 | 77 | 174 | 3,477 |
 | loam::amending-plan | 437 | 88 | 271 | 3,032 |
 | loam::checkpointing | 365 | 69 | 180 | 2,140 |
