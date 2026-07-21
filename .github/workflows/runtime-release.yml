@@ -49,6 +49,7 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#cli-v}"
           gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Loam runtime $version" \
             --generate-notes \
