@@ -22,7 +22,7 @@ jobs:
         runner: [ubuntu-22.04, macos-14, windows-2022]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         shell: bash
         run: rustup toolchain install 1.94.1 --profile minimal --component clippy,rustfmt
@@ -33,7 +33,7 @@ jobs:
   contracts:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         shell: bash
         run: rustup toolchain install 1.94.1 --profile minimal
@@ -51,7 +51,7 @@ jobs:
   windows-powershell:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         shell: bash
         run: rustup toolchain install 1.94.1 --profile minimal
@@ -65,14 +65,14 @@ jobs:
   dist-plan:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: axodotdev/cargo-dist@v0.28.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: axodotdev/cargo-dist@b96f4b7d6f3e9e5c36e25b08a63306df83d8893f # v0.28.0
       - run: dist plan
 
   release-resolution:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Version agreement is now `loam check versions`, so the gate needs the
       # native runtime built before it can run.
       - name: Install Rust

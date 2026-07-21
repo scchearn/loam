@@ -196,4 +196,16 @@ done
 [[ -s "$logged/.agents/loam/install.log" ]] || fail "14: install log was not written"
 ok
 
+# 15: runtime releases are tagged cli-v<version>. Every other check overrides
+# LOAM_RELEASE_BASE_URL, so nothing else exercises the default URL the launcher
+# builds — and getting this wrong makes every real install 404.
+grep -Fq 'REPO_RELEASE_BASE/cli-v$version' "$SCRIPT_DIR/loam.sh" \
+  || fail "15: loam.sh must resolve runtimes from the cli-v<version> release"
+grep -Fq 'RepoReleaseBase/cli-v$version' "$SCRIPT_DIR/loam.ps1" \
+  || fail "15: loam.ps1 must resolve runtimes from the cli-v<version> release"
+# A bare v<version> is the plugin release and never carries a runtime.
+grep -Eq 'REPO_RELEASE_BASE/v\$version' "$SCRIPT_DIR/loam.sh" \
+  && fail "15: loam.sh still points at the plugin v<version> release"
+ok
+
 echo "loam launcher contract: PASS ($pass checks)"

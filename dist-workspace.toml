@@ -7,6 +7,9 @@ members = ["cargo:."]
 cargo-dist-version = "0.28.0"
 # CI backends to support
 ci = "github"
+# Runtime releases are tagged cli-v<version>. Plain v<version> tags are plugin
+# releases and must never trigger a runtime build.
+tag-namespace = "cli"
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = [
   "x86_64-apple-darwin",

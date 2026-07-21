@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# Contract test for bin/bump-release.sh.
+#
+# Runs against throwaway git repositories, so a real bump is never performed on
+# this checkout. Covers both release lanes and, critically, that bumping one
+# lane leaves the other untouched.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+BUMP="$SCRIPT_DIR/bump-release.sh"
+LOAM="${LOAM_NATIVE_BIN:-$REPO_ROOT/target/release/loam}"
+
+[[ -x "$LOAM" ]] || { echo "bump-release contract: SKIP (build first: cargo build --release --workspace)"; exit 0; }
+
+PLUGIN_VERSION="0.8.3"
+RUNTIME_VERSION="0.9.0"
+
+failures=0
+fail() { printf 'FAIL: %s\n' "$*" >&2; failures=$((failures + 1)); }
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+# A fixture where each domain agrees internally and the two differ — the normal
+# decoupled state.
+make_fixture() {
+  local fixture="$1"
+  rm -rf "$fixture"
+  mkdir -p "$fixture/bin" "$fixture/.claude-plugin" "$fixture/.codex-plugin" \
+    "$fixture/.cursor-plugin" "$fixture/cli" "$fixture/skills/loam-using/scripts"
+  cp "$BUMP" "$fixture/bin/bump-release.sh"
+  chmod +x "$fixture/bin/bump-release.sh"
+
+  printf '{\n  "name": "loam",\n  "version": "%s",\n  "type": "module"\n}\n' "$PLUGIN_VERSION" \
+    > "$fixture/package.json"
+  printf '{\n  "name": "loam",\n  "metadata": {\n    "version": "%s"\n  },\n  "plugins": [\n    {\n      "name": "loam",\n      "version": "%s"\n    }\n  ]\n}\n' \
+    "$PLUGIN_VERSION" "$PLUGIN_VERSION" > "$fixture/.claude-plugin/marketplace.json"
+  printf '{\n  "name": "loam",\n  "version": "%s"\n}\n' "$PLUGIN_VERSION" \
+    > "$fixture/.codex-plugin/plugin.json"
+  printf '{\n  "name": "loam",\n  "version": "%s"\n}\n' "$PLUGIN_VERSION" \
+    > "$fixture/.cursor-plugin/plugin.json"
+  printf '[package]\nname = "loam"\nversion = "%s"\nedition = "2021"\n\n[dependencies]\nchrono = { version = "0.4", default-features = false }\n' \
+    "$RUNTIME_VERSION" > "$fixture/cli/Cargo.toml"
+  printf '%s\n' "$RUNTIME_VERSION" > "$fixture/skills/loam-using/scripts/CLI_VERSION"
+
+  git -C "$fixture" init -q
+  git -C "$fixture" config user.email "contract@example.invalid"
+  git -C "$fixture" config user.name "contract"
+  git -C "$fixture" add -A
+  git -C "$fixture" commit -qm "fixture"
+}
+
+fingerprint() { find "$1" -type f -not -path '*/.git/*' | sort | xargs cat | md5sum; }
+run_bump() { LOAM_NATIVE_BIN="$LOAM" "$1/bin/bump-release.sh" "${@:2}" 2>&1; }
+
+count_in() {
+  local file="$1" pattern="$2" expected="$3" label="$4"
+  local found
+  found="$(grep -F -c -- "$pattern" "$file" 2> /dev/null)"
+  [[ "$found" == "$expected" ]] || fail "$label: expected $expected of '$pattern' in $file, found ${found:-0}"
+}
+
+# --- 1. plugin lane updates exactly the five plugin values -------------------
+fixture="$tmp/plugin"
+make_fixture "$fixture"
+if out="$(run_bump "$fixture" --plugin 0.9.1)"; then
+  grep -Fq 'bump-release: plugin 0.8.3 -> 0.9.1' <<< "$out" || fail "plugin bump did not report the transition: $out"
+  grep -Fq 'version agreement: plugin PASS (0.9.1)' <<< "$out" || fail "plugin bump did not verify: $out"
+  grep -Fq 'tag v0.9.1' <<< "$out" || fail "plugin bump must name the v<version> tag: $out"
+else
+  fail "plugin bump exited non-zero: $out"
+fi
+count_in "$fixture/package.json"                    '"version": "0.9.1"' 1 "package.json"
+count_in "$fixture/.claude-plugin/marketplace.json" '"version": "0.9.1"' 2 "both marketplace fields"
+count_in "$fixture/.codex-plugin/plugin.json"       '"version": "0.9.1"' 1 "codex manifest"
+count_in "$fixture/.cursor-plugin/plugin.json"      '"version": "0.9.1"' 1 "cursor manifest"
+# The runtime lane must be untouched — this is the whole point of the split.
+count_in "$fixture/cli/Cargo.toml" "version = \"$RUNTIME_VERSION\"" 1 "cargo version untouched by plugin bump"
+[[ "$(tr -d ' \t\r\n' < "$fixture/skills/loam-using/scripts/CLI_VERSION")" == "$RUNTIME_VERSION" ]] \
+  || fail "plugin bump changed CLI_VERSION"
+
+# --- 2. runtime lane updates exactly the two runtime values ------------------
+fixture="$tmp/runtime"
+make_fixture "$fixture"
+if out="$(run_bump "$fixture" --runtime 1.0.0)"; then
+  grep -Fq 'bump-release: runtime 0.9.0 -> 1.0.0' <<< "$out" || fail "runtime bump did not report the transition: $out"
+  grep -Fq 'version agreement: runtime PASS (1.0.0)' <<< "$out" || fail "runtime bump did not verify: $out"
+  grep -Fq 'tag cli-v1.0.0' <<< "$out" || fail "runtime bump must name the cli-v<version> tag: $out"
+else
+  fail "runtime bump exited non-zero: $out"
+fi
+count_in "$fixture/cli/Cargo.toml" 'version = "1.0.0"' 1 "cargo package version"
+[[ "$(tr -d ' \t\r\n' < "$fixture/skills/loam-using/scripts/CLI_VERSION")" == "1.0.0" ]] \
+  || fail "CLI_VERSION was not updated"
+grep -Fq 'chrono = { version = "0.4", default-features = false }' "$fixture/cli/Cargo.toml" \
+  || fail "runtime bump rewrote a dependency version"
+# The plugin lane must be untouched.
+count_in "$fixture/package.json" "\"version\": \"$PLUGIN_VERSION\"" 1 "package.json untouched by runtime bump"
+count_in "$fixture/.cursor-plugin/plugin.json" "\"version\": \"$PLUGIN_VERSION\"" 1 "cursor untouched by runtime bump"
+
+# --- 3. a missing or wrong lane selector is refused --------------------------
+for args in "0.9.1" "--both 0.9.1" "--plugin" "--runtime" "--plugin 0.9.1 extra"; do
+  fixture="$tmp/args"
+  make_fixture "$fixture"
+  before="$(fingerprint "$fixture")"
+  # shellcheck disable=SC2086
+  if run_bump "$fixture" $args > /dev/null 2>&1; then
+    fail "invalid invocation '$args' was accepted"
+  fi
+  [[ "$before" == "$(fingerprint "$fixture")" ]] || fail "invalid invocation '$args' mutated the tree"
+done
+
+# --- 4. invalid versions are rejected without mutating -----------------------
+for bad in "1.2" "v1.2.3" "1.2.3-rc.1" "1.2.3+build" "01.2.3" "abc" "1.2.3.4"; do
+  for lane in --plugin --runtime; do
+    fixture="$tmp/bad"
+    make_fixture "$fixture"
+    before="$(fingerprint "$fixture")"
+    if run_bump "$fixture" "$lane" "$bad" > /dev/null 2>&1; then
+      fail "invalid version '$bad' accepted on $lane"
+    fi
+    [[ "$before" == "$(fingerprint "$fixture")" ]] || fail "invalid version '$bad' mutated the tree on $lane"
+  done
+done
+
+# --- 5. the same version is refused, per lane --------------------------------
+fixture="$tmp/same-plugin"
+make_fixture "$fixture"
+before="$(fingerprint "$fixture")"
+if out="$(run_bump "$fixture" --plugin "$PLUGIN_VERSION")"; then
+  fail "bumping plugin to its current version was accepted"
+else
+  grep -Fq "plugin is already at $PLUGIN_VERSION" <<< "$out" || fail "same-version refusal unclear: $out"
+fi
+[[ "$before" == "$(fingerprint "$fixture")" ]] || fail "same-version plugin attempt mutated the tree"
+
+fixture="$tmp/same-runtime"
+make_fixture "$fixture"
+before="$(fingerprint "$fixture")"
+if out="$(run_bump "$fixture" --runtime "$RUNTIME_VERSION")"; then
+  fail "bumping runtime to its current version was accepted"
+else
+  grep -Fq "runtime is already at $RUNTIME_VERSION" <<< "$out" || fail "same-version refusal unclear: $out"
+fi
+[[ "$before" == "$(fingerprint "$fixture")" ]] || fail "same-version runtime attempt mutated the tree"
+
+# --- 6. cross-domain equality is never required ------------------------------
+# Bumping plugin to the runtime's version must be allowed: they are unrelated.
+fixture="$tmp/cross"
+make_fixture "$fixture"
+if ! run_bump "$fixture" --plugin "$RUNTIME_VERSION" > /dev/null 2>&1; then
+  fail "plugin bump to the runtime's version was refused; the domains must be independent"
+fi
+
+# --- 7. a dirty worktree is refused ------------------------------------------
+fixture="$tmp/dirty"
+make_fixture "$fixture"
+printf 'scratch\n' > "$fixture/untracked.txt"
+before="$(fingerprint "$fixture")"
+if out="$(run_bump "$fixture" --plugin 0.9.1)"; then
+  fail "bump ran on a dirty worktree"
+else
+  grep -Fq 'worktree is dirty' <<< "$out" || fail "dirty refusal unclear: $out"
+fi
+[[ "$before" == "$(fingerprint "$fixture")" ]] || fail "dirty-worktree attempt mutated the tree"
+
+# --- 8. pre-existing drift in the target lane is refused ---------------------
+fixture="$tmp/drift"
+make_fixture "$fixture"
+printf '{\n  "name": "loam",\n  "version": "0.1.0"\n}\n' > "$fixture/.codex-plugin/plugin.json"
+git -C "$fixture" add -A && git -C "$fixture" commit -qm "drift"
+before="$(fingerprint "$fixture")"
+if run_bump "$fixture" --plugin 0.9.1 > /dev/null 2>&1; then
+  fail "bump ran while the plugin domain disagreed"
+fi
+[[ "$before" == "$(fingerprint "$fixture")" ]] || fail "drifted tree was partially written"
+# ...but the healthy runtime lane must still be bumpable.
+if ! run_bump "$fixture" --runtime 1.0.0 > /dev/null 2>&1; then
+  fail "plugin drift wrongly blocked a runtime bump"
+fi
+
+# --- 9. a missing surface is refused, with no partial write ------------------
+fixture="$tmp/missing"
+make_fixture "$fixture"
+rm "$fixture/.cursor-plugin/plugin.json"
+git -C "$fixture" add -A && git -C "$fixture" commit -qm "missing"
+before="$(fingerprint "$fixture")"
+if run_bump "$fixture" --plugin 0.9.1 > /dev/null 2>&1; then
+  fail "bump ran with a missing version surface"
+fi
+[[ "$before" == "$(fingerprint "$fixture")" ]] || fail "missing-surface attempt wrote partial changes"
+
+# --- 10. help is available and does not mutate -------------------------------
+fixture="$tmp/help"
+make_fixture "$fixture"
+before="$(fingerprint "$fixture")"
+out="$(run_bump "$fixture" --help)" || fail "--help exited non-zero"
+grep -Fq 'cli-v<version>' <<< "$out" || fail "--help must document the runtime tag scheme: $out"
+[[ "$before" == "$(fingerprint "$fixture")" ]] || fail "--help mutated the tree"
+
+if [[ "$failures" -ne 0 ]]; then
+  printf 'bump-release contract: %d failure(s)\n' "$failures" >&2
+  exit 1
+fi
+
+printf 'bump-release contract: PASS\n'

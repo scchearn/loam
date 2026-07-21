@@ -196,7 +196,7 @@ bootstrap() {
   # shellcheck disable=SC2064
   trap "rm -f '$marker'" EXIT INT TERM
 
-  base=${LOAM_RELEASE_BASE_URL:-"$REPO_RELEASE_BASE/v$version"}
+  base=${LOAM_RELEASE_BASE_URL:-"$REPO_RELEASE_BASE/cli-v$version"}
   staging=$(mktemp -d "${TMPDIR:-/tmp}/loam-install.XXXXXX") || return 1
   status=1
 

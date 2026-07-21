@@ -120,7 +120,7 @@ function Invoke-Bootstrap($version, $target) {
   } catch { return 0 }
 
   $base = $env:LOAM_RELEASE_BASE_URL
-  if (-not $base) { $base = "$RepoReleaseBase/v$version" }
+  if (-not $base) { $base = "$RepoReleaseBase/cli-v$version" }
   $staging = Join-Path ([System.IO.Path]::GetTempPath()) ('loam-install-' + [System.Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $staging -Force | Out-Null
   $status = 1
