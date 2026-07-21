@@ -1,11 +1,11 @@
-# Custom `local-artifacts-jobs` workflow wired in through dist-workspace.toml.
+# Reusable raw-runtime build workflow called by runtime-release.yml.
 #
 # dist's own archives are not what Loam's bootstrap downloads. This job builds
 # one raw `loam` executable per target and publishes it alongside a
 # loam-runtime-manifest.json carrying each executable's SHA-256, which the
 # launcher verifies before publishing a runnable binary.
 #
-# Never hand-edit the generated release.yml; change this file instead.
+# This is the runtime artifact source of truth; the caller publishes its output.
 #
 # Action refs are pinned to commit SHAs with the tag in a trailing comment.
 # Keep them pinned: a movable tag is an unreviewed third-party code change.

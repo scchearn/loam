@@ -72,8 +72,10 @@ jobs:
           set -euo pipefail
           curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.29.0/cargo-dist-installer.sh | sh
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - run: dist generate --check
-      - run: dist plan
+      # Runtime releases use the checked-in raw artifact workflow rather than
+      # dist's generated release workflow, so the custom tag namespace remains
+      # decoupled from cargo-dist's package-tag parser.
+      - run: dist plan --allow-dirty
 
   release-resolution:
     runs-on: ubuntu-22.04

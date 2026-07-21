@@ -1,0 +1,55 @@
+# Runtime release workflow for the private Loam CLI binary.
+#
+# cargo-dist plans the target matrix, but its package-tag parser treats a
+# namespace such as cli-v as a package prefix. The runtime lane deliberately
+# uses the independent cli-v<version> tag, so publish the already-defined raw
+# artifact workflow directly and attach its manifest to that exact tag.
+name: Runtime Release
+
+on:
+  push:
+    tags:
+      - 'cli-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-raw-runtimes:
+    uses: ./.github/workflows/raw-runtime-artifacts.yml
+    with:
+      plan: '{"announcement_tag":"${{ github.ref_name }}"}'
+    secrets: inherit
+
+  publish:
+    needs: build-raw-runtimes
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: artifacts-raw-runtimes
+          path: raw-runtimes
+
+      - name: Verify runtime manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#cli-v}"
+          jq -e --arg version "$version" \
+            '.version == $version and (.runtimes | length == 5)' \
+            raw-runtimes/loam-runtime-manifest.json > /dev/null
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#cli-v}"
+          gh release create "$GITHUB_REF_NAME" \
+            --target "$GITHUB_SHA" \
+            --title "Loam runtime $version" \
+            --generate-notes \
+            raw-runtimes/*
