@@ -131,6 +131,26 @@ You don't need to memorize the list above; the agent routes itself.
 
 loam works fully on its own. If your wiki grows large, [qmd](https://github.com/tobilu/qmd) (`npm install -g @tobilu/qmd`) speeds up search across memory — the skills detect it automatically and fall back to built-in search when it's absent.
 
+### Native runtime
+
+`npx skills add scchearn/loam` remains the only installation command. It copies
+text launchers plus a `CLI_VERSION` file; the first state probe downloads the
+matching native `loam` executable for your platform from this repository's
+GitHub Release, verifies its SHA-256 against a published runtime manifest, and
+stores it under `.agents/loam/` — project-scoped for a project install, global
+for a global one. Nothing is added to `PATH`.
+
+The download happens in the background and never blocks session start: while it
+is missing, installing, unsupported, or offline you get a minimal workspace
+state and a `runtime_unavailable` hint. Supported targets are macOS (Intel and
+Apple Silicon), Windows x64, and Linux x64/arm64. Native Windows works under
+in-box Windows PowerShell 5.1 — Git Bash or WSL is now only needed for the
+POSIX SessionStart hook.
+
+Trust model: the GitHub repository plus HTTPS. The manifest SHA-256 detects
+corruption, truncation, and artifact mismatch; no installer script is ever
+executed and nothing is downloaded once the requested runtime is ready.
+
 Agents can install `/checkpoint` and `/resume` slash-command shortcuts — the `loam::using` skill bundles the command files and an install reference.
 
 ## Ways to use loam
@@ -175,22 +195,22 @@ startup, while the body is only loaded when the skill activates.
 |-------|---:|---:|---:|---:|
 | loam::initializing-vault | 206 | 51 | 9 | 73 |
 | loam::scaffolding-wiki | 445 | 90 | 198 | 2,196 |
-| loam::adding-to-memory | 592 | 116 | 218 | 2,361 |
+| loam::adding-to-memory | 592 | 116 | 218 | 2,375 |
 | loam::amending-memory | 505 | 114 | 180 | 1,951 |
 | loam::auditing-guidance | 410 | 85 | 252 | 2,528 |
-| loam::ingesting-codebase | 329 | 76 | 271 | 3,229 |
-| loam::learning-from-session | 487 | 101 | 366 | 4,264 |
-| loam::linting-memory | 471 | 102 | 289 | 4,943 |
+| loam::ingesting-codebase | 329 | 76 | 271 | 3,256 |
+| loam::learning-from-session | 487 | 101 | 366 | 4,278 |
+| loam::linting-memory | 471 | 102 | 308 | 5,253 |
 | loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
-| loam::querying-memory | 530 | 105 | 176 | 1,673 |
+| loam::querying-memory | 530 | 105 | 176 | 1,687 |
 | loam::reviewing-memory | 510 | 113 | 137 | 1,787 |
-| loam::syncing-code-graph | 363 | 84 | 221 | 3,043 |
+| loam::syncing-code-graph | 363 | 84 | 221 | 3,052 |
 | loam::using | 368 | 77 | 174 | 3,477 |
 | loam::amending-plan | 437 | 88 | 271 | 3,032 |
-| loam::checkpointing | 365 | 69 | 180 | 2,140 |
+| loam::checkpointing | 365 | 69 | 180 | 2,202 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,176 |
 | loam::planning | 327 | 62 | 323 | 4,317 |
-| loam::resuming | 376 | 77 | 143 | 1,875 |
+| loam::resuming | 376 | 77 | 143 | 1,889 |
 | loam::setting-goals | 473 | 101 | 184 | 1,853 |
 | loam::starting | 166 | 34 | 355 | 4,983 |
 | loam::writing-spec | 332 | 66 | 252 | 2,892 |
