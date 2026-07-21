@@ -1,108 +1,70 @@
-#!/usr/bin/env pwsh
-# loamstate.ps1 — PowerShell twin of loamstate.sh
-# Probes wiki root and qmd readiness in one shot.
+# loamstate.ps1 — PowerShell compatibility entry point for workspace state.
 #
-# Usage:
-#   loamstate.ps1 <workspace-root>
+# Invoke exactly as:
+#   powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File loamstate.ps1 [--fast] <workspace-root>
 #
-# Exit codes: 0 (JSON always emitted), 1 bad args
+# Delegates to the native runtime through loam.ps1, so native Windows receives
+# the same full state/hint contract as POSIX hosts. When the runtime is absent,
+# installing, unsupported, or unavailable it emits minimal valid state and
+# exits 0 rather than blocking session startup.
+#
+# Exit codes: 0 always for probe/environment failures; 1 for bad arguments.
 
 param(
-  [Parameter(Position = 0)]
-  [string]$WorkspaceRoot = ''
+  [Parameter(ValueFromRemainingArguments = $true)]
+  [string[]]$Arguments = @()
 )
 
 $ErrorActionPreference = 'Stop'
 
-if (-not $WorkspaceRoot) {
-  Write-Host 'Usage: loamstate.ps1 <workspace-root>'
+$fast = $false
+$workspace = ''
+foreach ($argument in $Arguments) {
+  if ($argument -eq '--fast') { $fast = $true }
+  elseif ($argument.StartsWith('-')) {
+    Write-Error 'Usage: loamstate.ps1 [--fast] <workspace-root>'
+    exit 1
+  } else { $workspace = $argument }
+}
+
+if (-not $workspace) {
+  Write-Error 'Usage: loamstate.ps1 [--fast] <workspace-root>'
   exit 1
 }
 
-if (-not (Test-Path $WorkspaceRoot -PathType Container)) {
-  Write-Host '{"error":"workspace not found"}'
+function Get-MinimalState($reason, $version, $target) {
+  # Every field consumers read, degraded to neutral values, plus the canonical
+  # runtime_unavailable maintenance hint.
+  $hint = '{"kind":"runtime_unavailable","group":"maintenance","severity":"info",' +
+    '"message":"Native loam runtime is unavailable; state is minimal until it installs.",' +
+    '"command":null,"evidence":{"reason":"' + $reason + '","target":"' + $target + '","version":"' + $version + '"}}'
+  return '{"wiki_root":"","exists":false,"qmd_ready":false,"latest_checkpoint":null,' +
+    '"recent_checkpoints":[],"checkpoint_count":0,"git_status":null,"drift_count":null,' +
+    '"hints":[' + $hint + ']}'
+}
+
+$launcher = Join-Path $PSScriptRoot 'loam.ps1'
+$stateArgs = @('state')
+if ($fast) { $stateArgs += '--fast' }
+$stateArgs += $workspace
+
+$output = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $launcher @stateArgs 2>$null
+$status = $LASTEXITCODE
+
+if ($status -eq 0 -and $output) {
+  Write-Output ($output -join "`n")
   exit 0
 }
 
-# --- Resolve wiki root ---
+$version = ''
+$versionFile = Join-Path $PSScriptRoot 'CLI_VERSION'
+if (Test-Path $versionFile -PathType Leaf) { $version = (Get-Content $versionFile -Raw).Trim() }
+$target = $env:LOAM_TARGET
+if (-not $target) { $target = 'x86_64-pc-windows-msvc' }
 
-$WikiRoot = ''
-foreach ($candidate in @((Join-Path $WorkspaceRoot 'wiki'), $WorkspaceRoot)) {
-  if ((Test-Path (Join-Path $candidate 'SCHEMA.md')) -or
-      (Test-Path (Join-Path $candidate 'index.md')) -or
-      (Test-Path (Join-Path $candidate 'log.md'))) {
-    $WikiRoot = (Resolve-Path $candidate).Path
-    break
-  }
-}
+$reason = 'unavailable'
+if ($status -eq 78) { $reason = 'configuration' }
+elseif ($status -eq 75) { $reason = 'installing' }
 
-if (-not $WikiRoot) {
-  Write-Host '{"wiki_root":"","exists":false,"qmd_ready":false,"hints":[{"kind":"memory_missing","group":"maintenance","severity":"info","message":"No memory substrate found; scaffold a wiki to begin.","command":"/loam::scaffolding-wiki <goal>","evidence":{}}]}'
-  exit 0
-}
-
-# --- Check contract files ---
-
-$HasSchema   = Test-Path (Join-Path $WikiRoot 'SCHEMA.md')
-$HasIndex    = Test-Path (Join-Path $WikiRoot 'index.md')
-$HasLog      = Test-Path (Join-Path $WikiRoot 'log.md')
-$HasOverview = Test-Path (Join-Path $WikiRoot 'overview.md')
-
-# --- qmd readiness ---
-
-$QmdReady = $false
-$Collection = ''
-$MetaStatus = ''
-$MetaPath = ''
-
-$MetaFile = Join-Path $WikiRoot '.wiki-metadata.json'
-if (Test-Path $MetaFile -PathType Leaf) {
-  $MetaPath = $MetaFile
-  $meta = Get-Content $MetaFile -Raw | ConvertFrom-Json
-  if ($meta.retrieval) {
-    $MetaStatus = $meta.retrieval.status
-    $Collection = $meta.retrieval.collection_name
-    if ($MetaStatus -eq 'ready') { $QmdReady = $true }
-  }
-}
-
-# Fallback: if not ready from metadata, try qmd CLI
-if (-not $QmdReady) {
-  $qmdCmd = Get-Command qmd -ErrorAction SilentlyContinue
-  if ($qmdCmd) {
-    try {
-      $collections = qmd collection list 2>$null
-      if ($collections) {
-        foreach ($line in ($collections -split "`n")) {
-          if ($line -match [regex]::Escape($WikiRoot)) {
-            $QmdReady = $true
-            if (-not $Collection) {
-              $Collection = ($line -split '\s+')[0] -replace '[: ]',''
-            }
-            break
-          }
-        }
-      }
-    } catch { }
-  }
-}
-
-# --- Emit JSON ---
-
-$result = [PSCustomObject]@{
-  wiki_root       = $WikiRoot
-  exists          = $true
-  has_schema      = $HasSchema
-  has_index       = $HasIndex
-  has_log         = $HasLog
-  has_overview    = $HasOverview
-  qmd_ready       = $QmdReady
-  collection      = $Collection
-  metadata_status = $MetaStatus
-  metadata_path   = $MetaPath
-  hints           = @()  # ponytail: empty parity; bash twin owns hint probes for now
-}
-
-# -Depth 3 so nested hint evidence objects serialize once hints land here.
-$json = $result | ConvertTo-Json -Compress -Depth 3
-Write-Host $json
+Write-Output (Get-MinimalState $reason $version $target)
+exit 0

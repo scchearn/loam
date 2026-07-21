@@ -1,0 +1,90 @@
+# Repository gates: Rust workspace, contract tests, curation, and the strict
+# release-resolution check that catches a CLI_VERSION with no published runtime.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Daily, so a release that never finished publishing is reported even when
+    # nobody pushes.
+    - cron: '17 6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install 1.94.1 --profile minimal --component clippy,rustfmt
+      - run: cargo +1.94.1 fmt --all -- --check
+      - run: cargo +1.94.1 clippy --workspace --all-targets -- -D warnings
+      - run: cargo +1.94.1 test --workspace --locked
+
+  contracts:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - run: cargo +1.94.1 build --release --locked
+      - run: bash bin/check-curation.sh
+      - run: skills/loam-using/scripts/loam-launcher-contract-test
+      - run: skills/loam-using/scripts/loamstate-contract-test
+      - run: skills/loam-work/loam-checkpointing/scripts/checkpoint-contract-test
+      - run: skills/loam-work/loam-setting-goals/scripts/goal-contract-test
+      - run: skills/loam-memory/loam-ingesting-codebase/scripts/codegraph-contract-test
+      # bootstrap-contract-test also covers the Claude, Cursor, and
+      # default/Copilot hook JSON formats.
+      - run: bin/bootstrap-contract-test
+
+  windows-powershell:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - run: cargo +1.94.1 build --release --locked
+      # In-box Windows PowerShell 5.1 with the exact pinned invocation Loam
+      # documents everywhere. pwsh is deliberately not used here.
+      - name: PowerShell wrapper contract
+        shell: cmd
+        run: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File skills\loam-using\scripts\loam-launcher-contract-test.ps1
+
+  dist-plan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: axodotdev/cargo-dist@v0.28.0
+      - run: dist plan
+
+  release-resolution:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      # Version agreement is now `loam check versions`, so the gate needs the
+      # native runtime built before it can run.
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - run: cargo +1.94.1 build --release --locked
+      # Pull requests only assert version agreement: a release-version PR is
+      # allowed to name a tag that has not been pushed yet. Pushes to main and
+      # the scheduled run require the manifest to actually resolve.
+      - name: Version agreement
+        if: github.event_name == 'pull_request'
+        run: bin/check-release-resolution.sh --versions-only
+      - name: Strict manifest resolution
+        if: github.event_name != 'pull_request'
+        run: bin/check-release-resolution.sh

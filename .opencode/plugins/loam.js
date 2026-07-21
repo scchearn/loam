@@ -56,12 +56,15 @@ const findSkillPath = () => {
   return null;
 };
 
-// Find loamstate.sh in the npx skills install path.
+// Find the platform-appropriate loamstate wrapper in the npx skills install
+// path: .ps1 on Windows, .sh elsewhere. Project scope wins over global.
 // Returns absolute path or null.
 const findLoamstatePath = () => {
+  const wrapper =
+    process.platform === 'win32' ? 'loamstate.ps1' : 'loamstate.sh';
   const candidates = [
-    path.join(process.cwd(), '.agents/skills/loam-using/scripts/loamstate.sh'),
-    path.join(os.homedir(), '.agents/skills/loam-using/scripts/loamstate.sh'),
+    path.join(process.cwd(), '.agents/skills/loam-using/scripts', wrapper),
+    path.join(os.homedir(), '.agents/skills/loam-using/scripts', wrapper),
   ];
   for (const p of candidates) {
     if (fs.existsSync(p)) return p;
@@ -91,23 +94,30 @@ const checkForUpdate = (pluginRoot) => {
   return '';
 };
 
-// Run loamstate.sh and format a compact workspace state block.
+// Run the platform state wrapper and format a compact workspace state block.
 // Returns formatted string or empty string on any failure.
-// Requires bash — skips silently if bash is not available (native Windows).
+// On Windows the wrapper runs under in-box Windows PowerShell 5.1, so state is
+// no longer skipped just because bash is absent.
 const getWorkspaceState = () => {
   const loamstatePath = findLoamstatePath();
   if (!loamstatePath) return '';
 
-  try {
-    // Check bash availability (skip on native Windows without Git Bash)
-    execSync('bash --version', { timeout: 2000, encoding: 'utf8', stdio: 'pipe' });
-  } catch {
-    return '';
+  const isWindows = process.platform === 'win32';
+  if (!isWindows) {
+    try {
+      execSync('bash --version', { timeout: 2000, encoding: 'utf8', stdio: 'pipe' });
+    } catch {
+      return '';
+    }
   }
+
+  const command = isWindows
+    ? `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${loamstatePath}" --fast "${process.cwd()}"`
+    : `bash "${loamstatePath}" --fast "${process.cwd()}"`;
 
   let stdout;
   try {
-    stdout = execSync(`bash "${loamstatePath}" --fast "${process.cwd()}"`, {
+    stdout = execSync(command, {
       timeout: 5000,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],

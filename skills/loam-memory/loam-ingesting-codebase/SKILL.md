@@ -28,7 +28,7 @@ If the injected state cannot be reused, run a fast probe:
 
 ```bash
 bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" --fast "$(pwd)" 2>/dev/null \
-  || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+  || powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
 ```
 
 If `exists` is false, stop and recommend:
@@ -52,21 +52,21 @@ If `$ARGUMENTS` is empty, default the codebase root to `$(pwd)`. Do not ask for 
 Run the index subcommand to get every code-ingested page already in the wiki:
 
 ```bash
-"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/scripts/codegraph.sh" index <wiki-root> --codebase-root <codebase-root>
+"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loam.sh" codegraph index <wiki-root> --codebase-root <codebase-root>
 ```
 
 Parse the JSON output into an in-memory map: `{source_path → {slug, ingested_at, mtime, exists}}`. Pages without `source_path:` front matter are prose entity pages and are skipped silently. This map is the set of already-ingested code nodes. The index scans both `code/` and `entities/` (for legacy stranded `source_path:` pages during the transition to the `code/` namespace).
 
 If the script is missing or fails, fall back to Globbing `code/*.md` and `entities/*.md` and parsing front matter with Read. The script is an optimization, not a hard dependency.
 
-If `codegraph.sh index` or `codegraph.sh diff` reports `wiki root contract not found` or `did you mean: .../wiki`, stop and rerun the command with the actual `wiki_root`. Do not proceed from an empty index caused by a bad wiki-root path.
+If `loam.sh codegraph index` or `loam.sh codegraph diff` reports `wiki root contract not found` or `did you mean: .../wiki`, stop and rerun the command with the actual `wiki_root`. Do not proceed from an empty index caused by a bad wiki-root path.
 
 ### Optional preflight summary
 
 For a quick size check before ingesting, run:
 
 ```bash
-"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/scripts/codegraph.sh" walk <codebase-root> --summary \
+"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loam.sh" codegraph walk <codebase-root> --summary \
   --exclusions "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/ingestion-exclusions.md"
 ```
 
@@ -83,7 +83,7 @@ Default mode is diff-guided ingest: process `new` and `stale` entries from `code
 Run the diff subcommand to get the files that need ingestion or re-summarization:
 
 ```bash
-"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/scripts/codegraph.sh" diff <codebase-root> <wiki-root> \
+"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loam.sh" codegraph diff <codebase-root> \
   --exclusions "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/ingestion-exclusions.md"
 ```
 
@@ -277,4 +277,4 @@ Codebase ingested from <codebase root>
 - Read the wiki schema before editing the index or log.
 - Prefer incremental linked updates over large rewrites.
 - Do not leave avoidable broken wikilinks after the ingest pass.
-- If the script (`codegraph.sh` / `codegraph.ps1`) is missing or fails, fall back to Glob/Read/stat. The skill must work fully without the script.
+- If the codegraph forwarder or the native runtime is missing or fails, fall back to Glob/Read/stat. The skill must work fully without the script.

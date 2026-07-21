@@ -1,0 +1,111 @@
+# Custom `local-artifacts-jobs` workflow wired in through dist-workspace.toml.
+#
+# dist's own archives are not what Loam's bootstrap downloads. This job builds
+# one raw `loam` executable per target and publishes it alongside a
+# loam-runtime-manifest.json carrying each executable's SHA-256, which the
+# launcher verifies before publishing a runnable binary.
+#
+# Never hand-edit the generated release.yml; change this file instead.
+#
+# Action refs are major-version tags. Resolve them to commit SHAs before the
+# first real release; see AGENTS.md "Release" for the pinning step.
+name: raw-runtime-artifacts
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-raw-runtimes:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-14
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        shell: bash
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal
+          rustup target add --toolchain 1.94.1 ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build raw runtime
+        shell: bash
+        run: cargo +1.94.1 build --release --locked --package loam --target ${{ matrix.target }}
+
+      - name: Stage raw executable
+        shell: bash
+        run: |
+          mkdir -p raw-runtimes
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/loam.exe" "raw-runtimes/loam-${{ matrix.target }}.exe"
+          else
+            cp "target/${{ matrix.target }}/release/loam" "raw-runtimes/loam-${{ matrix.target }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raw-runtime-${{ matrix.target }}
+          path: raw-runtimes/*
+          if-no-files-found: error
+
+  manifest:
+    needs: build-raw-runtimes
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: raw-runtime-*
+          merge-multiple: true
+          path: raw-runtimes
+
+      - name: Build loam-runtime-manifest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(jq -r '.announcement_tag' <<< '${{ inputs.plan }}' | sed 's/^v//')"
+          {
+            printf '{"version":"%s","runtimes":[' "$version"
+            first=1
+            for file in raw-runtimes/loam-*; do
+              name="$(basename "$file")"
+              target="${name#loam-}"
+              target="${target%.exe}"
+              digest="$(sha256sum "$file" | awk '{print $1}')"
+              [ $first -eq 1 ] || printf ','
+              first=0
+              printf '{"target":"%s","file":"%s","sha256":"%s"}' "$target" "$name" "$digest"
+            done
+            printf ']}\n'
+          } > raw-runtimes/loam-runtime-manifest.json
+          cat raw-runtimes/loam-runtime-manifest.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-raw-runtimes
+          path: raw-runtimes/*
+          if-no-files-found: error

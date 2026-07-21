@@ -41,7 +41,7 @@ require .claude-plugin/marketplace.json 'goals' 'marketplace descriptions omit g
 require .cursor-plugin/plugin.json 'goals' 'Cursor description omits goals'
 require .codex-plugin/plugin.json 'goals' 'Codex description omits goals'
 require_absent WHY.md '20 skill' 'WHY.md contains stale skill count'
-require_absent skills/loam-using/scripts/loamstate.sh 'goal_ready_for_spec|goal_review_due|goal_missing|goal_stale|goal_progress' 'loamstate must not emit goal hints'
+require_absent cli/src/state.rs 'goal_ready_for_spec|goal_review_due|goal_missing|goal_stale|goal_progress' 'native state must not emit goal hints'
 
 python3 -m json.tool "$ROOT/skills/loam-work/loam-setting-goals/evals/evals.json" >/dev/null
 printf 'goal contract: PASS\n'
