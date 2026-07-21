@@ -26,6 +26,20 @@ if [ "$readme_count" != "$plugin_count" ] || [ "$plugin_count" != "$disk_count" 
   fail "skill count mismatch: README.md count ($readme_count) != .claude-plugin/plugin.json count ($plugin_count) != disk SKILL.md count ($disk_count)"
 fi
 
+# Every Windows call site in skill instructions must use in-box Windows
+# PowerShell 5.1 through the exact pinned invocation. A bare `.ps1` path or a
+# `pwsh` command silently assumes PowerShell 7 is installed.
+pinned_powershell='powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File'
+while IFS= read -r doc; do
+  while IFS= read -r line; do
+    case "$line" in
+      *"$pinned_powershell"*) continue ;;
+      *pwsh*) fail "$doc invokes pwsh; use: $pinned_powershell <script>.ps1" ;;
+      *.ps1*) fail "$doc has a bare .ps1 invocation; use: $pinned_powershell <script>.ps1" ;;
+    esac
+  done < <(grep -n 'pwsh\|\.ps1' "$doc" 2>/dev/null || true)
+done < <(find skills -type f -name '*.md' | sort)
+
 if [ -z "$(tail -n 1 README.md)" ]; then
   fail "README.md has a trailing blank line; skill-metrics update must be idempotent"
 fi

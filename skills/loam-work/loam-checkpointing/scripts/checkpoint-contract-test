@@ -3,7 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../../.." && pwd)
-VERIFY="$SCRIPT_DIR/checkpoint-verify"
+# The retained Bash body stays the independent oracle: the distributed
+# checkpoint-verify is now a launcher forwarder and needs an installed runtime.
+VERIFY="$SCRIPT_DIR/checkpoint-verify-legacy"
+NATIVE="$REPO_ROOT/target/release/loam"
 CHECKPOINTING="$REPO_ROOT/skills/loam-work/loam-checkpointing/SKILL.md"
 RESUMING="$REPO_ROOT/skills/loam-work/loam-resuming/SKILL.md"
 LINTING="$REPO_ROOT/skills/loam-memory/loam-linting-memory/SKILL.md"
@@ -59,5 +62,25 @@ grep -Fq 'Pick up `<scope>` by <single next action>.' "$RESUMING"
 
 grep -Fq 'checkpoint-YYYY-MM-DD-HHMM-<slug>.md' "$LINTING"
 grep -Fq 'checkpoint-YYYY-MM-DD-HHMM.md' "$LINTING"
+
+# The native runtime must agree with the oracle byte for byte. Skipped when the
+# release binary has not been built, so the contract still runs standalone.
+if [ -x "$NATIVE" ]; then
+  for fixture in "$tmp/with-intent.md" "$tmp/without-intent.md"; do
+    if ! diff <("$VERIFY" "$fixture") <("$NATIVE" checkpoint verify "$fixture") > /dev/null; then
+      printf 'FAIL: native checkpoint verify diverges from the oracle on %s\n' "$fixture" >&2
+      diff <("$VERIFY" "$fixture") <("$NATIVE" checkpoint verify "$fixture") >&2 || true
+      exit 1
+    fi
+  done
+  echo "checkpoint contract: native parity PASS"
+else
+  echo "checkpoint contract: native parity SKIP (build first: cargo build --release --workspace)"
+fi
+
+# Both forwarders must exist so Windows is not left without a checkpoint path.
+for forwarder in checkpoint-verify checkpoint-state checkpoint-verify.ps1 checkpoint-state.ps1; do
+  [ -f "$SCRIPT_DIR/$forwarder" ] || { printf 'FAIL: missing forwarder %s\n' "$forwarder" >&2; exit 1; }
+done
 
 echo "checkpoint contract: PASS"

@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# Contract test for loam.sh — scope resolution, CLI_VERSION validation,
+# unsupported targets, bootstrap integrity, and concurrency markers.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+LAUNCHER="$SCRIPT_DIR/loam.sh"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+pass=0
+fail() { echo "loam launcher contract: FAIL: $1" >&2; exit 1; }
+ok() { pass=$((pass + 1)); }
+
+sha256() { sha256sum "$1" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$1" | awk '{print $1}'; }
+
+# Copy the launcher plus a CLI_VERSION into an isolated .agents tree.
+# install_tree <root> <version>
+install_tree() {
+  local base="$1" version="$2"
+  local dir="$base/.agents/skills/loam-using/scripts"
+  mkdir -p "$dir"
+  cp "$LAUNCHER" "$dir/loam.sh"
+  chmod +x "$dir/loam.sh"
+  printf '%s\n' "$version" > "$dir/CLI_VERSION"
+  printf '%s' "$dir/loam.sh"
+}
+
+# --- 1. Project scope: runtime path derives from the nearest .agents ancestor.
+project="$tmp/project"
+launcher=$(install_tree "$project" "1.2.3")
+path=$(HOME="$tmp/home" LOAM_TARGET=x86_64-unknown-linux-musl "$launcher" --loam-runtime-path) \
+  || fail "1: --loam-runtime-path exited non-zero"
+[[ "$path" == "$project/.agents/loam/bin/1.2.3/x86_64-unknown-linux-musl/loam" ]] \
+  || fail "1: project scope resolved to: $path"
+ok
+
+# --- 2. Bootstrap writes .agents/.gitignore so a clean worktree stays clean.
+[[ -f "$project/.agents/.gitignore" ]] || fail "2: .agents/.gitignore not created"
+grep -Fqx '*' "$project/.agents/.gitignore" || fail "2: .agents/.gitignore does not ignore the tree"
+ok
+
+# --- 3. Global scope: no .agents ancestor → ~/.agents/loam.
+global="$tmp/global"
+mkdir -p "$global/skills/loam-using/scripts"
+cp "$LAUNCHER" "$global/skills/loam-using/scripts/loam.sh"
+chmod +x "$global/skills/loam-using/scripts/loam.sh"
+printf '1.2.3\n' > "$global/skills/loam-using/scripts/CLI_VERSION"
+export HOME="$tmp/home"
+mkdir -p "$HOME"
+path=$(LOAM_TARGET=x86_64-unknown-linux-musl "$global/skills/loam-using/scripts/loam.sh" --loam-runtime-path) \
+  || fail "3: global --loam-runtime-path exited non-zero"
+[[ "$path" == "$HOME/.agents/loam/bin/1.2.3/x86_64-unknown-linux-musl/loam" ]] \
+  || fail "3: global scope resolved to: $path"
+ok
+
+# --- 4. Symlinked launcher resolves the logical .agents scope, not the inode's.
+linked="$tmp/linked"
+mkdir -p "$linked/.agents/skills/loam-using"
+ln -s "$project/.agents/skills/loam-using/scripts" "$linked/.agents/skills/loam-using/scripts"
+path=$(LOAM_TARGET=x86_64-unknown-linux-musl "$linked/.agents/skills/loam-using/scripts/loam.sh" --loam-runtime-path) \
+  || fail "4: symlinked --loam-runtime-path exited non-zero"
+[[ "$path" == "$linked/.agents/loam/bin/1.2.3/x86_64-unknown-linux-musl/loam" ]] \
+  || fail "4: symlink scope resolved to: $path"
+ok
+
+# --- 5. Missing/empty/malformed CLI_VERSION → exit 78, no network.
+for bad in "" "not-semver" "1.2"; do
+  broken="$tmp/broken-$RANDOM"
+  launcher=$(install_tree "$broken" "$bad")
+  out=$(LOAM_TARGET=x86_64-unknown-linux-musl "$launcher" state --fast "$broken" 2>&1)
+  [[ $? -eq 78 ]] || fail "5: CLI_VERSION '$bad' did not exit 78 (got: $out)"
+done
+absent="$tmp/absent"
+launcher=$(install_tree "$absent" "1.2.3")
+rm "$absent/.agents/skills/loam-using/scripts/CLI_VERSION"
+LOAM_TARGET=x86_64-unknown-linux-musl "$launcher" state --fast "$absent" >/dev/null 2>&1
+[[ $? -eq 78 ]] || fail "5: absent CLI_VERSION did not exit 78"
+ok
+
+# --- 6. Unsupported target → exit 78, no download attempted.
+unsupported="$tmp/unsupported"
+launcher=$(install_tree "$unsupported" "1.2.3")
+err=$(LOAM_TARGET=sparc64-unknown-haiku "$launcher" state --fast "$unsupported" 2>&1)
+[[ $? -eq 78 ]] || fail "6: unsupported target did not exit 78"
+grep -Fq 'unsupported' <<< "$err" || fail "6: expected unsupported diagnostic, got: $err"
+ok
+
+# --- 7. Runtime absent → exit 75 with a temporary-unavailable message.
+pending="$tmp/pending"
+launcher=$(install_tree "$pending" "1.2.3")
+err=$(LOAM_NO_BOOTSTRAP=1 LOAM_TARGET=x86_64-unknown-linux-musl "$launcher" state --fast "$pending" 2>&1)
+[[ $? -eq 75 ]] || fail "7: absent runtime did not exit 75 (got: $err)"
+grep -Fqi 'temporarily unavailable' <<< "$err" || fail "7: expected retry message, got: $err"
+ok
+
+# --- 8. Ready runtime is executed by absolute path with the caller's arguments.
+ready="$tmp/ready"
+launcher=$(install_tree "$ready" "1.2.3")
+runtime_dir="$ready/.agents/loam/bin/1.2.3/x86_64-unknown-linux-musl"
+mkdir -p "$runtime_dir"
+cat > "$runtime_dir/loam" <<'STUB'
+#!/bin/sh
+echo "stub:$*"
+STUB
+chmod +x "$runtime_dir/loam"
+out=$(LOAM_TARGET=x86_64-unknown-linux-musl "$launcher" state --fast /some/workspace)
+[[ "$out" == "stub:state --fast /some/workspace" ]] || fail "8: runtime not invoked with args, got: $out"
+ok
+
+# --- 9. Bootstrap verifies the manifest SHA-256 and publishes a runnable binary.
+release="$tmp/release"
+mkdir -p "$release"
+printf '#!/bin/sh\necho installed\n' > "$release/loam-x86_64-unknown-linux-musl"
+digest=$(sha256 "$release/loam-x86_64-unknown-linux-musl")
+cat > "$release/loam-runtime-manifest.json" <<JSON
+{"version":"1.2.3","runtimes":[
+  {"target":"x86_64-unknown-linux-musl","file":"loam-x86_64-unknown-linux-musl","sha256":"$digest"}
+]}
+JSON
+install="$tmp/install"
+launcher=$(install_tree "$install" "1.2.3")
+LOAM_TARGET=x86_64-unknown-linux-musl LOAM_RELEASE_BASE_URL="file://$release" \
+  "$launcher" --loam-bootstrap || fail "9: bootstrap exited non-zero"
+runtime="$install/.agents/loam/bin/1.2.3/x86_64-unknown-linux-musl/loam"
+[[ -x "$runtime" ]] || fail "9: runtime was not published"
+[[ "$("$runtime")" == "installed" ]] || fail "9: published runtime does not run"
+ok
+
+# --- 10. Checksum mismatch never publishes an executable.
+bad_release="$tmp/bad-release"
+mkdir -p "$bad_release"
+printf '#!/bin/sh\necho tampered\n' > "$bad_release/loam-x86_64-unknown-linux-musl"
+cat > "$bad_release/loam-runtime-manifest.json" <<JSON
+{"version":"1.2.3","runtimes":[
+  {"target":"x86_64-unknown-linux-musl","file":"loam-x86_64-unknown-linux-musl","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}
+]}
+JSON
+tampered="$tmp/tampered"
+launcher=$(install_tree "$tampered" "1.2.3")
+LOAM_TARGET=x86_64-unknown-linux-musl LOAM_RELEASE_BASE_URL="file://$bad_release" \
+  "$launcher" --loam-bootstrap >/dev/null 2>&1
+[[ $? -ne 0 ]] || fail "10: checksum mismatch reported success"
+[[ ! -e "$tampered/.agents/loam/bin/1.2.3/x86_64-unknown-linux-musl/loam" ]] \
+  || fail "10: checksum mismatch published an executable"
+ok
+
+# --- 11. Missing release (404) leaves no runtime and no partial state.
+missing="$tmp/missing"
+launcher=$(install_tree "$missing" "1.2.3")
+LOAM_TARGET=x86_64-unknown-linux-musl LOAM_RELEASE_BASE_URL="file://$tmp/no-such-release" \
+  "$launcher" --loam-bootstrap >/dev/null 2>&1
+[[ $? -ne 0 ]] || fail "11: missing release reported success"
+[[ ! -e "$missing/.agents/loam/bin/1.2.3/x86_64-unknown-linux-musl/loam" ]] \
+  || fail "11: missing release published an executable"
+ok
+
+# --- 12. A fresh .installing marker suppresses a duplicate concurrent download.
+concurrent="$tmp/concurrent"
+launcher=$(install_tree "$concurrent" "1.2.3")
+marker_dir="$concurrent/.agents/loam/bin/1.2.3"
+mkdir -p "$marker_dir"
+: > "$marker_dir/x86_64-unknown-linux-musl.installing"
+LOAM_TARGET=x86_64-unknown-linux-musl LOAM_RELEASE_BASE_URL="file://$release" \
+  "$launcher" --loam-bootstrap >/dev/null 2>&1
+[[ ! -e "$concurrent/.agents/loam/bin/1.2.3/x86_64-unknown-linux-musl/loam" ]] \
+  || fail "12: fresh marker did not suppress the duplicate install"
+ok
+
+# --- 13. Updating CLI_VERSION installs beside the old version, never over it.
+upgrade="$tmp/upgrade"
+launcher=$(install_tree "$upgrade" "1.2.3")
+old_dir="$upgrade/.agents/loam/bin/1.0.0/x86_64-unknown-linux-musl"
+mkdir -p "$old_dir"
+printf '#!/bin/sh\necho old\n' > "$old_dir/loam"
+chmod +x "$old_dir/loam"
+LOAM_TARGET=x86_64-unknown-linux-musl LOAM_RELEASE_BASE_URL="file://$release" \
+  "$launcher" --loam-bootstrap || fail "13: upgrade bootstrap exited non-zero"
+[[ "$("$old_dir/loam")" == "old" ]] || fail "13: previous version was overwritten"
+[[ -x "$upgrade/.agents/loam/bin/1.2.3/x86_64-unknown-linux-musl/loam" ]] \
+  || fail "13: new version was not installed"
+ok
+
+# --- 14. Installer output goes to a scope-local log, not the caller's streams.
+logged="$tmp/logged"
+launcher=$(install_tree "$logged" "1.2.3")
+out=$(LOAM_TARGET=x86_64-unknown-linux-musl LOAM_RELEASE_BASE_URL="file://$tmp/no-such-release" \
+  "$launcher" state --fast "$logged" 2>/dev/null)
+[[ -z "$out" ]] || fail "14: launcher leaked stdout: $out"
+# Give the detached installer a moment to fail and write its log.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [[ -s "$logged/.agents/loam/install.log" ]] && break
+  sleep 0.2
+done
+[[ -s "$logged/.agents/loam/install.log" ]] || fail "14: install log was not written"
+ok
+
+echo "loam launcher contract: PASS ($pass checks)"

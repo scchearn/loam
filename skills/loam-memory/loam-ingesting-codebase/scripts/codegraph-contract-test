@@ -4,9 +4,8 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SKILL_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
 REPO_ROOT=$(cd -- "$SKILL_DIR/../../.." && pwd)
-CODEGRAPH="$SCRIPT_DIR/codegraph.sh"
+CODEGRAPH="$SCRIPT_DIR/codegraph-legacy.sh"
 INGEST_SKILL="$SKILL_DIR/SKILL.md"
-LOAM_COMMON="$REPO_ROOT/skills/loam-using/scripts/loam-common.sh"
 
 stat_epoch() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
@@ -97,10 +96,9 @@ touch -d '2026-06-24 10:00:00' "$codebase/src/new.ts"
 # unlike the repo source layout where this skill lives under skills/loam-memory/.
 flat="$tmp/flat-skills"
 mkdir -p "$flat/loam-ingesting-codebase/scripts" "$flat/loam-ingesting-codebase/references" "$flat/loam-using/scripts"
-cp "$CODEGRAPH" "$flat/loam-ingesting-codebase/scripts/codegraph.sh"
+cp "$CODEGRAPH" "$flat/loam-ingesting-codebase/scripts/codegraph-legacy.sh"
 cp "$SKILL_DIR/references/ingestion-exclusions.md" "$flat/loam-ingesting-codebase/references/ingestion-exclusions.md"
-cp "$LOAM_COMMON" "$flat/loam-using/scripts/loam-common.sh"
-flat_summary_json=$("$flat/loam-ingesting-codebase/scripts/codegraph.sh" walk "$codebase" --summary)
+flat_summary_json=$("$flat/loam-ingesting-codebase/scripts/codegraph-legacy.sh" walk "$codebase" --summary)
 
 current_epoch=$(stat_epoch "$codebase/src/current.ts")
 stale_ingested_epoch=$(date -d '2026-06-24 14:33:00' '+%s')

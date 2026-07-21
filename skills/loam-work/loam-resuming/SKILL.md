@@ -26,7 +26,7 @@ If no hint is provided, derive the likely resume target from the current session
 
    ```bash
    bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" --fast "$(pwd)" 2>/dev/null \
-     || powershell "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+     || powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
    ```
 
    Treat an empty `wiki_root` as "no wiki," not as an error. Runtime guard: if a required probe fails or returns invalid JSON, fall back to testing `wiki/SCHEMA.md`, `wiki/index.md`, `wiki/log.md` with `Read` (filesystem open, git-agnostic) — **do not use Glob to discover the wiki root**.

@@ -6,7 +6,7 @@
 set -uo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-LOAMSTATE="$SCRIPT_DIR/loamstate.sh"
+LOAMSTATE="$SCRIPT_DIR/loamstate-legacy.sh"
 
 command -v python3 >/dev/null 2>&1 || { echo "loamstate contract: SKIP (python3 not found)"; exit 0; }
 
@@ -167,25 +167,25 @@ PY
 #     and confirm code_ingest_pending still resolves. ---
 flat=$(mktemp -d)
 mkdir -p "$flat/loam-using/scripts" "$flat/loam-ingesting-codebase/scripts"
-cp "$LOAMSTATE" "$flat/loam-using/scripts/loamstate.sh"
-cat > "$flat/loam-ingesting-codebase/scripts/codegraph.sh" <<'STUB'
+cp "$LOAMSTATE" "$flat/loam-using/scripts/loamstate-legacy.sh"
+cat > "$flat/loam-ingesting-codebase/scripts/codegraph-legacy.sh" <<'STUB'
 #!/usr/bin/env bash
 # stub: only the `diff` subcommand is exercised; report one new file.
 [[ "${1:-}" == "diff" ]] && echo '[{"path":"a.py","mtime":"1","reason":"new"}]'
 exit 0
 STUB
-chmod +x "$flat/loam-ingesting-codebase/scripts/codegraph.sh"
+chmod +x "$flat/loam-ingesting-codebase/scripts/codegraph-legacy.sh"
 ws_flat=$(mktemp -d)
 mkdir -p "$ws_flat/wiki/code"
 : > "$ws_flat/wiki/SCHEMA.md"
-out_flat=$("$flat/loam-using/scripts/loamstate.sh" "$ws_flat")
+out_flat=$("$flat/loam-using/scripts/loamstate-legacy.sh" "$ws_flat")
 rm -rf "$flat" "$ws_flat"
 python3 - "$out_flat" <<'PY' || exit 1
 import json, sys
 data = json.loads(sys.argv[1])
 kinds = {h["kind"] for h in data["hints"]}
 assert "code_ingest_pending" in kinds, \
-    f"flat-layout codegraph.sh must resolve → code_ingest_pending; got {sorted(kinds)}"
+    f"flat-layout codegraph-legacy.sh must resolve → code_ingest_pending; got {sorted(kinds)}"
 print("loamstate contract: flat-install codegraph PASS")
 PY
 

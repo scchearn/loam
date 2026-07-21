@@ -29,7 +29,7 @@ Skills install to `~/.agents/skills/loam-*` and are discovered automatically by 
    ln -s ~/.codex/loam/skills ~/.agents/skills/loam
    ```
 
-   **Windows (PowerShell):**
+   **Windows** (in-box Windows PowerShell 5.1):
    ```powershell
    New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.agents\skills"
    cmd /c mklink /J "$env:USERPROFILE\.agents\skills\loam" "$env:USERPROFILE\.codex\loam\skills"
