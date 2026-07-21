@@ -92,6 +92,7 @@ jobs:
             printf '{"version":"%s","runtimes":[' "$version"
             first=1
             for file in raw-runtimes/loam-*; do
+              [[ "$file" == *loam-runtime-manifest.json ]] && continue
               name="$(basename "$file")"
               target="${name#loam-}"
               target="${target%.exe}"
