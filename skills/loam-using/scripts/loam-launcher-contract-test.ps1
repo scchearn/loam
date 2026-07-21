@@ -31,9 +31,40 @@ function Install-Tree($base, $version) {
 }
 
 function Invoke-Launcher($launcher, $launcherArgs) {
+  # Windows PowerShell 5.1 wraps native-command stderr in ErrorRecord objects.
+  # Under the script's $ErrorActionPreference = 'Stop', merging with 2>&1 turns
+  # the first stderr line into a terminating error — so a launcher correctly
+  # exiting nonzero *with* a diagnostic (invalid CLI_VERSION, unsupported
+  # target, missing release) aborted this script instead of being asserted on.
+  #
+  # Capture stderr through a file rather than the merged stream, and drop the
+  # preference to 'Continue' for the call. Assigning the preference inside the
+  # function creates a function-scoped copy that is discarded on return, so the
+  # caller's 'Stop' is restored automatically.
+  $ErrorActionPreference = 'Continue'
   $all = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $launcher) + $launcherArgs
-  $output = & powershell.exe @all 2>&1
-  return @{ Output = ($output -join "`n"); ExitCode = $LASTEXITCODE }
+  $errorFile = [System.IO.Path]::GetTempFileName()
+  $stdout = $null
+  $stderr = ''
+  $code = $null
+  try {
+    $stdout = & powershell.exe @all 2> $errorFile
+    $code = $LASTEXITCODE
+    if (Test-Path -LiteralPath $errorFile) {
+      $stderr = Get-Content -LiteralPath $errorFile -Raw
+    }
+  } finally {
+    Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
+  }
+  # A launcher that never ran leaves $LASTEXITCODE untouched; -1 keeps the
+  # exit-code assertions meaningful instead of comparing against $null.
+  if ($null -eq $code) { $code = -1 }
+
+  $lines = @()
+  if ($null -ne $stdout) { $lines += @($stdout | ForEach-Object { [string]$_ }) }
+  if (-not [string]::IsNullOrEmpty($stderr)) { $lines += @($stderr -split "`r?`n") }
+  $combined = ($lines -join "`n")
+  return @{ Output = $combined.TrimEnd("`r", "`n"); ExitCode = $code }
 }
 
 $env:LOAM_TARGET = 'x86_64-pc-windows-msvc'

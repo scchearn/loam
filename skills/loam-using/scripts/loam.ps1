@@ -187,12 +187,12 @@ Initialize-AgentsGitignore
 
 $version = Get-CliVersion
 if (-not $version) {
-  Write-Error "loam: CLI_VERSION is missing, empty, or not valid SemVer at $ScriptDir\CLI_VERSION"
+  [Console]::Error.WriteLine("loam: CLI_VERSION is missing, empty, or not valid SemVer at $ScriptDir\CLI_VERSION")
   exit 78
 }
 $target = Get-Target
 if ($SupportedTargets -notcontains $target) {
-  Write-Error "loam: unsupported platform target: $target"
+  [Console]::Error.WriteLine("loam: unsupported platform target: $target")
   exit 78
 }
 $binary = Get-RuntimeBinary $version $target
@@ -211,5 +211,5 @@ if (Test-Path $binary -PathType Leaf) {
 }
 
 Start-BackgroundBootstrap
-Write-Error "loam: native runtime $version ($target) is temporarily unavailable; retry shortly"
+[Console]::Error.WriteLine("loam: native runtime $version ($target) is temporarily unavailable; retry shortly")
 exit 75

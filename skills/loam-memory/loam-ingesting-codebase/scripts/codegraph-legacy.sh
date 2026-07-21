@@ -236,10 +236,16 @@ collect_walk() {
   # gitignored files with included extensions from the git ignored set.
   local -A _gitignored=()
   if $use_gitignore; then
-    local _gi_ext_regex
+    local _gi_ext_regex _gi_path
     _gi_ext_regex=$(printf '|\.%s' "${include_exts[@]}")
     _gi_ext_regex="(${_gi_ext_regex#|})$"
-    excluded_gitignore=$(git -C "$codebase_root" ls-files --others --ignored --exclude-standard 2>/dev/null | grep -cE "$_gi_ext_regex" || true)
+    # Populate the set, not just a count. fd pre-filters gitignored files so the
+    # set looks redundant there, but the find fallback enumerates them and Step 6
+    # is the only place that can drop them.
+    while IFS= read -r _gi_path; do
+      [[ -n "$_gi_path" ]] && _gitignored["$_gi_path"]=1
+    done < <(git -C "$codebase_root" ls-files --others --ignored --exclude-standard 2>/dev/null | grep -E "$_gi_ext_regex" || true)
+    excluded_gitignore=${#_gitignored[@]}
   fi
 
   # Step 3: batch stat — single stat call for size + mtime
@@ -279,8 +285,10 @@ collect_walk() {
   for file in "${_all_files[@]}"; do
     rel_path="${file#"$codebase_root"/}"
 
+    # excluded_gitignore is already the size of the ignored set, matching the
+    # native walker. Incrementing here would double-count on the find path.
     if $use_gitignore && [[ -n "${_gitignored["$rel_path"]:-}" ]]; then
-      excluded_gitignore=$((excluded_gitignore + 1)); continue
+      continue
     fi
 
     size="${_stat_size["$file"]:-0}"

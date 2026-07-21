@@ -130,6 +130,21 @@ EOF
 
 walk_json=$("$CODEGRAPH" walk "$codebase")
 summary_json=$("$CODEGRAPH" walk "$codebase" --summary)
+
+# fd is optional and pre-filters gitignored files, which hides gitignore bugs in
+# the find fallback. CI has no fd, so run the fallback explicitly: build a PATH
+# holding only the commands the walker needs, with fd absent.
+nofd_bin="$tmp/nofd-bin"
+mkdir -p "$nofd_bin"
+for _b in awk basename cat dirname find git grep sed sha256sum shasum stat tr sort head wc uname env bash sh mktemp rm ls date cut; do
+  _p=$(command -v "$_b" 2>/dev/null) && ln -sf "$_p" "$nofd_bin/$_b"
+done
+if PATH="$nofd_bin" command -v fd > /dev/null 2>&1; then
+  echo "no-fd harness failed: fd is still reachable" >&2
+  exit 1
+fi
+fallback_walk_json=$(PATH="$nofd_bin" "$CODEGRAPH" walk "$codebase")
+fallback_summary_json=$(PATH="$nofd_bin" "$CODEGRAPH" walk "$codebase" --summary)
 index_json=$("$CODEGRAPH" index "$wiki" --codebase-root "$codebase")
 diff_json=$("$CODEGRAPH" diff "$codebase" "$wiki")
 
@@ -153,7 +168,7 @@ else
   no_gitignore_json='[]'
 fi
 
-WALK_JSON="$walk_json" SUMMARY_JSON="$summary_json" FLAT_SUMMARY_JSON="$flat_summary_json" INDEX_JSON="$index_json" DIFF_JSON="$diff_json" NO_GITIGNORE_JSON="$no_gitignore_json" STALE_EPOCH="$stale_epoch" python3 - <<'PY'
+WALK_JSON="$walk_json" SUMMARY_JSON="$summary_json" FALLBACK_WALK_JSON="$fallback_walk_json" FALLBACK_SUMMARY_JSON="$fallback_summary_json" FLAT_SUMMARY_JSON="$flat_summary_json" INDEX_JSON="$index_json" DIFF_JSON="$diff_json" NO_GITIGNORE_JSON="$no_gitignore_json" STALE_EPOCH="$stale_epoch" python3 - <<'PY'
 import json, os
 
 walk = json.loads(os.environ['WALK_JSON'])
@@ -191,6 +206,22 @@ assert excluded['gitignore'] >= 1
 assert 'node_modules/dummy/index.js' not in paths, "root-level node_modules leaked past **/node_modules/**"
 assert 'dist/build.js' not in paths, "root-level dist leaked past **/dist/**"
 assert flat_summary['total'] == summary['total'], "flat installed layout could not load shared helpers"
+
+# The find fallback (no fd) must filter gitignored files exactly as fd does.
+# fd respects .gitignore itself, so only this path exercises the walker's own
+# gitignore filtering — the CI environment has no fd.
+fallback_walk = json.loads(os.environ['FALLBACK_WALK_JSON'])
+fallback_summary = json.loads(os.environ['FALLBACK_SUMMARY_JSON'])
+fallback_paths = {item['path'] for item in fallback_walk}
+assert 'ignored.ts' not in fallback_paths, "find fallback leaked a gitignored file"
+assert fallback_paths == paths, (
+    "find fallback disagrees with the fd path: "
+    f"only-fallback={sorted(fallback_paths - paths)} only-fd={sorted(paths - fallback_paths)}"
+)
+assert fallback_summary == summary, (
+    f"find fallback summary drift: fallback={fallback_summary} fd={summary}"
+)
+assert fallback_summary['total'] == len(fallback_walk)
 
 by_source = {item['source_path']: item for item in index}
 assert by_source['src/current.ts']['exists'] is True
