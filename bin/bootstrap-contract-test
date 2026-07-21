@@ -43,7 +43,7 @@ export INJECTED_CONTEXT="$TMP/injected-context"
 
 (
   cd "$WORKSPACE"
-  bun --eval '
+  node --no-warnings --input-type=module --eval '
     const { LoamPlugin } = await import(process.env.PLUGIN_URL);
     const hooks = await LoamPlugin({ client: {}, directory: process.cwd() });
     const output = {
@@ -51,7 +51,7 @@ export INJECTED_CONTEXT="$TMP/injected-context"
     };
     await hooks["experimental.chat.messages.transform"]({}, output);
     await hooks["experimental.chat.messages.transform"]({}, output);
-    await Bun.write(process.env.INJECTED_CONTEXT, output.messages[0].parts[0].text);
+    (await import("fs")).writeFileSync(process.env.INJECTED_CONTEXT, output.messages[0].parts[0].text);
   '
 )
 

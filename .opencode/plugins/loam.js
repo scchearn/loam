@@ -175,7 +175,7 @@ const getWorkspaceState = () => {
 
 export const LoamPlugin = async ({ client, directory }) => {
   // Plugin root = clone root (where .git lives), two levels up from loam.js
-  const pluginRoot = path.resolve(__dirname, '../..');
+  const pluginRoot = path.resolve(import.meta.dirname, '../..');
 
   // Helper to generate bootstrap content
   const getBootstrapContent = () => {

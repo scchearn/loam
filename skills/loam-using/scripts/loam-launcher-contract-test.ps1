@@ -132,10 +132,17 @@ $ready = Join-Path $tmp 'ready'
 $launcher = Install-Tree $ready '1.2.3'
 $runtimeDir = Join-Path $ready '.agents\loam\bin\1.2.3\x86_64-pc-windows-msvc'
 New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
-# A .cmd stub stands in for the native executable so the test needs no build.
+# Compile a real PE stub in-box so Windows can execute the ready-runtime path
+# without downloading or building the native runtime.
 $stub = Join-Path $runtimeDir 'loam.exe'
-Set-Content -Path (Join-Path $runtimeDir 'stub.cmd') -Value '@echo stub:%*' -Encoding ASCII
-Copy-Item (Join-Path $runtimeDir 'stub.cmd') $stub -Force
+Add-Type -OutputType ConsoleApplication -OutputAssembly $stub -TypeDefinition @'
+using System;
+public static class LoamContractStub {
+  public static void Main(string[] args) {
+    Console.WriteLine("stub:" + String.Join(" ", args));
+  }
+}
+'@
 $result = Invoke-Launcher $launcher @('state', '--fast', 'C:\some\workspace')
 if ($result.Output -notmatch 'stub:') { Fail "7: runtime not invoked, got $($result.Output)" }
 Add-Check

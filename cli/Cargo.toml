@@ -3,6 +3,10 @@ name = "loam"
 version = "0.9.0"
 edition = "2021"
 publish = false
+repository = "https://github.com/scchearn/loam"
+
+[package.metadata.dist]
+dist = true
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
