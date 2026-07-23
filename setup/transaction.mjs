@@ -1,6 +1,5 @@
-import { mkdir, readdir, readFile, rename, rm } from 'node:fs/promises';
+import { mkdir, open, readdir, readFile, rename, rm, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
 import { cleanupStaging, createStagingDirectory, writeAtomicFile, publishJson } from './atomic.mjs';
@@ -10,7 +9,27 @@ import { installRuntime } from './runtime.mjs';
 import { installHarnesses } from './harnesses.mjs';
 import { migrateLegacyProject } from './migration.mjs';
 import { verifyInstallation } from './verify.mjs';
-import { withSetupLock } from './lock.mjs';
+
+// ponytail: trivial lockfile — no polling, no stale-PID detection.
+// Two concurrent setups on the same HOME is a near-zero event; the second
+// exits 1. Upgrade to bounded waits only if real contention is reported.
+async function withSetupLock({ globalRoot }, callback) {
+  const lockPath = join(globalRoot, 'setup.lock');
+  await mkdir(globalRoot, { recursive: true, mode: 0o700 });
+  let handle;
+  try {
+    handle = await open(lockPath, 'wx', 0o600);
+  } catch (error) {
+    if (error?.code === 'EEXIST') throw new Error(`setup is already running: ${lockPath}`);
+    throw error;
+  }
+  try {
+    return await callback();
+  } finally {
+    await handle.close().catch(() => {});
+    await unlink(lockPath).catch(() => {});
+  }
+}
 
 async function stageIntegration({ packageRoot, globalRoot, pluginVersion }) {
   const sourceRoot = join(packageRoot, 'integration');
@@ -32,30 +51,6 @@ async function stageIntegration({ packageRoot, globalRoot, pluginVersion }) {
     throw error;
   }
   return { root: candidateRoot, path: join(candidateRoot, 'loam.mjs') };
-}
-
-async function verifyIntegrationCandidate({ discovery, install, integrationPath, runner, timeoutMs }) {
-  const integration = await import(`${pathToFileURL(integrationPath).href}?candidate=${randomUUID()}`);
-  if (typeof integration.runIntegration !== 'function') throw new Error('candidate integration is missing runIntegration');
-  const options = {
-    globalRoot: discovery.globalRoot,
-    skillsRoot: discovery.skillsRoot,
-    integrationPath,
-    target: discovery.target,
-    platform: discovery.platform,
-    arch: discovery.arch,
-    workspace: discovery.workspace,
-    install,
-    runner,
-    timeoutMs,
-    output: { write: () => {} },
-  };
-  if (await integration.runIntegration(['status'], options) !== 0) {
-    throw new Error('candidate integration status verification failed');
-  }
-  if (await integration.runIntegration(['hook', '--harness', 'opencode', '--workspace', discovery.workspace], options) !== 0) {
-    throw new Error('candidate integration hook verification failed');
-  }
 }
 
 export async function executeSetup(parsed, discovery, options = {}) {
@@ -111,7 +106,6 @@ export async function executeSetup(parsed, discovery, options = {}) {
         workspace: discovery.workspace,
         smokeRunner: options.smokeRunner,
         expectedSha256: alreadyReady.install?.runtime_sha256,
-        lock: false,
       });
       stage(output, runtime.reused ? 'Runtime reused' : 'Runtime downloaded and verified');
 
@@ -179,13 +173,6 @@ export async function executeSetup(parsed, discovery, options = {}) {
           .filter(([, harness]) => harness.state === 'ready')
           .map(([id]) => id),
       };
-      await verifyIntegrationCandidate({
-        discovery,
-        install,
-        integrationPath,
-        runner: options.smokeRunner,
-        timeoutMs: options.runtimeTimeoutMs,
-      });
       const final = await (options.finalVerify || verifyInstallation)({
         discovery,
         packageRoot: discovery.packageRoot,

@@ -5,7 +5,6 @@ import { join, resolve } from 'node:path';
 
 import { invokeRuntime, verifyRuntimeFile } from '../integration/runtime.mjs';
 import { createStagingDirectory, cleanupStaging, publishAtomic } from './atomic.mjs';
-import { withSetupLock } from './lock.mjs';
 import { assertSupportedTarget, detectTarget, runtimePath } from './target.mjs';
 
 const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
@@ -159,8 +158,6 @@ export async function installRuntime({
   smokeRunner,
   expectedSha256,
   force = false,
-  lock = true,
-  lockOptions = {},
 } = {}) {
   if (!SEMVER.test(version || '')) throw new Error(`invalid runtime version: ${version || '(missing)'}`);
   const selectedTarget = target || detectTarget({ platform, arch, override: process.env.LOAM_TARGET });
@@ -207,5 +204,5 @@ export async function installRuntime({
       await cleanupStaging(staging);
     }
   };
-  return lock ? withSetupLock({ globalRoot: root, ...lockOptions }, install) : install();
+  return install();
 }
