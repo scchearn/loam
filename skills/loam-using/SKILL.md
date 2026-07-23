@@ -147,9 +147,12 @@ For native operations, invoke the same native command directly:
 ```
 
 If the integration reports `Loam is unavailable` or does not provide real
-state, stop the runtime-dependent operation. Report the recovery command
-`npx @scchearn/loam setup`; never fabricate workspace state or hints and never
-fall back to a project-local launcher.
+state, you may run `npx @scchearn/loam setup` to install or repair Loam.
+Setup is agent-initiated — if the recovery command is in your context, use
+it. If setup succeeds, continue the task. If setup fails, retry once. If it
+fails again, report the failure output to the user and stop — do not loop.
+Never fabricate workspace state or hints and never fall back to a
+project-local launcher.
 
 ### Reuse before probing
 
