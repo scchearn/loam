@@ -17,9 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # OIDC trusted publishing requires npm >= 11.5.1; the runner's default is older.
-      - run: npm install -g npm@latest
-
       - name: Verify package version
         shell: bash
         run: |
@@ -28,9 +25,14 @@ jobs:
           expected="${GITHUB_REF_NAME#v}"
           test "$version" = "$expected"
 
+      # Tests run under the runner's default npm (what they are written against).
       - run: npm ci
       - run: npm test
       - run: npm pack --dry-run
+
+      # OIDC trusted publishing needs npm >= 11.5.1; upgrade only for publish so
+      # the test steps above keep the npm they expect.
+      - run: npm install -g npm@latest
 
       # Auth is via GitHub OIDC (Trusted Publishing) — no token. Requires the
       # trusted publisher to be configured on npmjs.com for this repo + workflow.
