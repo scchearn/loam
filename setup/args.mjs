@@ -15,6 +15,8 @@ export function parseArgs(argv) {
 
   if (args.length === 0) return { command: 'help' };
   const command = args[0];
+  if (command === 'help') return { command: 'help' };
+  if (command === 'version') return { command: 'version' };
   if (command !== 'setup' && command !== 'uninstall') {
     throw new UsageError(`unknown command: ${command}`);
   }

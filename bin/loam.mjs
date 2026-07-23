@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 import { EXIT_CODES, HELP_TEXT, PACKAGE_VERSION } from '../setup/constants.mjs';
 import { parseArgs } from '../setup/args.mjs';
@@ -32,7 +32,9 @@ export async function main(argv = process.argv.slice(2), output = process.stdout
   }
 }
 
-const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : '';
-if (import.meta.url === invokedPath || fileURLToPath(import.meta.url) === process.argv[1]) {
+// Compare real paths: npx invokes this through a node_modules/.bin symlink, so
+// process.argv[1] and import.meta.url only match once both are resolved.
+const invokedPath = process.argv[1] ? realpathSync(process.argv[1]) : '';
+if (invokedPath === fileURLToPath(import.meta.url)) {
   process.exitCode = await main();
 }
