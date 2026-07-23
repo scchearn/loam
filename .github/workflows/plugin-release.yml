@@ -17,6 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # OIDC trusted publishing requires npm >= 11.5.1; the runner's default is older.
+      - run: npm install -g npm@latest
+
       - name: Verify package version
         shell: bash
         run: |
@@ -29,11 +32,7 @@ jobs:
       - run: npm test
       - run: npm pack --dry-run
 
+      # Auth is via GitHub OIDC (Trusted Publishing) — no token. Requires the
+      # trusted publisher to be configured on npmjs.com for this repo + workflow.
       - name: Publish package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm config set //registry.npmjs.org/:_authToken "$NODE_AUTH_TOKEN"
-          npm publish --access public --provenance
+        run: npm publish --access public --provenance
