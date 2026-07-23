@@ -34,33 +34,22 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust
-        shell: bash
-        run: rustup toolchain install 1.94.1 --profile minimal
-      - run: cargo +1.94.1 build --release --locked
+      - run: npm ci
       - run: bash bin/check-curation.sh
-      - run: skills/loam-using/scripts/loam-launcher-contract-test
-      - run: skills/loam-using/scripts/loamstate-contract-test
-      - run: skills/loam-work/loam-checkpointing/scripts/checkpoint-contract-test
+      - run: bash bin/setup-contract-test
       - run: skills/loam-work/loam-setting-goals/scripts/goal-contract-test
-      - run: skills/loam-memory/loam-ingesting-codebase/scripts/codegraph-contract-test
-      # bootstrap-contract-test also covers the Claude, Cursor, and
-      # default/Copilot hook JSON formats.
-      - run: bin/bootstrap-contract-test
 
-  windows-powershell:
-    runs-on: windows-2022
+  node-contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust
-        shell: bash
-        run: rustup toolchain install 1.94.1 --profile minimal
-      - run: cargo +1.94.1 build --release --locked
-      # In-box Windows PowerShell 5.1 with the exact pinned invocation Loam
-      # documents everywhere. pwsh is deliberately not used here.
-      - name: PowerShell wrapper contract
-        shell: cmd
-        run: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File skills\loam-using\scripts\loam-launcher-contract-test.ps1
+      - run: node --version
+      - run: npm ci
+      - run: npm test
 
   dist-plan:
     runs-on: ubuntu-22.04

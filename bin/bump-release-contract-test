@@ -32,7 +32,7 @@ make_fixture() {
   cp "$BUMP" "$fixture/bin/bump-release.sh"
   chmod +x "$fixture/bin/bump-release.sh"
 
-  printf '{\n  "name": "loam",\n  "version": "%s",\n  "type": "module"\n}\n' "$PLUGIN_VERSION" \
+  printf '{\n  "name": "@scchearn/loam",\n  "version": "%s",\n  "type": "module"\n}\n' "$PLUGIN_VERSION" \
     > "$fixture/package.json"
   printf '{\n  "name": "loam",\n  "metadata": {\n    "version": "%s"\n  },\n  "plugins": [\n    {\n      "name": "loam",\n      "version": "%s"\n    }\n  ]\n}\n' \
     "$PLUGIN_VERSION" "$PLUGIN_VERSION" > "$fixture/.claude-plugin/marketplace.json"

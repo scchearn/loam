@@ -11,80 +11,34 @@ sessions build on each other instead of starting from scratch.
 
 ## Install
 
-### Step 1 — all harnesses (skill discovery)
+### Step 1 — global setup
 
 ```bash
-npx skills add scchearn/loam
+npx @scchearn/loam setup
 ```
 
-Skills install into your agent's skills directory
-(`~/.agents/skills/loam-*`, symlinked from `~/.claude/skills/`,
-`~/.config/opencode/skills/`, etc.) and are available the next time you
-start a session. This is the single source of truth for skill content —
-the plugin bootstrap (step 2) reads from here.
+Setup delegates canonical global skill installation to Skills CLI, installs and
+verifies the exact native runtime pinned by `CLI_VERSION`, configures detected
+OpenCode, Claude Code, and Cursor integrations, and migrates recognized legacy
+project Loam artifacts only from the current workspace. It does not modify
+`PATH` or install a project-local runtime.
 
-### Step 2 — injection harnesses only (optional, auto-injection)
+### Harness visibility
 
-On OpenCode, Claude Code, and Cursor, you can optionally register loam as a
-plugin to auto-inject the `loam::using` router into every session start. The
-plugin reads skill content from the `npx skills` install — no second copy.
+Successful setup leaves supported detected harnesses ready. Session startup is
+local, read-only, and network-free. If the runtime is missing or mismatched,
+the integration reports `npx @scchearn/loam setup` instead of fabricating state.
 
-### OpenCode (auto-injection)
+- OpenCode, Claude Code, and Cursor receive automatic integration when detected
+  and configured by setup.
+- Codex and other universal-discovery harnesses can discover the global skills;
+  Loam makes no full integration claim without a shipped adapter.
+- The existing clone plus direct `.opencode/plugins/loam.js` path remains a
+  migration compatibility path and reports setup recovery when incomplete.
 
-Clone the repo and add the plugin entry point directly to your `opencode.json`:
-
-```bash
-git clone https://github.com/scchearn/loam.git ~/.config/opencode/loam
-```
-
-```json
-{ "plugin": ["/home/YOU/.config/opencode/loam/.opencode/plugins/loam.js"] }
-```
-
-Restart OpenCode. The plugin injects `loam::using` into the first user message
-of each session and auto-checks for updates (warns in-session if the local
-clone is behind `origin/main`). See [`.opencode/INSTALL.md`](./.opencode/INSTALL.md)
-for details.
-
-### Claude Code (auto-injection)
-
-Register the loam marketplace and install the plugin:
-
-```bash
-/plugin marketplace add scchearn/loam
-/plugin install loam@loam
-```
-
-The `hooks/hooks.json` SessionStart hook injects `loam::using` at session start
-(startup, clear, compact).
-
-### Cursor (auto-injection)
-
-Install loam as a Cursor plugin. The `hooks/hooks-cursor.json` sessionStart hook
-injects `loam::using` at session start. `.cursor-plugin/plugin.json` drives
-plugin discovery.
-
-### Codex (skill discovery only)
-
-Codex has no session-start injection. Clone and symlink for skill discovery:
-
-```bash
-git clone https://github.com/scchearn/loam.git ~/.codex/loam
-mkdir -p ~/.agents/skills
-ln -s ~/.codex/loam/skills ~/.agents/skills/loam
-```
-
-See [`.codex/INSTALL.md`](./.codex/INSTALL.md) for details. Invoke
-`loam::using` on demand at session start.
-
-### Antigravity (skill discovery only)
-
-```bash
-npx skills add scchearn/loam
-```
-
-No auto-injection. Skills are discovered via `~/.agents/skills/loam-*`;
-invoke `loam::using` on demand.
+See [`.opencode/INSTALL.md`](./.opencode/INSTALL.md) and
+[`.codex/INSTALL.md`](./.codex/INSTALL.md) for harness-specific discovery and
+migration notes.
 
 ## What you get
 
@@ -133,19 +87,13 @@ loam works fully on its own. If your wiki grows large, [qmd](https://github.com/
 
 ### Native runtime
 
-`npx skills add scchearn/loam` remains the only installation command. It copies
-text launchers plus a `CLI_VERSION` file; the first state probe downloads the
-matching native `loam` executable for your platform from this repository's
-GitHub Release, verifies its SHA-256 against a published runtime manifest, and
-stores it under `.agents/loam/` — project-scoped for a project install, global
-for a global one. Nothing is added to `PATH`.
-
-The download happens in the background and never blocks session start: while it
-is missing, installing, unsupported, or offline you get a minimal workspace
-state and a `runtime_unavailable` hint. Supported targets are macOS (Intel and
-Apple Silicon), Windows x64, and Linux x64/arm64. Native Windows works under
-in-box Windows PowerShell 5.1 — Git Bash or WSL is now only needed for the
-POSIX SessionStart hook.
+The setup package installs the exact native `loam` executable selected by the
+global `CLI_VERSION`, verifies its SHA-256 against the published runtime
+manifest, and stores it under the global `.agents/loam/` root outside `PATH`.
+Runtime-dependent skills invoke the injected absolute native command directly;
+the shared Node integration is limited to readiness, startup context, and
+harness envelopes. Supported targets are macOS (Intel and Apple Silicon),
+Windows x64, and Linux x64/arm64.
 
 Trust model: the GitHub repository plus HTTPS. The manifest SHA-256 detects
 corruption, truncation, and artifact mismatch; no installer script is ever
@@ -195,23 +143,23 @@ startup, while the body is only loaded when the skill activates.
 |-------|---:|---:|---:|---:|
 | loam::initializing-vault | 206 | 51 | 9 | 73 |
 | loam::scaffolding-wiki | 445 | 90 | 198 | 2,196 |
-| loam::adding-to-memory | 592 | 116 | 218 | 2,375 |
+| loam::adding-to-memory | 592 | 116 | 217 | 2,301 |
 | loam::amending-memory | 505 | 114 | 180 | 1,951 |
 | loam::auditing-guidance | 410 | 85 | 252 | 2,528 |
-| loam::ingesting-codebase | 329 | 76 | 271 | 3,256 |
-| loam::learning-from-session | 487 | 101 | 366 | 4,278 |
-| loam::linting-memory | 471 | 102 | 310 | 5,258 |
+| loam::ingesting-codebase | 329 | 76 | 270 | 3,099 |
+| loam::learning-from-session | 487 | 101 | 365 | 4,202 |
+| loam::linting-memory | 471 | 102 | 310 | 4,875 |
 | loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
-| loam::querying-memory | 530 | 105 | 176 | 1,687 |
+| loam::querying-memory | 530 | 105 | 175 | 1,586 |
 | loam::reviewing-memory | 510 | 113 | 137 | 1,787 |
-| loam::syncing-code-graph | 363 | 84 | 221 | 3,052 |
-| loam::using | 368 | 77 | 174 | 3,477 |
+| loam::syncing-code-graph | 363 | 84 | 220 | 2,924 |
+| loam::using | 368 | 77 | 225 | 3,778 |
 | loam::amending-plan | 437 | 88 | 271 | 3,032 |
-| loam::checkpointing | 365 | 69 | 180 | 2,202 |
+| loam::checkpointing | 365 | 69 | 180 | 2,188 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,176 |
-| loam::planning | 327 | 62 | 323 | 4,317 |
-| loam::resuming | 376 | 77 | 143 | 1,889 |
-| loam::setting-goals | 473 | 101 | 184 | 1,853 |
+| loam::planning | 327 | 62 | 323 | 4,314 |
+| loam::resuming | 376 | 77 | 142 | 1,807 |
+| loam::setting-goals | 473 | 101 | 184 | 1,850 |
 | loam::starting | 166 | 34 | 355 | 4,983 |
 | loam::writing-spec | 332 | 66 | 252 | 2,892 |
 <!-- END skill-metrics -->

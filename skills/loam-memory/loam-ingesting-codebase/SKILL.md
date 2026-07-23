@@ -22,13 +22,12 @@ The codebase root is: $ARGUMENTS
 
 ### Wiki resolution and qmd readiness
 
-First reuse the injected `Workspace state` under the reuse contract in `loam::using`. Do not rerun `loamstate` when that block supplies wiki existence/root, qmd readiness, collection, and hints; Step 2 computes the authoritative codegraph diff.
+First reuse the injected `Workspace state` under the reuse contract in `loam::using`. Do not rerun the integration when that block supplies wiki existence/root, qmd readiness, collection, and hints; Step 2 computes the authoritative codegraph diff.
 
-If the injected state cannot be reused, run a fast probe:
+If the injected state cannot be reused, refresh native state through the injected absolute integration path:
 
 ```bash
-bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" --fast "$(pwd)" 2>/dev/null \
-  || powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+<native-runtime-command> state --fast "$(pwd)"
 ```
 
 If `exists` is false, stop and recommend:
@@ -37,7 +36,7 @@ If `exists` is false, stop and recommend:
 /loam::scaffolding-wiki <topic or wiki goal>
 ```
 
-Use `wiki_root` from the resolved state as the wiki root. Do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh (`qmd update -c <collection>`). The skill works fully without qmd; it only accelerates post-ingest discovery. Runtime guard: if a required probe fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md`.
+If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. Use `wiki_root` from the resolved state as the wiki root. Do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh (`qmd update -c <collection>`). The skill works fully without qmd; it only accelerates post-ingest discovery.
 
 A `code_ingest_pending` hint, when present, previews the work set; Step 2 remains authoritative when fast injected state omits that hint.
 
@@ -52,27 +51,27 @@ If `$ARGUMENTS` is empty, default the codebase root to `$(pwd)`. Do not ask for 
 Run the index subcommand to get every code-ingested page already in the wiki:
 
 ```bash
-"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loam.sh" codegraph index <wiki-root> --codebase-root <codebase-root>
+<native-runtime-command> codegraph index <wiki-root> --codebase-root <codebase-root>
 ```
 
 Parse the JSON output into an in-memory map: `{source_path → {slug, ingested_at, mtime, exists}}`. Pages without `source_path:` front matter are prose entity pages and are skipped silently. This map is the set of already-ingested code nodes. The index scans both `code/` and `entities/` (for legacy stranded `source_path:` pages during the transition to the `code/` namespace).
 
-If the script is missing or fails, fall back to Globbing `code/*.md` and `entities/*.md` and parsing front matter with Read. The script is an optimization, not a hard dependency.
+If the native runtime command fails or reports an unavailable runtime, stop and report the setup recovery command. Do not fall back to a project-local launcher.
 
-If `loam.sh codegraph index` or `loam.sh codegraph diff` reports `wiki root contract not found` or `did you mean: .../wiki`, stop and rerun the command with the actual `wiki_root`. Do not proceed from an empty index caused by a bad wiki-root path.
+If the native codegraph command reports `wiki root contract not found` or `did you mean: .../wiki`, stop and rerun it with the actual `wiki_root`. Do not proceed from an empty index caused by a bad wiki-root path.
 
 ### Optional preflight summary
 
 For a quick size check before ingesting, run:
 
 ```bash
-"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loam.sh" codegraph walk <codebase-root> --summary \
+<native-runtime-command> codegraph walk <codebase-root> --summary \
   --exclusions "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/ingestion-exclusions.md"
 ```
 
 This reports candidate counts by extension plus excluded low-signal counts (`pattern`, `gitignore`, `empty`, `large`, `generated_header`, `binary`). Use it to decide whether the run is likely to hit the cap; it is not required for correctness.
 
-If the script is missing or fails, fall back to Globbing the tree and applying the exclusion list manually (Read `references/ingestion-exclusions.md` for the patterns).
+If the native runtime command fails or reports an unavailable runtime, stop and report the setup recovery command. Do not fall back to a project-local launcher.
 
 ---
 
@@ -83,7 +82,7 @@ Default mode is diff-guided ingest: process `new` and `stale` entries from `code
 Run the diff subcommand to get the files that need ingestion or re-summarization:
 
 ```bash
-"${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loam.sh" codegraph diff <codebase-root> \
+<native-runtime-command> codegraph diff <codebase-root> \
   --exclusions "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/ingestion-exclusions.md"
 ```
 
@@ -277,4 +276,4 @@ Codebase ingested from <codebase root>
 - Read the wiki schema before editing the index or log.
 - Prefer incremental linked updates over large rewrites.
 - Do not leave avoidable broken wikilinks after the ingest pass.
-- If the codegraph forwarder or the native runtime is missing or fails, fall back to Glob/Read/stat. The skill must work fully without the script.
+- If the codegraph forwarder or the native runtime is missing or fails, stop and recommend `npx @scchearn/loam setup`; do not substitute a project-local fallback.

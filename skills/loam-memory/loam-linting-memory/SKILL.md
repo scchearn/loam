@@ -41,8 +41,7 @@ If the target is a `goals/<slug>.md` path, run only the goal-health pass (Step 2
 The injected summary omits `metadata_status` and `metadata_path`, and lint must inspect current state. Run a fresh fast probe rather than reusing it:
 
 ```bash
-bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" --fast "$(pwd)" 2>/dev/null \
-  || powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+<native-runtime-command> state --fast "$(pwd)"
 ```
 
 If `exists` is false, check whether `goals/` exists (`ls goals/*.md 2>/dev/null`). If `goals/` exists, skip all wiki-only steps (Steps 1 "Read the wiki contract" through Step 2 "Apply safe fixes") and jump directly to the goal-health pass (Step 2G). If neither a wiki nor goals exist, stop and recommend:
@@ -53,7 +52,7 @@ If `exists` is false, check whether `goals/` exists (`ls goals/*.md 2>/dev/null`
 
 If the target was a single `goals/<slug>.md` path, skip all wiki-only steps and run only the goal-health pass for that file.
 
-Use `wiki_root` as the resolved wiki root (resolved from on-disk contract files, not qmd metadata). If `has_overview` is true, note it as a legacy root-hub file to fold into `index.md`. Then resolve the lint scope: if the user named a wiki root, subdirectory, topic, or entity, use that. If no scope given, lint the whole wiki.
+If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. Use `wiki_root` as the resolved wiki root (resolved from on-disk contract files, not qmd metadata). If `has_overview` is true, note it as a legacy root-hub file to fold into `index.md`. Then resolve the lint scope: if the user named a wiki root, subdirectory, topic, or entity, use that. If no scope given, lint the whole wiki.
 
 This skill satisfies the `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, and `legacy_structure_pending` hints (see the hint contract in `loam::using`); treat them as advisory scope, not extra mandatory work. Fast state omits date drift, which the lint pass checks directly later.
 
@@ -81,8 +80,7 @@ Structural link and heading integrity is machine-checkable. Run it before
 reading pages, so manual review is spent on judgement rather than link chasing:
 
 ```bash
-bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loam.sh" lint "$WORKSPACE_ROOT" 2>/dev/null \
-  || powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loam.ps1" lint "$WORKSPACE_ROOT" 2>/dev/null
+<native-runtime-command> lint "$WORKSPACE_ROOT"
 ```
 
 Each line is one JSON finding with `rule`, `file`, `line`, `description`,
@@ -90,20 +88,23 @@ Each line is one JSON finding with `rule`, `file`, `line`, `description`,
 arguments or an unreadable input. `--only markdown|memory|work` narrows the
 scan. The command is read-only and never fixes anything.
 
-If it exits 75 or 78 the native runtime is not ready — fall through to the
-manual `Glob`/`Grep` checks below. The linter reports; **you** still classify
-findings and apply safe fixes through the normal proposal/approval path.
+If it exits 75 or 78 the native runtime is not ready — stop and report
+`npx @scchearn/loam setup`. Do not claim a clean result from a fallback check.
+The linter reports; **you** still classify findings and apply safe fixes
+through the normal proposal/approval path.
 
 
 ### qmd metadata health (secondary only)
 
-The `loamstate` probe already resolved `qmd_ready`, `collection`, `metadata_status`, and `metadata_path`. If `metadata_path` is non-empty, compare its `retrieval.collection_path` to the actual resolved `<wiki root>` using absolute path equality. If they differ, mark qmd metadata as stale and plan a safe metadata reconciliation during fixes.
+Use the integration's `qmd_ready`, `collection`, `metadata_status`, and
+`metadata_path` fields. When metadata exists, compare
+`retrieval.collection_path` with the resolved `<wiki root>`; report mismatches
+and reconcile metadata without moving the wiki. Validate the collection when
+qmd is ready; otherwise use Grep/Glob only.
 
-If metadata is stale and qmd is available, validate the recorded `collection` with `qmd collection show <collection> 2>/dev/null` when supported. If another collection is already registered for the actual `<wiki root>`, plan to update `collection_name` to that collection. If no collection points at the actual `<wiki root>`, do not rename or move wiki directories; set `retrieval.status` to `"degraded"`, keep the actual `<wiki root>` in `retrieval.collection_path`, and report the collection/path mismatch.
-
-If `qmd_ready` is false, qmd is not available — use Grep/Glob only.
-
-qmd is **secondary only** in this skill: use it only for *content* discovery — finding related-note neighborhoods when a structural fix might need reciprocal links or nearby canonical notes, or surfacing stale claims and contradictions. If ready, follow the qmd search protocol in `loam::using` (structural checks stay Glob/Grep-led — qmd does not replace inventory, orphan, or wikilink checks).
+qmd is secondary: use it for content discovery and related-note neighborhoods.
+Keep structural checks Glob/Grep-led and follow the qmd search protocol in
+`loam::using`.
 
 ### Audit for health issues
 
@@ -225,15 +226,14 @@ On successful completion of the pass, append one line to `<wiki root>/log.md`:
 ## [YYYY-MM-DD] lint-check | <scope>
 ```
 
-This is the stable evidence `loamstate` reads for the `memory_lint_stale` hint (stale after 7 days). Write it even when the pass found nothing to fix — the marker records that the check ran.
+This is the stable evidence the native state probe reads for the `memory_lint_stale` hint (stale after 7 days). Write it even when the pass found nothing to fix — the marker records that the check ran.
 
 ### Check date format drift
 
 Run `datecheck` to scan all markdown files for date-format drift:
 
 ```bash
-bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loam.sh" datecheck check "$WIKI_ROOT" 2>/dev/null \
-  || powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loam.ps1" datecheck check "$WIKI_ROOT" 2>/dev/null
+<native-runtime-command> datecheck check "$WIKI_ROOT"
 ```
 
 The script reports drift as JSON: front matter point-in-time fields missing timezone offsets, legacy TZ labels (`SAST`, `GMT+N`, `UTC`), and decisions-log entries using non-em-dash separators.
@@ -242,8 +242,8 @@ Canonical formats are defined in `loam-using/references/date-formats.md`.
 
 If drift is found:
 1. Report the findings to the user.
-2. After approval, run `loam.sh datecheck fix "$WIKI_ROOT" --offset <local-offset>` to apply normalizations.
-3. Re-run `loam.sh datecheck check` to confirm zero drift.
+2. After approval, run `<native-runtime-command> datecheck fix "$WIKI_ROOT" --offset <local-offset>` to apply normalizations.
+3. Re-run `<native-runtime-command> datecheck check "$WIKI_ROOT"` to confirm zero drift.
 
 This check is read-only — `check` mode never writes. `fix` mode is only run after explicit approval, same as checkpoint filename migration.
 
@@ -255,7 +255,7 @@ If qmd was ready and you wrote to the wiki, run `qmd update -c <collection> 2>/d
 
 ## Step 2G — Goal-health pass (report-only)
 
-The goal pass runs when `goals/` exists (`ls goals/*.md 2>/dev/null`), even if `loamstate` reports no wiki. It is structurally separate from wiki linting, report-only, and does not alter files or append a wiki lint log entry solely for goal checks.
+The goal pass runs when `goals/` exists (`ls goals/*.md 2>/dev/null`), even if native state reports no wiki. It is structurally separate from wiki linting, report-only, and does not alter files or append a wiki lint log entry solely for goal checks.
 
 Read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/lint-checklist.md` and apply the **Goal health** section. It checks: missing required front matter or sections, invalid lifecycle status, stale drafts (30 days), overdue or stale active goals (`next_review_at`, otherwise `reviewed_at` or fallback `updated_at` at 90 days), broken linked spec/plan paths, inconsistent `goals/INDEX.md` rows, achieved without a passing review, and `reviewed_at` inconsistent with the newest review entry (compare date portion only).
 
@@ -309,7 +309,7 @@ If the pass found no significant issues, say so explicitly and still note any re
 - Own code-page migration. Lint may move `entities/*.md` pages with `source_path:` front matter to `code/` and rebuild the generated hub. Wikilinks need no change (Obsidian resolves by filename). On collision with an existing `code/<slug>.md`, do not overwrite; report unresolved. Append a `## [YYYY-MM-DD] migrate | code entities → code/` log entry (structural change exception to the no-per-pass-entry rule).
 - Never move or rename `<wiki root>` or any wiki content directory as part of `.obsidian/` placement or qmd metadata repair.
 - Rotate `<wiki root>/log.md` when it exceeds 500 lines; lint does not append per-pass entries to `log.md`.
-- Check date format drift with `loam.sh datecheck check`; canonical formats are in `loam-using/references/date-formats.md`. Apply only unambiguous local normalizations and report ambiguous drift.
+- Check date format drift with `<native-runtime-command> datecheck check`; canonical formats are in `loam-using/references/date-formats.md`. Apply only unambiguous local normalizations and report ambiguous drift.
 - Check that qmd excludes `.archive/**`; flag missing archive exclusion as a health issue.
 - Flag pages older than 90 days that cite volatile surfaces for re-validation; do not auto-archive them.
 - Keep the note graph traversable, not just the index accurate.

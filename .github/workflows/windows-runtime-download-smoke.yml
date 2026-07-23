@@ -1,27 +1,34 @@
-name: Windows Runtime Download Smoke
+name: Windows Packaged Setup Smoke
 
 on:
   workflow_dispatch:
     inputs:
       runtime_version:
-        description: Published runtime version to download (for example, 0.9.1)
+        description: Published runtime version expected from the installed skills (for example, 0.9.1)
         required: true
+        type: string
+      plugin_version:
+        description: Published @scchearn/loam package version (for example, 0.8.3)
+        required: true
+        default: '0.8.3'
         type: string
 
 permissions:
   contents: read
 
 jobs:
-  live-download:
+  packaged-setup:
     runs-on: windows-2022
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # This is deliberately manual: the requested runtime must already be
-      # published, and ordinary PR/main CI should not depend on release timing.
-      - name: Download and execute published runtime
+      # This is deliberately manual: the requested package and runtime must
+      # already be published, and ordinary PR/main CI should not depend on
+      # release timing.
+      - name: Run public packaged setup
         shell: cmd
         env:
           LOAM_RUNTIME_VERSION: ${{ inputs.runtime_version }}
+          LOAM_PLUGIN_VERSION: ${{ inputs.plugin_version }}
         run: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .github\scripts\windows-runtime-download-smoke.ps1

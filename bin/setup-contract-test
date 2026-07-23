@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+HOME_ROOT="$TMP/home"
+WORKSPACE="$TMP/workspace"
+mkdir -p "$HOME_ROOT" "$WORKSPACE"
+export HOME="$HOME_ROOT"
+export USERPROFILE="$HOME_ROOT"
+
+PACKED_NAME="$(npm pack --silent --pack-destination "$TMP")"
+tar -xzf "$TMP/$PACKED_NAME" -C "$TMP"
+PACKED_ROOT="$TMP/package"
+
+[[ "$(node "$PACKED_ROOT/bin/loam.mjs" --version)" == "0.8.3" ]] || {
+  printf 'FAIL: packed version command mismatch\n' >&2
+  exit 1
+}
+
+node "$PACKED_ROOT/bin/loam.mjs" --help >/dev/null
+DRY_RUN_OUTPUT="$(cd "$WORKSPACE" && node "$PACKED_ROOT/bin/loam.mjs" setup --dry-run --yes 2>&1)"
+printf '%s\n' "$DRY_RUN_OUTPUT" | grep -Eiq 'dry.?run' || {
+  printf 'FAIL: packed dry-run did not report preview mode\n' >&2
+  exit 1
+}
+[[ ! -e "$HOME_ROOT/.agents/loam" ]] || {
+  printf 'FAIL: packed dry-run created a global Loam root\n' >&2
+  exit 1
+}
+
+grep -Fq 'Native runtime command' "$PACKED_ROOT/integration/context.mjs" || {
+  printf 'FAIL: packed context lacks the native runtime command contract\n' >&2
+  exit 1
+}
+if grep -Fq 'run --' "$PACKED_ROOT/integration/loam.mjs"; then
+  printf 'FAIL: packed integration retains the public run proxy\n' >&2
+  exit 1
+fi
+
+HOOK_OUTPUT="$(cd "$WORKSPACE" && printf '{}' | CLAUDE_PLUGIN_ROOT="$PACKED_ROOT" node "$PACKED_ROOT/hooks/session-start.mjs")"
+HOOK_OUTPUT="$HOOK_OUTPUT" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ['HOOK_OUTPUT'])
+context = payload['hookSpecificOutput']['additionalContext']
+assert '<LOAM_IMPORTANT>' in context
+assert 'npx @scchearn/loam setup' in context
+PY
+
+printf 'OK: packaged setup contract passed\n'

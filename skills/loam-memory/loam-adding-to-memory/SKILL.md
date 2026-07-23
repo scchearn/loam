@@ -42,13 +42,12 @@ Rules:
 
 ### Wiki resolution and qmd readiness
 
-First reuse the injected `Workspace state` under the reuse contract in `loam::using`. Do not rerun `loamstate` when that block supplies wiki existence/root, qmd readiness, collection, and hints. A `legacy_structure_pending` hint is equivalent to `has_overview: true` for this workflow.
+First reuse the injected `Workspace state` under the reuse contract in `loam::using`. Do not rerun native state when that block supplies wiki existence/root, qmd readiness, collection, and hints. A `legacy_structure_pending` hint is equivalent to `has_overview: true` for this workflow.
 
-If the injected state cannot be reused, run a fast probe:
+If the injected state cannot be reused, refresh native state through the injected absolute integration path:
 
 ```bash
-bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" --fast "$(pwd)" 2>/dev/null \
-  || powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+<native-runtime-command> state --fast "$(pwd)"
 ```
 
 If `exists` is false, stop and recommend:
@@ -63,7 +62,7 @@ If multiple wiki roots are present and the target is ambiguous, ask the smallest
 
 If qmd is ready (`qmd_ready: true`), use the `collection` name and follow the **qmd and code-graph discovery** protocol in `loam::using` (the router) to find existing related notes — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (deriving search terms, archive exclusion) if you want it. If qmd is not ready, use Grep/Glob to find existing notes.
 
-Runtime guard: if a required probe fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks (`which qmd` + `qmd collection list`).
+If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. If qmd is not ready, use Grep/Glob for existing notes.
 
 ### Mode detection
 

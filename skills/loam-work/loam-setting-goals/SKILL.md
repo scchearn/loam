@@ -20,7 +20,7 @@ Only this skill changes goal meaning, validation, lifecycle, or review history. 
 - Intent, validation criteria, pause, abandonment, and meaning changes are user-owned decisions. The skill may apply an objectively supported review transition after explicit review.
 - Review evidence stays concise and inline. Existing stable paths or URLs may be referenced but are not copied. Never record secrets or sensitive payloads.
 - No automatic iteration, retries, loops, progress percentages, or unattended spec-plan-execute cycles.
-- Goals must not create background pressure or proactive prompts. Goal creation, review, and linting are user-invoked only. No goal-related hints are emitted by `loamstate` or session-start.
+- Goals must not create background pressure or proactive prompts. Goal creation, review, and linting are user-invoked only. No goal-related hints are emitted by native state or session-start.
 
 ## Input
 

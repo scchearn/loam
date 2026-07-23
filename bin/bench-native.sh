@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# bench-native.sh — release-build benchmark harness for the native runtime and
-# the launcher/bootstrap path.
+# bench-native.sh — release-build benchmark harness for the native runtime.
 #
 # Two warmups plus ten measured runs per case; reports fixture size, mean, and
 # p95 in milliseconds. Compilation time is excluded: build first.
@@ -11,7 +10,6 @@ set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 LOAM="$ROOT/target/release/loam"
-LAUNCHER="$ROOT/skills/loam-using/scripts/loam.sh"
 WARMUPS=2
 RUNS=10
 
@@ -123,45 +121,6 @@ measure "check versions (repo)" "7 values" -- "$LOAM" check versions "$ROOT"
 # would be visible rather than assumed absent.
 measure "lint --only work (repo)" "$(find "$ROOT/goals" -name '*.md' | wc -l | tr -d ' ') goals" -- \
   "$LOAM" lint --only work "$ROOT"
-
-# --- launcher / bootstrap path ------------------------------------------------
-scope="$tmp/scope/.agents/skills/loam-using/scripts"
-mkdir -p "$scope"
-cp "$LAUNCHER" "$scope/loam.sh"
-chmod +x "$scope/loam.sh"
-printf '0.0.1\n' > "$scope/CLI_VERSION"
-ready="$tmp/scope/.agents/loam/bin/0.0.1/x86_64-unknown-linux-musl"
-mkdir -p "$ready"
-cp "$LOAM" "$ready/loam"
-
-export LOAM_TARGET=x86_64-unknown-linux-musl
-measure "launcher scope resolution" "n/a" -- "$scope/loam.sh" --loam-runtime-path
-measure "launcher dispatch overhead (state --fast)" "25 files" -- \
-  "$scope/loam.sh" state --fast "$tmp/small"
-measure "native state --fast (no launcher)" "25 files" -- \
-  "$LOAM" state --fast "$tmp/small"
-
-# Local release fixture: measures manifest parse + download + SHA-256 verify +
-# atomic publish without network variance.
-release="$tmp/release"
-mkdir -p "$release"
-cp "$LOAM" "$release/loam-x86_64-unknown-linux-musl"
-digest=$(sha256sum "$release/loam-x86_64-unknown-linux-musl" | awk '{print $1}')
-printf '{"version":"0.0.1","runtimes":[{"target":"x86_64-unknown-linux-musl","file":"loam-x86_64-unknown-linux-musl","sha256":"%s"}]}\n' \
-  "$digest" > "$release/loam-runtime-manifest.json"
-artifact_size=$(du -h "$release/loam-x86_64-unknown-linux-musl" | awk '{print $1}')
-
-bootstrap_once() {
-  local target="$tmp/bootstrap-run"
-  rm -rf "$target"
-  mkdir -p "$target/.agents/skills/loam-using/scripts"
-  cp "$LAUNCHER" "$target/.agents/skills/loam-using/scripts/loam.sh"
-  chmod +x "$target/.agents/skills/loam-using/scripts/loam.sh"
-  printf '0.0.1\n' > "$target/.agents/skills/loam-using/scripts/CLI_VERSION"
-  LOAM_RELEASE_BASE_URL="file://$release" "$target/.agents/skills/loam-using/scripts/loam.sh" --loam-bootstrap
-}
-measure "bootstrap: manifest+verify+publish" "$artifact_size" -- bootstrap_once
-export -f bootstrap_once 2> /dev/null || true
 
 # --- legacy shell comparison --------------------------------------------------
 legacy_codegraph="$ROOT/skills/loam-memory/loam-ingesting-codebase/scripts/codegraph-legacy.sh"

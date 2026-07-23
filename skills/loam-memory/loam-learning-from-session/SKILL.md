@@ -188,11 +188,10 @@ If the session produced any wiki-bound learnings, run the wiki workflow below. I
 
 #### Find the wiki and probe state
 
-Reuse the injected `Workspace state` under the reuse contract in `loam::using` only when no relevant wiki, qmd, checkpoint, or metadata operation occurred during the session. Otherwise run a fresh fast probe:
+Reuse the injected `Workspace state` under the reuse contract in `loam::using` only when no relevant wiki, qmd, checkpoint, or metadata operation occurred during the session. Otherwise refresh native state through the injected absolute integration path:
 
 ```bash
-bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" --fast "$(pwd)" 2>/dev/null \
-  || powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+<native-runtime-command> state --fast "$(pwd)"
 ```
 
 If `exists` is false, stop and recommend:
@@ -201,7 +200,7 @@ If `exists` is false, stop and recommend:
 /loam::scaffolding-wiki <topic or wiki goal>
 ```
 
-Use `wiki_root` as the resolved wiki root. Treat `has_overview: true` or a `legacy_structure_pending` hint as a legacy root-hub file. Use `qmd_ready` + `collection` for qmd state. Runtime guard: if a required probe fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks.
+If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. Use `wiki_root` as the resolved wiki root. Treat `has_overview: true` or a `legacy_structure_pending` hint as a legacy root-hub file. Use `qmd_ready` + `collection` for qmd state.
 
 If qmd is ready, follow the **qmd and code-graph discovery** protocol in `loam::using` (the router) for finding existing destination notes — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (search terms for what the session resolved, archive exclusion) if you want it. If qmd is not ready, use Grep/Glob to find existing pages.
 

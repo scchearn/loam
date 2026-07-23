@@ -1,66 +1,36 @@
 # Installing loam for Codex
 
-Enable loam skills in Codex via native skill discovery.
-
-## Prerequisites
-
-- Git
-
 ## Installation
 
-**Option A — npx skills (recommended):**
+Run the global setup wizard:
 
 ```bash
-npx skills add scchearn/loam
+npx @scchearn/loam setup
 ```
 
-Skills install to `~/.agents/skills/loam-*` and are discovered automatically by Codex on the next session.
+Setup installs global skills through Skills CLI and verifies the private native
+runtime. Codex can discover the global skills under `~/.agents/skills/`, but
+Loam does not claim full session-start integration without a shipped Codex
+adapter.
 
-**Option B — clone and symlink (manual):**
+Use `--yes` for automation or `--dry-run` to preview without mutation or
+download. The runtime remains outside `PATH`.
 
-1. **Clone the loam repository:**
-   ```bash
-   git clone https://github.com/scchearn/loam.git ~/.codex/loam
-   ```
-
-2. **Create the skills symlink:**
-   ```bash
-   mkdir -p ~/.agents/skills
-   ln -s ~/.codex/loam/skills ~/.agents/skills/loam
-   ```
-
-   **Windows** (in-box Windows PowerShell 5.1):
-   ```powershell
-   New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.agents\skills"
-   cmd /c mklink /J "$env:USERPROFILE\.agents\skills\loam" "$env:USERPROFILE\.codex\loam\skills"
-   ```
-
-3. **Restart Codex** (quit and relaunch the CLI) to discover the skills.
-
-## Verify
+## Verify and update
 
 ```bash
-npx skills list -g | grep loam
+npx skills list --global
+npx skills update --global
+npx @scchearn/loam setup
 ```
 
-You should see all 20 loam skills listed.
+The existing clone plus symlink path is a repository-development or migration
+compatibility option, not the normal installation path. It must not create a
+project-local Loam runtime or skill copy.
 
-## Updating
+## Session use
 
-```bash
-npx skills update
-```
-
-Or if you used the clone+symlink path: `cd ~/.codex/loam && git pull`
-
-## Uninstalling
-
-```bash
-npx skills remove loam
-```
-
-Or if you used the clone+symlink path: `rm ~/.agents/skills/loam` and `rm -rf ~/.codex/loam`.
-
-## Note on auto-injection
-
-Codex does not support session-start context injection. loam skills are discovered via `~/.agents/skills/loam-*` and invoked on demand through Codex's skill loader. The `loam::using` router skill is the entry point — invoke it at session start or whenever a loam task appears.
+Codex has no Loam session-start adapter in this release. Invoke `loam::using`
+at session start or whenever a Loam task appears; runtime-dependent skills use
+the injected absolute native runtime command and stop with setup guidance when
+it is unavailable.

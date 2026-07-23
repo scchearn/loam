@@ -22,16 +22,15 @@ The question is: $ARGUMENTS
 
 ## Step 1 — Discover candidates
 
-First reuse the injected `Workspace state` under the reuse contract in `loam::using`. For a non-code query, do not rerun `loamstate` when that block supplies wiki existence/root, qmd readiness, collection, and hints.
+First reuse the injected `Workspace state` under the reuse contract in `loam::using`. For a non-code query, do not rerun native state when that block supplies wiki existence/root, qmd readiness, collection, and hints.
 
-If the injected state cannot be reused, run a fast probe:
+If the injected state cannot be reused, refresh native state through the injected absolute integration path:
 
 ```bash
-bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" --fast "$(pwd)" 2>/dev/null \
-  || powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+<native-runtime-command> state --fast "$(pwd)"
 ```
 
-If the question needs the code graph, run the full probe (omit `--fast`) before trusting it because fast state omits `code_ingest_pending`. On a PowerShell-only fallback that cannot supply that signal, treat graph freshness as unknown and verify against raw source. If `exists` is false, stop and recommend `/loam::scaffolding-wiki <topic>`. Use `wiki_root` as the resolved wiki root and `qmd_ready` + `collection` for qmd state. Runtime guard: if a required probe fails or returns invalid JSON, fall back to Globbing for `SCHEMA.md`, `index.md`, or `log.md` and manual qmd checks.
+If the question needs the code graph, run the required native check through `<native-runtime-command> ...` before trusting it because the startup state is fast. If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. If `exists` is false, stop and recommend `/loam::scaffolding-wiki <topic>`. Use `wiki_root` as the resolved wiki root and `qmd_ready` + `collection` for qmd state.
 
 Classify the question internally (do not expose unless it helps the answer): **lookup** (answer from one or a few pages), **comparison** (differences/tradeoffs across pages), **synthesis** (higher-level explanation combining multiple parts), **gap check** (whether memory can answer something yet). Derive 3-8 search terms.
 

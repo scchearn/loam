@@ -1,6 +1,35 @@
 {
-  "name": "loam",
+  "name": "@scchearn/loam",
   "version": "0.8.3",
+  "description": "Global setup and verified integrations for Loam workflow skills",
   "type": "module",
-  "main": ".opencode/plugins/loam.js"
+  "main": ".opencode/plugins/loam.js",
+  "bin": {
+    "loam": "bin/loam.mjs"
+  },
+  "files": [
+    "bin",
+    "setup",
+    "integration",
+    "adapters",
+    "hooks",
+    "skills",
+    ".opencode",
+    ".claude-plugin",
+    ".codex-plugin",
+    ".cursor-plugin"
+  ],
+  "scripts": {
+    "prepack": "node setup/package-check.mjs",
+    "test": "node --test tests/*.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "skills": "1.5.20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }

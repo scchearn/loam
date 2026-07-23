@@ -23,7 +23,7 @@ You are a senior engineer compiling an approved spec into a rigorous implementat
 
 The spec path or topic is: $ARGUMENTS
 
-A `spec_ready_for_plan` hint in `loamstate` output (an approved spec with no matching plan) is the advisory signal for this skill; see the hint contract in `loam::using`.
+A `spec_ready_for_plan` hint in native state output (an approved spec with no matching plan) is the advisory signal for this skill; see the hint contract in `loam::using`.
 
 ---
 

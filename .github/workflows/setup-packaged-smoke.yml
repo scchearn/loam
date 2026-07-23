@@ -1,0 +1,33 @@
+name: Packaged Setup Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugin_version:
+        description: Published @scchearn/loam package version (for example, 0.8.3)
+        required: true
+        default: '0.8.3'
+        type: string
+      runtime_version:
+        description: Published runtime version expected by the package (for example, 0.9.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run public packaged setup
+        env:
+          LOAM_PLUGIN_VERSION: ${{ inputs.plugin_version }}
+          LOAM_RUNTIME_VERSION: ${{ inputs.runtime_version }}
+        run: node .github/scripts/packaged-setup-smoke.mjs

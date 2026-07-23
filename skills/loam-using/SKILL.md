@@ -17,6 +17,20 @@ This is the router for the loam skill namespace. It tells you which loam skill t
 3. **Agent-owned memory writes.** The agent writes, corrects, routes, and archives memory without pre-approval. A human flagging a page as wrong/stale triggers the same correction flow as an agent-found contradiction.
 4. **Domain-router precedence.** In a workspace with loam artifacts (`wiki/`, `goals/`, `specs/`, `plans/`), `loam::using` routes memory, goals, specs, plans, checkpoints, and agent debates before generic skill routers. Non-loam work is unaffected.
 
+## Global installation boundary
+
+Loam is installed once under the user's global `<home>/.agents/loam/` root.
+Skills are global and authoritative; the current workspace owns only its
+memory, goals, specs, plans, and checkpoint data. Do not install, update, or
+execute a project-local Loam runtime or skill copy.
+
+The injected `Native runtime command:` line is the only runtime command for
+skills. Use its quoted absolute native executable prefix directly; on Windows
+the value includes the PowerShell call operator and `.exe` path. The shared
+Node integration entry is reserved for status and harness startup. Setup owns
+downloads, updates, migration, and configuration. Startup and the integration
+are read-only, network-free, and must not poll for updates.
+
 ## The memory model
 
 **Memory** is the umbrella for everything loam captures. Three substrates:
@@ -108,20 +122,53 @@ If you catch yourself rationalizing a shortcut, invoke the skill instead — eve
 - **Goal vs debate:** explicit debate, conference, or consensus intent wins → `configuring-agents`; use `setting-goals` when the user wants the goal artifact created or changed.
 - **Durable enough?** How-to-work-here (command, pattern, quirk) = guidance; what-is-true-here (fact, decision, architecture) = wiki; transient work-state = checkpoint; operational lifecycle = goal. When still unsure, ask before guessing.
 
-## loamstate hints
+## Runtime and workspace state
 
-`loamstate.sh [--fast] <workspace-root>` may emit advisory `hints[]` with `maintenance` or `workflow` signals. Hints point at the relevant loam skill; they never authorize bypassing that skill or auto-running commands. Missing hints mean "no cheap signal," not "nothing to do." For schema and kinds, inspect `loamstate.sh` output or the script header.
+The shared integration invokes native `state --fast` and may emit advisory
+`hints[]` with `maintenance` or `workflow` signals. Hints point at the
+relevant loam skill; they never authorize bypassing that skill or auto-running
+commands. Missing hints mean "no cheap signal," not "nothing to do."
+
+When a fresh state block is needed, run the native state operation through the
+injected native runtime command. `<native-runtime-command>` means the exact
+quoted command shown in the `Native runtime command:` context line:
+
+```text
+<native-runtime-command> state --fast "$(pwd)"
+```
+
+The harness hook operation is reserved for adapters and session startup; skills
+must not use it to resolve workspace state.
+
+For native operations, invoke the same native command directly:
+
+```text
+<native-runtime-command> <native-loam-args>
+```
+
+If the integration reports `Loam is unavailable` or does not provide real
+state, stop the runtime-dependent operation. Report the recovery command
+`npx @scchearn/loam setup`; never fabricate workspace state or hints and never
+fall back to a project-local launcher.
 
 ### Reuse before probing
 
-The injected `## Workspace state` block is a compact `loamstate --fast` result. Reuse it when its `Workspace` matches the current workspace, it contains the fields the active skill needs, and no later operation changed the relevant wiki, qmd, checkpoint, or metadata state. Do not rerun `loamstate` merely to rediscover the same state.
+The injected `## Workspace state` block is a compact native-state result from
+startup. Reuse it when its `Workspace` matches the current
+workspace, it contains the fields the active skill needs, and no later
+operation changed the relevant wiki, qmd, checkpoint, or metadata state. Do
+not rerun the integration merely to rediscover the same state.
 
-Run a fresh `--fast` probe when the block is absent, belongs to another workspace, lacks required fields, or relevant state changed after injection. Run the full probe only when omitted checks such as date drift or `code_ingest_pending` are required. When a skill performs a newer authoritative check itself, use that result instead of rerunning `loamstate`.
+Run a fresh native command when the block is absent, belongs to another
+workspace, lacks required fields, or relevant state changed after injection.
+Run the native command directly when omitted checks such as date drift or
+`code_ingest_pending` are required. When a skill performs a newer authoritative
+check itself, use that result instead of rerunning the startup context.
 
 The injected block uses these stable line forms; checkpoint and signal lines are optional:
 
 ```text
-Workspace: <absolute workspace> · Probe: loamstate --fast
+Workspace: <absolute workspace> · Probe: state --fast
 Wiki: <absolute wiki root> · qmd: <ready|not installed> [· collection: <name>]
 Wiki: none
 Checkpoints: <count> (latest: "<title>" — <captured_at>)
@@ -129,11 +176,13 @@ Signals:
 - [loam:hint] <kind> — <message> [(<evidence key>: <value>, ...)] [→ <command>]
 ```
 
-The PowerShell twin is fast-equivalent and currently omits full-only checks. If bash is unavailable when a full-only signal is required, treat that signal as unknown and use the active skill's conservative fallback.
+The native runtime command is resolved once and quoted for the host operating
+system. Do not add a shell or PowerShell twin, a Node command proxy, or a
+project-local runtime for runtime access.
 
 ### Consuming hints
 
-After completing the primary task of any loam skill that consumed injected or freshly probed loamstate, scan its hints and surface unsatisfied hints to the user as suggested next actions. This is mandatory — hints that go unread are signals wasted.
+After completing the primary task of any loam skill that consumed injected or freshly probed native state, scan its hints and surface unsatisfied hints to the user as suggested next actions. This is mandatory — hints that go unread are signals wasted.
 
 For each hint, emit one Markdown list item in this form:
 
@@ -149,11 +198,13 @@ Rules:
 - **Empty `hints[]` → say nothing.** Do not invent suggestions or pad the report.
 - **`evidence` summary.** When the hint's `evidence` object carries a count (e.g. `pending_count`, `drift_count`, `log_lines`, `age_minutes`), include it parenthetically: `- [loam:hint] code_ingest_pending — 3 source file(s) new or changed (pending_count: 3)`. Omit the parenthetical when `evidence` is empty.
 
-This makes `loamstate` a closed loop: the script signals, the skill acts, and the next-most-pressing signal surfaces to the user instead of dying in the JSON.
+This makes the integration state a closed loop: native state signals, the skill
+acts, and the next-most-pressing signal surfaces to the user instead of dying
+in JSON.
 
 ## qmd and code-graph discovery
 
-When `loamstate` reports `qmd_ready: true` and `collection: <name>`, prefer qmd over Glob/Grep for content discovery in the wiki.
+When the integration reports `qmd_ready: true` and `collection: <name>`, prefer qmd over Glob/Grep for content discovery in the wiki.
 
 - **Lookup**: `qmd search "<keywords>" --files -n 8 -c <collection>`
 - **Comparison/synthesis**: `qmd query "<natural-language question>" --files -n 8 -c <collection>`

@@ -22,16 +22,15 @@ If no hint is provided, derive the likely resume target from the current session
 
 ## Step 1 — Locate checkpoints and derive the current resume context
 
-1. **Resolve the wiki root from loamstate** (git-agnostic; Glob respects `.gitignore` and `.git/info/exclude`, so `wiki/`, `specs/`, `plans/` are invisible to Glob when projects locally ignore them). First reuse the injected `Workspace state` under the contract in `loam::using`; the direct checkpoint listing in step 2 is authoritative for current checkpoint files. If the injected state cannot be reused, run a fast probe:
+1. **Resolve the wiki root from the injected native state** (git-agnostic; Glob respects `.gitignore` and `.git/info/exclude`, so `wiki/`, `specs/`, `plans/` are invisible to Glob when projects locally ignore them). First reuse the injected `Workspace state` under the contract in `loam::using`; the direct checkpoint listing in step 2 is authoritative for current checkpoint files. If the injected state cannot be reused, refresh native state through the injected native runtime command:
 
    ```bash
-   bash "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.sh" --fast "$(pwd)" 2>/dev/null \
-     || powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/../loam-using/scripts/loamstate.ps1" "$(pwd)" 2>/dev/null
+   <native-runtime-command> state --fast "$(pwd)"
    ```
 
-   Treat an empty `wiki_root` as "no wiki," not as an error. Runtime guard: if a required probe fails or returns invalid JSON, fall back to testing `wiki/SCHEMA.md`, `wiki/index.md`, `wiki/log.md` with `Read` (filesystem open, git-agnostic) — **do not use Glob to discover the wiki root**.
+   If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. Treat an empty `wiki_root` as "no wiki," not as an error. If no state is available, do not use Glob to discover the wiki root.
 
-   A `resume_available` or `resume_stale` hint in the `loamstate` output is the advisory signal for this skill (see the hint contract in `loam::using`); `resume_stale` means the latest checkpoint is over 24h old, so verify live state extra carefully.
+   A `resume_available` or `resume_stale` hint in the integration state is the advisory signal for this skill (see the hint contract in `loam::using`); `resume_stale` means the latest checkpoint is over 24h old, so verify live state extra carefully.
 
 2. **List checkpoints with `ls`, not Glob** (same gitignore caveat applies to checkpoint files). From the resolved `<wiki_root>`:
 

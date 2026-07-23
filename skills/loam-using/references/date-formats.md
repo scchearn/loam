@@ -65,7 +65,7 @@ the state hasn't been reached yet.
 ```
 
 The offset is mandatory. `SAST`, `GMT+2`, and other named labels are
-legacy — `datecheck.sh fix` normalizes them to numeric offsets.
+legacy. The native datecheck command normalizes them to numeric offsets.
 
 ## Decisions log entries
 
@@ -91,7 +91,8 @@ migrate to epoch on the next `loam::syncing-code-graph` run.
 
 ## Enforcement
 
-`datecheck.sh check <wiki-root>` scans all `*.md` files for drift from
-these formats and reports findings as JSON. `loam-linting-memory` calls
-this during its health check. `datecheck.sh fix <wiki-root>` applies
-normalizations (idempotent — skips already-canonical values).
+`<native-runtime-command> datecheck check <wiki-root>`
+scans all `*.md` files for drift from these formats and reports findings as
+JSON. `loam::linting-memory` calls this during its health check. Use
+`<native-runtime-command> datecheck fix <wiki-root> --offset <local-offset>` only after approval;
+normalization is idempotent and skips already-canonical values.

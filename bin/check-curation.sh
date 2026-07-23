@@ -26,6 +26,20 @@ if [ "$readme_count" != "$plugin_count" ] || [ "$plugin_count" != "$disk_count" 
   fail "skill count mismatch: README.md count ($readme_count) != .claude-plugin/plugin.json count ($plugin_count) != disk SKILL.md count ($disk_count)"
 fi
 
+package_name="$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).name")"
+[ "$package_name" = '@scchearn/loam' ] || fail "package identity must be @scchearn/loam, got $package_name"
+grep -Fq 'npx @scchearn/loam setup' README.md || fail 'README.md must document the public setup command'
+node setup/package-check.mjs >/dev/null || fail 'package asset check failed'
+
+for workflow in .github/workflows/*.yml; do
+  while IFS= read -r action; do
+    [[ "$action" == *'uses: ./'* ]] && continue
+    ref="${action##*@}"
+    ref="${ref%%[[:space:]#]*}"
+    [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || fail "workflow action is not pinned to a commit SHA: $workflow"
+  done < <(grep -h 'uses:' "$workflow" 2>/dev/null || true)
+done
+
 # Every Windows call site in skill instructions must use in-box Windows
 # PowerShell 5.1 through the exact pinned invocation. A bare `.ps1` path or a
 # `pwsh` command silently assumes PowerShell 7 is installed.
@@ -38,6 +52,67 @@ while IFS= read -r doc; do
       *.ps1*) fail "$doc has a bare .ps1 invocation; use: $pinned_powershell <script>.ps1" ;;
     esac
   done < <(grep -n 'pwsh\|\.ps1' "$doc" 2>/dev/null || true)
+done < <(find skills -type f -name '*.md' | sort)
+
+# Runtime access in installed instructions is global and must use the injected
+# native runtime command. The shared Node integration remains a startup/status
+# boundary only. These patterns catch old project-first launchers and paired
+# fallback blocks without rejecting ordinary setup documentation.
+runtime_docs=(
+  "skills/loam-using/SKILL.md"
+  "skills/loam-memory/loam-adding-to-memory/SKILL.md"
+  "skills/loam-memory/loam-querying-memory/SKILL.md"
+  "skills/loam-memory/loam-learning-from-session/SKILL.md"
+  "skills/loam-memory/loam-linting-memory/SKILL.md"
+  "skills/loam-memory/loam-ingesting-codebase/SKILL.md"
+  "skills/loam-memory/loam-syncing-code-graph/SKILL.md"
+  "skills/loam-work/loam-resuming/SKILL.md"
+  "skills/loam-work/loam-checkpointing/SKILL.md"
+)
+state_docs=(
+  "skills/loam-using/SKILL.md"
+  "skills/loam-memory/loam-adding-to-memory/SKILL.md"
+  "skills/loam-memory/loam-querying-memory/SKILL.md"
+  "skills/loam-memory/loam-learning-from-session/SKILL.md"
+  "skills/loam-memory/loam-linting-memory/SKILL.md"
+  "skills/loam-memory/loam-ingesting-codebase/SKILL.md"
+  "skills/loam-memory/loam-syncing-code-graph/SKILL.md"
+  "skills/loam-work/loam-resuming/SKILL.md"
+)
+
+for doc in "${runtime_docs[@]}"; do
+  [ -f "$doc" ] || { fail "runtime instruction file is missing: $doc"; continue; }
+  grep -Fq '<native-runtime-command>' "$doc" \
+    || fail "runtime instructions must use the injected native runtime command: $doc"
+done
+
+for doc in "${state_docs[@]}"; do
+  grep -Fq '<native-runtime-command> state --fast' "$doc" \
+    || fail "state refresh must use the direct native runtime command: $doc"
+done
+
+for retired in \
+  skills/loam-using/scripts/loam.sh \
+  skills/loam-using/scripts/loam.ps1 \
+  skills/loam-using/scripts/loamstate.sh \
+  skills/loam-using/scripts/loamstate.ps1 \
+  skills/loam-using/scripts/datecheck.sh \
+  skills/loam-using/scripts/datecheck.ps1 \
+  skills/loam-memory/loam-ingesting-codebase/scripts/codegraph.sh \
+  skills/loam-memory/loam-ingesting-codebase/scripts/codegraph.ps1 \
+  skills/loam-work/loam-checkpointing/scripts/checkpoint-state \
+  skills/loam-work/loam-checkpointing/scripts/checkpoint-state.ps1 \
+  skills/loam-work/loam-checkpointing/scripts/checkpoint-verify \
+  skills/loam-work/loam-checkpointing/scripts/checkpoint-verify.ps1; do
+  [ ! -e "$retired" ] || fail "retired runtime wrapper still exists: $retired"
+done
+
+while IFS= read -r doc; do
+  if grep -Eni \
+    'loamstate\.(sh|ps1)|loam\.(sh|ps1)|datecheck\.(sh|ps1)|codegraph\.(sh|ps1)|checkpoint-(state|verify)(\.ps1)?|hook --harness|node[^[:cntrl:]]*loam\.mjs[^[:cntrl:]]*run --|(^|[[:space:]])run --|project-first|project-scoped (bootstrap|runtime)|nearest [^[:space:]]* \.agents|git ls-remote|startup[^[:cntrl:]]*(download|install|update|poll)|(^|[[:space:]])\|\|[[:space:]]*powershell\.exe|minimal state|synthetic state|fabricated state' \
+    "$doc" >/dev/null; then
+    fail "stale project-first/fallback/runtime behavior in production instructions: $doc"
+  fi
 done < <(find skills -type f -name '*.md' | sort)
 
 if [ -z "$(tail -n 1 README.md)" ]; then
