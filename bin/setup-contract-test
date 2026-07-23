@@ -15,7 +15,8 @@ PACKED_NAME="$(npm pack --silent --pack-destination "$TMP")"
 tar -xzf "$TMP/$PACKED_NAME" -C "$TMP"
 PACKED_ROOT="$TMP/package"
 
-[[ "$(node "$PACKED_ROOT/bin/loam.mjs" --version)" == "0.8.3" ]] || {
+EXPECTED_VERSION="$(node -p "require('$PACKED_ROOT/package.json').version")"
+[[ "$(node "$PACKED_ROOT/bin/loam.mjs" --version)" == "$EXPECTED_VERSION" ]] || {
   printf 'FAIL: packed version command mismatch\n' >&2
   exit 1
 }

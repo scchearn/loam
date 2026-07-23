@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { assertPackageAssets } from '../setup/package-check.mjs';
+import { PACKAGE_VERSION } from '../setup/constants.mjs';
 
 const root = new URL('..', import.meta.url);
 const rootPath = fileURLToPath(root);
@@ -23,7 +24,7 @@ test('dry-run package contains the scoped executable and legacy OpenCode entry',
   const files = new Set(packageJson.files.map(({ path }) => path));
 
   assert.equal(packageJson.name, '@scchearn/loam');
-  assert.equal(packageJson.version, '0.8.3');
+  assert.equal(packageJson.version, PACKAGE_VERSION);
   assert.ok(packageJson.files.length > 0);
   assert.ok(files.has('bin/loam.mjs'));
   assert.ok(files.has('.opencode/plugins/loam.js'));
