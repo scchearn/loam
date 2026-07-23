@@ -3,6 +3,12 @@
   "version": "0.8.4",
   "description": "Global setup and verified integrations for Loam workflow skills",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/scchearn/loam.git"
+  },
+  "homepage": "https://github.com/scchearn/loam#readme",
+  "bugs": "https://github.com/scchearn/loam/issues",
   "main": ".opencode/plugins/loam.js",
   "bin": {
     "loam": "bin/loam.mjs"
