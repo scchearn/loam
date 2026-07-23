@@ -2,7 +2,7 @@
   "name": "loam",
   "displayName": "loam",
   "description": "Workflow skills for AI coding agents: goals, planning, specs, memory, checkpoints, and agent debates",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "author": {
     "name": "scchearn",
     "url": "https://github.com/scchearn"
