@@ -14,8 +14,9 @@ export function parseArgs(argv) {
   if (wantsVersion) return { command: 'version' };
 
   if (args.length === 0) return { command: 'help' };
-  if (args[0] !== 'setup') {
-    throw new UsageError(`unknown command: ${args[0]}`);
+  const command = args[0];
+  if (command !== 'setup' && command !== 'uninstall') {
+    throw new UsageError(`unknown command: ${command}`);
   }
 
   let yes = false;
@@ -26,7 +27,7 @@ export function parseArgs(argv) {
     if (flag === '--dry-run') dryRun = true;
   }
 
-  return { command: 'setup', dryRun, yes };
+  return { command, dryRun, yes };
 }
 
 export { UsageError };

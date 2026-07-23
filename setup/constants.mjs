@@ -21,14 +21,17 @@ Usage:
   npx @scchearn/loam setup
   npx @scchearn/loam setup --yes
   npx @scchearn/loam setup --dry-run
+  npx @scchearn/loam uninstall
+  npx @scchearn/loam uninstall --yes
   npx @scchearn/loam --help
   npx @scchearn/loam --version
 
 Commands:
   setup       Install or reconcile global Loam skills, runtime, and integrations.
+  uninstall   Remove global Loam runtime, integration, and harness hook entries.
 
 Options:
-  --yes       Accept supported setup and current-project migration changes.
+  --yes       Accept changes without interactive confirmation.
   --dry-run   Preview checks and changes without mutation or downloads.
   --help      Show this help without network access.
   --version   Show the setup package version without network access.

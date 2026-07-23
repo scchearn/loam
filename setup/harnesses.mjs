@@ -76,7 +76,7 @@ function hookEntry(command) {
   return { type: 'command', command: `node ${JSON.stringify(command)}` };
 }
 
-function isOwnedCommand(item, globalRoot, assetName) {
+export function isOwnedCommand(item, globalRoot, assetName) {
   if (item?.type !== 'command' || typeof item.command !== 'string' || !item.command.startsWith('node ')) return false;
   let commandPath;
   try {
