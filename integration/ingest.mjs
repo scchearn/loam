@@ -544,36 +544,13 @@ async function updateIntent(root, tokens, update) {
   }).catch(() => false);
 }
 
-async function launchMode({ harness, workspace, env, root }) {
+async function launchMode({ harness, workspace, env }) {
   if (harness === 'opencode') return 'opencode_child';
   if (harness === 'codex') return 'codex_exec';
   const help = await execFile('claude', ['--help'], { cwd: workspace, timeout: 5000, env });
-  if (help.code !== 0 || !/--bg|--background/.test(help.stdout) || env.CLAUDE_CODE_DISABLE_AGENT_VIEW === '1') return 'claude_print';
-  const settingsPath = join(root, 'claude-settings.json');
-  await atomicJson(settingsPath, { worktree: { bgIsolation: 'none' } });
-  const name = 'loam-ingest-capability-probe-' + randomUUID().slice(0, 8);
-  try {
-    const probe = startTracked({
-      command: 'claude',
-      args: ['--bg', '--name', name, '--settings', settingsPath, '--permission-mode', 'dontAsk', '--allowedTools', 'Read', 'Reply only OK.'],
-      cwd: workspace, env, timeoutMs: 5000, detached: true, captureOutput: false,
-    });
-    const result = await probe.completion;
-    const probeIntent = { planned_identity: { name }, child_identity: null };
-    let manager = await waitForClaude(workspace, probeIntent, Date.now() + 5000);
-    if (manager.state === 'live') {
-      await stopClaude(workspace, probeIntent);
-      manager = await waitForClaude(workspace, probeIntent, Date.now() + 5000);
-    }
-    if (result.code !== 0 || !['dead', 'terminal'].includes(manager.state)) return 'claude_print';
-    const id = manager.record?.id || manager.record?.session_id || manager.record?.sessionID;
-    if (!id) return 'claude_print';
-    const removed = await execFile('claude', ['rm', id], { cwd: workspace, timeout: 5000, env });
-    if (removed.code !== 0 || (await queryClaude(workspace, probeIntent)).state !== 'dead') return 'claude_print';
-    return 'claude_bg';
-  } finally {
-    await rm(settingsPath, { force: true });
-  }
+  const supportsBg = help.code === 0 && /--bg|--background/.test(help.stdout)
+    && env.CLAUDE_CODE_DISABLE_AGENT_VIEW !== '1';
+  return supportsBg ? 'claude_bg' : 'claude_print';
 }
 
 async function waitForClaude(workspace, intent, deadline) {
@@ -672,6 +649,11 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent
       }
       const completion = started.completion.finally(() => rm(settingsPath, { force: true }));
       const result = await completion;
+      if (result.code !== 0) {
+        const reset = await updateIntent(root, intent, { launch_mode: 'claude_print', launch_state: 'planned', child_identity: null });
+        if (!reset) return { category: 'orphan_unknown' };
+        return launchModel({ launchMode: 'claude_print', workspace, env, timeoutMs, intent, openCodeSession, root });
+      }
       const match = result.stdout.match(/(?:backgrounded|session|id)[^A-Za-z0-9_-]+([A-Za-z0-9_-]{4,})/i);
       if (!(await updateIntent(root, intent, { child_identity: { manager_id: match?.[1] || null, manager_name: name } }))) {
         if (match?.[1]) await execFile('claude', ['stop', match[1]], { cwd: workspace, timeout: 5000 });
@@ -800,7 +782,7 @@ export async function runWorker({
     if (existingIntent?.lease_id === lease.lease_id && existingIntent.actionable_fingerprint === fingerprint.fingerprint) {
       await skip('duplicate_intent'); return { reason: 'duplicate_intent' };
     }
-    const selectedLaunchMode = await launchMode({ harness, workspace: canonical, env, root });
+    const selectedLaunchMode = await launchMode({ harness, workspace: canonical, env });
     intent = {
       schema: 1, state: 'active', attempt_id: randomBytes(16).toString('hex'), lease_id: lease.lease_id,
       actionable_fingerprint: fingerprint.fingerprint, launch_token: randomBytes(16).toString('hex'),

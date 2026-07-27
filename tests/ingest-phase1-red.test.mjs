@@ -154,7 +154,7 @@ test('ambiguous OpenCode launch persists host identity with the child identity',
   assert.ok(statusCalls >= 1);
 });
 
-test('Claude capability probe stops and removes its exact registration and avoids inline settings JSON', async () => {
+test('Claude capability check uses help output without launching a probe agent', async () => {
   const { root, workspace, wiki, skills } = await fixture();
   const fakeRoot = await mkdtemp(join(tmpdir(), 'loam-fake-claude-'));
   const fake = join(fakeRoot, 'claude');
@@ -232,31 +232,13 @@ process.exit(0);
     });
     const calls = (await readFile(log, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
     const bgCalls = calls.filter((args) => args[0] === '--bg');
-    assert.ok(bgCalls.length >= 2);
-    const firstBg = calls.findIndex((args) => args[0] === '--bg');
-    const secondBg = calls.findIndex((args, index) => index > firstBg && args[0] === '--bg');
+    assert.equal(bgCalls.length, 1);
+    assert.equal(calls.filter((args) => args[0] === '--help').length, 1);
+    assert.equal(calls.some((args) => args[0] === 'rm'), false);
     const settings = (await readFile(settingsLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-    assert.ok(settings.length >= 1);
+    assert.equal(settings.length, 1);
     assert.ok(settings.every((entry) => entry.path.startsWith(runRoot(root, workspace) + '/')));
     assert.ok(settings.every((entry) => entry.value && entry.value.worktree?.bgIsolation === 'none'));
-    const probe = calls.slice(firstBg + 1, secondBg);
-    const stopIndex = probe.findIndex((args) => args[0] === 'stop');
-    const removeIndex = probe.findIndex((args) => args[0] === 'rm');
-    const probeName = calls[firstBg][calls[firstBg].indexOf('--name') + 1];
-    const observations = (await readFile(observationsLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-    const probeObservations = observations.filter((entry) => entry.name === probeName);
-    const terminal = probeObservations.find((entry) => entry.state === 'terminal');
-    const absent = probeObservations.find((entry) => entry.state === 'absent');
-    const removeAbsoluteIndex = firstBg + 1 + removeIndex;
-    assert.ok(probe.filter((args) => args[0] === 'agents').length >= 3);
-    assert.ok(stopIndex >= 0);
-    assert.equal(probe[stopIndex][1], 'manager-1');
-    assert.ok(terminal);
-    assert.ok(absent);
-    assert.ok(terminal.callIndex < removeAbsoluteIndex);
-    assert.ok(absent.callIndex > removeAbsoluteIndex);
-    assert.ok(removeIndex > stopIndex);
-    assert.ok(probe.slice(removeIndex + 1).some((args) => args[0] === 'agents'));
   } finally {
     if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
     if (oldLog === undefined) delete process.env.LOAM_FAKE_CLAUDE_LOG; else process.env.LOAM_FAKE_CLAUDE_LOG = oldLog;
