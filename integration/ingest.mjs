@@ -12,8 +12,6 @@ import { FingerprintError, fingerprintActionable } from './ingest-fingerprint.mj
 
 const PROMPT = 'Run the existing loam::ingesting-codebase skill for the provided workspace. Do not modify source files, commit, or push.';
 const DEFAULTS = Object.freeze({ enabled: false, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800 });
-const LOG_MAX_RECORD = 2048;
-const LOG_MAX_BYTES = 256 * 1024;
 function hash(value) { return createHash('sha256').update(String(value)).digest('hex'); }
 export function runRoot(globalRoot, workspace) { return join(resolve(globalRoot), 'run', hash(workspace).slice(0, 16)); }
 async function json(path, fallback = null) { try { return JSON.parse(await readFile(path, 'utf8')); } catch { return fallback; } }
@@ -34,20 +32,6 @@ async function writeAtomicFile(path, contents) {
     await rm(temporary, { force: true }).catch(() => {});
     throw error;
   }
-}
-async function appendLog(root, event, fields = {}) {
-  try {
-    const record = JSON.stringify({ schema: 1, at: new Date().toISOString(), event, ...fields }) + '\n';
-    if (Buffer.byteLength(record) > LOG_MAX_RECORD) return;
-    const path = join(root, 'log.jsonl');
-    let current = await readFile(path, 'utf8').catch(() => '');
-    if (Buffer.byteLength(current) + Buffer.byteLength(record) > LOG_MAX_BYTES) {
-      await rm(join(root, 'log.1.jsonl'), { force: true });
-      await rename(path, join(root, 'log.1.jsonl')).catch(() => {});
-      current = '';
-    }
-    await writeAtomicFile(path, current + record);
-  } catch {}
 }
 function numeric(value, fallback) { const parsed = Number(value); return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback; }
 
@@ -86,22 +70,13 @@ function recursion(payload, env) {
 
 export async function gate({ harness, payload = {}, globalRoot, env = process.env, now = Date.now() } = {}) {
   const config = await readIngestConfig(globalRoot, env);
-  const logEarlySkip = async (reason) => {
-    const category = publicReason(reason);
-    try {
-      const workspace = await canonicalWorkspace(payloadWorkspace(payload));
-      await appendLog(runRoot(globalRoot, workspace), 'gate_skip', { reason: category, detail: reason });
-    } catch {}
-    return { action: 'skip', reason: category };
-  };
-  if (!config.enabled) return logEarlySkip('disabled');
-  if (recursion(payload, env)) return logEarlySkip('recursion');
+  if (!config.enabled) return { action: 'skip', reason: 'disabled' };
+  if (recursion(payload, env)) return { action: 'skip', reason: 'disabled' };
   const workspace = await canonicalWorkspace(payloadWorkspace(payload));
   const root = runRoot(globalRoot, workspace);
   await ensureRoot(root);
   const skip = async (reason, fields = {}) => {
     const category = publicReason(reason);
-    await appendLog(root, 'gate_skip', { reason: category, detail: reason, ...fields });
     return { action: 'skip', reason: category, workspace, ...fields };
   };
   const last = await json(join(root, 'last-run.json'), null);
@@ -302,7 +277,6 @@ async function writeSkip(root, reason, fields = {}, leaseId) {
     });
     return true;
   })().catch(() => false);
-  if (result) await appendLog(root, 'skip', { reason: category, ...(category === reason ? {} : { detail: reason }) });
   return result;
 }
 
@@ -497,7 +471,6 @@ async function recordProgress(root, pre, post, count, lease) {
     });
     return { status, complete: post.complete };
   })().catch(() => false);
-  if (result) await appendLog(root, 'outcome', { status: result.status, fingerprint_complete: result.complete, actionable_count: count });
   return Boolean(result);
 }
 
@@ -663,8 +636,6 @@ export async function ingestStatus({ globalRoot, workspace, env = process.env } 
   let exclusions;
   try { exclusions = { ready: true, path: await resolveExclusions(env.LOAM_INGEST_SKILLS_ROOT) }; }
   catch (error) { exclusions = { ready: false, reason: error.reason || 'exclusions_unavailable' }; }
-  const records = (await readFile(join(root, 'log.jsonl'), 'utf8').catch(() => ''))
-    .split('\n').filter(Boolean).slice(-16).map((line) => jsonLine(line)).filter(Boolean);
   return {
     schema: 1, workspace: canonical, enabled: (await readIngestConfig(globalRoot, env)).enabled,
     lease, lease_state: leaseState, intent: lease?.launch_mode ? lease : null,
@@ -676,10 +647,8 @@ export async function ingestStatus({ globalRoot, workspace, env = process.env } 
       count: lastRun?.actionable_count ?? null,
       fingerprint: lastRun?.actionable_fingerprint || lastRun?.post_fingerprint || null,
     },
-    queue: { root }, records,
+    queue: { root },
   };
 }
-
-function jsonLine(line) { try { return JSON.parse(line); } catch { return null; } }
 
 export { inspectIntent, resolveExclusions };

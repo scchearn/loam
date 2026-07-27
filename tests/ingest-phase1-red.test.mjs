@@ -296,7 +296,7 @@ test('status reports malformed ownership as unknown and keeps bounded diagnostic
   const status = await ingestStatus({ globalRoot: root, workspace, env: { LOAM_INGEST_BACKGROUND: '1' } });
   assert.equal(status.intent_state, 'unknown');
   assert.equal(status.orphan, true);
-  assert.ok(!JSON.stringify(status.records).includes('Run the existing loam::ingesting-codebase skill'));
+  assert.equal(status.records, undefined);
 });
 
 test('live lease remains held when zero TTL makes its deadline immediately expired', async () => {
