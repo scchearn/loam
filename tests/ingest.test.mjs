@@ -337,7 +337,7 @@ test('published adapters load only the staged integration after the source tree 
   }
 });
 
-test('process descriptors resolve absolute executables and keep Windows batch data out of cmd text', async () => {
+test('process descriptors resolve executables and pass Windows batch arguments directly', async () => {
   const descriptor = processDescriptor({
     command: process.execPath,
     args: ['--version'],
@@ -352,19 +352,16 @@ test('process descriptors resolve absolute executables and keep Windows batch da
     args: ['path with spaces & punctuation'],
     platform: 'win32',
     env: { ComSpec: process.execPath, SystemRoot: '/Windows' },
-    staticCommand: 'call "%LOAM_CMD_EXECUTABLE%" "%LOAM_CMD_ARG_0%"',
   });
   assert.equal(windows.kind, 'cmd');
-  assert.deepEqual(windows.args.slice(0, 4), ['/d', '/s', '/v:off', '/c']);
-  assert.doesNotMatch(windows.args[4], /spaces|punctuation/);
-  assert.equal(windows.env.LOAM_CMD_ARG_0, 'path with spaces & punctuation');
+  assert.deepEqual(windows.args, ['/d', '/s', '/c', batch, 'path with spaces & punctuation']);
   const quoted = processDescriptor({
     command: batch,
-    args: ['{"worktree":{"bgIsolation":"none"}}'],
+    args: ['{"worktree":{"bgIsolation":"none"}}', '%PATH%', '!value!'],
     platform: 'win32',
     env: { ComSpec: process.execPath },
   });
-  assert.match(quoted.env.LOAM_CMD_SAFE_ARG_0, /\^"/u);
+  assert.deepEqual(quoted.args.slice(4), ['{"worktree":{"bgIsolation":"none"}}', '%PATH%', '!value!']);
   assert.throws(() => processDescriptor({
     command: batch, platform: 'win32', env: { ComSpec: join(tmpdir(), 'missing-cmd.exe') },
   }), /ComSpec/);

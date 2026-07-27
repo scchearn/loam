@@ -55,29 +55,13 @@ export function processDescriptor({
   args = [],
   platform = process.platform,
   env = process.env,
-  staticCommand,
 } = {}) {
   const executable = resolveExecutable(command, { platform, env });
   const windowsBatch = platform === 'win32' && ['.cmd', '.bat'].includes(extname(executable).toLowerCase());
   if (!windowsBatch) {
     return { kind: command === process.execPath || command === 'node' || /^node(?:\.exe)?$/iu.test(basename(executable)) ? 'node' : 'direct', executable, args: [...args], shell: false };
   }
-  if (typeof staticCommand === 'string' && /[\r\n]/u.test(staticCommand)) {
-    throw new Error('Windows batch launch requires a static command descriptor');
-  }
-  if (args.some((value) => /[%!\r\n]/u.test(String(value)))) {
-    throw new Error('Windows batch launch cannot safely encode percent or control characters');
-  }
   const commandEnvironment = normalizeEnvironment(env, platform);
-  if (/[%!\r\n]/u.test(executable)) throw new Error('Windows batch executable path is unsafe');
-  commandEnvironment.LOAM_CMD_EXECUTABLE = executable;
-  commandEnvironment.LOAM_CMD_SAFE_EXECUTABLE = `"${executable.replace(/["^&|<>]/gu, '^$&')}"`;
-  const argumentNames = args.map((value, index) => {
-    commandEnvironment[`LOAM_CMD_ARG_${index}`] = String(value);
-    commandEnvironment[`LOAM_CMD_SAFE_ARG_${index}`] = `"${String(value).replace(/["^&|<>]/gu, '^$&')}"`;
-    return `%LOAM_CMD_SAFE_ARG_${index}%`;
-  });
-  const fixedCommand = `call %LOAM_CMD_SAFE_EXECUTABLE%${argumentNames.length ? ` ${argumentNames.join(' ')}` : ''}`;
   const comspec = commandEnvironment.ComSpec || commandEnvironment.COMSPEC || commandEnvironment.comspec
     || join(commandEnvironment.SystemRoot || commandEnvironment.systemroot || 'C:\\\\Windows', 'System32', 'cmd.exe');
   if (!isAbsolute(comspec) && !win32.isAbsolute(comspec)) throw new Error('ComSpec must be absolute');
@@ -85,7 +69,7 @@ export function processDescriptor({
   return {
     kind: 'cmd',
     executable: comspec,
-    args: ['/d', '/s', '/v:off', '/c', fixedCommand],
+    args: ['/d', '/s', '/c', executable, ...args.map(String)],
     shell: false,
     env: commandEnvironment,
   };
@@ -100,11 +84,10 @@ export function startTracked({
   input,
   timeoutMs = 900000,
   detached = false,
-  staticCommand,
   windowsHide = true,
   captureOutput = true,
 } = {}) {
-  const descriptor = processDescriptor({ command, args, platform, env, staticCommand });
+  const descriptor = processDescriptor({ command, args, platform, env });
   let resolveCompletion;
   const completion = new Promise((resolvePromise) => { resolveCompletion = resolvePromise; });
   const child = spawn(descriptor.executable, descriptor.args, {
@@ -252,7 +235,6 @@ export async function execFile(command, args = [], options = {}) {
       env: options.env || process.env,
       platform: options.platform || process.platform,
       timeoutMs: options.timeout || options.timeoutMs || 30000,
-      staticCommand: options.staticCommand || 'call "%LOAM_CMD_EXECUTABLE%"',
     }).completion;
   } catch (error) {
     return { code: null, stdout: '', stderr: '', error, category: 'runtime_error' };
