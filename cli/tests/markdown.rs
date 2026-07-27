@@ -1,14 +1,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 fn temporary_workspace() -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after epoch")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("loam-markdown-{nonce}"));
+    let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("loam-markdown-{nonce}-{serial}"));
     fs::create_dir_all(&path).expect("temporary workspace should be created");
     path
 }

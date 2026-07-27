@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import { formatContext, formatNativeRuntimeCommand } from '../integration/context.mjs';
 import { runIntegration } from '../integration/loam.mjs';
 import { detectLegacyShadow } from '../integration/shadow.mjs';
-import { detectTarget, SUPPORTED_TARGETS, runtimePath } from '../integration/paths.mjs';
+import { detectTarget, resolveGlobalRoot, SUPPORTED_TARGETS, runtimePath } from '../integration/paths.mjs';
 import { invokeRuntime, probeState, verifyRuntimeFile } from '../integration/runtime.mjs';
 
 const target = detectTarget();
@@ -19,11 +19,11 @@ async function fixture({ runtimeVersion = '0.9.1', includeRuntime = true } = {})
   const globalRoot = join(home, '.agents', 'loam');
   const skillsRoot = join(home, '.agents', 'skills');
   const runtimeFile = runtimePath(globalRoot, runtimeVersion, target);
-  const integrationPath = join(globalRoot, 'integration', 'loam.mjs');
+  const integrationPath = join(globalRoot, 'integration', '0.8.3-fixture', 'loam.mjs');
   const runtimeBytes = 'fixture runtime';
   const adapterRoot = join(globalRoot, 'plugins', '0.8.3');
 
-  await mkdir(join(globalRoot, 'integration'), { recursive: true });
+  await mkdir(join(globalRoot, 'integration', '0.8.3-fixture'), { recursive: true });
   await mkdir(join(skillsRoot, 'loam-using', 'scripts'), { recursive: true });
   await writeFile(integrationPath, 'export {};\n');
   await writeFile(
@@ -98,6 +98,28 @@ test('ready state invokes native state once and formats one common context', asy
   assert.match(context, new RegExp(fixtureData.runtimePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(context, /project-wiki/);
   assert.doesNotMatch(context, /^name: loam::using$/m);
+});
+
+test('versioned integration path resolves the global Loam root', async () => {
+  const fixtureData = await fixture();
+  const chunks = [];
+  const code = await runIntegration(['status'], {
+    skillsRoot: fixtureData.skillsRoot,
+    integrationPath: fixtureData.integrationPath,
+    target,
+    runner: async () => ({ code: 0, signal: null, stdout: JSON.stringify(state), stderr: '' }),
+    output: { write: (chunk) => chunks.push(String(chunk)) },
+  });
+
+  assert.equal(code, 0);
+  assert.equal(JSON.parse(chunks.join('')).globalRoot, fixtureData.globalRoot);
+});
+
+test('legacy integration path still resolves the global Loam root', () => {
+  const globalRoot = join(tmpdir(), 'loam-root');
+  const integrationPath = join(globalRoot, 'integration', 'loam.mjs');
+
+  assert.equal(resolveGlobalRoot({ env: {}, integrationPath }), globalRoot);
 });
 
 test('quotes native runtime paths for POSIX and PowerShell commands', () => {

@@ -1,6 +1,6 @@
-import { homedir } from 'node:os';
 import { realpath } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 export const SUPPORTED_TARGETS = Object.freeze([
   'x86_64-apple-darwin',
@@ -53,7 +53,10 @@ export function resolveGlobalRoot({ home = homedir(), env = process.env, integra
     if (!isAbsolute(env.LOAM_HOME)) throw new Error('LOAM_HOME must be absolute');
     return resolve(env.LOAM_HOME);
   }
-  if (integrationPath) return resolve(integrationPath, '..', '..');
+  if (integrationPath) {
+    const directory = dirname(resolve(integrationPath));
+    return dirname(basename(directory) === 'integration' ? directory : dirname(directory));
+  }
   return resolve(home, '.agents', 'loam');
 }
 
