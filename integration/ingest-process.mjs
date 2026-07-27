@@ -91,23 +91,6 @@ export function processDescriptor({
   };
 }
 
-export function spawnTracked({
-  command,
-  args = [],
-  cwd,
-  env = process.env,
-  platform = process.platform,
-  input,
-  timeoutMs = 900000,
-  detached = false,
-  staticCommand,
-  windowsHide = true,
-  captureOutput = true,
-} = {}) {
-  const started = startTracked({ command, args, cwd, env, platform, input, timeoutMs, detached, staticCommand, windowsHide, captureOutput });
-  return started.completion;
-}
-
 export function startTracked({
   command,
   args = [],

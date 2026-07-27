@@ -17,14 +17,6 @@ const LOG_MAX_BYTES = 256 * 1024;
 const OWNERSHIP_STALE_MS = 30000;
 const OWNERSHIP_FILE = '.ownership.lock';
 const ARCHIVE_MAX = 8;
-const SKIP_REASONS = Object.freeze([
-  'disabled', 'recursion', 'duplicate_event', 'lease_held', 'debounced', 'backoff',
-  'duplicate_intent', 'wiki_missing', 'codegraph_missing', 'no_pending', 'no_actionable_work',
-  'exclusions_unavailable', 'no_progress_suppressed', 'runtime_unavailable',
-  'probe_failed', 'probe_timeout', 'malformed_state', 'schema_unknown',
-  'fingerprint_unavailable', 'orphan_live', 'orphan_unknown',
-]);
-
 function hash(value) { return createHash('sha256').update(String(value)).digest('hex'); }
 export function runRoot(globalRoot, workspace) { return join(resolve(globalRoot), 'run', hash(workspace).slice(0, 16)); }
 async function json(path, fallback = null) { try { return JSON.parse(await readFile(path, 'utf8')); } catch { return fallback; } }
@@ -160,7 +152,7 @@ export async function readIngestConfig(globalRoot, env = process.env) {
 
 export async function canonicalWorkspace(value = process.cwd()) {
   const path = resolve(String(value));
-  try { return await import('node:fs/promises').then((fs) => fs.realpath(path)); } catch { return path; }
+  try { return await realpath(path); } catch { return path; }
 }
 
 function payloadWorkspace(payload = {}) { return payload.cwd || payload.directory || payload.workspace?.root || process.cwd(); }
@@ -948,4 +940,4 @@ export async function ingestStatus({ globalRoot, workspace, env = process.env } 
 
 function jsonLine(line) { try { return JSON.parse(line); } catch { return null; } }
 
-export { SKIP_REASONS, inspectIntent, resolveExclusions };
+export { inspectIntent, resolveExclusions };
