@@ -1,6 +1,6 @@
 {
   "name": "@scchearn/loam",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Global setup and verified integrations for Loam workflow skills",
   "type": "module",
   "repository": {
