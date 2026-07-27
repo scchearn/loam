@@ -361,7 +361,7 @@ test('published adapters load only the staged integration after the source tree 
   }
 });
 
-test('process descriptors resolve executables and pass Windows batch arguments directly', async () => {
+test('process descriptors quote Windows batch commands without a shell', async () => {
   const descriptor = processDescriptor({
     command: process.execPath,
     args: ['--version'],
@@ -378,14 +378,21 @@ test('process descriptors resolve executables and pass Windows batch arguments d
     env: { ComSpec: process.execPath, SystemRoot: '/Windows' },
   });
   assert.equal(windows.kind, 'cmd');
-  assert.deepEqual(windows.args, ['/d', '/s', '/c', batch, 'path with spaces & punctuation']);
+  assert.deepEqual(windows.args, ['/d', '/s', '/c', `""${batch}" "path with spaces & punctuation""`]);
+  assert.equal(windows.windowsVerbatimArguments, true);
   const quoted = processDescriptor({
     command: batch,
-    args: ['{"worktree":{"bgIsolation":"none"}}', '%PATH%', '!value!'],
+    args: ['say "yes"', '!value!'],
     platform: 'win32',
     env: { ComSpec: process.execPath },
   });
-  assert.deepEqual(quoted.args.slice(4), ['{"worktree":{"bgIsolation":"none"}}', '%PATH%', '!value!']);
+  assert.equal(quoted.args[3], `""${batch}" "say ""yes""" "!value!""`);
+  assert.throws(() => processDescriptor({
+    command: batch,
+    args: ['%PATH%'],
+    platform: 'win32',
+    env: { ComSpec: process.execPath },
+  }), /percent expansion/);
   assert.throws(() => processDescriptor({
     command: batch, platform: 'win32', env: { ComSpec: join(tmpdir(), 'missing-cmd.exe') },
   }), /ComSpec/);

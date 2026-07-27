@@ -21,6 +21,12 @@ function isRegularFile(path) {
   try { return statSync(path).isFile(); } catch { return false; }
 }
 
+function cmdToken(value) {
+  const text = String(value);
+  if (text.includes('%')) throw new Error('Windows batch arguments cannot contain percent expansion');
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
 function runExecFile(command, args, options = {}) {
   return new Promise((resolvePromise) => {
     nodeExecFile(command, args, options, (error, stdout, stderr) => resolvePromise({
@@ -69,9 +75,10 @@ export function processDescriptor({
   return {
     kind: 'cmd',
     executable: comspec,
-    args: ['/d', '/s', '/c', executable, ...args.map(String)],
+    args: ['/d', '/s', '/c', `"${[executable, ...args].map(cmdToken).join(' ')}"`],
     shell: false,
     env: commandEnvironment,
+    windowsVerbatimArguments: true,
   };
 }
 
@@ -94,6 +101,7 @@ export function startTracked({
     cwd,
     env: descriptor.env || normalizeEnvironment(env, platform),
     shell: false,
+    windowsVerbatimArguments: descriptor.windowsVerbatimArguments === true,
     detached,
     windowsHide,
     stdio: captureOutput ? ['pipe', 'pipe', 'pipe'] : [input === undefined ? 'ignore' : 'pipe', 'ignore', 'ignore'],
@@ -135,6 +143,7 @@ export function spawnDetached(options = {}) {
     cwd: options.cwd,
     env: descriptor.env || normalizeEnvironment(options.env || process.env, options.platform || process.platform),
     shell: false,
+    windowsVerbatimArguments: descriptor.windowsVerbatimArguments === true,
     detached: true,
     windowsHide: options.windowsHide !== false,
     stdio: 'ignore',
