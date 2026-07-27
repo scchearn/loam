@@ -32,7 +32,7 @@ function runExecFile(command, args, options = {}) {
 
 export function resolveExecutable(command, { platform = process.platform, env = process.env } = {}) {
   const source = String(command);
-  const pathApi = platform === 'win32' ? win32 : process.platform === 'win32' ? win32 : undefined;
+  const pathApi = platform === 'win32' ? win32 : undefined;
   const absolute = pathApi ? pathApi.isAbsolute(source) : isAbsolute(source);
   if (absolute) {
     if (!isRegularFile(source)) throw new Error(`executable is not a file: ${source}`);
