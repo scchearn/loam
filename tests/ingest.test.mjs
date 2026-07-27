@@ -96,10 +96,10 @@ test('worker leases before full state and issues the exact exclusions-aware diff
   const result = await runWorker({
     harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
     readiness, runtimeRunner, env: { LOAM_INGEST_BACKGROUND: '1' },
-    modelRunner: async ({ intent }) => {
+    modelRunner: async ({ lease }) => {
       modelCalls += 1;
-      assert.equal(intent.launch_state, 'planned');
-      assert.equal(intent.actionable_fingerprint.length, 64);
+      assert.equal(lease.launch_state, 'planned');
+      assert.equal(lease.actionable_fingerprint.length, 64);
       return { completion: Promise.resolve({ code: 0 }) };
     },
   });
@@ -215,7 +215,7 @@ test('OpenCode creates a child, records identity before prompt, and verifies ter
       parentSessionId: 'parent-1',
       createChild: async (input) => { calls.push(['create', input]); return { id: 'child-1' }; },
       promptAsync: async (input) => { calls.push(['prompt', input]); },
-      status: async (id) => { calls.push(['status', id]); statusCalls += 1; return { status: statusCalls === 1 ? 'running' : 'idle' }; },
+      status: async (id) => { calls.push(['status', id]); statusCalls += 1; return { type: statusCalls === 1 ? 'busy' : 'idle' }; },
       abort: async () => { calls.push(['abort']); },
     },
   });
@@ -266,7 +266,7 @@ test('OpenCode live child keeps the lease and intent when abort/requery cannot v
       parentSessionId: 'parent-1',
       createChild: async () => ({ id: 'child-live' }),
       promptAsync: async () => {},
-      status: async () => ({ status: 'running' }),
+      status: async () => ({ type: 'busy' }),
     },
   });
   assert.equal(result.reason, 'busy');

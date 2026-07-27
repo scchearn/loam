@@ -75,16 +75,12 @@ export async function gate({ harness, payload = {}, globalRoot, env = process.en
   const workspace = await canonicalWorkspace(payloadWorkspace(payload));
   const root = runRoot(globalRoot, workspace);
   await ensureRoot(root);
-  const skip = async (reason, fields = {}) => {
-    const category = publicReason(reason);
-    return { action: 'skip', reason: category, workspace, ...fields };
-  };
   const last = await json(join(root, 'last-run.json'), null);
-  if (last && last.schema !== 1) return skip('schema_unknown');
+  if (last && last.schema !== 1) return { action: 'skip', reason: publicReason('schema_unknown'), workspace };
   const previous = last || {};
-  if (Number(previous.backoff_until || 0) > now) return skip('backoff');
+  if (Number(previous.backoff_until || 0) > now) return { action: 'skip', reason: publicReason('backoff'), workspace };
   if (Number(previous.completed_at || 0) + config.min_interval_seconds * 1000 > now && previous.status === 'ok') {
-    return skip('debounced');
+    return { action: 'skip', reason: publicReason('debounced'), workspace };
   }
   return { action: 'spawn_worker', workspace, config };
 }
@@ -170,13 +166,13 @@ async function leaseOwner() {
   return { pid: process.pid, boot_id: await bootIdentity(), process_start: await processStartIdentity(process.pid) };
 }
 
-async function queryClaude(workspace, intent) {
+async function queryClaude(workspace, lease) {
   const result = await execFile('claude', ['agents', '--json', '--cwd', workspace, '--all'], { cwd: workspace, timeout: 5000 });
   if (result.code !== 0 || result.category === 'runtime_error') return { state: 'unknown' };
   let records; try { records = JSON.parse(result.stdout); } catch { return { state: 'unknown' }; }
   const list = Array.isArray(records) ? records : records?.agents || [];
-  const identity = intent.child_identity || {};
-  const plannedName = intent.planned_identity?.name;
+  const identity = lease.child_identity || {};
+  const plannedName = lease.planned_identity?.name;
   const match = plannedName
     ? list.find((item) => item.name === plannedName || item.title === plannedName)
       || list.find((item) => identity.manager_id && (item.id === identity.manager_id || item.session_id === identity.manager_id))
@@ -188,42 +184,33 @@ async function queryClaude(workspace, intent) {
   return { state: 'unknown', record: match };
 }
 
-function sessionRecord(value, id) {
-  const data = value?.data ?? value;
-  return data?.[id] || data?.sessions?.[id] || data;
-}
+function sessionState(record) { return record?.type; }
 
-function sessionState(value, id) {
-  const record = sessionRecord(value, id);
-  return record?.type || record?.state || record?.status || record?.data?.type || record?.data?.state || record?.data?.status;
-}
-
-async function inspectIntent(path, workspace, openCodeSession) {
-  const record = await jsonRecord(path);
-  if (!record.present) return { state: 'dead', intent: null };
-  if (record.malformed || !record.value || typeof record.value !== 'object' || Array.isArray(record.value)) {
+async function inspectIntent(leaseRecord, workspace, openCodeSession) {
+  if (!leaseRecord.present) return { state: 'dead', intent: null };
+  if (leaseRecord.malformed || !leaseRecord.value || typeof leaseRecord.value !== 'object' || Array.isArray(leaseRecord.value)) {
     return { state: 'unknown', intent: null };
   }
-  const intent = record.value;
-  if (intent.schema !== 1) return { state: 'unknown', intent };
-  if (!intent.launch_mode) return { state: 'dead', intent };
-  if (intent.launch_mode === 'claude_bg') return { ...(await queryClaude(workspace, intent)), intent };
-  if (!intent.child_identity) return { state: 'unknown', intent };
-  if (intent.launch_mode === 'claude_print' || intent.launch_mode === 'codex_exec') {
-    return { state: await classifyChild(intent.child_identity), intent };
+  const lease = leaseRecord.value;
+  if (lease.schema !== 1) return { state: 'unknown', intent: lease };
+  if (!lease.launch_mode) return { state: 'dead', intent: lease };
+  if (lease.launch_mode === 'claude_bg') return { ...(await queryClaude(workspace, lease)), intent: lease };
+  if (!lease.child_identity) return { state: 'unknown', intent: lease };
+  if (lease.launch_mode === 'claude_print' || lease.launch_mode === 'codex_exec') {
+    return { state: await classifyChild(lease.child_identity), intent: lease };
   }
-  if (intent.launch_mode === 'opencode_child') {
-    const sessionId = intent.child_identity?.session_id;
-    if (!sessionId || typeof openCodeSession?.status !== 'function') return { state: 'unknown', intent };
+  if (lease.launch_mode === 'opencode_child') {
+    const sessionId = lease.child_identity?.session_id;
+    if (!sessionId || typeof openCodeSession?.status !== 'function') return { state: 'unknown', intent: lease };
     try {
       const record = await openCodeSession.status(sessionId);
-      const state = sessionState(record, sessionId);
-      if (['working', 'running', 'pending', 'busy', 'retry'].includes(state)) return { state: 'live', record, intent };
-      if (['idle', 'done', 'completed', 'failed', 'stopped'].includes(state)) return { state: 'terminal', record, intent };
+      const state = sessionState(record);
+      if (['working', 'running', 'pending', 'busy', 'retry'].includes(state)) return { state: 'live', record, intent: lease };
+      if (['idle', 'done', 'completed', 'failed', 'stopped'].includes(state)) return { state: 'terminal', record, intent: lease };
     } catch {}
-    return { state: 'unknown', intent };
+    return { state: 'unknown', intent: lease };
   }
-  return { state: 'unknown', intent };
+  return { state: 'unknown', intent: lease };
 }
 
 async function acquireLease(root, workspace, harness, config, openCodeSession) {
@@ -239,7 +226,7 @@ async function acquireLease(root, workspace, harness, config, openCodeSession) {
       const current = await classifyChild({ pid: existing.owner_pid, boot_id: existing.boot_id, process_start: existing.process_start });
       if (current === 'live') return { status: 'held' };
       if (current !== 'dead') return { status: 'orphan_unknown' };
-      const orphan = await inspectIntent(path, workspace, openCodeSession);
+      const orphan = await inspectIntent(leaseRecord, workspace, openCodeSession);
       if (orphan.state === 'live') return { status: 'orphan_live' };
       if (orphan.state === 'unknown') return { status: 'orphan_unknown' };
       try { await rm(path); } catch (error) { if (error?.code !== 'ENOENT') return { status: 'held' }; }
@@ -264,7 +251,7 @@ async function acquireLease(root, workspace, harness, config, openCodeSession) {
 
 async function writeSkip(root, reason, fields = {}, leaseId) {
   const category = publicReason(reason);
-  const result = await (async () => {
+  try {
     if (leaseId) {
       const lease = await json(join(root, 'lease.json'));
       if (lease?.lease_id !== leaseId) return false;
@@ -277,8 +264,9 @@ async function writeSkip(root, reason, fields = {}, leaseId) {
       ...(category === reason ? {} : { detail: reason }), ...fields,
     });
     return true;
-  })().catch(() => false);
-  return result;
+  } catch {
+    return false;
+  }
 }
 
 async function releaseLease(root, leaseId) {
@@ -290,14 +278,15 @@ async function releaseLease(root, leaseId) {
 }
 
 async function liveOwnedChild(root, workspace, openCodeSession, leaseId) {
-  const current = await json(join(root, 'lease.json'));
+  const leaseRecord = await jsonRecord(join(root, 'lease.json'));
+  const current = leaseRecord.value;
   if (!current || current.lease_id !== leaseId || current.launch_state !== 'launched') return false;
-  const observed = await inspectIntent(join(root, 'lease.json'), workspace, openCodeSession).catch(() => ({ state: 'unknown' }));
+  const observed = await inspectIntent(leaseRecord, workspace, openCodeSession).catch(() => ({ state: 'unknown' }));
   return observed.state === 'live' || observed.state === 'unknown';
 }
 
 async function updateLease(root, lease, update) {
-  return (async () => {
+  try {
     const path = join(root, 'lease.json');
     const current = await json(path);
     if (!current || current.lease_id !== lease.lease_id) return false;
@@ -305,7 +294,9 @@ async function updateLease(root, lease, update) {
     await atomicJson(path, next);
     Object.assign(lease, next);
     return true;
-  })().catch(() => false);
+  } catch {
+    return false;
+  }
 }
 
 async function launchMode({ harness, workspace, env }) {
@@ -318,12 +309,12 @@ async function launchMode({ harness, workspace, env }) {
   return supportsBg ? 'claude_bg' : 'claude_print';
 }
 
-async function waitForClaude(workspace, intent, deadline) {
+async function waitForClaude(workspace, lease, deadline) {
   let result = { state: 'unknown' };
   let observed = false;
   const registrationDeadline = Math.min(deadline, Date.now() + 5000);
   while (Date.now() < deadline) {
-    result = await queryClaude(workspace, intent);
+    result = await queryClaude(workspace, lease);
     if (result.state === 'live') observed = true;
     if (result.state === 'terminal' || (result.state === 'dead' && observed)) return result;
     if (!observed && Date.now() >= registrationDeadline) return { ...result, state: 'unknown' };
@@ -332,10 +323,10 @@ async function waitForClaude(workspace, intent, deadline) {
   return result;
 }
 
-async function stopClaude(workspace, intent) {
-  const queried = await queryClaude(workspace, intent);
+async function stopClaude(workspace, lease) {
+  const queried = await queryClaude(workspace, lease);
   const record = queried.record;
-  const id = record?.id || record?.session_id || record?.sessionID || intent.child_identity?.manager_id;
+  const id = record?.id || record?.session_id || record?.sessionID || lease.child_identity?.manager_id;
   if (!id) return { state: 'unknown' };
   const result = await execFile('claude', ['stop', id], { cwd: workspace, timeout: 5000 });
   return result.code === 0 ? { state: 'stopping' } : { state: 'unknown' };
@@ -347,7 +338,7 @@ async function waitForOpenCode(openCodeSession, sessionId, deadline) {
   while (Date.now() < deadline) {
     try {
       const record = await openCodeSession.status(sessionId);
-      const state = sessionState(record, sessionId);
+      const state = sessionState(record);
       if (['working', 'running', 'pending', 'busy', 'retry'].includes(state)) last = { state: 'live', record };
       else if (['idle', 'done', 'completed', 'failed', 'stopped', 'error'].includes(state)) return { state: 'terminal', record };
       else last = { state: 'unknown', record };
@@ -358,22 +349,22 @@ async function waitForOpenCode(openCodeSession, sessionId, deadline) {
   return last;
 }
 
-async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent, openCodeSession, root }) {
+async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease, openCodeSession, root }) {
   const prompt = PROMPT + ' Workspace: ' + workspace;
   if (mode === 'opencode_child') {
     if (!openCodeSession?.createChild || !openCodeSession?.promptAsync || !openCodeSession.parentSessionId) return { category: 'runtime_unavailable' };
     const child = await openCodeSession.createChild({
       parentId: openCodeSession.parentSessionId,
-      title: intent.planned_identity.title,
+      title: lease.planned_identity.title,
     });
     const sessionId = child?.id || child?.session_id || child?.sessionID;
     if (!sessionId) return { category: 'runtime_unavailable' };
     const identity = {
       session_id: String(sessionId),
       parent_session_id: String(openCodeSession.parentSessionId),
-      host_identity: intent.planned_identity?.owner_identity || null,
+      host_identity: lease.planned_identity?.owner_identity || null,
     };
-    if (!(await updateLease(root, intent, { launch_state: 'launched', child_identity: identity }))) {
+    if (!(await updateLease(root, lease, { launch_state: 'launched', child_identity: identity }))) {
       if (typeof openCodeSession.abort === 'function') await openCodeSession.abort(String(sessionId)).catch(() => {});
       return { category: 'orphan_unknown' };
     }
@@ -382,7 +373,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent
     } catch {
       try {
         const record = await openCodeSession.status(String(sessionId));
-        const state = sessionState(record, String(sessionId));
+        const state = sessionState(record);
         if (['working', 'running', 'pending', 'busy', 'retry'].includes(state)) return { category: 'orphan_live' };
         if (!['idle', 'done', 'completed', 'failed', 'stopped', 'error'].includes(state)) return { category: 'orphan_unknown' };
       } catch {}
@@ -391,7 +382,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent
     return { category: null, completion: Promise.resolve({ code: 0 }), background: true, sessionId: String(sessionId) };
   }
   if (mode === 'claude_bg') {
-      const name = intent.planned_identity.name;
+      const name = lease.planned_identity.name;
       const settingsPath = join(root, 'claude-settings.json');
       await atomicJson(settingsPath, { worktree: { bgIsolation: 'none' } });
       let started;
@@ -406,7 +397,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent
         await rm(settingsPath, { force: true });
         throw error;
       }
-      if (!(await updateLease(root, intent, { launch_state: 'launched', child_identity: { manager_name: name } }))) {
+      if (!(await updateLease(root, lease, { launch_state: 'launched', child_identity: { manager_name: name } }))) {
         await terminateChild(started.child);
         await rm(settingsPath, { force: true });
         return { category: 'orphan_unknown' };
@@ -414,12 +405,12 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent
       const completion = started.completion.finally(() => rm(settingsPath, { force: true }));
       const result = await completion;
       if (result.code !== 0) {
-        const reset = await updateLease(root, intent, { launch_mode: 'claude_print', launch_state: 'planned', child_identity: null });
+        const reset = await updateLease(root, lease, { launch_mode: 'claude_print', launch_state: 'planned', child_identity: null });
         if (!reset) return { category: 'orphan_unknown' };
-        return launchModel({ launchMode: 'claude_print', workspace, env, timeoutMs, intent, openCodeSession, root });
+        return launchModel({ launchMode: 'claude_print', workspace, env, timeoutMs, lease, openCodeSession, root });
       }
       const match = result.stdout.match(/(?:backgrounded|session|id)[^A-Za-z0-9_-]+([A-Za-z0-9_-]{4,})/i);
-      if (!(await updateLease(root, intent, { child_identity: { manager_id: match?.[1] || null, manager_name: name } }))) {
+      if (!(await updateLease(root, lease, { child_identity: { manager_id: match?.[1] || null, manager_name: name } }))) {
         if (match?.[1]) await execFile('claude', ['stop', match[1]], { cwd: workspace, timeout: 5000 });
         return { category: 'orphan_unknown' };
       }
@@ -433,7 +424,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent
         detached: true, captureOutput: false,
       });
     const identity = await childIdentity(started.child.pid);
-    if (!(await updateLease(root, intent, { launch_state: 'launched', child_identity: identity }))) {
+    if (!(await updateLease(root, lease, { launch_state: 'launched', child_identity: identity }))) {
       await terminateChild(started.child);
       return { category: 'orphan_unknown' };
     }
@@ -446,7 +437,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent
     detached: true, captureOutput: false,
   });
   const identity = await childIdentity(started.child.pid);
-  if (!(await updateLease(root, intent, { launch_state: 'launched', child_identity: identity }))) {
+  if (!(await updateLease(root, lease, { launch_state: 'launched', child_identity: identity }))) {
     await terminateChild(started.child);
     return { category: 'orphan_unknown' };
   }
@@ -454,7 +445,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent
 }
 
 async function recordProgress(root, pre, post, count, lease) {
-  const result = await (async () => {
+  try {
     const current = await json(join(root, 'lease.json'));
     if (current?.lease_id !== lease.lease_id) return false;
     const loaded = await json(join(root, 'last-run.json'));
@@ -471,9 +462,10 @@ async function recordProgress(root, pre, post, count, lease) {
       fingerprint_complete: post.complete, actionable_count: count,
       failure_count: failureCount, backoff_until: backoff,
     });
-    return { status, complete: post.complete };
-  })().catch(() => false);
-  return Boolean(result);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function runWorker({
@@ -492,9 +484,7 @@ export async function runWorker({
     await writeSkip(root, reason, fields, lease.lease_id);
     return { reason: publicReason(reason) };
   };
-  const intent = lease;
-  let keepIntent = false;
-  let retainOwnership = false;
+  let retainLease = false;
   try {
     if (!config.enabled) return skip('disabled');
     const localOutcome = await json(join(root, 'last-run.json'));
@@ -560,42 +550,40 @@ export async function runWorker({
     let launch;
     try {
       launch = modelRunner
-        ? await modelRunner({ harness, workspace: canonical, intent, root })
-        : await launchModel({ launchMode: intent.launch_mode, workspace: canonical, env: { ...env, LOAM_INGEST_GLOBAL_ROOT: globalRoot }, timeoutMs: config.timeout_seconds * 1000, intent, openCodeSession, root });
+        ? await modelRunner({ harness, workspace: canonical, lease, root })
+        : await launchModel({ launchMode: lease.launch_mode, workspace: canonical, env: { ...env, LOAM_INGEST_GLOBAL_ROOT: globalRoot }, timeoutMs: config.timeout_seconds * 1000, lease, openCodeSession, root });
     } catch (error) {
-      if (intent.child_identity) { keepIntent = true; retainOwnership = true; }
+      if (lease.child_identity) retainLease = true;
       return skip('runtime_unavailable', { detail: error instanceof Error ? error.message.slice(0, 256) : String(error).slice(0, 256) });
     }
     if (launch.category) {
-      if (['orphan_live', 'orphan_unknown'].includes(launch.category)) { keepIntent = true; retainOwnership = true; }
+      if (['orphan_live', 'orphan_unknown'].includes(launch.category)) retainLease = true;
       return skip(launch.category);
     }
     const result = await (launch.completion || Promise.resolve({ code: 0 }));
-    if (!launch.background && result.category === 'timeout' && intent.child_identity) {
-      const childState = await classifyChild(intent.child_identity, { platform });
+    if (!launch.background && result.category === 'timeout' && lease.child_identity) {
+      const childState = await classifyChild(lease.child_identity, { platform });
       if (childState === 'live' || childState === 'unknown') {
-        keepIntent = true;
-        retainOwnership = true;
+        retainLease = true;
         const reason = childState === 'live' ? 'orphan_live' : 'orphan_unknown';
         return skip(reason);
       }
     }
     if (launch.background) {
-      let manager = intent.launch_mode === 'claude_bg'
-        ? await waitForClaude(canonical, intent, Date.parse(intent.hard_deadline))
-        : await waitForOpenCode(openCodeSession, launch.sessionId, Date.parse(intent.hard_deadline));
+      let manager = lease.launch_mode === 'claude_bg'
+        ? await waitForClaude(canonical, lease, Date.parse(lease.hard_deadline))
+        : await waitForOpenCode(openCodeSession, launch.sessionId, Date.parse(lease.hard_deadline));
       if (manager.state === 'live') {
-        if (intent.launch_mode === 'claude_bg') {
-          await stopClaude(canonical, intent);
-          manager = await waitForClaude(canonical, intent, Date.now() + 5000);
+        if (lease.launch_mode === 'claude_bg') {
+          await stopClaude(canonical, lease);
+          manager = await waitForClaude(canonical, lease, Date.now() + 5000);
         } else if (typeof openCodeSession?.abort === 'function') {
           try { await openCodeSession.abort(launch.sessionId); } catch {}
           manager = await waitForOpenCode(openCodeSession, launch.sessionId, Date.now() + 5000);
         }
       }
       if (manager.state === 'live' || manager.state === 'unknown') {
-        keepIntent = true;
-        retainOwnership = true;
+        retainLease = true;
         const reason = manager.state === 'live' ? 'orphan_live' : 'orphan_unknown';
         return skip(reason);
       }
@@ -610,14 +598,11 @@ export async function runWorker({
       }
     } catch {}
     if (result.category || (typeof result.code === 'number' && result.code !== 0)) post.complete = false;
-    await recordProgress(root, fingerprint, post, fingerprint.count, intent);
+    await recordProgress(root, fingerprint, post, fingerprint.count, lease);
     return { reason: result?.category === 'timeout' ? 'unavailable' : 'ok' };
   } finally {
-    if (!keepIntent && await liveOwnedChild(root, canonical, openCodeSession, lease.lease_id)) {
-      keepIntent = true;
-      retainOwnership = true;
-    }
-    if (!retainOwnership) await releaseLease(root, lease.lease_id);
+    if (!retainLease && await liveOwnedChild(root, canonical, openCodeSession, lease.lease_id)) retainLease = true;
+    if (!retainLease) await releaseLease(root, lease.lease_id);
   }
 }
 
@@ -633,7 +618,7 @@ export async function ingestStatus({ globalRoot, workspace, env = process.env } 
     : 'dead';
   const lastRun = await json(join(root, 'last-run.json'));
   const intentState = leaseRecord.present
-    ? await inspectIntent(join(root, 'lease.json'), canonical)
+    ? await inspectIntent(leaseRecord, canonical)
     : { state: 'dead' };
   let exclusions;
   try { exclusions = { ready: true, path: await resolveExclusions(env.LOAM_INGEST_SKILLS_ROOT) }; }
