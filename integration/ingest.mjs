@@ -156,24 +156,13 @@ export async function canonicalWorkspace(value = process.cwd()) {
 }
 
 function payloadWorkspace(payload = {}) { return payload.cwd || payload.directory || payload.workspace?.root || process.cwd(); }
-function eventKey({ workspace, harness, payload = {}, now = Date.now() }) {
-  const stable = payload.event_id || payload.turn_id || payload.stop_hook_id;
-  return workspace + ':' + harness + ':' + (stable || Math.floor(now / 2000));
-}
 
-async function eventRecord(root, keyHash, now = Date.now()) {
-  return withWorkspaceOwnership(root, async () => {
-    const path = join(root, 'events.json');
-    const current = await json(path, null);
-    if (current && current.schema !== 1) return { unknown: true };
-    const record = current || { schema: 1, entries: [] };
-    const entries = Array.isArray(record.entries) ? record.entries : [];
-    const fresh = entries.filter((entry) => Number(entry.at) > now - 120000).slice(-31);
-    if (fresh.some((entry) => entry.key_hash === keyHash)) return { duplicate: true };
-    fresh.push({ key_hash: keyHash, at: now });
-    await atomicJson(path, { schema: 1, entries: fresh });
-    return { duplicate: false };
-  });
+function publicReason(reason) {
+  if (reason === 'disabled' || reason === 'recursion') return 'disabled';
+  if (['lease_held', 'orphan_live', 'orphan_unknown', 'duplicate_intent'].includes(reason)) return 'lease_held';
+  if (reason === 'debounced' || reason === 'backoff') return 'too_soon';
+  if (['wiki_missing', 'codegraph_missing', 'no_pending', 'no_actionable_work'].includes(reason)) return 'nothing_to_do';
+  return reason === 'ok' ? 'ok' : 'unavailable';
 }
 
 function recursion(payload, env) {
@@ -184,11 +173,12 @@ function recursion(payload, env) {
 export async function gate({ harness, payload = {}, globalRoot, env = process.env, now = Date.now() } = {}) {
   const config = await readIngestConfig(globalRoot, env);
   const logEarlySkip = async (reason) => {
+    const category = publicReason(reason);
     try {
       const workspace = await canonicalWorkspace(payloadWorkspace(payload));
-      await appendLog(runRoot(globalRoot, workspace), 'gate_skip', { reason });
+      await appendLog(runRoot(globalRoot, workspace), 'gate_skip', { reason: category, detail: reason });
     } catch {}
-    return { action: 'skip', reason };
+    return { action: 'skip', reason: category };
   };
   if (!config.enabled) return logEarlySkip('disabled');
   if (recursion(payload, env)) return logEarlySkip('recursion');
@@ -196,8 +186,9 @@ export async function gate({ harness, payload = {}, globalRoot, env = process.en
   const root = runRoot(globalRoot, workspace);
   await ensureRoot(root);
   const skip = async (reason, fields = {}) => {
-    await appendLog(root, 'gate_skip', { reason, ...fields });
-    return { action: 'skip', reason, workspace, ...fields };
+    const category = publicReason(reason);
+    await appendLog(root, 'gate_skip', { reason: category, detail: reason, ...fields });
+    return { action: 'skip', reason: category, workspace, ...fields };
   };
   const last = await json(join(root, 'last-run.json'), null);
   if (last && last.schema !== 1) return skip('schema_unknown');
@@ -206,11 +197,7 @@ export async function gate({ harness, payload = {}, globalRoot, env = process.en
   if (Number(previous.completed_at || 0) + config.min_interval_seconds * 1000 > now && previous.status === 'ok') {
     return skip('debounced');
   }
-  const keyHash = hash(eventKey({ workspace, harness, payload, now }));
-  const event = await eventRecord(root, keyHash, now);
-  if (event.unknown) return skip('schema_unknown');
-  if (event.duplicate) return skip('duplicate_event', { key_hash: keyHash });
-  return { action: 'spawn_worker', workspace, key_hash: keyHash, config };
+  return { action: 'spawn_worker', workspace, config };
 }
 
 export function startWorker({ harness, workspace, globalRoot, skillsRoot, workerPath, env = process.env } = {}) {
@@ -229,26 +216,15 @@ async function installedWorkerPath(globalRoot) {
   return assertInside(resolve(globalRoot), join(resolve(install.adapter_root), 'ingest-worker.mjs'), 'worker path');
 }
 
-async function forgetEvent(root, keyHash) {
-  await withWorkspaceOwnership(root, async () => {
-    const path = join(root, 'events.json');
-    const events = await json(path, { schema: 1, entries: [] });
-    await atomicJson(path, { schema: 1, entries: (events.entries || []).filter((entry) => entry.key_hash !== keyHash) });
-  }).catch(() => {});
-}
-
 export async function dispatchBoundary(options = {}) {
   const result = await gate(options);
   if (result.action !== 'spawn_worker') return result;
   try {
-    const started = startWorker({ ...options, workerPath: await installedWorkerPath(options.globalRoot), workspace: result.workspace });
-    started.child.once('error', () => { forgetEvent(runRoot(options.globalRoot, result.workspace), result.key_hash).catch(() => {}); });
+    startWorker({ ...options, workerPath: await installedWorkerPath(options.globalRoot), workspace: result.workspace });
     return result;
   }
   catch (error) {
-    const root = runRoot(options.globalRoot, result.workspace);
-    await forgetEvent(root, result.key_hash);
-    return { action: 'skip', reason: 'runtime_unavailable', detail: error.message };
+    return { action: 'skip', reason: 'unavailable', detail: error.message };
   }
 }
 
@@ -460,6 +436,7 @@ async function acquireLease(root, workspace, harness, config, openCodeSession) {
 }
 
 async function writeSkip(root, reason, extra = {}) {
+  const category = publicReason(reason);
   const result = await withWorkspaceOwnership(root, async () => {
     const leaseId = extra.__lease_id;
     const intent = extra.__intent;
@@ -476,12 +453,14 @@ async function writeSkip(root, reason, extra = {}) {
     }
     const previous = await json(join(root, 'last-run.json'));
     if (previous && previous.schema !== 1) return false;
+    const { no_progress_count, suppressed_fingerprint, ...kept } = previous || {};
     await atomicJson(join(root, 'last-run.json'), {
-      ...(previous || {}), schema: 1, completed_at: Date.now(), status: 'skipped', reason, ...fields,
+      ...kept, schema: 1, completed_at: Date.now(), status: 'skipped', reason: category,
+      ...(category === reason ? {} : { detail: reason }), ...fields,
     });
     return true;
   }).catch(() => false);
-  if (result) await appendLog(root, 'skip', { reason });
+  if (result) await appendLog(root, 'skip', { reason: category, ...(category === reason ? {} : { detail: reason }) });
   return result;
 }
 
@@ -702,17 +681,14 @@ async function recordProgress(root, pre, post, count, intent) {
     const previous = loaded || {};
     const same = pre.complete && post.complete && pre.fingerprint === post.fingerprint;
     const progress = post.complete && (post.count === 0 || post.fingerprint !== pre.fingerprint);
-    const noProgressCount = same ? Number(previous.no_progress_count || 0) + 1 : 0;
     const failureCount = progress ? 0 : Number(previous.failure_count || 0) + 1;
     const status = post.complete && post.count === 0 ? 'ok' : post.complete && !same ? 'partial' : 'failed';
-    const suppressed = noProgressCount >= 3 ? pre.fingerprint : progress ? null : previous.suppressed_fingerprint || null;
-    const backoff = progress || same ? null : Date.now() + Math.min(3600000, 300000 * Math.max(1, failureCount));
+    const backoff = progress ? null : Date.now() + Math.min(3600000, 300000 * Math.max(1, failureCount));
     await atomicJson(join(root, 'last-run.json'), {
       schema: 1, completed_at: Date.now(), attempt_id: intent.attempt_id, status,
       pre_fingerprint: pre.fingerprint, post_fingerprint: post.fingerprint,
       fingerprint_complete: post.complete, actionable_count: count,
-      failure_count: failureCount, no_progress_count: noProgressCount,
-      suppressed_fingerprint: suppressed, backoff_until: backoff,
+      failure_count: failureCount, backoff_until: backoff,
     });
     return { status, complete: post.complete };
   }).catch(() => false);
@@ -730,57 +706,58 @@ export async function runWorker({
   await ensureRoot(root);
   const leaseResult = await acquireLease(root, canonical, harness, config, openCodeSession);
   if (leaseResult.status === 'held') { await writeSkip(root, 'lease_held'); return { reason: 'lease_held' }; }
-  if (leaseResult.status === 'orphan_live') { await writeSkip(root, 'orphan_live'); return { reason: 'orphan_live' }; }
-  if (leaseResult.status === 'orphan_unknown') { await writeSkip(root, 'orphan_unknown'); return { reason: 'orphan_unknown' }; }
-  if (leaseResult.status !== 'acquired') { await writeSkip(root, 'runtime_unavailable'); return { reason: 'runtime_unavailable' }; }
+  if (leaseResult.status === 'orphan_live') { await writeSkip(root, 'orphan_live'); return { reason: 'lease_held' }; }
+  if (leaseResult.status === 'orphan_unknown') { await writeSkip(root, 'orphan_unknown'); return { reason: 'lease_held' }; }
+  if (leaseResult.status !== 'acquired') { await writeSkip(root, 'runtime_unavailable'); return { reason: 'unavailable' }; }
   const lease = leaseResult.lease;
-  const skip = (reason, fields = {}) => writeSkip(root, reason, { ...fields, __lease_id: lease.lease_id });
+  const skip = async (reason, fields = {}) => {
+    await writeSkip(root, reason, { ...fields, __lease_id: lease.lease_id });
+    return { reason: publicReason(reason) };
+  };
   let intent = null;
   let keepIntent = false;
   let retainOwnership = false;
   try {
-    if (!config.enabled) { await skip('disabled'); return { reason: 'disabled' }; }
+    if (!config.enabled) return skip('disabled');
     const localOutcome = await json(join(root, 'last-run.json'));
-    if (localOutcome && localOutcome.schema !== 1) { await skip('schema_unknown'); return { reason: 'schema_unknown' }; }
+    if (localOutcome && localOutcome.schema !== 1) return skip('schema_unknown');
     if (Number(localOutcome?.backoff_until || 0) > Date.now()) {
-      await skip('backoff'); return { reason: 'backoff' };
+      return skip('backoff');
     }
     if (Number(localOutcome?.completed_at || 0) + config.min_interval_seconds * 1000 > Date.now()
       && localOutcome?.status === 'ok') {
-      await skip('debounced'); return { reason: 'debounced' };
+      return skip('debounced');
     }
     const ready = readiness || await checkReadiness({ globalRoot, skillsRoot, env, platform });
-    if (!ready.ready) { await skip(ready.category || 'runtime_unavailable'); return { reason: ready.category || 'runtime_unavailable' }; }
+    if (!ready.ready) return skip(ready.category || 'runtime_unavailable');
     const stateResult = await probeFullState({ readiness: ready, workspace: canonical, timeoutMs: 20000, runner: runtimeRunner });
     if (!stateResult.ready) {
       const reason = stateResult.category === 'timeout' ? 'probe_timeout' : stateResult.category === 'malformed_state' ? 'malformed_state' : stateResult.category === 'runtime_failed' ? 'probe_failed' : 'runtime_unavailable';
-      await skip(reason); return { reason };
+      return skip(reason);
     }
     const state = stateResult.state;
-    if (!validState(state)) { await skip('schema_unknown'); return { reason: 'schema_unknown' }; }
-    if (!state.wiki_root) { await skip('wiki_missing'); return { reason: 'wiki_missing' }; }
-    if (!(await hasExistingWiki(state.wiki_root))) { await skip('wiki_missing'); return { reason: 'wiki_missing' }; }
-    if (!(await hasExistingCodegraph(state.wiki_root))) { await skip('codegraph_missing'); return { reason: 'codegraph_missing' }; }
+    if (!validState(state)) return skip('schema_unknown');
+    if (!state.wiki_root) return skip('wiki_missing');
+    if (!(await hasExistingWiki(state.wiki_root))) return skip('wiki_missing');
+    if (!(await hasExistingCodegraph(state.wiki_root))) return skip('codegraph_missing');
     const pending = pendingHint(state);
-    if (!pending || pendingCount(pending) === 0) { await skip('no_pending'); return { reason: 'no_pending' }; }
+    if (!pending || pendingCount(pending) === 0) return skip('no_pending');
     let exclusionsPath;
     try { exclusionsPath = await resolveExclusions(skillsRoot || env.LOAM_INGEST_SKILLS_ROOT); }
-    catch { await skip('exclusions_unavailable'); return { reason: 'exclusions_unavailable' }; }
+    catch { return skip('exclusions_unavailable'); }
     const diffResult = await diff({ readiness: ready, workspace: canonical, wikiRoot: state.wiki_root, exclusionsPath, runner: runtimeRunner });
-    if (diffResult.error) { await skip(diffResult.error); return { reason: diffResult.error }; }
+    if (diffResult.error) return skip(diffResult.error);
     let fingerprint;
     try { fingerprint = await fingerprintActionable({ workspace: canonical, entries: diffResult.entries, exclusionsPath, deadlineMs: 20000 }); }
-    catch (error) { const reason = error.reason || 'fingerprint_unavailable'; await skip(reason); return { reason }; }
-    if (fingerprint.count === 0) { await skip('no_actionable_work', { actionable_count: 0, actionable_fingerprint: fingerprint.fingerprint }); return { reason: 'no_actionable_work' }; }
-    if (!fingerprint.complete) { await skip('fingerprint_unavailable', { actionable_count: fingerprint.count, actionable_fingerprint: fingerprint.fingerprint }); return { reason: 'fingerprint_unavailable' }; }
+    catch (error) { return skip(error.reason || 'fingerprint_unavailable'); }
+    if (fingerprint.count === 0) return skip('no_actionable_work', { actionable_count: 0, actionable_fingerprint: fingerprint.fingerprint });
+    if (!fingerprint.complete) return skip('fingerprint_unavailable', { actionable_count: fingerprint.count, actionable_fingerprint: fingerprint.fingerprint });
     const previousRecord = await json(join(root, 'last-run.json'));
-    if (previousRecord && previousRecord.schema !== 1) { await skip('schema_unknown'); return { reason: 'schema_unknown' }; }
-    const previous = previousRecord || {};
-    if (previous.suppressed_fingerprint === fingerprint.fingerprint) { await skip('no_progress_suppressed', { actionable_count: fingerprint.count, actionable_fingerprint: fingerprint.fingerprint }); return { reason: 'no_progress_suppressed' }; }
+    if (previousRecord && previousRecord.schema !== 1) return skip('schema_unknown');
     const existingIntent = await json(join(root, 'intent.json'));
-    if (existingIntent && existingIntent.schema !== 1) { await skip('schema_unknown'); return { reason: 'schema_unknown' }; }
+    if (existingIntent && existingIntent.schema !== 1) return skip('schema_unknown');
     if (existingIntent?.lease_id === lease.lease_id && existingIntent.actionable_fingerprint === fingerprint.fingerprint) {
-      await skip('duplicate_intent'); return { reason: 'duplicate_intent' };
+      return skip('duplicate_intent');
     }
     const selectedLaunchMode = await launchMode({ harness, workspace: canonical, env });
     intent = {
@@ -811,9 +788,7 @@ export async function runWorker({
     };
     const published = await publishIntent(root, lease.lease_id, intent);
     if (published.status !== 'published') {
-      if (published.status === 'orphan_unknown') return { reason: 'orphan_unknown' };
-      await skip(published.status);
-      return { reason: published.status };
+      return skip(published.status);
     }
     let launch;
     try {
@@ -822,12 +797,11 @@ export async function runWorker({
         : await launchModel({ launchMode: intent.launch_mode, workspace: canonical, env: { ...env, LOAM_INGEST_GLOBAL_ROOT: globalRoot }, timeoutMs: config.timeout_seconds * 1000, intent, openCodeSession, root });
     } catch (error) {
       if (intent.child_identity) { keepIntent = true; retainOwnership = true; }
-      await skip('runtime_unavailable', { detail: error instanceof Error ? error.message.slice(0, 256) : String(error).slice(0, 256), __intent: intent });
-      return { reason: 'runtime_unavailable' };
+      return skip('runtime_unavailable', { detail: error instanceof Error ? error.message.slice(0, 256) : String(error).slice(0, 256), __intent: intent });
     }
     if (launch.category) {
       if (['orphan_live', 'orphan_unknown'].includes(launch.category)) { keepIntent = true; retainOwnership = true; }
-      await skip(launch.category, { __intent: intent }); return { reason: launch.category };
+      return skip(launch.category, { __intent: intent });
     }
     const result = await (launch.completion || Promise.resolve({ code: 0 }));
     if (!launch.background && result.category === 'timeout' && intent.child_identity) {
@@ -836,8 +810,7 @@ export async function runWorker({
         keepIntent = true;
         retainOwnership = true;
         const reason = childState === 'live' ? 'orphan_live' : 'orphan_unknown';
-        await skip(reason, { __intent: intent });
-        return { reason };
+        return skip(reason, { __intent: intent });
       }
     }
     if (launch.background) {
@@ -857,8 +830,7 @@ export async function runWorker({
         keepIntent = true;
         retainOwnership = true;
         const reason = manager.state === 'live' ? 'orphan_live' : 'orphan_unknown';
-        await skip(reason, { __intent: intent });
-        return { reason };
+        return skip(reason, { __intent: intent });
       }
     }
     const postState = await probeFullState({ readiness: ready, workspace: canonical, timeoutMs: 20000, runner: runtimeRunner });
@@ -872,7 +844,7 @@ export async function runWorker({
     } catch {}
     if (result.category || (typeof result.code === 'number' && result.code !== 0)) post.complete = false;
     await recordProgress(root, fingerprint, post, fingerprint.count, intent);
-    return { reason: result?.category === 'timeout' ? 'probe_timeout' : 'ok' };
+    return { reason: result?.category === 'timeout' ? 'unavailable' : 'ok' };
   } finally {
     if (intent && !keepIntent && await liveOwnedIntent(root, canonical, openCodeSession, intent)) {
       keepIntent = true;
@@ -915,7 +887,6 @@ export async function ingestStatus({ globalRoot, workspace, env = process.env } 
       count: lastRun?.actionable_count ?? null,
       fingerprint: lastRun?.actionable_fingerprint || lastRun?.post_fingerprint || null,
     },
-    events: await json(join(root, 'events.json'), { schema: 1, entries: [] }),
     queue: { root }, records,
   };
 }

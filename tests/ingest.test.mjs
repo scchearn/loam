@@ -135,7 +135,7 @@ test('maintenance worker distinguishes missing wiki and missing codegraph before
       },
       modelRunner: async () => { modelCalls += 1; return { completion: Promise.resolve({ code: 0 }) }; },
     });
-    assert.equal(result.reason, item.name);
+    assert.equal(result.reason, 'nothing_to_do');
     assert.equal(modelCalls, 0);
     assert.equal(calls.length, 1);
     assert.equal(calls[0][0], 'state');
@@ -161,7 +161,7 @@ test('a live lease blocks before runtime, capability, or model work', async () =
   assert.equal(runtimeCalls, 0);
 });
 
-test('three complete no-progress attempts persist suppression for every later boundary', async () => {
+test('a complete no-progress attempt backs off without fingerprint suppression state', async () => {
   const { root, workspace, wiki, skills } = await fixture();
   let modelCalls = 0;
   const runtimeRunner = async ({ args }) => args[0] === 'state'
@@ -174,14 +174,12 @@ test('three complete no-progress attempts persist suppression for every later bo
     modelRunner: async () => { modelCalls += 1; return { completion: Promise.resolve({ code: 0 }) }; },
   });
   assert.equal((await run()).reason, 'ok');
-  assert.equal((await run()).reason, 'ok');
-  assert.equal((await run()).reason, 'ok');
-  assert.equal((await run()).reason, 'no_progress_suppressed');
-  assert.equal((await run()).reason, 'no_progress_suppressed');
-  assert.equal(modelCalls, 3);
+  assert.equal((await run()).reason, 'too_soon');
+  assert.equal(modelCalls, 1);
   const outcome = JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8'));
-  assert.equal(outcome.no_progress_count, 3);
-  assert.equal(typeof outcome.suppressed_fingerprint, 'string');
+  assert.equal(outcome.no_progress_count, undefined);
+  assert.equal(outcome.suppressed_fingerprint, undefined);
+  assert.equal(typeof outcome.backoff_until, 'number');
 });
 
 test('a second admitted worker rechecks backoff after acquiring the lease', async () => {
@@ -200,7 +198,7 @@ test('a second admitted worker rechecks backoff after acquiring the lease', asyn
     },
   };
   assert.equal((await runWorker(options)).reason, 'ok');
-  assert.equal((await runWorker(options)).reason, 'backoff');
+  assert.equal((await runWorker(options)).reason, 'too_soon');
   assert.equal(modelCalls, 1);
 });
 
@@ -283,7 +281,7 @@ test('OpenCode live child keeps the lease and intent when abort/requery cannot v
       status: async () => ({ status: 'running' }),
     },
   });
-  assert.equal(result.reason, 'orphan_live');
+  assert.equal(result.reason, 'lease_held');
   const runPath = runRoot(root, workspace);
   assert.equal(JSON.parse(await readFile(join(runPath, 'intent.json'), 'utf8')).child_identity.session_id, 'child-live');
   assert.ok(await readFile(join(runPath, 'lease.json'), 'utf8'));
@@ -304,7 +302,7 @@ test('OpenCode prompt transport failure keeps ownership after child identity was
       status: async () => ({ type: 'busy' }),
     },
   });
-  assert.equal(result.reason, 'orphan_live');
+  assert.equal(result.reason, 'lease_held');
   const runPath = runRoot(root, workspace);
   assert.equal(JSON.parse(await readFile(join(runPath, 'intent.json'), 'utf8')).child_identity.session_id, 'child-transport-failed');
   assert.ok(await readFile(join(runPath, 'lease.json'), 'utf8'));
