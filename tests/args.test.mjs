@@ -22,7 +22,8 @@ test('package exposes the scoped setup executable and pinned Skills CLI', async 
   assert.equal(packageJson.bin.loam, 'bin/loam.mjs');
   assert.equal(packageJson.dependencies.skills, SKILLS_CLI_VERSION);
   assert.match(HELP_TEXT, /@scchearn\/loam setup/);
-  assert.equal(basename(resolve(root)), 'loam');
+  const base = basename(resolve(root));
+  assert.ok(base === 'loam' || resolve(root).includes(join('.claude', 'worktrees')));
 });
 
 test('setup accepts the confirmation and dry-run flags', () => {

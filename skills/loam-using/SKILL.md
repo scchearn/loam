@@ -140,6 +140,20 @@ quoted command shown in the `Native runtime command:` context line:
 The harness hook operation is reserved for adapters and session startup; skills
 must not use it to resolve workspace state.
 
+### Background code ingestion
+
+Background code ingestion is opt-in and boundary-triggered only. Claude Stop,
+Codex Stop, and OpenCode `session.idle` may start a same-harness worker when
+`LOAM_INGEST_BACKGROUND=1` or global config enables it; Cursor has no idle
+worker. `LOAM_INGEST_BACKGROUND=0` always disables it. The worker acquires a
+workspace lease before probing, requires full state and
+`code_ingest_pending.evidence.pending_count > 0`, resolves the installed
+ingestion exclusions, and needs a complete actionable fingerprint. Missing or
+unreadable exclusions, uncertain process identity, live workers, and
+stat/read/deadline races fail closed. It never changes source files, commits,
+or pushes. Inspect it with the installed integration's
+`ingest-status --workspace <path> --json` command.
+
 For native operations, invoke the same native command directly:
 
 ```text

@@ -21,6 +21,7 @@ export async function detectHarnesses({ home = homedir() } = {}) {
   const roots = {
     opencode: join(home, '.config', 'opencode'),
     claude: join(home, '.claude'),
+    codex: join(home, '.codex'),
     cursor: join(home, '.cursor'),
   };
   const result = {};
@@ -34,7 +35,7 @@ async function publishAssets(globalRoot, pluginVersion) {
   const versionRoot = join(resolve(globalRoot), 'plugins', `${pluginVersion}-${randomUUID()}`);
   try {
     await mkdir(versionRoot, { recursive: true, mode: 0o700 });
-    const names = ['opencode.mjs', 'claude-session-start.mjs', 'cursor-session-start.mjs'];
+    const names = ['opencode.mjs', 'claude-session-start.mjs', 'claude-stop.mjs', 'codex-stop.mjs', 'ingest-worker.mjs', 'ingest-modules.mjs', 'cursor-session-start.mjs'];
     const assets = {};
     for (const name of names) {
       const source = await readFile(join(adapterRoot, name), 'utf8');
@@ -72,18 +73,18 @@ async function restoreFile(snapshot) {
   else await rm(snapshot.path, { force: true });
 }
 
-function hookEntry(command) {
-  return { type: 'command', command: `node ${JSON.stringify(command)}` };
+function hookEntry(command, { async = false, timeout } = {}) {
+  return { type: 'command', command: 'node', args: [command], async, ...(timeout ? { timeout } : {}) };
 }
 
 export function isOwnedCommand(item, globalRoot, assetName) {
-  if (item?.type !== 'command' || typeof item.command !== 'string' || !item.command.startsWith('node ')) return false;
+  if (Array.isArray(item?.hooks)) return item.hooks.some((hook) => isOwnedCommand(hook, globalRoot, assetName));
+  if (item?.type !== 'command') return false;
   let commandPath;
-  try {
-    commandPath = JSON.parse(item.command.slice(5));
-  } catch {
-    return false;
-  }
+  if (item.command === 'node' && Array.isArray(item.args) && item.args.length === 1) commandPath = item.args[0];
+  else if (typeof item.command === 'string' && item.command.startsWith('node ')) {
+    try { commandPath = JSON.parse(item.command.slice(5)); } catch { commandPath = item.command.slice(5); }
+  } else return false;
   if (typeof commandPath !== 'string') return false;
   const pluginRoot = resolve(globalRoot, 'plugins');
   const candidate = resolve(commandPath);
@@ -91,7 +92,7 @@ export function isOwnedCommand(item, globalRoot, assetName) {
   return relativePath && !relativePath.startsWith('..') && !isAbsolute(relativePath) && basename(candidate) === assetName;
 }
 
-function mergeClaudeHooks(existing, entry, globalRoot) {
+function mergeClaudeHooks(existing, entry, globalRoot, assetName = 'claude-session-start.mjs') {
   const current = Array.isArray(existing) ? existing : [];
   const cleaned = [];
   for (const item of current) {
@@ -99,7 +100,7 @@ function mergeClaudeHooks(existing, entry, globalRoot) {
       cleaned.push(item);
       continue;
     }
-    const hooks = item.hooks.filter((hook) => !isOwnedCommand(hook, globalRoot, 'claude-session-start.mjs'));
+    const hooks = item.hooks.filter((hook) => !isOwnedCommand(hook, globalRoot, assetName));
     if (hooks.length || item.hooks.length === 0) cleaned.push(hooks.length === item.hooks.length ? item : { ...item, hooks });
   }
   return [...cleaned, entry];
@@ -122,6 +123,51 @@ async function installClaude({ home, globalRoot, assetPath }) {
           matcher: 'startup|clear|compact',
           hooks: [hookEntry(assetPath)],
         }, globalRoot),
+        Stop: mergeClaudeHooks(config.hooks?.Stop, {
+          matcher: '',
+          hooks: [hookEntry(join(dirname(assetPath), 'claude-stop.mjs'), { async: true, timeout: 30 })],
+        }, globalRoot, 'claude-stop.mjs'),
+      },
+    }),
+  });
+}
+
+function unsafeCodexPath(path) {
+  // ponytail: this covers double-quoted-context expansion only; emit argv if Codex hooks support it.
+  return /[%!$`\r\n]/u.test(path);
+}
+
+function codexHandler(assetPath) {
+  const windowsPath = assetPath.replaceAll('/', '\\');
+  return {
+    type: 'command',
+    command: 'node ' + JSON.stringify(assetPath),
+    commandWindows: 'node ' + JSON.stringify(windowsPath),
+    timeout: 5,
+  };
+}
+
+function mergeCodexHooks(existing, handler, globalRoot) {
+  if (existing !== undefined && !Array.isArray(existing)) throw new Error('Codex Stop hooks policy-owned; install manually');
+  const groups = Array.isArray(existing) ? existing : [];
+  const cleaned = groups.map((group) => {
+    if (!group || typeof group !== 'object' || !Array.isArray(group.hooks)) return isOwnedCommand(group, globalRoot, 'codex-stop.mjs') ? null : group;
+    const hooks = group.hooks.filter((item) => !isOwnedCommand(item, globalRoot, 'codex-stop.mjs'));
+    return hooks.length === group.hooks.length ? group : { ...group, hooks };
+  }).filter(Boolean);
+  return [...cleaned, { hooks: [handler] }];
+}
+
+async function installCodex({ home, globalRoot, assetPath }) {
+  const filePath = join(home, '.codex', 'hooks.json');
+  if (unsafeCodexPath(assetPath)) throw new Error('Codex adapter path is unsafe; install the fixed hook manually');
+  return mergeJsonConfig({
+    filePath,
+    update: (config) => ({
+      ...config,
+      hooks: {
+        ...(config.hooks || {}),
+        Stop: mergeCodexHooks(config.hooks?.Stop, codexHandler(assetPath), globalRoot),
       },
     }),
   });
@@ -153,7 +199,7 @@ export async function installHarnesses({
     .filter(([, harness]) => harness.state !== 'absent')
     .map(([id]) => id === 'opencode'
       ? join(home, '.config', 'opencode', 'plugins', 'loam.mjs')
-      : join(home, id === 'claude' ? '.claude' : '.cursor', id === 'claude' ? 'settings.json' : 'hooks.json'));
+      : join(home, id === 'claude' ? '.claude' : id === 'codex' ? '.codex' : '.cursor', id === 'claude' ? 'settings.json' : 'hooks.json'));
   const snapshots = await Promise.all(affectedFiles.map(snapshotFile));
   const directories = await Promise.all([...new Set(affectedFiles.map(dirname))].map(snapshotDirectory));
   let assets;
@@ -174,7 +220,7 @@ export async function installHarnesses({
 
   assets = await publishAssets(globalRoot, pluginVersion);
   const result = {};
-  for (const id of ['opencode', 'claude', 'cursor']) {
+  for (const id of ['opencode', 'claude', 'codex', 'cursor']) {
     const harness = detected[id] || { id, state: 'absent' };
     if (harness.state === 'absent') {
       result[id] = { ...harness, state: 'absent' };
@@ -190,6 +236,10 @@ export async function installHarnesses({
         const config = await installClaude({ home, globalRoot, assetPath: assets.assets['claude-session-start'] });
         if (config.backupPath) backupPaths.push(config.backupPath);
         result[id] = { ...harness, state: 'ready', path: assets.assets['claude-session-start'], backupPath: config.backupPath };
+      } else if (id === 'codex') {
+        const config = await installCodex({ home, globalRoot, assetPath: assets.assets['codex-stop'] });
+        if (config.backupPath) backupPaths.push(config.backupPath);
+        result[id] = { ...harness, state: 'ready', path: assets.assets['codex-stop'], backupPath: config.backupPath };
       } else {
         const config = await installCursor({ home, globalRoot, assetPath: assets.assets['cursor-session-start'] });
         if (config.backupPath) backupPaths.push(config.backupPath);

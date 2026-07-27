@@ -4,6 +4,8 @@ import { dirname, join, resolve } from 'node:path';
 
 import { writeAtomicFile } from './atomic.mjs';
 import { isOwnedCommand } from './harnesses.mjs';
+import { classifyChild } from '../integration/ingest-process.mjs';
+import { inspectIntent } from '../integration/ingest.mjs';
 
 // ponytail: uninstall reverses setup. No Skills CLI touch — global skills
 // remain under ~/.agents/skills/ for `npx skills remove` or a future setup rerun.
@@ -28,17 +30,41 @@ function stripLoamHooks(hooks, globalRoot, assetName) {
 }
 
 function cleanClaudeConfig(config, globalRoot) {
-  if (!config?.hooks?.SessionStart) return config;
-  const cleaned = Array.isArray(config.hooks.SessionStart)
-    ? config.hooks.SessionStart
+  if (!config?.hooks) return config;
+  const cleanEntries = (entries, assetName) => Array.isArray(entries)
+    ? entries
         .map((entry) => {
           if (!entry || typeof entry !== 'object' || !Array.isArray(entry.hooks)) return entry;
-          const hooks = stripLoamHooks(entry.hooks, globalRoot, 'claude-session-start.mjs');
+          const hooks = stripLoamHooks(entry.hooks, globalRoot, assetName);
           return hooks.length === entry.hooks.length ? entry : { ...entry, hooks };
         })
         .filter((entry) => entry?.hooks?.length !== 0 || !Array.isArray(entry?.hooks))
-    : config.hooks.SessionStart;
-  return { ...config, hooks: { ...config.hooks, SessionStart: cleaned } };
+    : entries;
+  return {
+    ...config,
+    hooks: {
+      ...config.hooks,
+      SessionStart: cleanEntries(config.hooks.SessionStart, 'claude-session-start.mjs'),
+      Stop: cleanEntries(config.hooks.Stop, 'claude-stop.mjs'),
+    },
+  };
+}
+
+function cleanCodexConfig(config, globalRoot) {
+  if (!config?.hooks?.Stop || !Array.isArray(config.hooks.Stop)) return config;
+  return {
+    ...config,
+    hooks: {
+      ...config.hooks,
+      Stop: config.hooks.Stop
+        .map((entry) => {
+          if (!Array.isArray(entry?.hooks)) return isOwnedCommand(entry, globalRoot, 'codex-stop.mjs') ? null : entry;
+          const hooks = stripLoamHooks(entry.hooks, globalRoot, 'codex-stop.mjs');
+          return hooks.length === entry.hooks.length ? entry : { ...entry, hooks };
+        })
+        .filter((entry) => entry && (!Array.isArray(entry?.hooks) || entry.hooks.length > 0)),
+    },
+  };
 }
 
 function cleanCursorConfig(config, globalRoot) {
@@ -96,6 +122,36 @@ async function removeBackups(dir) {
   return removed;
 }
 
+async function blockingWorkers(root) {
+  const blocked = [];
+  const runRoot = join(root, 'run');
+  for (const entry of await readdir(runRoot, { withFileTypes: true }).catch(() => [])) {
+    if (!entry.isDirectory()) continue;
+    const leasePath = join(runRoot, entry.name, 'lease.json');
+    const readRecord = async (path) => {
+      try { return { present: true, value: JSON.parse(await readFile(path, 'utf8')) }; }
+      catch (error) { return error?.code === 'ENOENT' ? { present: false } : { present: true, malformed: true }; }
+    };
+    const leaseRecord = await readRecord(leasePath);
+    if (leaseRecord.malformed || (leaseRecord.present && (leaseRecord.value?.schema !== 1
+      || !Number.isInteger(leaseRecord.value.owner_pid) || !leaseRecord.value.boot_id))) {
+      blocked.push({ path: leasePath, state: 'unknown' });
+      continue;
+    }
+    const lease = leaseRecord.value;
+    if (leaseRecord.present) {
+      const state = await classifyChild({ pid: lease.owner_pid, boot_id: lease.boot_id, process_start: lease.process_start });
+      if (state === 'live' || state === 'unknown') {
+        blocked.push({ path: leasePath, state });
+        continue;
+      }
+      const child = await inspectIntent(leasePath, lease.workspace || '', undefined);
+      if (child.state === 'live' || child.state === 'unknown') blocked.push({ path: leasePath, state: child.state });
+    }
+  }
+  return blocked;
+}
+
 export async function uninstall({
   home = homedir(),
   globalRoot,
@@ -126,12 +182,22 @@ export async function uninstall({
     return 130;
   }
 
+  const workers = await blockingWorkers(root);
+  if (workers.length) {
+    output.write(`Uninstall blocked by ${workers.length} active or uncertain background worker lease(s).\n`);
+    return 1;
+  }
+
   const results = { configs: [], opencode: null, globalRoot: null, backups: [] };
 
   // Clean harness configs in-place
   if (install.configured_harnesses?.includes('claude')) {
     results.configs.push(await cleanHarnessConfig(join(home, '.claude', 'settings.json'), root, cleanClaudeConfig));
     results.backups.push(...(await removeBackups(join(home, '.claude'))));
+  }
+  if (install.configured_harnesses?.includes('codex')) {
+    results.configs.push(await cleanHarnessConfig(join(home, '.codex', 'hooks.json'), root, cleanCodexConfig));
+    results.backups.push(...(await removeBackups(join(home, '.codex'))));
   }
   if (install.configured_harnesses?.includes('cursor')) {
     results.configs.push(await cleanHarnessConfig(join(home, '.cursor', 'hooks.json'), root, cleanCursorConfig));
