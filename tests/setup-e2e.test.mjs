@@ -11,6 +11,7 @@ import { test } from 'node:test';
 import { loadSkillInventory } from '../setup/inventory.mjs';
 import { runSetup } from '../setup/main.mjs';
 import { parseArgs } from '../setup/args.mjs';
+import { PACKAGE_VERSION } from '../setup/constants.mjs';
 import { discover } from '../setup/discovery.mjs';
 import { verifyInstallation } from '../setup/verify.mjs';
 import { detectTarget, runtimePath } from '../setup/target.mjs';
@@ -111,6 +112,28 @@ test('complete ready rerun is local-only and does not call Skills CLI or downloa
 
   assert.equal(code, 0, capture.text());
   assert.match(capture.text(), /already ready|Loam is ready/);
+});
+
+test('setup reconciles an install from an older plugin version', async () => {
+  const fixture = await baseFixture();
+  await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  const metadataPath = join(fixture.home, '.agents', 'loam', 'install.json');
+  const previous = JSON.parse(await readFile(metadataPath, 'utf8'));
+  await writeFile(metadataPath, JSON.stringify({ ...previous, plugin_version: '0.0.0' }));
+
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['setup', '--yes']), {
+    ...fixture,
+    packageRoot,
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+
+  assert.equal(code, 0, capture.text());
+  assert.doesNotMatch(capture.text(), /already ready/);
+  const current = JSON.parse(await readFile(metadataPath, 'utf8'));
+  assert.equal(current.plugin_version, PACKAGE_VERSION);
+  assert.notEqual(current.integration_path, previous.integration_path);
 });
 
 test('dry-run is valid and byte-stable without creating roots, backups, or invoking mutators', async () => {
