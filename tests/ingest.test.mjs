@@ -36,7 +36,7 @@ test('fingerprints the complete UTF-8 actionable set and includes exclusions ide
   assert.equal(first.complete, true);
   assert.equal(first.count, 2);
   assert.equal(first.fingerprint, reversed.fingerprint);
-  assert.ok(first.serialized.length > 4);
+  assert.equal(first.fingerprint.length, 64);
 
   await writeFile(exclusions, '# changed exclusions\n');
   const changedExclusions = await fingerprintActionable({ workspace, entries, exclusionsPath: exclusions });
@@ -47,7 +47,7 @@ test('fingerprints the complete UTF-8 actionable set and includes exclusions ide
   );
   const empty = await fingerprintActionable({ workspace, entries: [], exclusionsPath: exclusions });
   assert.equal(empty.complete, true);
-  assert.equal(empty.serialized.at(-1), 0x00);
+  assert.equal(empty.count, 0);
 });
 
 test('fingerprint validation rejects controls/traversal and normalizes Windows separators deterministically', async () => {
