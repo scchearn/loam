@@ -11,10 +11,7 @@
   "plugins": [
     {
       "name": "loam",
-      "source": {
-        "source": "url",
-        "url": "https://github.com/scchearn/loam.git"
-      },
+      "source": "./plugins/loam-adapter",
       "description": "Workflow skills for AI coding agents: goals, planning, specs, memory, checkpoints, and agent debates",
       "version": "0.9.0",
       "strict": true

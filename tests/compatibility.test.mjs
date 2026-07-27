@@ -13,11 +13,13 @@ const execFileAsync = promisify(execFile);
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 const loaderPath = join(packageRoot, '.opencode', 'plugins', 'loam.js');
 const hookPath = join(packageRoot, 'hooks', 'session-start.mjs');
+const marketplaceRoot = join(packageRoot, 'plugins', 'loam-adapter');
+const marketplaceHookPath = join(marketplaceRoot, 'hooks', 'session-start.mjs');
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
-async function runHook(env, payload = {}) {
+async function runHook(env, payload = {}, path = hookPath) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [hookPath], {
+    const child = spawn(process.execPath, [path], {
       cwd: packageRoot,
       env: { ...process.env, ...env },
     });
@@ -113,6 +115,65 @@ test('packaged session hook emits valid Claude, Cursor, and default envelopes', 
     const context = field === 'hookSpecificOutput' ? parsed[field].additionalContext : parsed[field];
     assert.match(context, /<LOAM_IMPORTANT>/);
     assert.match(context, /npx @scchearn\/loam setup/);
+  }
+});
+
+test('thin marketplace adapter contains no skills and emits Claude and Codex envelopes', async () => {
+  const claude = JSON.parse(await readFile(join(marketplaceRoot, '.claude-plugin', 'plugin.json'), 'utf8'));
+  const codex = JSON.parse(await readFile(join(marketplaceRoot, '.codex-plugin', 'plugin.json'), 'utf8'));
+  const adapter = await import(pathToFileURL(join(marketplaceRoot, 'adapter.mjs')).href);
+
+  assert.equal('skills' in claude, false);
+  assert.equal('skills' in codex, false);
+  assert.equal('hooks' in claude, false);
+  assert.equal('hooks' in codex, false);
+
+  const calls = [];
+  const codexAdapter = adapter.createMarketplaceAdapter({
+    harness: 'codex',
+    getContext: async (input) => {
+      calls.push(input);
+      return 'codex context';
+    },
+  });
+  assert.deepEqual(await codexAdapter({ cwd: '/workspace' }), {
+    hookSpecificOutput: {
+      hookEventName: 'SessionStart',
+      additionalContext: 'codex context',
+    },
+  });
+  assert.equal(calls[0].harness, 'codex');
+
+  for (const env of [
+    { CLAUDE_PLUGIN_ROOT: marketplaceRoot },
+    { PLUGIN_ROOT: marketplaceRoot, CLAUDE_PLUGIN_ROOT: marketplaceRoot },
+  ]) {
+    const result = await runHook(env, { cwd: join(packageRoot, 'workspace') }, marketplaceHookPath);
+    assert.equal(result.code, 0, result.stderr);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.hookSpecificOutput.hookEventName, 'SessionStart');
+    assert.match(parsed.hookSpecificOutput.additionalContext, /<LOAM_IMPORTANT>/);
+    assert.match(parsed.hookSpecificOutput.additionalContext, /npx @scchearn\/loam setup/);
+  }
+});
+
+test('Codex marketplace adapter falls back to the legacy Claude integration harness', async () => {
+  const fixture = await mkdtemp(join(tmpdir(), 'loam-codex-legacy-integration-'));
+  const integrationPath = join(fixture, 'loam.mjs');
+  await writeFile(integrationPath, `
+export async function runIntegration(argv, { output }) {
+  const harness = argv[argv.indexOf('--harness') + 1];
+  if (harness === 'codex') throw new Error('unsupported harness: codex');
+  output.write('<LOAM_IMPORTANT>legacy integration</LOAM_IMPORTANT>');
+  return 0;
+}
+`);
+  try {
+    const adapter = await import(`${pathToFileURL(join(marketplaceRoot, 'adapter.mjs')).href}?legacy=${Date.now()}`);
+    const output = await adapter.createMarketplaceAdapter({ harness: 'codex', integrationPath })({ cwd: '/workspace' });
+    assert.equal(output.hookSpecificOutput.additionalContext, '<LOAM_IMPORTANT>legacy integration</LOAM_IMPORTANT>');
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
   }
 });
 

@@ -132,3 +132,23 @@ process.exit(1);
     await rm(fakeBin, { recursive: true, force: true });
   }
 });
+
+test('packed Claude and Codex marketplaces point to one skill-free adapter', async () => {
+  const fixture = await packedRoot();
+  try {
+    const claudeMarketplace = JSON.parse(await readFile(join(fixture.root, '.claude-plugin', 'marketplace.json'), 'utf8'));
+    const codexMarketplace = JSON.parse(await readFile(join(fixture.root, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
+    const adapterRoot = join(fixture.root, 'plugins', 'loam-adapter');
+    const claudePlugin = JSON.parse(await readFile(join(adapterRoot, '.claude-plugin', 'plugin.json'), 'utf8'));
+    const codexPlugin = JSON.parse(await readFile(join(adapterRoot, '.codex-plugin', 'plugin.json'), 'utf8'));
+
+    assert.equal(claudeMarketplace.plugins[0].source, './plugins/loam-adapter');
+    assert.equal(codexMarketplace.plugins[0].source, './plugins/loam-adapter');
+    assert.equal('skills' in claudePlugin, false);
+    assert.equal('skills' in codexPlugin, false);
+    await assert.rejects(() => readdir(join(adapterRoot, 'skills')));
+    await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'session-start.mjs'), 'utf8'));
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});

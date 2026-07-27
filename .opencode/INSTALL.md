@@ -13,7 +13,7 @@ Run the global setup wizard from any workspace:
 npx @scchearn/loam setup
 ```
 
-Setup installs the canonical global skills through Skills CLI, verifies the
+Setup installs the canonical universal skills through Skills CLI, verifies the
 exact native runtime, and configures the user-level OpenCode adapter. It does
 not require a repository clone, write project configuration, or modify `PATH`.
 Use `--yes` for automation and `--dry-run` to preview without mutation or

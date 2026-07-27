@@ -27,7 +27,8 @@ trap 'rm -rf "$tmp"' EXIT
 make_fixture() {
   local fixture="$1"
   rm -rf "$fixture"
-  mkdir -p "$fixture/bin" "$fixture/.claude-plugin" "$fixture/.codex-plugin" \
+  mkdir -p "$fixture/bin" "$fixture/.claude-plugin" \
+    "$fixture/plugins/loam-adapter/.codex-plugin" \
     "$fixture/.cursor-plugin" "$fixture/cli" "$fixture/skills/loam-using/scripts"
   cp "$BUMP" "$fixture/bin/bump-release.sh"
   chmod +x "$fixture/bin/bump-release.sh"
@@ -37,7 +38,7 @@ make_fixture() {
   printf '{\n  "name": "loam",\n  "metadata": {\n    "version": "%s"\n  },\n  "plugins": [\n    {\n      "name": "loam",\n      "version": "%s"\n    }\n  ]\n}\n' \
     "$PLUGIN_VERSION" "$PLUGIN_VERSION" > "$fixture/.claude-plugin/marketplace.json"
   printf '{\n  "name": "loam",\n  "version": "%s"\n}\n' "$PLUGIN_VERSION" \
-    > "$fixture/.codex-plugin/plugin.json"
+    > "$fixture/plugins/loam-adapter/.codex-plugin/plugin.json"
   printf '{\n  "name": "loam",\n  "version": "%s"\n}\n' "$PLUGIN_VERSION" \
     > "$fixture/.cursor-plugin/plugin.json"
   printf '[package]\nname = "loam"\nversion = "%s"\nedition = "2021"\n\n[dependencies]\nchrono = { version = "0.4", default-features = false }\n' \
@@ -73,7 +74,7 @@ else
 fi
 count_in "$fixture/package.json"                    '"version": "0.9.1"' 1 "package.json"
 count_in "$fixture/.claude-plugin/marketplace.json" '"version": "0.9.1"' 2 "both marketplace fields"
-count_in "$fixture/.codex-plugin/plugin.json"       '"version": "0.9.1"' 1 "codex manifest"
+count_in "$fixture/plugins/loam-adapter/.codex-plugin/plugin.json" '"version": "0.9.1"' 1 "codex manifest"
 count_in "$fixture/.cursor-plugin/plugin.json"      '"version": "0.9.1"' 1 "cursor manifest"
 # The runtime lane must be untouched — this is the whole point of the split.
 count_in "$fixture/cli/Cargo.toml" "version = \"$RUNTIME_VERSION\"" 1 "cargo version untouched by plugin bump"
@@ -168,7 +169,7 @@ fi
 # --- 8. pre-existing drift in the target lane is refused ---------------------
 fixture="$tmp/drift"
 make_fixture "$fixture"
-printf '{\n  "name": "loam",\n  "version": "0.1.0"\n}\n' > "$fixture/.codex-plugin/plugin.json"
+printf '{\n  "name": "loam",\n  "version": "0.1.0"\n}\n' > "$fixture/plugins/loam-adapter/.codex-plugin/plugin.json"
 git -C "$fixture" add -A && git -C "$fixture" commit -qm "drift"
 before="$(fingerprint "$fixture")"
 if run_bump "$fixture" --plugin 0.9.1 > /dev/null 2>&1; then

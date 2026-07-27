@@ -1,0 +1,8 @@
+{
+  "name": "loam",
+  "description": "Auto-updating session adapter for canonical global Loam skills.",
+  "author": {
+    "name": "scchearn",
+    "url": "https://github.com/scchearn"
+  }
+}

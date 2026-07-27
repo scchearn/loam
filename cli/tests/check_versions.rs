@@ -46,7 +46,7 @@ fn agreeing_root(label: &str) -> PathBuf {
         &format!("{{\n  \"name\": \"loam\",\n  \"metadata\": {{\n    \"description\": \"d\",\n    \"version\": \"{PLUGIN}\"\n  }},\n  \"plugins\": [\n    {{\n      \"name\": \"loam\",\n      \"version\": \"{PLUGIN}\"\n    }}\n  ]\n}}\n"),
     );
     write(
-        &root.join(".codex-plugin/plugin.json"),
+        &root.join("plugins/loam-adapter/.codex-plugin/plugin.json"),
         &format!("{{\n  \"name\": \"loam\",\n  \"version\": \"{PLUGIN}\"\n}}\n"),
     );
     write(
@@ -157,8 +157,8 @@ fn any_drifted_plugin_value_fails_and_names_itself() {
         ),
         (
             "codex",
-            ".codex-plugin/plugin.json",
-            ".codex-plugin/plugin.json version",
+            "plugins/loam-adapter/.codex-plugin/plugin.json",
+            "plugins/loam-adapter/.codex-plugin/plugin.json version",
         ),
         (
             "cursor",
@@ -237,7 +237,7 @@ fn a_selector_scopes_the_failure() {
 fn every_drifted_value_is_reported_not_just_the_first() {
     let root = agreeing_root("all-drift");
     write(
-        &root.join(".codex-plugin/plugin.json"),
+        &root.join("plugins/loam-adapter/.codex-plugin/plugin.json"),
         "{\n  \"name\": \"loam\",\n  \"version\": \"0.1.0\"\n}\n",
     );
     write(
@@ -249,7 +249,7 @@ fn every_drifted_value_is_reported_not_just_the_first() {
 
     assert_eq!(code, 1);
     assert!(
-        stderr.contains(".codex-plugin/plugin.json"),
+        stderr.contains("plugins/loam-adapter/.codex-plugin/plugin.json"),
         "stderr: {stderr}"
     );
     assert!(
@@ -261,13 +261,14 @@ fn every_drifted_value_is_reported_not_just_the_first() {
 #[test]
 fn a_missing_file_is_a_hard_failure() {
     let root = agreeing_root("missing");
-    fs::remove_file(root.join(".codex-plugin/plugin.json")).expect("fixture should be removable");
+    fs::remove_file(root.join("plugins/loam-adapter/.codex-plugin/plugin.json"))
+        .expect("fixture should be removable");
 
     let (code, _, stderr) = check(&root, &[]);
 
     assert_eq!(code, 1);
     assert!(
-        stderr.contains(".codex-plugin/plugin.json"),
+        stderr.contains("plugins/loam-adapter/.codex-plugin/plugin.json"),
         "stderr: {stderr}"
     );
 }

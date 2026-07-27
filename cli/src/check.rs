@@ -5,7 +5,7 @@
 //! across them:
 //!
 //! - **plugin** (`package.json`, both `.claude-plugin/marketplace.json` fields,
-//!   `.codex-plugin/plugin.json`, `.cursor-plugin/plugin.json`) — what the
+//!   `plugins/loam-adapter/.codex-plugin/plugin.json`, `.cursor-plugin/plugin.json`) — what the
 //!   harnesses display and resolve. Released as a `v<version>` tag.
 //! - **runtime** (`cli/Cargo.toml`, `skills/loam-using/scripts/CLI_VERSION`) —
 //!   what the launcher downloads. Released as a `cli-v<version>` tag, and only
@@ -125,8 +125,17 @@ fn check_domain(root: &Path, domain: Domain) -> bool {
                     )
                 }),
                 read_marketplace_plugin(root),
-                read_json_field(root, ".codex-plugin/plugin.json", &["version"])
-                    .map(|value| (".codex-plugin/plugin.json version".to_owned(), value)),
+                read_json_field(
+                    root,
+                    "plugins/loam-adapter/.codex-plugin/plugin.json",
+                    &["version"],
+                )
+                .map(|value| {
+                    (
+                        "plugins/loam-adapter/.codex-plugin/plugin.json version".to_owned(),
+                        value,
+                    )
+                }),
                 read_json_field(root, ".cursor-plugin/plugin.json", &["version"])
                     .map(|value| (".cursor-plugin/plugin.json version".to_owned(), value)),
             ],

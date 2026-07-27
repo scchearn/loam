@@ -139,6 +139,40 @@ test('setup reconciles an install from an older plugin version', async () => {
   assert.notEqual(current.integration_path, previous.integration_path);
 });
 
+test('marketplace-owned Claude and Codex satisfy final readiness without setup hooks', async () => {
+  const fixture = await baseFixture();
+  await mkdir(join(fixture.home, '.claude'), { recursive: true });
+  await mkdir(join(fixture.home, '.codex'), { recursive: true });
+  await writeFile(join(fixture.home, '.claude', 'settings.json'), JSON.stringify({
+    enabledPlugins: { 'loam@loam': true },
+  }));
+  await writeFile(join(fixture.home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
+  const claudeCache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
+  await mkdir(claudeCache, { recursive: true });
+  await writeFile(join(fixture.home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'user', installPath: claudeCache, version: '0.8.6' }] },
+  }));
+  await mkdir(join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', '0.8.6'), { recursive: true });
+  const capture = outputCapture();
+
+  const code = await runSetup(parseArgs(['setup', '--yes']), {
+    ...fixture,
+    packageRoot,
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+
+  assert.equal(code, 0, capture.text());
+  const metadata = JSON.parse(await readFile(join(fixture.home, '.agents', 'loam', 'install.json'), 'utf8'));
+  assert.ok(metadata.configured_harnesses.includes('claude'));
+  assert.ok(metadata.configured_harnesses.includes('codex'));
+  const claude = JSON.parse(await readFile(join(fixture.home, '.claude', 'settings.json'), 'utf8'));
+  const codex = JSON.parse(await readFile(join(fixture.home, '.codex', 'hooks.json'), 'utf8'));
+  assert.deepEqual(claude.hooks.SessionStart, []);
+  assert.deepEqual(codex.hooks.SessionStart, []);
+});
+
 test('dry-run is valid and byte-stable without creating roots, backups, or invoking mutators', async () => {
   const fixture = await baseFixture();
   const capture = outputCapture();

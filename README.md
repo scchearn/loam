@@ -20,6 +20,23 @@ not per project), and wires up whatever coding agents it finds. OpenCode,
 Claude Code, and Cursor are configured automatically, and Codex can discover the
 skills too. Nothing is added to your `PATH` and nothing is installed per-project.
 
+Claude Code and Codex users may also install `loam@loam` from this repository's
+marketplace. The marketplace plugin is a thin, auto-updating session adapter;
+the canonical skills still come from the global Skills CLI installation above.
+When setup detects an enabled marketplace plugin it removes its own fallback
+hook for that harness, so only one Loam context envelope is injected.
+
+Marketplace updates do not replace the explicit global boundaries:
+
+```bash
+npx skills update --global
+npx @scchearn/loam setup
+```
+
+The first command updates the universal skill content. The second reconciles
+the private native runtime and non-marketplace fallback adapters. Session
+startup remains read-only and never downloads updates.
+
 To remove everything loam installed:
 
 ```bash

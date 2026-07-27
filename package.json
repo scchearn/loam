@@ -19,10 +19,11 @@
     "integration",
     "adapters",
     "hooks",
+    "plugins",
     "skills",
+    ".agents",
     ".opencode",
     ".claude-plugin",
-    ".codex-plugin",
     ".cursor-plugin"
   ],
   "scripts": {
