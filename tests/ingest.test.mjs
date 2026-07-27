@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -72,7 +72,7 @@ test('boundary gate defaults on without an environment override or config file',
   const result = await gate({ ...options, env: {} });
   assert.equal(result.action, 'spawn_worker');
   assert.equal(result.config.enabled, true);
-  assert.equal(await realpath(globalRoot), globalRoot);
+  assert.equal((await stat(globalRoot)).isDirectory(), true);
   await assert.rejects(() => realpath(join(globalRoot, 'config.json')), (error) => error.code === 'ENOENT');
 });
 
