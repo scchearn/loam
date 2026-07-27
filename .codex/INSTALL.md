@@ -10,8 +10,22 @@ npx @scchearn/loam setup
 
 Setup installs global skills through Skills CLI and verifies the private native
 runtime. Codex can discover the global skills under `~/.agents/skills/`. Setup
-also installs a user-scope Stop hook for background ingestion, enabled by
-default; it does not write repository hooks or Codex TOML.
+also installs user-scope SessionStart and Stop hooks; it does not write
+repository hooks or Codex TOML.
+
+For an auto-updating SessionStart adapter, install the thin marketplace plugin:
+
+```bash
+codex plugin marketplace add scchearn/loam
+codex plugin add loam@loam
+npx @scchearn/loam setup
+```
+
+Codex refreshes configured Git marketplaces on startup. Setup detects the
+installed and enabled plugin, removes only its direct SessionStart fallback,
+and retains the Stop hook used by background ingestion. The marketplace plugin
+contains no skills; canonical skill content remains under
+`~/.agents/skills/`.
 
 Use `--yes` for automation or `--dry-run` to preview without mutation or
 download. The runtime remains outside `PATH`.
@@ -30,9 +44,9 @@ project-local Loam runtime or skill copy.
 
 ## Session use
 
-Invoke `loam::using` at session start or whenever a Loam task appears;
-runtime-dependent skills use the injected absolute native runtime command and
-stop with setup guidance when it is unavailable.
+The marketplace or setup fallback injects `loam::using`, the absolute native
+runtime command, and current workspace state at SessionStart. If the runtime is
+unavailable, it remains network-free and reports `npx @scchearn/loam setup`.
 
 ## Background ingestion
 

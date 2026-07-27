@@ -175,7 +175,7 @@ test('harness detection and installation use only user HOME paths and are idempo
   assert.equal(cursorHooks.hooks.sessionStart.filter((hook) => JSON.stringify(hook).includes('loam')).length, 1);
 });
 
-test('marketplace-owned Claude and Codex remove setup hooks while fallback Codex installs one', async () => {
+test('marketplace ownership removes setup SessionStart hooks but keeps background Stop hooks', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-owned-'));
   const globalRoot = join(home, '.agents', 'loam');
   const oldRoot = join(globalRoot, 'plugins', 'old');
@@ -210,6 +210,10 @@ test('marketplace-owned Claude and Codex remove setup hooks while fallback Codex
   assert.equal(owned.codex.owner, 'marketplace');
   assert.deepEqual(claude.hooks.SessionStart[0].hooks, [unrelated]);
   assert.deepEqual(codex.hooks.SessionStart[0].hooks, [unrelated]);
+  const claudeStop = claude.hooks.Stop.flatMap((entry) => entry.hooks || []);
+  const codexStop = codex.hooks.Stop.flatMap((entry) => entry.hooks || []);
+  assert.equal(claudeStop.filter((entry) => entry.command === 'node' && entry.args?.[0] === owned.claude.stopPath).length, 1);
+  assert.equal(codexStop.filter((entry) => entry.command === `node ${JSON.stringify(owned.codex.stopPath)}`).length, 1);
 
   const fallbackHome = await mkdtemp(join(tmpdir(), 'loam-codex-fallback-'));
   await mkdir(join(fallbackHome, '.codex'), { recursive: true });
@@ -223,7 +227,9 @@ test('marketplace-owned Claude and Codex remove setup hooks while fallback Codex
   const hooks = JSON.parse(await readFile(join(fallbackHome, '.codex', 'hooks.json'), 'utf8'));
   const commands = hooks.hooks.SessionStart.flatMap((entry) => entry.hooks || []);
   assert.equal(fallback.codex.owner, 'setup');
-  assert.equal(commands.filter((entry) => entry.command === `node ${JSON.stringify(fallback.codex.path)}`).length, 1);
+  assert.equal(commands.filter((entry) => entry.command === `node ${JSON.stringify(fallback.codex.sessionPath)}`).length, 1);
+  assert.equal(hooks.hooks.Stop.flatMap((entry) => entry.hooks || [])
+    .filter((entry) => entry.command === `node ${JSON.stringify(fallback.codex.stopPath)}`).length, 1);
 });
 
 test('enabled marketplace settings without installed plugin bytes keep setup ownership', async () => {

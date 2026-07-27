@@ -13,6 +13,7 @@ async function readyFixture() {
   const globalRoot = join(home, '.agents', 'loam');
   await mkdir(join(home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(home, '.claude'), { recursive: true });
+  await mkdir(join(home, '.codex'), { recursive: true });
   await mkdir(join(home, '.cursor'), { recursive: true });
   await mkdir(join(home, '.agents', 'skills', 'loam-using'), { recursive: true });
   await writeFile(join(home, '.agents', 'skills', 'loam-using', 'SKILL.md'), '# using\n');
@@ -29,7 +30,7 @@ async function readyFixture() {
     integration_path: join(globalRoot, 'integration', 'loam.mjs'),
     skills_scope: 'global',
     skills_source: 'scchearn/loam',
-    configured_harnesses: ['opencode', 'claude', 'cursor'],
+    configured_harnesses: ['opencode', 'claude', 'codex', 'cursor'],
   };
   await mkdir(join(globalRoot, 'integration'), { recursive: true });
   await writeFile(install.integration_path, 'export async function runIntegration() { return 0; }\n');
@@ -51,14 +52,21 @@ async function exists(path) {
 test('uninstall removes the global root, adapter, and Loam-owned hooks; preserves unrelated config and skills', async () => {
   const { home, globalRoot, install, installed } = await readyFixture();
   const unrelatedClaude = { type: 'command', command: 'node "/usr/local/bin/other-hook.mjs"' };
+  const unrelatedCodexSession = { type: 'command', command: 'node "/usr/local/bin/other-codex-session.mjs"' };
+  const unrelatedCodexStop = { type: 'command', command: 'node "/usr/local/bin/other-codex-stop.mjs"' };
   const unrelatedCursor = { type: 'command', command: 'node "/opt/other-tools/cursor-hook.mjs"' };
   const claudePath = join(home, '.claude', 'settings.json');
+  const codexPath = join(home, '.codex', 'hooks.json');
   const cursorPath = join(home, '.cursor', 'hooks.json');
   const claude = JSON.parse(await readFile(claudePath, 'utf8'));
+  const codex = JSON.parse(await readFile(codexPath, 'utf8'));
   const cursor = JSON.parse(await readFile(cursorPath, 'utf8'));
   claude.hooks.SessionStart[0].hooks.unshift(unrelatedClaude);
+  codex.hooks.SessionStart[0].hooks.unshift(unrelatedCodexSession);
+  codex.hooks.Stop[0].hooks.unshift(unrelatedCodexStop);
   cursor.hooks.sessionStart.unshift(unrelatedCursor);
   await writeFile(claudePath, JSON.stringify(claude));
+  await writeFile(codexPath, JSON.stringify(codex));
   await writeFile(cursorPath, JSON.stringify(cursor));
 
   const code = await uninstall({ home, globalRoot, yes: true, output: { write: () => {} } });
@@ -69,13 +77,20 @@ test('uninstall removes the global root, adapter, and Loam-owned hooks; preserve
   assert.equal(await exists(join(home, '.agents', 'skills', 'loam-using', 'SKILL.md')), true, 'global skills preserved');
 
   const claudeAfter = JSON.parse(await readFile(claudePath, 'utf8'));
+  const codexAfter = JSON.parse(await readFile(codexPath, 'utf8'));
   const cursorAfter = JSON.parse(await readFile(cursorPath, 'utf8'));
   const claudeHooks = claudeAfter.hooks.SessionStart.flatMap((e) => e.hooks || []);
+  const codexSessionHooks = codexAfter.hooks.SessionStart.flatMap((e) => e.hooks || []);
+  const codexStopHooks = codexAfter.hooks.Stop.flatMap((e) => e.hooks || []);
   const cursorHooks = cursorAfter.hooks.sessionStart;
   assert.deepEqual(claudeHooks[0], unrelatedClaude, 'unrelated claude hook preserved');
+  assert.deepEqual(codexSessionHooks[0], unrelatedCodexSession, 'unrelated codex SessionStart hook preserved');
+  assert.deepEqual(codexStopHooks[0], unrelatedCodexStop, 'unrelated codex Stop hook preserved');
   assert.deepEqual(cursorHooks[0], unrelatedCursor, 'unrelated cursor hook preserved');
-  assert.equal(claudeHooks.filter((h) => h.command === `node ${JSON.stringify(installed.claude.path)}`).length, 0, 'loam claude hook removed');
-  assert.equal(cursorHooks.filter((h) => h.command === `node ${JSON.stringify(installed.cursor.path)}`).length, 0, 'loam cursor hook removed');
+  assert.equal(claudeHooks.filter((h) => h.command === 'node' && h.args?.[0] === installed.claude.path).length, 0, 'loam claude hook removed');
+  assert.equal(codexSessionHooks.filter((h) => h.command === `node ${JSON.stringify(installed.codex.sessionPath)}`).length, 0, 'loam codex SessionStart hook removed');
+  assert.equal(codexStopHooks.filter((h) => h.command === `node ${JSON.stringify(installed.codex.stopPath)}`).length, 0, 'loam codex Stop hook removed');
+  assert.equal(cursorHooks.filter((h) => h.command === 'node' && h.args?.[0] === installed.cursor.path).length, 0, 'loam cursor hook removed');
 });
 
 test('uninstall removes backup files created by setup', async () => {

@@ -57,6 +57,17 @@ async function executeCodexAdapter(assetPath, workspace, integrationPath) {
   });
 }
 
+async function verifyCodexSessionEnvelope(assetPath, workspace) {
+  const module = await import(`${pathToFileURL(assetPath).href}?verify-session=${randomUUID()}`);
+  const context = '<LOAM_IMPORTANT>\nverification context\n</LOAM_IMPORTANT>';
+  const result = await module.handleMarketplaceHook(
+    { cwd: workspace },
+    { harness: 'codex', getContext: async () => context },
+  );
+  return result?.hookSpecificOutput?.hookEventName === 'SessionStart'
+    && result.hookSpecificOutput.additionalContext === context;
+}
+
 async function verifyIngestExclusions(skillsRoot) {
   try { return { ready: true, path: await resolveExclusions(skillsRoot) }; }
   catch (error) { return { ready: false, category: error.reason || 'exclusions_unavailable' }; }
@@ -127,6 +138,7 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
   const assetRoot = install.adapter_root;
   const assetName = id === 'opencode' ? 'opencode.mjs' : `${id}-session-start.mjs`;
   const assetPath = join(assetRoot, id === 'codex' ? 'codex-stop.mjs' : assetName);
+  const sessionAssetPath = join(assetRoot, assetName);
   try {
     if (id === 'opencode') {
       const stablePath = join(harness.root, 'plugins', 'loam.mjs');
@@ -137,9 +149,15 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
       if (actual !== expected) return { ...harness, ready: false, category: 'registration_mismatch' };
     } else if (id === 'codex') {
       const config = JSON.parse(await readFile(join(harness.root, 'hooks.json'), 'utf8'));
-      const commands = Array.isArray(config.hooks?.Stop) ? config.hooks.Stop : [];
-      const owned = commands.filter((entry) => ownsCommand(entry, assetPath));
-      if (owned.length !== 1) return { ...harness, ready: false, category: owned.length ? 'registration_duplicate' : 'registration_missing' };
+      const stopCommands = Array.isArray(config.hooks?.Stop) ? config.hooks.Stop : [];
+      const ownedStop = stopCommands.filter((entry) => ownsCommand(entry, assetPath));
+      if (ownedStop.length !== 1) return { ...harness, ready: false, category: ownedStop.length ? 'registration_duplicate' : 'registration_missing' };
+      const sessionCommands = Array.isArray(config.hooks?.SessionStart) ? config.hooks.SessionStart : [];
+      const ownedSession = sessionCommands.filter((entry) => ownsCommand(entry, sessionAssetPath));
+      const expectedSessionCount = harness.marketplaceOwned ? 0 : 1;
+      if (ownedSession.length !== expectedSessionCount) {
+        return { ...harness, ready: false, category: ownedSession.length ? 'registration_duplicate' : 'registration_missing' };
+      }
     } else {
       const configPath = id === 'claude' ? join(harness.root, 'settings.json') : join(harness.root, 'hooks.json');
       const config = JSON.parse(await readFile(configPath, 'utf8'));
@@ -147,7 +165,8 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
         ? (Array.isArray(config.hooks?.SessionStart) ? config.hooks.SessionStart : []).flatMap((entry) => Array.isArray(entry?.hooks) ? entry.hooks : [])
         : (Array.isArray(config.hooks?.sessionStart) ? config.hooks.sessionStart : []);
       const owned = commands.filter((entry) => ownsCommand(entry, assetPath));
-      if (owned.length !== 1) {
+      const expectedSessionCount = id === 'claude' && harness.marketplaceOwned ? 0 : 1;
+      if (owned.length !== expectedSessionCount) {
         return {
           ...harness,
           ready: false,
@@ -167,7 +186,10 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
     if (!(await fileExists(assetPath)) || !(await verifyAdapterEnvelope(id, assetPath, workspace, install.integration_path, globalRoot))) {
       return { ...harness, ready: false, category: 'adapter_envelope_invalid' };
     }
-    return { ...harness, ready: true };
+    if (id === 'codex' && (!(await fileExists(sessionAssetPath)) || !(await verifyCodexSessionEnvelope(sessionAssetPath, workspace)))) {
+      return { ...harness, ready: false, category: 'adapter_envelope_invalid' };
+    }
+    return { ...harness, ready: true, owner: harness.marketplaceOwned ? 'marketplace' : 'setup' };
   } catch (error) {
     return { ...harness, ready: false, category: 'adapter_envelope_invalid', detail: error instanceof Error ? error.message : String(error) };
   }

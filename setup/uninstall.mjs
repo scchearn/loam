@@ -50,19 +50,25 @@ function cleanClaudeConfig(config, globalRoot) {
   };
 }
 
+function cleanCodexGroups(groups, globalRoot, assetName) {
+  if (!Array.isArray(groups)) return groups;
+  return groups
+    .map((entry) => {
+      if (!Array.isArray(entry?.hooks)) return isOwnedCommand(entry, globalRoot, assetName) ? null : entry;
+      const hooks = stripLoamHooks(entry.hooks, globalRoot, assetName);
+      return hooks.length === entry.hooks.length ? entry : { ...entry, hooks };
+    })
+    .filter((entry) => entry && (!Array.isArray(entry?.hooks) || entry.hooks.length > 0));
+}
+
 function cleanCodexConfig(config, globalRoot) {
-  if (!config?.hooks?.Stop || !Array.isArray(config.hooks.Stop)) return config;
+  if (!config?.hooks) return config;
   return {
     ...config,
     hooks: {
       ...config.hooks,
-      Stop: config.hooks.Stop
-        .map((entry) => {
-          if (!Array.isArray(entry?.hooks)) return isOwnedCommand(entry, globalRoot, 'codex-stop.mjs') ? null : entry;
-          const hooks = stripLoamHooks(entry.hooks, globalRoot, 'codex-stop.mjs');
-          return hooks.length === entry.hooks.length ? entry : { ...entry, hooks };
-        })
-        .filter((entry) => entry && (!Array.isArray(entry?.hooks) || entry.hooks.length > 0)),
+      SessionStart: cleanCodexGroups(config.hooks.SessionStart, globalRoot, 'codex-session-start.mjs'),
+      Stop: cleanCodexGroups(config.hooks.Stop, globalRoot, 'codex-stop.mjs'),
     },
   };
 }
@@ -171,7 +177,7 @@ export async function uninstall({
   }
 
   output.write('Loam uninstall will:\n');
-  output.write('  - Remove Loam-owned hook entries from Claude and Cursor configs\n');
+  output.write('  - Remove Loam-owned hook entries from Claude, Codex, and Cursor configs\n');
   output.write('  - Remove the OpenCode Loam adapter\n');
   output.write('  - Remove the global Loam root (install.json, runtime, integration, plugins)\n');
   output.write('  - Leave global skills intact (use `npx skills remove` separately)\n');

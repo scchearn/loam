@@ -139,7 +139,7 @@ test('setup reconciles an install from an older plugin version', async () => {
   assert.notEqual(current.integration_path, previous.integration_path);
 });
 
-test('marketplace-owned Claude and Codex satisfy final readiness without setup hooks', async () => {
+test('marketplace-owned Claude and Codex satisfy readiness with Stop hooks only', async () => {
   const fixture = await baseFixture();
   await mkdir(join(fixture.home, '.claude'), { recursive: true });
   await mkdir(join(fixture.home, '.codex'), { recursive: true });
@@ -171,6 +171,8 @@ test('marketplace-owned Claude and Codex satisfy final readiness without setup h
   const codex = JSON.parse(await readFile(join(fixture.home, '.codex', 'hooks.json'), 'utf8'));
   assert.deepEqual(claude.hooks.SessionStart, []);
   assert.deepEqual(codex.hooks.SessionStart, []);
+  assert.equal(claude.hooks.Stop.flatMap((entry) => entry.hooks || []).length, 1);
+  assert.equal(codex.hooks.Stop.flatMap((entry) => entry.hooks || []).length, 1);
 });
 
 test('dry-run is valid and byte-stable without creating roots, backups, or invoking mutators', async () => {
