@@ -205,8 +205,9 @@ test('absent harnesses remain absent and do not receive project-local hook files
   assert.equal(result.cursor.state, 'absent');
 });
 
-test('Codex uses matcher groups, preserves unrelated hooks, and ignores ordinary config.toml', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'loam-codex-hooks-'));
+test('Codex preserves hook groups, accepts Windows 8.3 paths, and rejects expansion paths', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loam-codex-hooks-'));
+  const home = join(root, 'RUNNER~1');
   await mkdir(join(home, '.codex'), { recursive: true });
   await writeFile(join(home, '.codex', 'config.toml'), 'model = "keep"\n');
   const unrelated = { type: 'command', command: 'node "/opt/other-stop.mjs"' };
@@ -223,4 +224,18 @@ test('Codex uses matcher groups, preserves unrelated hooks, and ignores ordinary
   assert.deepEqual(config.hooks.Stop[0].hooks, [unrelated]);
   assert.equal(config.hooks.Stop[1].hooks.length, 1);
   assert.equal(config.hooks.Stop[1].hooks[0].command, 'node ' + JSON.stringify(result.codex.path));
+
+  for (const character of ['%', '!']) {
+    const blockedHome = join(root, `RUNNER${character}1`);
+    await mkdir(join(blockedHome, '.codex'), { recursive: true });
+    const blocked = await installHarnesses({
+      home: blockedHome,
+      globalRoot: join(blockedHome, '.agents', 'loam'),
+      pluginVersion: '0.8.3',
+      detected: { opencode: { id: 'opencode', state: 'absent' }, claude: { id: 'claude', state: 'absent' }, cursor: { id: 'cursor', state: 'absent' }, codex: { id: 'codex', state: 'detected', root: join(blockedHome, '.codex') } },
+    });
+    assert.equal(blocked.codex.state, 'partial');
+    assert.equal(blocked.codex.category, 'install_failed');
+    assert.match(blocked.codex.detail, /Codex adapter path is unsafe/u);
+  }
 });

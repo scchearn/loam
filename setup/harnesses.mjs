@@ -133,7 +133,8 @@ async function installClaude({ home, globalRoot, assetPath }) {
 }
 
 function unsafeCodexPath(path) {
-  return /["'`$&|;<>^%!\r\n\t()[\]{}*?~#]/u.test(path);
+  // ponytail: this covers double-quoted-context expansion only; emit argv if Codex hooks support it.
+  return /[%!$`\r\n]/u.test(path);
 }
 
 function codexHandler(assetPath) {
