@@ -229,6 +229,7 @@ async function inspectIntent(path, workspace, openCodeSession) {
 async function acquireLease(root, workspace, harness, config, openCodeSession) {
   await ensureRoot(root);
   const path = join(root, 'lease.json');
+  // ponytail: stale reclaim gets one retry; add OS-level locking only if concurrent reclaim becomes observable.
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const leaseRecord = await jsonRecord(path);
     if (leaseRecord.malformed || (leaseRecord.present && (!leaseRecord.value || typeof leaseRecord.value !== 'object' || Array.isArray(leaseRecord.value)))) return { status: 'orphan_unknown' };
@@ -310,6 +311,7 @@ async function updateLease(root, lease, update) {
 async function launchMode({ harness, workspace, env }) {
   if (harness === 'opencode') return 'opencode_child';
   if (harness === 'codex') return 'codex_exec';
+  // ponytail: --help grep is a capability heuristic; replace it if Claude exposes a versioned capability API.
   const help = await execFile('claude', ['--help'], { cwd: workspace, timeout: 5000, env });
   const supportsBg = help.code === 0 && /--bg|--background/.test(help.stdout)
     && env.CLAUDE_CODE_DISABLE_AGENT_VIEW !== '1';
