@@ -64,14 +64,30 @@ test('fingerprint validation rejects controls/traversal and normalizes Windows s
   }
 });
 
-test('boundary gate defaults on, honors opt-out precedence, and blocks worker recursion', async () => {
+test('boundary gate defaults on without an environment override or config file', async () => {
   const workspace = await mkdtemp(join(tmpdir(), 'loam-gate-'));
-  const globalRoot = await mkdtemp(join(tmpdir(), 'loam-gate-global-'));
+  const globalRoot = join(await mkdtemp(join(tmpdir(), 'loam-gate-parent-')), 'missing-global');
   const options = { harness: 'claude', payload: { cwd: workspace, event_id: 'same-event' }, globalRoot };
 
-  const defaultResult = await gate({ ...options, env: {} });
-  assert.equal(defaultResult.action, 'spawn_worker');
-  assert.equal(defaultResult.config.enabled, true);
+  const result = await gate({ ...options, env: {} });
+  assert.equal(result.action, 'spawn_worker');
+  assert.equal(result.config.enabled, true);
+  assert.equal(await realpath(globalRoot), globalRoot);
+  await assert.rejects(() => realpath(join(globalRoot, 'config.json')), (error) => error.code === 'ENOENT');
+});
+
+test('explicitly disabled boundary gate rejects before creating state or probing native runtime', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'loam-gate-disabled-'));
+  const globalRoot = join(await mkdtemp(join(tmpdir(), 'loam-gate-disabled-parent-')), 'missing-global');
+
+  assert.deepEqual(await gate({ harness: 'claude', payload: { cwd: workspace }, globalRoot, env: { LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
+  await assert.rejects(() => realpath(globalRoot), (error) => error.code === 'ENOENT');
+});
+
+test('boundary gate honors config and environment precedence and blocks worker recursion', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'loam-gate-precedence-'));
+  const globalRoot = await mkdtemp(join(tmpdir(), 'loam-gate-precedence-global-'));
+  const options = { harness: 'claude', payload: { cwd: workspace, event_id: 'same-event' }, globalRoot };
 
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { enabled: false } }));
   assert.deepEqual(await gate({ ...options, env: {} }), { action: 'skip', reason: 'disabled' });
