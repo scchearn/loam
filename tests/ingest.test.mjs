@@ -8,7 +8,7 @@ import { test } from 'node:test';
 
 import { fingerprintActionable } from '../integration/ingest-fingerprint.mjs';
 import { gate, ingestStatus, runRoot, runWorker } from '../integration/ingest.mjs';
-import { bootIdentity, childIdentity, processDescriptor, resolveExecutable } from '../integration/ingest-process.mjs';
+import { bootIdentity, childIdentity, processDescriptor, resolveExecutable, startTracked } from '../integration/ingest-process.mjs';
 
 async function fixture() {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'loam-ingest-')));
@@ -390,6 +390,25 @@ test('process descriptors resolve executables and pass Windows batch arguments d
     command: batch, platform: 'win32', env: { ComSpec: join(tmpdir(), 'missing-cmd.exe') },
   }), /ComSpec/);
   assert.equal(resolveExecutable(process.execPath), process.execPath);
+});
+
+test('Windows batch launch executes from a spaced path', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loam batch '));
+  const batch = join(root, 'echo args.cmd');
+  try {
+    await writeFile(batch, '@echo off\r\necho %~1^|%~2\r\n');
+    const started = startTracked({
+      command: batch,
+      args: ['alpha beta', 'gamma'],
+      cwd: root,
+      timeoutMs: 10_000,
+    });
+    const result = await started.completion;
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout.trim(), 'alpha beta|gamma');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('Claude uses a help-only capability check, falls back cleanly, and receives the source-safety prompt', async () => {
