@@ -7,12 +7,23 @@ import { formatContext } from './context.mjs';
 import { readSkillContent } from './metadata.mjs';
 import { resolveGlobalRoot, resolveSkillsRoot } from './paths.mjs';
 import { probeState } from './runtime.mjs';
+import { ingestStatus } from './ingest.mjs';
 
-const HARNESS_IDS = new Set(['opencode', 'claude', 'cursor']);
+const HARNESS_IDS = new Set(['opencode', 'claude', 'codex', 'cursor']);
 
 function parseArgs(argv) {
   const [command, ...rest] = argv;
   if (command === 'status') return { command };
+  if (command === 'ingest-status') {
+    let workspace = process.cwd();
+    let jsonOutput = false;
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--workspace') workspace = rest[++index];
+      else if (rest[index] === '--json') jsonOutput = true;
+      else throw new Error('unknown integration option: ' + rest[index]);
+    }
+    return { command, workspace: resolve(workspace), jsonOutput };
+  }
   if (command === 'hook') {
     let harness;
     let workspace;
@@ -42,6 +53,12 @@ export async function runIntegration(argv = process.argv.slice(2), options = {})
   const skillsRoot = options.skillsRoot || resolveSkillsRoot({ home: options.home, env });
   const output = options.output || process.stdout;
   const target = options.target;
+
+  if (parsed.command === 'ingest-status') {
+    const result = await ingestStatus({ globalRoot, workspace: parsed.workspace, env });
+    output.write(JSON.stringify(result) + '\n');
+    return 0;
+  }
 
   if (parsed.command === 'status') {
     const result = await probeState({

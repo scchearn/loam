@@ -29,6 +29,40 @@ test('OpenCode injects the shared context once and ignores unrelated dedup marke
   assert.deepEqual(calls, ['/workspace']);
 });
 
+test('OpenCode background events queue work and normalize the all-session status map', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loam-opencode-worker-'));
+  let observed;
+  let finished;
+  const done = new Promise((resolve) => { finished = resolve; });
+  const plugin = await createOpenCodeAdapter({
+    client: {
+      session: {
+        create: async () => ({ id: 'child-1' }),
+        promptAsync: async () => undefined,
+        status: async (input) => {
+          assert.deepEqual(input, { query: { directory: '/workspace' } });
+          return { data: { 'child-1': { type: 'idle' } } };
+        },
+      },
+    },
+    ingestion: {
+      gate: async () => ({ action: 'spawn_worker', workspace: '/workspace' }),
+      resolveGlobalRoot: () => root,
+      resolveSkillsRoot: () => root,
+      runWorker: async ({ openCodeSession }) => {
+        const child = await openCodeSession.createChild({ parentId: 'parent-1', title: 'test' });
+        await openCodeSession.promptAsync({ sessionId: child.id, parts: [] });
+        observed = await openCodeSession.status(child.id);
+        finished();
+      },
+    },
+  })({ directory: '/workspace' });
+
+  await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-1', id: 'event-1' } });
+  await done;
+  assert.deepEqual(observed, { type: 'idle' });
+});
+
 test('Claude and Cursor adapters use payload workspace roots and emit documented envelopes', async () => {
   const getContext = async ({ workspace }) => `context for ${workspace}`;
   const claude = createClaudeAdapter({ getContext });
@@ -107,8 +141,8 @@ test('harness installation preserves unrelated hook commands containing loam', a
 
   assert.deepEqual(claudeHooks[0], unrelatedClaude);
   assert.deepEqual(cursorHooks[0], unrelatedCursor);
-  assert.equal(claudeHooks.filter((entry) => entry.command === `node ${JSON.stringify(result.claude.path)}`).length, 1);
-  assert.equal(cursorHooks.filter((entry) => entry.command === `node ${JSON.stringify(result.cursor.path)}`).length, 1);
+  assert.equal(claudeHooks.filter((entry) => entry.command === 'node' && entry.args?.[0] === result.claude.path).length, 1);
+  assert.equal(cursorHooks.filter((entry) => entry.command === 'node' && entry.args?.[0] === result.cursor.path).length, 1);
   await result.rollback();
 });
 
@@ -169,4 +203,24 @@ test('absent harnesses remain absent and do not receive project-local hook files
   assert.equal(result.opencode.state, 'absent');
   assert.equal(result.claude.state, 'absent');
   assert.equal(result.cursor.state, 'absent');
+});
+
+test('Codex uses matcher groups, preserves unrelated hooks, and ignores ordinary config.toml', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-codex-hooks-'));
+  await mkdir(join(home, '.codex'), { recursive: true });
+  await writeFile(join(home, '.codex', 'config.toml'), 'model = "keep"\n');
+  const unrelated = { type: 'command', command: 'node "/opt/other-stop.mjs"' };
+  await writeFile(join(home, '.codex', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{ matcher: "", hooks: [unrelated] }] } }));
+  const result = await installHarnesses({
+    home,
+    globalRoot: join(home, '.agents', 'loam'),
+    pluginVersion: '0.8.3',
+    detected: { opencode: { id: 'opencode', state: 'absent' }, claude: { id: 'claude', state: 'absent' }, cursor: { id: 'cursor', state: 'absent' }, codex: { id: 'codex', state: 'detected', root: join(home, '.codex') } },
+  });
+  assert.equal(result.codex.state, 'ready');
+  const config = JSON.parse(await readFile(join(home, '.codex', 'hooks.json'), 'utf8'));
+  assert.equal(config.hooks.Stop.length, 2);
+  assert.deepEqual(config.hooks.Stop[0].hooks, [unrelated]);
+  assert.equal(config.hooks.Stop[1].hooks.length, 1);
+  assert.equal(config.hooks.Stop[1].hooks[0].command, 'node ' + JSON.stringify(result.codex.path));
 });

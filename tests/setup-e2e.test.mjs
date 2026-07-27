@@ -55,6 +55,9 @@ async function baseFixture() {
       await mkdir(join(skillsRoot, 'scripts'), { recursive: true });
       await writeFile(join(skillsRoot, 'scripts', 'CLI_VERSION'), '0.9.1\n');
       await writeFile(join(skillsRoot, 'SKILL.md'), '---\nname: loam::using\n---\n# using\n');
+      const ingestRoot = join(home, '.agents', 'skills', 'loam-ingesting-codebase', 'references');
+      await mkdir(ingestRoot, { recursive: true });
+      await writeFile(join(ingestRoot, 'ingestion-exclusions.md'), '# exclusions\n');
       return { code: 0, stdout: '', stderr: '' };
     }
     if (request.args.includes('remove')) return { code: 0, stdout: '', stderr: '' };

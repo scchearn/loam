@@ -180,3 +180,15 @@ test('uninstall preserves a pre-existing harness config that setup modified', as
   assert.deepEqual(cursor.hooks.sessionStart, [{ type: 'command', command: 'node "/opt/other/hook.mjs"' }], 'unrelated hook preserved');
   assert.equal(await exists(join(home, '.cursor', 'hooks.json.backup-deadbeef')), false, 'backup removed');
 });
+
+test('uninstall blocks on malformed worker ownership state', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const runPath = join(globalRoot, 'run', 'malformed');
+  await mkdir(runPath, { recursive: true });
+  await writeFile(join(runPath, 'lease.json'), '{not-json');
+
+  const code = await uninstall({ home, globalRoot, yes: true, output: { write: () => {} } });
+
+  assert.equal(code, 1);
+  assert.equal(await exists(globalRoot), true);
+});

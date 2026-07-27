@@ -40,6 +40,22 @@ The existing clone plus direct `.opencode/plugins/loam.js` path remains a
 migration compatibility path. If it is retained, update it with `git pull` and
 restart OpenCode; it does not poll for updates at session start.
 
+## Optional background ingestion
+
+Background code ingestion is disabled by default. Set
+`LOAM_INGEST_BACKGROUND=1` or `background_ingest.enabled` in
+`~/.agents/loam/config.json`; `LOAM_INGEST_BACKGROUND=0` always wins. The
+adapter acts only on `session.idle`, creates a child session for the existing
+`loam::ingesting-codebase` skill, and ignores child idle events.
+
+The worker takes a per-workspace lease, requires full native state with a
+`code_ingest_pending` hint, resolves installed exclusions, and computes a
+complete actionable fingerprint before spending model tokens. Missing or
+unreadable exclusions, live/uncertain workers, and race/deadline fingerprints
+fail closed. Use `ingest-status --workspace <path> --json` through the
+installed integration to inspect the lease, intent, fingerprint, and last
+outcome. The worker never edits source files, commits, or pushes.
+
 ## Troubleshooting
 
 1. Rerun `npx @scchearn/loam setup --dry-run` to inspect readiness and paths.

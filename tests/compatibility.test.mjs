@@ -124,6 +124,8 @@ test('plugin manifests point at the packaged Node hook entry', async () => {
 
   assert.equal(claude.hooks, './hooks/hooks.json');
   assert.equal(cursor.hooks, './hooks/hooks-cursor.json');
-  assert.match(claudeHooks.hooks.SessionStart[0].hooks[0].command, /session-start\.mjs/);
+  const claudeSessionStart = claudeHooks.hooks.SessionStart[0].hooks[0];
+  assert.equal(claudeSessionStart.command, 'node');
+  assert.match(claudeSessionStart.args[0], /session-start\.mjs/);
   assert.match(cursorHooks.hooks.sessionStart[0].command, /session-start\.mjs/);
 });

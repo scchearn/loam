@@ -1,6 +1,7 @@
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { readInstallMetadata, readRequiredVersion, readSkillContent } from '../integration/metadata.mjs';
@@ -25,22 +26,111 @@ async function localSkills(skillsRoot) {
   }
 }
 
-function hookCommand(path) {
-  return `node ${JSON.stringify(path)}`;
+function ownsCommand(entry, path) {
+  if (Array.isArray(entry?.hooks)) return entry.hooks.some((hook) => ownsCommand(hook, path));
+  if (entry?.type !== 'command') return false;
+  const candidates = [];
+  if (entry.command === 'node' && Array.isArray(entry.args) && entry.args.length === 1) candidates.push(entry.args[0]);
+  for (const value of [entry.command, entry.commandWindows]) {
+    if (typeof value !== 'string' || !value.startsWith('node ')) continue;
+    const raw = value.slice(5).trim();
+    try { candidates.push(JSON.parse(raw)); } catch { candidates.push(raw); }
+  }
+  return candidates.some((candidate) => candidate === path || candidate === path.replaceAll('/', '\\'));
 }
 
-async function verifyAdapterEnvelope(id, assetPath, workspace) {
-  const module = await import(`${pathToFileURL(assetPath).href}?verify=${randomUUID()}`);
+async function executeCodexAdapter(assetPath, workspace, integrationPath) {
+  return new Promise((resolvePromise) => {
+    const child = spawn(process.execPath, [assetPath], {
+      stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+      env: { ...process.env, LOAM_INGEST_BACKGROUND: '0', ...(integrationPath ? { LOAM_INTEGRATION_PATH: integrationPath } : {}) },
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString().slice(0, 2048 - stdout.length); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString().slice(0, 2048 - stderr.length); });
+    const timer = setTimeout(() => { child.kill(); resolvePromise({ code: null, stdout, stderr, error: new Error('adapter verification timed out') }); }, 5000);
+    child.once('error', (error) => { clearTimeout(timer); resolvePromise({ code: null, stdout, stderr, error }); });
+    child.once('close', (code) => { clearTimeout(timer); resolvePromise({ code, stdout, stderr }); });
+    child.stdin.end(JSON.stringify({ cwd: workspace, session_id: 'verify', stop_hook_active: false }));
+  });
+}
+
+async function verifyIngestExclusions(skillsRoot) {
+  let physicalRoot;
+  try { physicalRoot = await realpath(skillsRoot); } catch { return { ready: false, category: 'exclusions_unavailable' }; }
+  const candidates = [
+    join(skillsRoot, 'loam-ingesting-codebase', 'references', 'ingestion-exclusions.md'),
+    join(skillsRoot, 'loam-memory', 'loam-ingesting-codebase', 'references', 'ingestion-exclusions.md'),
+  ];
+  for (const path of candidates) {
+    try {
+      const physicalPath = await realpath(path);
+      const rel = relative(resolve(physicalRoot), physicalPath);
+      if (!rel || rel.startsWith('..') || isAbsolute(rel)) continue;
+      if (await fileExists(physicalPath)) {
+        await readFile(physicalPath);
+        return { ready: true, path: physicalPath };
+      }
+    } catch {}
+  }
+  return { ready: false, category: 'exclusions_unavailable' };
+}
+
+async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, globalRoot) {
+  const hadIntegrationPath = Object.hasOwn(process.env, 'LOAM_INTEGRATION_PATH');
+  const previousIntegrationPath = process.env.LOAM_INTEGRATION_PATH;
+  if (integrationPath) process.env.LOAM_INTEGRATION_PATH = integrationPath;
+  let module;
+  try {
+    module = await import(`${pathToFileURL(assetPath).href}?verify=${randomUUID()}`);
+  } finally {
+    if (hadIntegrationPath) process.env.LOAM_INTEGRATION_PATH = previousIntegrationPath;
+    else delete process.env.LOAM_INTEGRATION_PATH;
+  }
   const context = '<LOAM_IMPORTANT>\nverification context\n</LOAM_IMPORTANT>';
   if (id === 'opencode') {
     const adapter = await module.createOpenCodeAdapter({ getContext: async () => context })({ directory: workspace });
     const output = { messages: [{ info: { role: 'user' }, parts: [{ type: 'text', text: 'prompt' }] }] };
     await adapter['experimental.chat.messages.transform']({}, output);
-    return output.messages[0].parts.filter((part) => part.type === 'text' && part.text === context).length === 1;
+    const previous = process.env.LOAM_INGEST_BACKGROUND;
+    const previousGlobal = process.env.LOAM_INGEST_GLOBAL_ROOT;
+    process.env.LOAM_INGEST_BACKGROUND = '0';
+    if (globalRoot) process.env.LOAM_INGEST_GLOBAL_ROOT = globalRoot;
+    try {
+      await adapter.event({ event: { type: 'session.updated', sessionID: 'verify' } });
+      await adapter.event({ event: { type: 'session.idle', sessionID: 'verify' } });
+    } finally {
+      if (previous === undefined) delete process.env.LOAM_INGEST_BACKGROUND;
+      else process.env.LOAM_INGEST_BACKGROUND = previous;
+      if (globalRoot) {
+        if (previousGlobal === undefined) delete process.env.LOAM_INGEST_GLOBAL_ROOT;
+        else process.env.LOAM_INGEST_GLOBAL_ROOT = previousGlobal;
+      }
+    }
+    return output.messages[0].parts.filter((part) => part.type === 'text' && part.text === context).length === 1
+      && typeof adapter.event === 'function';
   }
   if (id === 'claude') {
     const result = await module.handleClaudeHook({ cwd: workspace }, { getContext: async () => context });
-    return result?.hookSpecificOutput?.hookEventName === 'SessionStart' && result.hookSpecificOutput.additionalContext === context;
+    const hadPath = Object.hasOwn(process.env, 'LOAM_INTEGRATION_PATH');
+    const previousPath = process.env.LOAM_INTEGRATION_PATH;
+    if (integrationPath) process.env.LOAM_INTEGRATION_PATH = integrationPath;
+    let stop;
+    try {
+      stop = await import(`${pathToFileURL(join(assetPath, '..', 'claude-stop.mjs')).href}?verify-stop=${randomUUID()}`);
+    } finally {
+      if (hadPath) process.env.LOAM_INTEGRATION_PATH = previousPath;
+      else delete process.env.LOAM_INTEGRATION_PATH;
+    }
+    const stopped = await stop.main({ env: { ...process.env, LOAM_INGEST_BACKGROUND: '0', ...(globalRoot ? { LOAM_INGEST_GLOBAL_ROOT: globalRoot } : {}) }, payload: { cwd: workspace } });
+    return result?.hookSpecificOutput?.hookEventName === 'SessionStart'
+      && result.hookSpecificOutput.additionalContext === context
+      && stopped?.reason === 'disabled';
+  }
+  if (id === 'codex') {
+    const result = await executeCodexAdapter(assetPath, workspace, integrationPath);
+    return result.code === 0 && result.stdout === '{}';
   }
   const result = await module.handleCursorHook({ cwd: workspace }, { getContext: async () => context });
   return result?.additional_context === context;
@@ -51,7 +141,7 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
   if (!install) return { ...harness, ready: false, category: 'install_metadata_missing' };
   const assetRoot = install.adapter_root;
   const assetName = id === 'opencode' ? 'opencode.mjs' : `${id}-session-start.mjs`;
-  const assetPath = join(assetRoot, assetName);
+  const assetPath = join(assetRoot, id === 'codex' ? 'codex-stop.mjs' : assetName);
   try {
     if (id === 'opencode') {
       const stablePath = join(harness.root, 'plugins', 'loam.mjs');
@@ -60,13 +150,18 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
         readFile(join(packageRoot, 'adapters', 'opencode.mjs'), 'utf8'),
       ]);
       if (actual !== expected) return { ...harness, ready: false, category: 'registration_mismatch' };
+    } else if (id === 'codex') {
+      const config = JSON.parse(await readFile(join(harness.root, 'hooks.json'), 'utf8'));
+      const commands = Array.isArray(config.hooks?.Stop) ? config.hooks.Stop : [];
+      const owned = commands.filter((entry) => ownsCommand(entry, assetPath));
+      if (owned.length !== 1) return { ...harness, ready: false, category: owned.length ? 'registration_duplicate' : 'registration_missing' };
     } else {
       const configPath = id === 'claude' ? join(harness.root, 'settings.json') : join(harness.root, 'hooks.json');
       const config = JSON.parse(await readFile(configPath, 'utf8'));
       const commands = id === 'claude'
         ? (Array.isArray(config.hooks?.SessionStart) ? config.hooks.SessionStart : []).flatMap((entry) => Array.isArray(entry?.hooks) ? entry.hooks : [])
         : (Array.isArray(config.hooks?.sessionStart) ? config.hooks.sessionStart : []);
-      const owned = commands.filter((entry) => entry?.type === 'command' && entry.command === hookCommand(assetPath));
+      const owned = commands.filter((entry) => ownsCommand(entry, assetPath));
       if (owned.length !== 1) {
         return {
           ...harness,
@@ -74,9 +169,17 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
           category: owned.length ? 'registration_duplicate' : 'registration_missing',
         };
       }
+      if (id === 'claude') {
+        const stopPath = join(assetRoot, 'claude-stop.mjs');
+        const stopHooks = (Array.isArray(config.hooks?.Stop) ? config.hooks.Stop : [])
+          .flatMap((entry) => Array.isArray(entry?.hooks) ? entry.hooks : []);
+        if (stopHooks.filter((entry) => ownsCommand(entry, stopPath)).length !== 1) {
+          return { ...harness, ready: false, category: 'registration_missing' };
+        }
+      }
     }
 
-    if (!(await fileExists(assetPath)) || !(await verifyAdapterEnvelope(id, assetPath, workspace))) {
+    if (!(await fileExists(assetPath)) || !(await verifyAdapterEnvelope(id, assetPath, workspace, install.integration_path, globalRoot))) {
       return { ...harness, ready: false, category: 'adapter_envelope_invalid' };
     }
     return { ...harness, ready: true };
@@ -136,12 +239,14 @@ export async function verifyInstallation({
   const migration = legacy || discovery.legacy;
   const harnessReady = Object.values(harnesses).every((harness) => harness.ready);
   const pluginVersionReady = install?.plugin_version === discovery.packageVersion;
+  const ingestExclusions = await verifyIngestExclusions(discovery.skillsRoot);
   return {
-    ready: Boolean(pluginVersionReady && skills.ready && runtime.ready && harnessReady && migration.ready),
+    ready: Boolean(pluginVersionReady && skills.ready && runtime.ready && harnessReady && migration.ready && ingestExclusions.ready),
     install,
     skills,
     runtime,
     harnesses,
+    ingestExclusions,
     migration,
     native: { ready: runtime.ready },
   };

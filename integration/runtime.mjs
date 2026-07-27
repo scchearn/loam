@@ -265,10 +265,11 @@ export async function checkReadiness({
   };
 }
 
-export async function probeState({
+async function probeStateWithMode({
   workspace,
   runner,
   timeoutMs = 5000,
+  fast = true,
   readiness,
   ...readinessOptions
 } = {}) {
@@ -277,7 +278,7 @@ export async function probeState({
 
   const result = await invokeRuntime({
     runtimePath: status.runtimePath,
-    args: ['state', '--fast', resolve(workspace)],
+    args: fast ? ['state', '--fast', resolve(workspace)] : ['state', resolve(workspace)],
     cwd: resolve(workspace),
     timeoutMs,
     runner,
@@ -306,4 +307,12 @@ export async function probeState({
       detail: safeDetail(error instanceof Error ? `invalid JSON: ${error.message}` : error),
     };
   }
+}
+
+export async function probeState(options = {}) {
+  return probeStateWithMode({ ...options, fast: true });
+}
+
+export async function probeFullState(options = {}) {
+  return probeStateWithMode({ ...options, fast: false });
 }
