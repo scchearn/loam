@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 const execFileAsync = promisify(execFile);
 const semver = /^\d+\.\d+\.\d+$/;
@@ -15,14 +15,18 @@ if (!semver.test(runtimeVersion)) throw new Error(`invalid runtime version: ${ru
 const tempRoot = await mkdtemp(join(tmpdir(), 'loam-packaged-smoke-'));
 const home = join(tempRoot, 'home');
 const workspace = join(tempRoot, 'workspace');
-const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+const npx = process.platform === 'win32' ? process.execPath : 'npx';
 const env = { ...process.env, HOME: home, USERPROFILE: home };
 
 try {
   await mkdir(home, { recursive: true });
   await mkdir(workspace, { recursive: true });
 
-  const setup = await execFileAsync(npx, ['--yes', `@scchearn/loam@${pluginVersion}`, 'setup', '--yes'], {
+  const npxArgs = [
+    ...(process.platform === 'win32' ? [join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npx-cli.js')] : []),
+    '--yes', `@scchearn/loam@${pluginVersion}`, 'setup', '--yes',
+  ];
+  const setup = await execFileAsync(npx, npxArgs, {
     cwd: workspace,
     env,
     maxBuffer: 4 * 1024 * 1024,
