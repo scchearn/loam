@@ -2,12 +2,12 @@ use std::fs;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn temporary_wiki() -> std::path::PathBuf {
+fn temporary_wiki(label: &str) -> std::path::PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after epoch")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("loam-datecheck-{nonce}"));
+    let path = std::env::temp_dir().join(format!("loam-datecheck-{label}-{nonce}"));
     fs::create_dir_all(&path).expect("temporary wiki should be created");
     path
 }
@@ -22,7 +22,7 @@ fn drifted_note(wiki: &std::path::Path) {
 
 #[test]
 fn datecheck_check_reports_drift_and_exits_two() {
-    let wiki = temporary_wiki();
+    let wiki = temporary_wiki("check");
     drifted_note(&wiki);
 
     let binary = std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide the loam binary");
@@ -52,7 +52,7 @@ fn datecheck_check_reports_drift_and_exits_two() {
 
 #[test]
 fn datecheck_fix_is_idempotent_and_normalizes_the_file() {
-    let wiki = temporary_wiki();
+    let wiki = temporary_wiki("fix");
     drifted_note(&wiki);
     let binary = std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide the loam binary");
 
@@ -110,7 +110,7 @@ fn datecheck_fix_is_idempotent_and_normalizes_the_file() {
 
 #[test]
 fn datecheck_ignores_unicode_bullets_without_panicking() {
-    let wiki = temporary_wiki();
+    let wiki = temporary_wiki("unicode");
     fs::write(
         wiki.join("note.md"),
         "- protect → shield, boundary, watch mark\n",

@@ -322,7 +322,8 @@ test('status and hook commands share one read-only integration boundary', async 
   }
 
   assert.ok(contexts.every((context) => context.includes('<LOAM_IMPORTANT>')));
-  assert.ok(contexts.every((context) => context.includes(`Native runtime command: '${fixtureData.runtimePath}'`)));
+  const runtimeCommand = formatNativeRuntimeCommand(fixtureData.runtimePath);
+  assert.ok(contexts.every((context) => context.includes(`Native runtime command: ${runtimeCommand}`)));
   assert.deepEqual(new Set(contexts).size, 1);
   assert.equal(await readFile(join(fixtureData.skillsRoot, 'loam-using', 'SKILL.md'), 'utf8'), before);
 });
