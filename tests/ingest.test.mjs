@@ -408,6 +408,7 @@ test('Windows batch launch executes from a spaced path', { skip: process.platfor
       command: batch,
       args: ['alpha beta', 'gamma'],
       cwd: root,
+      env: { ...process.env },
       timeoutMs: 10_000,
     });
     const result = await started.completion;
