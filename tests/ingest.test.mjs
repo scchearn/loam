@@ -64,14 +64,22 @@ test('fingerprint validation rejects controls/traversal and normalizes Windows s
   }
 });
 
-test('boundary gate is default-off and does not probe native state', async () => {
-  const result = await gate({
-    harness: 'claude',
-    payload: { cwd: await mkdtemp(join(tmpdir(), 'loam-gate-')), event_id: 'same-event' },
-    globalRoot: join(tmpdir(), 'loam-gate-global-missing'),
-    env: {},
-  });
-  assert.deepEqual(result, { action: 'skip', reason: 'disabled' });
+test('boundary gate defaults on, honors opt-out precedence, and blocks worker recursion', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'loam-gate-'));
+  const globalRoot = await mkdtemp(join(tmpdir(), 'loam-gate-global-'));
+  const options = { harness: 'claude', payload: { cwd: workspace, event_id: 'same-event' }, globalRoot };
+
+  const defaultResult = await gate({ ...options, env: {} });
+  assert.equal(defaultResult.action, 'spawn_worker');
+  assert.equal(defaultResult.config.enabled, true);
+
+  await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { enabled: false } }));
+  assert.deepEqual(await gate({ ...options, env: {} }), { action: 'skip', reason: 'disabled' });
+  assert.equal((await gate({ ...options, env: { LOAM_INGEST_BACKGROUND: '1' } })).action, 'spawn_worker');
+
+  await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { enabled: true } }));
+  assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
+  assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_WORKER: '1' } }), { action: 'skip', reason: 'disabled' });
 });
 
 test('worker leases before full state and issues the exact exclusions-aware diff argv', async () => {
