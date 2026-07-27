@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, readFile, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { loadSkillInventory } from '../setup/inventory.mjs';
 import { discover } from '../setup/discovery.mjs';
 import { detectLegacyProject, migrateLegacyProject } from '../setup/migration.mjs';
-import { npxCommand, runSkills } from '../setup/process.mjs';
+import { npxCommand, runCommand, runSkills } from '../setup/process.mjs';
 import { ensureGlobalSkills } from '../setup/skills.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
@@ -60,6 +60,24 @@ test('Skills CLI commands use an argument array and the exact pinned global add'
     '--yes',
   ]);
   assert.equal(calls[0].shell, false);
+});
+
+test('setup commands execute a Windows batch file from a spaced path', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loam setup '));
+  const batch = join(root, 'echo args.cmd');
+  try {
+    await writeFile(batch, '@echo off\r\necho %~1^|%~2\r\n');
+    const result = await runCommand({
+      command: batch,
+      args: ['alpha beta', 'gamma'],
+      cwd: root,
+      timeoutMs: 10_000,
+    });
+    assert.equal(result.ok, true, result.stderr);
+    assert.equal(result.stdout.trim(), 'alpha beta|gamma');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('complete global Skills CLI inventory skips mutation and verifies CLI_VERSION/source metadata', async () => {
