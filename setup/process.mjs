@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 
+import { processDescriptor } from '../integration/ingest-process.mjs';
 import { safeDetail } from '../integration/runtime.mjs';
 
 export const SKILLS_CLI_VERSION = '1.5.20';
@@ -70,7 +71,14 @@ export function runCommand({
 
 function spawnCommand({ command, args, cwd, env, timeoutMs }) {
   return new Promise((resolvePromise) => {
-    const child = spawn(command, args, { cwd, env, shell: false, windowsHide: true });
+    const descriptor = processDescriptor({ command, args, env });
+    const child = spawn(descriptor.executable, descriptor.args, {
+      cwd,
+      env: descriptor.env || env,
+      shell: false,
+      windowsHide: true,
+      windowsVerbatimArguments: descriptor.windowsVerbatimArguments === true,
+    });
     let stdout = '';
     let stderr = '';
     let settled = false;
