@@ -102,6 +102,6 @@ export function runSkills(args, options = {}) {
   return runCommand({
     ...options,
     command: options.command || npxCommand(),
-    args: ['--yes', `skills@${SKILLS_CLI_VERSION}`, ...args],
+    args: ['--yes', '--package', `skills@${SKILLS_CLI_VERSION}`, 'skills', ...args],
   });
 }

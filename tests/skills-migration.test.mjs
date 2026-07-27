@@ -36,7 +36,7 @@ async function completeList() {
 test('Skills CLI commands use an argument array and the exact pinned global add', async () => {
   const calls = [];
   await runSkills(
-    ['add', 'scchearn/loam', '--global', '--agent', 'claude-code', '--yes'],
+    ['add', 'scchearn/loam', '--global', '--agent', '*', '--yes'],
     {
       cwd: '/workspace',
       runner: async (request) => {
@@ -49,12 +49,14 @@ test('Skills CLI commands use an argument array and the exact pinned global add'
   assert.equal(calls[0].command, npxCommand());
   assert.deepEqual(calls[0].args, [
     '--yes',
+    '--package',
     'skills@1.5.20',
+    'skills',
     'add',
     'scchearn/loam',
     '--global',
     '--agent',
-    'claude-code',
+    '*',
     '--yes',
   ]);
   assert.equal(calls[0].shell, false);
@@ -75,7 +77,7 @@ test('complete global Skills CLI inventory skips mutation and verifies CLI_VERSI
   assert.equal(result.ready, true);
   assert.equal(result.changed, false);
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].args, ['--yes', 'skills@1.5.20', 'list', '--json', '--global']);
+  assert.deepEqual(calls[0].args, ['--yes', '--package', 'skills@1.5.20', 'skills', 'list', '--json', '--global']);
 });
 
 test('incomplete global inventory invokes the pinned public add and re-verifies', async () => {
@@ -104,17 +106,19 @@ test('incomplete global inventory invokes the pinned public add and re-verifies'
   assert.equal(result.changed, true);
   assert.deepEqual(calls[1].args, [
     '--yes',
+    '--package',
     'skills@1.5.20',
+    'skills',
     'add',
     'scchearn/loam',
     '--global',
     '--agent',
-    'claude-code',
+    '*',
     '--yes',
   ]);
 });
 
-test('fresh global setup adds skills when local CLI_VERSION and skill content are absent', async () => {
+test('fresh global setup preserves the canonical skills root', async () => {
   const skillsRoot = await mkdtemp(join(tmpdir(), 'loam-skills-empty-'));
   const full = await completeList();
   const calls = [];
@@ -124,6 +128,7 @@ test('fresh global setup adds skills when local CLI_VERSION and skill content ar
     runner: async (request) => {
       calls.push(request);
       if (request.args.includes('add')) {
+        assert.deepEqual(request.args.slice(-3), ['--agent', '*', '--yes']);
         await mkdir(join(skillsRoot, 'loam-using', 'scripts'), { recursive: true });
         await writeFile(join(skillsRoot, 'loam-using', 'scripts', 'CLI_VERSION'), '0.9.1\n');
         await writeFile(join(skillsRoot, 'loam-using', 'SKILL.md'), '# installed\n');
@@ -135,6 +140,7 @@ test('fresh global setup adds skills when local CLI_VERSION and skill content ar
   assert.equal(result.ready, true);
   assert.equal(result.changed, true);
   assert.equal(calls.filter((call) => call.args.includes('add')).length, 1);
+  assert.equal(await readFile(join(skillsRoot, 'loam-using', 'scripts', 'CLI_VERSION'), 'utf8'), '0.9.1\n');
 });
 
 test('migration removes only exact current-workspace Loam skills and owned runtime', async () => {
@@ -170,7 +176,7 @@ test('migration removes only exact current-workspace Loam skills and owned runti
   assert.equal(result.ready, true);
   const remove = calls.filter((call) => call.args.includes('remove'));
   assert.equal(remove.length, 1);
-  assert.deepEqual(remove[0].args, ['--yes', 'skills@1.5.20', 'remove', 'loam::using', '--yes']);
+  assert.deepEqual(remove[0].args, ['--yes', '--package', 'skills@1.5.20', 'skills', 'remove', 'loam::using', '--yes']);
   assert.equal(remove[0].args.includes('--all'), false);
   assert.equal(remove[0].args.includes('--global'), false);
   assert.equal(remove[0].cwd, workspace);
