@@ -128,13 +128,11 @@ async function blockingWorkers(root) {
   for (const entry of await readdir(runRoot, { withFileTypes: true }).catch(() => [])) {
     if (!entry.isDirectory()) continue;
     const leasePath = join(runRoot, entry.name, 'lease.json');
-    const intentPath = join(runRoot, entry.name, 'intent.json');
     const readRecord = async (path) => {
       try { return { present: true, value: JSON.parse(await readFile(path, 'utf8')) }; }
       catch (error) { return error?.code === 'ENOENT' ? { present: false } : { present: true, malformed: true }; }
     };
     const leaseRecord = await readRecord(leasePath);
-    const intentRecord = await readRecord(intentPath);
     if (leaseRecord.malformed || (leaseRecord.present && (leaseRecord.value?.schema !== 1
       || !Number.isInteger(leaseRecord.value.owner_pid) || !leaseRecord.value.boot_id))) {
       blocked.push({ path: leasePath, state: 'unknown' });
@@ -143,15 +141,12 @@ async function blockingWorkers(root) {
     const lease = leaseRecord.value;
     if (leaseRecord.present) {
       const state = await classifyChild({ pid: lease.owner_pid, boot_id: lease.boot_id, process_start: lease.process_start });
-      if (state === 'live' || state === 'unknown') blocked.push({ path: leasePath, state });
-    }
-    if (intentRecord.malformed) {
-      blocked.push({ path: intentPath, state: 'unknown' });
-      continue;
-    }
-    if (intentRecord.present) {
-      const intent = await inspectIntent(intentPath, lease?.workspace || '', undefined);
-      if (intent.state === 'live' || intent.state === 'unknown') blocked.push({ path: intentPath, state: intent.state });
+      if (state === 'live' || state === 'unknown') {
+        blocked.push({ path: leasePath, state });
+        continue;
+      }
+      const child = await inspectIntent(leasePath, lease.workspace || '', undefined);
+      if (child.state === 'live' || child.state === 'unknown') blocked.push({ path: leasePath, state: child.state });
     }
   }
   return blocked;

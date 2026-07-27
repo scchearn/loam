@@ -99,7 +99,6 @@ test('worker leases before full state and issues the exact exclusions-aware diff
     modelRunner: async ({ intent }) => {
       modelCalls += 1;
       assert.equal(intent.launch_state, 'planned');
-      assert.equal(typeof intent.launch_token, 'string');
       assert.equal(intent.actionable_fingerprint.length, 64);
       return { completion: Promise.resolve({ code: 0 }) };
     },
@@ -202,18 +201,6 @@ test('a second admitted worker rechecks backoff after acquiring the lease', asyn
   assert.equal(modelCalls, 1);
 });
 
-test('a dead lock owner is reclaimed instead of wedging the boundary', async () => {
-  const { root, workspace } = await fixture();
-  const lockRoot = runRoot(root, workspace);
-  await mkdir(lockRoot, { recursive: true });
-  await writeFile(join(lockRoot, '.ownership.lock'), '999999\n');
-  const result = await gate({
-    harness: 'codex', payload: { cwd: workspace, event_id: 'dead-lock' }, globalRoot: root,
-    env: { LOAM_INGEST_BACKGROUND: '1' },
-  });
-  assert.equal(result.action, 'spawn_worker');
-});
-
 test('OpenCode creates a child, records identity before prompt, and verifies terminal ownership', async () => {
   const { root, workspace, wiki, skills } = await fixture();
   const calls = [];
@@ -240,12 +227,13 @@ test('OpenCode creates a child, records identity before prompt, and verifies ter
   assert.ok(calls.some(([kind]) => kind === 'status'));
 });
 
-test('a dead active intent with a missing lease is recovered before the first runtime probe', async () => {
+test('a dead worker and dead child lease is recovered before the first runtime probe', async () => {
   const { root, workspace, wiki, skills } = await fixture();
   const runPath = runRoot(root, workspace);
   await mkdir(runPath, { recursive: true });
-  await writeFile(join(runPath, 'intent.json'), JSON.stringify({
-    schema: 1, state: 'active', attempt_id: 'old', lease_id: 'old-lease', launch_token: 'old-token',
+  await writeFile(join(runPath, 'lease.json'), JSON.stringify({
+    schema: 1, lease_id: 'old-lease', workspace, harness: 'codex', owner_pid: 999998,
+    boot_id: await bootIdentity(), process_start: '1',
     actionable_fingerprint: 'old-fingerprint', launch_mode: 'codex_exec', launch_state: 'launched',
     planned_identity: {}, child_identity: { pid: 999999, boot_id: await bootIdentity(), process_start: '1' },
   }));
@@ -263,7 +251,7 @@ test('a dead active intent with a missing lease is recovered before the first ru
   });
   assert.equal(result.reason, 'ok');
   assert.equal(calls[0][0], 'state');
-  assert.equal(await readFile(join(runPath, 'intent.json')).then(() => true).catch(() => false), false);
+  assert.equal(await readFile(join(runPath, 'lease.json')).then(() => true).catch(() => false), false);
 });
 
 test('OpenCode live child keeps the lease and intent when abort/requery cannot verify death', async () => {
@@ -283,8 +271,7 @@ test('OpenCode live child keeps the lease and intent when abort/requery cannot v
   });
   assert.equal(result.reason, 'lease_held');
   const runPath = runRoot(root, workspace);
-  assert.equal(JSON.parse(await readFile(join(runPath, 'intent.json'), 'utf8')).child_identity.session_id, 'child-live');
-  assert.ok(await readFile(join(runPath, 'lease.json'), 'utf8'));
+  assert.equal(JSON.parse(await readFile(join(runPath, 'lease.json'), 'utf8')).child_identity.session_id, 'child-live');
 });
 
 test('OpenCode prompt transport failure keeps ownership after child identity was published', async () => {
@@ -304,8 +291,7 @@ test('OpenCode prompt transport failure keeps ownership after child identity was
   });
   assert.equal(result.reason, 'lease_held');
   const runPath = runRoot(root, workspace);
-  assert.equal(JSON.parse(await readFile(join(runPath, 'intent.json'), 'utf8')).child_identity.session_id, 'child-transport-failed');
-  assert.ok(await readFile(join(runPath, 'lease.json'), 'utf8'));
+  assert.equal(JSON.parse(await readFile(join(runPath, 'lease.json'), 'utf8')).child_identity.session_id, 'child-transport-failed');
 });
 
 test('published adapters load only the staged integration after the source tree disappears', async () => {

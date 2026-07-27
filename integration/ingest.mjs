@@ -1,5 +1,5 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 import { assertInside, resolveSkillsRoot } from './paths.mjs';
@@ -14,9 +14,6 @@ const PROMPT = 'Run the existing loam::ingesting-codebase skill for the provided
 const DEFAULTS = Object.freeze({ enabled: false, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800 });
 const LOG_MAX_RECORD = 2048;
 const LOG_MAX_BYTES = 256 * 1024;
-const OWNERSHIP_STALE_MS = 30000;
-const OWNERSHIP_FILE = '.ownership.lock';
-const ARCHIVE_MAX = 8;
 function hash(value) { return createHash('sha256').update(String(value)).digest('hex'); }
 export function runRoot(globalRoot, workspace) { return join(resolve(globalRoot), 'run', hash(workspace).slice(0, 16)); }
 async function json(path, fallback = null) { try { return JSON.parse(await readFile(path, 'utf8')); } catch { return fallback; } }
@@ -26,89 +23,6 @@ async function jsonRecord(path) {
 }
 async function ensureRoot(root) { await mkdir(root, { recursive: true, mode: 0o700 }); }
 async function delay(ms) { await new Promise((resolvePromise) => setTimeout(resolvePromise, ms)); }
-async function ownershipRecord(path) {
-  const info = await stat(path).catch(() => null);
-  if (!info) return null;
-  const raw = await readFile(path, 'utf8').catch(() => '');
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object') return { ...parsed, age: Date.now() - info.mtimeMs };
-  } catch {}
-  const pid = Number.parseInt(raw.trim(), 10);
-  return Number.isInteger(pid) && pid > 0 ? { pid, age: Date.now() - info.mtimeMs } : { age: Date.now() - info.mtimeMs };
-}
-async function ownershipDead(owner) {
-  if (!owner?.pid) return owner?.age > OWNERSHIP_STALE_MS;
-  if (owner.boot_id && owner.process_start) {
-    return (await classifyChild(owner, { platform: process.platform })) === 'dead';
-  }
-  try { process.kill(Number(owner.pid), 0); return false; } catch (error) { return error?.code === 'ESRCH'; }
-}
-async function claimWorkspace(root) {
-  const path = join(root, OWNERSHIP_FILE);
-  await ensureRoot(root);
-  let generation = 1;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const owner = {
-      schema: 1, token: randomUUID(), generation, pid: process.pid,
-      boot_id: await bootIdentity(), process_start: await processStartIdentity(process.pid),
-      acquired_at: Date.now(),
-    };
-    try {
-      await writeFile(path, JSON.stringify(owner) + '\n', { flag: 'wx', mode: 0o600 });
-      return owner;
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error;
-      const current = await ownershipRecord(path);
-      if (!current) continue;
-      generation = Math.max(generation, (Number(current.generation) || 0) + 1);
-      if (!(await ownershipDead(current))) {
-        await delay(10);
-        continue;
-      }
-      const takeoverPath = `${path}.takeover-${hash(String(current.token || 'legacy'))}-${current.generation || 0}`;
-      const takeover = {
-        schema: 1, token: randomUUID(), expected_token: current.token,
-        expected_generation: current.generation || 0, pid: process.pid,
-        boot_id: owner.boot_id, process_start: owner.process_start, acquired_at: Date.now(),
-      };
-      try {
-        await writeFile(takeoverPath, JSON.stringify(takeover) + '\n', { flag: 'wx', mode: 0o600 });
-      } catch (takeoverError) {
-        if (takeoverError?.code !== 'EEXIST') throw takeoverError;
-        const activeTakeover = await ownershipRecord(takeoverPath);
-        if (await ownershipDead(activeTakeover)) {
-          const staleTakeover = `${takeoverPath}.${randomUUID()}.stale`;
-          try { await rename(takeoverPath, staleTakeover); await rm(staleTakeover, { force: true }); } catch {}
-        } else await delay(10);
-        continue;
-      }
-      try {
-        const latest = await ownershipRecord(path);
-        if (latest?.token !== takeover.expected_token
-          || (latest.generation || 0) !== takeover.expected_generation) continue;
-        const stale = `${path}.${randomUUID()}.stale`;
-        await rename(path, stale);
-        await rm(stale, { force: true });
-      } catch (takeoverError) {
-        if (takeoverError?.code !== 'ENOENT') await delay(10);
-      } finally {
-        const activeTakeover = await json(takeoverPath);
-        if (activeTakeover?.token === takeover.token) await rm(takeoverPath, { force: true });
-      }
-    }
-  }
-  throw new Error('workspace ownership unavailable');
-}
-async function releaseWorkspace(root, owner) {
-  const path = join(root, OWNERSHIP_FILE);
-  const current = await json(path);
-  if (current?.token === owner?.token && current?.generation === owner?.generation) await rm(path, { force: true });
-}
-async function withWorkspaceOwnership(root, callback) {
-  const owner = await claimWorkspace(root);
-  try { return await callback(owner); } finally { await releaseWorkspace(root, owner); }
-}
 async function atomicJson(path, value) { await writeAtomicFile(path, JSON.stringify(value) + '\n'); }
 async function writeAtomicFile(path, contents) {
   const temporary = `${path}.${randomUUID()}.tmp`;
@@ -122,7 +36,7 @@ async function writeAtomicFile(path, contents) {
   }
 }
 async function appendLog(root, event, fields = {}) {
-  await withWorkspaceOwnership(root, async () => {
+  try {
     const record = JSON.stringify({ schema: 1, at: new Date().toISOString(), event, ...fields }) + '\n';
     if (Buffer.byteLength(record) > LOG_MAX_RECORD) return;
     const path = join(root, 'log.jsonl');
@@ -133,7 +47,7 @@ async function appendLog(root, event, fields = {}) {
       current = '';
     }
     await writeAtomicFile(path, current + record);
-  }).catch(() => {});
+  } catch {}
 }
 function numeric(value, fallback) { const parsed = Number(value); return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback; }
 
@@ -316,13 +230,11 @@ async function inspectIntent(path, workspace, openCodeSession) {
     return { state: 'unknown', intent: null };
   }
   const intent = record.value;
-  if (intent.schema !== 1 || intent.state !== 'active') return { state: 'unknown', intent };
+  if (intent.schema !== 1) return { state: 'unknown', intent };
+  if (!intent.launch_mode) return { state: 'dead', intent };
   if (intent.launch_mode === 'claude_bg') return { ...(await queryClaude(workspace, intent)), intent };
-  if (intent.launch_state === 'planned' && !intent.child_identity) {
-    return { state: 'unknown', intent };
-  }
+  if (!intent.child_identity) return { state: 'unknown', intent };
   if (intent.launch_mode === 'claude_print' || intent.launch_mode === 'codex_exec') {
-    if (!intent.child_identity) return { state: 'unknown', intent };
     return { state: await classifyChild(intent.child_identity), intent };
   }
   if (intent.launch_mode === 'opencode_child') {
@@ -339,47 +251,11 @@ async function inspectIntent(path, workspace, openCodeSession) {
   return { state: 'unknown', intent };
 }
 
-async function archiveIntentFile(root, expected) {
-  const current = await json(join(root, 'intent.json'));
-  if (!current || current.schema !== 1 || current.state !== 'active') return true;
-  if (expected && (current.attempt_id !== expected.attempt_id || current.lease_id !== expected.lease_id
-    || current.launch_token !== expected.launch_token)) return false;
-  try {
-    await rename(join(root, 'intent.json'), join(root, `intent.${current.attempt_id}.stale`));
-    await pruneArchives(root, 'intent.', '.stale');
-    return true;
-  } catch (error) {
-    return error?.code === 'ENOENT';
-  }
-}
-async function pruneArchives(root, prefix, suffix) {
-  const entries = (await readdir(root).catch(() => []))
-    .filter((name) => name.startsWith(prefix) && name.endsWith(suffix))
-    .sort()
-    .reverse();
-  for (const entry of entries.slice(ARCHIVE_MAX)) await rm(join(root, entry), { force: true });
-}
-
-function recordSignature(record) {
-  if (!record?.present) return 'absent';
-  if (record.malformed) return 'malformed';
-  return 'value:' + JSON.stringify(record.value);
-}
-function sameRecord(left, right) { return recordSignature(left) === recordSignature(right); }
-async function workspaceMetadataSnapshot(root) {
-  return withWorkspaceOwnership(root, async () => ({
-    lease: await jsonRecord(join(root, 'lease.json')),
-    intent: await jsonRecord(join(root, 'intent.json')),
-  }));
-}
-
 async function acquireLease(root, workspace, harness, config, openCodeSession) {
   await ensureRoot(root);
   const path = join(root, 'lease.json');
-  const intentPath = join(root, 'intent.json');
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const snapshot = await workspaceMetadataSnapshot(root);
-    const leaseRecord = snapshot.lease;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const leaseRecord = await jsonRecord(path);
     if (leaseRecord.malformed || (leaseRecord.present && (!leaseRecord.value || typeof leaseRecord.value !== 'object' || Array.isArray(leaseRecord.value)))) return { status: 'orphan_unknown' };
     const existing = leaseRecord.value || null;
     if (existing) {
@@ -387,69 +263,35 @@ async function acquireLease(root, workspace, harness, config, openCodeSession) {
       const current = await classifyChild({ pid: existing.owner_pid, boot_id: existing.boot_id, process_start: existing.process_start });
       if (current === 'live') return { status: 'held' };
       if (current !== 'dead') return { status: 'orphan_unknown' };
-      const orphan = await inspectIntent(intentPath, workspace, openCodeSession);
+      const orphan = await inspectIntent(path, workspace, openCodeSession);
       if (orphan.state === 'live') return { status: 'orphan_live' };
       if (orphan.state === 'unknown') return { status: 'orphan_unknown' };
-      const result = await withWorkspaceOwnership(root, async () => {
-        const latestLease = await jsonRecord(path);
-        const latestIntent = await jsonRecord(intentPath);
-        if (!sameRecord(latestLease, snapshot.lease) || !sameRecord(latestIntent, snapshot.intent)) return { status: 'retry' };
-        if (latestLease.value?.lease_id !== existing.lease_id) return { status: 'retry' };
-        try {
-          const stale = `${path}.${randomUUID()}.stale`;
-          await rename(path, stale);
-          await rm(stale, { force: true });
-        } catch (error) {
-          return error?.code === 'ENOENT' ? { status: 'retry' } : { status: 'held' };
-        }
-        if (orphan.intent && !(await archiveIntentFile(root, orphan.intent))) return { status: 'orphan_unknown' };
-        return { status: 'retry' };
-      });
-      if (result.status !== 'retry') return result;
+      try { await rm(path); } catch (error) { if (error?.code !== 'ENOENT') return { status: 'held' }; }
       continue;
     }
-    const orphan = await inspectIntent(intentPath, workspace, openCodeSession);
-    if (orphan.state === 'live') return { status: 'orphan_live' };
-    if (orphan.state === 'unknown') return { status: 'orphan_unknown' };
     const owner = await leaseOwner();
     const lease = {
       schema: 1, lease_id: randomUUID(), workspace, harness, owner_pid: owner.pid,
       boot_id: owner.boot_id, process_start: owner.process_start, started_at: Date.now(),
       hard_deadline: new Date(Date.now() + config.lease_ttl_seconds * 1000).toISOString(),
+      launch_mode: null, launch_state: null, planned_identity: null, child_identity: null,
     };
-    const result = await withWorkspaceOwnership(root, async () => {
-      const latestLease = await jsonRecord(path);
-      const latestIntent = await jsonRecord(intentPath);
-      if (!sameRecord(latestLease, snapshot.lease) || !sameRecord(latestIntent, snapshot.intent)) return { status: 'retry' };
-      if (latestLease.present) return { status: 'retry' };
-      if (orphan.intent && !(await archiveIntentFile(root, orphan.intent))) return { status: 'orphan_unknown' };
-      try {
-        await writeFile(path, JSON.stringify(lease) + '\n', { flag: 'wx', mode: 0o600 });
-        return { status: 'acquired', path, lease };
-      } catch (error) {
-        return error?.code === 'EEXIST' ? { status: 'retry' } : { status: 'error', detail: error?.message || 'lease creation failed' };
-      }
-    });
-    if (result.status !== 'retry') return result;
+    try {
+      await writeFile(path, JSON.stringify(lease) + '\n', { flag: 'wx', mode: 0o600 });
+      return { status: 'acquired', path, lease };
+    } catch (error) {
+      if (error?.code !== 'EEXIST') return { status: 'error', detail: error?.message || 'lease creation failed' };
+    }
   }
-  return { status: 'error', detail: 'workspace lease unavailable' };
+  return { status: 'held' };
 }
 
-async function writeSkip(root, reason, extra = {}) {
+async function writeSkip(root, reason, fields = {}, leaseId) {
   const category = publicReason(reason);
-  const result = await withWorkspaceOwnership(root, async () => {
-    const leaseId = extra.__lease_id;
-    const intent = extra.__intent;
-    const fields = { ...extra };
-    delete fields.__lease_id;
-    delete fields.__intent;
+  const result = await (async () => {
     if (leaseId) {
       const lease = await json(join(root, 'lease.json'));
       if (lease?.lease_id !== leaseId) return false;
-    }
-    if (intent) {
-      const current = await json(join(root, 'intent.json'));
-      if (!current || current.attempt_id !== intent.attempt_id || current.lease_id !== intent.lease_id || current.launch_token !== intent.launch_token) return false;
     }
     const previous = await json(join(root, 'last-run.json'));
     if (previous && previous.schema !== 1) return false;
@@ -459,68 +301,36 @@ async function writeSkip(root, reason, extra = {}) {
       ...(category === reason ? {} : { detail: reason }), ...fields,
     });
     return true;
-  }).catch(() => false);
+  })().catch(() => false);
   if (result) await appendLog(root, 'skip', { reason: category, ...(category === reason ? {} : { detail: reason }) });
   return result;
 }
 
-async function retireIntent(root, tokens) {
-  return withWorkspaceOwnership(root, async () => {
-    const path = join(root, 'intent.json');
-    const lease = await json(join(root, 'lease.json'));
-    if (lease?.lease_id !== tokens.lease_id) return false;
-    const current = await json(path);
-    if (!current || current.attempt_id !== tokens.attempt_id || current.lease_id !== tokens.lease_id || current.launch_token !== tokens.launch_token) return false;
-    try { await rename(path, join(root, 'intent.' + tokens.attempt_id + '.done')); } catch (error) { if (error?.code !== 'ENOENT') return false; }
-    const entries = await readdir(root).catch(() => []);
-    for (const entry of entries.filter((name) => name.startsWith('intent.') && name.endsWith('.done')).slice(0, -8)) await rm(join(root, entry), { force: true });
-    return true;
-  }).catch(() => false);
-}
-
 async function releaseLease(root, leaseId) {
-  await withWorkspaceOwnership(root, async () => {
+  try {
     const path = join(root, 'lease.json');
     const current = await json(path);
     if (current?.lease_id === leaseId) await rm(path, { force: true });
-  }).catch(() => {});
+  } catch {}
 }
 
-async function publishIntent(root, leaseId, intent) {
-  return withWorkspaceOwnership(root, async () => {
-    const lease = await json(join(root, 'lease.json'));
-    if (lease?.lease_id !== leaseId) return { status: 'orphan_unknown' };
-    const current = await jsonRecord(join(root, 'intent.json'));
-    if (current.present) return { status: 'duplicate_intent' };
-    try {
-      await writeFile(join(root, 'intent.json'), JSON.stringify(intent) + '\n', { flag: 'wx', mode: 0o600 });
-      return { status: 'published' };
-    } catch (error) {
-      return error?.code === 'EEXIST' ? { status: 'duplicate_intent' } : { status: 'runtime_unavailable' };
-    }
-  }).catch(() => ({ status: 'runtime_unavailable' }));
-}
-
-async function liveOwnedIntent(root, workspace, openCodeSession, tokens) {
-  const current = await json(join(root, 'intent.json'));
-  if (!current || current.attempt_id !== tokens.attempt_id || current.lease_id !== tokens.lease_id
-    || current.launch_token !== tokens.launch_token || current.launch_state !== 'launched') return false;
-  const observed = await inspectIntent(join(root, 'intent.json'), workspace, openCodeSession).catch(() => ({ state: 'unknown' }));
+async function liveOwnedChild(root, workspace, openCodeSession, leaseId) {
+  const current = await json(join(root, 'lease.json'));
+  if (!current || current.lease_id !== leaseId || current.launch_state !== 'launched') return false;
+  const observed = await inspectIntent(join(root, 'lease.json'), workspace, openCodeSession).catch(() => ({ state: 'unknown' }));
   return observed.state === 'live' || observed.state === 'unknown';
 }
 
-async function updateIntent(root, tokens, update) {
-  return withWorkspaceOwnership(root, async () => {
-    const path = join(root, 'intent.json');
-    const lease = await json(join(root, 'lease.json'));
-    if (lease?.lease_id !== tokens.lease_id) return false;
+async function updateLease(root, lease, update) {
+  return (async () => {
+    const path = join(root, 'lease.json');
     const current = await json(path);
-    if (!current || current.attempt_id !== tokens.attempt_id || current.lease_id !== tokens.lease_id || current.launch_token !== tokens.launch_token) return false;
+    if (!current || current.lease_id !== lease.lease_id) return false;
     const next = { ...current, ...update };
     await atomicJson(path, next);
-    Object.assign(tokens, next);
+    Object.assign(lease, next);
     return true;
-  }).catch(() => false);
+  })().catch(() => false);
 }
 
 async function launchMode({ harness, workspace, env }) {
@@ -586,9 +396,8 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent
       session_id: String(sessionId),
       parent_session_id: String(openCodeSession.parentSessionId),
       host_identity: intent.planned_identity?.owner_identity || null,
-      launch_token: intent.launch_token,
     };
-    if (!(await updateIntent(root, intent, { launch_state: 'launched', child_identity: identity }))) {
+    if (!(await updateLease(root, intent, { launch_state: 'launched', child_identity: identity }))) {
       if (typeof openCodeSession.abort === 'function') await openCodeSession.abort(String(sessionId)).catch(() => {});
       return { category: 'orphan_unknown' };
     }
@@ -621,7 +430,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent
         await rm(settingsPath, { force: true });
         throw error;
       }
-      if (!(await updateIntent(root, intent, { launch_state: 'launched', child_identity: { manager_name: name } }))) {
+      if (!(await updateLease(root, intent, { launch_state: 'launched', child_identity: { manager_name: name } }))) {
         await terminateChild(started.child);
         await rm(settingsPath, { force: true });
         return { category: 'orphan_unknown' };
@@ -629,12 +438,12 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent
       const completion = started.completion.finally(() => rm(settingsPath, { force: true }));
       const result = await completion;
       if (result.code !== 0) {
-        const reset = await updateIntent(root, intent, { launch_mode: 'claude_print', launch_state: 'planned', child_identity: null });
+        const reset = await updateLease(root, intent, { launch_mode: 'claude_print', launch_state: 'planned', child_identity: null });
         if (!reset) return { category: 'orphan_unknown' };
         return launchModel({ launchMode: 'claude_print', workspace, env, timeoutMs, intent, openCodeSession, root });
       }
       const match = result.stdout.match(/(?:backgrounded|session|id)[^A-Za-z0-9_-]+([A-Za-z0-9_-]{4,})/i);
-      if (!(await updateIntent(root, intent, { child_identity: { manager_id: match?.[1] || null, manager_name: name } }))) {
+      if (!(await updateLease(root, intent, { child_identity: { manager_id: match?.[1] || null, manager_name: name } }))) {
         if (match?.[1]) await execFile('claude', ['stop', match[1]], { cwd: workspace, timeout: 5000 });
         return { category: 'orphan_unknown' };
       }
@@ -648,7 +457,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent
         detached: true, captureOutput: false,
       });
     const identity = await childIdentity(started.child.pid);
-    if (!(await updateIntent(root, intent, { launch_state: 'launched', child_identity: identity }))) {
+    if (!(await updateLease(root, intent, { launch_state: 'launched', child_identity: identity }))) {
       await terminateChild(started.child);
       return { category: 'orphan_unknown' };
     }
@@ -661,21 +470,17 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, intent
     detached: true, captureOutput: false,
   });
   const identity = await childIdentity(started.child.pid);
-  if (!(await updateIntent(root, intent, { launch_state: 'launched', child_identity: identity }))) {
+  if (!(await updateLease(root, intent, { launch_state: 'launched', child_identity: identity }))) {
     await terminateChild(started.child);
     return { category: 'orphan_unknown' };
   }
   return { category: null, completion: started.completion };
 }
 
-async function recordProgress(root, pre, post, count, intent) {
-  const result = await withWorkspaceOwnership(root, async () => {
-    const lease = await json(join(root, 'lease.json'));
-    const current = await json(join(root, 'intent.json'));
-    if (lease?.lease_id !== intent.lease_id || !current
-      || current.attempt_id !== intent.attempt_id
-      || current.lease_id !== intent.lease_id
-      || current.launch_token !== intent.launch_token) return false;
+async function recordProgress(root, pre, post, count, lease) {
+  const result = await (async () => {
+    const current = await json(join(root, 'lease.json'));
+    if (current?.lease_id !== lease.lease_id) return false;
     const loaded = await json(join(root, 'last-run.json'));
     if (loaded && loaded.schema !== 1) return false;
     const previous = loaded || {};
@@ -685,13 +490,13 @@ async function recordProgress(root, pre, post, count, intent) {
     const status = post.complete && post.count === 0 ? 'ok' : post.complete && !same ? 'partial' : 'failed';
     const backoff = progress ? null : Date.now() + Math.min(3600000, 300000 * Math.max(1, failureCount));
     await atomicJson(join(root, 'last-run.json'), {
-      schema: 1, completed_at: Date.now(), attempt_id: intent.attempt_id, status,
+      schema: 1, completed_at: Date.now(), lease_id: lease.lease_id, status,
       pre_fingerprint: pre.fingerprint, post_fingerprint: post.fingerprint,
       fingerprint_complete: post.complete, actionable_count: count,
       failure_count: failureCount, backoff_until: backoff,
     });
     return { status, complete: post.complete };
-  }).catch(() => false);
+  })().catch(() => false);
   if (result) await appendLog(root, 'outcome', { status: result.status, fingerprint_complete: result.complete, actionable_count: count });
   return Boolean(result);
 }
@@ -705,16 +510,14 @@ export async function runWorker({
   const config = await readIngestConfig(globalRoot, env);
   await ensureRoot(root);
   const leaseResult = await acquireLease(root, canonical, harness, config, openCodeSession);
-  if (leaseResult.status === 'held') { await writeSkip(root, 'lease_held'); return { reason: 'lease_held' }; }
-  if (leaseResult.status === 'orphan_live') { await writeSkip(root, 'orphan_live'); return { reason: 'lease_held' }; }
-  if (leaseResult.status === 'orphan_unknown') { await writeSkip(root, 'orphan_unknown'); return { reason: 'lease_held' }; }
-  if (leaseResult.status !== 'acquired') { await writeSkip(root, 'runtime_unavailable'); return { reason: 'unavailable' }; }
+  if (['held', 'orphan_live', 'orphan_unknown'].includes(leaseResult.status)) return { reason: 'lease_held' };
+  if (leaseResult.status !== 'acquired') return { reason: 'unavailable' };
   const lease = leaseResult.lease;
   const skip = async (reason, fields = {}) => {
-    await writeSkip(root, reason, { ...fields, __lease_id: lease.lease_id });
+    await writeSkip(root, reason, fields, lease.lease_id);
     return { reason: publicReason(reason) };
   };
-  let intent = null;
+  const intent = lease;
   let keepIntent = false;
   let retainOwnership = false;
   try {
@@ -754,42 +557,31 @@ export async function runWorker({
     if (!fingerprint.complete) return skip('fingerprint_unavailable', { actionable_count: fingerprint.count, actionable_fingerprint: fingerprint.fingerprint });
     const previousRecord = await json(join(root, 'last-run.json'));
     if (previousRecord && previousRecord.schema !== 1) return skip('schema_unknown');
-    const existingIntent = await json(join(root, 'intent.json'));
-    if (existingIntent && existingIntent.schema !== 1) return skip('schema_unknown');
-    if (existingIntent?.lease_id === lease.lease_id && existingIntent.actionable_fingerprint === fingerprint.fingerprint) {
-      return skip('duplicate_intent');
-    }
     const selectedLaunchMode = await launchMode({ harness, workspace: canonical, env });
-    intent = {
-      schema: 1, state: 'active', attempt_id: randomBytes(16).toString('hex'), lease_id: lease.lease_id,
-      actionable_fingerprint: fingerprint.fingerprint, launch_token: randomBytes(16).toString('hex'),
-      launch_mode: selectedLaunchMode,
-      launch_state: 'planned',
-      planned_identity: selectedLaunchMode === 'claude_bg'
+    const plannedIdentity = selectedLaunchMode === 'claude_bg'
+      ? {
+          name: 'loam-ingest-' + hash(canonical).slice(0, 10) + '-' + randomUUID().slice(0, 8),
+          owner_identity: { pid: lease.owner_pid, boot_id: lease.boot_id, process_start: lease.process_start },
+        }
+      : selectedLaunchMode === 'opencode_child'
         ? {
-            name: 'loam-ingest-' + hash(canonical).slice(0, 10) + '-' + randomUUID().slice(0, 8),
+            parent_session_id: openCodeSession?.parentSessionId || null,
+            title: 'Loam background code ingestion',
             owner_identity: { pid: lease.owner_pid, boot_id: lease.boot_id, process_start: lease.process_start },
           }
-        : selectedLaunchMode === 'opencode_child'
-          ? {
-              parent_session_id: openCodeSession?.parentSessionId || null,
-              title: 'Loam background code ingestion',
-              owner_identity: { pid: lease.owner_pid, boot_id: lease.boot_id, process_start: lease.process_start },
-            }
         : {
             boot_id: lease.boot_id,
             launch_at: new Date().toISOString(),
-            token: randomBytes(16).toString('hex'),
             owner_identity: { pid: lease.owner_pid, boot_id: lease.boot_id, process_start: lease.process_start },
-          },
+          };
+    if (!(await updateLease(root, lease, {
+      actionable_fingerprint: fingerprint.fingerprint,
+      launch_mode: selectedLaunchMode,
+      launch_state: 'planned',
+      planned_identity: plannedIdentity,
       child_identity: null,
       hard_deadline: new Date(Date.now() + config.timeout_seconds * 1000).toISOString(),
-      created_at: new Date().toISOString(),
-    };
-    const published = await publishIntent(root, lease.lease_id, intent);
-    if (published.status !== 'published') {
-      return skip(published.status);
-    }
+    }))) return skip('orphan_unknown');
     let launch;
     try {
       launch = modelRunner
@@ -797,11 +589,11 @@ export async function runWorker({
         : await launchModel({ launchMode: intent.launch_mode, workspace: canonical, env: { ...env, LOAM_INGEST_GLOBAL_ROOT: globalRoot }, timeoutMs: config.timeout_seconds * 1000, intent, openCodeSession, root });
     } catch (error) {
       if (intent.child_identity) { keepIntent = true; retainOwnership = true; }
-      return skip('runtime_unavailable', { detail: error instanceof Error ? error.message.slice(0, 256) : String(error).slice(0, 256), __intent: intent });
+      return skip('runtime_unavailable', { detail: error instanceof Error ? error.message.slice(0, 256) : String(error).slice(0, 256) });
     }
     if (launch.category) {
       if (['orphan_live', 'orphan_unknown'].includes(launch.category)) { keepIntent = true; retainOwnership = true; }
-      return skip(launch.category, { __intent: intent });
+      return skip(launch.category);
     }
     const result = await (launch.completion || Promise.resolve({ code: 0 }));
     if (!launch.background && result.category === 'timeout' && intent.child_identity) {
@@ -810,7 +602,7 @@ export async function runWorker({
         keepIntent = true;
         retainOwnership = true;
         const reason = childState === 'live' ? 'orphan_live' : 'orphan_unknown';
-        return skip(reason, { __intent: intent });
+        return skip(reason);
       }
     }
     if (launch.background) {
@@ -830,7 +622,7 @@ export async function runWorker({
         keepIntent = true;
         retainOwnership = true;
         const reason = manager.state === 'live' ? 'orphan_live' : 'orphan_unknown';
-        return skip(reason, { __intent: intent });
+        return skip(reason);
       }
     }
     const postState = await probeFullState({ readiness: ready, workspace: canonical, timeoutMs: 20000, runner: runtimeRunner });
@@ -846,11 +638,10 @@ export async function runWorker({
     await recordProgress(root, fingerprint, post, fingerprint.count, intent);
     return { reason: result?.category === 'timeout' ? 'unavailable' : 'ok' };
   } finally {
-    if (intent && !keepIntent && await liveOwnedIntent(root, canonical, openCodeSession, intent)) {
+    if (!keepIntent && await liveOwnedChild(root, canonical, openCodeSession, lease.lease_id)) {
       keepIntent = true;
       retainOwnership = true;
     }
-    if (intent && !keepIntent) await retireIntent(root, intent);
     if (!retainOwnership) await releaseLease(root, lease.lease_id);
   }
 }
@@ -865,11 +656,9 @@ export async function ingestStatus({ globalRoot, workspace, env = process.env } 
     : lease
     ? await classifyChild({ pid: lease.owner_pid, boot_id: lease.boot_id, process_start: lease.process_start })
     : 'dead';
-  const intentRecord = await jsonRecord(join(root, 'intent.json'));
-  const intent = intentRecord.value || null;
   const lastRun = await json(join(root, 'last-run.json'));
-  const intentState = intentRecord.present
-    ? await inspectIntent(join(root, 'intent.json'), canonical)
+  const intentState = leaseRecord.present
+    ? await inspectIntent(join(root, 'lease.json'), canonical)
     : { state: 'dead' };
   let exclusions;
   try { exclusions = { ready: true, path: await resolveExclusions(env.LOAM_INGEST_SKILLS_ROOT) }; }
@@ -878,7 +667,7 @@ export async function ingestStatus({ globalRoot, workspace, env = process.env } 
     .split('\n').filter(Boolean).slice(-16).map((line) => jsonLine(line)).filter(Boolean);
   return {
     schema: 1, workspace: canonical, enabled: (await readIngestConfig(globalRoot, env)).enabled,
-    lease, lease_state: leaseState, intent,
+    lease, lease_state: leaseState, intent: lease?.launch_mode ? lease : null,
     intent_state: intentState.state,
     orphan: intentState.state === 'live' || intentState.state === 'unknown',
     exclusions,

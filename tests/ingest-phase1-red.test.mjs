@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -139,18 +138,14 @@ test('ambiguous OpenCode launch persists host identity with the child identity',
   });
   assert.equal(result.reason, 'lease_held');
   const runPath = runRoot(root, workspace);
-  const intent = JSON.parse(await readFile(join(runPath, 'intent.json'), 'utf8'));
   const lease = JSON.parse(await readFile(join(runPath, 'lease.json'), 'utf8'));
-  assert.equal(intent.schema, 1);
-  assert.equal(intent.state, 'active');
-  assert.equal(intent.launch_state, 'launched');
-  assert.equal(intent.child_identity.session_id, 'child-ambiguous');
-  assert.equal(intent.child_identity.parent_session_id, 'parent');
-  assert.ok(intent.child_identity.host_identity?.pid);
-  assert.ok(intent.child_identity.host_identity?.boot_id);
-  assert.ok(intent.child_identity.host_identity?.process_start);
-  assert.equal(intent.child_identity.launch_token, intent.launch_token);
-  assert.equal(lease.lease_id, intent.lease_id);
+  assert.equal(lease.schema, 1);
+  assert.equal(lease.launch_state, 'launched');
+  assert.equal(lease.child_identity.session_id, 'child-ambiguous');
+  assert.equal(lease.child_identity.parent_session_id, 'parent');
+  assert.ok(lease.child_identity.host_identity?.pid);
+  assert.ok(lease.child_identity.host_identity?.boot_id);
+  assert.ok(lease.child_identity.host_identity?.process_start);
   assert.ok(statusCalls >= 1);
 });
 
@@ -297,7 +292,7 @@ test('status reports malformed ownership as unknown and keeps bounded diagnostic
   const { root, workspace } = await fixture();
   const runPath = runRoot(root, workspace);
   await mkdir(runPath, { recursive: true });
-  await writeFile(join(runPath, 'intent.json'), '{malformed');
+  await writeFile(join(runPath, 'lease.json'), '{malformed');
   const status = await ingestStatus({ globalRoot: root, workspace, env: { LOAM_INGEST_BACKGROUND: '1' } });
   assert.equal(status.intent_state, 'unknown');
   assert.equal(status.orphan, true);
@@ -330,10 +325,7 @@ test('live OpenCode lease returns held without querying the active child', async
   await writeFile(join(runPath, 'lease.json'), JSON.stringify({
     schema: 1, lease_id: 'live-opencode', owner_pid: process.pid, ...identity,
     started_at: Date.now(), hard_deadline: new Date(0).toISOString(),
-  }));
-  await writeFile(join(runPath, 'intent.json'), JSON.stringify({
-    schema: 1, state: 'active', attempt_id: 'active-opencode', lease_id: 'live-opencode',
-    launch_token: 'launch-opencode', launch_mode: 'opencode_child', launch_state: 'launched',
+    launch_mode: 'opencode_child', launch_state: 'launched',
     child_identity: { session_id: 'child-live', parent_session_id: 'parent-live' },
   }));
   let statusCalls = 0;
@@ -351,43 +343,7 @@ test('live OpenCode lease returns held without querying the active child', async
   assert.equal(statusCalls, 0);
 });
 
-test('simultaneous stale reclaimers recover a crashed takeover', async () => {
-  const { root, workspace } = await fixture();
-  const moduleUrl = new URL('../integration/ingest.mjs', import.meta.url).href;
-  const runPath = runRoot(root, workspace);
-  await mkdir(runPath, { recursive: true });
-  await writeFile(join(runPath, '.ownership.lock'), JSON.stringify({
-    schema: 1, token: 'stale-owner', generation: 7, pid: 999999,
-    boot_id: 'stale-boot', process_start: 'stale-start', acquired_at: Date.now() - 60000,
-  }));
-  const takeoverName = `.ownership.lock.takeover-${createHash('sha256').update('stale-owner').digest('hex')}-7`;
-  await writeFile(join(runPath, takeoverName), JSON.stringify({
-    schema: 1, token: 'crashed-takeover', expected_token: 'stale-owner', expected_generation: 7,
-    pid: 999998, boot_id: 'crashed-boot', process_start: 'crashed-start', acquired_at: Date.now() - 60000,
-  }));
-  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { enabled: true } }));
-  const script = `import { gate } from ${JSON.stringify(moduleUrl)};
-const result = await gate({
-  harness: 'codex', payload: { cwd: process.env.LOAM_TEST_WORKSPACE, event_id: process.env.LOAM_TEST_EVENT },
-  globalRoot: process.env.LOAM_TEST_GLOBAL_ROOT,
-  env: { ...process.env, LOAM_INGEST_BACKGROUND: '1', LOAM_INGEST_MIN_INTERVAL: '0' },
-});
-process.stdout.write(JSON.stringify(result) + '\\n');`;
-  const launch = (index) => {
-    const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
-      env: { ...process.env, LOAM_TEST_WORKSPACE: workspace, LOAM_TEST_GLOBAL_ROOT: root, LOAM_TEST_EVENT: `stale-${index}` },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let output = '';
-    child.stdout.on('data', (chunk) => { output += chunk; });
-    return new Promise((resolve) => child.once('close', (code, signal) => resolve({ code, signal, output })));
-  };
-  const results = await Promise.all(Array.from({ length: 12 }, (_, index) => launch(index)));
-  assert.ok(results.every(({ code }) => code === 0));
-  assert.ok(results.every(({ output }) => JSON.parse(output).action === 'spawn_worker'));
-});
-
-test('workspace ownership distinguishes unknown launch crashes from recoverable dead-owner claims', async () => {
+test('workspace lease blocks contenders and distinguishes ambiguous launch crashes', async () => {
   const moduleUrl = new URL('../integration/ingest.mjs', import.meta.url).href;
   const script = `import { writeFileSync } from 'node:fs';
 import { runWorker } from ${JSON.stringify(moduleUrl)};
