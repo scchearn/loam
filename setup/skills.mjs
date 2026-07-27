@@ -97,7 +97,7 @@ export async function ensureGlobalSkills(options = {}) {
   if (current.ready) return current;
 
   const added = await runSkills(
-    ['add', 'scchearn/loam', '--global', '--agent', 'claude-code', '--yes'],
+    ['add', 'scchearn/loam', '--global', '--agent', '*', '--yes'],
     { cwd: options.cwd, runner: options.runner },
   );
   if (!added.ok) {
