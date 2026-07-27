@@ -6,6 +6,7 @@ import { test } from 'node:test';
 
 import { installHarnesses, detectHarnesses } from '../setup/harnesses.mjs';
 import { uninstall } from '../setup/uninstall.mjs';
+import { childIdentity } from '../integration/ingest-process.mjs';
 
 async function readyFixture() {
   const home = await mkdtemp(join(tmpdir(), 'loam-uninstall-'));
@@ -186,6 +187,22 @@ test('uninstall blocks on malformed worker ownership state', async () => {
   const runPath = join(globalRoot, 'run', 'malformed');
   await mkdir(runPath, { recursive: true });
   await writeFile(join(runPath, 'lease.json'), '{not-json');
+
+  const code = await uninstall({ home, globalRoot, yes: true, output: { write: () => {} } });
+
+  assert.equal(code, 1);
+  assert.equal(await exists(globalRoot), true);
+});
+
+test('uninstall blocks while a background worker lease is live', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const runPath = join(globalRoot, 'run', 'active');
+  const identity = await childIdentity(process.pid);
+  await mkdir(runPath, { recursive: true });
+  await writeFile(join(runPath, 'lease.json'), JSON.stringify({
+    schema: 1, lease_id: 'active', workspace: home, harness: 'codex',
+    owner_pid: process.pid, boot_id: identity.boot_id, process_start: identity.process_start,
+  }));
 
   const code = await uninstall({ home, globalRoot, yes: true, output: { write: () => {} } });
 

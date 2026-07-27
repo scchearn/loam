@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
 import { fingerprintActionable } from '../integration/ingest-fingerprint.mjs';
-import { gate, runRoot, runWorker } from '../integration/ingest.mjs';
+import { gate, ingestStatus, runRoot, runWorker } from '../integration/ingest.mjs';
 import { bootIdentity, childIdentity, processDescriptor, resolveExecutable } from '../integration/ingest-process.mjs';
 
 async function fixture() {
@@ -366,4 +366,92 @@ test('process descriptors resolve executables and pass Windows batch arguments d
     command: batch, platform: 'win32', env: { ComSpec: join(tmpdir(), 'missing-cmd.exe') },
   }), /ComSpec/);
   assert.equal(resolveExecutable(process.execPath), process.execPath);
+});
+
+test('Claude uses a help-only capability check, falls back cleanly, and receives the source-safety prompt', async () => {
+  const { root, workspace, wiki, skills } = await fixture();
+  const bin = await mkdtemp(join(tmpdir(), 'loam-claude-'));
+  const command = join(bin, 'claude');
+  const calls = join(bin, 'calls.jsonl');
+  await writeFile(command, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.LOAM_TEST_CALLS, JSON.stringify(args) + '\\n');
+if (args[0] === '--help') { process.stdout.write('--bg'); process.exit(0); }
+process.exit(args[0] === '--bg' ? 1 : 0);
+`);
+  await chmod(command, 0o700);
+  const source = await readFile(join(workspace, 'src', 'a.js'), 'utf8');
+  const result = await runWorker({
+    harness: 'claude', workspace, globalRoot: root, skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' },
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH || ''}`, LOAM_TEST_CALLS: calls, LOAM_INGEST_BACKGROUND: '1' },
+    runtimeRunner: async ({ args }) => args[0] === 'state'
+      ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+      : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
+  });
+  const argv = (await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(result.reason, 'ok');
+  assert.deepEqual(argv.map((args) => args[0]), ['--help', '--bg', '-p']);
+  assert.match(argv.at(-1)[1], /Do not modify source files, commit, or push/u);
+  assert.equal(await readFile(join(workspace, 'src', 'a.js'), 'utf8'), source);
+});
+
+test('separate workspaces proceed independently while a live workspace lease remains held', async () => {
+  const { root, workspace, skills } = await fixture();
+  const identity = await childIdentity(process.pid);
+  const heldRoot = runRoot(root, workspace);
+  await mkdir(heldRoot, { recursive: true });
+  await writeFile(join(heldRoot, 'lease.json'), JSON.stringify({
+    schema: 1, lease_id: 'held', workspace, harness: 'codex', owner_pid: process.pid, ...identity,
+  }));
+
+  const second = join(root, 'workspace-two');
+  const secondWiki = join(second, 'wiki');
+  await mkdir(join(second, 'src'), { recursive: true });
+  await mkdir(join(secondWiki, 'code'), { recursive: true });
+  await writeFile(join(second, 'src', 'b.js'), 'export const b = 2;\n');
+  let launches = 0;
+  const result = await runWorker({
+    harness: 'codex', workspace: second, globalRoot: root, skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' }, env: { LOAM_INGEST_BACKGROUND: '1' },
+    runtimeRunner: async ({ args }) => args[0] === 'state'
+      ? { code: 0, stdout: JSON.stringify({ wiki_root: secondWiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+      : { code: 0, stdout: JSON.stringify([{ path: 'src/b.js', mtime: '1', reason: 'new' }]), stderr: '' },
+    modelRunner: async () => { launches += 1; return { completion: Promise.resolve({ code: 0 }) }; },
+  });
+  assert.equal(result.reason, 'ok');
+  assert.equal(launches, 1);
+  assert.ok(await readFile(join(heldRoot, 'lease.json'), 'utf8'));
+});
+
+test('a live model child on a dead worker lease prevents a second launch', async () => {
+  const { root, workspace, skills } = await fixture();
+  const child = await childIdentity(process.pid);
+  const leaseRoot = runRoot(root, workspace);
+  await mkdir(leaseRoot, { recursive: true });
+  await writeFile(join(leaseRoot, 'lease.json'), JSON.stringify({
+    schema: 1, lease_id: 'orphan-child', workspace, harness: 'codex',
+    owner_pid: 999999, boot_id: child.boot_id, process_start: 'dead',
+    launch_mode: 'codex_exec', launch_state: 'launched', child_identity: child,
+  }));
+  let launches = 0;
+  const result = await runWorker({
+    harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
+    env: { LOAM_INGEST_BACKGROUND: '1' },
+    runtimeRunner: async () => { throw new Error('must not probe while child is live'); },
+    modelRunner: async () => { launches += 1; },
+  });
+  assert.equal(result.reason, 'lease_held');
+  assert.equal(launches, 0);
+});
+
+test('ingestStatus always returns JSON-shaped state, including malformed leases', async () => {
+  const { root, workspace } = await fixture();
+  const leaseRoot = runRoot(root, workspace);
+  await mkdir(leaseRoot, { recursive: true });
+  await writeFile(join(leaseRoot, 'lease.json'), '{malformed');
+  const status = await ingestStatus({ globalRoot: root, workspace, env: { LOAM_INGEST_BACKGROUND: '1' } });
+  assert.equal(JSON.parse(JSON.stringify(status)).lease_state, 'unknown');
+  assert.equal(status.intent_state, 'unknown');
 });
