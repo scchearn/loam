@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
@@ -11,7 +11,7 @@ import { gate, ingestStatus, runRoot, runWorker } from '../integration/ingest.mj
 import { bootIdentity, childIdentity, processDescriptor, resolveExecutable } from '../integration/ingest-process.mjs';
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), 'loam-ingest-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'loam-ingest-')));
   const workspace = join(root, 'workspace');
   const wiki = join(workspace, 'wiki');
   const skills = join(root, 'skills');
@@ -371,21 +371,26 @@ test('process descriptors resolve executables and pass Windows batch arguments d
 test('Claude uses a help-only capability check, falls back cleanly, and receives the source-safety prompt', async () => {
   const { root, workspace, wiki, skills } = await fixture();
   const bin = await mkdtemp(join(tmpdir(), 'loam-claude-'));
-  const command = join(bin, 'claude');
+  const command = join(bin, process.platform === 'win32' ? 'claude.cmd' : 'claude');
+  const script = process.platform === 'win32' ? join(bin, 'claude-shim.cjs') : command;
   const calls = join(bin, 'calls.jsonl');
-  await writeFile(command, `#!/usr/bin/env node
+  await writeFile(script, `#!/usr/bin/env node
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.LOAM_TEST_CALLS, JSON.stringify(args) + '\\n');
 if (args[0] === '--help') { process.stdout.write('--bg'); process.exit(0); }
 process.exit(args[0] === '--bg' ? 1 : 0);
 `);
-  await chmod(command, 0o700);
+  if (process.platform === 'win32') {
+    await writeFile(command, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+  } else {
+    await chmod(command, 0o700);
+  }
   const source = await readFile(join(workspace, 'src', 'a.js'), 'utf8');
   const result = await runWorker({
     harness: 'claude', workspace, globalRoot: root, skillsRoot: skills,
     readiness: { ready: true, runtimePath: '/private/loam' },
-    env: { ...process.env, PATH: `${bin}:${process.env.PATH || ''}`, LOAM_TEST_CALLS: calls, LOAM_INGEST_BACKGROUND: '1' },
+    env: { ...process.env, PATH: [bin, process.env.PATH || ''].filter(Boolean).join(delimiter), LOAM_TEST_CALLS: calls, LOAM_INGEST_BACKGROUND: '1' },
     runtimeRunner: async ({ args }) => args[0] === 'state'
       ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
       : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },

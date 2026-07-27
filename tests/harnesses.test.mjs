@@ -217,7 +217,7 @@ test('Codex uses matcher groups, preserves unrelated hooks, and ignores ordinary
     pluginVersion: '0.8.3',
     detected: { opencode: { id: 'opencode', state: 'absent' }, claude: { id: 'claude', state: 'absent' }, cursor: { id: 'cursor', state: 'absent' }, codex: { id: 'codex', state: 'detected', root: join(home, '.codex') } },
   });
-  assert.equal(result.codex.state, 'ready');
+  assert.equal(result.codex.state, 'ready', JSON.stringify(result.codex));
   const config = JSON.parse(await readFile(join(home, '.codex', 'hooks.json'), 'utf8'));
   assert.equal(config.hooks.Stop.length, 2);
   assert.deepEqual(config.hooks.Stop[0].hooks, [unrelated]);
