@@ -8,7 +8,7 @@ import { test } from 'node:test';
 
 import { fingerprintActionable } from '../integration/ingest-fingerprint.mjs';
 import { gate, ingestStatus, runRoot, runWorker } from '../integration/ingest.mjs';
-import { bootIdentity, childIdentity, processDescriptor, resolveExecutable } from '../integration/ingest-process.mjs';
+import { bootIdentity, childIdentity, processDescriptor, resolveExecutable, startTracked } from '../integration/ingest-process.mjs';
 
 async function fixture() {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'loam-ingest-')));
@@ -361,7 +361,7 @@ test('published adapters load only the staged integration after the source tree 
   }
 });
 
-test('process descriptors resolve executables and pass Windows batch arguments directly', async () => {
+test('process descriptors quote Windows batch commands without a shell', async () => {
   const descriptor = processDescriptor({
     command: process.execPath,
     args: ['--version'],
@@ -378,18 +378,45 @@ test('process descriptors resolve executables and pass Windows batch arguments d
     env: { ComSpec: process.execPath, SystemRoot: '/Windows' },
   });
   assert.equal(windows.kind, 'cmd');
-  assert.deepEqual(windows.args, ['/d', '/s', '/c', batch, 'path with spaces & punctuation']);
+  assert.deepEqual(windows.args, ['/d', '/s', '/c', `""${batch}" "path with spaces & punctuation""`]);
+  assert.equal(windows.windowsVerbatimArguments, true);
   const quoted = processDescriptor({
     command: batch,
-    args: ['{"worktree":{"bgIsolation":"none"}}', '%PATH%', '!value!'],
+    args: ['say "yes"', '!value!'],
     platform: 'win32',
     env: { ComSpec: process.execPath },
   });
-  assert.deepEqual(quoted.args.slice(4), ['{"worktree":{"bgIsolation":"none"}}', '%PATH%', '!value!']);
+  assert.equal(quoted.args[3], `""${batch}" "say ""yes""" "!value!""`);
+  assert.throws(() => processDescriptor({
+    command: batch,
+    args: ['%PATH%'],
+    platform: 'win32',
+    env: { ComSpec: process.execPath },
+  }), /percent expansion/);
   assert.throws(() => processDescriptor({
     command: batch, platform: 'win32', env: { ComSpec: join(tmpdir(), 'missing-cmd.exe') },
   }), /ComSpec/);
   assert.equal(resolveExecutable(process.execPath), process.execPath);
+});
+
+test('Windows batch launch executes from a spaced path', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loam batch '));
+  const batch = join(root, 'echo args.cmd');
+  try {
+    await writeFile(batch, '@echo off\r\necho %~1^|%~2\r\n');
+    const started = startTracked({
+      command: batch,
+      args: ['alpha beta', 'gamma'],
+      cwd: root,
+      env: { ...process.env },
+      timeoutMs: 10_000,
+    });
+    const result = await started.completion;
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout.trim(), 'alpha beta|gamma');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('Claude uses a help-only capability check, falls back cleanly, and receives the source-safety prompt', async () => {
