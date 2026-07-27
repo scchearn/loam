@@ -10,7 +10,7 @@ import { formatContext, formatNativeRuntimeCommand } from '../integration/contex
 import { runIntegration } from '../integration/loam.mjs';
 import { detectLegacyShadow } from '../integration/shadow.mjs';
 import { detectTarget, SUPPORTED_TARGETS, runtimePath } from '../integration/paths.mjs';
-import { invokeRuntime, probeState } from '../integration/runtime.mjs';
+import { invokeRuntime, probeState, verifyRuntimeFile } from '../integration/runtime.mjs';
 
 const target = detectTarget();
 
@@ -191,6 +191,25 @@ test('runtime readiness rejects symlinked executables', async (t) => {
   assert.equal(result.category, 'runtime_untrusted');
 });
 
+test('runtime trust accepts a regular file through an aliased root', async (t) => {
+  if (process.platform === 'win32') return t.skip('symlink privileges vary on Windows');
+  const physicalRoot = await mkdtemp(join(tmpdir(), 'loam-physical-root-'));
+  const aliasParent = await mkdtemp(join(tmpdir(), 'loam-alias-parent-'));
+  const aliasRoot = join(aliasParent, 'loam');
+  const runtimeFile = join(aliasRoot, 'runtime');
+  const bytes = 'fixture runtime';
+  await writeFile(join(physicalRoot, 'runtime'), bytes);
+  await symlink(physicalRoot, aliasRoot);
+
+  const result = await verifyRuntimeFile({
+    globalRoot: aliasRoot,
+    runtimePath: runtimeFile,
+    expectedSha256: createHash('sha256').update(bytes).digest('hex'),
+  });
+
+  assert.equal(result.ready, true);
+});
+
 test('runtime invocation times out and bounds stderr diagnostics', async () => {
   const result = await invokeRuntime({
     runtimePath: '/contained/runtime',
@@ -254,6 +273,13 @@ test('legacy shadow detection is report-only and rejects escaping symlinks', asy
   const escaped = await detectLegacyShadow(workspace);
   assert.equal(escaped.unsafe.length, 1);
   assert.equal(escaped.shadows.length, 1);
+});
+
+test('legacy shadow detection handles a workspace with no shadow directories', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'loam-empty-workspace-'));
+  const report = await detectLegacyShadow(workspace);
+
+  assert.deepEqual(report, { shadows: [], unsafe: [] });
 });
 
 test('status and hook commands share one read-only integration boundary', async () => {

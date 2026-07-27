@@ -1,10 +1,7 @@
-import { lstat, readdir, realpath } from 'node:fs/promises';
-import { join, relative, resolve } from 'node:path';
+import { lstat, readdir } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 
-function isInside(root, candidate) {
-  const relativePath = relative(resolve(root), resolve(candidate));
-  return !relativePath.startsWith('..') && !relativePath.startsWith('/');
-}
+import { assertPhysicalInside } from './paths.mjs';
 
 async function inspect(candidate, workspace, kind, report) {
   let info;
@@ -14,15 +11,11 @@ async function inspect(candidate, workspace, kind, report) {
     return false;
   }
 
-  let resolved;
   try {
-    resolved = await realpath(candidate);
-  } catch {
-    report.unsafe.push({ path: candidate, kind, reason: 'unresolvable path' });
-    return false;
-  }
-  if (!isInside(workspace, resolved)) {
-    report.unsafe.push({ path: candidate, kind, reason: 'path escapes workspace' });
+    await assertPhysicalInside(workspace, candidate, kind);
+  } catch (error) {
+    const reason = error?.code === 'PATH_ESCAPE' ? 'path escapes workspace' : 'unresolvable path';
+    report.unsafe.push({ path: candidate, kind, reason });
     return false;
   }
   return info;
@@ -33,7 +26,7 @@ export async function detectLegacyShadow(workspaceRoot) {
   const report = { shadows: [], unsafe: [] };
   const skillsRoot = join(workspace, '.agents', 'skills');
   const skillsInfo = await inspect(skillsRoot, workspace, 'project-skills', report);
-  if (skillsInfo?.isDirectory()) {
+  if (skillsInfo && skillsInfo.isDirectory()) {
     for (const entry of await readdir(skillsRoot, { withFileTypes: true })) {
       if (!entry.name.startsWith('loam-')) continue;
       const path = join(skillsRoot, entry.name);

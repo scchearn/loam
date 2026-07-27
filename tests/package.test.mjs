@@ -15,6 +15,7 @@ async function packedRoot() {
   const directory = await mkdtemp(join(tmpdir(), 'loam-packaged-contract-'));
   const { stdout } = await execFileAsync(npmCommand, ['pack', '--silent', '--pack-destination', directory], {
     cwd: packageRoot,
+    shell: process.platform === 'win32',
   });
   const tarball = join(directory, stdout.trim().split(/\r?\n/).at(-1));
   await execFileAsync('tar', ['-xzf', tarball], { cwd: directory });

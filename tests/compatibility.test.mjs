@@ -13,6 +13,7 @@ const execFileAsync = promisify(execFile);
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 const loaderPath = join(packageRoot, '.opencode', 'plugins', 'loam.js');
 const hookPath = join(packageRoot, 'hooks', 'session-start.mjs');
+const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 async function runHook(env, payload = {}) {
   return new Promise((resolve, reject) => {
@@ -62,13 +63,13 @@ test('packed tarball contains a loadable adapter through the preserved main entr
   const extracted = join(destination, 'extracted');
   await mkdir(extracted);
   try {
-    const { stdout } = await execFileAsync('npm', [
+    const { stdout } = await execFileAsync(npmCommand, [
       'pack',
       '--ignore-scripts',
       '--silent',
       '--pack-destination',
       destination,
-    ], { cwd: packageRoot });
+    ], { cwd: packageRoot, shell: process.platform === 'win32' });
     const tarball = join(destination, stdout.trim().split(/\r?\n/).at(-1));
     await execFileAsync('tar', ['-xzf', tarball], { cwd: extracted });
     const packedRoot = join(extracted, 'package');
