@@ -1,10 +1,11 @@
-import { readFile, realpath, stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { readInstallMetadata, readRequiredVersion, readSkillContent } from '../integration/metadata.mjs';
+import { resolveExclusions } from '../integration/ingest.mjs';
 import { checkReadiness, probeState } from '../integration/runtime.mjs';
 import { verifyGlobalSkills } from './skills.mjs';
 
@@ -57,24 +58,8 @@ async function executeCodexAdapter(assetPath, workspace, integrationPath) {
 }
 
 async function verifyIngestExclusions(skillsRoot) {
-  let physicalRoot;
-  try { physicalRoot = await realpath(skillsRoot); } catch { return { ready: false, category: 'exclusions_unavailable' }; }
-  const candidates = [
-    join(skillsRoot, 'loam-ingesting-codebase', 'references', 'ingestion-exclusions.md'),
-    join(skillsRoot, 'loam-memory', 'loam-ingesting-codebase', 'references', 'ingestion-exclusions.md'),
-  ];
-  for (const path of candidates) {
-    try {
-      const physicalPath = await realpath(path);
-      const rel = relative(resolve(physicalRoot), physicalPath);
-      if (!rel || rel.startsWith('..') || isAbsolute(rel)) continue;
-      if (await fileExists(physicalPath)) {
-        await readFile(physicalPath);
-        return { ready: true, path: physicalPath };
-      }
-    } catch {}
-  }
-  return { ready: false, category: 'exclusions_unavailable' };
+  try { return { ready: true, path: await resolveExclusions(skillsRoot) }; }
+  catch (error) { return { ready: false, category: error.reason || 'exclusions_unavailable' }; }
 }
 
 async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, globalRoot) {
