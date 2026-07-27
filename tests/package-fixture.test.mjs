@@ -17,6 +17,7 @@ test('dry-run package contains the scoped executable and legacy OpenCode entry',
   const result = spawnSync(npmCommand, ['pack', '--dry-run', '--json'], {
     cwd: rootPath,
     encoding: 'utf8',
+    shell: process.platform === 'win32',
   });
 
   assert.equal(result.status, 0, result.stderr);

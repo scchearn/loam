@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { lstat, readFile, realpath, stat } from 'node:fs/promises';
+import { lstat, readFile, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 import { readInstallMetadata, readRequiredVersion, readSkillContent, validateInstallMetadata } from './metadata.mjs';
-import { assertInside, detectTarget, resolveSkillsRoot, runtimePath } from './paths.mjs';
+import { assertInside, assertPhysicalInside, detectTarget, resolveSkillsRoot, runtimePath } from './paths.mjs';
 
 export const MAX_DETAIL = 4096;
 const MAX_RUNTIME_BYTES = 64 * 1024 * 1024;
@@ -120,7 +120,7 @@ export async function verifyRuntimeFile({ runtimePath, globalRoot, expectedSha25
     if (!info.isFile() || info.isSymbolicLink()) {
       return unavailable('runtime_untrusted', 'runtime path is not a regular file');
     }
-    assertInside(root, await realpath(candidate), 'runtime physical path');
+    await assertPhysicalInside(root, candidate, 'runtime physical path');
     if (info.size > MAX_RUNTIME_BYTES) {
       return unavailable('runtime_untrusted', 'runtime file exceeds the supported size limit');
     }

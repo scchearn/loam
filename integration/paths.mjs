@@ -1,4 +1,5 @@
 import { homedir } from 'node:os';
+import { realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 
 export const SUPPORTED_TARGETS = Object.freeze([
@@ -14,9 +15,16 @@ export function assertInside(root, candidate, label = 'path') {
   const resolvedCandidate = resolve(candidate);
   const relativePath = relative(resolvedRoot, resolvedCandidate);
   if (relativePath.startsWith('..') || isAbsolute(relativePath)) {
-    throw new Error(`${label} escapes global Loam root: ${candidate}`);
+    const error = new Error(`${label} escapes global Loam root: ${candidate}`);
+    error.code = 'PATH_ESCAPE';
+    throw error;
   }
   return resolvedCandidate;
+}
+
+export async function assertPhysicalInside(root, candidate, label = 'path') {
+  const [physicalRoot, physicalCandidate] = await Promise.all([realpath(root), realpath(candidate)]);
+  return assertInside(physicalRoot, physicalCandidate, label);
 }
 
 export function detectTarget({

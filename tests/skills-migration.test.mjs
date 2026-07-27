@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -245,6 +245,29 @@ test('escaping project skill paths are blocked and home projects are never scann
   assert.equal(report.unsafe.length, 1);
   assert.equal(report.skillNames.length, 0);
   assert.ok(calls.every((call) => call.cwd === workspace));
+});
+
+test('legacy detection accepts project paths through an aliased workspace root', async (t) => {
+  if (process.platform === 'win32') return t.skip('symlink privileges vary on Windows');
+  const physical = await mkdtemp(join(tmpdir(), 'loam-project-physical-'));
+  const aliasParent = await mkdtemp(join(tmpdir(), 'loam-project-alias-'));
+  const workspace = join(aliasParent, 'workspace');
+  await symlink(physical, workspace);
+  const projectSkill = join(workspace, '.agents', 'skills', 'loam-using');
+  await mkdir(projectSkill, { recursive: true });
+
+  const report = await detectLegacyProject({
+    workspace,
+    packageRoot,
+    runner: async () => ({
+      code: 0,
+      stdout: JSON.stringify({ skills: [{ name: 'loam::using', path: projectSkill }] }),
+      stderr: '',
+    }),
+  });
+
+  assert.deepEqual(report.unsafe, []);
+  assert.equal(report.paths.length, 1);
 });
 
 test('unrelated plugin metadata is not treated as an owned Loam marker', async () => {

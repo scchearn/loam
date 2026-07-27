@@ -148,7 +148,7 @@ test('ready runtime is reused only after digest verification and a smoke test', 
     globalRoot,
     version: '0.9.1',
     target,
-    releaseBaseUrl: 'file:///missing-release',
+    releaseBaseUrl: pathToFileURL(join(tmpdir(), 'missing-release')).href,
     expectedSha256: first.sha256,
     smokeRunner: async () => {
       smokeCalls += 1;

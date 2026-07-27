@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -22,7 +22,7 @@ test('package exposes the scoped setup executable and pinned Skills CLI', async 
   assert.equal(packageJson.bin.loam, 'bin/loam.mjs');
   assert.equal(packageJson.dependencies.skills, SKILLS_CLI_VERSION);
   assert.match(HELP_TEXT, /@scchearn\/loam setup/);
-  assert.ok(root.endsWith('/loam/'));
+  assert.equal(basename(resolve(root)), 'loam');
 });
 
 test('setup accepts the confirmation and dry-run flags', () => {

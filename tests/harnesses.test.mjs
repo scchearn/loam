@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 
 import { createClaudeAdapter, workspaceFromPayload as claudeWorkspace } from '../adapters/claude-session-start.mjs';
@@ -33,19 +33,20 @@ test('Claude and Cursor adapters use payload workspace roots and emit documented
   const getContext = async ({ workspace }) => `context for ${workspace}`;
   const claude = createClaudeAdapter({ getContext });
   const cursor = createCursorAdapter({ getContext });
-  const payload = { cwd: '/payload/workspace', workspace: { root: '/nested/root' } };
+  const workspace = resolve('/payload/workspace');
+  const payload = { cwd: workspace, workspace: { root: resolve('/nested/root') } };
 
-  assert.equal(claudeWorkspace(payload), '/payload/workspace');
-  assert.equal(cursorWorkspace(payload), '/payload/workspace');
+  assert.equal(claudeWorkspace(payload), workspace);
+  assert.equal(cursorWorkspace(payload), workspace);
   const claudeOutput = await claude(payload);
   const cursorOutput = await cursor(payload);
   assert.deepEqual(claudeOutput, {
     hookSpecificOutput: {
       hookEventName: 'SessionStart',
-      additionalContext: 'context for /payload/workspace',
+      additionalContext: `context for ${workspace}`,
     },
   });
-  assert.deepEqual(cursorOutput, { additional_context: 'context for /payload/workspace' });
+  assert.deepEqual(cursorOutput, { additional_context: `context for ${workspace}` });
 });
 
 test('config merge preserves unrelated JSON, creates a backup, and deduplicates Loam entries', async () => {

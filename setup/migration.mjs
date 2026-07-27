@@ -1,6 +1,7 @@
-import { lstat, readFile, realpath, rm } from 'node:fs/promises';
+import { lstat, readFile, rm } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 
+import { assertPhysicalInside } from '../integration/paths.mjs';
 import { loadSkillInventory } from './inventory.mjs';
 import { listSkills, skillEntryAliases } from './skills.mjs';
 import { runSkills } from './process.mjs';
@@ -41,14 +42,11 @@ async function safePath(workspace, candidate, kind, report) {
   }
   try {
     await lstat(path);
-    const physical = await realpath(path);
-    if (!inside(workspace, physical)) {
-      report.unsafe.push({ path, kind, reason: 'path escapes workspace' });
-      return false;
-    }
+    await assertPhysicalInside(workspace, path, kind);
   } catch (error) {
     if (error?.code === 'ENOENT') return false;
-    report.unsafe.push({ path, kind, reason: 'path cannot be resolved' });
+    const reason = error?.code === 'PATH_ESCAPE' ? 'path escapes workspace' : 'path cannot be resolved';
+    report.unsafe.push({ path, kind, reason });
   }
   return report.unsafe.every((entry) => entry.path !== path);
 }

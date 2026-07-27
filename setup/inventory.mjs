@@ -1,5 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
@@ -48,7 +49,7 @@ async function resolveSkillFile(packageRoot, declaredPath) {
   return { skillDir, skillPath };
 }
 
-export async function loadSkillInventory({ packageRoot = resolve(new URL('..', import.meta.url).pathname) } = {}) {
+export async function loadSkillInventory({ packageRoot = fileURLToPath(new URL('..', import.meta.url)) } = {}) {
   const root = resolve(packageRoot);
   const manifestPath = join(root, '.claude-plugin', 'plugin.json');
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
