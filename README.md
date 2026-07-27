@@ -82,23 +82,6 @@ checksum before anything runs. No install script is ever executed. Supported
 platforms are macOS (Intel and Apple Silicon), Windows x64, and Linux
 x64/arm64.
 
-### Optional background code ingestion
-
-Background code ingestion is opt-in. Enable it with
-`LOAM_INGEST_BACKGROUND=1`, or set `background_ingest.enabled` to `true` in
-`~/.agents/loam/config.json`; `LOAM_INGEST_BACKGROUND=0` is an unconditional
-kill switch. Claude Stop, Codex Stop, and OpenCode `session.idle` boundaries
-can start one bounded worker in the same harness. Cursor intentionally has no
-idle ingestion hook.
-
-The worker acquires a per-workspace lease, requires a full native state probe
-and `code_ingest_pending`, resolves the installed ingestion exclusions, and
-uses a complete exclusions-aware actionable fingerprint before launching a
-model. Missing exclusions, unreadable files, live/uncertain workers, and
-incomplete fingerprints fail closed. It never edits source files, commits, or
-pushes. Inspect state with the installed integration's
-`ingest-status --workspace <path> --json` command.
-
 ## Ways to use loam
 
 You don't need to memorize skill names. Say what you want in plain
