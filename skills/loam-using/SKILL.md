@@ -2,7 +2,7 @@
 name: loam::using
 description: "The always-on protocol for the loam skill namespace. Use at session start and whenever a loam task appears. Routes goals and other loam work, explains the memory model (memory = umbrella; wiki, guidance, and checkpoints are substrates), and lists cross-cutting rules. This is a routing/meta skill — delegate to a specific loam skill rather than performing work itself."
 metadata:
-  version: "1.8.0"
+  version: "1.9.0"
   author: scchearn
 ---
 
@@ -142,16 +142,17 @@ must not use it to resolve workspace state.
 
 ### Background code ingestion
 
-Background code ingestion is opt-in and boundary-triggered only. Claude Stop,
-Codex Stop, and OpenCode `session.idle` may start a same-harness worker when
-`LOAM_INGEST_BACKGROUND=1` or global config enables it; Cursor has no idle
-worker. `LOAM_INGEST_BACKGROUND=0` always disables it. The worker acquires a
-workspace lease before probing, requires full state and
-`code_ingest_pending.evidence.pending_count > 0`, resolves the installed
-ingestion exclusions, and needs a complete actionable fingerprint. Missing or
-unreadable exclusions, uncertain process identity, live workers, and
-stat/read/deadline races fail closed. It never changes source files, commits,
-or pushes. Inspect it with the installed integration's
+Background code ingestion is enabled by default and boundary-triggered only.
+Set `LOAM_INGEST_BACKGROUND=0` to opt out unconditionally, or set
+`background_ingest.enabled` to `false` in global config;
+`LOAM_INGEST_BACKGROUND=1` overrides a disabled config. Claude Stop, Codex
+Stop, and OpenCode `session.idle` may start a same-harness worker; Cursor has no
+idle worker. The worker acquires a workspace lease before probing, requires
+full state and `code_ingest_pending.evidence.pending_count > 0`, resolves the
+installed ingestion exclusions, and needs a complete actionable fingerprint.
+Missing or unreadable exclusions, uncertain process identity, live workers,
+and stat/read/deadline races fail closed. It never changes source files,
+commits, or pushes. Inspect it with the installed integration's
 `ingest-status --workspace <path> --json` command.
 
 For native operations, invoke the same native command directly:

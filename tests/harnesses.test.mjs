@@ -33,6 +33,7 @@ test('OpenCode background events queue work and normalize the all-session status
   const root = await mkdtemp(join(tmpdir(), 'loam-opencode-worker-'));
   let observed;
   let finished;
+  let gateCalls = 0;
   const done = new Promise((resolve) => { finished = resolve; });
   const plugin = await createOpenCodeAdapter({
     client: {
@@ -46,7 +47,7 @@ test('OpenCode background events queue work and normalize the all-session status
       },
     },
     ingestion: {
-      gate: async () => ({ action: 'spawn_worker', workspace: '/workspace' }),
+      gate: async () => { gateCalls += 1; return { action: 'spawn_worker', workspace: '/workspace' }; },
       resolveGlobalRoot: () => root,
       resolveSkillsRoot: () => root,
       runWorker: async ({ openCodeSession }) => {
@@ -60,7 +61,9 @@ test('OpenCode background events queue work and normalize the all-session status
 
   await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-1', id: 'event-1' } });
   await done;
+  await plugin.event({ event: { type: 'session.idle', sessionID: 'child-1', id: 'event-2' } });
   assert.deepEqual(observed, { type: 'idle' });
+  assert.equal(gateCalls, 1);
 });
 
 test('Claude and Cursor adapters use payload workspace roots and emit documented envelopes', async () => {

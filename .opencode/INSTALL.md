@@ -40,12 +40,13 @@ The existing clone plus direct `.opencode/plugins/loam.js` path remains a
 migration compatibility path. If it is retained, update it with `git pull` and
 restart OpenCode; it does not poll for updates at session start.
 
-## Optional background ingestion
+## Background ingestion
 
-Background code ingestion is disabled by default. Set
-`LOAM_INGEST_BACKGROUND=1` or `background_ingest.enabled` in
-`~/.agents/loam/config.json`; `LOAM_INGEST_BACKGROUND=0` always wins. The
-adapter acts only on `session.idle`, creates a child session for the existing
+Background code ingestion is enabled by default. To opt out, set
+`LOAM_INGEST_BACKGROUND=0` as the unconditional kill switch, or set
+`background_ingest.enabled` to `false` in `~/.agents/loam/config.json`.
+`LOAM_INGEST_BACKGROUND=1` explicitly overrides a disabled config. The adapter
+acts only on `session.idle`, creates a child session for the existing
 `loam::ingesting-codebase` skill, and ignores child idle events.
 
 The worker takes a per-workspace lease, requires full native state with a

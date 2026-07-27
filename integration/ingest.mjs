@@ -11,7 +11,7 @@ import {
 import { FingerprintError, fingerprintActionable } from './ingest-fingerprint.mjs';
 
 const PROMPT = 'Run the existing loam::ingesting-codebase skill for the provided workspace. Do not modify source files, commit, or push.';
-const DEFAULTS = Object.freeze({ enabled: false, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800 });
+const DEFAULTS = Object.freeze({ enabled: true, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800 });
 function hash(value) { return createHash('sha256').update(String(value)).digest('hex'); }
 export function runRoot(globalRoot, workspace) { return join(resolve(globalRoot), 'run', hash(workspace).slice(0, 16)); }
 async function json(path, fallback = null) { try { return JSON.parse(await readFile(path, 'utf8')); } catch { return fallback; } }
@@ -39,7 +39,7 @@ export async function readIngestConfig(globalRoot, env = process.env) {
   const file = await json(join(resolve(globalRoot), 'config.json'), {});
   const section = file?.background_ingest || {};
   const enabled = env.LOAM_INGEST_BACKGROUND === '0'
-    ? false : env.LOAM_INGEST_BACKGROUND === '1' ? true : section.enabled === true;
+    ? false : env.LOAM_INGEST_BACKGROUND === '1' ? true : section.enabled !== false;
   return {
     enabled,
     min_interval_seconds: numeric(env.LOAM_INGEST_MIN_INTERVAL, numeric(section.min_interval_seconds, DEFAULTS.min_interval_seconds)),
