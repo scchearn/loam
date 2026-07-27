@@ -9,7 +9,7 @@ async function input() {
 
 export async function main({ env = process.env, payload = null } = {}) {
   const body = payload || await input();
-  if (!dispatchBoundary) return { action: 'skip', reason: 'runtime_unavailable' };
+  if (!dispatchBoundary) return { action: 'skip', reason: 'unavailable' };
   return dispatchBoundary({
     harness: 'claude',
     payload: body,

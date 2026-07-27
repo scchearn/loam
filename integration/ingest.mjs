@@ -57,7 +57,7 @@ function payloadWorkspace(payload = {}) { return payload.cwd || payload.director
 
 function publicReason(reason) {
   if (reason === 'disabled' || reason === 'recursion') return 'disabled';
-  if (['lease_held', 'orphan_live', 'orphan_unknown', 'duplicate_intent'].includes(reason)) return 'lease_held';
+  if (['lease_held', 'orphan_live', 'orphan_unknown', 'duplicate_intent'].includes(reason)) return 'busy';
   if (reason === 'debounced' || reason === 'backoff') return 'too_soon';
   if (['wiki_missing', 'codegraph_missing', 'no_pending', 'no_actionable_work'].includes(reason)) return 'nothing_to_do';
   return reason === 'ok' ? 'ok' : 'unavailable';
@@ -485,7 +485,7 @@ export async function runWorker({
   const config = await readIngestConfig(globalRoot, env);
   await ensureRoot(root);
   const leaseResult = await acquireLease(root, canonical, harness, config, openCodeSession);
-  if (['held', 'orphan_live', 'orphan_unknown'].includes(leaseResult.status)) return { reason: 'lease_held' };
+  if (['held', 'orphan_live', 'orphan_unknown'].includes(leaseResult.status)) return { reason: 'busy' };
   if (leaseResult.status !== 'acquired') return { reason: 'unavailable' };
   const lease = leaseResult.lease;
   const skip = async (reason, fields = {}) => {

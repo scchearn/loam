@@ -156,7 +156,7 @@ test('a live lease blocks before runtime, capability, or model work', async () =
     runtimeRunner: async () => { runtimeCalls += 1; return { code: 0, stdout: '{}', stderr: '' }; },
     modelRunner: async () => { throw new Error('model must not launch'); },
   });
-  assert.equal(result.reason, 'lease_held');
+  assert.equal(result.reason, 'busy');
   assert.equal(runtimeCalls, 0);
 });
 
@@ -269,7 +269,7 @@ test('OpenCode live child keeps the lease and intent when abort/requery cannot v
       status: async () => ({ status: 'running' }),
     },
   });
-  assert.equal(result.reason, 'lease_held');
+  assert.equal(result.reason, 'busy');
   const runPath = runRoot(root, workspace);
   assert.equal(JSON.parse(await readFile(join(runPath, 'lease.json'), 'utf8')).child_identity.session_id, 'child-live');
 });
@@ -289,7 +289,7 @@ test('OpenCode prompt transport failure keeps ownership after child identity was
       status: async () => ({ type: 'busy' }),
     },
   });
-  assert.equal(result.reason, 'lease_held');
+  assert.equal(result.reason, 'busy');
   const runPath = runRoot(root, workspace);
   assert.equal(JSON.parse(await readFile(join(runPath, 'lease.json'), 'utf8')).child_identity.session_id, 'child-transport-failed');
 });
@@ -442,7 +442,7 @@ test('a live model child on a dead worker lease prevents a second launch', async
     runtimeRunner: async () => { throw new Error('must not probe while child is live'); },
     modelRunner: async () => { launches += 1; },
   });
-  assert.equal(result.reason, 'lease_held');
+  assert.equal(result.reason, 'busy');
   assert.equal(launches, 0);
 });
 
