@@ -135,8 +135,9 @@ export async function verifyInstallation({
   }
   const migration = legacy || discovery.legacy;
   const harnessReady = Object.values(harnesses).every((harness) => harness.ready);
+  const pluginVersionReady = install?.plugin_version === discovery.packageVersion;
   return {
-    ready: Boolean(install && skills.ready && runtime.ready && harnessReady && migration.ready),
+    ready: Boolean(pluginVersionReady && skills.ready && runtime.ready && harnessReady && migration.ready),
     install,
     skills,
     runtime,
