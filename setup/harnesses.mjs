@@ -8,6 +8,7 @@ import { writeAtomicFile } from './atomic.mjs';
 import { mergeJsonConfig } from './config.mjs';
 
 const adapterRoot = fileURLToPath(new URL('../adapters', import.meta.url));
+const marketplaceAdapterPath = fileURLToPath(new URL('../plugins/loam-adapter/adapter.mjs', import.meta.url));
 
 async function exists(path) {
   try {
@@ -15,6 +16,23 @@ async function exists(path) {
   } catch {
     return false;
   }
+}
+
+async function hasClaudeMarketplaceInstall(root, name) {
+  try {
+    const registry = JSON.parse(await readFile(join(root, 'plugins', 'installed_plugins.json'), 'utf8'));
+    const installs = registry.plugins?.[name];
+    return Array.isArray(installs)
+      && (await Promise.all(installs.map(({ installPath }) => typeof installPath === 'string' && exists(installPath)))).some(Boolean);
+  } catch {
+    return false;
+  }
+}
+
+async function hasCodexMarketplaceInstall(root, name) {
+  const [plugin, marketplace, extra] = name.split('@');
+  if (plugin !== 'loam' || !marketplace || extra) return false;
+  return exists(join(root, 'plugins', 'cache', marketplace, plugin));
 }
 
 export async function detectHarnesses({ home = homedir() } = {}) {
@@ -26,7 +44,42 @@ export async function detectHarnesses({ home = homedir() } = {}) {
   };
   const result = {};
   for (const [id, root] of Object.entries(roots)) {
-    result[id] = { id, root, state: await exists(root) ? 'detected' : 'absent' };
+    const state = await exists(root) ? 'detected' : 'absent';
+    let marketplaceOwned = false;
+    if (state === 'detected' && id === 'claude') {
+      try {
+        const settings = JSON.parse(await readFile(join(root, 'settings.json'), 'utf8'));
+        for (const [name, enabled] of Object.entries(settings.enabledPlugins || {})) {
+          if (name.startsWith('loam@') && enabled === true && await hasClaudeMarketplaceInstall(root, name)) {
+            marketplaceOwned = true;
+            break;
+          }
+        }
+      } catch {
+        marketplaceOwned = false;
+      }
+    } else if (state === 'detected' && id === 'codex') {
+      try {
+        const config = await readFile(join(root, 'config.toml'), 'utf8');
+        let loamPlugin = '';
+        // ponytail: parse the table form Codex writes; unsupported TOML forms fail closed to setup ownership.
+        for (const line of config.split(/\r?\n/)) {
+          const section = line.match(/^\s*\[plugins\."([^"]+)"\]\s*$/);
+          if (section) {
+            loamPlugin = section[1].startsWith('loam@') ? section[1] : '';
+            continue;
+          }
+          if (/^\s*\[/.test(line)) loamPlugin = '';
+          if (loamPlugin && /^\s*enabled\s*=\s*true\s*(?:#.*)?$/.test(line)) {
+            marketplaceOwned = await hasCodexMarketplaceInstall(root, loamPlugin);
+            break;
+          }
+        }
+      } catch {
+        marketplaceOwned = false;
+      }
+    }
+    result[id] = { id, root, state, marketplaceOwned };
   }
   return result;
 }
@@ -35,10 +88,15 @@ async function publishAssets(globalRoot, pluginVersion) {
   const versionRoot = join(resolve(globalRoot), 'plugins', `${pluginVersion}-${randomUUID()}`);
   try {
     await mkdir(versionRoot, { recursive: true, mode: 0o700 });
-    const names = ['opencode.mjs', 'claude-session-start.mjs', 'claude-stop.mjs', 'codex-stop.mjs', 'ingest-worker.mjs', 'ingest-modules.mjs', 'cursor-session-start.mjs'];
+    const names = ['opencode.mjs', 'claude-session-start.mjs', 'claude-stop.mjs', 'codex-session-start.mjs', 'codex-stop.mjs', 'ingest-worker.mjs', 'ingest-modules.mjs', 'cursor-session-start.mjs'];
     const assets = {};
     for (const name of names) {
-      const source = await readFile(join(adapterRoot, name), 'utf8');
+      const source = await readFile(
+        name === 'claude-session-start.mjs' || name === 'codex-session-start.mjs'
+          ? marketplaceAdapterPath
+          : join(adapterRoot, name),
+        'utf8',
+      );
       const destination = join(versionRoot, name);
       await writeAtomicFile(destination, source);
       assets[name.replace('.mjs', '')] = destination;
@@ -103,7 +161,7 @@ function mergeClaudeHooks(existing, entry, globalRoot, assetName = 'claude-sessi
     const hooks = item.hooks.filter((hook) => !isOwnedCommand(hook, globalRoot, assetName));
     if (hooks.length || item.hooks.length === 0) cleaned.push(hooks.length === item.hooks.length ? item : { ...item, hooks });
   }
-  return [...cleaned, entry];
+  return entry ? [...cleaned, entry] : cleaned;
 }
 
 function mergeCursorHooks(existing, entry, globalRoot) {
@@ -111,7 +169,7 @@ function mergeCursorHooks(existing, entry, globalRoot) {
   return [...current.filter((item) => !isOwnedCommand(item, globalRoot, 'cursor-session-start.mjs')), entry];
 }
 
-async function installClaude({ home, globalRoot, assetPath }) {
+async function installClaude({ home, globalRoot, assetPath, marketplaceOwned }) {
   const filePath = join(home, '.claude', 'settings.json');
   return mergeJsonConfig({
     filePath,
@@ -119,10 +177,14 @@ async function installClaude({ home, globalRoot, assetPath }) {
       ...config,
       hooks: {
         ...(config.hooks || {}),
-        SessionStart: mergeClaudeHooks(config.hooks?.SessionStart, {
-          matcher: 'startup|clear|compact',
-          hooks: [hookEntry(assetPath)],
-        }, globalRoot),
+        SessionStart: mergeClaudeHooks(
+          config.hooks?.SessionStart,
+          marketplaceOwned ? null : {
+            matcher: 'startup|resume|clear|compact',
+            hooks: [hookEntry(assetPath)],
+          },
+          globalRoot,
+        ),
         Stop: mergeClaudeHooks(config.hooks?.Stop, {
           matcher: '',
           hooks: [hookEntry(join(dirname(assetPath), 'claude-stop.mjs'), { async: true, timeout: 30 })],
@@ -147,27 +209,33 @@ function codexHandler(assetPath) {
   };
 }
 
-function mergeCodexHooks(existing, handler, globalRoot) {
-  if (existing !== undefined && !Array.isArray(existing)) throw new Error('Codex Stop hooks policy-owned; install manually');
+function mergeCodexHooks(existing, handler, globalRoot, assetName = 'codex-stop.mjs') {
+  if (existing !== undefined && !Array.isArray(existing)) throw new Error('Codex hooks policy-owned; install manually');
   const groups = Array.isArray(existing) ? existing : [];
   const cleaned = groups.map((group) => {
-    if (!group || typeof group !== 'object' || !Array.isArray(group.hooks)) return isOwnedCommand(group, globalRoot, 'codex-stop.mjs') ? null : group;
-    const hooks = group.hooks.filter((item) => !isOwnedCommand(item, globalRoot, 'codex-stop.mjs'));
+    if (!group || typeof group !== 'object' || !Array.isArray(group.hooks)) return isOwnedCommand(group, globalRoot, assetName) ? null : group;
+    const hooks = group.hooks.filter((item) => !isOwnedCommand(item, globalRoot, assetName));
     return hooks.length === group.hooks.length ? group : { ...group, hooks };
   }).filter(Boolean);
-  return [...cleaned, { hooks: [handler] }];
+  return handler ? [...cleaned, { hooks: [handler] }] : cleaned;
 }
 
-async function installCodex({ home, globalRoot, assetPath }) {
+async function installCodex({ home, globalRoot, sessionAssetPath, stopAssetPath, marketplaceOwned }) {
   const filePath = join(home, '.codex', 'hooks.json');
-  if (unsafeCodexPath(assetPath)) throw new Error('Codex adapter path is unsafe; install the fixed hook manually');
+  if (unsafeCodexPath(sessionAssetPath) || unsafeCodexPath(stopAssetPath)) throw new Error('Codex adapter path is unsafe; install the fixed hook manually');
   return mergeJsonConfig({
     filePath,
     update: (config) => ({
       ...config,
       hooks: {
         ...(config.hooks || {}),
-        Stop: mergeCodexHooks(config.hooks?.Stop, codexHandler(assetPath), globalRoot),
+        SessionStart: mergeCodexHooks(
+          config.hooks?.SessionStart,
+          marketplaceOwned ? null : codexHandler(sessionAssetPath),
+          globalRoot,
+          'codex-session-start.mjs',
+        ),
+        Stop: mergeCodexHooks(config.hooks?.Stop, codexHandler(stopAssetPath), globalRoot),
       },
     }),
   });
@@ -233,13 +301,40 @@ export async function installHarnesses({
         await writeAtomicFile(stablePath, source);
         result[id] = { ...harness, state: 'ready', path: stablePath, versionRoot: assets.versionRoot };
       } else if (id === 'claude') {
-        const config = await installClaude({ home, globalRoot, assetPath: assets.assets['claude-session-start'] });
+        const config = await installClaude({
+          home,
+          globalRoot,
+          assetPath: assets.assets['claude-session-start'],
+          marketplaceOwned: harness.marketplaceOwned,
+        });
         if (config.backupPath) backupPaths.push(config.backupPath);
-        result[id] = { ...harness, state: 'ready', path: assets.assets['claude-session-start'], backupPath: config.backupPath };
+        result[id] = {
+          ...harness,
+          state: 'ready',
+          owner: harness.marketplaceOwned ? 'marketplace' : 'setup',
+          path: assets.assets['claude-session-start'],
+          sessionPath: assets.assets['claude-session-start'],
+          stopPath: assets.assets['claude-stop'],
+          backupPath: config.backupPath,
+        };
       } else if (id === 'codex') {
-        const config = await installCodex({ home, globalRoot, assetPath: assets.assets['codex-stop'] });
+        const config = await installCodex({
+          home,
+          globalRoot,
+          sessionAssetPath: assets.assets['codex-session-start'],
+          stopAssetPath: assets.assets['codex-stop'],
+          marketplaceOwned: harness.marketplaceOwned,
+        });
         if (config.backupPath) backupPaths.push(config.backupPath);
-        result[id] = { ...harness, state: 'ready', path: assets.assets['codex-stop'], backupPath: config.backupPath };
+        result[id] = {
+          ...harness,
+          state: 'ready',
+          owner: harness.marketplaceOwned ? 'marketplace' : 'setup',
+          path: assets.assets['codex-stop'],
+          sessionPath: assets.assets['codex-session-start'],
+          stopPath: assets.assets['codex-stop'],
+          backupPath: config.backupPath,
+        };
       } else {
         const config = await installCursor({ home, globalRoot, assetPath: assets.assets['cursor-session-start'] });
         if (config.backupPath) backupPaths.push(config.backupPath);

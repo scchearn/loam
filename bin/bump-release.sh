@@ -6,7 +6,7 @@
 #   --plugin  <version>   package.json
 #                         .claude-plugin/marketplace.json  metadata.version
 #                         .claude-plugin/marketplace.json  plugins[0].version
-#                         .codex-plugin/plugin.json
+#                         plugins/loam-adapter/.codex-plugin/plugin.json
 #                         .cursor-plugin/plugin.json
 #                         -> released as tag  v<version>
 #
@@ -171,7 +171,7 @@ stage_cargo_line() {
 if [[ "$DOMAIN" == "plugin" ]]; then
   stage_literal "package.json"                    1 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
   stage_literal ".claude-plugin/marketplace.json" 2 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
-  stage_literal ".codex-plugin/plugin.json"       1 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
+  stage_literal "plugins/loam-adapter/.codex-plugin/plugin.json" 1 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
   stage_literal ".cursor-plugin/plugin.json"      1 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
 else
   stage_cargo_line
@@ -192,7 +192,7 @@ publish() {
 if [[ "$DOMAIN" == "plugin" ]]; then
   publish "$STAGE/package.json"                    "package.json"
   publish "$STAGE/.claude-plugin_marketplace.json" ".claude-plugin/marketplace.json"
-  publish "$STAGE/.codex-plugin_plugin.json"       ".codex-plugin/plugin.json"
+  publish "$STAGE/plugins_loam-adapter_.codex-plugin_plugin.json" "plugins/loam-adapter/.codex-plugin/plugin.json"
   publish "$STAGE/.cursor-plugin_plugin.json"      ".cursor-plugin/plugin.json"
   TAG="v$NEW"
 else

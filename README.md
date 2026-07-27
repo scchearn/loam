@@ -20,6 +20,35 @@ not per project), and wires up whatever coding agents it finds. OpenCode,
 Claude Code, and Cursor are configured automatically, and Codex can discover the
 skills too. Nothing is added to your `PATH` and nothing is installed per-project.
 
+If you use Claude Code or Codex, you can let the small startup adapter update
+automatically through their plugin marketplaces:
+
+```bash
+# Claude Code
+claude plugin marketplace add scchearn/loam
+claude plugin install loam@loam --scope user
+
+# Codex
+codex plugin marketplace add scchearn/loam
+codex plugin add loam@loam
+```
+
+Your Loam skills still live in one shared global installation, regardless of
+which coding agent you use. Rerun setup after installing the plugin; it notices
+the marketplace adapter, prevents duplicate startup messages, and keeps the
+background-ingestion hook working.
+
+To update Loam later:
+
+```bash
+npx skills update --global
+npx @scchearn/loam setup
+```
+
+The first command updates your skills. The second updates the private helper
+and repairs each agent's connection to Loam. Starting a coding session remains
+read-only and never downloads updates.
+
 To remove everything loam installed:
 
 ```bash

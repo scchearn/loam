@@ -175,6 +175,76 @@ test('harness detection and installation use only user HOME paths and are idempo
   assert.equal(cursorHooks.hooks.sessionStart.filter((hook) => JSON.stringify(hook).includes('loam')).length, 1);
 });
 
+test('marketplace ownership removes setup SessionStart hooks but keeps background Stop hooks', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-owned-'));
+  const globalRoot = join(home, '.agents', 'loam');
+  const oldRoot = join(globalRoot, 'plugins', 'old');
+  const oldClaude = { type: 'command', command: `node ${JSON.stringify(join(oldRoot, 'claude-session-start.mjs'))}` };
+  const oldCodex = { type: 'command', command: `node ${JSON.stringify(join(oldRoot, 'codex-session-start.mjs'))}` };
+  const unrelated = { type: 'command', command: 'node "/usr/local/bin/unrelated.mjs"' };
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await mkdir(join(home, '.codex'), { recursive: true });
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({
+    enabledPlugins: { 'loam@loam': true },
+    hooks: { SessionStart: [{ hooks: [unrelated, oldClaude] }] },
+  }));
+  await writeFile(join(home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
+  const claudeCache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
+  await mkdir(claudeCache, { recursive: true });
+  await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'user', installPath: claudeCache, version: '0.8.6' }] },
+  }));
+  await mkdir(join(home, '.codex', 'plugins', 'cache', 'loam', 'loam', '0.8.6'), { recursive: true });
+  await writeFile(join(home, '.codex', 'hooks.json'), JSON.stringify({
+    hooks: { SessionStart: [{ hooks: [unrelated, oldCodex] }] },
+  }));
+
+  const detected = await detectHarnesses({ home });
+  assert.equal(detected.claude.marketplaceOwned, true);
+  assert.equal(detected.codex.marketplaceOwned, true);
+  const owned = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.6', detected });
+  const claude = JSON.parse(await readFile(join(home, '.claude', 'settings.json'), 'utf8'));
+  const codex = JSON.parse(await readFile(join(home, '.codex', 'hooks.json'), 'utf8'));
+  assert.equal(owned.claude.owner, 'marketplace');
+  assert.equal(owned.codex.owner, 'marketplace');
+  assert.deepEqual(claude.hooks.SessionStart[0].hooks, [unrelated]);
+  assert.deepEqual(codex.hooks.SessionStart[0].hooks, [unrelated]);
+  const claudeStop = claude.hooks.Stop.flatMap((entry) => entry.hooks || []);
+  const codexStop = codex.hooks.Stop.flatMap((entry) => entry.hooks || []);
+  assert.equal(claudeStop.filter((entry) => entry.command === 'node' && entry.args?.[0] === owned.claude.stopPath).length, 1);
+  assert.equal(codexStop.filter((entry) => entry.command === `node ${JSON.stringify(owned.codex.stopPath)}`).length, 1);
+
+  const fallbackHome = await mkdtemp(join(tmpdir(), 'loam-codex-fallback-'));
+  await mkdir(join(fallbackHome, '.codex'), { recursive: true });
+  const fallbackDetected = await detectHarnesses({ home: fallbackHome });
+  const fallback = await installHarnesses({
+    home: fallbackHome,
+    globalRoot: join(fallbackHome, '.agents', 'loam'),
+    pluginVersion: '0.8.6',
+    detected: fallbackDetected,
+  });
+  const hooks = JSON.parse(await readFile(join(fallbackHome, '.codex', 'hooks.json'), 'utf8'));
+  const commands = hooks.hooks.SessionStart.flatMap((entry) => entry.hooks || []);
+  assert.equal(fallback.codex.owner, 'setup');
+  assert.equal(commands.filter((entry) => entry.command === `node ${JSON.stringify(fallback.codex.sessionPath)}`).length, 1);
+  assert.equal(hooks.hooks.Stop.flatMap((entry) => entry.hooks || [])
+    .filter((entry) => entry.command === `node ${JSON.stringify(fallback.codex.stopPath)}`).length, 1);
+});
+
+test('enabled marketplace settings without installed plugin bytes keep setup ownership', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-missing-cache-'));
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await mkdir(join(home, '.codex'), { recursive: true });
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
+  await writeFile(join(home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
+
+  const detected = await detectHarnesses({ home });
+
+  assert.equal(detected.claude.marketplaceOwned, false);
+  assert.equal(detected.codex.marketplaceOwned, false);
+});
+
 test('managed harness policy becomes partial without changing its settings', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-home-policy-'));
   await mkdir(join(home, '.claude'), { recursive: true });
