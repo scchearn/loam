@@ -22,6 +22,10 @@ export async function main(argv = process.argv.slice(2), output = process.stdout
       const { runSetup } = await import('../setup/main.mjs');
       return await runSetup(parsed, { output, errorOutput });
     }
+    if (parsed.command === 'doctor') {
+      const { runDoctor } = await import('../setup/doctor.mjs');
+      return await runDoctor({ output, errorOutput });
+    }
     if (parsed.command === 'uninstall') {
       const { uninstall } = await import('../setup/uninstall.mjs');
       return await uninstall({ ...parsed, output, errorOutput });

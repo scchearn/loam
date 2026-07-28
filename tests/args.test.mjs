@@ -39,6 +39,19 @@ test('setup accepts the confirmation and dry-run flags', () => {
   });
 });
 
+test('install aliases setup and doctor is a supported command', () => {
+  assert.deepEqual(parseArgs(['install']), {
+    command: 'setup',
+    dryRun: false,
+    yes: false,
+  });
+  assert.deepEqual(parseArgs(['doctor']), {
+    command: 'doctor',
+    dryRun: false,
+    yes: false,
+  });
+});
+
 test('help and version are read-only command modes', () => {
   assert.deepEqual(parseArgs(['--help']), { command: 'help' });
   assert.deepEqual(parseArgs(['--version']), { command: 'version' });
@@ -67,7 +80,7 @@ test('the bin runs when invoked through a symlink (npx path)', async () => {
 });
 
 test('invalid setup arguments expose the public usage status', () => {
-  assert.throws(() => parseArgs(['install']), (error) => {
+  assert.throws(() => parseArgs(['unknown']), (error) => {
     assert.ok(error instanceof UsageError);
     assert.equal(error.exitCode, EXIT_CODES.USAGE);
     return true;

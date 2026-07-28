@@ -14,11 +14,12 @@ export function parseArgs(argv) {
   if (wantsVersion) return { command: 'version' };
 
   if (args.length === 0) return { command: 'help' };
-  const command = args[0];
+  const requestedCommand = args[0];
+  const command = requestedCommand === 'install' ? 'setup' : requestedCommand;
   if (command === 'help') return { command: 'help' };
   if (command === 'version') return { command: 'version' };
-  if (command !== 'setup' && command !== 'uninstall') {
-    throw new UsageError(`unknown command: ${command}`);
+  if (command !== 'setup' && command !== 'doctor' && command !== 'uninstall') {
+    throw new UsageError(`unknown command: ${requestedCommand}`);
   }
 
   let yes = false;

@@ -15,12 +15,14 @@ export const EXIT_CODES = Object.freeze({
   CANCELLED: 130,
 });
 
-export const HELP_TEXT = `Loam Setup
+export const HELP_TEXT = `Loam CLI
 
 Usage:
   npx @scchearn/loam setup
+  npx @scchearn/loam install
   npx @scchearn/loam setup --yes
   npx @scchearn/loam setup --dry-run
+  npx @scchearn/loam doctor
   npx @scchearn/loam uninstall
   npx @scchearn/loam uninstall --yes
   npx @scchearn/loam --help
@@ -28,11 +30,13 @@ Usage:
 
 Commands:
   setup       Install or reconcile global Loam skills, runtime, and integrations.
-  uninstall   Remove global Loam runtime, integration, and harness hook entries.
+  install     Alias for setup.
+  doctor      Check the global Loam installation without changing it.
+  uninstall   Remove global Loam skills, runtime, integration, and hook entries.
 
 Options:
   --yes       Accept changes without interactive confirmation.
-  --dry-run   Preview checks and changes without mutation or downloads.
+  --dry-run   Preview setup changes without mutation or downloads.
   --help      Show this help without network access.
   --version   Show the setup package version without network access.
 `;

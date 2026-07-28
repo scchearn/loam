@@ -3,12 +3,15 @@ import { readFile, readdir, rm, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
 import { writeAtomicFile } from './atomic.mjs';
+import { PACKAGE_ROOT } from './constants.mjs';
 import { isOwnedCommand } from './harnesses.mjs';
 import { classifyChild } from '../integration/ingest-process.mjs';
 import { inspectIntent } from '../integration/ingest.mjs';
+import { loadSkillInventory } from './inventory.mjs';
+import { listSkills, skillEntryAliases, skillEntrySource } from './skills.mjs';
+import { runSkills } from './process.mjs';
+import { confirmUninstall } from './wizard.mjs';
 
-// ponytail: uninstall reverses setup. No Skills CLI touch — global skills
-// remain under ~/.agents/skills/ for `npx skills remove` or a future setup rerun.
 // Harness configs are cleaned in-place (remove only Loam-owned hook entries,
 // preserve unrelated config) rather than blind-restoring backups, because a
 // later setup rerun may have superseded the backup. If no Loam entries remain
@@ -158,11 +161,63 @@ async function blockingWorkers(root) {
   return blocked;
 }
 
+function installedSkillName(entry) {
+  return [entry.name, entry.skill, entry.id, entry.slug, entry.directory]
+    .find((value) => typeof value === 'string' && value);
+}
+
+async function findGlobalLoamSkills({ packageRoot = PACKAGE_ROOT, expectedSource = '', runner } = {}) {
+  const inventory = await loadSkillInventory({ packageRoot });
+  const knownAliases = new Set(inventory.skills.flatMap((skill) => skill.aliases));
+  const listed = await listSkills({ global: true, runner });
+  if (!listed.ok) {
+    return {
+      ready: false,
+      category: listed.category || 'skills_list_failed',
+      detail: listed.stderr || 'Skills CLI list failed',
+      names: [],
+    };
+  }
+
+  const names = [...new Set(listed.entries.flatMap((entry) => {
+    if (!skillEntryAliases(entry).some((alias) => knownAliases.has(alias))) return [];
+    const source = skillEntrySource(entry, listed.source) || expectedSource;
+    if (!source.includes('scchearn/loam')) return [];
+    const name = installedSkillName(entry);
+    return name ? [name] : [];
+  }))];
+  return { ready: true, names };
+}
+
+async function removeGlobalSkills({ packageRoot, expectedSource, runner, initial } = {}) {
+  const found = initial || await findGlobalLoamSkills({ packageRoot, expectedSource, runner });
+  if (!found.ready || !found.names.length) return found;
+
+  const removed = await runSkills(['remove', ...found.names, '--global', '--yes'], { runner });
+  if (!removed.ok) {
+    return {
+      ready: false,
+      category: removed.category || 'skills_remove_failed',
+      detail: removed.stderr || 'Skills CLI remove failed',
+      names: found.names,
+    };
+  }
+
+  const remaining = await findGlobalLoamSkills({ packageRoot, expectedSource, runner });
+  if (!remaining.ready) return remaining;
+  return remaining.names.length
+    ? { ready: false, category: 'skills_remove_incomplete', detail: remaining.names.join(', '), names: remaining.names }
+    : { ready: true, names: found.names };
+}
+
 export async function uninstall({
   home = homedir(),
   globalRoot,
+  packageRoot = PACKAGE_ROOT,
+  runner,
   yes = false,
-  confirm = async () => false,
+  confirm,
+  input = process.stdin,
   output = process.stdout,
 } = {}) {
   const root = resolve(globalRoot || join(home, '.agents', 'loam'));
@@ -172,18 +227,31 @@ export async function uninstall({
   try {
     install = JSON.parse(await readFile(metadataPath, 'utf8'));
   } catch {
+    install = null;
+  }
+
+  const listedSkills = await findGlobalLoamSkills({
+    packageRoot,
+    expectedSource: install?.skills_source,
+    runner,
+  });
+  if (!listedSkills.ready) {
+    output.write(`Unable to inspect global Loam skills: ${listedSkills.detail || listedSkills.category}\n`);
+    return 1;
+  }
+  if (!install && !listedSkills.names.length) {
     output.write('No Loam installation found at %s. Nothing to uninstall.\n'.replace('%s', root));
     return 0;
   }
 
   output.write('Loam uninstall will:\n');
+  output.write(`  - Remove ${listedSkills.names.length || 'any remaining'} globally installed Loam skills via the Skills CLI\n`);
   output.write('  - Remove Loam-owned hook entries from Claude, Codex, and Cursor configs\n');
   output.write('  - Remove the OpenCode Loam adapter\n');
   output.write('  - Remove the global Loam root (install.json, runtime, integration, plugins)\n');
-  output.write('  - Leave global skills intact (use `npx skills remove` separately)\n');
   output.write(`  - Global root: ${root}\n`);
 
-  if (!yes && !(await confirm())) {
+  if (!(await confirmUninstall({ yes, confirm, input, output }))) {
     output.write('Uninstall cancelled.\n');
     return 130;
   }
@@ -194,14 +262,25 @@ export async function uninstall({
     return 1;
   }
 
-  const results = { configs: [], opencode: null, globalRoot: null, backups: [] };
+  const results = { configs: [], opencode: null, globalRoot: null, backups: [], skills: null };
+
+  results.skills = await removeGlobalSkills({
+    packageRoot,
+    expectedSource: install?.skills_source,
+    runner,
+    initial: listedSkills,
+  });
+  if (!results.skills.ready) {
+    output.write(`Skills removal failed: ${results.skills.detail || results.skills.category}\n`);
+    return 1;
+  }
 
   // Clean harness configs in-place
-  if (install.configured_harnesses?.includes('claude')) {
+  if (install?.configured_harnesses?.includes('claude')) {
     results.configs.push(await cleanHarnessConfig(join(home, '.claude', 'settings.json'), root, cleanClaudeConfig));
     results.backups.push(...(await removeBackups(join(home, '.claude'))));
   }
-  if (install.configured_harnesses?.includes('codex')) {
+  if (install?.configured_harnesses?.includes('codex')) {
     results.configs.push(await cleanHarnessConfig(join(home, '.codex', 'hooks.json'), root, cleanCodexConfig));
     results.backups.push(...(await removeBackups(join(home, '.codex'))));
   }
