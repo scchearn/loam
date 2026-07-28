@@ -16,6 +16,11 @@ async function confirmAction({ yes = false, confirm, input, output, promptText, 
     output.write(`${nonInteractiveMessage}\n`);
     return false;
   }
+  if (input === process.stdin && output === process.stdout) {
+    const { confirm: clackConfirm, isCancel } = await import('@clack/prompts');
+    const answer = await clackConfirm({ message: promptText.replace(/\s*\[y\/N\]\s*$/u, '') });
+    return !isCancel(answer) && answer === true;
+  }
   const prompt = readline.createInterface({ input, output });
   try {
     const answer = await prompt.question(promptText);
@@ -45,6 +50,31 @@ export function confirmUninstall({ yes = false, confirm, input = process.stdin, 
     promptText: 'Proceed with global Loam uninstall? [y/N] ',
     nonInteractiveMessage: 'Uninstall requires confirmation; rerun with --yes.',
   });
+}
+
+export async function selectMarketplaceHarnesses({
+  yes = false,
+  harnesses = {},
+  select,
+} = {}) {
+  const candidates = ['claude', 'codex'].filter((id) => harnesses[id]?.state !== 'absent');
+  if (yes || candidates.length === 0) return candidates;
+  let isCancel = () => false;
+  if (!select) {
+    const prompts = await import('@clack/prompts');
+    select = prompts.multiselect;
+    isCancel = prompts.isCancel;
+  }
+  const selected = await select({
+    message: 'Install Loam marketplace plugins',
+    options: candidates.map((value) => ({
+      value,
+      label: value === 'claude' ? 'Claude Code' : 'Codex',
+    })),
+    initialValues: candidates,
+    required: false,
+  });
+  return isCancel(selected) ? null : selected;
 }
 
 export function stage(output, name, detail = '') {

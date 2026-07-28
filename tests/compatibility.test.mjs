@@ -15,6 +15,7 @@ const loaderPath = join(packageRoot, '.opencode', 'plugins', 'loam.js');
 const hookPath = join(packageRoot, 'hooks', 'session-start.mjs');
 const marketplaceRoot = join(packageRoot, 'plugins', 'loam-adapter');
 const marketplaceHookPath = join(marketplaceRoot, 'hooks', 'session-start.mjs');
+const marketplaceStopPath = join(marketplaceRoot, 'hooks', 'stop.mjs');
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 async function runHook(env, payload = {}, path = hookPath) {
@@ -189,4 +190,27 @@ test('plugin manifests point at the packaged Node hook entry', async () => {
   assert.equal(claudeSessionStart.command, 'node');
   assert.match(claudeSessionStart.args[0], /session-start\.mjs/);
   assert.match(cursorHooks.hooks.sessionStart[0].command, /session-start\.mjs/);
+});
+
+test('marketplace plugin owns SessionStart and Stop for Claude and Codex', async () => {
+  const hooks = JSON.parse(await readFile(join(marketplaceRoot, 'hooks', 'hooks.json'), 'utf8'));
+  assert.match(hooks.hooks.SessionStart[0].hooks[0].command, /session-start\.mjs/);
+  assert.match(hooks.hooks.Stop[0].hooks[0].command, /stop\.mjs/);
+
+  const stop = await import(pathToFileURL(marketplaceStopPath).href);
+  const calls = [];
+  const loadIngest = async () => ({
+    resolveGlobalRoot: () => '/global',
+    resolveSkillsRoot: () => '/skills',
+    dispatchBoundary: async (input) => calls.push(input),
+  });
+
+  assert.deepEqual(await stop.handleStop(
+    { cwd: '/workspace', session_id: 'session' },
+    { PLUGIN_ROOT: marketplaceRoot },
+    { loadIngest },
+  ), {});
+  assert.equal(calls[0].harness, 'codex');
+  assert.equal(calls[0].globalRoot, '/global');
+  assert.equal(calls[0].skillsRoot, '/skills');
 });

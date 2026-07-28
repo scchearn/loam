@@ -79,8 +79,14 @@ test('uninstall removes the global root, skills, adapter, and Loam-owned hooks; 
   const claudePath = join(home, '.claude', 'settings.json');
   const codexPath = join(home, '.codex', 'hooks.json');
   const cursorPath = join(home, '.cursor', 'hooks.json');
-  const claude = JSON.parse(await readFile(claudePath, 'utf8'));
-  const codex = JSON.parse(await readFile(codexPath, 'utf8'));
+  const claude = { hooks: {
+    SessionStart: [{ hooks: [{ type: 'command', command: 'node', args: [installed.claude.path] }] }],
+    Stop: [],
+  } };
+  const codex = { hooks: {
+    SessionStart: [{ hooks: [{ type: 'command', command: `node ${JSON.stringify(installed.codex.sessionPath)}` }] }],
+    Stop: [{ hooks: [{ type: 'command', command: `node ${JSON.stringify(installed.codex.stopPath)}` }] }],
+  } };
   const cursor = JSON.parse(await readFile(cursorPath, 'utf8'));
   claude.hooks.SessionStart[0].hooks.unshift(unrelatedClaude);
   codex.hooks.SessionStart[0].hooks.unshift(unrelatedCodexSession);
@@ -176,6 +182,61 @@ test('uninstall removes globally installed Loam skills through the Skills CLI', 
     '--yes', '--package', 'skills@1.5.20', 'skills', 'remove', 'loam::using', '--global', '--yes',
   ]);
   assert.equal(await exists(skillsPath), true, 'the Skills CLI owns removal of skill files');
+});
+
+test('uninstall delegates marketplace plugin removal to Claude and Codex', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const claudeCache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.2');
+  await mkdir(claudeCache, { recursive: true });
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
+  await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'user', installPath: claudeCache, version: '0.9.2' }] },
+  }));
+  await writeFile(join(home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
+  await mkdir(join(home, '.codex', 'plugins', 'cache', 'loam', 'loam', '0.9.2'), { recursive: true });
+  const calls = [];
+  const skills = skillsRunner();
+  const runner = async (request) => {
+    if (request.command === 'claude' || request.command === 'codex') {
+      calls.push({ command: request.command, args: request.args });
+      return { code: 0, stdout: '', stderr: '' };
+    }
+    return skills(request);
+  };
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner, output: { write: () => {} } });
+
+  assert.equal(code, 0);
+  assert.deepEqual(calls, [
+    { command: 'claude', args: ['plugin', 'uninstall', 'loam@loam', '--scope', 'user', '--yes'] },
+    { command: 'codex', args: ['plugin', 'remove', 'loam@loam'] },
+  ]);
+});
+
+test('plugin-only uninstall succeeds without install metadata', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-uninstall-plugin-only-'));
+  const globalRoot = join(home, '.agents', 'loam');
+  const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.2');
+  await mkdir(cache, { recursive: true });
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': false } }));
+  await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'user', installPath: cache, version: '0.9.2' }] },
+  }));
+  const calls = [];
+  const runner = async (request) => {
+    if (request.command === 'claude') {
+      calls.push(request.args);
+      return { code: 0, stdout: '', stderr: '' };
+    }
+    return skillsRunner({ installed: false })(request);
+  };
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner, output: { write: () => {} } });
+
+  assert.equal(code, 0);
+  assert.deepEqual(calls, [['plugin', 'uninstall', 'loam@loam', '--scope', 'user', '--yes']]);
 });
 
 test('uninstall deletes a fresh harness config created by setup, not leaving an empty husk', async () => {

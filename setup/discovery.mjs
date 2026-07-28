@@ -78,7 +78,7 @@ export async function discover({
     requiredVersion,
     node: process.version,
     npm: process.env.npm_execpath || 'npx',
-    harnesses: await detectHarnesses({ home: resolvedHome }),
+    harnesses: await detectHarnesses({ home: resolvedHome, pluginVersion: PACKAGE_VERSION }),
     legacy: { ...legacy, needed: hasEvidence, sourceRepository },
   };
 }

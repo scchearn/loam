@@ -1,6 +1,6 @@
 {
   "name": "@scchearn/loam",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "description": "Global setup and verified integrations for Loam workflow skills",
   "type": "module",
   "repository": {
@@ -31,9 +31,10 @@
     "test": "node --test tests/*.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.12"
   },
   "dependencies": {
+    "@clack/prompts": "^1.7.0",
     "skills": "1.5.20"
   },
   "publishConfig": {

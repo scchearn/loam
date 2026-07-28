@@ -148,6 +148,7 @@ test('packed Claude and Codex marketplaces point to one skill-free adapter', asy
     assert.equal('skills' in codexPlugin, false);
     await assert.rejects(() => readdir(join(adapterRoot, 'skills')));
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'session-start.mjs'), 'utf8'));
+    await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'stop.mjs'), 'utf8'));
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
   }

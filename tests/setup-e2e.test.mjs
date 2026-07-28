@@ -139,7 +139,7 @@ test('setup reconciles an install from an older plugin version', async () => {
   assert.notEqual(current.integration_path, previous.integration_path);
 });
 
-test('marketplace-owned Claude and Codex satisfy readiness with Stop hooks only', async () => {
+test('marketplace-owned Claude and Codex satisfy readiness without user hooks', async () => {
   const fixture = await baseFixture();
   await mkdir(join(fixture.home, '.claude'), { recursive: true });
   await mkdir(join(fixture.home, '.codex'), { recursive: true });
@@ -147,13 +147,16 @@ test('marketplace-owned Claude and Codex satisfy readiness with Stop hooks only'
     enabledPlugins: { 'loam@loam': true },
   }));
   await writeFile(join(fixture.home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
-  const claudeCache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
-  await mkdir(claudeCache, { recursive: true });
+  const claudeCache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
+  await mkdir(join(claudeCache, 'hooks'), { recursive: true });
+  await writeFile(join(claudeCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
   await writeFile(join(fixture.home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
     version: 2,
-    plugins: { 'loam@loam': [{ scope: 'user', installPath: claudeCache, version: '0.8.6' }] },
+    plugins: { 'loam@loam': [{ scope: 'user', installPath: claudeCache, version: PACKAGE_VERSION }] },
   }));
-  await mkdir(join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', '0.8.6'), { recursive: true });
+  const codexCache = join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
+  await mkdir(join(codexCache, 'hooks'), { recursive: true });
+  await writeFile(join(codexCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
   const capture = outputCapture();
 
   const code = await runSetup(parseArgs(['setup', '--yes']), {
@@ -168,11 +171,108 @@ test('marketplace-owned Claude and Codex satisfy readiness with Stop hooks only'
   assert.ok(metadata.configured_harnesses.includes('claude'));
   assert.ok(metadata.configured_harnesses.includes('codex'));
   const claude = JSON.parse(await readFile(join(fixture.home, '.claude', 'settings.json'), 'utf8'));
-  const codex = JSON.parse(await readFile(join(fixture.home, '.codex', 'hooks.json'), 'utf8'));
   assert.deepEqual(claude.hooks.SessionStart, []);
-  assert.deepEqual(codex.hooks.SessionStart, []);
-  assert.equal(claude.hooks.Stop.flatMap((entry) => entry.hooks || []).length, 1);
-  assert.equal(codex.hooks.Stop.flatMap((entry) => entry.hooks || []).length, 1);
+  assert.equal((claude.hooks.Stop || []).flatMap((entry) => entry.hooks || []).length, 0);
+  await assert.rejects(() => readFile(join(fixture.home, '.codex', 'hooks.json')), { code: 'ENOENT' });
+});
+
+test('setup verifies an updated marketplace plugin from disk instead of trusting CLI success', async () => {
+  const fixture = await baseFixture();
+  const cache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
+  await mkdir(join(cache, 'hooks'), { recursive: true });
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  await writeFile(join(fixture.home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
+  await writeFile(join(fixture.home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'user', installPath: cache, version: '0.8.6' }] },
+  }));
+  const capture = outputCapture();
+
+  const code = await runSetup(parseArgs(['setup', '--yes']), {
+    ...fixture,
+    packageRoot,
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+
+  assert.equal(code, 1, capture.text());
+  assert.match(capture.text(), /verification failed|incomplete/i);
+});
+
+test('setup --yes installs a missing Codex plugin in one pass', async () => {
+  const fixture = await baseFixture();
+  await mkdir(join(fixture.home, '.codex'), { recursive: true });
+  const calls = [];
+  const runner = async (request) => {
+    if (request.command !== 'codex') return fixture.runner(request);
+    calls.push(request.args);
+    if (request.args[1] === 'add') {
+      await writeFile(join(fixture.home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
+      const cache = join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
+      await mkdir(join(cache, 'hooks'), { recursive: true });
+      await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+    }
+    return { code: 0, stdout: '', stderr: '' };
+  };
+
+  const code = await runSetup(parseArgs(['setup', '--yes']), {
+    ...fixture,
+    packageRoot,
+    runner,
+    output: outputCapture().output,
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(calls, [
+    ['plugin', 'marketplace', 'add', 'scchearn/loam'],
+    ['plugin', 'add', 'loam@loam'],
+  ]);
+  await assert.rejects(() => readFile(join(fixture.home, '.codex', 'hooks.json')), { code: 'ENOENT' });
+});
+
+test('partial marketplace failure keeps successful installs and removes legacy hooks', async () => {
+  const fixture = await baseFixture();
+  const globalRoot = join(fixture.home, '.agents', 'loam');
+  const oldRoot = join(globalRoot, 'plugins', 'old');
+  await mkdir(join(fixture.home, '.claude'), { recursive: true });
+  await mkdir(join(fixture.home, '.codex'), { recursive: true });
+  await writeFile(join(fixture.home, '.claude', 'settings.json'), JSON.stringify({
+    hooks: { SessionStart: [{ hooks: [{ type: 'command', command: `node ${JSON.stringify(join(oldRoot, 'claude-session-start.mjs'))}` }] }] },
+  }));
+  await writeFile(join(fixture.home, '.codex', 'hooks.json'), JSON.stringify({
+    hooks: { Stop: [{ hooks: [{ type: 'command', command: `node ${JSON.stringify(join(oldRoot, 'codex-stop.mjs'))}` }] }] },
+  }));
+  const runner = async (request) => {
+    if (request.command === 'claude') {
+      return request.args.includes('install')
+        ? { code: 1, stdout: '', stderr: 'claude install failed' }
+        : { code: 0, stdout: '', stderr: '' };
+    }
+    if (request.command === 'codex') {
+      if (request.args[1] === 'add') {
+        await writeFile(join(fixture.home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
+        const cache = join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
+        await mkdir(join(cache, 'hooks'), { recursive: true });
+        await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    }
+    return fixture.runner(request);
+  };
+
+  const code = await runSetup(parseArgs(['setup', '--yes']), {
+    ...fixture,
+    packageRoot,
+    runner,
+    output: outputCapture().output,
+  });
+
+  assert.equal(code, 1);
+  const claude = JSON.parse(await readFile(join(fixture.home, '.claude', 'settings.json'), 'utf8'));
+  const codex = JSON.parse(await readFile(join(fixture.home, '.codex', 'hooks.json'), 'utf8'));
+  assert.equal(claude.hooks.SessionStart.length, 0);
+  assert.equal(codex.hooks.Stop.flatMap((entry) => entry.hooks || []).length, 0);
+  await assert.doesNotReject(() => readFile(join(fixture.home, '.codex', 'config.toml')));
 });
 
 test('dry-run is valid and byte-stable without creating roots, backups, or invoking mutators', async () => {
@@ -239,6 +339,25 @@ test('managed harness failure prevents the setup transaction from claiming readi
   assert.equal(code, 1);
   assert.match(capture.text(), /Harness integration is incomplete/);
   await assert.rejects(() => readFile(join(fixture.home, '.agents', 'loam', 'install.json')));
+});
+
+test('marketplace failure cannot mask policy-owned legacy hook cleanup', async () => {
+  const fixture = await baseFixture();
+  await mkdir(join(fixture.home, '.claude'), { recursive: true });
+  await writeFile(join(fixture.home, '.claude', 'settings.json'), JSON.stringify({ managed: true }));
+  const runner = async (request) => request.command === 'claude'
+    ? { code: 1, stdout: '', stderr: 'plugin failed' }
+    : fixture.runner(request);
+
+  const code = await runSetup(parseArgs(['setup', '--yes']), {
+    ...fixture,
+    packageRoot,
+    runner,
+    output: outputCapture().output,
+  });
+
+  assert.equal(code, 1);
+  await assert.rejects(() => readFile(join(fixture.home, '.agents', 'loam', 'install.json')), { code: 'ENOENT' });
 });
 
 test('migration failure preserves the global installation without publishing metadata', async () => {
@@ -348,7 +467,21 @@ async function readyHarnessFixture() {
   await mkdir(join(fixture.home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(fixture.home, '.claude'), { recursive: true });
   await mkdir(join(fixture.home, '.cursor'), { recursive: true });
-  await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  const runner = async (request) => {
+    if (request.command !== 'claude') return fixture.runner(request);
+    if (request.args.includes('install')) {
+      const cache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
+      await mkdir(join(cache, 'hooks'), { recursive: true });
+      await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+      await writeFile(join(fixture.home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
+      await writeFile(join(fixture.home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+        version: 2,
+        plugins: { 'loam@loam': [{ scope: 'user', installPath: cache, version: PACKAGE_VERSION }] },
+      }));
+    }
+    return { code: 0, stdout: '', stderr: '' };
+  };
+  await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, runner, output: outputCapture().output });
   const discovery = await discover({
     home: fixture.home,
     workspace: fixture.workspace,
@@ -358,7 +491,7 @@ async function readyHarnessFixture() {
   return { fixture, discovery };
 }
 
-test('harness readiness rejects stale owned paths and unrelated Loam strings', async () => {
+test('harness readiness ignores hook paths outside the setup-owned root', async () => {
   const { fixture, discovery } = await readyHarnessFixture();
   const settingsPath = join(fixture.home, '.claude', 'settings.json');
   const settings = JSON.parse(await readFile(settingsPath, 'utf8'));
@@ -366,17 +499,17 @@ test('harness readiness rejects stale owned paths and unrelated Loam strings', a
   await writeFile(settingsPath, JSON.stringify(settings));
 
   let result = await verifyInstallation({ discovery, packageRoot, runtimeRunner: fixture.smokeRunner });
-  assert.equal(result.ready, false);
-  assert.equal(result.harnesses.claude.ready, false);
+  assert.equal(result.ready, true);
+  assert.equal(result.harnesses.claude.ready, true);
 
   settings.hooks.SessionStart = [{ hooks: [{ type: 'command', command: 'node unrelated-loam-hook' }] }];
   await writeFile(settingsPath, JSON.stringify(settings));
   result = await verifyInstallation({ discovery, packageRoot, runtimeRunner: fixture.smokeRunner });
-  assert.equal(result.ready, false);
-  assert.equal(result.harnesses.claude.ready, false);
+  assert.equal(result.ready, true);
+  assert.equal(result.harnesses.claude.ready, true);
 });
 
-test('harness readiness rejects duplicate registrations and malformed adapters', async () => {
+test('harness readiness rejects duplicate setup-owned registrations', async () => {
   const { fixture, discovery } = await readyHarnessFixture();
   const metadata = JSON.parse(await readFile(join(fixture.home, '.agents', 'loam', 'install.json'), 'utf8'));
   const assetPath = join(metadata.adapter_root, 'claude-session-start.mjs');
@@ -390,12 +523,6 @@ test('harness readiness rejects duplicate registrations and malformed adapters',
   assert.equal(result.ready, false);
   assert.equal(result.harnesses.claude.ready, false);
 
-  await writeFile(assetPath, 'export default {};\n');
-  settings.hooks.SessionStart = [{ hooks: [{ type: 'command', command }] }];
-  await writeFile(settingsPath, JSON.stringify(settings));
-  result = await verifyInstallation({ discovery, packageRoot, runtimeRunner: fixture.smokeRunner });
-  assert.equal(result.ready, false);
-  assert.equal(result.harnesses.claude.ready, false);
 });
 
 test('failed post-harness setup restores every active harness mutation', async () => {

@@ -14,6 +14,16 @@ async function defaultIntegrationPath() {
   }
 }
 
+async function defaultIngestModules({ integrationPath } = {}) {
+  integrationPath ||= await defaultIntegrationPath();
+  const root = new URL('./', pathToFileURL(integrationPath));
+  const [paths, ingest] = await Promise.all([
+    import(new URL('paths.mjs', root).href),
+    import(new URL('ingest.mjs', root).href),
+  ]);
+  return { ...paths, ...ingest };
+}
+
 export function workspaceFromPayload(payload = {}, fallback = process.cwd()) {
   const value = payload.cwd || payload.workspaceRoot || payload.workspace?.root || payload.session?.cwd || fallback;
   return resolve(value);
@@ -64,6 +74,29 @@ export async function handleMarketplaceHook(payload, options = {}) {
 
 export async function handleClaudeHook(payload, options = {}) {
   return handleMarketplaceHook(payload, { ...options, harness: 'claude' });
+}
+
+export async function handleMarketplaceStop(payload = {}, {
+  harness = 'claude',
+  env = process.env,
+  loadIngest = defaultIngestModules,
+} = {}) {
+  try {
+    const { resolveGlobalRoot, resolveSkillsRoot, dispatchBoundary } = await loadIngest();
+    if (!dispatchBoundary) return {};
+    await dispatchBoundary({
+      harness,
+      payload: {
+        session_id: typeof payload?.session_id === 'string' ? payload.session_id : undefined,
+        cwd: typeof payload?.cwd === 'string' ? payload.cwd : undefined,
+        stop_hook_active: payload?.stop_hook_active === true,
+      },
+      globalRoot: env.LOAM_INGEST_GLOBAL_ROOT || resolveGlobalRoot({ env }),
+      skillsRoot: env.LOAM_INGEST_SKILLS_ROOT || resolveSkillsRoot({ env }),
+      env,
+    });
+  } catch {}
+  return {};
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
