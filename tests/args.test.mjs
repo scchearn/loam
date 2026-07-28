@@ -52,6 +52,11 @@ test('install aliases setup and doctor is a supported command', () => {
   });
 });
 
+test('native hook commands are not package installation commands', () => {
+  assert.throws(() => parseArgs(['events']), UsageError);
+  assert.throws(() => parseArgs(['hooks', 'list']), UsageError);
+});
+
 test('help and version are read-only command modes', () => {
   assert.deepEqual(parseArgs(['--help']), { command: 'help' });
   assert.deepEqual(parseArgs(['--version']), { command: 'version' });

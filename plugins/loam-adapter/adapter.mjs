@@ -24,6 +24,16 @@ async function defaultIngestModules({ integrationPath } = {}) {
   return { ...paths, ...ingest };
 }
 
+async function defaultHookModules({ integrationPath } = {}) {
+  integrationPath ||= await defaultIntegrationPath();
+  const root = new URL('./', pathToFileURL(integrationPath));
+  const [paths, hooks] = await Promise.all([
+    import(new URL('paths.mjs', root).href),
+    import(new URL('hooks.mjs', root).href),
+  ]);
+  return { ...paths, ...hooks };
+}
+
 export function workspaceFromPayload(payload = {}, fallback = process.cwd()) {
   const value = payload.cwd || payload.workspaceRoot || payload.workspace?.root || payload.session?.cwd || fallback;
   return resolve(value);
@@ -79,11 +89,28 @@ export async function handleClaudeHook(payload, options = {}) {
 export async function handleMarketplaceStop(payload = {}, {
   harness = 'claude',
   env = process.env,
+  loadHooks = defaultHookModules,
   loadIngest = defaultIngestModules,
 } = {}) {
+  const workspace = workspaceFromPayload(payload);
+  let hookRun = null;
+  let finishHookRun;
+  try {
+    const hooks = await loadHooks();
+    finishHookRun = hooks.finishHookRun;
+    hookRun = await hooks.beginHookRun?.({
+      globalRoot: hooks.resolveGlobalRoot({ env }),
+      harness,
+      hook: 'stop',
+      workspace,
+      sessionId: typeof payload?.session_id === 'string' ? payload.session_id : undefined,
+    });
+  } catch {}
+
+  let failure;
   try {
     const { resolveGlobalRoot, resolveSkillsRoot, dispatchBoundary } = await loadIngest();
-    if (!dispatchBoundary) return {};
+    if (!dispatchBoundary) throw new Error('Loam ingestion integration is unavailable');
     await dispatchBoundary({
       harness,
       payload: {
@@ -95,7 +122,19 @@ export async function handleMarketplaceStop(payload = {}, {
       skillsRoot: env.LOAM_INGEST_SKILLS_ROOT || resolveSkillsRoot({ env }),
       env,
     });
-  } catch {}
+  } catch (error) {
+    failure = error;
+  }
+
+  if (hookRun && finishHookRun) {
+    try {
+      await finishHookRun({
+        run: hookRun,
+        status: failure ? 'failed' : 'succeeded',
+        ...(failure ? { detail: failure instanceof Error ? failure.message : String(failure) } : {}),
+      });
+    } catch {}
+  }
   return {};
 }
 

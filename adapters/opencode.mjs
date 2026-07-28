@@ -28,13 +28,17 @@ async function loadIngestModules() {
         import(new URL('paths.mjs', root).href),
         import(new URL('ingest.mjs', root).href),
       ]);
-      return { ...paths, ...ingest };
+      let hooks = {};
+      try { hooks = await import(new URL('hooks.mjs', root).href); } catch {}
+      return { ...paths, ...ingest, ...hooks };
     } catch {}
   }
   throw new Error('loam ingestion integration is unavailable');
 }
 
-const { resolveGlobalRoot, resolveSkillsRoot, gate, runWorker } = await loadIngestModules().catch(() => ({}));
+const {
+  resolveGlobalRoot, resolveSkillsRoot, gate, runWorker, beginHookRun, finishHookRun,
+} = await loadIngestModules().catch(() => ({}));
 
 async function defaultContext({ integrationPath, workspace }) {
   try {
@@ -53,7 +57,13 @@ async function defaultContext({ integrationPath, workspace }) {
 
 function responseData(response) { return response?.data ?? response; }
 
-export function createOpenCodeAdapter({ client, integrationPath, getContext = defaultContext, ingestion = {} } = {}) {
+export function createOpenCodeAdapter({
+  client,
+  integrationPath,
+  getContext = defaultContext,
+  ingestion = {},
+  hookRuns = {},
+} = {}) {
   const childSessions = new Set();
   const completedChildSessions = new Set();
   const completedOrder = [];
@@ -69,6 +79,9 @@ export function createOpenCodeAdapter({ client, integrationPath, getContext = de
   const ingestWorker = ingestion.runWorker || runWorker;
   const ingestGlobalRoot = ingestion.resolveGlobalRoot || resolveGlobalRoot;
   const ingestSkillsRoot = ingestion.resolveSkillsRoot || resolveSkillsRoot;
+  const hookBegin = hookRuns.beginHookRun || beginHookRun;
+  const hookFinish = hookRuns.finishHookRun || finishHookRun;
+  const hookGlobalRoot = hookRuns.resolveGlobalRoot || resolveGlobalRoot;
   return async ({ directory, client: invocationClient } = {}) => {
     const sdk = client || invocationClient;
     return {
@@ -82,63 +95,90 @@ export function createOpenCodeAdapter({ client, integrationPath, getContext = de
       const reference = firstUser.parts[0];
       firstUser.parts.unshift({ ...reference, type: 'text', text: context });
     },
-    event: ({ event } = {}) => {
+    event: async ({ event } = {}) => {
       if (event?.type !== 'session.idle') return;
       const childId = event.sessionID || event.session_id || event.properties?.sessionID || event.properties?.session_id;
       if (childId && (childSessions.has(childId) || completedChildSessions.has(childId))) return;
-      if (!ingestGate || !ingestWorker || !ingestGlobalRoot || !ingestSkillsRoot) return;
       const workspace = directory || event.directory || process.cwd();
       const env = process.env;
-      const globalRoot = ingestGlobalRoot({ env, integrationPath });
-      const skillsRoot = ingestSkillsRoot({ env });
-      void (async () => {
+      let hookRun = null;
+      if (hookBegin && hookGlobalRoot) {
+        try {
+          hookRun = await hookBegin({
+            globalRoot: hookGlobalRoot({ env, integrationPath }),
+            harness: 'opencode',
+            hook: 'session_idle',
+            workspace,
+            sessionId: typeof childId === 'string' ? childId : undefined,
+          });
+        } catch {}
+      }
+      let failure;
+      try {
+        if (!ingestGate || !ingestWorker || !ingestGlobalRoot || !ingestSkillsRoot) {
+          throw new Error('Loam ingestion integration is unavailable');
+        }
+        const globalRoot = ingestGlobalRoot({ env, integrationPath });
+        const skillsRoot = ingestSkillsRoot({ env });
         const gated = await ingestGate({
           harness: 'opencode',
           payload: { cwd: workspace, event_id: event.id, session_id: childId },
           globalRoot,
           env,
         });
-        if (gated.action !== 'spawn_worker' || !sdk?.session) return;
-        const childSession = {
-          parentSessionId: childId,
-          createChild: async ({ parentId, title }) => {
-            const child = responseData(await sdk.session.create({
-              query: { directory: workspace },
-              body: { parentID: parentId, title },
-            }));
-            const id = child?.id || child?.session_id || child?.sessionID;
-            if (id) { childSession.lastChildId = String(id); childSessions.add(String(id)); }
-            return child;
-          },
-          promptAsync: async ({ sessionId, parts }) => {
-            await sdk.session.promptAsync({
-              path: { id: sessionId },
-              query: { directory: workspace },
-              body: { parts },
-            });
-            childSessions.add(String(sessionId));
-          },
-          status: async (id) => {
-            if (typeof sdk.session.status !== 'function') throw new Error('OpenCode session status is unavailable');
-            const response = responseData(await sdk.session.status({ query: { directory: workspace } }));
-            return response?.[id] || response?.data?.[id] || response;
-          },
-          abort: async (id) => {
-            if (typeof sdk.session.abort !== 'function') throw new Error('OpenCode session abort is unavailable');
-            return responseData(await sdk.session.abort({ path: { id }, query: { directory: workspace } }));
-          },
-        };
-        await Promise.resolve(ingestWorker({
-          harness: 'opencode',
-          workspace: gated.workspace,
-          globalRoot,
-          skillsRoot,
-          env,
-          openCodeSession: childSession,
-        })).catch(() => {}).finally(() => {
-          if (childSession.lastChildId) rememberCompleted(childSession.lastChildId);
-        });
-      })().catch(() => {});
+        if (gated.action === 'spawn_worker' && sdk?.session) {
+          const childSession = {
+            parentSessionId: childId,
+            createChild: async ({ parentId, title }) => {
+              const child = responseData(await sdk.session.create({
+                query: { directory: workspace },
+                body: { parentID: parentId, title },
+              }));
+              const id = child?.id || child?.session_id || child?.sessionID;
+              if (id) { childSession.lastChildId = String(id); childSessions.add(String(id)); }
+              return child;
+            },
+            promptAsync: async ({ sessionId, parts }) => {
+              await sdk.session.promptAsync({
+                path: { id: sessionId },
+                query: { directory: workspace },
+                body: { parts },
+              });
+              childSessions.add(String(sessionId));
+            },
+            status: async (id) => {
+              if (typeof sdk.session.status !== 'function') throw new Error('OpenCode session status is unavailable');
+              const response = responseData(await sdk.session.status({ query: { directory: workspace } }));
+              return response?.[id] || response?.data?.[id] || response;
+            },
+            abort: async (id) => {
+              if (typeof sdk.session.abort !== 'function') throw new Error('OpenCode session abort is unavailable');
+              return responseData(await sdk.session.abort({ path: { id }, query: { directory: workspace } }));
+            },
+          };
+          void Promise.resolve(ingestWorker({
+            harness: 'opencode',
+            workspace: gated.workspace,
+            globalRoot,
+            skillsRoot,
+            env,
+            openCodeSession: childSession,
+          })).catch(() => {}).finally(() => {
+            if (childSession.lastChildId) rememberCompleted(childSession.lastChildId);
+          });
+        }
+      } catch (error) {
+        failure = error;
+      }
+      if (hookRun && hookFinish) {
+        try {
+          await hookFinish({
+            run: hookRun,
+            status: failure ? 'failed' : 'succeeded',
+            ...(failure ? { detail: failure instanceof Error ? failure.message : String(failure) } : {}),
+          });
+        } catch {}
+      }
     },
     };
   };

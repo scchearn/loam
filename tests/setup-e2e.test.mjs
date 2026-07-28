@@ -122,6 +122,8 @@ test('setup reconciles an install from an older plugin version', async () => {
   await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
   const metadataPath = join(fixture.home, '.agents', 'loam', 'install.json');
   const previous = JSON.parse(await readFile(metadataPath, 'utf8'));
+  const databasePath = join(fixture.home, '.agents', 'loam', 'loam.sqlite3');
+  await writeFile(databasePath, 'operational history');
   await writeFile(metadataPath, JSON.stringify({ ...previous, plugin_version: '0.0.0' }));
 
   const capture = outputCapture();
@@ -137,6 +139,7 @@ test('setup reconciles an install from an older plugin version', async () => {
   const current = JSON.parse(await readFile(metadataPath, 'utf8'));
   assert.equal(current.plugin_version, PACKAGE_VERSION);
   assert.notEqual(current.integration_path, previous.integration_path);
+  assert.equal(await readFile(databasePath, 'utf8'), 'operational history');
 });
 
 test('marketplace-owned Claude and Codex satisfy readiness without user hooks', async () => {

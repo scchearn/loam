@@ -34,6 +34,8 @@ test('OpenCode background events queue work and normalize the all-session status
   let observed;
   let finished;
   let gateCalls = 0;
+  const hookRuns = [];
+  const order = [];
   const done = new Promise((resolve) => { finished = resolve; });
   const plugin = await createOpenCodeAdapter({
     client: {
@@ -47,7 +49,7 @@ test('OpenCode background events queue work and normalize the all-session status
       },
     },
     ingestion: {
-      gate: async () => { gateCalls += 1; return { action: 'spawn_worker', workspace: '/workspace' }; },
+      gate: async () => { order.push('gate'); gateCalls += 1; return { action: 'spawn_worker', workspace: '/workspace' }; },
       resolveGlobalRoot: () => root,
       resolveSkillsRoot: () => root,
       runWorker: async ({ openCodeSession }) => {
@@ -57,6 +59,18 @@ test('OpenCode background events queue work and normalize the all-session status
         finished();
       },
     },
+    hookRuns: {
+      resolveGlobalRoot: () => root,
+      beginHookRun: async (input) => {
+        order.push('begin');
+        hookRuns.push(['begin', input]);
+        return { id: 9 };
+      },
+      finishHookRun: async (input) => {
+        order.push('finish');
+        hookRuns.push(['finish', input]);
+      },
+    },
   })({ directory: '/workspace' });
 
   await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-1', id: 'event-1' } });
@@ -64,6 +78,57 @@ test('OpenCode background events queue work and normalize the all-session status
   await plugin.event({ event: { type: 'session.idle', sessionID: 'child-1', id: 'event-2' } });
   assert.deepEqual(observed, { type: 'idle' });
   assert.equal(gateCalls, 1);
+  assert.deepEqual(order.slice(0, 3), ['begin', 'gate', 'finish']);
+  assert.deepEqual(hookRuns, [
+    ['begin', {
+      globalRoot: root,
+      harness: 'opencode',
+      hook: 'session_idle',
+      workspace: '/workspace',
+      sessionId: 'parent-1',
+    }],
+    ['finish', { run: { id: 9 }, status: 'succeeded' }],
+  ]);
+});
+
+test('OpenCode hook-run logging remains fail-open', async () => {
+  let calls = 0;
+  const plugin = await createOpenCodeAdapter({
+    hookRuns: {
+      resolveGlobalRoot: () => '/global',
+      beginHookRun: async () => { calls += 1; throw new Error('locked'); },
+      finishHookRun: async () => { throw new Error('must not finish'); },
+    },
+  })({ directory: '/workspace' });
+
+  await assert.doesNotReject(() => plugin.event({ event: { type: 'session.idle', sessionID: 'parent' } }));
+  assert.equal(calls, 1);
+});
+
+test('OpenCode finishes a catchable gate failure without rejecting the hook', async () => {
+  const finished = [];
+  const run = { id: 10 };
+  const plugin = await createOpenCodeAdapter({
+    ingestion: {
+      gate: async () => { throw new Error('gate failed'); },
+      resolveGlobalRoot: () => '/global',
+      resolveSkillsRoot: () => '/skills',
+      runWorker: async () => undefined,
+    },
+    hookRuns: {
+      resolveGlobalRoot: () => '/global',
+      beginHookRun: async () => run,
+      finishHookRun: async (input) => finished.push(input),
+    },
+  })({ directory: '/workspace' });
+
+  await assert.doesNotReject(() => plugin.event({
+    event: { type: 'session.idle', sessionID: 'parent-session' },
+  }));
+  assert.equal(finished.length, 1);
+  assert.equal(finished[0].run, run);
+  assert.equal(finished[0].status, 'failed');
+  assert.match(finished[0].detail, /gate failed/);
 });
 
 test('Claude and Cursor adapters use payload workspace roots and emit documented envelopes', async () => {

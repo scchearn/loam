@@ -3,7 +3,7 @@ import { execFile, spawn } from 'node:child_process';
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
@@ -199,18 +199,69 @@ test('marketplace plugin owns SessionStart and Stop for Claude and Codex', async
 
   const stop = await import(pathToFileURL(marketplaceStopPath).href);
   const calls = [];
+  const run = { id: 8 };
+  const workspace = resolve('/workspace');
+  const loadHooks = async () => ({
+    resolveGlobalRoot: () => '/global',
+    beginHookRun: async (input) => { calls.push(['begin', input]); return run; },
+    finishHookRun: async (input) => calls.push(['finish', input]),
+  });
   const loadIngest = async () => ({
     resolveGlobalRoot: () => '/global',
     resolveSkillsRoot: () => '/skills',
-    dispatchBoundary: async (input) => calls.push(input),
+    dispatchBoundary: async (input) => calls.push(['ingest', input]),
   });
 
   assert.deepEqual(await stop.handleStop(
-    { cwd: '/workspace', session_id: 'session' },
+    { cwd: workspace, session_id: 'session' },
     { PLUGIN_ROOT: marketplaceRoot },
-    { loadIngest },
+    { loadHooks, loadIngest },
   ), {});
-  assert.equal(calls[0].harness, 'codex');
-  assert.equal(calls[0].globalRoot, '/global');
-  assert.equal(calls[0].skillsRoot, '/skills');
+  assert.deepEqual(calls.map(([kind]) => kind), ['begin', 'ingest', 'finish']);
+  assert.deepEqual(calls[0][1], {
+    globalRoot: '/global', harness: 'codex', hook: 'stop', workspace, sessionId: 'session',
+  });
+  assert.equal(calls[1][1].harness, 'codex');
+  assert.equal(calls[1][1].globalRoot, '/global');
+  assert.equal(calls[1][1].skillsRoot, '/skills');
+  assert.deepEqual(calls[2][1], { run, status: 'succeeded' });
+
+  calls.length = 0;
+  assert.deepEqual(await stop.handleStop(
+    { cwd: workspace, session_id: 'failed-session' },
+    { PLUGIN_ROOT: marketplaceRoot },
+    {
+      loadHooks,
+      loadIngest: async () => ({
+        resolveGlobalRoot: () => '/global',
+        resolveSkillsRoot: () => '/skills',
+        dispatchBoundary: async () => { throw new Error('gate failed'); },
+      }),
+    },
+  ), {});
+  assert.deepEqual(calls.map(([kind]) => kind), ['begin', 'finish']);
+  assert.equal(calls[1][1].status, 'failed');
+  assert.match(calls[1][1].detail, /gate failed/);
+
+  calls.length = 0;
+  assert.deepEqual(await stop.handleStop(
+    { cwd: workspace },
+    { PLUGIN_ROOT: marketplaceRoot },
+    { loadHooks: async () => { throw new Error('old integration'); }, loadIngest },
+  ), {});
+  assert.deepEqual(calls.map(([kind]) => kind), ['ingest']);
+});
+
+test('marketplace Stop writes exact hook JSON when logging is unavailable', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-stop-output-'));
+  const result = await runHook({
+    HOME: home,
+    USERPROFILE: home,
+    LOAM_HOME: join(home, '.agents', 'loam'),
+    PLUGIN_ROOT: marketplaceRoot,
+  }, { cwd: home }, marketplaceStopPath);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout, '{}\n');
+  assert.equal(result.stderr, '');
 });
