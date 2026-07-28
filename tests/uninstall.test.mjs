@@ -2,11 +2,32 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 
 import { installHarnesses, detectHarnesses } from '../setup/harnesses.mjs';
 import { uninstall } from '../setup/uninstall.mjs';
 import { childIdentity } from '../integration/ingest-process.mjs';
+import { confirmUninstall } from '../setup/wizard.mjs';
+
+function skillsRunner({ installed = true, calls = [] } = {}) {
+  let active = installed;
+  return async ({ args }) => {
+    calls.push(args);
+    if (args.includes('list')) {
+      return {
+        code: 0,
+        stdout: JSON.stringify(active ? [{ name: 'loam::using', source: 'https://github.com/scchearn/loam' }] : []),
+        stderr: '',
+      };
+    }
+    if (args.includes('remove')) {
+      active = false;
+      return { code: 0, stdout: '', stderr: '' };
+    }
+    return { code: 1, stdout: '', stderr: 'unexpected Skills CLI command' };
+  };
+}
 
 async function readyFixture() {
   const home = await mkdtemp(join(tmpdir(), 'loam-uninstall-'));
@@ -49,7 +70,7 @@ async function exists(path) {
   }
 }
 
-test('uninstall removes the global root, adapter, and Loam-owned hooks; preserves unrelated config and skills', async () => {
+test('uninstall removes the global root, skills, adapter, and Loam-owned hooks; preserves unrelated config', async () => {
   const { home, globalRoot, install, installed } = await readyFixture();
   const unrelatedClaude = { type: 'command', command: 'node "/usr/local/bin/other-hook.mjs"' };
   const unrelatedCodexSession = { type: 'command', command: 'node "/usr/local/bin/other-codex-session.mjs"' };
@@ -69,12 +90,12 @@ test('uninstall removes the global root, adapter, and Loam-owned hooks; preserve
   await writeFile(codexPath, JSON.stringify(codex));
   await writeFile(cursorPath, JSON.stringify(cursor));
 
-  const code = await uninstall({ home, globalRoot, yes: true, output: { write: () => {} } });
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
 
   assert.equal(code, 0);
   assert.equal(await exists(globalRoot), false, 'global root removed');
   assert.equal(await exists(join(home, '.config', 'opencode', 'plugins', 'loam.mjs')), false, 'opencode adapter removed');
-  assert.equal(await exists(join(home, '.agents', 'skills', 'loam-using', 'SKILL.md')), true, 'global skills preserved');
+  assert.equal(await exists(join(home, '.agents', 'skills', 'loam-using', 'SKILL.md')), true, 'fixture skill tree is not touched directly');
 
   const claudeAfter = JSON.parse(await readFile(claudePath, 'utf8'));
   const codexAfter = JSON.parse(await readFile(codexPath, 'utf8'));
@@ -100,7 +121,7 @@ test('uninstall removes backup files created by setup', async () => {
   await writeFile(claudeBackup, '{"old":true}');
   await writeFile(cursorBackup, '{"old":true}');
 
-  const code = await uninstall({ home, globalRoot, yes: true, output: { write: () => {} } });
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
 
   assert.equal(code, 0);
   assert.equal(await exists(claudeBackup), false, 'claude backup removed');
@@ -111,7 +132,7 @@ test('uninstall without install.json reports nothing to remove', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-uninstall-empty-'));
   const globalRoot = join(home, '.agents', 'loam');
   let message = '';
-  const code = await uninstall({ home, globalRoot, yes: true, output: { write: (s) => { message += s; } } });
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner({ installed: false }), output: { write: (s) => { message += s; } } });
 
   assert.equal(code, 0);
   assert.match(message, /Nothing to uninstall/);
@@ -124,6 +145,7 @@ test('uninstall cancelled without --yes returns 130', async () => {
     globalRoot,
     yes: false,
     confirm: async () => false,
+    runner: skillsRunner(),
     output: { write: () => {} },
   });
 
@@ -131,12 +153,29 @@ test('uninstall cancelled without --yes returns 130', async () => {
   assert.equal(await exists(join(globalRoot, 'install.json')), true, 'global root preserved on cancel');
 });
 
-test('uninstall does not touch global skills', async () => {
+test('uninstall confirmation prompts on an interactive input', async () => {
+  const input = new PassThrough();
+  input.isTTY = true;
+  let output = '';
+  const confirmation = confirmUninstall({
+    input,
+    output: { write: (value) => { output += value; } },
+  });
+  input.end('y\n');
+
+  assert.equal(await confirmation, true);
+  assert.match(output, /Proceed with global Loam uninstall/);
+});
+
+test('uninstall removes globally installed Loam skills through the Skills CLI', async () => {
   const { home, globalRoot } = await readyFixture();
   const skillsPath = join(home, '.agents', 'skills', 'loam-using', 'SKILL.md');
-  await uninstall({ home, globalRoot, yes: true, output: { write: () => {} } });
-  assert.equal(await exists(skillsPath), true, 'skills untouched');
-  assert.equal(await exists(join(home, '.agents', 'skills')), true, 'skills root untouched');
+  const calls = [];
+  await uninstall({ home, globalRoot, yes: true, runner: skillsRunner({ calls }), output: { write: () => {} } });
+  assert.deepEqual(calls.find((args) => args.includes('remove')), [
+    '--yes', '--package', 'skills@1.5.20', 'skills', 'remove', 'loam::using', '--global', '--yes',
+  ]);
+  assert.equal(await exists(skillsPath), true, 'the Skills CLI owns removal of skill files');
 });
 
 test('uninstall deletes a fresh harness config created by setup, not leaving an empty husk', async () => {
@@ -159,7 +198,7 @@ test('uninstall deletes a fresh harness config created by setup, not leaving an 
     skills_source: 'scchearn/loam', configured_harnesses: ['cursor'],
   }, null, 2)}\n`);
 
-  const code = await uninstall({ home, globalRoot, yes: true, output: { write: () => {} } });
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner({ installed: false }), output: { write: () => {} } });
 
   assert.equal(code, 0);
   assert.equal(await exists(join(home, '.cursor', 'hooks.json')), false, 'fresh config deleted, not left as empty husk');
@@ -188,7 +227,7 @@ test('uninstall preserves a pre-existing harness config that setup modified', as
     skills_source: 'scchearn/loam', configured_harnesses: ['cursor'],
   }, null, 2)}\n`);
 
-  const code = await uninstall({ home, globalRoot, yes: true, output: { write: () => {} } });
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner({ installed: false }), output: { write: () => {} } });
   const cursor = JSON.parse(await readFile(join(home, '.cursor', 'hooks.json'), 'utf8'));
 
   assert.equal(code, 0);
@@ -203,7 +242,7 @@ test('uninstall blocks on malformed worker ownership state', async () => {
   await mkdir(runPath, { recursive: true });
   await writeFile(join(runPath, 'lease.json'), '{not-json');
 
-  const code = await uninstall({ home, globalRoot, yes: true, output: { write: () => {} } });
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
 
   assert.equal(code, 1);
   assert.equal(await exists(globalRoot), true);
@@ -219,7 +258,7 @@ test('uninstall blocks while a background worker lease is live', async () => {
     owner_pid: process.pid, boot_id: identity.boot_id, process_start: identity.process_start,
   }));
 
-  const code = await uninstall({ home, globalRoot, yes: true, output: { write: () => {} } });
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
 
   assert.equal(code, 1);
   assert.equal(await exists(globalRoot), true);

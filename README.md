@@ -55,6 +55,9 @@ To remove everything loam installed:
 npx @scchearn/loam uninstall
 ```
 
+`install` is an alias for `setup`; `doctor` checks the installation without
+changing it. `uninstall` also removes Loam's globally installed skills.
+
 For agent-specific setup notes, see [`.opencode/INSTALL.md`](./.opencode/INSTALL.md)
 and [`.codex/INSTALL.md`](./.codex/INSTALL.md).
 
