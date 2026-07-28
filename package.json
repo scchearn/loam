@@ -31,9 +31,10 @@
     "test": "node --test tests/*.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.12"
   },
   "dependencies": {
+    "@clack/prompts": "^1.7.0",
     "skills": "1.5.20"
   },
   "publishConfig": {

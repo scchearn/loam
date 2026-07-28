@@ -4,13 +4,14 @@ import { dirname, join, resolve } from 'node:path';
 
 import { writeAtomicFile } from './atomic.mjs';
 import { PACKAGE_ROOT } from './constants.mjs';
-import { isOwnedCommand } from './harnesses.mjs';
+import { detectHarnesses, isOwnedCommand } from './harnesses.mjs';
 import { classifyChild } from '../integration/ingest-process.mjs';
 import { inspectIntent } from '../integration/ingest.mjs';
 import { loadSkillInventory } from './inventory.mjs';
 import { listSkills, skillEntryAliases, skillEntrySource } from './skills.mjs';
 import { runSkills } from './process.mjs';
 import { confirmUninstall } from './wizard.mjs';
+import { removeMarketplacePlugins } from './marketplace.mjs';
 
 // Harness configs are cleaned in-place (remove only Loam-owned hook entries,
 // preserve unrelated config) rather than blind-restoring backups, because a
@@ -239,7 +240,9 @@ export async function uninstall({
     output.write(`Unable to inspect global Loam skills: ${listedSkills.detail || listedSkills.category}\n`);
     return 1;
   }
-  if (!install && !listedSkills.names.length) {
+  const detectedHarnesses = await detectHarnesses({ home });
+  const hasMarketplacePlugin = ['claude', 'codex'].some((id) => detectedHarnesses[id]?.marketplaceInstalled);
+  if (!install && !listedSkills.names.length && !hasMarketplacePlugin) {
     output.write('No Loam installation found at %s. Nothing to uninstall.\n'.replace('%s', root));
     return 0;
   }
@@ -247,6 +250,7 @@ export async function uninstall({
   output.write('Loam uninstall will:\n');
   output.write(`  - Remove ${listedSkills.names.length || 'any remaining'} globally installed Loam skills via the Skills CLI\n`);
   output.write('  - Remove Loam-owned hook entries from Claude, Codex, and Cursor configs\n');
+  output.write('  - Remove installed Claude and Codex marketplace plugins through their native CLIs\n');
   output.write('  - Remove the OpenCode Loam adapter\n');
   output.write('  - Remove the global Loam root (install.json, runtime, integration, plugins)\n');
   output.write(`  - Global root: ${root}\n`);
@@ -262,7 +266,17 @@ export async function uninstall({
     return 1;
   }
 
-  const results = { configs: [], opencode: null, globalRoot: null, backups: [], skills: null };
+  const results = { configs: [], opencode: null, globalRoot: null, backups: [], skills: null, marketplace: null };
+
+  results.marketplace = await removeMarketplacePlugins({
+    harnesses: detectedHarnesses,
+    cwd: process.cwd(),
+    runner,
+  });
+  if (Object.values(results.marketplace).some((entry) => entry.state === 'partial')) {
+    output.write('Marketplace plugin removal failed; Loam core was preserved.\n');
+    return 1;
+  }
 
   results.skills = await removeGlobalSkills({
     packageRoot,
@@ -284,7 +298,7 @@ export async function uninstall({
     results.configs.push(await cleanHarnessConfig(join(home, '.codex', 'hooks.json'), root, cleanCodexConfig));
     results.backups.push(...(await removeBackups(join(home, '.codex'))));
   }
-  if (install.configured_harnesses?.includes('cursor')) {
+  if (install?.configured_harnesses?.includes('cursor')) {
     results.configs.push(await cleanHarnessConfig(join(home, '.cursor', 'hooks.json'), root, cleanCursorConfig));
     results.backups.push(...(await removeBackups(join(home, '.cursor'))));
   }

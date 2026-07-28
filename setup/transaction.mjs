@@ -3,10 +3,11 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { cleanupStaging, createStagingDirectory, writeAtomicFile, publishJson } from './atomic.mjs';
-import { confirmSetup, renderDiscovery, stage } from './wizard.mjs';
+import { confirmSetup, renderDiscovery, selectMarketplaceHarnesses, stage } from './wizard.mjs';
 import { ensureGlobalSkills, verifyGlobalSkills } from './skills.mjs';
 import { installRuntime } from './runtime.mjs';
 import { installHarnesses } from './harnesses.mjs';
+import { installMarketplacePlugins } from './marketplace.mjs';
 import { migrateLegacyProject } from './migration.mjs';
 import { verifyInstallation } from './verify.mjs';
 
@@ -65,10 +66,28 @@ export async function executeSetup(parsed, discovery, options = {}) {
     stage(output, 'Setup cancelled');
     return 130;
   }
+  const selectedMarketplaceHarnesses = await selectMarketplaceHarnesses({
+    yes: parsed.yes,
+    harnesses: discovery.harnesses,
+    select: options.marketplaceSelect,
+  });
+  if (selectedMarketplaceHarnesses === null) {
+    stage(output, 'Setup cancelled');
+    return 130;
+  }
+
+  const selected = new Set(selectedMarketplaceHarnesses);
+  const requestedHarnesses = Object.fromEntries(Object.entries(discovery.harnesses).map(([id, harness]) => [
+    id,
+    (id === 'claude' || id === 'codex') && !selected.has(id) && !harness.marketplaceReady
+      ? { ...harness, state: 'skipped' }
+      : harness,
+  ]));
+  const requestedDiscovery = { ...discovery, harnesses: requestedHarnesses };
 
   return withSetupLock({ globalRoot: discovery.globalRoot, ...(options.lockOptions || {}) }, async () => {
     const alreadyReady = await verifyInstallation({
-      discovery,
+      discovery: requestedDiscovery,
       packageRoot: discovery.packageRoot,
       runner: options.runner,
       runtimeRunner: options.smokeRunner,
@@ -117,18 +136,36 @@ export async function executeSetup(parsed, discovery, options = {}) {
       const integrationPath = candidateIntegration.path;
       stage(output, 'Shared integration staged');
 
+      const marketplace = await installMarketplacePlugins({
+        selected: selectedMarketplaceHarnesses,
+        harnesses: discovery.harnesses,
+        cwd: discovery.workspace,
+        runner: options.runner,
+      });
+      const effectiveHarnesses = Object.fromEntries(Object.entries(requestedHarnesses).map(([id, harness]) => [
+        id,
+        marketplace[id] || harness,
+      ]));
+
       harnessInstall = await installHarnesses({
         home: discovery.home,
         globalRoot: discovery.globalRoot,
         pluginVersion: discovery.packageVersion,
         integrationPath,
-        detected: discovery.harnesses,
+        detected: effectiveHarnesses,
       });
       const harnesses = harnessInstall;
-      if (Object.values(harnesses).some((harness) => harness.state === 'partial')) {
+      for (const [id, state] of Object.entries(marketplace)) {
+        if (state.state === 'partial' && harnesses[id]?.state !== 'partial') harnesses[id] = state;
+      }
+      const marketplaceFailed = Object.values(marketplace).some((harness) => harness.state === 'partial');
+      const integrationFailed = Object.entries(harnesses).some(([id, harness]) =>
+        harness.state === 'partial' && marketplace[id]?.state !== 'partial');
+      if (integrationFailed) {
         errorOutput.write('Harness integration is incomplete.\n');
         return 1;
       }
+      if (marketplaceFailed) errorOutput.write('Marketplace plugin installation is incomplete.\n');
       stage(output, 'Supported integrations configured');
 
       const globalSkills = await verifyGlobalSkills({
@@ -173,8 +210,14 @@ export async function executeSetup(parsed, discovery, options = {}) {
           .filter(([, harness]) => harness.state === 'ready')
           .map(([id]) => id),
       };
+      const verificationHarnesses = Object.fromEntries(Object.entries(harnesses).map(([id, harness]) => [
+        id,
+        harness.state === 'partial' && marketplace[id]?.state === 'partial'
+          ? { ...harness, state: 'skipped' }
+          : harness,
+      ]));
       const final = await (options.finalVerify || verifyInstallation)({
-        discovery,
+        discovery: { ...discovery, harnesses: verificationHarnesses },
         packageRoot: discovery.packageRoot,
         install,
         runner: options.runner,
@@ -188,8 +231,8 @@ export async function executeSetup(parsed, discovery, options = {}) {
       await options.beforeActivate?.({ install, metadataPath, integrationPath });
       await publishJson({ filePath: metadataPath, value: install });
       activated = true;
-      stage(output, 'Loam is ready');
-      return 0;
+      stage(output, marketplaceFailed ? 'Loam core is ready' : 'Loam is ready');
+      return marketplaceFailed ? 1 : 0;
     } finally {
       if (!activated) {
         try {

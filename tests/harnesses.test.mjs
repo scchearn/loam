@@ -144,7 +144,7 @@ test('harness installation preserves unrelated hook commands containing loam', a
 
   assert.deepEqual(claudeHooks[0], unrelatedClaude);
   assert.deepEqual(cursorHooks[0], unrelatedCursor);
-  assert.equal(claudeHooks.filter((entry) => entry.command === 'node' && entry.args?.[0] === result.claude.path).length, 1);
+  assert.equal(claudeHooks.filter((entry) => entry.command === 'node' && entry.args?.[0] === result.claude.path).length, 0);
   assert.equal(cursorHooks.filter((entry) => entry.command === 'node' && entry.args?.[0] === result.cursor.path).length, 1);
   await result.rollback();
 });
@@ -163,19 +163,17 @@ test('harness detection and installation use only user HOME paths and are idempo
   const first = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', detected });
   const second = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', detected });
   assert.deepEqual(first.opencode.state, 'ready');
-  assert.deepEqual(first.claude.state, 'ready');
+  assert.deepEqual(first.claude.state, 'skipped');
   assert.deepEqual(first.cursor.state, 'ready');
-  assert.deepEqual(second.claude.state, 'ready');
+  assert.deepEqual(second.claude.state, 'skipped');
   assert.deepEqual(second.cursor.state, 'ready');
 
-  const claudeSettings = JSON.parse(await readFile(join(home, '.claude', 'settings.json'), 'utf8'));
   const cursorHooks = JSON.parse(await readFile(join(home, '.cursor', 'hooks.json'), 'utf8'));
-  assert.equal(claudeSettings.unrelated, undefined);
-  assert.equal(claudeSettings.hooks.SessionStart.filter((hook) => JSON.stringify(hook).includes('loam')).length, 1);
+  await assert.rejects(() => readFile(join(home, '.claude', 'settings.json')), { code: 'ENOENT' });
   assert.equal(cursorHooks.hooks.sessionStart.filter((hook) => JSON.stringify(hook).includes('loam')).length, 1);
 });
 
-test('marketplace ownership removes setup SessionStart hooks but keeps background Stop hooks', async () => {
+test('marketplace plugins own all Claude and Codex lifecycle hooks', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-owned-'));
   const globalRoot = join(home, '.agents', 'loam');
   const oldRoot = join(globalRoot, 'plugins', 'old');
@@ -190,12 +188,15 @@ test('marketplace ownership removes setup SessionStart hooks but keeps backgroun
   }));
   await writeFile(join(home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
   const claudeCache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
-  await mkdir(claudeCache, { recursive: true });
+  await mkdir(join(claudeCache, 'hooks'), { recursive: true });
+  await writeFile(join(claudeCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
   await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
     version: 2,
     plugins: { 'loam@loam': [{ scope: 'user', installPath: claudeCache, version: '0.8.6' }] },
   }));
-  await mkdir(join(home, '.codex', 'plugins', 'cache', 'loam', 'loam', '0.8.6'), { recursive: true });
+  const codexCache = join(home, '.codex', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
+  await mkdir(join(codexCache, 'hooks'), { recursive: true });
+  await writeFile(join(codexCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
   await writeFile(join(home, '.codex', 'hooks.json'), JSON.stringify({
     hooks: { SessionStart: [{ hooks: [unrelated, oldCodex] }] },
   }));
@@ -210,10 +211,10 @@ test('marketplace ownership removes setup SessionStart hooks but keeps backgroun
   assert.equal(owned.codex.owner, 'marketplace');
   assert.deepEqual(claude.hooks.SessionStart[0].hooks, [unrelated]);
   assert.deepEqual(codex.hooks.SessionStart[0].hooks, [unrelated]);
-  const claudeStop = claude.hooks.Stop.flatMap((entry) => entry.hooks || []);
-  const codexStop = codex.hooks.Stop.flatMap((entry) => entry.hooks || []);
-  assert.equal(claudeStop.filter((entry) => entry.command === 'node' && entry.args?.[0] === owned.claude.stopPath).length, 1);
-  assert.equal(codexStop.filter((entry) => entry.command === `node ${JSON.stringify(owned.codex.stopPath)}`).length, 1);
+  const claudeStop = claude.hooks.Stop?.flatMap((entry) => entry.hooks || []) || [];
+  const codexStop = codex.hooks.Stop?.flatMap((entry) => entry.hooks || []) || [];
+  assert.equal(claudeStop.filter((entry) => JSON.stringify(entry).includes('loam')).length, 0);
+  assert.equal(codexStop.filter((entry) => JSON.stringify(entry).includes('loam')).length, 0);
 
   const fallbackHome = await mkdtemp(join(tmpdir(), 'loam-codex-fallback-'));
   await mkdir(join(fallbackHome, '.codex'), { recursive: true });
@@ -224,15 +225,11 @@ test('marketplace ownership removes setup SessionStart hooks but keeps backgroun
     pluginVersion: '0.8.6',
     detected: fallbackDetected,
   });
-  const hooks = JSON.parse(await readFile(join(fallbackHome, '.codex', 'hooks.json'), 'utf8'));
-  const commands = hooks.hooks.SessionStart.flatMap((entry) => entry.hooks || []);
-  assert.equal(fallback.codex.owner, 'setup');
-  assert.equal(commands.filter((entry) => entry.command === `node ${JSON.stringify(fallback.codex.sessionPath)}`).length, 1);
-  assert.equal(hooks.hooks.Stop.flatMap((entry) => entry.hooks || [])
-    .filter((entry) => entry.command === `node ${JSON.stringify(fallback.codex.stopPath)}`).length, 1);
+  assert.equal(fallback.codex.state, 'skipped');
+  await assert.rejects(() => readFile(join(fallbackHome, '.codex', 'hooks.json')), { code: 'ENOENT' });
 });
 
-test('enabled marketplace settings without installed plugin bytes keep setup ownership', async () => {
+test('enabled marketplace settings without installed plugin bytes do not claim marketplace ownership', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-missing-cache-'));
   await mkdir(join(home, '.claude'), { recursive: true });
   await mkdir(join(home, '.codex'), { recursive: true });
@@ -243,6 +240,22 @@ test('enabled marketplace settings without installed plugin bytes keep setup own
 
   assert.equal(detected.claude.marketplaceOwned, false);
   assert.equal(detected.codex.marketplaceOwned, false);
+});
+
+test('disabled marketplace plugins remain discoverable for uninstall', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-disabled-'));
+  const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.2');
+  await mkdir(join(cache, 'hooks'), { recursive: true });
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': false } }));
+  await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'user', installPath: cache, version: '0.9.2' }] },
+  }));
+
+  const detected = await detectHarnesses({ home });
+  assert.equal(detected.claude.marketplaceInstalled, true);
+  assert.equal(detected.claude.marketplaceOwned, false);
 });
 
 test('managed harness policy becomes partial without changing its settings', async () => {
@@ -278,7 +291,7 @@ test('absent harnesses remain absent and do not receive project-local hook files
   assert.equal(result.cursor.state, 'absent');
 });
 
-test('Codex preserves hook groups, accepts Windows 8.3 paths, and rejects expansion paths', async () => {
+test('Codex cleanup preserves unrelated hook groups without adding setup hooks', async () => {
   const root = await mkdtemp(join(tmpdir(), 'loam-codex-hooks-'));
   const home = join(root, 'RUNNER~1');
   await mkdir(join(home, '.codex'), { recursive: true });
@@ -291,24 +304,8 @@ test('Codex preserves hook groups, accepts Windows 8.3 paths, and rejects expans
     pluginVersion: '0.8.3',
     detected: { opencode: { id: 'opencode', state: 'absent' }, claude: { id: 'claude', state: 'absent' }, cursor: { id: 'cursor', state: 'absent' }, codex: { id: 'codex', state: 'detected', root: join(home, '.codex') } },
   });
-  assert.equal(result.codex.state, 'ready', JSON.stringify(result.codex));
+  assert.equal(result.codex.state, 'skipped', JSON.stringify(result.codex));
   const config = JSON.parse(await readFile(join(home, '.codex', 'hooks.json'), 'utf8'));
-  assert.equal(config.hooks.Stop.length, 2);
+  assert.equal(config.hooks.Stop.length, 1);
   assert.deepEqual(config.hooks.Stop[0].hooks, [unrelated]);
-  assert.equal(config.hooks.Stop[1].hooks.length, 1);
-  assert.equal(config.hooks.Stop[1].hooks[0].command, 'node ' + JSON.stringify(result.codex.path));
-
-  for (const character of ['%', '!']) {
-    const blockedHome = join(root, `RUNNER${character}1`);
-    await mkdir(join(blockedHome, '.codex'), { recursive: true });
-    const blocked = await installHarnesses({
-      home: blockedHome,
-      globalRoot: join(blockedHome, '.agents', 'loam'),
-      pluginVersion: '0.8.3',
-      detected: { opencode: { id: 'opencode', state: 'absent' }, claude: { id: 'claude', state: 'absent' }, cursor: { id: 'cursor', state: 'absent' }, codex: { id: 'codex', state: 'detected', root: join(blockedHome, '.codex') } },
-    });
-    assert.equal(blocked.codex.state, 'partial');
-    assert.equal(blocked.codex.category, 'install_failed');
-    assert.match(blocked.codex.detail, /Codex adapter path is unsafe/u);
-  }
 });

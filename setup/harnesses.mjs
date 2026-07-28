@@ -18,21 +18,42 @@ async function exists(path) {
   }
 }
 
-async function hasClaudeMarketplaceInstall(root, name) {
+async function hasRequiredHooks(pluginRoot) {
   try {
-    const registry = JSON.parse(await readFile(join(root, 'plugins', 'installed_plugins.json'), 'utf8'));
-    const installs = registry.plugins?.[name];
-    return Array.isArray(installs)
-      && (await Promise.all(installs.map(({ installPath }) => typeof installPath === 'string' && exists(installPath)))).some(Boolean);
+    const config = JSON.parse(await readFile(join(pluginRoot, 'hooks', 'hooks.json'), 'utf8'));
+    return Array.isArray(config.hooks?.SessionStart) && config.hooks.SessionStart.length > 0
+      && Array.isArray(config.hooks?.Stop) && config.hooks.Stop.length > 0;
   } catch {
     return false;
   }
 }
 
-async function hasCodexMarketplaceInstall(root, name) {
+async function claudeMarketplaceInstall(root, name) {
+  try {
+    const registry = JSON.parse(await readFile(join(root, 'plugins', 'installed_plugins.json'), 'utf8'));
+    const installs = registry.plugins?.[name];
+    const paths = Array.isArray(installs)
+      ? installs.map(({ installPath }) => installPath).filter((path) => typeof path === 'string' && path)
+      : [];
+    const installed = (await Promise.all(paths.map(exists))).some(Boolean);
+    const ready = installed && (await Promise.all(paths.map(hasRequiredHooks))).some(Boolean);
+    return { installed, ready };
+  } catch {
+    return { installed: false, ready: false };
+  }
+}
+
+async function codexMarketplaceInstall(root, name) {
   const [plugin, marketplace, extra] = name.split('@');
-  if (plugin !== 'loam' || !marketplace || extra) return false;
-  return exists(join(root, 'plugins', 'cache', marketplace, plugin));
+  if (plugin !== 'loam' || !marketplace || extra) return { installed: false, ready: false };
+  const pluginRoot = join(root, 'plugins', 'cache', marketplace, plugin);
+  const installed = await exists(pluginRoot);
+  if (!installed) return { installed: false, ready: false };
+  const versions = await readdir(pluginRoot, { withFileTypes: true }).catch(() => []);
+  const ready = (await Promise.all(versions
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => hasRequiredHooks(join(pluginRoot, entry.name))))).some(Boolean);
+  return { installed: true, ready };
 }
 
 export async function detectHarnesses({ home = homedir() } = {}) {
@@ -46,19 +67,21 @@ export async function detectHarnesses({ home = homedir() } = {}) {
   for (const [id, root] of Object.entries(roots)) {
     const state = await exists(root) ? 'detected' : 'absent';
     let marketplaceOwned = false;
+    let marketplaceInstalled = false;
+    let marketplaceReady = false;
     if (state === 'detected' && id === 'claude') {
+      const install = await claudeMarketplaceInstall(root, 'loam@loam');
+      marketplaceInstalled = install.installed;
       try {
         const settings = JSON.parse(await readFile(join(root, 'settings.json'), 'utf8'));
-        for (const [name, enabled] of Object.entries(settings.enabledPlugins || {})) {
-          if (name.startsWith('loam@') && enabled === true && await hasClaudeMarketplaceInstall(root, name)) {
-            marketplaceOwned = true;
-            break;
-          }
-        }
+        marketplaceOwned = settings.enabledPlugins?.['loam@loam'] === true && install.installed;
+        marketplaceReady = marketplaceOwned && install.ready;
       } catch {
         marketplaceOwned = false;
       }
     } else if (state === 'detected' && id === 'codex') {
+      const install = await codexMarketplaceInstall(root, 'loam@loam');
+      marketplaceInstalled = install.installed;
       try {
         const config = await readFile(join(root, 'config.toml'), 'utf8');
         let loamPlugin = '';
@@ -71,7 +94,8 @@ export async function detectHarnesses({ home = homedir() } = {}) {
           }
           if (/^\s*\[/.test(line)) loamPlugin = '';
           if (loamPlugin && /^\s*enabled\s*=\s*true\s*(?:#.*)?$/.test(line)) {
-            marketplaceOwned = await hasCodexMarketplaceInstall(root, loamPlugin);
+            marketplaceOwned = install.installed;
+            marketplaceReady = marketplaceOwned && install.ready;
             break;
           }
         }
@@ -79,7 +103,7 @@ export async function detectHarnesses({ home = homedir() } = {}) {
         marketplaceOwned = false;
       }
     }
-    result[id] = { id, root, state, marketplaceOwned };
+    result[id] = { id, root, state, marketplaceOwned, marketplaceInstalled, marketplaceReady };
   }
   return result;
 }
@@ -171,6 +195,12 @@ function mergeCursorHooks(existing, entry, globalRoot) {
 
 async function installClaude({ home, globalRoot, assetPath, marketplaceOwned }) {
   const filePath = join(home, '.claude', 'settings.json');
+  try {
+    await readFile(filePath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { path: filePath, backupPath: null };
+    throw error;
+  }
   return mergeJsonConfig({
     filePath,
     update: (config) => ({
@@ -179,34 +209,13 @@ async function installClaude({ home, globalRoot, assetPath, marketplaceOwned }) 
         ...(config.hooks || {}),
         SessionStart: mergeClaudeHooks(
           config.hooks?.SessionStart,
-          marketplaceOwned ? null : {
-            matcher: 'startup|resume|clear|compact',
-            hooks: [hookEntry(assetPath)],
-          },
+          null,
           globalRoot,
         ),
-        Stop: mergeClaudeHooks(config.hooks?.Stop, {
-          matcher: '',
-          hooks: [hookEntry(join(dirname(assetPath), 'claude-stop.mjs'), { async: true, timeout: 30 })],
-        }, globalRoot, 'claude-stop.mjs'),
+        Stop: mergeClaudeHooks(config.hooks?.Stop, null, globalRoot, 'claude-stop.mjs'),
       },
     }),
   });
-}
-
-function unsafeCodexPath(path) {
-  // ponytail: this covers double-quoted-context expansion only; emit argv if Codex hooks support it.
-  return /[%!$`\r\n]/u.test(path);
-}
-
-function codexHandler(assetPath) {
-  const windowsPath = assetPath.replaceAll('/', '\\');
-  return {
-    type: 'command',
-    command: 'node ' + JSON.stringify(assetPath),
-    commandWindows: 'node ' + JSON.stringify(windowsPath),
-    timeout: 5,
-  };
 }
 
 function mergeCodexHooks(existing, handler, globalRoot, assetName = 'codex-stop.mjs') {
@@ -222,7 +231,12 @@ function mergeCodexHooks(existing, handler, globalRoot, assetName = 'codex-stop.
 
 async function installCodex({ home, globalRoot, sessionAssetPath, stopAssetPath, marketplaceOwned }) {
   const filePath = join(home, '.codex', 'hooks.json');
-  if (unsafeCodexPath(sessionAssetPath) || unsafeCodexPath(stopAssetPath)) throw new Error('Codex adapter path is unsafe; install the fixed hook manually');
+  try {
+    await readFile(filePath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { path: filePath, backupPath: null };
+    throw error;
+  }
   return mergeJsonConfig({
     filePath,
     update: (config) => ({
@@ -231,11 +245,11 @@ async function installCodex({ home, globalRoot, sessionAssetPath, stopAssetPath,
         ...(config.hooks || {}),
         SessionStart: mergeCodexHooks(
           config.hooks?.SessionStart,
-          marketplaceOwned ? null : codexHandler(sessionAssetPath),
+          null,
           globalRoot,
           'codex-session-start.mjs',
         ),
-        Stop: mergeCodexHooks(config.hooks?.Stop, codexHandler(stopAssetPath), globalRoot),
+        Stop: mergeCodexHooks(config.hooks?.Stop, null, globalRoot),
       },
     }),
   });
@@ -310,8 +324,8 @@ export async function installHarnesses({
         if (config.backupPath) backupPaths.push(config.backupPath);
         result[id] = {
           ...harness,
-          state: 'ready',
-          owner: harness.marketplaceOwned ? 'marketplace' : 'setup',
+          state: harness.marketplaceReady ? 'ready' : 'skipped',
+          owner: harness.marketplaceReady ? 'marketplace' : null,
           path: assets.assets['claude-session-start'],
           sessionPath: assets.assets['claude-session-start'],
           stopPath: assets.assets['claude-stop'],
@@ -328,8 +342,8 @@ export async function installHarnesses({
         if (config.backupPath) backupPaths.push(config.backupPath);
         result[id] = {
           ...harness,
-          state: 'ready',
-          owner: harness.marketplaceOwned ? 'marketplace' : 'setup',
+          state: harness.marketplaceReady ? 'ready' : 'skipped',
+          owner: harness.marketplaceReady ? 'marketplace' : null,
           path: assets.assets['codex-stop'],
           sessionPath: assets.assets['codex-session-start'],
           stopPath: assets.assets['codex-stop'],

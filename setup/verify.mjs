@@ -1,5 +1,4 @@
 import { readFile, stat } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -8,6 +7,7 @@ import { readInstallMetadata, readRequiredVersion, readSkillContent } from '../i
 import { resolveExclusions } from '../integration/ingest.mjs';
 import { checkReadiness, probeState } from '../integration/runtime.mjs';
 import { verifyGlobalSkills } from './skills.mjs';
+import { isOwnedCommand } from './harnesses.mjs';
 
 async function fileExists(path) {
   try {
@@ -38,34 +38,6 @@ function ownsCommand(entry, path) {
     try { candidates.push(JSON.parse(raw)); } catch { candidates.push(raw); }
   }
   return candidates.some((candidate) => candidate === path || candidate === path.replaceAll('/', '\\'));
-}
-
-async function executeCodexAdapter(assetPath, workspace, integrationPath) {
-  return new Promise((resolvePromise) => {
-    const child = spawn(process.execPath, [assetPath], {
-      stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
-      env: { ...process.env, LOAM_INGEST_BACKGROUND: '0', ...(integrationPath ? { LOAM_INTEGRATION_PATH: integrationPath } : {}) },
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => { stdout += chunk.toString().slice(0, 2048 - stdout.length); });
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString().slice(0, 2048 - stderr.length); });
-    const timer = setTimeout(() => { child.kill(); resolvePromise({ code: null, stdout, stderr, error: new Error('adapter verification timed out') }); }, 5000);
-    child.once('error', (error) => { clearTimeout(timer); resolvePromise({ code: null, stdout, stderr, error }); });
-    child.once('close', (code) => { clearTimeout(timer); resolvePromise({ code, stdout, stderr }); });
-    child.stdin.end(JSON.stringify({ cwd: workspace, session_id: 'verify', stop_hook_active: false }));
-  });
-}
-
-async function verifyCodexSessionEnvelope(assetPath, workspace) {
-  const module = await import(`${pathToFileURL(assetPath).href}?verify-session=${randomUUID()}`);
-  const context = '<LOAM_IMPORTANT>\nverification context\n</LOAM_IMPORTANT>';
-  const result = await module.handleMarketplaceHook(
-    { cwd: workspace },
-    { harness: 'codex', getContext: async () => context },
-  );
-  return result?.hookSpecificOutput?.hookEventName === 'SessionStart'
-    && result.hookSpecificOutput.additionalContext === context;
 }
 
 async function verifyIngestExclusions(skillsRoot) {
@@ -107,39 +79,32 @@ async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, 
     return output.messages[0].parts.filter((part) => part.type === 'text' && part.text === context).length === 1
       && typeof adapter.event === 'function';
   }
-  if (id === 'claude') {
-    const result = await module.handleClaudeHook({ cwd: workspace }, { getContext: async () => context });
-    const hadPath = Object.hasOwn(process.env, 'LOAM_INTEGRATION_PATH');
-    const previousPath = process.env.LOAM_INTEGRATION_PATH;
-    if (integrationPath) process.env.LOAM_INTEGRATION_PATH = integrationPath;
-    let stop;
-    try {
-      stop = await import(`${pathToFileURL(join(assetPath, '..', 'claude-stop.mjs')).href}?verify-stop=${randomUUID()}`);
-    } finally {
-      if (hadPath) process.env.LOAM_INTEGRATION_PATH = previousPath;
-      else delete process.env.LOAM_INTEGRATION_PATH;
-    }
-    const stopped = await stop.main({ env: { ...process.env, LOAM_INGEST_BACKGROUND: '0', ...(globalRoot ? { LOAM_INGEST_GLOBAL_ROOT: globalRoot } : {}) }, payload: { cwd: workspace } });
-    return result?.hookSpecificOutput?.hookEventName === 'SessionStart'
-      && result.hookSpecificOutput.additionalContext === context
-      && stopped?.reason === 'disabled';
-  }
-  if (id === 'codex') {
-    const result = await executeCodexAdapter(assetPath, workspace, integrationPath);
-    return result.code === 0 && result.stdout === '{}';
-  }
   const result = await module.handleCursorHook({ cwd: workspace }, { getContext: async () => context });
   return result?.additional_context === context;
 }
 
 async function verifyHarness(id, harness, { packageRoot, globalRoot, install, workspace }) {
-  if (harness.state === 'absent') return { ...harness, ready: true };
+  if (harness.state === 'absent' || harness.state === 'skipped') return { ...harness, ready: true };
   if (!install) return { ...harness, ready: false, category: 'install_metadata_missing' };
   const assetRoot = install.adapter_root;
   const assetName = id === 'opencode' ? 'opencode.mjs' : `${id}-session-start.mjs`;
   const assetPath = join(assetRoot, id === 'codex' ? 'codex-stop.mjs' : assetName);
   const sessionAssetPath = join(assetRoot, assetName);
   try {
+    if (id === 'claude' || id === 'codex') {
+      if (!harness.marketplaceReady) return { ...harness, ready: false, category: 'plugin_incomplete' };
+      const configPath = id === 'claude' ? join(harness.root, 'settings.json') : join(harness.root, 'hooks.json');
+      let config = {};
+      try { config = JSON.parse(await readFile(configPath, 'utf8')); }
+      catch (error) { if (error?.code !== 'ENOENT') throw error; }
+      const session = Array.isArray(config.hooks?.SessionStart) ? config.hooks.SessionStart : [];
+      const stop = Array.isArray(config.hooks?.Stop) ? config.hooks.Stop : [];
+      if (session.some((entry) => isOwnedCommand(entry, globalRoot, `${id}-session-start.mjs`))
+        || stop.some((entry) => isOwnedCommand(entry, globalRoot, `${id}-stop.mjs`))) {
+        return { ...harness, ready: false, category: 'registration_duplicate' };
+      }
+      return { ...harness, ready: true, owner: 'marketplace' };
+    }
     if (id === 'opencode') {
       const stablePath = join(harness.root, 'plugins', 'loam.mjs');
       const [actual, expected] = await Promise.all([
@@ -147,17 +112,6 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
         readFile(join(packageRoot, 'adapters', 'opencode.mjs'), 'utf8'),
       ]);
       if (actual !== expected) return { ...harness, ready: false, category: 'registration_mismatch' };
-    } else if (id === 'codex') {
-      const config = JSON.parse(await readFile(join(harness.root, 'hooks.json'), 'utf8'));
-      const stopCommands = Array.isArray(config.hooks?.Stop) ? config.hooks.Stop : [];
-      const ownedStop = stopCommands.filter((entry) => ownsCommand(entry, assetPath));
-      if (ownedStop.length !== 1) return { ...harness, ready: false, category: ownedStop.length ? 'registration_duplicate' : 'registration_missing' };
-      const sessionCommands = Array.isArray(config.hooks?.SessionStart) ? config.hooks.SessionStart : [];
-      const ownedSession = sessionCommands.filter((entry) => ownsCommand(entry, sessionAssetPath));
-      const expectedSessionCount = harness.marketplaceOwned ? 0 : 1;
-      if (ownedSession.length !== expectedSessionCount) {
-        return { ...harness, ready: false, category: ownedSession.length ? 'registration_duplicate' : 'registration_missing' };
-      }
     } else {
       const configPath = id === 'claude' ? join(harness.root, 'settings.json') : join(harness.root, 'hooks.json');
       const config = JSON.parse(await readFile(configPath, 'utf8'));
@@ -165,7 +119,7 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
         ? (Array.isArray(config.hooks?.SessionStart) ? config.hooks.SessionStart : []).flatMap((entry) => Array.isArray(entry?.hooks) ? entry.hooks : [])
         : (Array.isArray(config.hooks?.sessionStart) ? config.hooks.sessionStart : []);
       const owned = commands.filter((entry) => ownsCommand(entry, assetPath));
-      const expectedSessionCount = id === 'claude' && harness.marketplaceOwned ? 0 : 1;
+      const expectedSessionCount = 1;
       if (owned.length !== expectedSessionCount) {
         return {
           ...harness,
@@ -173,23 +127,12 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
           category: owned.length ? 'registration_duplicate' : 'registration_missing',
         };
       }
-      if (id === 'claude') {
-        const stopPath = join(assetRoot, 'claude-stop.mjs');
-        const stopHooks = (Array.isArray(config.hooks?.Stop) ? config.hooks.Stop : [])
-          .flatMap((entry) => Array.isArray(entry?.hooks) ? entry.hooks : []);
-        if (stopHooks.filter((entry) => ownsCommand(entry, stopPath)).length !== 1) {
-          return { ...harness, ready: false, category: 'registration_missing' };
-        }
-      }
     }
 
     if (!(await fileExists(assetPath)) || !(await verifyAdapterEnvelope(id, assetPath, workspace, install.integration_path, globalRoot))) {
       return { ...harness, ready: false, category: 'adapter_envelope_invalid' };
     }
-    if (id === 'codex' && (!(await fileExists(sessionAssetPath)) || !(await verifyCodexSessionEnvelope(sessionAssetPath, workspace)))) {
-      return { ...harness, ready: false, category: 'adapter_envelope_invalid' };
-    }
-    return { ...harness, ready: true, owner: harness.marketplaceOwned ? 'marketplace' : 'setup' };
+    return { ...harness, ready: true, owner: 'setup' };
   } catch (error) {
     return { ...harness, ready: false, category: 'adapter_envelope_invalid', detail: error instanceof Error ? error.message : String(error) };
   }
