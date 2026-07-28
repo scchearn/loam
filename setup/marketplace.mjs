@@ -72,7 +72,7 @@ export async function removeMarketplacePlugins({
   const result = {};
   for (const id of ['claude', 'codex']) {
     const harness = harnesses[id];
-    if (!harness?.marketplaceInstalled) continue;
+    if (!harness?.marketplaceInstalled && !harness?.marketplaceConfigured) continue;
     const run = await runCommand({ command: id, args: removals[id], cwd, runner });
     result[id] = run.ok
       ? { ...harness, state: 'removed' }

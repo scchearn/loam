@@ -201,9 +201,14 @@ test('marketplace plugins own all Claude and Codex lifecycle hooks', async () =>
     hooks: { SessionStart: [{ hooks: [unrelated, oldCodex] }] },
   }));
 
-  const detected = await detectHarnesses({ home });
+  const detected = await detectHarnesses({ home, pluginVersion: '0.8.6' });
   assert.equal(detected.claude.marketplaceOwned, true);
   assert.equal(detected.codex.marketplaceOwned, true);
+  assert.equal(detected.claude.marketplaceReady, true);
+  assert.equal(detected.codex.marketplaceReady, true);
+  const stale = await detectHarnesses({ home, pluginVersion: '0.9.4' });
+  assert.equal(stale.claude.marketplaceReady, false);
+  assert.equal(stale.codex.marketplaceReady, false);
   const owned = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.6', detected });
   const claude = JSON.parse(await readFile(join(home, '.claude', 'settings.json'), 'utf8'));
   const codex = JSON.parse(await readFile(join(home, '.codex', 'hooks.json'), 'utf8'));
@@ -238,6 +243,8 @@ test('enabled marketplace settings without installed plugin bytes do not claim m
 
   const detected = await detectHarnesses({ home });
 
+  assert.equal(detected.claude.marketplaceConfigured, true);
+  assert.equal(detected.codex.marketplaceConfigured, true);
   assert.equal(detected.claude.marketplaceOwned, false);
   assert.equal(detected.codex.marketplaceOwned, false);
 });
@@ -256,6 +263,23 @@ test('disabled marketplace plugins remain discoverable for uninstall', async () 
   const detected = await detectHarnesses({ home });
   assert.equal(detected.claude.marketplaceInstalled, true);
   assert.equal(detected.claude.marketplaceOwned, false);
+});
+
+test('project-scoped Claude plugins do not satisfy a user-scoped install', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-project-scope-'));
+  const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.4');
+  await mkdir(join(cache, 'hooks'), { recursive: true });
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
+  await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'project', installPath: cache, version: '0.9.4' }] },
+  }));
+
+  const detected = await detectHarnesses({ home, pluginVersion: '0.9.4' });
+  assert.equal(detected.claude.marketplaceConfigured, true);
+  assert.equal(detected.claude.marketplaceInstalled, false);
+  assert.equal(detected.claude.marketplaceReady, false);
 });
 
 test('managed harness policy becomes partial without changing its settings', async () => {

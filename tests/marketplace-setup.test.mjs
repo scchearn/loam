@@ -113,3 +113,19 @@ test('marketplace removal delegates to each owning harness', async () => {
   assert.equal(result.claude.state, 'removed');
   assert.equal(result.codex.state, 'removed');
 });
+
+test('marketplace removal delegates configured plugins even when cache bytes are missing', async () => {
+  const calls = [];
+  await removeMarketplacePlugins({
+    harnesses: {
+      claude: { ...harnesses.claude, marketplaceConfigured: true, marketplaceInstalled: false },
+      codex: { ...harnesses.codex, marketplaceConfigured: true, marketplaceInstalled: false },
+    },
+    runner: async (request) => {
+      calls.push(request.command);
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  });
+
+  assert.deepEqual(calls, ['claude', 'codex']);
+});

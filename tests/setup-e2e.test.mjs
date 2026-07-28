@@ -147,13 +147,16 @@ test('marketplace-owned Claude and Codex satisfy readiness without user hooks', 
     enabledPlugins: { 'loam@loam': true },
   }));
   await writeFile(join(fixture.home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
-  const claudeCache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
-  await mkdir(claudeCache, { recursive: true });
+  const claudeCache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
+  await mkdir(join(claudeCache, 'hooks'), { recursive: true });
+  await writeFile(join(claudeCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
   await writeFile(join(fixture.home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
     version: 2,
-    plugins: { 'loam@loam': [{ scope: 'user', installPath: claudeCache, version: '0.8.6' }] },
+    plugins: { 'loam@loam': [{ scope: 'user', installPath: claudeCache, version: PACKAGE_VERSION }] },
   }));
-  await mkdir(join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', '0.8.6'), { recursive: true });
+  const codexCache = join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
+  await mkdir(join(codexCache, 'hooks'), { recursive: true });
+  await writeFile(join(codexCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
   const capture = outputCapture();
 
   const code = await runSetup(parseArgs(['setup', '--yes']), {
@@ -173,6 +176,29 @@ test('marketplace-owned Claude and Codex satisfy readiness without user hooks', 
   await assert.rejects(() => readFile(join(fixture.home, '.codex', 'hooks.json')), { code: 'ENOENT' });
 });
 
+test('setup verifies an updated marketplace plugin from disk instead of trusting CLI success', async () => {
+  const fixture = await baseFixture();
+  const cache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
+  await mkdir(join(cache, 'hooks'), { recursive: true });
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  await writeFile(join(fixture.home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
+  await writeFile(join(fixture.home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'user', installPath: cache, version: '0.8.6' }] },
+  }));
+  const capture = outputCapture();
+
+  const code = await runSetup(parseArgs(['setup', '--yes']), {
+    ...fixture,
+    packageRoot,
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+
+  assert.equal(code, 1, capture.text());
+  assert.match(capture.text(), /verification failed|incomplete/i);
+});
+
 test('setup --yes installs a missing Codex plugin in one pass', async () => {
   const fixture = await baseFixture();
   await mkdir(join(fixture.home, '.codex'), { recursive: true });
@@ -182,7 +208,9 @@ test('setup --yes installs a missing Codex plugin in one pass', async () => {
     calls.push(request.args);
     if (request.args[1] === 'add') {
       await writeFile(join(fixture.home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
-      await mkdir(join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', '0.9.2'), { recursive: true });
+      const cache = join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
+      await mkdir(join(cache, 'hooks'), { recursive: true });
+      await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
     }
     return { code: 0, stdout: '', stderr: '' };
   };
@@ -223,7 +251,9 @@ test('partial marketplace failure keeps successful installs and removes legacy h
     if (request.command === 'codex') {
       if (request.args[1] === 'add') {
         await writeFile(join(fixture.home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
-        await mkdir(join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', '0.9.2'), { recursive: true });
+        const cache = join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
+        await mkdir(join(cache, 'hooks'), { recursive: true });
+        await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
       }
       return { code: 0, stdout: '', stderr: '' };
     }
@@ -440,13 +470,13 @@ async function readyHarnessFixture() {
   const runner = async (request) => {
     if (request.command !== 'claude') return fixture.runner(request);
     if (request.args.includes('install')) {
-      const cache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.2');
+      const cache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
       await mkdir(join(cache, 'hooks'), { recursive: true });
       await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
       await writeFile(join(fixture.home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
       await writeFile(join(fixture.home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
         version: 2,
-        plugins: { 'loam@loam': [{ scope: 'user', installPath: cache, version: '0.9.2' }] },
+        plugins: { 'loam@loam': [{ scope: 'user', installPath: cache, version: PACKAGE_VERSION }] },
       }));
     }
     return { code: 0, stdout: '', stderr: '' };

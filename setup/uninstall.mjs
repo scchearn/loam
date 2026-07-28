@@ -241,7 +241,8 @@ export async function uninstall({
     return 1;
   }
   const detectedHarnesses = await detectHarnesses({ home });
-  const hasMarketplacePlugin = ['claude', 'codex'].some((id) => detectedHarnesses[id]?.marketplaceInstalled);
+  const hasMarketplacePlugin = ['claude', 'codex'].some((id) =>
+    detectedHarnesses[id]?.marketplaceInstalled || detectedHarnesses[id]?.marketplaceConfigured);
   if (!install && !listedSkills.names.length && !hasMarketplacePlugin) {
     output.write('No Loam installation found at %s. Nothing to uninstall.\n'.replace('%s', root));
     return 0;

@@ -28,22 +28,25 @@ async function hasRequiredHooks(pluginRoot) {
   }
 }
 
-async function claudeMarketplaceInstall(root, name) {
+async function claudeMarketplaceInstall(root, name, pluginVersion) {
   try {
     const registry = JSON.parse(await readFile(join(root, 'plugins', 'installed_plugins.json'), 'utf8'));
     const installs = registry.plugins?.[name];
-    const paths = Array.isArray(installs)
-      ? installs.map(({ installPath }) => installPath).filter((path) => typeof path === 'string' && path)
+    const candidates = Array.isArray(installs)
+      ? installs.filter(({ scope, installPath }) => scope === 'user' && typeof installPath === 'string' && installPath)
       : [];
-    const installed = (await Promise.all(paths.map(exists))).some(Boolean);
-    const ready = installed && (await Promise.all(paths.map(hasRequiredHooks))).some(Boolean);
+    const present = await Promise.all(candidates.map(async (entry) => ({ ...entry, exists: await exists(entry.installPath) })));
+    const installed = present.some((entry) => entry.exists);
+    const ready = (await Promise.all(present
+      .filter((entry) => entry.exists && (!pluginVersion || entry.version === pluginVersion || basename(entry.installPath) === pluginVersion))
+      .map((entry) => hasRequiredHooks(entry.installPath)))).some(Boolean);
     return { installed, ready };
   } catch {
     return { installed: false, ready: false };
   }
 }
 
-async function codexMarketplaceInstall(root, name) {
+async function codexMarketplaceInstall(root, name, pluginVersion) {
   const [plugin, marketplace, extra] = name.split('@');
   if (plugin !== 'loam' || !marketplace || extra) return { installed: false, ready: false };
   const pluginRoot = join(root, 'plugins', 'cache', marketplace, plugin);
@@ -51,12 +54,12 @@ async function codexMarketplaceInstall(root, name) {
   if (!installed) return { installed: false, ready: false };
   const versions = await readdir(pluginRoot, { withFileTypes: true }).catch(() => []);
   const ready = (await Promise.all(versions
-    .filter((entry) => entry.isDirectory())
+    .filter((entry) => entry.isDirectory() && (!pluginVersion || entry.name === pluginVersion))
     .map((entry) => hasRequiredHooks(join(pluginRoot, entry.name))))).some(Boolean);
   return { installed: true, ready };
 }
 
-export async function detectHarnesses({ home = homedir() } = {}) {
+export async function detectHarnesses({ home = homedir(), pluginVersion } = {}) {
   const roots = {
     opencode: join(home, '.config', 'opencode'),
     claude: join(home, '.claude'),
@@ -67,20 +70,22 @@ export async function detectHarnesses({ home = homedir() } = {}) {
   for (const [id, root] of Object.entries(roots)) {
     const state = await exists(root) ? 'detected' : 'absent';
     let marketplaceOwned = false;
+    let marketplaceConfigured = false;
     let marketplaceInstalled = false;
     let marketplaceReady = false;
     if (state === 'detected' && id === 'claude') {
-      const install = await claudeMarketplaceInstall(root, 'loam@loam');
+      const install = await claudeMarketplaceInstall(root, 'loam@loam', pluginVersion);
       marketplaceInstalled = install.installed;
       try {
         const settings = JSON.parse(await readFile(join(root, 'settings.json'), 'utf8'));
+        marketplaceConfigured = Object.hasOwn(settings.enabledPlugins || {}, 'loam@loam');
         marketplaceOwned = settings.enabledPlugins?.['loam@loam'] === true && install.installed;
         marketplaceReady = marketplaceOwned && install.ready;
       } catch {
         marketplaceOwned = false;
       }
     } else if (state === 'detected' && id === 'codex') {
-      const install = await codexMarketplaceInstall(root, 'loam@loam');
+      const install = await codexMarketplaceInstall(root, 'loam@loam', pluginVersion);
       marketplaceInstalled = install.installed;
       try {
         const config = await readFile(join(root, 'config.toml'), 'utf8');
@@ -90,6 +95,7 @@ export async function detectHarnesses({ home = homedir() } = {}) {
           const section = line.match(/^\s*\[plugins\."([^"]+)"\]\s*$/);
           if (section) {
             loamPlugin = section[1].startsWith('loam@') ? section[1] : '';
+            if (loamPlugin === 'loam@loam') marketplaceConfigured = true;
             continue;
           }
           if (/^\s*\[/.test(line)) loamPlugin = '';
@@ -103,7 +109,7 @@ export async function detectHarnesses({ home = homedir() } = {}) {
         marketplaceOwned = false;
       }
     }
-    result[id] = { id, root, state, marketplaceOwned, marketplaceInstalled, marketplaceReady };
+    result[id] = { id, root, state, marketplaceOwned, marketplaceConfigured, marketplaceInstalled, marketplaceReady };
   }
   return result;
 }
@@ -276,7 +282,7 @@ export async function installHarnesses({
   integrationPath: _integrationPath,
   detected,
 } = {}) {
-  detected ||= await detectHarnesses({ home });
+  detected ||= await detectHarnesses({ home, pluginVersion });
   const affectedFiles = Object.entries(detected)
     .filter(([, harness]) => harness.state !== 'absent')
     .map(([id]) => id === 'opencode'

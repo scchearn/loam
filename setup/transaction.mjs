@@ -6,7 +6,7 @@ import { cleanupStaging, createStagingDirectory, writeAtomicFile, publishJson } 
 import { confirmSetup, renderDiscovery, selectMarketplaceHarnesses, stage } from './wizard.mjs';
 import { ensureGlobalSkills, verifyGlobalSkills } from './skills.mjs';
 import { installRuntime } from './runtime.mjs';
-import { installHarnesses } from './harnesses.mjs';
+import { detectHarnesses, installHarnesses } from './harnesses.mjs';
 import { installMarketplacePlugins } from './marketplace.mjs';
 import { migrateLegacyProject } from './migration.mjs';
 import { verifyInstallation } from './verify.mjs';
@@ -142,9 +142,18 @@ export async function executeSetup(parsed, discovery, options = {}) {
         cwd: discovery.workspace,
         runner: options.runner,
       });
+      const refreshedHarnesses = await detectHarnesses({
+        home: discovery.home,
+        pluginVersion: discovery.packageVersion,
+      });
+      for (const id of selectedMarketplaceHarnesses) {
+        if (marketplace[id]?.state === 'ready' && !refreshedHarnesses[id]?.marketplaceReady) {
+          marketplace[id] = { ...marketplace[id], state: 'partial', category: 'verification_failed' };
+        }
+      }
       const effectiveHarnesses = Object.fromEntries(Object.entries(requestedHarnesses).map(([id, harness]) => [
         id,
-        marketplace[id] || harness,
+        marketplace[id]?.state === 'partial' ? marketplace[id] : marketplace[id] ? refreshedHarnesses[id] : harness,
       ]));
 
       harnessInstall = await installHarnesses({
@@ -155,12 +164,11 @@ export async function executeSetup(parsed, discovery, options = {}) {
         detected: effectiveHarnesses,
       });
       const harnesses = harnessInstall;
+      const integrationFailed = Object.values(harnesses).some((harness) => harness.state === 'partial');
       for (const [id, state] of Object.entries(marketplace)) {
         if (state.state === 'partial' && harnesses[id]?.state !== 'partial') harnesses[id] = state;
       }
       const marketplaceFailed = Object.values(marketplace).some((harness) => harness.state === 'partial');
-      const integrationFailed = Object.entries(harnesses).some(([id, harness]) =>
-        harness.state === 'partial' && marketplace[id]?.state !== 'partial');
       if (integrationFailed) {
         errorOutput.write('Harness integration is incomplete.\n');
         return 1;
