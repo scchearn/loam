@@ -534,7 +534,7 @@ test('failed post-harness setup restores every active harness mutation', async (
   const files = [
     metadataPath,
     metadata.integration_path,
-    join(fixture.home, '.config', 'opencode', 'plugins', 'loam.mjs'),
+    join(fixture.home, '.config', 'opencode', 'plugins', 'loam.js'),
     join(adapterRoot, 'opencode.mjs'),
     join(adapterRoot, 'claude-session-start.mjs'),
     join(adapterRoot, 'cursor-session-start.mjs'),
@@ -579,7 +579,7 @@ test('failed fresh harness setup removes originally absent harness files', async
   });
 
   assert.equal(code, 1);
-  await assert.rejects(() => readFile(join(fixture.home, '.config', 'opencode', 'plugins', 'loam.mjs')), { code: 'ENOENT' });
+  await assert.rejects(() => readFile(join(fixture.home, '.config', 'opencode', 'plugins', 'loam.js')), { code: 'ENOENT' });
   await assert.rejects(() => readFile(join(fixture.home, '.claude', 'settings.json')), { code: 'ENOENT' });
   await assert.rejects(() => readFile(join(fixture.home, '.cursor', 'hooks.json')), { code: 'ENOENT' });
 });

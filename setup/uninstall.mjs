@@ -304,11 +304,13 @@ export async function uninstall({
     results.backups.push(...(await removeBackups(join(home, '.cursor'))));
   }
 
-  // Remove OpenCode adapter
-  const opencodePath = join(home, '.config', 'opencode', 'plugins', 'loam.mjs');
-  if (await exists(opencodePath)) {
-    await rm(opencodePath, { force: true });
-    results.opencode = { path: opencodePath, action: 'removed' };
+  // Remove the current OpenCode adapter and the legacy undiscoverable path.
+  for (const name of ['loam.js', 'loam.mjs']) {
+    const opencodePath = join(home, '.config', 'opencode', 'plugins', name);
+    if (await exists(opencodePath)) {
+      await rm(opencodePath, { force: true });
+      results.opencode = { path: opencodePath, action: 'removed' };
+    }
   }
 
   // Remove global root
