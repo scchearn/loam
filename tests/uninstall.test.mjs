@@ -95,12 +95,14 @@ test('uninstall removes the global root, skills, adapter, and Loam-owned hooks; 
   await writeFile(claudePath, JSON.stringify(claude));
   await writeFile(codexPath, JSON.stringify(codex));
   await writeFile(cursorPath, JSON.stringify(cursor));
+  await writeFile(join(home, '.config', 'opencode', 'plugins', 'loam.mjs'), 'legacy adapter');
 
   const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
 
   assert.equal(code, 0);
   assert.equal(await exists(globalRoot), false, 'global root removed');
-  assert.equal(await exists(join(home, '.config', 'opencode', 'plugins', 'loam.mjs')), false, 'opencode adapter removed');
+  assert.equal(await exists(join(home, '.config', 'opencode', 'plugins', 'loam.js')), false, 'opencode adapter removed');
+  assert.equal(await exists(join(home, '.config', 'opencode', 'plugins', 'loam.mjs')), false, 'legacy opencode adapter removed');
   assert.equal(await exists(join(home, '.agents', 'skills', 'loam-using', 'SKILL.md')), true, 'fixture skill tree is not touched directly');
 
   const claudeAfter = JSON.parse(await readFile(claudePath, 'utf8'));

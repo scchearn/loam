@@ -106,7 +106,7 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
       return { ...harness, ready: true, owner: 'marketplace' };
     }
     if (id === 'opencode') {
-      const stablePath = join(harness.root, 'plugins', 'loam.mjs');
+      const stablePath = join(harness.root, 'plugins', 'loam.js');
       const [actual, expected] = await Promise.all([
         readFile(stablePath, 'utf8'),
         readFile(join(packageRoot, 'adapters', 'opencode.mjs'), 'utf8'),

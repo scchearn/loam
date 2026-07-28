@@ -155,6 +155,9 @@ test('harness detection and installation use only user HOME paths and are idempo
   await mkdir(join(home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(home, '.claude'), { recursive: true });
   await mkdir(join(home, '.cursor'), { recursive: true });
+  const legacyOpenCodePath = join(home, '.config', 'opencode', 'plugins', 'loam.mjs');
+  await mkdir(join(home, '.config', 'opencode', 'plugins'), { recursive: true });
+  await writeFile(legacyOpenCodePath, 'legacy adapter');
   const detected = await detectHarnesses({ home });
   assert.equal(detected.opencode.state, 'detected');
   assert.equal(detected.claude.state, 'detected');
@@ -167,6 +170,8 @@ test('harness detection and installation use only user HOME paths and are idempo
   assert.deepEqual(first.cursor.state, 'ready');
   assert.deepEqual(second.claude.state, 'skipped');
   assert.deepEqual(second.cursor.state, 'ready');
+  assert.equal(first.opencode.path, join(home, '.config', 'opencode', 'plugins', 'loam.js'));
+  await assert.rejects(() => readFile(legacyOpenCodePath), { code: 'ENOENT' });
 
   const cursorHooks = JSON.parse(await readFile(join(home, '.cursor', 'hooks.json'), 'utf8'));
   await assert.rejects(() => readFile(join(home, '.claude', 'settings.json')), { code: 'ENOENT' });

@@ -285,9 +285,9 @@ export async function installHarnesses({
   detected ||= await detectHarnesses({ home, pluginVersion });
   const affectedFiles = Object.entries(detected)
     .filter(([, harness]) => harness.state !== 'absent')
-    .map(([id]) => id === 'opencode'
-      ? join(home, '.config', 'opencode', 'plugins', 'loam.mjs')
-      : join(home, id === 'claude' ? '.claude' : id === 'codex' ? '.codex' : '.cursor', id === 'claude' ? 'settings.json' : 'hooks.json'));
+    .flatMap(([id]) => id === 'opencode'
+      ? ['loam.js', 'loam.mjs'].map((name) => join(home, '.config', 'opencode', 'plugins', name))
+      : [join(home, id === 'claude' ? '.claude' : id === 'codex' ? '.codex' : '.cursor', id === 'claude' ? 'settings.json' : 'hooks.json')]);
   const snapshots = await Promise.all(affectedFiles.map(snapshotFile));
   const directories = await Promise.all([...new Set(affectedFiles.map(dirname))].map(snapshotDirectory));
   let assets;
@@ -316,9 +316,10 @@ export async function installHarnesses({
     }
     try {
       if (id === 'opencode') {
-        const stablePath = join(home, '.config', 'opencode', 'plugins', 'loam.mjs');
+        const stablePath = join(home, '.config', 'opencode', 'plugins', 'loam.js');
         const source = await readFile(join(adapterRoot, 'opencode.mjs'), 'utf8');
         await writeAtomicFile(stablePath, source);
+        await rm(join(dirname(stablePath), 'loam.mjs'), { force: true });
         result[id] = { ...harness, state: 'ready', path: stablePath, versionRoot: assets.versionRoot };
       } else if (id === 'claude') {
         const config = await installClaude({
