@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { formatContext, formatNativeRuntimeCommand } from '../integration/context.mjs';
+import { beginHookRun, finishHookRun } from '../integration/hooks.mjs';
 import { runIntegration } from '../integration/loam.mjs';
 import { detectLegacyShadow } from '../integration/shadow.mjs';
 import { detectTarget, resolveGlobalRoot, SUPPORTED_TARGETS, runtimePath } from '../integration/paths.mjs';
@@ -243,6 +244,123 @@ test('runtime invocation times out and bounds stderr diagnostics', async () => {
   assert.equal(result.code, null);
   assert.equal(result.category, 'timeout');
   assert.match(result.stderr, /timed out/);
+});
+
+test('hook-run logging invokes the installed private runtime with fixed validated argv', async () => {
+  const fixtureData = await fixture();
+  const calls = [];
+  const runner = async (request) => {
+    calls.push(request);
+    return { code: 0, signal: null, stdout: calls.length === 1 ? '42\n' : '', stderr: '' };
+  };
+  const run = await beginHookRun({
+    globalRoot: fixtureData.globalRoot,
+    harness: 'codex',
+    hook: 'stop',
+    workspace: fixtureData.home,
+    sessionId: 'session-42',
+    runner,
+  });
+  const finished = await finishHookRun({ run, status: 'succeeded', runner });
+
+  assert.deepEqual(run, {
+    id: 42,
+    globalRoot: fixtureData.globalRoot,
+    runtimePath: fixtureData.runtimePath,
+    workspace: fixtureData.home,
+  });
+  assert.equal(finished, true);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].runtimePath, fixtureData.runtimePath);
+  assert.deepEqual(calls[0].args, [
+    'hooks', 'begin', fixtureData.globalRoot,
+    '--harness', 'codex',
+    '--hook', 'stop',
+    '--workspace', fixtureData.home,
+    '--plugin-version', '0.8.3',
+    '--session-id', 'session-42',
+  ]);
+  assert.deepEqual(calls[1].args, [
+    'hooks', 'finish', fixtureData.globalRoot,
+    '--id', '42',
+    '--status', 'succeeded',
+  ]);
+  assert.equal(calls[0].cwd, fixtureData.home);
+  assert.equal(calls[0].timeoutMs, 300);
+  assert.equal(calls[1].timeoutMs, 300);
+});
+
+test('hook-run logging is fail-open for invalid input, malformed IDs, runtime failure, and timeout', async () => {
+  const fixtureData = await fixture();
+  let calls = 0;
+  assert.equal(await beginHookRun({
+    globalRoot: fixtureData.globalRoot,
+    harness: 'Claude Code',
+    hook: 'stop',
+    workspace: fixtureData.home,
+    runner: async () => { calls += 1; },
+  }), null);
+  assert.equal(calls, 0);
+  assert.equal(await beginHookRun({
+    globalRoot: fixtureData.globalRoot,
+    harness: 'claude',
+    hook: 'stop',
+    workspace: fixtureData.home,
+    runner: async () => ({ code: 1, stdout: '', stderr: 'locked' }),
+  }), null);
+  assert.equal(await beginHookRun({
+    globalRoot: fixtureData.globalRoot,
+    harness: 'claude',
+    hook: 'stop',
+    workspace: fixtureData.home,
+    runner: async () => ({ code: 0, stdout: 'not-an-id\n', stderr: '' }),
+  }), null);
+  assert.equal(await beginHookRun({
+    globalRoot: fixtureData.globalRoot,
+    harness: 'claude',
+    hook: 'stop',
+    workspace: fixtureData.home,
+    timeoutMs: 10,
+    runner: () => new Promise(() => {}),
+  }), null);
+  assert.equal(await finishHookRun({ run: null, status: 'succeeded' }), false);
+});
+
+test('failed hook-run logging bounds and sanitizes its diagnostic', async () => {
+  const fixtureData = await fixture();
+  const calls = [];
+  const run = await beginHookRun({
+    globalRoot: fixtureData.globalRoot,
+    harness: 'claude',
+    hook: 'stop',
+    workspace: fixtureData.home,
+    runner: async () => ({ code: 0, stdout: '7\n', stderr: '' }),
+  });
+  assert.equal(await finishHookRun({
+    run,
+    status: 'failed',
+    detail: 'bad\u0000' + 'x'.repeat(2000),
+    runner: async (request) => {
+      calls.push(request);
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  }), true);
+  const detail = calls[0].args.at(-1);
+  assert.equal(calls[0].args.at(-2), '--detail');
+  assert.ok([...detail].length <= 1024);
+  assert.doesNotMatch(detail, /[\u0000-\u001F\u007F]/);
+});
+
+test('direct runtime invocation closes stdin', async () => {
+  const result = await invokeRuntime({
+    runtimePath: process.execPath,
+    args: ['-e', "process.stdin.resume(); process.stdin.on('end', () => process.stdout.write('closed'))"],
+    cwd: process.cwd(),
+    timeoutMs: 1000,
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout, 'closed');
 });
 
 test('malformed native state is reported without synthetic fields', async () => {

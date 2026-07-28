@@ -61,7 +61,12 @@ function withTimeout(task, timeoutMs) {
 
 function spawnRuntime({ runtimePath, args, cwd, timeoutMs }) {
   return new Promise((resolvePromise) => {
-    const child = spawn(runtimePath, args, { cwd, shell: false, windowsHide: true });
+    const child = spawn(runtimePath, args, {
+      cwd,
+      shell: false,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     let stdout = '';
     let stderr = '';
     let settled = false;

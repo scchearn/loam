@@ -253,7 +253,7 @@ export async function uninstall({
   output.write('  - Remove Loam-owned hook entries from Claude, Codex, and Cursor configs\n');
   output.write('  - Remove installed Claude and Codex marketplace plugins through their native CLIs\n');
   output.write('  - Remove the OpenCode Loam adapter\n');
-  output.write('  - Remove the global Loam root (install.json, runtime, integration, plugins)\n');
+  output.write('  - Remove the global Loam root (install.json, runtime, integration, plugins, local operational history)\n');
   output.write(`  - Global root: ${root}\n`);
 
   if (!(await confirmUninstall({ yes, confirm, input, output }))) {
