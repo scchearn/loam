@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
@@ -100,9 +100,10 @@ test('boundary gate honors config and environment precedence and blocks worker r
 
 test('detached worker launch forwards the hook-run correlation id', () => {
   let request;
+  const workspace = resolve('/workspace');
   const result = startWorker({
     harness: 'codex',
-    workspace: '/workspace',
+    workspace,
     globalRoot: '/global',
     skillsRoot: '/skills',
     workerPath: '/worker.mjs',
@@ -112,7 +113,7 @@ test('detached worker launch forwards the hook-run correlation id', () => {
   });
   assert.equal(result, 'started');
   assert.deepEqual(request.args, [
-    '/worker.mjs', '--harness', 'codex', '--workspace', '/workspace', '--hook-run-id', '17',
+    '/worker.mjs', '--harness', 'codex', '--workspace', workspace, '--hook-run-id', '17',
   ]);
 });
 

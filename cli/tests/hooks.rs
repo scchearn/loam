@@ -493,6 +493,7 @@ fn earlier_v1_listing_is_read_only_and_exposes_null_result_fields() {
             .unwrap(),
         1
     );
+    drop(connection);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -528,6 +529,7 @@ fn the_next_write_completes_v1_and_preserves_old_rows() {
             .unwrap(),
         None
     );
+    drop(connection);
     fs::remove_dir_all(root).unwrap();
 }
 

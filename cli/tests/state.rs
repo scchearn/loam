@@ -1,13 +1,17 @@
 use std::fs;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 fn temporary_workspace() -> std::path::PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after epoch")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("loam-state-{nonce}"));
+    let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("loam-state-{nonce}-{serial}"));
     fs::create_dir(&path).expect("temporary workspace should be created");
     path
 }
