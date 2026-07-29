@@ -64,6 +64,21 @@ fn native_fast_state_matches_bash_on_qmd_and_workflow_fixture() {
         "---\nstatus: pending\n---\n",
     )
     .expect("plan should be written");
+    // Every task [x] with an open criterion: exercises the reconcilable path in
+    // both implementations, including [-] counting as resolved.
+    fs::write(
+        workspace.join("plans/drifted.md"),
+        "---\nstatus: done\n---\n\n## Acceptance criteria\n\n- [x] met. Evidence: tests.\n- [-] superseded.\n- [ ] pending.\n\n## Tasks\n\n### T1\n\n- **Status:** [x]\n",
+    )
+    .expect("drifting plan should be written");
+    // Complete and fully resolved: must produce no reconcilable hint. Without
+    // this, a marker check that counts every criterion as open still looks
+    // correct, because miscounting an already-drifting plan changes nothing.
+    fs::write(
+        workspace.join("plans/resolved.md"),
+        "---\nstatus: done\n---\n\n## Acceptance criteria\n\n- [x] met. Evidence: tests.\n- [-] superseded.\n\n## Tasks\n\n### T1\n\n- **Status:** [x]\n",
+    )
+    .expect("resolved plan should be written");
     fs::write(workspace.join("src/main.rs"), "fn main() {}\n").expect("source should be written");
     fs::write(
         workspace.join("wiki/note.md"),
