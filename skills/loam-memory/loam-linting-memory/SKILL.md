@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate) and goal artifacts. Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, consolidate a legacy root `overview.md` into `index.md`, or health-check goal artifacts. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.9.0"
+  version: "1.10.0"
   author: scchearn
   argument-hint: [wiki root, goal path, or focus area]
 ---
@@ -126,7 +126,7 @@ Keep structural checks Glob/Grep-led and follow the qmd search protocol in
 
 **I. Stranded code pages in `entities/`** — Check whether `entities/` contains pages with `source_path:` front matter. These are code-graph pages that belong in `code/`, not `entities/`. Prose entity pages never carry `source_path:`. See Step 2 for the migration procedure.
 
-**J. Legacy code hash fields** — Check code-graph pages under `code/` and legacy `entities/` pages with `source_path:` front matter for missing `source_size:` or `content_hash:`. Flag as `legacy-hash-fields` (low/informational). Missing fields mean hash-secondary false-stale suppression will not fire for that page yet. Do not backfill during lint; ingest/sync will populate the fields on the next re-summarize.
+**J. Legacy code identity fields** — Check code-graph pages under `code/` and legacy `entities/` pages with `source_path:` front matter for missing `source_size:`, `content_hash:`, `content_id:`, `source_state:`, or `generator_version:`. Native rule `MEM008` retains the `legacy-hash-fields` alias for compatibility and reports these omissions as informational. Do not require `blob_oid:` or `source_commit:` because non-Git and provisional files legitimately lack Git provenance. Do not backfill during lint; run `/loam::ingesting-codebase <codebase root>` until the incremental migration is complete. Updating Loam itself never mutates a project's wiki.
 
 Distinguish: **fix now** (safe from existing wiki evidence) vs **annotate now** (mark but don't resolve) vs **follow-up** (needs future evidence/research/user direction).
 

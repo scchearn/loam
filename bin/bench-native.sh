@@ -57,7 +57,7 @@ build_fixture() {
   local i
   for ((i = 0; i < count; i++)); do
     printf 'fn item_%d() { let value = %d; }\n' "$i" "$i" > "$base/src/file_$i.rs"
-    printf -- '---\nsource_path: src/file_%d.rs\ningested_at: "1"\nsource_size: "%d"\ncontent_hash: "deadbeef"\n---\n\n# page\n' \
+    printf -- '---\nsource_path: src/file_%d.rs\ningested_at: "1"\nsource_size: "%d"\ncontent_hash: "deadbeef"\ncontent_id: sha256:deadbeef\nsource_state: fallback\ngenerator_version: loam-code-page-v1\n---\n\n# page\n' \
       "$i" "$(wc -c < "$base/src/file_$i.rs")" > "$base/wiki/code/src-file-$i-rs.md"
   done
 }
@@ -74,10 +74,23 @@ for scale in small large; do
     "$LOAM" codegraph walk "$root"
   measure "codegraph diff ($scale)" "$count files" -- \
     "$LOAM" codegraph diff "$root" "$root/wiki"
-  measure "codegraph diff --strict ($scale)" "$count files" -- \
-    "$LOAM" codegraph diff "$root" "$root/wiki" --strict
   measure "state --fast ($scale)" "$count files" -- \
     "$LOAM" state --fast "$root"
+done
+
+for scale in small large; do
+  cp -R "$tmp/$scale" "$tmp/ref-$scale"
+  root="$tmp/ref-$scale"
+  git -C "$root" init -q
+  git -C "$root" config user.email benchmark@example.invalid
+  git -C "$root" config user.name "Loam Benchmark"
+  git -C "$root" add src
+  git -C "$root" commit -qm fixture
+  count=$(find "$root/src" -type f | wc -l | tr -d ' ')
+  measure "codegraph walk --ref ($scale)" "$count files" -- \
+    "$LOAM" codegraph walk "$root" --ref HEAD
+  measure "codegraph diff --ref ($scale)" "$count files" -- \
+    "$LOAM" codegraph diff "$root" "$root/wiki" --ref HEAD
 done
 
 # --- checkpoint + version gate ------------------------------------------------
@@ -121,6 +134,8 @@ measure "check versions (repo)" "7 values" -- "$LOAM" check versions "$ROOT"
 # would be visible rather than assumed absent.
 measure "lint --only work (repo)" "$(find "$ROOT/goals" -name '*.md' | wc -l | tr -d ' ') goals" -- \
   "$LOAM" lint --only work "$ROOT"
+measure "lint --only memory (large)" "2000 pages" -- \
+  "$LOAM" lint --only memory "$tmp/large"
 
 # --- legacy shell comparison --------------------------------------------------
 legacy_codegraph="$ROOT/skills/loam-memory/loam-ingesting-codebase/scripts/codegraph-legacy.sh"

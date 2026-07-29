@@ -8,6 +8,11 @@ source_path: <relative-path-from-codebase-root>
 ingested_at: <source-file-mtime-epoch>
 source_size: <bytes>
 content_hash: <sha256-hex>
+content_id: <namespaced-content-id>
+blob_oid: <git-blob-oid-or-empty>
+source_commit: <commit-oid-or-empty>
+source_state: <committed|provisional|fallback>
+generator_version: loam-code-page-v1
 ---
 
 # <PrimaryExportName>

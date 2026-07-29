@@ -44,6 +44,7 @@ If real sessions don't show these, the project failed and we should say so out l
 - **It degrades gracefully.** `qmd` accelerates memory search when installed; built-in search covers the gap when it isn't. The substrate is plain markdown — readable in any editor, diffable in git, survivable past any vendor.
 - **It routes itself.** The `loam::using` skill recognizes plain-language intent ("the wiki is wrong about X", "stopping work", "add to memory") and dispatches the right skill. Users never memorize skill names.
 - **It has one explicit runtime boundary.** Global setup installs and verifies the private native runtime; runtime-dependent skills invoke that absolute command directly, while harness adapters only provide readiness context and the required envelope. Startup never downloads, repairs, or invents state.
+- **Its code graph follows real work.** Working-tree and untracked files remain visible, non-Git projects still work, and stable content identity avoids timestamp churn. Git blob/commit provenance supports an explicit reproducible ref view without treating provisional local summaries as published truth.
 
 ---
 

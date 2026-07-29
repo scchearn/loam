@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::UNIX_EPOCH;
 
@@ -99,6 +100,20 @@ fn run_walk(mut args: impl Iterator<Item = String>) -> i32 {
         match arg.as_str() {
             "--summary" => options.summary = true,
             "--no-gitignore" => options.no_gitignore = true,
+            "--ref" => {
+                let Some(value) = args.next() else {
+                    eprintln!("Error: --ref requires a commit");
+                    return 1;
+                };
+                options.source_ref = Some(value);
+            }
+            "--generator-version" => {
+                let Some(value) = args.next() else {
+                    eprintln!("Error: --generator-version requires a value");
+                    return 1;
+                };
+                options.generator_version = value;
+            }
             "--exclusions" => {
                 let Some(path) = args.next() else {
                     eprintln!("Error: --exclusions requires a file");
@@ -182,12 +197,25 @@ fn run_diff(mut args: impl Iterator<Item = String>) -> i32 {
     };
 
     let mut options = Options::default();
-    let mut strict = false;
     let mut pending = next;
     while let Some(arg) = pending.take().or_else(|| args.next()) {
         match arg.as_str() {
             "--no-gitignore" => options.no_gitignore = true,
-            "--strict" => strict = true,
+            "--strict" => {}
+            "--ref" => {
+                let Some(value) = args.next() else {
+                    eprintln!("Error: --ref requires a commit");
+                    return 1;
+                };
+                options.source_ref = Some(value);
+            }
+            "--generator-version" => {
+                let Some(value) = args.next() else {
+                    eprintln!("Error: --generator-version requires a value");
+                    return 1;
+                };
+                options.generator_version = value;
+            }
             "--exclusions" => {
                 let Some(path) = args.next() else {
                     eprintln!("Error: --exclusions requires a file");
@@ -245,56 +273,66 @@ fn run_diff(mut args: impl Iterator<Item = String>) -> i32 {
         .iter()
         .map(|entry| (entry.source_path.as_str(), entry))
         .collect();
+    let by_content: HashMap<&str, &IndexEntry> = index
+        .iter()
+        .filter(|entry| !entry.content_id.is_empty())
+        .map(|entry| (entry.content_id.as_str(), entry))
+        .collect();
 
     let mut entries = Vec::new();
     for item in &walk.items {
         let Some(record) = by_source.get(item.path.as_str()) else {
-            entries.push(format!(
-                "{{\"path\":\"{}\",\"mtime\":\"{}\",\"reason\":\"new\"}}",
-                json_escape(&item.path),
-                item.mtime
-            ));
+            let reuse = by_content.get(item.content_id.as_str()).copied();
+            entries.push(diff_record_json(item, "new", None, reuse));
             continue;
         };
-        if !is_stale(&codebase_root, item, record, strict) {
+        if !is_stale(item, record, &options.generator_version) {
             continue;
         }
-        entries.push(format!(
-            "{{\"path\":\"{}\",\"mtime\":\"{}\",\"reason\":\"stale\",\"slug\":\"{}\"}}",
-            json_escape(&item.path),
-            item.mtime,
-            json_escape(&record.slug)
-        ));
+        entries.push(diff_record_json(item, "stale", Some(&record.slug), None));
     }
     println!("[{}]", entries.join(","));
     0
 }
 
-/// Mirrors codegraph.sh's staleness ladder: strict re-hashes everything, otherwise
-/// mtime gates the check and size/hash decide.
-fn is_stale(codebase_root: &Path, item: &WalkItem, record: &IndexEntry, strict: bool) -> bool {
-    if strict {
-        return record.content_hash.is_empty()
-            || compute_hash(&codebase_root.join(&item.path)) != record.content_hash;
+fn diff_record_json(
+    item: &WalkItem,
+    reason: &str,
+    slug: Option<&str>,
+    reuse: Option<&IndexEntry>,
+) -> String {
+    let mut record = format!(
+        "{{\"path\":\"{}\",\"mtime\":\"{}\",\"reason\":\"{}\"",
+        json_escape(&item.path),
+        item.mtime,
+        reason
+    );
+    if let Some(slug) = slug {
+        record.push_str(&format!(",\"slug\":\"{}\"", json_escape(slug)));
     }
-    if !is_epoch(&record.ingested_at) {
-        return true;
+    record.push_str(&format!(
+        ",\"content_id\":\"{}\",\"blob_oid\":\"{}\",\"source_commit\":\"{}\",\"source_state\":\"{}\",\"generator_version\":\"{}\"",
+        json_escape(&item.content_id),
+        json_escape(&item.blob_oid),
+        json_escape(&item.source_commit),
+        json_escape(&item.source_state),
+        json_escape(&item.generator_version)
+    ));
+    if let Some(reuse) = reuse {
+        record.push_str(&format!(
+            ",\"reuse_slug\":\"{}\",\"reuse_source_path\":\"{}\"",
+            json_escape(&reuse.slug),
+            json_escape(&reuse.source_path)
+        ));
     }
-    if item.mtime <= record.ingested_at.parse().unwrap_or(0) {
-        return false;
-    }
-    let Some(size) = record
-        .source_size
-        .as_deref()
-        .filter(|value| is_epoch(value))
-        .and_then(|value| value.parse::<u64>().ok())
-    else {
-        return true;
-    };
-    if size != item.size || record.content_hash.is_empty() {
-        return true;
-    }
-    compute_hash(&codebase_root.join(&item.path)) != record.content_hash
+    record.push('}');
+    record
+}
+
+fn is_stale(item: &WalkItem, record: &IndexEntry, generator_version: &str) -> bool {
+    record.content_id.is_empty()
+        || item.content_id != record.content_id
+        || (!generator_version.is_empty() && generator_version != record.generator_version)
 }
 
 /// 0 when the root holds the wiki contract, otherwise exit code 2 with the
@@ -332,6 +370,11 @@ struct IndexEntry {
     ingested_at: String,
     source_size: Option<String>,
     content_hash: String,
+    content_id: String,
+    blob_oid: String,
+    source_commit: String,
+    source_state: String,
+    generator_version: String,
     mtime: Option<u64>,
 }
 
@@ -376,6 +419,11 @@ fn index_records(wiki_root: &Path, codebase_root: Option<&Path>) -> Vec<IndexEnt
                 ingested_at: record.ingested_at,
                 source_size: record.source_size,
                 content_hash: record.content_hash,
+                content_id: record.content_id,
+                blob_oid: record.blob_oid,
+                source_commit: record.source_commit,
+                source_state: record.source_state,
+                generator_version: record.generator_version,
                 mtime,
             });
         }
@@ -395,12 +443,17 @@ fn index_json(entries: &[IndexEntry]) -> String {
         .iter()
         .map(|entry| {
             format!(
-                "{{\"source_path\":\"{}\",\"slug\":\"{}\",\"ingested_at\":\"{}\",\"source_size\":\"{}\",\"content_hash\":\"{}\",\"mtime\":\"{}\",\"exists\":{}}}",
+                "{{\"source_path\":\"{}\",\"slug\":\"{}\",\"ingested_at\":\"{}\",\"source_size\":\"{}\",\"content_hash\":\"{}\",\"content_id\":\"{}\",\"blob_oid\":\"{}\",\"source_commit\":\"{}\",\"source_state\":\"{}\",\"generator_version\":\"{}\",\"mtime\":\"{}\",\"exists\":{}}}",
                 json_escape(&entry.source_path),
                 json_escape(&entry.slug),
                 json_escape(&entry.ingested_at),
                 json_escape(entry.source_size.as_deref().unwrap_or_default()),
                 json_escape(&entry.content_hash),
+                json_escape(&entry.content_id),
+                json_escape(&entry.blob_oid),
+                json_escape(&entry.source_commit),
+                json_escape(&entry.source_state),
+                json_escape(&entry.generator_version),
                 entry.mtime.map(|value| value.to_string()).unwrap_or_default(),
                 entry.mtime.is_some()
             )
@@ -422,7 +475,7 @@ pub fn pending_count(codebase: &Path, wiki_root: &Path) -> Option<usize> {
         walk.items
             .iter()
             .filter(|item| match by_source.get(item.path.as_str()) {
-                Some(record) => is_stale(codebase, item, record, false),
+                Some(record) => is_stale(item, record, ""),
                 None => true,
             })
             .count(),
@@ -433,6 +486,11 @@ struct IndexRecord {
     ingested_at: String,
     source_size: Option<String>,
     content_hash: String,
+    content_id: String,
+    blob_oid: String,
+    source_commit: String,
+    source_state: String,
+    generator_version: String,
 }
 
 fn parse_index_page(path: &Path) -> Option<(String, IndexRecord)> {
@@ -442,6 +500,11 @@ fn parse_index_page(path: &Path) -> Option<(String, IndexRecord)> {
     let mut ingested_at = None;
     let mut source_size = None;
     let mut content_hash = None;
+    let mut content_id = None;
+    let mut blob_oid = None;
+    let mut source_commit = None;
+    let mut source_state = None;
+    let mut generator_version = None;
     for line in content.lines() {
         if line == "---" {
             if in_frontmatter {
@@ -462,6 +525,11 @@ fn parse_index_page(path: &Path) -> Option<(String, IndexRecord)> {
             "ingested_at" => ingested_at = Some(value),
             "source_size" => source_size = Some(value),
             "content_hash" => content_hash = Some(value.to_ascii_lowercase()),
+            "content_id" => content_id = Some(value),
+            "blob_oid" => blob_oid = Some(value.to_ascii_lowercase()),
+            "source_commit" => source_commit = Some(value.to_ascii_lowercase()),
+            "source_state" => source_state = Some(value),
+            "generator_version" => generator_version = Some(value),
             _ => {}
         }
     }
@@ -471,26 +539,23 @@ fn parse_index_page(path: &Path) -> Option<(String, IndexRecord)> {
             ingested_at: ingested_at.filter(|value| !value.is_empty())?,
             source_size,
             content_hash: content_hash.unwrap_or_default(),
+            content_id: content_id.unwrap_or_default(),
+            blob_oid: blob_oid.unwrap_or_default(),
+            source_commit: source_commit.unwrap_or_default(),
+            source_state: source_state.unwrap_or_default(),
+            generator_version: generator_version.unwrap_or_default(),
         },
     ))
-}
-
-fn is_epoch(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn compute_hash(path: &Path) -> String {
-    crate::sha256::file_hex(path)
 }
 
 fn usage() {
     eprintln!("Usage:");
     eprintln!("  loam codegraph index <wiki-root> [--codebase-root <codebase-root>]");
     eprintln!(
-        "  loam codegraph walk  <codebase-root> [--exclusions <file>] [--summary] [--no-gitignore]"
+        "  loam codegraph walk  <codebase-root> [--exclusions <file>] [--summary] [--no-gitignore] [--ref <commit>] [--generator-version <opaque>]"
     );
     eprintln!(
-        "  loam codegraph diff  <codebase-root> [<wiki-root>] [--exclusions <file>] [--no-gitignore] [--strict]"
+        "  loam codegraph diff  <codebase-root> [<wiki-root>] [--exclusions <file>] [--no-gitignore] [--strict] [--ref <commit>] [--generator-version <opaque>]"
     );
 }
 
@@ -499,6 +564,8 @@ struct Options {
     summary: bool,
     no_gitignore: bool,
     exclusions: Option<PathBuf>,
+    source_ref: Option<String>,
+    generator_version: String,
 }
 
 struct Exclusions {
@@ -508,8 +575,14 @@ struct Exclusions {
 
 struct WalkItem {
     path: String,
+    filesystem_path: Option<PathBuf>,
     mtime: u64,
     size: u64,
+    content_id: String,
+    blob_oid: String,
+    source_commit: String,
+    source_state: String,
+    generator_version: String,
 }
 
 struct Candidate {
@@ -518,6 +591,243 @@ struct Candidate {
     extension: String,
     mtime: u64,
     size: u64,
+}
+
+struct GitRepo {
+    root: PathBuf,
+    prefix: String,
+    object_format: String,
+    head_commit: Option<String>,
+}
+
+impl GitRepo {
+    fn discover(codebase: &Path) -> Option<Self> {
+        let output = Command::new("git")
+            .args([
+                "-C",
+                codebase.to_str()?,
+                "rev-parse",
+                "--show-toplevel",
+                "--show-object-format",
+                "--show-prefix",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let mut lines = text.trim_end_matches('\n').split('\n');
+        let root = PathBuf::from(lines.next()?);
+        let object_format = lines.next()?.trim().to_owned();
+        if !matches!(object_format.as_str(), "sha1" | "sha256") {
+            return None;
+        }
+        let prefix = lines
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_owned();
+        let head_commit = git_text(
+            &root,
+            &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
+        );
+        Some(Self {
+            root,
+            prefix,
+            object_format,
+            head_commit,
+        })
+    }
+
+    fn repo_path(&self, relative: &str) -> String {
+        if self.prefix.is_empty() {
+            relative.to_owned()
+        } else {
+            format!("{}/{relative}", self.prefix)
+        }
+    }
+
+    fn local_path(&self, repo_path: &str) -> Option<String> {
+        if self.prefix.is_empty() {
+            return Some(repo_path.to_owned());
+        }
+        repo_path
+            .strip_prefix(&self.prefix)
+            .and_then(|path| path.strip_prefix('/'))
+            .map(str::to_owned)
+    }
+
+    fn resolve_commit(&self, source_ref: &str) -> Option<String> {
+        git_text(
+            &self.root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{source_ref}^{{commit}}"),
+            ],
+        )
+    }
+
+    fn commit_timestamp(&self, commit: &str) -> Option<u64> {
+        git_text(&self.root, &["show", "-s", "--format=%ct", commit])?
+            .parse()
+            .ok()
+    }
+
+    fn tree_blobs(&self, commit: &str) -> Option<Vec<(String, String)>> {
+        let mut command = Command::new("git");
+        command
+            .current_dir(&self.root)
+            .args(["ls-tree", "-r", "-z", "--full-tree", commit, "--"]);
+        if !self.prefix.is_empty() {
+            command.arg(&self.prefix);
+        }
+        let output = command.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let mut blobs = Vec::new();
+        for record in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+        {
+            let (metadata, path) = record.split_once_byte(b'\t')?;
+            let metadata = String::from_utf8_lossy(metadata);
+            let mut fields = metadata.split_whitespace();
+            let mode = fields.next()?;
+            let kind = fields.next()?;
+            let oid = fields.next()?;
+            if !mode.starts_with("100") || kind != "blob" {
+                continue;
+            }
+            let repo_path = String::from_utf8_lossy(path).replace('\\', "/");
+            let Some(local_path) = self.local_path(&repo_path) else {
+                continue;
+            };
+            blobs.push((local_path, oid.to_owned()));
+        }
+        blobs.sort_by(|left, right| left.0.cmp(&right.0));
+        Some(blobs)
+    }
+
+    fn hash_paths(&self, paths: &[String]) -> Vec<Option<String>> {
+        let mut hashes = vec![None; paths.len()];
+        let normal = paths
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| !path.contains('\n') && !path.contains('\r'))
+            .collect::<Vec<_>>();
+        if !normal.is_empty() {
+            let mut child = match Command::new("git")
+                .current_dir(&self.root)
+                .args(["hash-object", "--stdin-paths"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(_) => return hashes,
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                for (_, path) in &normal {
+                    let _ = writeln!(stdin, "{path}");
+                }
+            }
+            if let Ok(output) = child.wait_with_output() {
+                if output.status.success() {
+                    let values = String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    if values.len() == normal.len() {
+                        for ((index, _), value) in normal.iter().zip(values) {
+                            hashes[*index] = Some(value);
+                        }
+                    }
+                }
+            }
+        }
+        for (index, path) in paths
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| path.contains('\n') || path.contains('\r'))
+        {
+            hashes[index] = git_text(
+                &self.root,
+                &["hash-object", &format!("--path={path}"), "--", path],
+            );
+        }
+        hashes
+    }
+
+    fn cat_files(&self, oids: &[String]) -> Option<Vec<Vec<u8>>> {
+        let mut child = Command::new("git")
+            .current_dir(&self.root)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        {
+            let mut stdin = child.stdin.take()?;
+            for oid in oids {
+                writeln!(stdin, "{oid}").ok()?;
+            }
+        }
+        let output = child.wait_with_output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let mut cursor = 0usize;
+        let mut contents = Vec::with_capacity(oids.len());
+        for _ in oids {
+            let header_end = output.stdout[cursor..]
+                .iter()
+                .position(|byte| *byte == b'\n')?
+                + cursor;
+            let header = String::from_utf8_lossy(&output.stdout[cursor..header_end]);
+            let size = header.split_whitespace().last()?.parse::<usize>().ok()?;
+            let start = header_end + 1;
+            let end = start.checked_add(size)?;
+            if end >= output.stdout.len() || output.stdout[end] != b'\n' {
+                return None;
+            }
+            contents.push(output.stdout[start..end].to_vec());
+            cursor = end + 1;
+        }
+        Some(contents)
+    }
+}
+
+trait SplitOnceByte {
+    fn split_once_byte(&self, separator: u8) -> Option<(&[u8], &[u8])>;
+}
+
+impl SplitOnceByte for [u8] {
+    fn split_once_byte(&self, separator: u8) -> Option<(&[u8], &[u8])> {
+        let index = self.iter().position(|byte| *byte == separator)?;
+        Some((&self[..index], &self[index + 1..]))
+    }
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+fn git_text(root: &Path, args: &[&str]) -> Option<String> {
+    String::from_utf8(git_output(root, args)?)
+        .ok()
+        .map(|value| value.trim().to_owned())
 }
 
 #[derive(Default)]
@@ -534,6 +844,13 @@ struct WalkResult {
 }
 
 fn collect(codebase: &Path, options: &Options) -> Result<WalkResult, (i32, String)> {
+    if let Some(source_ref) = options.source_ref.as_deref() {
+        return collect_ref(codebase, options, source_ref);
+    }
+    collect_worktree(codebase, options)
+}
+
+fn collect_worktree(codebase: &Path, options: &Options) -> Result<WalkResult, (i32, String)> {
     let exclusions = match &options.exclusions {
         Some(path) => parse_exclusions_file(path).map_err(|message| (3, message))?,
         None => Exclusions {
@@ -547,7 +864,8 @@ fn collect(codebase: &Path, options: &Options) -> Result<WalkResult, (i32, Strin
                 .collect(),
         },
     };
-    let gitignored = (!options.no_gitignore)
+    let git = GitRepo::discover(codebase);
+    let gitignored = (!options.no_gitignore && git.is_some())
         .then(|| gitignored_paths(codebase, &exclusions.extensions))
         .flatten();
     let mut result = WalkResult {
@@ -566,14 +884,168 @@ fn collect(codebase: &Path, options: &Options) -> Result<WalkResult, (i32, Strin
     )?;
     merge_results(
         &mut result,
-        process_candidates(candidates, !options.summary),
+        process_candidates(
+            candidates,
+            !options.summary,
+            git.is_none(),
+            &options.generator_version,
+        ),
     );
+    if let Some(git) = &git {
+        apply_git_identities(&mut result.items, git);
+    }
     if !options.summary {
         result
             .items
             .sort_by(|left, right| left.path.cmp(&right.path));
     }
     Ok(result)
+}
+
+fn collect_ref(
+    codebase: &Path,
+    options: &Options,
+    source_ref: &str,
+) -> Result<WalkResult, (i32, String)> {
+    let git = GitRepo::discover(codebase).ok_or_else(|| {
+        (
+            2,
+            format!(
+                "--ref requires a usable Git repository: {}",
+                codebase.display()
+            ),
+        )
+    })?;
+    let commit = git
+        .resolve_commit(source_ref)
+        .ok_or_else(|| (2, format!("cannot resolve Git ref: {source_ref}")))?;
+    let timestamp = git.commit_timestamp(&commit).unwrap_or_default();
+    let exclusions = match &options.exclusions {
+        Some(path) => parse_exclusions_file(path).map_err(|message| (3, message))?,
+        None => Exclusions {
+            patterns: DEFAULT_PATTERNS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            extensions: DEFAULT_EXTENSIONS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        },
+    };
+    let blobs = git
+        .tree_blobs(&commit)
+        .ok_or_else(|| (2, format!("cannot read Git ref: {source_ref}")))?;
+    let mut selected = Vec::new();
+    let mut result = WalkResult::default();
+    for (path, oid) in blobs {
+        let extension = Path::new(&path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if !exclusions.extensions.contains(&extension) {
+            continue;
+        }
+        if matches_exclusion(&path, &exclusions.patterns) {
+            result.pattern += 1;
+            continue;
+        }
+        selected.push((path, oid, extension));
+    }
+    let oids = selected
+        .iter()
+        .map(|(_, oid, _)| oid.clone())
+        .collect::<Vec<_>>();
+    let contents = git
+        .cat_files(&oids)
+        .ok_or_else(|| (2, format!("cannot read blobs from Git ref: {source_ref}")))?;
+    for ((path, oid, extension), content) in selected.into_iter().zip(contents) {
+        if content.len() as u64 > MAX_BYTES {
+            result.large += 1;
+            continue;
+        }
+        if content.iter().all(u8::is_ascii_whitespace) {
+            result.empty += 1;
+            continue;
+        }
+        if content.contains(&0) {
+            result.binary += 1;
+            continue;
+        }
+        if generated_header(&content) {
+            result.generated_header += 1;
+            continue;
+        }
+        result.total += 1;
+        *result.by_ext.entry(extension).or_default() += 1;
+        if !options.summary {
+            result.items.push(WalkItem {
+                path,
+                filesystem_path: None,
+                mtime: timestamp,
+                size: content.len() as u64,
+                content_id: format!("git:{}:{oid}", git.object_format),
+                blob_oid: oid,
+                source_commit: commit.clone(),
+                source_state: "committed".to_owned(),
+                generator_version: options.generator_version.clone(),
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn apply_git_identities(items: &mut [WalkItem], git: &GitRepo) {
+    let head_blobs: HashMap<String, String> = git
+        .head_commit
+        .as_deref()
+        .and_then(|commit| git.tree_blobs(commit))
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let paths = items
+        .iter()
+        .map(|item| git.repo_path(&item.path))
+        .collect::<Vec<_>>();
+    for (item, oid) in items.iter_mut().zip(git.hash_paths(&paths)) {
+        if let Some(oid) = oid {
+            set_git_identity(item, &oid, git, &head_blobs);
+        } else {
+            let hash = item
+                .filesystem_path
+                .as_deref()
+                .map(crate::sha256::file_hex)
+                .unwrap_or_default();
+            item.content_id = format!("sha256:{hash}");
+            item.source_state = "fallback".to_owned();
+        }
+    }
+}
+
+fn set_git_identity(
+    item: &mut WalkItem,
+    oid: &str,
+    git: &GitRepo,
+    head_blobs: &HashMap<String, String>,
+) {
+    item.content_id = format!("git:{}:{oid}", git.object_format);
+    item.blob_oid = oid.to_owned();
+    if head_blobs
+        .get(&item.path)
+        .is_some_and(|head_oid| head_oid == oid)
+    {
+        item.source_commit = git.head_commit.clone().unwrap_or_default();
+        item.source_state = "committed".to_owned();
+    } else {
+        item.source_state = "provisional".to_owned();
+    }
+}
+
+fn sha256_hex(content: &[u8]) -> String {
+    let mut hasher = crate::sha256::Sha256::default();
+    hasher.update(content);
+    hasher.finish()
 }
 
 fn collect_candidates(
@@ -660,9 +1132,19 @@ fn collect_candidates(
     Ok(())
 }
 
-fn process_candidates(candidates: Vec<Candidate>, emit_items: bool) -> WalkResult {
+fn process_candidates(
+    candidates: Vec<Candidate>,
+    emit_items: bool,
+    fallback_identity: bool,
+    generator_version: &str,
+) -> WalkResult {
     if candidates.len() < 2 {
-        return process_candidate_chunk(&candidates, emit_items);
+        return process_candidate_chunk(
+            &candidates,
+            emit_items,
+            fallback_identity,
+            generator_version,
+        );
     }
 
     // ponytail: cap workers at 8; file checks are I/O-bound and more threads only
@@ -677,7 +1159,11 @@ fn process_candidates(candidates: Vec<Candidate>, emit_items: bool) -> WalkResul
     thread::scope(|scope| {
         let handles = candidates
             .chunks(chunk_size)
-            .map(|chunk| scope.spawn(move || process_candidate_chunk(chunk, emit_items)))
+            .map(|chunk| {
+                scope.spawn(move || {
+                    process_candidate_chunk(chunk, emit_items, fallback_identity, generator_version)
+                })
+            })
             .collect::<Vec<_>>();
         for handle in handles {
             merge_results(
@@ -689,7 +1175,12 @@ fn process_candidates(candidates: Vec<Candidate>, emit_items: bool) -> WalkResul
     result
 }
 
-fn process_candidate_chunk(candidates: &[Candidate], emit_items: bool) -> WalkResult {
+fn process_candidate_chunk(
+    candidates: &[Candidate],
+    emit_items: bool,
+    fallback_identity: bool,
+    generator_version: &str,
+) -> WalkResult {
     let mut result = WalkResult::default();
     for candidate in candidates {
         let content = match fs::read(&candidate.path) {
@@ -711,10 +1202,25 @@ fn process_candidate_chunk(candidates: &[Candidate], emit_items: bool) -> WalkRe
 
         result.total += 1;
         if emit_items {
+            let content_id = if fallback_identity {
+                format!("sha256:{}", sha256_hex(&content))
+            } else {
+                String::new()
+            };
             result.items.push(WalkItem {
                 path: candidate.relative.clone(),
+                filesystem_path: Some(candidate.path.clone()),
                 mtime: candidate.mtime,
                 size: candidate.size,
+                content_id,
+                blob_oid: String::new(),
+                source_commit: String::new(),
+                source_state: if fallback_identity {
+                    "fallback".to_owned()
+                } else {
+                    String::new()
+                },
+                generator_version: generator_version.to_owned(),
             });
         }
         *result
@@ -880,10 +1386,15 @@ fn walk_json(items: &[WalkItem]) -> String {
             output.push(',');
         }
         output.push_str(&format!(
-            "{{\"path\":\"{}\",\"mtime\":\"{}\",\"size\":\"{}\"}}",
+            "{{\"path\":\"{}\",\"mtime\":\"{}\",\"size\":\"{}\",\"content_id\":\"{}\",\"blob_oid\":\"{}\",\"source_commit\":\"{}\",\"source_state\":\"{}\",\"generator_version\":\"{}\"}}",
             json_escape(&item.path),
             item.mtime,
-            item.size
+            item.size,
+            json_escape(&item.content_id),
+            json_escape(&item.blob_oid),
+            json_escape(&item.source_commit),
+            json_escape(&item.source_state),
+            json_escape(&item.generator_version)
         ));
     }
     output.push(']');

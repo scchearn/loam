@@ -14,7 +14,7 @@ Use this checklist to health-check a markdown wiki without turning the pass into
 - Are there duplicate or overlapping pages that should likely be consolidated later?
 - Are there obvious placeholder pages with no useful content?
 - Are there code-graph pages (with `source_path:` front matter) stranded in `entities/` instead of `code/`?
-- Are code-graph pages missing `source_size:` or `content_hash:` front matter (`legacy-hash-fields`, informational only)?
+- Are code-graph pages missing `source_size:`, `content_hash:`, `content_id:`, `source_state:`, or `generator_version:` front matter (`MEM008` / `legacy-hash-fields`, informational only)? `blob_oid:` and `source_commit:` are optional Git provenance.
 
 ## Links
 
@@ -79,4 +79,4 @@ Goal lint findings are report-only. Do not alter goal files. Route corrections t
 - silent merges or renames of ambiguous duplicate notes
 - leaving a redundant `overview.md` behind after consolidation
 - deletion of meaningful disagreement
-- mass backfilling `source_size:` or `content_hash:` during lint; re-summarize through ingest/sync instead
+- mass backfilling code identity fields during lint; migrate incrementally with `/loam::ingesting-codebase <codebase root>` instead

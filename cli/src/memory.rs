@@ -146,10 +146,16 @@ fn lint_wiki(workspace: &Path, wiki_root: &Path, findings: &mut Vec<Finding>) {
                     .with_target(&source_path),
                 );
             }
-            let missing: Vec<&str> = ["source_size", "content_hash"]
-                .into_iter()
-                .filter(|name| field(&front_matter, name).is_none())
-                .collect();
+            let missing: Vec<&str> = [
+                "source_size",
+                "content_hash",
+                "content_id",
+                "source_state",
+                "generator_version",
+            ]
+            .into_iter()
+            .filter(|name| field(&front_matter, name).is_none())
+            .collect();
             if !missing.is_empty() {
                 findings.push(
                     Finding::file(
@@ -157,7 +163,7 @@ fn lint_wiki(workspace: &Path, wiki_root: &Path, findings: &mut Vec<Finding>) {
                         "legacy-hash-fields",
                         Severity::Info,
                         &display,
-                        "Code page is missing hash-secondary front matter",
+                        "Code page uses legacy identity front matter",
                     )
                     .with_evidence("missing", &missing.join(",")),
                 );

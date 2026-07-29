@@ -128,3 +128,35 @@ fn state_fast_without_wiki_returns_minimal_fallback() {
         r#"{"wiki_root":"","exists":false,"qmd_ready":false,"latest_checkpoint":null,"recent_checkpoints":[],"checkpoint_count":0,"git_status":null,"drift_count":null,"hints":[{"kind":"memory_missing","group":"maintenance","severity":"info","message":"No memory substrate found; scaffold a wiki to begin.","command":"/loam::scaffolding-wiki <goal>","evidence":{}}]}"#
     );
 }
+
+#[test]
+fn full_state_pending_hint_uses_stable_content_identity() {
+    let workspace = temporary_workspace();
+    fs::create_dir_all(workspace.join("src")).expect("src should be created");
+    fs::create_dir_all(workspace.join("wiki/code")).expect("code graph should be created");
+    fs::write(workspace.join("wiki/index.md"), "# Index\n").expect("index should be written");
+    fs::write(workspace.join("src/known.rs"), "fn known() {}\n").expect("source should be written");
+    fs::write(
+        workspace.join("wiki/code/known.md"),
+        "---\nsource_path: src/known.rs\ningested_at: \"1\"\ncontent_id: sha256:ff93b8b31f63b372f27a4c10588f9fa4c5735a16b7d7ec3d059cb5066b15c344\nsource_state: fallback\n---\n",
+    )
+    .expect("code page should be written");
+    let binary = std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide the loam binary");
+
+    let current = Command::new(&binary)
+        .args(["state", workspace.to_str().unwrap()])
+        .output()
+        .expect("loam should run");
+    fs::write(workspace.join("src/known.rs"), "fn other() {}\n").expect("source should change");
+    let changed = Command::new(binary)
+        .args(["state", workspace.to_str().unwrap()])
+        .output()
+        .expect("loam should run");
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    let current = String::from_utf8(current.stdout).expect("state output should be UTF-8");
+    let changed = String::from_utf8(changed.stdout).expect("state output should be UTF-8");
+    assert!(!current.contains("code_ingest_pending"), "{current}");
+    assert!(changed.contains("code_ingest_pending"), "{changed}");
+    assert!(changed.contains(r#""pending_count":1"#), "{changed}");
+}
