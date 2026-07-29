@@ -398,7 +398,12 @@ fn invalid_inputs_do_not_create_storage() {
 
 #[test]
 fn list_infers_only_a_valid_installed_runtime_root() {
-    let root = temporary_root("inferred");
+    let source =
+        PathBuf::from(std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide loam"));
+    let root = source
+        .parent()
+        .unwrap()
+        .join(temporary_root("inferred").file_name().unwrap());
     let workspace = temporary_root("workspace");
     begin_id(&root, "codex", "stop", &workspace);
 
@@ -408,11 +413,7 @@ fn list_infers_only_a_valid_installed_runtime_root() {
         .join("x86_64-unknown-linux-musl");
     fs::create_dir_all(&target_dir).unwrap();
     let installed = target_dir.join(if cfg!(windows) { "loam.exe" } else { "loam" });
-    fs::copy(
-        std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide loam"),
-        &installed,
-    )
-    .unwrap();
+    fs::hard_link(source, &installed).unwrap();
 
     let inferred = Command::new(installed)
         .args(["hooks", "list"])
