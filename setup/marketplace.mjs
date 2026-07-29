@@ -30,6 +30,7 @@ const updates = Object.freeze({
 export async function installMarketplacePlugins({
   selected = [],
   harnesses = {},
+  refresh = false,
   cwd = process.cwd(),
   runner,
 } = {}) {
@@ -37,7 +38,7 @@ export async function installMarketplacePlugins({
   for (const id of selected) {
     const harness = harnesses[id];
     if (!harness || !installs[id]) continue;
-    if (harness.marketplaceReady) {
+    if (harness.marketplaceReady && !refresh) {
       result[id] = { ...harness, state: 'ready', action: 'existing' };
       continue;
     }

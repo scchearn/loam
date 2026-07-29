@@ -52,6 +52,19 @@ test('install aliases setup and doctor is a supported command', () => {
   });
 });
 
+test('update is a supported setup mode with dry-run', () => {
+  assert.deepEqual(parseArgs(['update']), {
+    command: 'update',
+    dryRun: false,
+    yes: false,
+  });
+  assert.deepEqual(parseArgs(['update', '--dry-run']), {
+    command: 'update',
+    dryRun: true,
+    yes: false,
+  });
+});
+
 test('native hook commands are not package installation commands', () => {
   assert.throws(() => parseArgs(['events']), UsageError);
   assert.throws(() => parseArgs(['hooks', 'list']), UsageError);

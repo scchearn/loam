@@ -65,6 +65,13 @@ test('packed setup is offline, direct-native, and preserves the legacy entry', a
     assert.match(`${dryRun.stdout}${dryRun.stderr}`, /dry.?run/i);
     await assert.rejects(() => readdir(join(home, '.agents')));
 
+    const update = await execFileAsync(process.execPath, [join(fixture.root, 'bin', 'loam.mjs'), 'update', '--dry-run'], {
+      cwd: workspace,
+      env,
+    });
+    assert.match(`${update.stdout}${update.stderr}`, /Loam Update \(dry-run\)/);
+    await assert.rejects(() => readdir(join(home, '.agents')));
+
     const integration = await readFile(join(fixture.root, 'integration', 'loam.mjs'), 'utf8');
     assert.doesNotMatch(integration, /run --|command === ['"]run['"]/);
     assert.match(integration, /status/);

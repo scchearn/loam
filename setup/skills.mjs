@@ -94,7 +94,7 @@ export async function verifyGlobalSkills({
 
 export async function ensureGlobalSkills(options = {}) {
   const current = await verifyGlobalSkills(options);
-  if (current.ready) return current;
+  if (current.ready && !options.refresh) return current;
 
   const added = await runSkills(
     ['add', 'scchearn/loam', '--global', '--agent', '*', '--yes'],

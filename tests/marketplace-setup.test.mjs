@@ -75,6 +75,34 @@ test('installed plugins missing required hooks are updated instead of skipped', 
   assert.equal(result.codex.action, 'updated');
 });
 
+test('refresh updates ready marketplace plugins instead of skipping them', async () => {
+  const calls = [];
+  const ready = Object.fromEntries(['claude', 'codex'].map((id) => [id, {
+    ...harnesses[id],
+    marketplaceInstalled: true,
+    marketplaceOwned: true,
+    marketplaceReady: true,
+  }]));
+  const result = await installMarketplacePlugins({
+    selected: ['claude', 'codex'],
+    harnesses: ready,
+    refresh: true,
+    runner: async (request) => {
+      calls.push({ command: request.command, args: request.args });
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  });
+
+  assert.deepEqual(calls, [
+    { command: 'claude', args: ['plugin', 'update', 'loam@loam', '--scope', 'user'] },
+    { command: 'claude', args: ['plugin', 'enable', 'loam@loam', '--scope', 'user'] },
+    { command: 'codex', args: ['plugin', 'marketplace', 'upgrade', 'loam'] },
+    { command: 'codex', args: ['plugin', 'add', 'loam@loam'] },
+  ]);
+  assert.equal(result.claude.action, 'updated');
+  assert.equal(result.codex.action, 'updated');
+});
+
 test('one marketplace failure does not stop the other selected harness', async () => {
   const calls = [];
   const result = await installMarketplacePlugins({

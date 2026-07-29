@@ -117,6 +117,32 @@ test('complete ready rerun is local-only and does not call Skills CLI or downloa
   assert.match(capture.text(), /already ready|Loam is ready/);
 });
 
+test('update refreshes a ready installation without prompting', async () => {
+  const fixture = await baseFixture();
+  await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  const metadataPath = join(fixture.home, '.agents', 'loam', 'install.json');
+  const previous = JSON.parse(await readFile(metadataPath, 'utf8'));
+  let skillAdds = 0;
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['update']), {
+    ...fixture,
+    packageRoot,
+    runner: async (request) => {
+      if (request.command.includes('npx') && request.args.includes('skills') && request.args.includes('add')) skillAdds += 1;
+      return fixture.runner(request);
+    },
+    confirm: async () => { throw new Error('update prompted for confirmation'); },
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+
+  assert.equal(code, 0, capture.text());
+  assert.equal(skillAdds, 1);
+  assert.match(capture.text(), /Loam Update/);
+  const current = JSON.parse(await readFile(metadataPath, 'utf8'));
+  assert.notEqual(current.integration_path, previous.integration_path);
+});
+
 test('setup reconciles an install from an older plugin version', async () => {
   const fixture = await baseFixture();
   await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
@@ -291,6 +317,23 @@ test('dry-run is valid and byte-stable without creating roots, backups, or invok
 
   assert.equal(code, 0);
   assert.match(capture.text(), /Dry run|dry-run/i);
+  await assert.rejects(() => readdir(join(fixture.home, '.agents')));
+});
+
+test('update dry-run is valid without mutation or confirmation', async () => {
+  const fixture = await baseFixture();
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['update', '--dry-run']), {
+    ...fixture,
+    packageRoot,
+    runner: async () => { throw new Error('update dry-run invoked Skills CLI'); },
+    confirm: async () => { throw new Error('update dry-run prompted for confirmation'); },
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+
+  assert.equal(code, 0, capture.text());
+  assert.match(capture.text(), /Loam Update \(dry-run\)/);
   await assert.rejects(() => readdir(join(fixture.home, '.agents')));
 });
 

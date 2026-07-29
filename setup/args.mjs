@@ -18,7 +18,7 @@ export function parseArgs(argv) {
   const command = requestedCommand === 'install' ? 'setup' : requestedCommand;
   if (command === 'help') return { command: 'help' };
   if (command === 'version') return { command: 'version' };
-  if (command !== 'setup' && command !== 'doctor' && command !== 'uninstall') {
+  if (command !== 'setup' && command !== 'update' && command !== 'doctor' && command !== 'uninstall') {
     throw new UsageError(`unknown command: ${requestedCommand}`);
   }
 

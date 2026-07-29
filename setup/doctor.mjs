@@ -34,6 +34,10 @@ export async function runDoctor(options = {}) {
 
     output.write('Loam Doctor\n');
     report(output, 'Install metadata', result.install ? { ready: true } : { ready: false, category: 'install_metadata_missing' });
+    if (result.install) {
+      output.write(`  Plugin version: ${result.install.plugin_version}\n`);
+      output.write(`  CLI version: ${result.install.runtime_version}\n`);
+    }
     report(output, 'Global skills', result.skills);
     report(output, 'Native runtime', result.runtime);
     for (const [id, harness] of Object.entries(result.harnesses)) report(output, `${id} integration`, harness);

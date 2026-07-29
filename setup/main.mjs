@@ -3,6 +3,7 @@ import { executeSetup } from './transaction.mjs';
 
 export async function runSetup(parsed, options = {}) {
   const errorOutput = options.errorOutput || process.stderr;
+  const action = parsed.command === 'update' ? 'Update' : 'Setup';
   try {
     const discovery = await discover({
       home: options.home,
@@ -15,7 +16,7 @@ export async function runSetup(parsed, options = {}) {
     });
     return await executeSetup(parsed, discovery, options);
   } catch (error) {
-    errorOutput.write(`Setup failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    errorOutput.write(`${action} failed: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }
 }
