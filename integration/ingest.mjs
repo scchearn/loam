@@ -10,7 +10,7 @@ import {
 } from './ingest-process.mjs';
 import { FingerprintError, fingerprintActionable } from './ingest-fingerprint.mjs';
 
-const PROMPT = 'Run the existing loam::ingesting-codebase skill for the provided workspace. Do not modify source files, commit, or push.';
+const PROMPT = 'Run the existing loam::ingesting-codebase skill for the provided workspace. Do not modify source files, commit, or push. Do not spawn other agents or subagents.';
 const DEFAULTS = Object.freeze({ enabled: true, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800 });
 function hash(value) { return createHash('sha256').update(String(value)).digest('hex'); }
 export function runRoot(globalRoot, workspace) { return join(resolve(globalRoot), 'run', hash(workspace).slice(0, 16)); }

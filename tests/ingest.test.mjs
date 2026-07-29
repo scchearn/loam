@@ -450,6 +450,7 @@ process.exit(args[0] === '--bg' ? 1 : 0);
   assert.equal(result.reason, 'ok');
   assert.deepEqual(argv.map((args) => args[0]), ['--help', '--bg', '-p']);
   assert.match(argv.at(-1)[1], /Do not modify source files, commit, or push/u);
+  assert.match(argv.at(-1)[1], /Do not spawn other agents or subagents\./u);
   assert.equal(await readFile(join(workspace, 'src', 'a.js'), 'utf8'), source);
 });
 
