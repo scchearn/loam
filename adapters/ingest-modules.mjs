@@ -22,7 +22,9 @@ export async function loadIngestModules() {
         import(new URL('paths.mjs', root).href),
         import(new URL('ingest.mjs', root).href),
       ]);
-      return { ...paths, ...ingest };
+      let hooks = {};
+      try { hooks = await import(new URL('hooks.mjs', root).href); } catch {}
+      return { ...paths, ...ingest, ...hooks };
     } catch {}
   }
   throw new Error('loam ingestion integration is unavailable');

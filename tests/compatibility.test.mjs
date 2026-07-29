@@ -209,7 +209,10 @@ test('marketplace plugin owns SessionStart and Stop for Claude and Codex', async
   const loadIngest = async () => ({
     resolveGlobalRoot: () => '/global',
     resolveSkillsRoot: () => '/skills',
-    dispatchBoundary: async (input) => calls.push(['ingest', input]),
+    dispatchBoundary: async (input) => {
+      calls.push(['ingest', input]);
+      return { action: 'skip', reason: 'nothing_to_do', detail: 'no changes' };
+    },
   });
 
   assert.deepEqual(await stop.handleStop(
@@ -224,7 +227,14 @@ test('marketplace plugin owns SessionStart and Stop for Claude and Codex', async
   assert.equal(calls[1][1].harness, 'codex');
   assert.equal(calls[1][1].globalRoot, '/global');
   assert.equal(calls[1][1].skillsRoot, '/skills');
-  assert.deepEqual(calls[2][1], { run, status: 'succeeded' });
+  assert.equal(calls[1][1].hookRunId, 8);
+  assert.deepEqual(calls[2][1], {
+    run,
+    status: 'succeeded',
+    action: 'skip',
+    reason: 'nothing_to_do',
+    detail: 'no changes',
+  });
 
   calls.length = 0;
   assert.deepEqual(await stop.handleStop(

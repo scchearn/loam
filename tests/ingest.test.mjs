@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
 import { fingerprintActionable } from '../integration/ingest-fingerprint.mjs';
-import { gate, ingestStatus, runRoot, runWorker } from '../integration/ingest.mjs';
+import { gate, ingestStatus, runRoot, runWorker, startWorker } from '../integration/ingest.mjs';
 import { bootIdentity, childIdentity, processDescriptor, resolveExecutable, startTracked } from '../integration/ingest-process.mjs';
 
 async function fixture() {
@@ -96,6 +96,24 @@ test('boundary gate honors config and environment precedence and blocks worker r
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { enabled: true } }));
   assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
   assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_WORKER: '1' } }), { action: 'skip', reason: 'disabled' });
+});
+
+test('detached worker launch forwards the hook-run correlation id', () => {
+  let request;
+  const result = startWorker({
+    harness: 'codex',
+    workspace: '/workspace',
+    globalRoot: '/global',
+    skillsRoot: '/skills',
+    workerPath: '/worker.mjs',
+    hookRunId: 17,
+    env: {},
+    spawn: (input) => { request = input; return 'started'; },
+  });
+  assert.equal(result, 'started');
+  assert.deepEqual(request.args, [
+    '/worker.mjs', '--harness', 'codex', '--workspace', '/workspace', '--hook-run-id', '17',
+  ]);
 });
 
 test('worker leases before full state and issues the exact exclusions-aware diff argv', async () => {

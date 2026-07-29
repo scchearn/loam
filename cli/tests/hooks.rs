@@ -88,6 +88,19 @@ fn begin_id_with_session(
 }
 
 fn finish(root: &Path, id: i64, status: &str, detail: Option<&str>) -> Output {
+    let action = (status == "succeeded").then_some("skip");
+    let reason = (status == "succeeded").then_some("nothing_to_do");
+    finish_result(root, id, status, action, reason, detail)
+}
+
+fn finish_result(
+    root: &Path,
+    id: i64,
+    status: &str,
+    action: Option<&str>,
+    reason: Option<&str>,
+    detail: Option<&str>,
+) -> Output {
     let id = id.to_string();
     let mut args = vec![
         "hooks",
@@ -98,10 +111,68 @@ fn finish(root: &Path, id: i64, status: &str, detail: Option<&str>) -> Output {
         "--status",
         status,
     ];
+    if let Some(action) = action {
+        args.extend(["--action", action]);
+    }
+    if let Some(reason) = reason {
+        args.extend(["--reason", reason]);
+    }
     if let Some(detail) = detail {
         args.extend(["--detail", detail]);
     }
     loam(&args)
+}
+
+fn worker_start(root: &Path, id: i64, session_id: Option<&str>) -> Output {
+    let id = id.to_string();
+    let mut args = vec!["hooks", "worker-start", root.to_str().unwrap(), "--id", &id];
+    if let Some(session_id) = session_id {
+        args.extend(["--session-id", session_id]);
+    }
+    loam(&args)
+}
+
+fn worker_finish(root: &Path, id: i64, status: &str, reason: &str, detail: Option<&str>) -> Output {
+    let id = id.to_string();
+    let mut args = vec![
+        "hooks",
+        "worker-finish",
+        root.to_str().unwrap(),
+        "--id",
+        &id,
+        "--status",
+        status,
+        "--reason",
+        reason,
+    ];
+    if let Some(detail) = detail {
+        args.extend(["--detail", detail]);
+    }
+    loam(&args)
+}
+
+fn create_v1_store(root: &Path) {
+    fs::create_dir_all(root).unwrap();
+    let connection = Connection::open(root.join("loam.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE hook_run (
+                id INTEGER PRIMARY KEY,
+                started_at_ms INTEGER NOT NULL,
+                finished_at_ms INTEGER,
+                harness TEXT NOT NULL,
+                hook TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('started', 'succeeded', 'failed')),
+                detail TEXT,
+                session_id TEXT,
+                workspace TEXT NOT NULL,
+                plugin_version TEXT NOT NULL,
+                runtime_version TEXT NOT NULL
+            );
+            INSERT INTO hook_run VALUES (7, 1000, 1250, 'codex', 'stop', 'succeeded', NULL, 'old-session', '/', '0.9.5', '0.9.2');
+            PRAGMA user_version = 1;",
+        )
+        .unwrap();
 }
 
 #[test]
@@ -223,7 +294,7 @@ fn finish_validates_status_and_bounded_detail() {
     assert_eq!(finish(&root, id, "started", None).status.code(), Some(1));
     assert_eq!(finish(&root, id, "failed", None).status.code(), Some(1));
     assert_eq!(
-        finish(&root, id, "succeeded", Some("unexpected"))
+        finish_result(&root, id, "succeeded", None, None, None)
             .status
             .code(),
         Some(1)
@@ -234,7 +305,19 @@ fn finish_validates_status_and_bounded_detail() {
             .code(),
         Some(1)
     );
-    assert_eq!(finish(&root, id, "succeeded", None).status.code(), Some(0));
+    assert_eq!(
+        finish_result(
+            &root,
+            id,
+            "succeeded",
+            Some("skip"),
+            Some("nothing_to_do"),
+            Some("no actionable files")
+        )
+        .status
+        .code(),
+        Some(0)
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -382,6 +465,156 @@ fn an_unknown_schema_is_rejected_without_mutation() {
         "kept"
     );
     drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn earlier_v1_listing_is_read_only_and_exposes_null_result_fields() {
+    let root = temporary_root("schema-v1-list");
+    create_v1_store(&root);
+
+    let listed = loam(&["hooks", "list", root.to_str().unwrap()]);
+    assert_eq!(listed.status.code(), Some(0));
+    let line = String::from_utf8(listed.stdout).unwrap();
+    assert!(line.contains("\"schema\":1"), "stdout: {line}");
+    assert!(line.contains("\"action\":null"), "stdout: {line}");
+    assert!(line.contains("\"reason\":null"), "stdout: {line}");
+    assert!(line.contains("\"duration_ms\":250"), "stdout: {line}");
+    assert!(line.contains("\"worker_status\":null"), "stdout: {line}");
+    assert!(
+        line.contains("\"worker_duration_ms\":null"),
+        "stdout: {line}"
+    );
+
+    let connection = Connection::open(root.join("loam.sqlite3")).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn the_next_write_completes_v1_and_preserves_old_rows() {
+    let root = temporary_root("schema-v1-write");
+    let workspace = temporary_root("workspace");
+    create_v1_store(&root);
+
+    assert_eq!(
+        begin(&root, "claude", "stop", &workspace).status.code(),
+        Some(0)
+    );
+    let connection = Connection::open(root.join("loam.sqlite3")).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM hook_run", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT action FROM hook_run WHERE id = 7", [], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .unwrap(),
+        None
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn immediate_results_and_worker_lifecycle_are_guarded_and_listed() {
+    let root = temporary_root("worker-lifecycle");
+    let workspace = temporary_root("workspace");
+    let id = begin_id(&root, "opencode", "session_idle", &workspace);
+
+    assert_eq!(worker_start(&root, id, None).status.code(), Some(1));
+    assert_eq!(
+        finish_result(&root, id, "succeeded", Some("spawn_worker"), None, None)
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(
+        worker_start(&root, id, Some("worker-session"))
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(worker_start(&root, id, None).status.code(), Some(1));
+    assert_eq!(
+        worker_finish(&root, id, "succeeded", "ok", None)
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(
+        worker_finish(&root, id, "failed", "unavailable", Some("late"))
+            .status
+            .code(),
+        Some(1)
+    );
+
+    let listed = loam(&["hooks", "list", root.to_str().unwrap()]);
+    let line = String::from_utf8(listed.stdout).unwrap();
+    assert!(
+        line.contains("\"action\":\"spawn_worker\""),
+        "stdout: {line}"
+    );
+    assert!(line.contains("\"reason\":null"), "stdout: {line}");
+    assert!(
+        line.contains("\"worker_status\":\"succeeded\""),
+        "stdout: {line}"
+    );
+    assert!(line.contains("\"worker_reason\":\"ok\""), "stdout: {line}");
+    assert!(
+        line.contains("\"worker_session_id\":\"worker-session\""),
+        "stdout: {line}"
+    );
+    assert!(line.contains("\"duration_ms\":"), "stdout: {line}");
+    assert!(line.contains("\"worker_duration_ms\":"), "stdout: {line}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_finish_accepts_requested_and_validates_result_mapping() {
+    let root = temporary_root("worker-requested");
+    let workspace = temporary_root("workspace");
+    let id = begin_id(&root, "claude", "stop", &workspace);
+    assert_eq!(
+        finish_result(&root, id, "succeeded", Some("spawn_worker"), None, None)
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(
+        worker_finish(&root, id, "succeeded", "busy", None)
+            .status
+            .code(),
+        Some(1)
+    );
+    assert_eq!(
+        worker_finish(&root, id, "skipped", "busy", Some("lease held"))
+            .status
+            .code(),
+        Some(0)
+    );
+    let listed =
+        String::from_utf8(loam(&["hooks", "list", root.to_str().unwrap()]).stdout).unwrap();
+    assert!(listed.contains("\"worker_started_at\":null"));
+    assert!(listed.contains("\"worker_status\":\"skipped\""));
+    assert!(listed.contains("\"worker_reason\":\"busy\""));
+    assert!(listed.contains("\"worker_detail\":\"lease held\""));
+    assert!(listed.contains("\"worker_duration_ms\":null"));
     fs::remove_dir_all(root).unwrap();
 }
 
