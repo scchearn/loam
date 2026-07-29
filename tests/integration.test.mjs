@@ -7,7 +7,9 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { formatContext, formatNativeRuntimeCommand } from '../integration/context.mjs';
-import { beginHookRun, finishHookRun } from '../integration/hooks.mjs';
+import {
+  beginHookRun, finishHookRun, finishHookWorker, startHookWorker,
+} from '../integration/hooks.mjs';
 import { runIntegration } from '../integration/loam.mjs';
 import { detectLegacyShadow } from '../integration/shadow.mjs';
 import { detectTarget, resolveGlobalRoot, SUPPORTED_TARGETS, runtimePath } from '../integration/paths.mjs';
@@ -261,7 +263,14 @@ test('hook-run logging invokes the installed private runtime with fixed validate
     sessionId: 'session-42',
     runner,
   });
-  const finished = await finishHookRun({ run, status: 'succeeded', runner });
+  const finished = await finishHookRun({
+    run,
+    status: 'succeeded',
+    action: 'skip',
+    reason: 'nothing_to_do',
+    detail: 'no actionable files',
+    runner,
+  });
 
   assert.deepEqual(run, {
     id: 42,
@@ -284,10 +293,48 @@ test('hook-run logging invokes the installed private runtime with fixed validate
     'hooks', 'finish', fixtureData.globalRoot,
     '--id', '42',
     '--status', 'succeeded',
+    '--action', 'skip',
+    '--reason', 'nothing_to_do',
+    '--detail', 'no actionable files',
   ]);
   assert.equal(calls[0].cwd, fixtureData.home);
   assert.equal(calls[0].timeoutMs, 300);
   assert.equal(calls[1].timeoutMs, 300);
+});
+
+test('worker logging uses the same run and maps normalized results to native status', async () => {
+  const fixtureData = await fixture();
+  const calls = [];
+  const run = {
+    id: 42,
+    globalRoot: fixtureData.globalRoot,
+    runtimePath: fixtureData.runtimePath,
+    workspace: fixtureData.home,
+  };
+  const runner = async (request) => {
+    calls.push(request);
+    return { code: 0, signal: null, stdout: '', stderr: '' };
+  };
+
+  assert.equal(await startHookWorker({ run, sessionId: 'worker-42', runner }), true);
+  assert.equal(await finishHookWorker({ run, reason: 'busy', detail: 'lease held', runner }), true);
+  assert.deepEqual(calls.map(({ args }) => args), [
+    [
+      'hooks', 'worker-start', fixtureData.globalRoot,
+      '--id', '42',
+      '--session-id', 'worker-42',
+    ],
+    [
+      'hooks', 'worker-finish', fixtureData.globalRoot,
+      '--id', '42',
+      '--status', 'skipped',
+      '--reason', 'busy',
+      '--detail', 'lease held',
+    ],
+  ]);
+  assert.equal(calls[0].timeoutMs, 300);
+  assert.equal(calls[1].timeoutMs, 300);
+  assert.equal(await finishHookWorker({ run, reason: 'unknown', runner }), false);
 });
 
 test('hook-run logging is fail-open for invalid input, malformed IDs, runtime failure, and timeout', async () => {
@@ -324,6 +371,11 @@ test('hook-run logging is fail-open for invalid input, malformed IDs, runtime fa
     runner: () => new Promise(() => {}),
   }), null);
   assert.equal(await finishHookRun({ run: null, status: 'succeeded' }), false);
+  assert.equal(await finishHookRun({
+    run: { id: 1, globalRoot: fixtureData.globalRoot, runtimePath: fixtureData.runtimePath, workspace: fixtureData.home },
+    status: 'succeeded',
+    action: 'skip',
+  }), false);
 });
 
 test('failed hook-run logging bounds and sanitizes its diagnostic', async () => {

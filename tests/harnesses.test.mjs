@@ -8,6 +8,7 @@ import { test } from 'node:test';
 import { createClaudeAdapter, workspaceFromPayload as claudeWorkspace } from '../adapters/claude-session-start.mjs';
 import { createCursorAdapter, workspaceFromPayload as cursorWorkspace } from '../adapters/cursor-session-start.mjs';
 import { createOpenCodeAdapter } from '../adapters/opencode.mjs';
+import { main as runIngestWorker } from '../adapters/ingest-worker.mjs';
 import { dedupe, mergeJsonConfig } from '../setup/config.mjs';
 import { detectHarnesses, installHarnesses } from '../setup/harnesses.mjs';
 
@@ -35,6 +36,7 @@ test('OpenCode background events queue work and normalize the all-session status
   let finished;
   let gateCalls = 0;
   const hookRuns = [];
+  const workerRuns = [];
   const order = [];
   const done = new Promise((resolve) => { finished = resolve; });
   const plugin = await createOpenCodeAdapter({
@@ -52,11 +54,12 @@ test('OpenCode background events queue work and normalize the all-session status
       gate: async () => { order.push('gate'); gateCalls += 1; return { action: 'spawn_worker', workspace: '/workspace' }; },
       resolveGlobalRoot: () => root,
       resolveSkillsRoot: () => root,
-      runWorker: async ({ openCodeSession }) => {
+      runWorker: async ({ openCodeSession, hookRun }) => {
+        assert.deepEqual(hookRun, { id: 9 });
         const child = await openCodeSession.createChild({ parentId: 'parent-1', title: 'test' });
         await openCodeSession.promptAsync({ sessionId: child.id, parts: [] });
         observed = await openCodeSession.status(child.id);
-        finished();
+        return { reason: 'ok' };
       },
     },
     hookRuns: {
@@ -69,6 +72,11 @@ test('OpenCode background events queue work and normalize the all-session status
       finishHookRun: async (input) => {
         order.push('finish');
         hookRuns.push(['finish', input]);
+      },
+      startHookWorker: async (input) => workerRuns.push(['start', input]),
+      finishHookWorker: async (input) => {
+        workerRuns.push(['finish', input]);
+        finished();
       },
     },
   })({ directory: '/workspace' });
@@ -87,8 +95,49 @@ test('OpenCode background events queue work and normalize the all-session status
       workspace: '/workspace',
       sessionId: 'parent-1',
     }],
-    ['finish', { run: { id: 9 }, status: 'succeeded' }],
+    ['finish', { run: { id: 9 }, status: 'succeeded', action: 'spawn_worker' }],
   ]);
+  assert.deepEqual(workerRuns, [
+    ['start', { run: { id: 9 } }],
+    ['finish', { run: { id: 9 }, reason: 'ok' }],
+  ]);
+});
+
+test('detached workers report their result without changing worker failures', async () => {
+  const calls = [];
+  const options = {
+    harness: 'codex',
+    workspace: '/workspace',
+    hookRunId: 12,
+    globalRoot: '/global',
+    skillsRoot: '/skills',
+    env: {},
+    startHookWorker: async (input) => { calls.push(['start', input]); throw new Error('locked'); },
+    finishHookWorker: async (input) => calls.push(['finish', input]),
+  };
+  const result = await runIngestWorker({
+    ...options,
+    runWorker: async () => ({ reason: 'nothing_to_do', detail: 'wiki_missing' }),
+  });
+  assert.deepEqual(result, { reason: 'nothing_to_do', detail: 'wiki_missing' });
+  assert.deepEqual(calls, [
+    ['start', { run: { id: 12, globalRoot: '/global', workspace: '/workspace' } }],
+    ['finish', {
+      run: { id: 12, globalRoot: '/global', workspace: '/workspace' },
+      reason: 'nothing_to_do',
+      detail: 'wiki_missing',
+    }],
+  ]);
+
+  calls.length = 0;
+  await assert.rejects(() => runIngestWorker({
+    ...options,
+    startHookWorker: async () => undefined,
+    runWorker: async () => { throw new Error('worker crashed'); },
+  }), /worker crashed/);
+  assert.equal(calls[0][0], 'finish');
+  assert.equal(calls[0][1].reason, 'unavailable');
+  assert.match(calls[0][1].detail, /worker crashed/);
 });
 
 test('OpenCode hook-run logging remains fail-open', async () => {

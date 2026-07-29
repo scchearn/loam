@@ -357,28 +357,56 @@ fi
 
 # Workflow: specs/ and plans/ at the workspace root (may be gitignored, so use
 # direct filesystem globs, never Glob). spec_ready_for_plan / plan_* by status.
+# One aggregate hint per kind listing every affected path, so a workspace with a
+# real backlog adds four workflow hints rather than dozens.
+_json_list() { local _out="" _p; for _p in "$@"; do _out+="${_out:+,}\"$_p\""; done; printf '[%s]' "$_out"; }
+# Reconcilable: every task [x] but some criterion still open. [x] and [-] are
+# resolved; [ ], [>], and any unrecognized marker are open.
+_reconcilable() {
+  awk '
+    /^## / { inac = ($0 ~ /^## [Aa]cceptance [Cc]riteria[[:space:]]*$/); next }
+    /^[[:space:]]*- \*\*Status:\*\* \[/ { t++; if ($0 ~ /^[[:space:]]*- \*\*Status:\*\* \[x\]/) d++; next }
+    inac && /^- \[/ { if ($0 !~ /^- \[[x-]\]/) o++ }
+    END { exit !(t > 0 && t == d && o > 0) }
+  ' "$1"
+}
 shopt -s nullglob
+_specs_ready=(); _plans_ready=(); _plans_progress=(); _plans_recon=()
 for _spec in "$WORKSPACE"/specs/*.md; do
   _base=$(basename "$_spec"); [[ "$_base" == "INDEX.md" ]] && continue
   _slug="${_base%.md}"
   _st=$(sed -n 's/^status:[[:space:]]*//p' "$_spec" 2>/dev/null | head -1 | tr -d '"')
   _appr=$(sed -n 's/^approved_at:[[:space:]]*//p' "$_spec" 2>/dev/null | head -1 | tr -d '"')
   if [[ "$_st" == "approved" || ( -n "$_appr" && "$_appr" != "null" ) ]] && [[ ! -f "$WORKSPACE/plans/$_slug.md" ]]; then
-    add_hint spec_ready_for_plan workflow info "Approved spec has no plan yet." \
-      "/loam::planning specs/$_base" "$(printf '{"spec":"specs/%s"}' "$_base")"
+    _specs_ready+=("specs/$_base")
   fi
 done
 for _plan in "$WORKSPACE"/plans/*.md; do
   _base=$(basename "$_plan"); [[ "$_base" == "INDEX.md" ]] && continue
   _st=$(sed -n 's/^status:[[:space:]]*//p' "$_plan" 2>/dev/null | head -1 | tr -d '"')
   case "$_st" in
-    pending)     add_hint plan_ready_to_start workflow info "A plan is ready to start." \
-                   "/loam::starting plans/$_base" "$(printf '{"plan":"plans/%s"}' "$_base")" ;;
-    in-progress) add_hint plan_in_progress workflow info "A plan is in progress." \
-                   "/loam::starting plans/$_base" "$(printf '{"plan":"plans/%s"}' "$_base")" ;;
+    pending)     _plans_ready+=("plans/$_base") ;;
+    in-progress) _plans_progress+=("plans/$_base") ;;
   esac
+  _reconcilable "$_plan" && _plans_recon+=("plans/$_base")
 done
 shopt -u nullglob
+if [[ ${#_specs_ready[@]} -gt 0 ]]; then
+  add_hint spec_ready_for_plan workflow info "Approved spec has no plan yet." \
+    "/loam::planning" "$(printf '{"specs":%s}' "$(_json_list "${_specs_ready[@]}")")"
+fi
+if [[ ${#_plans_ready[@]} -gt 0 ]]; then
+  add_hint plan_ready_to_start workflow info "A plan is ready to start." \
+    "/loam::starting" "$(printf '{"plans":%s}' "$(_json_list "${_plans_ready[@]}")")"
+fi
+if [[ ${#_plans_progress[@]} -gt 0 ]]; then
+  add_hint plan_in_progress workflow info "A plan is in progress." \
+    "/loam::starting" "$(printf '{"plans":%s}' "$(_json_list "${_plans_progress[@]}")")"
+fi
+if [[ ${#_plans_recon[@]} -gt 0 ]]; then
+  add_hint plan_reconcilable workflow info "Every task is complete but acceptance criteria are unresolved." \
+    "/loam::amending-plan" "$(printf '{"plans":%s}' "$(_json_list "${_plans_recon[@]}")")"
+fi
 
 HINTS_JSON="["
 if [[ ${#HINTS[@]} -gt 0 ]]; then

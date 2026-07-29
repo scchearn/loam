@@ -481,49 +481,119 @@ fn add_hints(context: HintContext<'_>, hints: &mut Vec<String>) {
 
 fn workflow_hints(workspace: &Path, hints: &mut Vec<String>) {
     let specs = direct_markdown_files(&workspace.join("specs"));
+    let mut specs_ready: Vec<String> = Vec::new();
     for (name, path) in specs {
         let status = frontmatter_value(&path, "status").unwrap_or_default();
         let approved_at = frontmatter_value(&path, "approved_at").unwrap_or_default();
-        let slug = name.trim_end_matches(".md");
         if (status == "approved" || (!approved_at.is_empty() && approved_at != "null"))
             && !workspace.join("plans").join(&name).is_file()
         {
-            add_hint(
-                hints,
-                "spec_ready_for_plan",
-                "workflow",
-                "info",
-                "Approved spec has no plan yet.",
-                Some(&format!("/loam::planning specs/{name}")),
-                format!("{{\"spec\":\"specs/{name}\"}}"),
-            );
+            specs_ready.push(format!("specs/{name}"));
         }
-        let _ = slug;
     }
+    workflow_hint(
+        hints,
+        "spec_ready_for_plan",
+        "Approved spec has no plan yet.",
+        "/loam::planning",
+        &specs_ready,
+    );
 
+    let (mut ready, mut in_progress, mut reconcilable) = (Vec::new(), Vec::new(), Vec::new());
     for (name, path) in direct_markdown_files(&workspace.join("plans")) {
         match frontmatter_value(&path, "status").as_deref() {
-            Some("pending") => add_hint(
-                hints,
-                "plan_ready_to_start",
-                "workflow",
-                "info",
-                "A plan is ready to start.",
-                Some(&format!("/loam::starting plans/{name}")),
-                format!("{{\"plan\":\"plans/{name}\"}}"),
-            ),
-            Some("in-progress") => add_hint(
-                hints,
-                "plan_in_progress",
-                "workflow",
-                "info",
-                "A plan is in progress.",
-                Some(&format!("/loam::starting plans/{name}")),
-                format!("{{\"plan\":\"plans/{name}\"}}"),
-            ),
+            Some("pending") => ready.push(format!("plans/{name}")),
+            Some("in-progress") => in_progress.push(format!("plans/{name}")),
             _ => {}
         }
+        if plan_reconciliation(&path) {
+            reconcilable.push(format!("plans/{name}"));
+        }
     }
+    workflow_hint(
+        hints,
+        "plan_ready_to_start",
+        "A plan is ready to start.",
+        "/loam::starting",
+        &ready,
+    );
+    workflow_hint(
+        hints,
+        "plan_in_progress",
+        "A plan is in progress.",
+        "/loam::starting",
+        &in_progress,
+    );
+    workflow_hint(
+        hints,
+        "plan_reconcilable",
+        "Every task is complete but acceptance criteria are unresolved.",
+        "/loam::amending-plan",
+        &reconcilable,
+    );
+}
+
+/// True when every task in a plan is `[x]` but some acceptance criterion is
+/// still open. Resolved is `[x]` or `[-]`; `[ ]`, `[>]`, and any unrecognized
+/// marker are open. See `specs/acceptance-criteria-lifecycle.md`.
+// ponytail: line-prefix scan, not a Markdown parse. Criteria and task status
+// lines are template-generated and column-anchored; switch to markdown.rs if
+// they ever stop being.
+fn plan_reconciliation(path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    let (mut tasks, mut tasks_done, mut open) = (0usize, 0usize, 0usize);
+    let mut in_criteria = false;
+    for line in content.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            in_criteria = heading.trim().eq_ignore_ascii_case("acceptance criteria");
+            continue;
+        }
+        if let Some(marker) = line.trim_start().strip_prefix("- **Status:** [") {
+            tasks += 1;
+            tasks_done += usize::from(marker.starts_with('x'));
+            continue;
+        }
+        if in_criteria && line.starts_with("- [") {
+            open += usize::from(!matches!(line.as_bytes().get(3), Some(b'x') | Some(b'-')));
+        }
+    }
+    tasks > 0 && tasks_done == tasks && open > 0
+}
+
+/// One aggregate hint per kind, listing every affected path. Kind stays the
+/// suppression key a skill matches on; the agent infers the per-file command
+/// from the list, so the hint does not repeat itself once per file.
+fn workflow_hint(
+    hints: &mut Vec<String>,
+    kind: &str,
+    message: &str,
+    command: &str,
+    paths: &[String],
+) {
+    if paths.is_empty() {
+        return;
+    }
+    let list = paths
+        .iter()
+        .map(|path| format!("\"{}\"", json_escape(path)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let key = if kind == "spec_ready_for_plan" {
+        "specs"
+    } else {
+        "plans"
+    };
+    add_hint(
+        hints,
+        kind,
+        "workflow",
+        "info",
+        message,
+        Some(command),
+        format!("{{\"{key}\":[{list}]}}"),
+    );
 }
 
 fn direct_markdown_files(directory: &Path) -> Vec<(String, PathBuf)> {

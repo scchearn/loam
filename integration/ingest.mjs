@@ -85,11 +85,17 @@ export async function gate({ harness, payload = {}, globalRoot, env = process.en
   return { action: 'spawn_worker', workspace, config };
 }
 
-export function startWorker({ harness, workspace, globalRoot, skillsRoot, workerPath, env = process.env } = {}) {
+export function startWorker({
+  harness, workspace, globalRoot, skillsRoot, workerPath, hookRunId,
+  env = process.env, spawn = spawnDetached,
+} = {}) {
   if (!workerPath) throw new Error('installed ingestion worker is unavailable');
-  return spawnDetached({
+  return spawn({
     command: process.execPath,
-    args: [workerPath, '--harness', harness, '--workspace', resolve(workspace)],
+    args: [
+      workerPath, '--harness', harness, '--workspace', resolve(workspace),
+      ...(Number.isSafeInteger(hookRunId) && hookRunId > 0 ? ['--hook-run-id', String(hookRunId)] : []),
+    ],
     cwd: resolve(workspace),
     env: { ...env, LOAM_INGEST_WORKER: '1', LOAM_INGEST_GLOBAL_ROOT: resolve(globalRoot), ...(skillsRoot ? { LOAM_INGEST_SKILLS_ROOT: resolve(skillsRoot) } : {}) },
   });

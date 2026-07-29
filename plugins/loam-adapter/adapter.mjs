@@ -108,10 +108,11 @@ export async function handleMarketplaceStop(payload = {}, {
   } catch {}
 
   let failure;
+  let outcome;
   try {
     const { resolveGlobalRoot, resolveSkillsRoot, dispatchBoundary } = await loadIngest();
     if (!dispatchBoundary) throw new Error('Loam ingestion integration is unavailable');
-    await dispatchBoundary({
+    outcome = await dispatchBoundary({
       harness,
       payload: {
         session_id: typeof payload?.session_id === 'string' ? payload.session_id : undefined,
@@ -120,6 +121,7 @@ export async function handleMarketplaceStop(payload = {}, {
       },
       globalRoot: env.LOAM_INGEST_GLOBAL_ROOT || resolveGlobalRoot({ env }),
       skillsRoot: env.LOAM_INGEST_SKILLS_ROOT || resolveSkillsRoot({ env }),
+      hookRunId: hookRun?.id,
       env,
     });
   } catch (error) {
@@ -131,7 +133,13 @@ export async function handleMarketplaceStop(payload = {}, {
       await finishHookRun({
         run: hookRun,
         status: failure ? 'failed' : 'succeeded',
-        ...(failure ? { detail: failure instanceof Error ? failure.message : String(failure) } : {}),
+        ...(failure
+          ? { detail: failure instanceof Error ? failure.message : String(failure) }
+          : {
+              action: outcome?.action,
+              ...(outcome?.reason !== undefined ? { reason: outcome.reason } : {}),
+              ...(outcome?.detail !== undefined ? { detail: outcome.detail } : {}),
+            }),
       });
     } catch {}
   }

@@ -37,7 +37,8 @@ async function loadIngestModules() {
 }
 
 const {
-  resolveGlobalRoot, resolveSkillsRoot, gate, runWorker, beginHookRun, finishHookRun,
+  resolveGlobalRoot, resolveSkillsRoot, gate, runWorker,
+  beginHookRun, finishHookRun, startHookWorker, finishHookWorker,
 } = await loadIngestModules().catch(() => ({}));
 
 async function defaultContext({ integrationPath, workspace }) {
@@ -81,6 +82,8 @@ export function createOpenCodeAdapter({
   const ingestSkillsRoot = ingestion.resolveSkillsRoot || resolveSkillsRoot;
   const hookBegin = hookRuns.beginHookRun || beginHookRun;
   const hookFinish = hookRuns.finishHookRun || finishHookRun;
+  const hookWorkerStart = hookRuns.startHookWorker || startHookWorker;
+  const hookWorkerFinish = hookRuns.finishHookWorker || finishHookWorker;
   const hookGlobalRoot = hookRuns.resolveGlobalRoot || resolveGlobalRoot;
   return async ({ directory, client: invocationClient } = {}) => {
     const sdk = client || invocationClient;
@@ -114,13 +117,14 @@ export function createOpenCodeAdapter({
         } catch {}
       }
       let failure;
+      let gated;
       try {
         if (!ingestGate || !ingestWorker || !ingestGlobalRoot || !ingestSkillsRoot) {
           throw new Error('Loam ingestion integration is unavailable');
         }
         const globalRoot = ingestGlobalRoot({ env, integrationPath });
         const skillsRoot = ingestSkillsRoot({ env });
-        const gated = await ingestGate({
+        gated = await ingestGate({
           harness: 'opencode',
           payload: { cwd: workspace, event_id: event.id, session_id: childId },
           globalRoot,
@@ -156,16 +160,43 @@ export function createOpenCodeAdapter({
               return responseData(await sdk.session.abort({ path: { id }, query: { directory: workspace } }));
             },
           };
-          void Promise.resolve(ingestWorker({
-            harness: 'opencode',
-            workspace: gated.workspace,
-            globalRoot,
-            skillsRoot,
-            env,
-            openCodeSession: childSession,
-          })).catch(() => {}).finally(() => {
-            if (childSession.lastChildId) rememberCompleted(childSession.lastChildId);
-          });
+          void (async () => {
+            if (hookRun && hookWorkerStart) {
+              try { await hookWorkerStart({ run: hookRun }); } catch {}
+            }
+            try {
+              const result = await ingestWorker({
+                harness: 'opencode',
+                workspace: gated.workspace,
+                globalRoot,
+                skillsRoot,
+                env,
+                openCodeSession: childSession,
+                hookRun,
+              });
+              if (hookRun && hookWorkerFinish) {
+                try {
+                  await hookWorkerFinish({
+                    run: hookRun,
+                    reason: result?.reason,
+                    ...(result?.detail !== undefined ? { detail: result.detail } : {}),
+                  });
+                } catch {}
+              }
+            } catch (error) {
+              if (hookRun && hookWorkerFinish) {
+                try {
+                  await hookWorkerFinish({
+                    run: hookRun,
+                    reason: 'unavailable',
+                    detail: error instanceof Error ? error.message : String(error),
+                  });
+                } catch {}
+              }
+            } finally {
+              if (childSession.lastChildId) rememberCompleted(childSession.lastChildId);
+            }
+          })();
         }
       } catch (error) {
         failure = error;
@@ -175,7 +206,13 @@ export function createOpenCodeAdapter({
           await hookFinish({
             run: hookRun,
             status: failure ? 'failed' : 'succeeded',
-            ...(failure ? { detail: failure instanceof Error ? failure.message : String(failure) } : {}),
+            ...(failure
+              ? { detail: failure instanceof Error ? failure.message : String(failure) }
+              : {
+                  action: gated?.action,
+                  ...(gated?.reason !== undefined ? { reason: gated.reason } : {}),
+                  ...(gated?.detail !== undefined ? { detail: gated.detail } : {}),
+                }),
           });
         } catch {}
       }
