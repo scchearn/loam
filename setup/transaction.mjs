@@ -57,17 +57,19 @@ async function stageIntegration({ packageRoot, globalRoot, pluginVersion }) {
 export async function executeSetup(parsed, discovery, options = {}) {
   const output = options.output || process.stdout;
   const errorOutput = options.errorOutput || process.stderr;
-  renderDiscovery(discovery, output, { dryRun: parsed.dryRun });
+  const refresh = parsed.command === 'update';
+  const yes = parsed.yes || refresh;
+  renderDiscovery(discovery, output, { action: refresh ? 'Update' : 'Setup', dryRun: parsed.dryRun });
   if (parsed.dryRun) {
     stage(output, 'Dry run', 'no files, configuration, downloads, or mutating Skills CLI commands will run');
     return 0;
   }
-  if (!(await confirmSetup({ yes: parsed.yes, confirm: options.confirm, input: options.input, output }))) {
+  if (!(await confirmSetup({ yes, confirm: options.confirm, input: options.input, output }))) {
     stage(output, 'Setup cancelled');
     return 130;
   }
   const selectedMarketplaceHarnesses = await selectMarketplaceHarnesses({
-    yes: parsed.yes,
+    yes,
     harnesses: discovery.harnesses,
     select: options.marketplaceSelect,
   });
@@ -92,7 +94,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
       runner: options.runner,
       runtimeRunner: options.smokeRunner,
     });
-    if (alreadyReady.ready) {
+    if (alreadyReady.ready && !refresh) {
       stage(output, 'Loam is ready', 'already ready; no replacement or network operation required');
       return 0;
     }
@@ -107,6 +109,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
         packageRoot: discovery.packageRoot,
         skillsRoot: discovery.skillsRoot,
         cwd: discovery.workspace,
+        refresh,
         runner: options.runner,
       });
       if (!skills.ready) {
@@ -139,6 +142,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
       const marketplace = await installMarketplacePlugins({
         selected: selectedMarketplaceHarnesses,
         harnesses: discovery.harnesses,
+        refresh,
         cwd: discovery.workspace,
         runner: options.runner,
       });
@@ -192,7 +196,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
         migration = await migrateLegacyProject({
           workspace: discovery.workspace,
           packageRoot: discovery.packageRoot,
-          yes: parsed.yes,
+          yes,
           prompt: options.migrationConfirm || options.confirm,
           runner: options.runner,
         });

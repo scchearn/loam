@@ -22,6 +22,8 @@ Usage:
   npx @scchearn/loam install
   npx @scchearn/loam setup --yes
   npx @scchearn/loam setup --dry-run
+  npx @scchearn/loam update
+  npx @scchearn/loam update --dry-run
   npx @scchearn/loam doctor
   npx @scchearn/loam uninstall
   npx @scchearn/loam uninstall --yes
@@ -31,12 +33,13 @@ Usage:
 Commands:
   setup       Install or reconcile global Loam skills, runtime, and integrations.
   install     Alias for setup.
+  update      Refresh Loam skills, runtime, integrations, and marketplace plugins.
   doctor      Check the global Loam installation without changing it.
   uninstall   Remove global Loam skills, runtime, integration, and hook entries.
 
 Options:
   --yes       Accept changes without interactive confirmation.
-  --dry-run   Preview setup changes without mutation or downloads.
+  --dry-run   Preview setup or update changes without mutation or downloads.
   --help      Show this help without network access.
   --version   Show the setup package version without network access.
 `;

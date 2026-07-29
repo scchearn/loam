@@ -28,12 +28,11 @@ Use `--yes` to configure every detected harness without prompting, or
 To update Loam later:
 
 ```bash
-npx skills update --global
-npx @scchearn/loam setup
+npx @scchearn/loam update
 ```
 
-The first command updates your skills. The second updates the private helper
-and repairs each agent's connection to Loam. Starting a coding session remains
+This refreshes only Loam's skills, updates the private helper, and repairs each
+agent's integration and marketplace plugin. Starting a coding session remains
 read-only and never downloads updates.
 
 To remove everything loam installed:

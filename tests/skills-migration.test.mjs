@@ -98,6 +98,36 @@ test('complete global Skills CLI inventory skips mutation and verifies CLI_VERSI
   assert.deepEqual(calls[0].args, ['--yes', '--package', 'skills@1.5.20', 'skills', 'list', '--json', '--global']);
 });
 
+test('refresh forces the Loam source add even when the global inventory is complete', async () => {
+  const skillsRoot = await skillsRootFixture();
+  const calls = [];
+  const result = await ensureGlobalSkills({
+    packageRoot,
+    skillsRoot,
+    refresh: true,
+    runner: async (request) => {
+      calls.push(request);
+      return { code: 0, stdout: JSON.stringify(await completeList()), stderr: '' };
+    },
+  });
+
+  assert.equal(result.ready, true);
+  assert.equal(result.changed, true);
+  assert.equal(calls.filter((call) => call.args.includes('add')).length, 1);
+  assert.deepEqual(calls[1].args, [
+    '--yes',
+    '--package',
+    'skills@1.5.20',
+    'skills',
+    'add',
+    'scchearn/loam',
+    '--global',
+    '--agent',
+    '*',
+    '--yes',
+  ]);
+});
+
 test('incomplete global inventory invokes the pinned public add and re-verifies', async () => {
   const skillsRoot = await skillsRootFixture();
   const full = await completeList();

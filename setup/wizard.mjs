@@ -1,7 +1,7 @@
 import readline from 'node:readline/promises';
 
-export function renderDiscovery(discovery, output, { dryRun = false } = {}) {
-  output.write(`Loam Setup${dryRun ? ' (dry-run)' : ''}\n`);
+export function renderDiscovery(discovery, output, { action = 'Setup', dryRun = false } = {}) {
+  output.write(`Loam ${action}${dryRun ? ' (dry-run)' : ''}\n`);
   output.write(`  Home: ${discovery.home}\n`);
   output.write(`  Global root: ${discovery.globalRoot}\n`);
   output.write(`  Skills source: scchearn/loam (global, universal)\n`);
