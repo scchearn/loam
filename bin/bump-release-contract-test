@@ -45,6 +45,8 @@ make_fixture() {
     > "$fixture/.cursor-plugin/plugin.json"
   printf '[package]\nname = "loam"\nversion = "%s"\nedition = "2021"\n\n[dependencies]\nchrono = { version = "0.4", default-features = false }\n' \
     "$RUNTIME_VERSION" > "$fixture/cli/Cargo.toml"
+  printf 'version = 4\n\n[[package]]\nname = "chrono"\nversion = "0.4.0"\n\n[[package]]\nname = "loam"\nversion = "%s"\n' \
+    "$RUNTIME_VERSION" > "$fixture/Cargo.lock"
   printf '%s\n' "$RUNTIME_VERSION" > "$fixture/skills/loam-using/scripts/CLI_VERSION"
 
   git -C "$fixture" init -q
@@ -81,10 +83,11 @@ count_in "$fixture/plugins/loam-adapter/.codex-plugin/plugin.json" '"version": "
 count_in "$fixture/.cursor-plugin/plugin.json"      '"version": "0.9.1"' 1 "cursor manifest"
 # The runtime lane must be untouched — this is the whole point of the split.
 count_in "$fixture/cli/Cargo.toml" "version = \"$RUNTIME_VERSION\"" 1 "cargo version untouched by plugin bump"
+count_in "$fixture/Cargo.lock" "version = \"$RUNTIME_VERSION\"" 1 "cargo lock untouched by plugin bump"
 [[ "$(tr -d ' \t\r\n' < "$fixture/skills/loam-using/scripts/CLI_VERSION")" == "$RUNTIME_VERSION" ]] \
   || fail "plugin bump changed CLI_VERSION"
 
-# --- 2. runtime lane updates exactly the two runtime values ------------------
+# --- 2. runtime lane updates exactly the three runtime values ----------------
 fixture="$tmp/runtime"
 make_fixture "$fixture"
 if out="$(run_bump "$fixture" --runtime 1.0.0)"; then
@@ -95,6 +98,7 @@ else
   fail "runtime bump exited non-zero: $out"
 fi
 count_in "$fixture/cli/Cargo.toml" 'version = "1.0.0"' 1 "cargo package version"
+count_in "$fixture/Cargo.lock" 'version = "1.0.0"' 1 "cargo lock package version"
 [[ "$(tr -d ' \t\r\n' < "$fixture/skills/loam-using/scripts/CLI_VERSION")" == "1.0.0" ]] \
   || fail "CLI_VERSION was not updated"
 grep -Fq 'chrono = { version = "0.4", default-features = false }' "$fixture/cli/Cargo.toml" \
