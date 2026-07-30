@@ -1,4 +1,4 @@
-//! Minimal JSON reader.
+//! Minimal JSON reader and writer.
 //!
 //! It exists so the release-version gate can read plugin manifests without a
 //! `python3` runtime and the checkpoint digest can read `hcom`/`task` output
@@ -62,6 +62,47 @@ impl Value {
         matches!(self, Value::Null)
     }
 
+    /// Re-emits parsed values through the same dependency-free model so
+    /// security-sensitive callers can inspect and forward JSON without losing
+    /// object order or the exact spelling of numeric literals.
+    pub fn to_json(&self) -> String {
+        let mut output = String::new();
+        self.write_json(&mut output);
+        output
+    }
+
+    fn write_json(&self, output: &mut String) {
+        match self {
+            Value::Null => output.push_str("null"),
+            Value::Bool(true) => output.push_str("true"),
+            Value::Bool(false) => output.push_str("false"),
+            Value::Number(literal) => output.push_str(literal),
+            Value::String(value) => write_string(output, value),
+            Value::Array(items) => {
+                output.push('[');
+                for (index, item) in items.iter().enumerate() {
+                    if index != 0 {
+                        output.push(',');
+                    }
+                    item.write_json(output);
+                }
+                output.push(']');
+            }
+            Value::Object(entries) => {
+                output.push('{');
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index != 0 {
+                        output.push(',');
+                    }
+                    write_string(output, key);
+                    output.push(':');
+                    value.write_json(output);
+                }
+                output.push('}');
+            }
+        }
+    }
+
     /// Rendered the way `jq -r` renders a scalar in string interpolation.
     pub fn render(&self) -> String {
         match self {
@@ -73,6 +114,31 @@ impl Value {
             Value::Array(_) | Value::Object(_) => String::new(),
         }
     }
+}
+
+fn write_string(output: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{0008}' => output.push_str("\\b"),
+            '\u{000c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            '\u{0000}'..='\u{001f}' => {
+                let byte = character as usize;
+                output.push_str("\\u00");
+                output.push(HEX[byte >> 4] as char);
+                output.push(HEX[byte & 0x0f] as char);
+            }
+            _ => output.push(character),
+        }
+    }
+    output.push('"');
 }
 
 impl fmt::Display for Value {
@@ -398,6 +464,33 @@ mod tests {
             value.get("ratio").map(Value::render),
             Some("1.5e3".to_owned())
         );
+    }
+
+    #[test]
+    fn writes_nested_values_that_parse_back_equal() {
+        let value = parse(r#"{"outer":[null,true,false,{"text":"nested"}],"number":1.5e3}"#)
+            .expect("document should parse");
+
+        let written = value.to_json();
+
+        assert_eq!(parse(&written), Ok(value));
+    }
+
+    #[test]
+    fn writes_strings_with_json_escaping_and_utf8_intact() {
+        let value = Value::String("\"\\\u{0008}\u{000c}\n\r\t\u{0001}é🚀".to_owned());
+
+        let written = value.to_json();
+
+        assert_eq!(written, "\"\\\"\\\\\\b\\f\\n\\r\\t\\u0001é🚀\"");
+        assert_eq!(parse(&written), Ok(value));
+    }
+
+    #[test]
+    fn writes_object_keys_in_order_and_number_literals_verbatim() {
+        let value = parse(r#"{"z":1.5e3,"a":-0.25E-2}"#).expect("document should parse");
+
+        assert_eq!(value.to_json(), r#"{"z":1.5e3,"a":-0.25E-2}"#);
     }
 
     #[test]

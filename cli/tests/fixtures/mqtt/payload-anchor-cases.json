@@ -1,0 +1,29 @@
+[
+  {"name": "missing_repository_id", "patches": [{"op": "remove", "path": ["data", "context", "repository_id"]}]},
+  {"name": "invalid_git_refs_payload", "base": "git-refs-changed", "patches": [{"op": "set", "path": ["data", "payload"], "value": null}]},
+  {"name": "missing_old_oid", "base": "git-refs-changed", "patches": [{"op": "remove", "path": ["data", "payload", "old_oid"]}]},
+  {"name": "invalid_old_oid", "base": "git-refs-changed", "patches": [{"op": "set", "path": ["data", "payload", "old_oid"], "value": "not-an-oid"}]},
+  {"name": "missing_new_oid", "base": "git-refs-changed", "patches": [{"op": "remove", "path": ["data", "payload", "new_oid"]}]},
+  {"name": "invalid_new_oid", "base": "git-refs-changed", "patches": [{"op": "set", "path": ["data", "payload", "new_oid"], "value": "not-an-oid"}]},
+  {"name": "invalid_work_state_payload", "patches": [{"op": "set", "path": ["data", "payload"], "value": null}]},
+  {"name": "invalid_work_state", "patches": [{"op": "set", "path": ["data", "payload", "state"], "value": "complete"}]},
+  {"name": "missing_base_oid", "patches": [{"op": "remove", "path": ["data", "context", "git", "base_oid"]}]},
+  {"name": "invalid_base_oid", "patches": [{"op": "set", "path": ["data", "context", "git", "base_oid"], "value": "not-an-oid"}]},
+  {"name": "missing_plan_oid", "patches": [{"op": "remove", "path": ["data", "context", "git", "plan_oid"]}]},
+  {"name": "invalid_plan_oid", "patches": [{"op": "set", "path": ["data", "context", "git", "plan_oid"], "value": "not-an-oid"}]},
+  {"name": "missing_stable_artifact_id", "patches": [{"op": "set", "path": ["data", "context", "artifacts"], "value": [{"kind": "task", "id": ""}]}]},
+  {"name": "missing_stable_acceptance_id", "patches": [{"op": "set", "path": ["data", "payload", "acceptance"], "value": {"": "passed"}}]},
+  {"name": "invalid_message_payload", "base": "message", "patches": [{"op": "set", "path": ["data", "payload"], "value": null}]},
+  {"name": "missing_message_action", "base": "message", "patches": [{"op": "remove", "path": ["data", "payload", "action"]}]},
+  {"name": "invalid_message_params", "base": "message", "patches": [{"op": "set", "path": ["data", "payload", "params"], "value": "review"}]},
+  {"name": "invalid_response_status", "base": "message", "patches": [{"op": "set", "path": ["data", "payload", "response_status"], "value": 200}]},
+  {
+    "name": "missing_review_anchor",
+    "base": "message",
+    "patches": [
+      {"op": "remove", "path": ["data", "context", "git", "ref"]},
+      {"op": "remove", "path": ["data", "context", "git", "commit"]}
+    ]
+  },
+  {"name": "invalid_review_commit", "base": "message", "patches": [{"op": "set", "path": ["data", "context", "git", "commit"], "value": "not-an-oid"}]}
+]

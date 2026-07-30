@@ -1,0 +1,27 @@
+[
+  {
+    "base": "work-state",
+    "topic": "loam/v1/org-3A1/project-7M3/state/instance-01/activity-01K6Q5",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "org", "id": "org-3A1"}]}]
+  },
+  {
+    "base": "work-state",
+    "topic": "loam/v1/org-3A1/project-7M3/state/instance-01/activity-01K6Q5",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "project", "id": "project-7M3"}]}]
+  },
+  {
+    "base": "message",
+    "topic": "loam/v1/org-3A1/project-7M3/inbox/agent-91/instance-01/01K6Q6ESWMT48TPC",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "agent", "id": "agent-91"}]}]
+  },
+  {
+    "base": "message",
+    "topic": "loam/v1/org-3A1/project-7M3/inbox/employee-184/instance-01/01K6Q6ESWMT48TPC",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "principal", "id": "employee-184"}]}]
+  },
+  {
+    "base": "message",
+    "topic": "loam/v1/org-3A1/project-7M3/inbox/instance-02/instance-01/01K6Q6ESWMT48TPC",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "instance", "id": "instance-02"}]}]
+  }
+]

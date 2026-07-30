@@ -1,0 +1,9 @@
+[
+  {"name": "reserved_type", "patches": [{"op": "set", "path": ["type"], "value": "io.loam.something.new"}]},
+  {"name": "spoofed_reserved_type", "patches": [{"op": "set", "path": ["type"], "value": "io.LOAM.work.state"}]},
+  {"name": "unnamespaced_type", "patches": [{"op": "set", "path": ["type"], "value": "regression"}]},
+  {"name": "missing_schema_major", "patches": [{"op": "set", "path": ["dataschema"], "value": "https://schemas.acme.example/regression"}]},
+  {"name": "extension_dataschema_mismatch", "patches": [{"op": "set", "path": ["dataschema"], "value": "https://schemas.acme.example/other/1"}]},
+  {"name": "core_dataschema_mismatch", "base": "work-state", "patches": [{"op": "set", "path": ["dataschema"], "value": "urn:loam:schema:message:1"}]},
+  {"name": "breaking_without_new_major", "base": "work-state", "patches": [{"op": "set", "path": ["data", "payload", "state"], "value": "complete"}]}
+]

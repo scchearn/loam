@@ -1,0 +1,50 @@
+[
+  {
+    "name": "invalid_source_scheme",
+    "patches": [
+      {"op": "set", "path": ["source"], "value": "https://example.invalid/instance-01"}
+    ]
+  },
+  {
+    "name": "source_instance_mismatch",
+    "patches": [
+      {"op": "set", "path": ["source"], "value": "urn:loam:instance:instance-02"}
+    ]
+  },
+  {
+    "name": "unauthorized_principal",
+    "patches": [
+      {"op": "set", "path": ["data", "from", "principal_id"], "value": "employee-999"}
+    ]
+  },
+  {
+    "name": "authentication_precedes_structure",
+    "patches": [
+      {"op": "set", "path": ["data", "from", "principal_id"], "value": "employee-999"},
+      {"op": "remove", "path": ["data", "delivery", "revision"]}
+    ]
+  },
+  {
+    "name": "runtime_only_identity",
+    "patches": [
+      {"op": "remove", "path": ["data", "from", "principal_id"]},
+      {"op": "remove", "path": ["data", "from", "agent_id"]},
+      {"op": "remove", "path": ["data", "from", "instance_id"]}
+    ]
+  },
+  {
+    "name": "payload_only_identity",
+    "patches": [
+      {"op": "remove", "path": ["data", "from", "principal_id"]},
+      {"op": "remove", "path": ["data", "from", "agent_id"]},
+      {"op": "remove", "path": ["data", "from", "instance_id"]},
+      {"op": "set", "path": ["data", "payload", "principal_id"], "value": "employee-184"}
+    ]
+  },
+  {
+    "name": "plan_local_subject",
+    "patches": [
+      {"op": "set", "path": ["subject"], "value": "T4"}
+    ]
+  }
+]

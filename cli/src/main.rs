@@ -2,6 +2,7 @@ mod check;
 mod checkpoint;
 mod codegraph;
 mod datecheck;
+mod envelope;
 mod hooks;
 mod json;
 mod lint;
