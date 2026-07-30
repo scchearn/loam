@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DATABASE_NAME: &str = "loam.sqlite3";
+// This is a wait ceiling under contention, not a delay on uncontended operations.
+const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const SCHEMA_VERSION: i64 = 1;
 const RETENTION: i64 = 10_000;
 const SUPPORTED_TARGETS: [&str; 5] = [
@@ -404,7 +406,7 @@ fn begin(args: BeginArgs) -> Result<(), String> {
         private_permissions(&database, 0o600)?;
     }
     connection
-        .busy_timeout(Duration::from_millis(250))
+        .busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| error.to_string())?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -447,7 +449,7 @@ fn finish(args: FinishArgs) -> Result<(), String> {
     let mut connection = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|error| error.to_string())?;
     connection
-        .busy_timeout(Duration::from_millis(250))
+        .busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| error.to_string())?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -532,7 +534,7 @@ fn writable_store(root: &Path) -> Result<Connection, String> {
     let connection = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|error| error.to_string())?;
     connection
-        .busy_timeout(Duration::from_millis(250))
+        .busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| error.to_string())?;
     Ok(connection)
 }
@@ -545,7 +547,7 @@ fn list(args: ListArgs) -> Result<(), String> {
     let connection = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| error.to_string())?;
     connection
-        .busy_timeout(Duration::from_millis(250))
+        .busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| error.to_string())?;
     let version = schema_version(&connection)?;
     if version != SCHEMA_VERSION {

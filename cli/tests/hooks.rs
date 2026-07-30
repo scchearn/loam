@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -670,26 +671,34 @@ fn begin_prunes_only_old_hook_runs() {
 fn concurrent_begins_get_distinct_ids() {
     let root = temporary_root("concurrent");
     let workspace = temporary_root("workspace");
-    // Three writers match the supported Claude, Codex, and OpenCode boundary.
-    let writers: Vec<_> = (0..3)
-        .map(|_| {
-            let root = root.clone();
-            let workspace = workspace.clone();
-            thread::spawn(move || begin_id(&root, "codex", "stop", &workspace))
-        })
-        .collect();
-    let ids: HashSet<_> = writers
-        .into_iter()
-        .map(|writer| writer.join().unwrap())
-        .collect();
-    assert_eq!(ids.len(), 3);
+    // Repeated rounds amplify lock races at the supported three-harness boundary.
+    const WRITERS_PER_ROUND: usize = 3;
+    const ROUNDS: usize = 20;
+    let mut ids = HashSet::new();
+    for _ in 0..ROUNDS {
+        let barrier = Arc::new(Barrier::new(WRITERS_PER_ROUND));
+        let writers: Vec<_> = (0..WRITERS_PER_ROUND)
+            .map(|_| {
+                let root = root.clone();
+                let workspace = workspace.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    begin_id(&root, "codex", "stop", &workspace)
+                })
+            })
+            .collect();
+        ids.extend(writers.into_iter().map(|writer| writer.join().unwrap()));
+    }
+    let expected = (WRITERS_PER_ROUND * ROUNDS) as i64;
+    assert_eq!(ids.len(), expected as usize);
     let connection = Connection::open(root.join("loam.sqlite3")).unwrap();
     assert_eq!(
         connection
             .query_row("SELECT count(*) FROM hook_run", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
-        3
+        expected
     );
     drop(connection);
     fs::remove_dir_all(root).unwrap();
