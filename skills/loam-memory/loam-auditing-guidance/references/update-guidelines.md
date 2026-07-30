@@ -76,8 +76,8 @@ Why: Environment-specific knowledge.
 ### 6. Cross-references to canonical files
 
 When the audit (Phase 1c) finds a repo-root `DESIGN.md` that AGENTS.md does
-not reference, surface the gap in the report. The user decides whether to add
-a pointer; the canonical one-liner (when approved) is:
+not reference, add the pointer directly and note it in the report — the
+cross-reference is additive and mechanical. The canonical one-liner is:
 
 ```markdown
 ## Design system

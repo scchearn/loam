@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate) and goal artifacts. Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, consolidate a legacy root `overview.md` into `index.md`, or health-check goal artifacts. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.10.0"
+  version: "1.11.0"
   author: scchearn
   argument-hint: [wiki root, goal path, or focus area]
 ---
@@ -90,8 +90,10 @@ scan. The command is read-only and never fixes anything.
 
 If it exits 75 or 78 the native runtime is not ready — stop and report
 `npx @scchearn/loam setup`. Do not claim a clean result from a fallback check.
-The linter reports; **you** still classify findings and apply safe fixes
-through the normal proposal/approval path.
+The linter reports; **you** classify findings and apply safe fixes directly,
+recording each in `log.md`. Memory writes are agent-owned — the log entry is
+the audit trail, not a human gate. Never report a mechanical, reversible fix
+as needing approval.
 
 
 ### qmd metadata health (secondary only)
@@ -169,9 +171,9 @@ When `<wiki root>/.wiki-metadata.json` has a stale `retrieval.collection_path`:
 When `<wiki root>/checkpoints/` contains legacy slugged checkpoint filenames:
 
 1. identify files matching `checkpoint-YYYY-MM-DD-HHMM-<slug>.md`
-2. propose renames to `checkpoint-YYYY-MM-DD-HHMM.md`, using the smallest suffix only when a collision exists
+2. rename to `checkpoint-YYYY-MM-DD-HHMM.md`, using the smallest suffix only when a collision exists
 3. update checkpoint wikilinks that reference renamed notes
-4. apply the migration only through lint's normal proposal/approval path; do not rename checkpoint files silently
+4. apply the migration directly — it is mechanical and git-reversible, so it needs no approval; the `log.md` entry below is what makes it non-silent
 5. record the checkpoint filename migration in `<wiki root>/log.md`
 
 When `<wiki root>/entities/` contains stranded code pages (pages with `source_path:` front matter):
@@ -241,11 +243,11 @@ The script reports drift as JSON: front matter point-in-time fields missing time
 Canonical formats are defined in `loam-using/references/date-formats.md`.
 
 If drift is found:
-1. Report the findings to the user.
-2. After approval, run `<native-runtime-command> datecheck fix "$WIKI_ROOT" --offset <local-offset>` to apply normalizations.
-3. Re-run `<native-runtime-command> datecheck check "$WIKI_ROOT"` to confirm zero drift.
+1. Run `<native-runtime-command> datecheck fix "$WIKI_ROOT"`. `--offset` is optional and defaults to the machine's local offset, so no human input is needed.
+2. Re-run `datecheck check "$WIKI_ROOT"` to confirm zero drift.
+3. Record it in `<wiki root>/log.md` and report under "Fixed now".
 
-This check is read-only — `check` mode never writes. `fix` mode is only run after explicit approval, same as checkpoint filename migration.
+`check` never writes. `fix` is idempotent and loses no information — run it directly, never report date drift as needing approval.
 
 ### Refresh qmd after writes
 

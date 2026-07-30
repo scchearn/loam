@@ -94,5 +94,7 @@ migrate to epoch on the next `loam::syncing-code-graph` run.
 `<native-runtime-command> datecheck check <wiki-root>`
 scans all `*.md` files for drift from these formats and reports findings as
 JSON. `loam::linting-memory` calls this during its health check. Use
-`<native-runtime-command> datecheck fix <wiki-root> --offset <local-offset>` only after approval;
-normalization is idempotent and skips already-canonical values.
+`<native-runtime-command> datecheck fix <wiki-root>` applies the normalization
+directly — it is agent-owned, idempotent, skips already-canonical values, and
+loses no information, so it needs no approval. `--offset <local-offset>` is
+optional and defaults to the machine's local offset.

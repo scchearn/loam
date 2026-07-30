@@ -126,11 +126,11 @@ The currency score (section 5) feeds directly into prune proposals. When currenc
 - Sections that grew beyond their purpose (a one-liner list became paragraphs)
 - Multiple sections covering the same domain
 
-### Prune proposal rules
+### Prune rules
 
 1. Always show the removal as a diff (`-` lines)
 2. Give a one-line "why" for each removal
-3. User approves before anything is removed
+3. Apply the removal directly — guidance is an agent-owned memory substrate and lives in git, so the diff in your report is the audit trail, not an approval request
 4. Never remove without showing what's being removed
 
 ## Red Flags
