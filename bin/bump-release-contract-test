@@ -35,6 +35,8 @@ make_fixture() {
 
   printf '{\n  "name": "@scchearn/loam",\n  "version": "%s",\n  "type": "module"\n}\n' "$PLUGIN_VERSION" \
     > "$fixture/package.json"
+  printf '{\n  "name": "@scchearn/loam",\n  "version": "%s",\n  "lockfileVersion": 3,\n  "packages": {\n    "": {\n      "name": "@scchearn/loam",\n      "version": "%s"\n    }\n  }\n}\n' \
+    "$PLUGIN_VERSION" "$PLUGIN_VERSION" > "$fixture/package-lock.json"
   printf '{\n  "name": "loam",\n  "metadata": {\n    "version": "%s"\n  },\n  "plugins": [\n    {\n      "name": "loam",\n      "version": "%s"\n    }\n  ]\n}\n' \
     "$PLUGIN_VERSION" "$PLUGIN_VERSION" > "$fixture/.claude-plugin/marketplace.json"
   printf '{\n  "name": "loam",\n  "version": "%s"\n}\n' "$PLUGIN_VERSION" \
@@ -62,7 +64,7 @@ count_in() {
   [[ "$found" == "$expected" ]] || fail "$label: expected $expected of '$pattern' in $file, found ${found:-0}"
 }
 
-# --- 1. plugin lane updates exactly the five plugin values -------------------
+# --- 1. plugin lane updates exactly the seven plugin values ------------------
 fixture="$tmp/plugin"
 make_fixture "$fixture"
 if out="$(run_bump "$fixture" --plugin 0.9.1)"; then
@@ -73,6 +75,7 @@ else
   fail "plugin bump exited non-zero: $out"
 fi
 count_in "$fixture/package.json"                    '"version": "0.9.1"' 1 "package.json"
+count_in "$fixture/package-lock.json"               '"version": "0.9.1"' 2 "both package-lock fields"
 count_in "$fixture/.claude-plugin/marketplace.json" '"version": "0.9.1"' 2 "both marketplace fields"
 count_in "$fixture/plugins/loam-adapter/.codex-plugin/plugin.json" '"version": "0.9.1"' 1 "codex manifest"
 count_in "$fixture/.cursor-plugin/plugin.json"      '"version": "0.9.1"' 1 "cursor manifest"
@@ -98,6 +101,7 @@ grep -Fq 'chrono = { version = "0.4", default-features = false }' "$fixture/cli/
   || fail "runtime bump rewrote a dependency version"
 # The plugin lane must be untouched.
 count_in "$fixture/package.json" "\"version\": \"$PLUGIN_VERSION\"" 1 "package.json untouched by runtime bump"
+count_in "$fixture/package-lock.json" "\"version\": \"$PLUGIN_VERSION\"" 2 "package-lock untouched by runtime bump"
 count_in "$fixture/.cursor-plugin/plugin.json" "\"version\": \"$PLUGIN_VERSION\"" 1 "cursor untouched by runtime bump"
 
 # --- 3. a missing or wrong lane selector is refused --------------------------

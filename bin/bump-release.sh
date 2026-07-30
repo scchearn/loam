@@ -4,6 +4,7 @@
 # Loam releases two things independently from one repository:
 #
 #   --plugin  <version>   package.json
+#                         package-lock.json  (root and packages[""])
 #                         .claude-plugin/marketplace.json  metadata.version
 #                         .claude-plugin/marketplace.json  plugins[0].version
 #                         plugins/loam-adapter/.codex-plugin/plugin.json
@@ -53,7 +54,8 @@ show_usage() {
   echo "Usage: bin/bump-release.sh --plugin <version>"
   echo "       bin/bump-release.sh --runtime <version>"
   echo
-  echo "  --plugin   package.json, both marketplace fields, Codex, Cursor"
+  echo "  --plugin   package.json, package-lock.json, both marketplace fields,"
+  echo "             Codex, Cursor"
   echo "             released as tag v<version>"
   echo "  --runtime  cli/Cargo.toml, CLI_VERSION"
   echo "             released as tag cli-v<version> (triggers dist)"
@@ -112,7 +114,7 @@ read_current() {
     tr -d ' \t\r\n' < "$ROOT/$CLI_VERSION_FILE"
   else
     # package.json is the plugin reference; the domain check above already
-    # proved the other four agree with it.
+    # proved the other six agree with it.
     sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ROOT/package.json" | head -1
   fi
 }
@@ -170,6 +172,12 @@ stage_cargo_line() {
 
 if [[ "$DOMAIN" == "plugin" ]]; then
   stage_literal "package.json"                    1 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
+  # The lockfile carries the package's own version twice: the root field and
+  # packages[""]. Editing both is what `npm install --package-lock-only` would
+  # do for a version-only change, without needing npm at bump time. If a
+  # dependency ever pins this exact version the count guard fails loudly rather
+  # than rewriting it.
+  stage_literal "package-lock.json"               2 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
   stage_literal ".claude-plugin/marketplace.json" 2 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
   stage_literal "plugins/loam-adapter/.codex-plugin/plugin.json" 1 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
   stage_literal ".cursor-plugin/plugin.json"      1 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
@@ -191,6 +199,7 @@ publish() {
 
 if [[ "$DOMAIN" == "plugin" ]]; then
   publish "$STAGE/package.json"                    "package.json"
+  publish "$STAGE/package-lock.json"               "package-lock.json"
   publish "$STAGE/.claude-plugin_marketplace.json" ".claude-plugin/marketplace.json"
   publish "$STAGE/plugins_loam-adapter_.codex-plugin_plugin.json" "plugins/loam-adapter/.codex-plugin/plugin.json"
   publish "$STAGE/.cursor-plugin_plugin.json"      ".cursor-plugin/plugin.json"
