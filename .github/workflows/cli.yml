@@ -8,7 +8,7 @@ on:
       - cli/**
       - .github/workflows/cli.yml
   push:
-    branches: [main, feat/cli]
+    branches: [main]
     paths:
       - Cargo.toml
       - Cargo.lock

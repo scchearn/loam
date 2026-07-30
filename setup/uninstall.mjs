@@ -10,7 +10,7 @@ import { inspectIntent } from '../integration/ingest.mjs';
 import { loadSkillInventory } from './inventory.mjs';
 import { listSkills, skillEntryAliases, skillEntrySource } from './skills.mjs';
 import { runSkills } from './process.mjs';
-import { confirmUninstall } from './wizard.mjs';
+import { announce, confirmUninstall, finish } from './wizard.mjs';
 import { removeMarketplacePlugins } from './marketplace.mjs';
 
 // Harness configs are cleaned in-place (remove only Loam-owned hook entries,
@@ -248,16 +248,17 @@ export async function uninstall({
     return 0;
   }
 
-  output.write('Loam uninstall will:\n');
-  output.write(`  - Remove ${listedSkills.names.length || 'any remaining'} globally installed Loam skills via the Skills CLI\n`);
-  output.write('  - Remove Loam-owned hook entries from Claude, Codex, and Cursor configs\n');
-  output.write('  - Remove installed Claude and Codex marketplace plugins through their native CLIs\n');
-  output.write('  - Remove the OpenCode Loam adapter\n');
-  output.write('  - Remove the global Loam root (install.json, runtime, integration, plugins, local operational history)\n');
-  output.write(`  - Global root: ${root}\n`);
+  await announce(output, 'Loam uninstall will:', [
+    `- Remove ${listedSkills.names.length || 'any remaining'} globally installed Loam skills via the Skills CLI`,
+    '- Remove Loam-owned hook entries from the Claude, Codex, and Cursor configs',
+    '- Remove the Loam plugin file from OpenCode, which integrates by plugin rather than hooks',
+    '- Remove installed Claude and Codex marketplace plugins through their native CLIs',
+    '- Remove the global Loam root (install.json, runtime, integration, plugins, local operational history)',
+    `- Global root: ${root}`,
+  ], { level: 'warn' });
 
   if (!(await confirmUninstall({ yes, confirm, input, output }))) {
-    output.write('Uninstall cancelled.\n');
+    finish(output, 'Uninstall cancelled.');
     return 130;
   }
 
@@ -317,6 +318,6 @@ export async function uninstall({
   await rm(root, { recursive: true, force: true });
   results.globalRoot = { path: root, action: 'removed' };
 
-  output.write('Loam uninstalled.\n');
+  finish(output, 'Loam uninstalled.');
   return 0;
 }

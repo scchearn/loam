@@ -4,9 +4,9 @@
 //! they required GNU `awk` three-argument `match`, `grep -E`/`grep -oP`, `sed`,
 //! `jq`, GNU `date -d`, GNU `date -r`, and `find -mmin`.
 //!
-//! `verify` reproduces `checkpoint-verify-legacy` byte for byte; that script is
-//! retained as the parity oracle and `cli/tests/checkpoint_parity.rs` compares
-//! against it on Linux. The output is human-oriented text rather than the lint
+//! `verify` reproduced the retired `checkpoint-verify-legacy` Bash oracle byte
+//! for byte; `cli/tests/checkpoint_verify.rs` is now the whole contract. The
+//! output is human-oriented text rather than the lint
 //! NDJSON envelope, deliberately: it is read at save time as orientation, and
 //! it must never block a save, so it exits 0 for every note-content finding.
 
