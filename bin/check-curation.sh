@@ -191,6 +191,30 @@ for skill in "$ingest_skill" "$sync_skill"; do
   fi
 done
 
+code_page_fields=(
+  source_path ingested_at source_size content_hash content_id blob_oid
+  source_commit source_state generator_version
+)
+for skill in "$ingest_skill" "$sync_skill"; do
+  for field in "${code_page_fields[@]}"; do
+    grep -Fq "$field" "$skill" \
+      || fail "code graph skill must document $field: $skill"
+  done
+  grep -Fq 'loam-code-page-v1' "$skill" \
+    || fail "code graph skill must use the shared generator version: $skill"
+done
+
+for template in skills/loam-memory/loam-ingesting-codebase/references/templates/role-*.md; do
+  for field in "${code_page_fields[@]}"; do
+    grep -Fq "$field:" "$template" \
+      || fail "code page template is missing $field: $template"
+  done
+done
+
+if grep -Eq 'mtime\+size|--strict' "$sync_skill"; then
+  fail "code graph sync must not use legacy mtime/strict freshness decisions"
+fi
+
 for reference in \
   "skills/loam-ground/loam-scaffolding-wiki/references/schema-template.md" \
   "skills/loam-ground/loam-scaffolding-wiki/references/wiki-architecture.md"; do

@@ -3,9 +3,9 @@ name: loam::ingesting-codebase
 description: "Ingest a codebase into memory as code pages connected by wiki links. Walks the tree, classifies each code file by role, applies a role template, and writes a code page per meaningful unit under <wiki root>/code/. Resumable: skips files already ingested and current. Not for prose documents; use /loam::adding-to-memory for those."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.6.0"
+  version: "1.7.0"
   author: scchearn
-  argument-hint: <codebase root path>
+  argument-hint: <codebase root path> [--ref <commit>]
 ---
 
 You are a senior engineer and disciplined wiki maintainer ingesting a codebase into the persistent wiki so future sessions inherit a compressed semantic map of the code instead of re-reading source.
@@ -14,7 +14,9 @@ The codebase becomes a graph of code pages under `<wiki root>/code/`, connected 
 
 ## Input
 
-The codebase root is: $ARGUMENTS
+Arguments: $ARGUMENTS
+
+Parse the codebase root and optional `--ref <commit>`. With no root, use `$(pwd)`. Default mode reads the current working tree, including eligible untracked files, and also works outside Git. `--ref` instead selects a committed Git projection; it requires a usable repository and resolvable commit.
 
 ---
 
@@ -44,7 +46,7 @@ A `code_ingest_pending` hint, when present, previews the work set; Step 2 remain
 
 Resolve `$ARGUMENTS` to an absolute path. If it does not exist or is not a directory, stop and report the error. Treat it as the codebase root for `source_path` front-matter values (paths are relative to this root).
 
-If `$ARGUMENTS` is empty, default the codebase root to `$(pwd)`. Do not ask for scope confirmation just because the workspace contains multiple subprojects; the caller can pass a narrower path when they want one.
+If the root argument is empty, default the codebase root to `$(pwd)`. Do not ask for scope confirmation just because the workspace contains multiple subprojects; the caller can pass a narrower path when they want one.
 
 ### Build the existing index
 
@@ -54,7 +56,7 @@ Run the index subcommand to get every code-ingested page already in the wiki:
 <native-runtime-command> codegraph index <wiki-root> --codebase-root <codebase-root>
 ```
 
-Parse the JSON output into an in-memory map: `{source_path → {slug, ingested_at, mtime, exists}}`. Pages without `source_path:` front matter are prose entity pages and are skipped silently. This map is the set of already-ingested code nodes. The index scans both `code/` and `entities/` (for legacy stranded `source_path:` pages during the transition to the `code/` namespace).
+Parse the JSON output into an in-memory map keyed by `source_path`, retaining `slug`, compatibility fields, `content_id`, `blob_oid`, `source_commit`, `source_state`, `generator_version`, `mtime`, and `exists`. Pages without `source_path:` front matter are prose entity pages and are skipped silently. This map is the set of already-ingested code nodes. The index scans both `code/` and `entities/` (for legacy stranded `source_path:` pages during the transition to the `code/` namespace).
 
 If the native runtime command fails or reports an unavailable runtime, stop and report the setup recovery command. Do not fall back to a project-local launcher.
 
@@ -66,7 +68,8 @@ For a quick size check before ingesting, run:
 
 ```bash
 <native-runtime-command> codegraph walk <codebase-root> --summary \
-  --exclusions "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/ingestion-exclusions.md"
+  --exclusions "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/ingestion-exclusions.md" \
+  --generator-version loam-code-page-v1 [--ref <commit>]
 ```
 
 This reports candidate counts by extension plus excluded low-signal counts (`pattern`, `gitignore`, `empty`, `large`, `generated_header`, `binary`). Use it to decide whether the run is likely to hit the cap; it is not required for correctness.
@@ -83,14 +86,20 @@ Run the diff subcommand to get the files that need ingestion or re-summarization
 
 ```bash
 <native-runtime-command> codegraph diff <codebase-root> \
-  --exclusions "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/ingestion-exclusions.md"
+  --exclusions "${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/ingestion-exclusions.md" \
+  --generator-version loam-code-page-v1 [--ref <commit>]
 ```
 
-Parse the JSON output: `{path, mtime, reason, slug?}` where `mtime` is the source file's Unix epoch mtime and `reason` is `new` or `stale`. Legacy pages with date-only `ingested_at` are stale once so they migrate to epoch precision.
+Omit the bracketed `--ref` pair in default mode. Parse the additive JSON records, retaining `path`, `mtime`, `reason`, optional `slug`, `content_id`, `blob_oid`, `source_commit`, `source_state`, `generator_version`, and optional `reuse_slug`/`reuse_source_path`. In explicit-ref mode, `mtime` is the selected commit timestamp because Git trees have no per-file mtime.
 
 - **`reason: "new"`** → new ingest (create code page)
 - **`reason: "stale"`** → re-summarize (overwrite the same code page; `slug` is provided)
 - current files are omitted
+
+Legacy pages without `content_id` or the current generator version are stale once and migrate incrementally. For a new record carrying reuse fields:
+
+- If `reuse_source_path` is absent from the selected projection, treat it as a rename: reuse that page's semantic body and readable slug, then replace its source metadata.
+- If both paths exist, treat it as a copy: reuse the semantic body in a collision-safe readable page and replace its source metadata. Do not add a separate cache or content-addressed filename layer.
 
 **Cap the work set at 200 files.** If more remain, stop after 200 and report the pending count. The user re-invokes to continue; resumability (Step 1's index rebuild) means the next run picks up exactly where this one stopped.
 
@@ -122,7 +131,7 @@ Load the matching role template from `references/templates/role-<role>.md`.
 
 ### Read the file
 
-Read the file in full. Distinguish: the primary export or symbol (becomes the page name), its signature/shape, what it does (intent, not full implementation), what it depends on (imported names, called functions), and edge cases or failure modes.
+Read the file in full from the same projection used by diff. In default mode, read `<codebase-root>/<path>`. With `--ref`, read committed bytes with `git -C <codebase-root> show <source_commit>:./<path>`; never substitute working-tree bytes. Distinguish: the primary export or symbol (becomes the page name), its signature/shape, what it does (intent, not full implementation), what it depends on (imported names, called functions), and edge cases or failure modes.
 
 ### Derive the slug
 
@@ -152,12 +161,17 @@ source_path: <relative-path-from-codebase-root>
 ingested_at: <source-file-mtime-epoch>
 source_size: <bytes>
 content_hash: <sha256-hex>
+content_id: <namespaced-content-id>
+blob_oid: <git-blob-oid-or-empty>
+source_commit: <commit-oid-or-empty>
+source_state: <committed|provisional|fallback>
+generator_version: loam-code-page-v1
 ---
 ```
 
-Use the source file's Unix epoch mtime for `ingested_at`. For re-summarized files, update `ingested_at` to the file's current mtime, not today's date. Populate `source_size` with the file's byte size and `content_hash` with the lowercase SHA-256 hash (from `sha256sum` on POSIX, lowercase-normalized `Get-FileHash` on Windows).
+Copy identity and provenance fields from the native record. Use its `mtime` for `ingested_at`; in default mode this is the source-file mtime, while explicit-ref mode uses the commit timestamp. Populate `source_size` and lowercase raw-byte SHA-256 `content_hash` from the bytes actually read. These three compatibility fields remain useful provenance but do not decide freshness.
 
-Legacy pages (written before this version) may have only `source_path` and `ingested_at`. Treat missing `source_size` and `content_hash` as legacy, not errors. Populate all three fields on write. Do not backfill all pages in a single pass — let it happen incrementally as files drift and get re-summarized.
+Legacy pages may lack any newer field. Treat that as migration state, not an error, and populate the complete block on write. Do not bulk-backfill pages. A `provisional` page reflects local working bytes and is not authoritative published/federated source truth; only exact committed provenance is publishable.
 
 ### Write the page
 
@@ -168,7 +182,7 @@ Write to `<wiki root>/code/<slug>.md`. Overwrite if re-summarizing. Create if ne
 Add or update the entry in the in-memory index so subsequent files in this run can link to it:
 
 ```
-<source_path> → {slug, ingested_at: <file mtime epoch>, source_size: <file size>, content_hash: <file hash>, mtime: <file mtime epoch>}
+<source_path> → {slug, ingested_at, source_size, content_hash, content_id, blob_oid, source_commit, source_state, generator_version, mtime}
 ```
 
 ---
@@ -231,6 +245,7 @@ Codebase ingested from <codebase root>
 
 ### Mode
 - ingest | re-ingest
+- Projection: working tree | <commit>
 
 ### Work set
 - New pages: <count>
@@ -268,7 +283,9 @@ Codebase ingested from <codebase root>
 - One role per file. When ambiguous, pick the role matching the file's primary export or primary intent.
 - Edge links are untyped `[[slug]]`. Do not annotate edge type in the link itself.
 - Unresolved dependency names stay as plain text flagged `(external)`. Do not create broken wikilinks.
-- Code-ingested pages carry `source_path:` and `ingested_at:` front matter. Prose entity pages (from `/loam::adding-to-memory`) keep their existing front-matter-less shape.
+- Code-ingested pages carry the complete identity/provenance front matter from Step 4. Prose entity pages (from `/loam::adding-to-memory`) keep their existing front-matter-less shape.
+- Stable `content_id` plus `loam-code-page-v1` decides freshness. Mtime, size, and raw SHA-256 are compatibility provenance only.
+- Default mode preserves working-tree, untracked-file, and non-Git ingestion. Explicit `--ref` reads only the selected commit; never mix projections in one run.
 - Granularity: one code page per file, keyed by the file's primary export or primary symbol. Do not split a single file into multiple pages unless it contains multiple independently-meaningful top-level declarations.
 - Respect the 200-file cap. Do not silently exceed it.
 - Resumability is automatic: the next invocation rebuilds the index from disk and skips current files.

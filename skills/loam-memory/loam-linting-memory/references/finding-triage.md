@@ -45,7 +45,7 @@ Examples:
 
 - memory is missing raw source material needed to settle a contradiction
 - a topic page is outdated because the relevant ingest never happened
-- code-graph pages are missing `source_size:` or `content_hash:` (`legacy-hash-fields`); report as low/informational and let ingest/sync populate fields on next re-summarize
+- code-graph pages are missing compatibility or stable identity fields (`MEM008` / `legacy-hash-fields`); report as low/informational and run `/loam::ingesting-codebase <codebase root>` until the incremental migration is complete
 - a legacy `overview.md` contains substantial unique synthesis that should be preserved in a more appropriate durable page after its root-level orientation has been compressed into `index.md`
 - the right fix depends on user intent or domain-specific judgment not captured in memory (wiki substrate)
 - two or more notes probably need consolidation, but doing so safely requires a more deliberate restructuring pass

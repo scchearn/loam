@@ -30,6 +30,25 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr should be UTF-8")
 }
 
+fn walk_field(codebase: &std::path::Path, path: &str, field: &str) -> String {
+    let output = loam(&["codegraph", "walk", codebase.to_str().unwrap()]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let record = text
+        .split('{')
+        .find(|record| record.contains(&format!(r#""path":"{path}""#)))
+        .unwrap_or_else(|| panic!("missing {path} in {text}"));
+    let needle = format!(r#""{field}":""#);
+    let value = record
+        .split_once(&needle)
+        .unwrap_or_else(|| panic!("missing {field} in {record}"))
+        .1;
+    value
+        .split_once('"')
+        .map(|(value, _)| value.to_owned())
+        .unwrap_or_else(|| panic!("unterminated {field} in {record}"))
+}
+
 /// wiki root with a `code/` page describing `src/main.rs`.
 fn wiki_with_page(root: &std::path::Path, frontmatter: &str, slug: &str) {
     fs::create_dir_all(root.join("code")).expect("code dir should be created");
@@ -49,7 +68,7 @@ fn index_emits_records_for_code_pages() {
     fs::write(codebase.join("src/main.rs"), "fn main() {}\n").expect("source should be written");
     wiki_with_page(
         &wiki,
-        "source_path: src/main.rs\ningested_at: \"1700000000\"\nsource_size: \"13\"\ncontent_hash: \"ABC\"\n",
+        "source_path: src/main.rs\ningested_at: \"1700000000\"\nsource_size: \"13\"\ncontent_hash: \"ABC\"\ncontent_id: sha256:def\nblob_oid: abc123\nsource_commit: deadbeef\nsource_state: committed\ngenerator_version: loam-code-page-v1\n",
         "src-main-rs",
     );
 
@@ -69,6 +88,14 @@ fn index_emits_records_for_code_pages() {
     assert!(text.contains("\"slug\":\"src-main-rs\""), "{text}");
     assert!(text.contains("\"ingested_at\":\"1700000000\""), "{text}");
     assert!(text.contains("\"content_hash\":\"abc\""), "{text}");
+    assert!(text.contains("\"content_id\":\"sha256:def\""), "{text}");
+    assert!(text.contains("\"blob_oid\":\"abc123\""), "{text}");
+    assert!(text.contains("\"source_commit\":\"deadbeef\""), "{text}");
+    assert!(text.contains("\"source_state\":\"committed\""), "{text}");
+    assert!(
+        text.contains("\"generator_version\":\"loam-code-page-v1\""),
+        "{text}"
+    );
     assert!(text.contains("\"exists\":true"), "{text}");
 }
 
@@ -159,7 +186,7 @@ fn diff_reports_new_and_stale_entries() {
     fs::create_dir_all(codebase.join("src")).expect("src should be created");
     fs::write(codebase.join("src/known.rs"), "fn known() {}\n").expect("known source");
     fs::write(codebase.join("src/fresh.rs"), "fn fresh() {}\n").expect("new source");
-    // ingested_at far in the past → mtime newer → stale.
+    // A legacy page without content_id is stale once.
     wiki_with_page(
         &wiki,
         "source_path: src/known.rs\ningested_at: \"1\"\nsource_size: \"1\"\n",
@@ -182,6 +209,8 @@ fn diff_reports_new_and_stale_entries() {
     assert!(text.contains("\"path\":\"src/known.rs\""), "{text}");
     assert!(text.contains("\"reason\":\"stale\""), "{text}");
     assert!(text.contains("\"slug\":\"src-known-rs\""), "{text}");
+    assert!(text.contains("\"content_id\":\"sha256:"), "{text}");
+    assert!(text.contains("\"source_state\":\"fallback\""), "{text}");
 }
 
 #[test]
@@ -194,10 +223,7 @@ fn diff_treats_matching_hash_as_current() {
     let hash = "ff93b8b31f63b372f27a4c10588f9fa4c5735a16b7d7ec3d059cb5066b15c344";
     wiki_with_page(
         &wiki,
-        &format!(
-            "source_path: src/known.rs\ningested_at: \"1\"\nsource_size: \"{}\"\ncontent_hash: \"{hash}\"\n",
-            body.len()
-        ),
+        &format!("source_path: src/known.rs\ningested_at: \"1\"\nsource_size: \"{}\"\ncontent_hash: \"{hash}\"\ncontent_id: sha256:{hash}\nsource_state: fallback\n", body.len()),
         "src-known-rs",
     );
 
@@ -216,15 +242,15 @@ fn diff_treats_matching_hash_as_current() {
 }
 
 #[test]
-fn diff_strict_rehashes_regardless_of_mtime() {
+fn diff_strict_is_a_compatible_no_op() {
     let wiki = temporary_root("diff-strict-wiki");
     let codebase = temporary_root("diff-strict-code");
     fs::create_dir_all(codebase.join("src")).expect("src should be created");
     fs::write(codebase.join("src/known.rs"), "fn changed() {}\n").expect("known source");
-    // ingested_at in the far future so the non-strict path would say "current".
+    let content_id = walk_field(&codebase, "src/known.rs", "content_id");
     wiki_with_page(
         &wiki,
-        "source_path: src/known.rs\ningested_at: \"9999999999\"\nsource_size: \"16\"\ncontent_hash: \"deadbeef\"\n",
+        &format!("source_path: src/known.rs\ningested_at: \"1\"\ncontent_id: {content_id}\nsource_state: fallback\n"),
         "src-known-rs",
     );
 
@@ -247,10 +273,7 @@ fn diff_strict_rehashes_regardless_of_mtime() {
     fs::remove_dir_all(&codebase).ok();
 
     assert_eq!(relaxed_text.trim(), "[]", "relaxed: {relaxed_text}");
-    assert!(
-        strict_text.contains("\"reason\":\"stale\""),
-        "strict: {strict_text}"
-    );
+    assert_eq!(strict_text.trim(), "[]", "strict: {strict_text}");
 }
 
 #[test]
@@ -323,7 +346,7 @@ fn index_prefers_code_pages_over_legacy_entities() {
 }
 
 #[test]
-fn diff_reports_stale_when_recorded_size_differs() {
+fn diff_ignores_recorded_size_when_content_identity_matches() {
     let wiki = temporary_root("size-wiki");
     let codebase = temporary_root("size-code");
     fs::create_dir_all(codebase.join("src")).expect("src");
@@ -333,9 +356,7 @@ fn diff_reports_stale_when_recorded_size_differs() {
     // Correct hash but a stale recorded size: size mismatch short-circuits to stale.
     wiki_with_page(
         &wiki,
-        &format!(
-            "source_path: src/known.rs\ningested_at: \"1\"\nsource_size: \"999\"\ncontent_hash: \"{hash}\"\n"
-        ),
+        &format!("source_path: src/known.rs\ningested_at: \"1\"\nsource_size: \"999\"\ncontent_hash: \"{hash}\"\ncontent_id: sha256:{hash}\nsource_state: fallback\n"),
         "src-known-rs",
     );
 
@@ -350,7 +371,104 @@ fn diff_reports_stale_when_recorded_size_differs() {
     fs::remove_dir_all(&codebase).ok();
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(text.trim(), "[]");
+}
+
+#[test]
+fn diff_detects_changed_bytes_even_with_a_future_mtime_record() {
+    let wiki = temporary_root("identity-change-wiki");
+    let codebase = temporary_root("identity-change-code");
+    fs::create_dir_all(codebase.join("src")).expect("src");
+    fs::write(codebase.join("src/known.rs"), "fn first() {}\n").expect("source");
+    let content_id = walk_field(&codebase, "src/known.rs", "content_id");
+    wiki_with_page(
+        &wiki,
+        &format!("source_path: src/known.rs\ningested_at: \"9999999999\"\ncontent_id: {content_id}\nsource_state: fallback\n"),
+        "src-known-rs",
+    );
+    fs::write(codebase.join("src/known.rs"), "fn other() {}\n").expect("source should change");
+
+    let output = loam(&[
+        "codegraph",
+        "diff",
+        codebase.to_str().unwrap(),
+        wiki.to_str().unwrap(),
+    ]);
+    let text = stdout(&output);
+    fs::remove_dir_all(&wiki).ok();
+    fs::remove_dir_all(&codebase).ok();
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(text.contains("\"reason\":\"stale\""), "{text}");
+}
+
+#[test]
+fn diff_uses_the_supplied_generator_version() {
+    let wiki = temporary_root("generator-wiki");
+    let codebase = temporary_root("generator-code");
+    fs::create_dir_all(codebase.join("src")).expect("src");
+    fs::write(codebase.join("src/known.rs"), "fn known() {}\n").expect("source");
+    let content_id = walk_field(&codebase, "src/known.rs", "content_id");
+    wiki_with_page(
+        &wiki,
+        &format!("source_path: src/known.rs\ningested_at: \"1\"\ncontent_id: {content_id}\nsource_state: fallback\ngenerator_version: v1\n"),
+        "src-known-rs",
+    );
+
+    let current = loam(&[
+        "codegraph",
+        "diff",
+        codebase.to_str().unwrap(),
+        wiki.to_str().unwrap(),
+        "--generator-version",
+        "v1",
+    ]);
+    let stale = loam(&[
+        "codegraph",
+        "diff",
+        codebase.to_str().unwrap(),
+        wiki.to_str().unwrap(),
+        "--generator-version",
+        "v2",
+    ]);
+    fs::remove_dir_all(&wiki).ok();
+    fs::remove_dir_all(&codebase).ok();
+
+    assert_eq!(stdout(&current).trim(), "[]");
+    assert!(stdout(&stale).contains("\"reason\":\"stale\""));
+}
+
+#[test]
+fn diff_exposes_same_content_reuse_for_a_new_path() {
+    let wiki = temporary_root("reuse-wiki");
+    let codebase = temporary_root("reuse-code");
+    fs::create_dir_all(codebase.join("src")).expect("src");
+    let body = "fn shared() {}\n";
+    fs::write(codebase.join("src/new.rs"), body).expect("source");
+    let content_id = walk_field(&codebase, "src/new.rs", "content_id");
+    wiki_with_page(
+        &wiki,
+        &format!("source_path: src/old.rs\ningested_at: \"1\"\ncontent_id: {content_id}\nsource_state: fallback\n"),
+        "shared",
+    );
+
+    let output = loam(&[
+        "codegraph",
+        "diff",
+        codebase.to_str().unwrap(),
+        wiki.to_str().unwrap(),
+    ]);
+    let text = stdout(&output);
+    fs::remove_dir_all(&wiki).ok();
+    fs::remove_dir_all(&codebase).ok();
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(text.contains("\"reason\":\"new\""), "{text}");
+    assert!(text.contains("\"reuse_slug\":\"shared\""), "{text}");
+    assert!(
+        text.contains("\"reuse_source_path\":\"src/old.rs\""),
+        "{text}"
+    );
 }
 
 #[test]

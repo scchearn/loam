@@ -185,7 +185,7 @@ fn derived_pages_are_exempt_from_index_membership() {
     healthy_wiki(&workspace);
     write(
         &workspace.join("wiki/code/lexer.md"),
-        "---\nsource_path: src/lexer.rs\nsource_size: 10\ncontent_hash: abc\n---\n\n# Lexer\n\nBody.\n",
+        "---\nsource_path: src/lexer.rs\nsource_size: 10\ncontent_hash: abc\ncontent_id: sha256:abc\nsource_state: fallback\ngenerator_version: loam-code-page-v1\n---\n\n# Lexer\n\nBody.\n",
     );
     write(
         &workspace.join("wiki/log-archive/2026-06.md"),
@@ -233,7 +233,7 @@ fn indexed_code_page_is_reported_for_both_link_spellings() {
         write(
             &workspace.join(format!("wiki/code/{path}.md")),
             &format!(
-                "---\nsource_path: {source}\nsource_size: 10\ncontent_hash: abc\n---\n\n# {path}\n\nBody.\n"
+                "---\nsource_path: {source}\nsource_size: 10\ncontent_hash: abc\ncontent_id: sha256:abc\nsource_state: fallback\ngenerator_version: loam-code-page-v1\n---\n\n# {path}\n\nBody.\n"
             ),
         );
     }
@@ -271,7 +271,7 @@ fn ambiguous_shorthand_does_not_produce_a_code_page_finding() {
     healthy_wiki(&workspace);
     write(
         &workspace.join("wiki/code/auth.md"),
-        "---\nsource_path: src/auth.rs\nsource_size: 10\ncontent_hash: abc\n---\n\n# Auth\n\nBody.\n",
+        "---\nsource_path: src/auth.rs\nsource_size: 10\ncontent_hash: abc\ncontent_id: sha256:abc\nsource_state: fallback\ngenerator_version: loam-code-page-v1\n---\n\n# Auth\n\nBody.\n",
     );
     write(
         &workspace.join("wiki/topics/auth.md"),
@@ -299,7 +299,7 @@ fn ambiguous_shorthand_under_a_code_section_is_resolved_by_context() {
     healthy_wiki(&workspace);
     write(
         &workspace.join("wiki/code/auth.md"),
-        "---\nsource_path: src/auth.rs\nsource_size: 10\ncontent_hash: abc\n---\n\n# Auth\n\nBody.\n",
+        "---\nsource_path: src/auth.rs\nsource_size: 10\ncontent_hash: abc\ncontent_id: sha256:abc\nsource_state: fallback\ngenerator_version: loam-code-page-v1\n---\n\n# Auth\n\nBody.\n",
     );
     write(
         &workspace.join("wiki/topics/auth.md"),
@@ -335,7 +335,7 @@ fn hubbed_wiki(workspace: &Path) {
         write(
             &workspace.join(format!("wiki/code/{page}.md")),
             &format!(
-                "---\nsource_path: {source}\nsource_size: 10\ncontent_hash: abc\n---\n\n# {page}\n\nBody.\n"
+                "---\nsource_path: {source}\nsource_size: 10\ncontent_hash: abc\ncontent_id: sha256:abc\nsource_state: fallback\ngenerator_version: loam-code-page-v1\n---\n\n# {page}\n\nBody.\n"
             ),
         );
     }
@@ -503,7 +503,7 @@ fn metadata_pointing_elsewhere_is_reported() {
 }
 
 #[test]
-fn stranded_code_pages_and_legacy_hash_fields_are_reported() {
+fn stranded_code_pages_and_legacy_identity_fields_are_reported() {
     let workspace = temporary_workspace("code-pages");
     healthy_wiki(&workspace);
     write(
@@ -513,6 +513,10 @@ fn stranded_code_pages_and_legacy_hash_fields_are_reported() {
     write(
         &workspace.join("wiki/code/lexer.md"),
         "---\nsource_path: src/lexer.rs\n---\n\n# Lexer\n\nBody.\n",
+    );
+    write(
+        &workspace.join("wiki/code/current.md"),
+        "---\nsource_path: src/current.rs\nsource_size: 120\ncontent_hash: abc123\ncontent_id: sha256:abc123\nsource_state: fallback\ngenerator_version: loam-code-page-v1\n---\n\n# Current\n\nBody.\n",
     );
     write(
         &workspace.join("wiki/index.md"),
@@ -526,12 +530,26 @@ fn stranded_code_pages_and_legacy_hash_fields_are_reported() {
     // The fixture indexes `[[lexer]]`, a code page, so MEM013 fires alongside.
     assert_eq!(
         rules(&stdout),
-        vec!["MEM014", "MEM008", "MEM007", "MEM013"],
+        vec!["MEM014", "MEM008", "MEM007", "MEM008", "MEM013"],
         "output: {stdout}"
     );
     assert!(
         stdout.contains("\"severity\":\"info\""),
-        "legacy hash fields are informational: {stdout}"
+        "legacy identity fields are informational: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "\"missing\":\"source_size,content_hash,content_id,source_state,generator_version\""
+        ),
+        "fully legacy pages should report compatibility and identity fields: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"missing\":\"content_id,source_state,generator_version\""),
+        "old hash-aware pages should report the stable identity migration: {stdout}"
+    );
+    assert!(
+        !stdout.contains("wiki/code/current.md"),
+        "current identity front matter should not be flagged: {stdout}"
     );
 }
 

@@ -72,6 +72,8 @@ and [`.codex/INSTALL.md`](./.codex/INSTALL.md).
 - **Reviewing-memory**: surface what's unresolved or gaps in the knowledge base
 - **Learning-from-session**: capture learnings from a session into memory or agent guidance
 - **Auditing-guidance**: review and improve AGENTS.md / CLAUDE.md files
+- **Ingesting-codebase**: build resumable semantic pages from source files
+- **Syncing-code-graph**: reconcile those pages after code changes
 
 ### Setup
 
@@ -91,6 +93,15 @@ recognizes what you're trying to do and invokes the right skill for it.
 You don't need to memorize the list above; the agent routes itself.
 
 loam works fully on its own. If your wiki grows large, [qmd](https://github.com/tobi/qmd) (`npm install -g @tobilu/qmd`) speeds up search across memory. The skills detect it automatically and fall back to built-in search when it's absent.
+
+### Code graph
+
+The code graph follows the code you can currently edit: tracked, modified, and
+untracked working-tree files by default, with the same behavior in non-Git
+directories. Stable content identity prevents mtime-only churn. Git-backed
+records also carry blob/commit provenance; uncommitted records remain local and
+provisional. Use the optional `--ref <commit>` projection when a reproducible,
+committed-only graph is required.
 
 ### Native runtime
 
@@ -141,13 +152,13 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::adding-to-memory | 592 | 116 | 217 | 2,301 |
 | loam::amending-memory | 505 | 114 | 180 | 1,951 |
 | loam::auditing-guidance | 410 | 85 | 252 | 2,528 |
-| loam::ingesting-codebase | 329 | 76 | 270 | 3,099 |
+| loam::ingesting-codebase | 329 | 76 | 287 | 3,511 |
 | loam::learning-from-session | 487 | 101 | 365 | 4,202 |
-| loam::linting-memory | 471 | 102 | 310 | 4,875 |
+| loam::linting-memory | 471 | 102 | 310 | 4,928 |
 | loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
 | loam::querying-memory | 530 | 105 | 175 | 1,586 |
 | loam::reviewing-memory | 510 | 113 | 137 | 1,787 |
-| loam::syncing-code-graph | 363 | 84 | 220 | 2,924 |
+| loam::syncing-code-graph | 363 | 84 | 223 | 2,770 |
 | loam::using | 368 | 77 | 243 | 4,029 |
 | loam::amending-plan | 437 | 88 | 271 | 3,032 |
 | loam::checkpointing | 365 | 69 | 180 | 2,188 |
