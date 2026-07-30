@@ -1,4 +1,4 @@
-name: CLI
+name: runtime
 
 on:
   pull_request:
@@ -6,6 +6,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - cli/**
+      - dist-workspace.toml
       - .github/workflows/cli.yml
   push:
     branches: [main]
@@ -13,6 +14,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - cli/**
+      - dist-workspace.toml
       - .github/workflows/cli.yml
   workflow_dispatch:
 
@@ -25,9 +27,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
-        run: rustup toolchain install 1.94.1 --profile minimal --component clippy,rustfmt
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt
+      # Formatting is deterministic across platforms, so it runs once here.
+      # clippy is cfg-sensitive and runs on the full matrix in `build`.
       - run: cargo +1.94.1 fmt --all -- --check
-      - run: cargo +1.94.1 clippy --locked --workspace --all-targets -- -D warnings
 
   build:
     strategy:
@@ -47,7 +50,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
-        run: rustup toolchain install 1.94.1 --profile minimal
+        run: rustup toolchain install 1.94.1 --profile minimal --component clippy
+      - run: cargo +1.94.1 clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo +1.94.1 test --workspace --locked
       - run: cargo +1.94.1 build --release --locked --package loam
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -56,3 +60,18 @@ jobs:
           path: ${{ matrix.binary }}
           if-no-files-found: error
           retention-days: 7
+
+  dist-plan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.29.0/cargo-dist-installer.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # Runtime releases use the checked-in raw artifact workflow rather than
+      # dist's generated release workflow, so the custom tag namespace remains
+      # decoupled from cargo-dist's package-tag parser.
+      - run: dist plan --allow-dirty
