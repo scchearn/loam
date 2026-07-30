@@ -37,21 +37,6 @@ jobs:
       - run: npm ci
       - run: npm test
 
-  dist-plan:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install dist
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.29.0/cargo-dist-installer.sh | sh
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      # Runtime releases use the checked-in raw artifact workflow rather than
-      # dist's generated release workflow, so the custom tag namespace remains
-      # decoupled from cargo-dist's package-tag parser.
-      - run: dist plan --allow-dirty
-
   release-resolution:
     runs-on: ubuntu-22.04
     steps:
