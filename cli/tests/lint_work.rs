@@ -353,3 +353,162 @@ fn reviewed_at_out_of_step_with_newest_review_is_reported() {
     assert_eq!(code, 2, "output: {stdout}");
     assert_eq!(rules(&stdout), vec!["WRK011"], "output: {stdout}");
 }
+
+fn without_goals(workspace: &Path) {
+    fs::remove_dir_all(workspace.join("goals")).expect("goals directory should be removed");
+}
+
+fn completed_plan(criteria: &str, task_count: usize) -> String {
+    let tasks = (1..=task_count)
+        .map(|number| format!("### T{number}\n\n- **Status:** [x]\n"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("# Plan\n\n## Acceptance criteria\n\n{criteria}\n\n## Tasks\n\n{tasks}")
+}
+
+#[test]
+fn criterion_closed_with_evidence_is_clean() {
+    let workspace = temporary_workspace("ac-clean-evidence");
+    without_goals(&workspace);
+    write(
+        &workspace.join("specs/demo.md"),
+        "# Spec\n\n## Acceptance criteria\n\n- [x] Closed with proof. Evidence: cargo test passed.\n",
+    );
+
+    let (code, stdout) = lint(&workspace);
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert_eq!(code, 0, "output: {stdout}");
+    assert_eq!(stdout, "");
+}
+
+#[test]
+fn closed_criteria_without_evidence_are_reported_in_specs_and_plans_without_goals() {
+    let workspace = temporary_workspace("ac-evidence");
+    without_goals(&workspace);
+    let artifact = "# Artifact\n\n## Acceptance criteria\n\n- [x] Closed without proof.\n";
+    write(&workspace.join("plans/demo.md"), artifact);
+    write(&workspace.join("specs/demo.md"), artifact);
+
+    let (code, stdout) = lint(&workspace);
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert_eq!(code, 2, "output: {stdout}");
+    assert_eq!(rules(&stdout), vec!["WRK012", "WRK012"], "output: {stdout}");
+    assert_eq!(stdout.matches(r#""severity":"warning""#).count(), 2);
+    assert_eq!(stdout.matches(r#""line":5"#).count(), 2, "output: {stdout}");
+    assert!(
+        stdout.contains(r#""file":"plans/demo.md""#),
+        "output: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""file":"specs/demo.md""#),
+        "output: {stdout}"
+    );
+}
+
+#[test]
+fn completed_plan_with_twelve_open_criteria_reports_one_drift_finding() {
+    let workspace = temporary_workspace("ac-drift");
+    without_goals(&workspace);
+    let criteria = (1..=12)
+        .map(|number| format!("- [ ] Criterion {number}."))
+        .collect::<Vec<_>>()
+        .join("\n");
+    write(
+        &workspace.join("plans/admin-user-management.md"),
+        &completed_plan(&criteria, 12),
+    );
+
+    let (code, stdout) = lint(&workspace);
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert_eq!(code, 2, "output: {stdout}");
+    assert_eq!(rules(&stdout), vec!["WRK013"], "output: {stdout}");
+    assert!(stdout.contains(r#""line":3"#), "output: {stdout}");
+    assert!(stdout.contains(r#""open":"12""#), "output: {stdout}");
+    assert!(stdout.contains(r#""total":"12""#), "output: {stdout}");
+    assert!(
+        stdout.contains(r#""target":"/loam::amending-plan""#),
+        "output: {stdout}"
+    );
+}
+
+#[test]
+fn unknown_criterion_markers_are_reported_and_count_as_open() {
+    let workspace = temporary_workspace("ac-unknown");
+    without_goals(&workspace);
+    write(
+        &workspace.join("plans/demo.md"),
+        &completed_plan("- [~] Partial.\n- [h] Delegated.", 1),
+    );
+
+    let (code, stdout) = lint(&workspace);
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert_eq!(code, 2, "output: {stdout}");
+    assert_eq!(
+        rules(&stdout),
+        vec!["WRK013", "WRK014", "WRK014"],
+        "output: {stdout}"
+    );
+    assert!(stdout.contains(r#""open":"2""#), "output: {stdout}");
+    assert!(stdout.contains(r#""target":"[~]""#), "output: {stdout}");
+    assert!(stdout.contains(r#""target":"[h]""#), "output: {stdout}");
+}
+
+#[test]
+fn artifact_without_acceptance_criteria_section_is_ignored() {
+    let workspace = temporary_workspace("ac-absent");
+    without_goals(&workspace);
+    write(
+        &workspace.join("plans/demo.md"),
+        "# Plan\n\n## Tasks\n\n### T1\n\n- **Status:** [x]\n- **Steps:**\n  - [x] Not an acceptance criterion.\n",
+    );
+    write(
+        &workspace.join("specs/demo.md"),
+        "# Spec\n\n- [x] Also not an acceptance criterion.\n",
+    );
+
+    let (code, stdout) = lint(&workspace);
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert_eq!(code, 0, "output: {stdout}");
+    assert_eq!(stdout, "");
+}
+
+#[test]
+fn superseded_criterion_suppresses_drift() {
+    let workspace = temporary_workspace("ac-superseded");
+    without_goals(&workspace);
+    write(
+        &workspace.join("plans/resolved.md"),
+        &completed_plan("- [-] Superseded. Reason: replaced.", 1),
+    );
+
+    let (code, stdout) = lint(&workspace);
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert_eq!(code, 0, "output: {stdout}");
+    assert_eq!(stdout, "");
+}
+
+#[test]
+fn invalidated_criterion_counts_as_unresolved() {
+    let workspace = temporary_workspace("ac-invalidated");
+    without_goals(&workspace);
+    write(
+        &workspace.join("plans/invalidated.md"),
+        &completed_plan("- [>] Needs re-check.", 1),
+    );
+
+    let (code, stdout) = lint(&workspace);
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert_eq!(code, 2, "output: {stdout}");
+    assert_eq!(rules(&stdout), vec!["WRK013"], "output: {stdout}");
+    assert!(
+        stdout.contains(r#""file":"plans/invalidated.md""#),
+        "output: {stdout}"
+    );
+}

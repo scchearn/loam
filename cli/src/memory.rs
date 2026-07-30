@@ -15,7 +15,8 @@ pub fn wiki_findings(workspace: &Path, findings: &mut Vec<Finding>) {
     }
 }
 
-/// Work-artifact findings (`WRK*`). Silent when the workspace has no `goals/`.
+/// Work-artifact findings (`WRK*`). Acceptance-criteria checks run independently
+/// over `specs/` and `plans/`; goal checks stay silent without `goals/`.
 pub fn work_findings(workspace: &Path, today: i64, findings: &mut Vec<Finding>) {
     lint_work(workspace, today, findings);
 }
@@ -236,6 +237,125 @@ const ACTIVE_STALE_DAYS: i64 = 90;
 /// Report-only health pass over `goals/`. Runs with or without a wiki, and never
 /// writes: corrections belong to `/loam::setting-goals`.
 fn lint_work(workspace: &Path, today: i64, findings: &mut Vec<Finding>) {
+    lint_acceptance_artifacts(workspace, findings);
+    lint_goals(workspace, today, findings);
+}
+
+fn lint_acceptance_artifacts(workspace: &Path, findings: &mut Vec<Finding>) {
+    for (directory, plan) in [("plans", true), ("specs", false)] {
+        let root = workspace.join(directory);
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        let mut names = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".md") && name != "INDEX.md")
+            .collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            lint_acceptance_file(
+                &root.join(&name),
+                &format!("{directory}/{name}"),
+                plan,
+                findings,
+            );
+        }
+    }
+}
+
+// ponytail: line-prefix scan, not a Markdown parse. Acceptance criteria and
+// task statuses are template-generated and column-anchored; switch to the
+// Markdown parser if that contract changes.
+fn lint_acceptance_file(path: &Path, display: &str, plan: bool, findings: &mut Vec<Finding>) {
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    let (mut tasks, mut tasks_done) = (0usize, 0usize);
+    let (mut total, mut open) = (0usize, 0usize);
+    let mut criteria_heading = None;
+    let mut in_criteria = false;
+
+    for (index, line) in content.lines().enumerate() {
+        let line_number = index + 1;
+        if let Some(heading) = line.strip_prefix("## ") {
+            in_criteria = heading.trim().eq_ignore_ascii_case("acceptance criteria");
+            if in_criteria {
+                criteria_heading = Some((line_number, line));
+            }
+            continue;
+        }
+        if let Some(marker) = line.trim_start().strip_prefix("- **Status:** [") {
+            tasks += 1;
+            tasks_done += usize::from(marker.starts_with('x'));
+            continue;
+        }
+        if !in_criteria {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("- [") else {
+            continue;
+        };
+        let Some(end) = rest.find(']') else {
+            continue;
+        };
+        let marker = &rest[..end];
+        total += 1;
+        match marker {
+            "x" => {
+                if !line.contains("Evidence:") {
+                    findings.push(Finding::line(
+                        "WRK012",
+                        "closed-criterion-missing-evidence",
+                        Severity::Warning,
+                        display,
+                        line_number,
+                        line,
+                        "Closed acceptance criterion has no `Evidence:` clause",
+                    ));
+                }
+            }
+            "-" => {}
+            " " | ">" => open += 1,
+            _ => {
+                open += 1;
+                findings.push(
+                    Finding::line(
+                        "WRK014",
+                        "unknown-criterion-marker",
+                        Severity::Warning,
+                        display,
+                        line_number,
+                        line,
+                        "Acceptance criterion uses an unrecognized marker",
+                    )
+                    .with_target(&format!("[{marker}]")),
+                );
+            }
+        }
+    }
+
+    if plan && tasks > 0 && tasks_done == tasks && open > 0 {
+        if let Some((line_number, line)) = criteria_heading {
+            let mut finding = Finding::line(
+                "WRK013",
+                "completed-plan-has-open-criteria",
+                Severity::Warning,
+                display,
+                line_number,
+                line,
+                "Every task is complete but acceptance criteria remain open",
+            )
+            .with_evidence("open", &open.to_string())
+            .with_evidence("total", &total.to_string())
+            .with_target("/loam::amending-plan");
+            finding.detail = format!("{open} of {total} acceptance criteria are open");
+            findings.push(finding);
+        }
+    }
+}
+
+fn lint_goals(workspace: &Path, today: i64, findings: &mut Vec<Finding>) {
     let goals = workspace.join("goals");
     let Ok(entries) = fs::read_dir(&goals) else {
         return;

@@ -2,7 +2,7 @@
 name: loam::using
 description: "The always-on protocol for the loam skill namespace. Use at session start and whenever a loam task appears. Routes goals and other loam work, explains the memory model (memory = umbrella; wiki, guidance, and checkpoints are substrates), and lists cross-cutting rules. This is a routing/meta skill — delegate to a specific loam skill rather than performing work itself."
 metadata:
-  version: "1.10.0"
+  version: "1.11.0"
   author: scchearn
 ---
 
@@ -210,6 +210,7 @@ For each hint, emit one Markdown list item in this form:
 
 Rules:
 
+- **`plan_reconcilable`** — aggregate workflow hint for completed plans with open acceptance criteria; route listed plans to `/loam::amending-plan`.
 - **Suppress satisfied hints.** Skip any hint whose `kind` your skill body names as one it satisfies. A skill may satisfy more than one (e.g. `linting-memory` satisfies `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, and `legacy_structure_pending`); suppress all of them.
 - **Only surface hints with a non-null `command`.** Hints without a command (e.g. `retrieval_not_ready`) are informational; mention them only if the user asks for state.
 - **Do not auto-run the suggested skill.** Hints are advisory; the user decides whether to act. End your turn or hand back to the user after surfacing.
