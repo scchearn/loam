@@ -74,6 +74,7 @@ goal: # optional: goals/<slug>.md provenance; omit when not goal-backed
 ## Acceptance criteria
 
 <!-- Summary checkboxes derived from Scenarios. For behavior-changing specs, each criterion MUST trace to one or more scenarios. Do not introduce behavior absent from Scenarios. EARS-style phrasing (WHEN...THE SYSTEM SHALL...) is acceptable for conditional behavior. -->
+<!-- Markers: [ ] open; [x] resolved with an inline `Evidence:` clause; [>] invalidated and needing re-check; [-] permanently superseded with an inline reason. -->
 
 - [ ] <Acceptance criterion derived from scenarios>
 

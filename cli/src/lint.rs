@@ -157,6 +157,25 @@ impl Finding {
         }
     }
 
+    /// A finding anchored to one source line.
+    pub fn line(
+        rule: &'static str,
+        rule_name: &'static str,
+        severity: Severity,
+        file: &str,
+        line: usize,
+        context: &str,
+        description: &'static str,
+    ) -> Self {
+        let mut finding = Self::file(rule, rule_name, severity, file, description);
+        finding.line = line;
+        finding.column = 1;
+        finding.end_line = line;
+        finding.end_column = context.chars().count() + 1;
+        finding.context = context.to_owned();
+        finding
+    }
+
     fn from_markdown(diagnostic: markdown::Diagnostic) -> Self {
         Self {
             rule: diagnostic.rule,

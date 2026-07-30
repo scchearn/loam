@@ -3,7 +3,7 @@ name: loam::starting
 description: "Use when beginning or resuming a plan file, including mixed local and hcom-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
 allowed-tools: Read Write Edit Glob Grep Bash WebFetch
 metadata:
-  version: "2.4.0"
+  version: "2.5.0"
   author: scchearn
   argument-hint: plans/<slug>.md [T3 | T3,T5,T7 | T3-T7]
 ---
@@ -263,9 +263,11 @@ Hub verifies via the loop in `references/hcom-orchestration.md`: run every deleg
 
 ### 4. Mark done
 
-For a **hub task**, edit the plan file: change `[~]` to `[x]`.
+For a **hub task**, change `[~]` to `[x]`.
 
-For a **delegated group**, edit the plan file: change `[h]` to `[x]` for every task in the group that the hub just verified successfully.
+For a **delegated group**, change `[h]` to `[x]` for each hub-verified task.
+
+When closing a covered acceptance criterion, write `[x]` and its inline `Evidence:` clause in the same edit.
 
 **Accumulate touched files.** Inspect the task's `Files:` entries. For each entry with an `(edit)` or `(read+edit)` marker, add the path to the session's running touched-files set (deduplicated by path). Read-only `(read)` entries are excluded — they were not modified. Track which task IDs touched each path (comma-separated).
 

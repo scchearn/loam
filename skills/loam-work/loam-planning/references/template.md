@@ -23,6 +23,8 @@ goal: # optional: goals/<slug>.md provenance; omit when not goal-backed
 
 ## Acceptance criteria
 
+<!-- Markers: [ ] open; [x] resolved with an inline `Evidence:` clause; [>] invalidated and needing re-check; [-] permanently superseded with an inline reason. -->
+
 - [ ] <Acceptance criterion copied or directly derived from the spec>
 - [ ] Relevant automated tests or validations covering the changed behavior pass
 - [ ] Relevant workspace-native validation commands pass

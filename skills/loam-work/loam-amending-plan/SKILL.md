@@ -3,7 +3,7 @@ name: loam::amending-plan
 description: "Amend an existing plan file — add tasks, modify pending or delegated tasks, and mark completed tasks that are invalidated by the change as [>] (needs re-run). Walks through analysis, cascading impact, and user confirmation before touching the file. When memory (wiki substrate) exists, it may also preserve durable amendment findings there. Reports goal impact and routes intent, boundaries, or validation changes to loam::setting-goals."
 allowed-tools: Read Write Edit Glob Grep
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: scchearn
   argument-hint: plans/<slug>.md # describe what to amend in your message, then invoke this skill
 ---
@@ -147,6 +147,8 @@ Once confirmed, apply changes to the plan file in this exact order:
 ### A. Update plan goal / acceptance criteria / related research / specs / metadata (if needed)
 
 Edit the plan's `## Goal` and acceptance criteria if the amendment changes its observable end state. Keep them aligned with any linked goal artifact without changing that artifact here.
+
+Mark amendment-invalidated criteria `[>]`. Mark permanently inapplicable criteria `[-]` with an inline reason; never delete them.
 
 If the observable scope changes materially, also update front matter `description`. The description must stay within 70 tokens.
 
