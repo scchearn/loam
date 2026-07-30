@@ -1,5 +1,5 @@
-# Repository gates: contract tests, curation, and the strict release-resolution
-# check that catches a CLI_VERSION with no published runtime. Rust workspace
+# Repository gates: contract tests, curation, version agreement on changes, and
+# a daily strict check that every CLI_VERSION still resolves. Rust workspace
 # checks live in cli.yml, which is path-filtered to the runtime lane.
 name: ci
 
@@ -47,12 +47,13 @@ jobs:
         shell: bash
         run: rustup toolchain install 1.94.1 --profile minimal
       - run: cargo +1.94.1 build --release --locked
-      # Pull requests only assert version agreement: a release-version PR is
-      # allowed to name a tag that has not been pushed yet. Pushes to main and
-      # the scheduled run require the manifest to actually resolve.
+      # Pull requests and pushes assert version agreement. A runtime bump cannot
+      # resolve until its post-merge tag publishes the manifest; the release
+      # workflow verifies that public resolution immediately after publication.
       - name: Version agreement
-        if: github.event_name == 'pull_request'
+        if: github.event_name != 'schedule'
         run: bin/check-release-resolution.sh --versions-only
+      # The daily check catches a release that was removed or never completed.
       - name: Strict manifest resolution
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'schedule'
         run: bin/check-release-resolution.sh
