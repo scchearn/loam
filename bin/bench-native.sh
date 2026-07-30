@@ -136,31 +136,3 @@ measure "lint --only work (repo)" "$(find "$ROOT/goals" -name '*.md' | wc -l | t
   "$LOAM" lint --only work "$ROOT"
 measure "lint --only memory (large)" "2000 pages" -- \
   "$LOAM" lint --only memory "$tmp/large"
-
-# --- legacy shell comparison --------------------------------------------------
-legacy_codegraph="$ROOT/skills/loam-memory/loam-ingesting-codebase/scripts/codegraph-legacy.sh"
-legacy_state="$ROOT/skills/loam-using/scripts/loamstate-legacy.sh"
-if [[ -n "${BENCH_LEGACY:-}" && -x "$legacy_codegraph" ]]; then
-  measure "codegraph-legacy.sh index (large)" "2000 files" -- \
-    bash "$legacy_codegraph" index "$tmp/large/wiki" --codebase-root "$tmp/large"
-  measure "codegraph-legacy.sh diff (large)" "2000 files" -- \
-    bash "$legacy_codegraph" diff "$tmp/large" "$tmp/large/wiki"
-fi
-if [[ -n "${BENCH_LEGACY:-}" && -x "$legacy_state" ]]; then
-  measure "loamstate-legacy.sh --fast (large)" "2000 files" -- \
-    bash "$legacy_state" --fast "$tmp/large"
-fi
-
-legacy_verify="$ROOT/skills/loam-work/loam-checkpointing/scripts/checkpoint-verify-legacy"
-legacy_capture="$ROOT/skills/loam-work/loam-checkpointing/scripts/checkpoint-state-legacy"
-if [[ -n "${BENCH_LEGACY:-}" && -f "$legacy_verify" ]]; then
-  measure "checkpoint-verify-legacy (small note)" "1 ws / 2 ptr" -- \
-    bash "$legacy_verify" "$tmp/note-small.md"
-  measure "checkpoint-verify-legacy (large note)" "50 ws / 200 ptr" -- \
-    bash "$legacy_verify" "$tmp/note-large.md"
-fi
-if [[ -n "${BENCH_LEGACY:-}" && -f "$legacy_capture" ]]; then
-  # The legacy digest takes its root from WORKSPACE, never from an argument.
-  measure "checkpoint-state-legacy (large)" "2000 files" -- \
-    env WORKSPACE="$tmp/large" bash "$legacy_capture" --window 180
-fi

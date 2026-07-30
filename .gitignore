@@ -1,6 +1,5 @@
 node_modules/
 target/
-cli/src/markdown.rs.pre-unified-lint.bak
 .DS_Store
 *.log
 *.swp

@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { cleanupStaging, createStagingDirectory, writeAtomicFile, publishJson } from './atomic.mjs';
-import { confirmSetup, renderDiscovery, selectMarketplaceHarnesses, stage } from './wizard.mjs';
+import { confirmSetup, finish, renderDiscovery, selectMarketplaceHarnesses, stage } from './wizard.mjs';
 import { ensureGlobalSkills, verifyGlobalSkills } from './skills.mjs';
 import { installRuntime } from './runtime.mjs';
 import { detectHarnesses, installHarnesses } from './harnesses.mjs';
@@ -59,13 +59,13 @@ export async function executeSetup(parsed, discovery, options = {}) {
   const errorOutput = options.errorOutput || process.stderr;
   const refresh = parsed.command === 'update';
   const yes = parsed.yes || refresh;
-  renderDiscovery(discovery, output, { action: refresh ? 'Update' : 'Setup', dryRun: parsed.dryRun });
+  await renderDiscovery(discovery, output, { action: refresh ? 'Update' : 'Setup', dryRun: parsed.dryRun });
   if (parsed.dryRun) {
-    stage(output, 'Dry run', 'no files, configuration, downloads, or mutating Skills CLI commands will run');
+    finish(output, 'Dry run', 'no files, configuration, downloads, or mutating Skills CLI commands will run');
     return 0;
   }
   if (!(await confirmSetup({ yes, confirm: options.confirm, input: options.input, output }))) {
-    stage(output, 'Setup cancelled');
+    finish(output, 'Setup cancelled');
     return 130;
   }
   const selectedMarketplaceHarnesses = await selectMarketplaceHarnesses({
@@ -74,7 +74,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
     select: options.marketplaceSelect,
   });
   if (selectedMarketplaceHarnesses === null) {
-    stage(output, 'Setup cancelled');
+    finish(output, 'Setup cancelled');
     return 130;
   }
 
@@ -95,7 +95,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
       runtimeRunner: options.smokeRunner,
     });
     if (alreadyReady.ready && !refresh) {
-      stage(output, 'Loam is ready', 'already ready; no replacement or network operation required');
+      finish(output, 'Loam is ready', 'already ready; no replacement or network operation required');
       return 0;
     }
 
@@ -243,7 +243,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
       await options.beforeActivate?.({ install, metadataPath, integrationPath });
       await publishJson({ filePath: metadataPath, value: install });
       activated = true;
-      stage(output, marketplaceFailed ? 'Loam core is ready' : 'Loam is ready');
+      finish(output, marketplaceFailed ? 'Loam core is ready' : 'Loam is ready');
       return marketplaceFailed ? 1 : 0;
     } finally {
       if (!activated) {
