@@ -65,7 +65,7 @@ Use this reference when normalizing existing memory-like corpus to the repo's ta
 - trimming operational guidance before the durable knowledge clearly exists in memory (wiki substrate)
 - editing unrelated scoped guidance files in a large monorepo just because they exist
 
-When in doubt, propose the change but do not apply it silently.
+When in doubt, apply the reversible part, leave the lossy part undone, and record it as an unresolved finding. Do not stall the pass waiting on a human.
 
 ## Preservation rules
 
