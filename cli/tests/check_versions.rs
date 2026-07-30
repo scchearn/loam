@@ -3,7 +3,7 @@
 //!
 //! Plugin (`package.json`, both `package-lock.json` fields, both marketplace
 //! fields, Codex, Cursor) ships as
-//! `v<version>`; runtime (`cli/Cargo.toml`, `CLI_VERSION`) ships as
+//! `v<version>`; runtime (`cli/Cargo.toml`, `Cargo.lock`, `CLI_VERSION`) ships as
 //! `cli-v<version>`. Agreement is asserted *within* each domain and never
 //! across them — a plugin-only change must not force a runtime release.
 
@@ -30,6 +30,12 @@ fn write(path: &Path, content: &str) {
         fs::create_dir_all(parent).expect("parent directory should be created");
     }
     fs::write(path, content).expect("file should be written");
+}
+
+fn cargo_lock(runtime: &str, dependency: &str) -> String {
+    format!(
+        "version = 4\n\n[[package]]\nname = \"dependency\"\nversion = \"{dependency}\"\n\n[[package]]\nname = \"loam\"\nversion = \"{runtime}\"\n"
+    )
 }
 
 /// A fixture where each domain agrees internally and the two differ from each
@@ -64,6 +70,7 @@ fn agreeing_root(label: &str) -> PathBuf {
         &root.join("cli/Cargo.toml"),
         &format!("[package]\nname = \"loam\"\nversion = \"{RUNTIME}\"\nedition = \"2021\"\n\n[dependencies]\nchrono = {{ version = \"0.4\" }}\n"),
     );
+    write(&root.join("Cargo.lock"), &cargo_lock(RUNTIME, "0.4.0"));
     write(
         &root.join("skills/loam-using/scripts/CLI_VERSION"),
         &format!("{RUNTIME}\n"),
@@ -137,6 +144,7 @@ fn a_plugin_version_never_has_to_equal_the_runtime_version() {
         &root.join("cli/Cargo.toml"),
         "[package]\nname = \"loam\"\nversion = \"2.5.1\"\nedition = \"2021\"\n",
     );
+    write(&root.join("Cargo.lock"), &cargo_lock("2.5.1", "2.5.1"));
 
     let (code, stdout, stderr) = check(&root, &[]);
 
@@ -399,6 +407,54 @@ fn the_package_lock_is_not_part_of_the_runtime_domain() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(
         stdout.contains(&format!("version agreement: runtime PASS ({RUNTIME})\n")),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn a_stale_cargo_lock_version_fails_the_runtime_domain() {
+    let root = agreeing_root("cargo-lock-drift");
+    // The dependency deliberately matches the reference: only the stale loam
+    // package entry should decide the result.
+    write(&root.join("Cargo.lock"), &cargo_lock("0.0.1", RUNTIME));
+
+    let (code, _, stderr) = check(&root, &["--runtime"]);
+
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("Cargo.lock loam package version is 0.0.1"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("the runtime version must be one value"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_dependency_lock_version_does_not_affect_the_runtime_domain() {
+    let root = agreeing_root("cargo-lock-dependency");
+    write(&root.join("Cargo.lock"), &cargo_lock(RUNTIME, "0.0.1"));
+
+    let (code, stdout, stderr) = check(&root, &["--runtime"]);
+
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains(&format!("version agreement: runtime PASS ({RUNTIME})\n")),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn cargo_lock_is_not_part_of_the_plugin_domain() {
+    let root = agreeing_root("cargo-lock-plugin-isolation");
+    write(&root.join("Cargo.lock"), &cargo_lock("0.0.1", "0.0.2"));
+
+    let (code, stdout, stderr) = check(&root, &["--plugin"]);
+
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains(&format!("version agreement: plugin PASS ({PLUGIN})\n")),
         "stdout: {stdout}"
     );
 }

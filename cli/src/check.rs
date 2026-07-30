@@ -11,9 +11,11 @@
 //!   `package-lock.json` is gated because it is published in the tarball and
 //!   nothing else notices when it drifts: `npm ci` validates dependency
 //!   resolution, not the package's own version field.
-//! - **runtime** (`cli/Cargo.toml`, `skills/loam-using/scripts/CLI_VERSION`) —
-//!   what the launcher downloads. Released as a `cli-v<version>` tag, and only
-//!   `cli-v*` triggers the dist build.
+//! - **runtime** (`cli/Cargo.toml`, the `loam` package in `Cargo.lock`,
+//!   `skills/loam-using/scripts/CLI_VERSION`) — what the launcher downloads.
+//!   Released as a `cli-v<version>` tag, and only `cli-v*` triggers the dist
+//!   build. `Cargo.lock` is gated because locked CI builds refuse stale package
+//!   metadata.
 //!
 //! `CLI_VERSION` is not merely compared: the launcher interpolates it into the
 //! release URL and the on-disk runtime path, so it must name a published
@@ -31,6 +33,7 @@ use crate::json;
 const PLUGIN_REFERENCE: &str = "package.json";
 const PLUGIN_LOCK: &str = "package-lock.json";
 const RUNTIME_REFERENCE: &str = "cli/Cargo.toml";
+const RUNTIME_LOCK: &str = "Cargo.lock";
 const CLI_VERSION_FILE: &str = "skills/loam-using/scripts/CLI_VERSION";
 
 pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
@@ -150,7 +153,10 @@ fn check_domain(root: &Path, domain: Domain) -> bool {
                     .map(|value| (".cursor-plugin/plugin.json version".to_owned(), value)),
             ],
         ),
-        Domain::Runtime => (RUNTIME_REFERENCE, vec![read_cli_version(root)]),
+        Domain::Runtime => (
+            RUNTIME_REFERENCE,
+            vec![read_cargo_lock_version(root), read_cli_version(root)],
+        ),
     };
 
     let reference = match domain {
@@ -255,6 +261,46 @@ fn read_cargo_version(root: &Path) -> Result<(String, String), String> {
         return Ok((LABEL.to_owned(), value.to_owned()));
     }
     Err(format!("{RUNTIME_REFERENCE} has no [package] version"))
+}
+
+/// The version in the `[[package]]` block named `loam`; dependency versions
+/// elsewhere in the lockfile are deliberately ignored.
+fn read_cargo_lock_version(root: &Path) -> Result<(String, String), String> {
+    const LABEL: &str = "Cargo.lock loam package version";
+    let content = fs::read_to_string(root.join(RUNTIME_LOCK))
+        .map_err(|error| format!("cannot read {RUNTIME_LOCK}: {error}"))?;
+
+    for block in content.split("[[package]]").skip(1) {
+        let (mut name, mut version) = (None, None);
+        for line in block.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                break;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let Some(value) = value
+                .trim()
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+            else {
+                continue;
+            };
+            match key.trim() {
+                "name" => name = Some(value),
+                "version" => version = Some(value),
+                _ => {}
+            }
+        }
+        if name == Some("loam") {
+            return version
+                .map(|value| (LABEL.to_owned(), value.to_owned()))
+                .ok_or_else(|| format!("{RUNTIME_LOCK} loam package has no version"));
+        }
+    }
+
+    Err(format!("{RUNTIME_LOCK} has no loam package entry"))
 }
 
 fn read_cli_version(root: &Path) -> Result<(String, String), String> {

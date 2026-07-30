@@ -12,6 +12,7 @@
 #                         -> released as tag  v<version>
 #
 #   --runtime <version>   cli/Cargo.toml   [package] version
+#                         Cargo.lock       [[package]] loam version
 #                         skills/loam-using/scripts/CLI_VERSION
 #                         -> released as tag  cli-v<version>   (only cli-v*
 #                            triggers the dist / raw-runtime build)
@@ -57,7 +58,7 @@ show_usage() {
   echo "  --plugin   package.json, package-lock.json, both marketplace fields,"
   echo "             Codex, Cursor"
   echo "             released as tag v<version>"
-  echo "  --runtime  cli/Cargo.toml, CLI_VERSION"
+  echo "  --runtime  cli/Cargo.toml, Cargo.lock, CLI_VERSION"
   echo "             released as tag cli-v<version> (triggers dist)"
   echo
   echo "The plugin and runtime versions are independent; neither implies the other."
@@ -183,6 +184,9 @@ if [[ "$DOMAIN" == "plugin" ]]; then
   stage_literal ".cursor-plugin/plugin.json"      1 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
 else
   stage_cargo_line
+  # Cargo.lock is generated with one exact copy of the crate version. Refuse
+  # if a dependency shares it rather than rewriting an unrelated package.
+  stage_literal "Cargo.lock" 1 "version = \"$OLD\"" "version = \"$NEW\""
   printf '%s\n' "$NEW" > "$STAGE/CLI_VERSION" || fail "cannot stage $CLI_VERSION_FILE"
 fi
 
@@ -206,6 +210,7 @@ if [[ "$DOMAIN" == "plugin" ]]; then
   TAG="v$NEW"
 else
   publish "$STAGE/cli_Cargo.toml"  "cli/Cargo.toml"
+  publish "$STAGE/Cargo.lock"      "Cargo.lock"
   publish "$STAGE/CLI_VERSION"     "$CLI_VERSION_FILE"
   TAG="cli-v$NEW"
 fi
@@ -220,7 +225,7 @@ if [[ "$DOMAIN" == "runtime" ]]; then
   cat <<NEXT
 
 Next:
-  1. cargo build --release --workspace   # Cargo.lock records the new version
+  1. cargo build --release --workspace --locked   # verify the bumped lockfile
   2. review: git diff
   3. commit, then tag $TAG at the release commit and push the tag
      (cli-v* is what triggers the dist / raw-runtime build)
