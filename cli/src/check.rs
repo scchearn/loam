@@ -4,9 +4,13 @@
 //! there are two version domains and agreement is asserted *within* each, never
 //! across them:
 //!
-//! - **plugin** (`package.json`, both `.claude-plugin/marketplace.json` fields,
+//! - **plugin** (`package.json`, both `package-lock.json` fields, both
+//!   `.claude-plugin/marketplace.json` fields,
 //!   `plugins/loam-adapter/.codex-plugin/plugin.json`, `.cursor-plugin/plugin.json`) — what the
 //!   harnesses display and resolve. Released as a `v<version>` tag.
+//!   `package-lock.json` is gated because it is published in the tarball and
+//!   nothing else notices when it drifts: `npm ci` validates dependency
+//!   resolution, not the package's own version field.
 //! - **runtime** (`cli/Cargo.toml`, `skills/loam-using/scripts/CLI_VERSION`) —
 //!   what the launcher downloads. Released as a `cli-v<version>` tag, and only
 //!   `cli-v*` triggers the dist build.
@@ -25,6 +29,7 @@ use std::path::Path;
 use crate::json;
 
 const PLUGIN_REFERENCE: &str = "package.json";
+const PLUGIN_LOCK: &str = "package-lock.json";
 const RUNTIME_REFERENCE: &str = "cli/Cargo.toml";
 const CLI_VERSION_FILE: &str = "skills/loam-using/scripts/CLI_VERSION";
 
@@ -113,6 +118,11 @@ fn check_domain(root: &Path, domain: Domain) -> bool {
         Domain::Plugin => (
             PLUGIN_REFERENCE,
             vec![
+                read_json_field(root, PLUGIN_LOCK, &["version"])
+                    .map(|value| (format!("{PLUGIN_LOCK} version"), value)),
+                // packages[""] is the lockfile's entry for the package itself.
+                read_json_field(root, PLUGIN_LOCK, &["packages", "", "version"])
+                    .map(|value| (format!("{PLUGIN_LOCK} packages[\"\"].version"), value)),
                 read_json_field(
                     root,
                     ".claude-plugin/marketplace.json",

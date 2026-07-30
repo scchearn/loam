@@ -1,7 +1,8 @@
 //! `loam check versions` — offline version agreement across two independent
 //! release domains.
 //!
-//! Plugin (`package.json`, both marketplace fields, Codex, Cursor) ships as
+//! Plugin (`package.json`, both `package-lock.json` fields, both marketplace
+//! fields, Codex, Cursor) ships as
 //! `v<version>`; runtime (`cli/Cargo.toml`, `CLI_VERSION`) ships as
 //! `cli-v<version>`. Agreement is asserted *within* each domain and never
 //! across them — a plugin-only change must not force a runtime release.
@@ -39,6 +40,12 @@ fn agreeing_root(label: &str) -> PathBuf {
         &root.join("package.json"),
         &format!(
             "{{\n  \"name\": \"loam\",\n  \"version\": \"{PLUGIN}\",\n  \"type\": \"module\"\n}}\n"
+        ),
+    );
+    write(
+        &root.join("package-lock.json"),
+        &format!(
+            "{{\n  \"name\": \"loam\",\n  \"version\": \"{PLUGIN}\",\n  \"lockfileVersion\": 3,\n  \"packages\": {{\n    \"\": {{\n      \"name\": \"loam\",\n      \"version\": \"{PLUGIN}\"\n    }}\n  }}\n}}\n"
         ),
     );
     write(
@@ -331,4 +338,67 @@ fn the_real_repository_agrees_within_each_domain() {
     assert_eq!(code, 0, "each domain must ship one version: {stderr}");
     assert!(stdout.contains("plugin PASS ("), "{stdout}");
     assert!(stdout.contains("runtime PASS ("), "{stdout}");
+}
+
+/// The lockfile ships inside the published tarball, and `npm ci` validates
+/// dependency resolution rather than the package's own version field — so
+/// nothing but this gate notices when it drifts. It silently sat at 0.9.2
+/// across seven plugin releases before it was gated.
+#[test]
+fn a_stale_package_lock_version_fails_the_plugin_domain() {
+    let root = agreeing_root("lock-root-drift");
+    write(
+        &root.join("package-lock.json"),
+        &format!(
+            "{{\n  \"name\": \"loam\",\n  \"version\": \"0.0.1\",\n  \"lockfileVersion\": 3,\n  \"packages\": {{\n    \"\": {{\n      \"name\": \"loam\",\n      \"version\": \"{PLUGIN}\"\n    }}\n  }}\n}}\n"
+        ),
+    );
+
+    let (code, _, stderr) = check(&root, &["--plugin"]);
+
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("package-lock.json version is 0.0.1"),
+        "stderr: {stderr}"
+    );
+}
+
+/// `packages[""]` is the lockfile's record of the package itself and drifts
+/// independently of the root field, so both are gated.
+#[test]
+fn a_stale_package_lock_packages_entry_fails_the_plugin_domain() {
+    let root = agreeing_root("lock-packages-drift");
+    write(
+        &root.join("package-lock.json"),
+        &format!(
+            "{{\n  \"name\": \"loam\",\n  \"version\": \"{PLUGIN}\",\n  \"lockfileVersion\": 3,\n  \"packages\": {{\n    \"\": {{\n      \"name\": \"loam\",\n      \"version\": \"0.0.1\"\n    }}\n  }}\n}}\n"
+        ),
+    );
+
+    let (code, _, stderr) = check(&root, &["--plugin"]);
+
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("package-lock.json packages[\"\"].version is 0.0.1"),
+        "stderr: {stderr}"
+    );
+}
+
+/// The lockfile belongs to the plugin domain only; a runtime bump must not be
+/// blocked or touched by it.
+#[test]
+fn the_package_lock_is_not_part_of_the_runtime_domain() {
+    let root = agreeing_root("lock-runtime-isolation");
+    write(
+        &root.join("package-lock.json"),
+        "{\n  \"name\": \"loam\",\n  \"version\": \"0.0.1\",\n  \"lockfileVersion\": 3,\n  \"packages\": {\n    \"\": {\n      \"name\": \"loam\",\n      \"version\": \"0.0.1\"\n    }\n  }\n}\n",
+    );
+
+    let (code, stdout, stderr) = check(&root, &["--runtime"]);
+
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains(&format!("version agreement: runtime PASS ({RUNTIME})\n")),
+        "stdout: {stdout}"
+    );
 }
