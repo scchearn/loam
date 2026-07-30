@@ -88,6 +88,7 @@ pub enum Violation {
     InvalidRequestCorrelation,
     MissingResponseThread,
     MissingResponseCausation,
+    UnknownContextField,
     InvalidSourceScheme,
     SourceInstanceMismatch,
     UnauthorizedPrincipal,
@@ -1331,6 +1332,12 @@ fn validate_context(data: &[(String, Value)]) -> Result<(), Violation> {
     let context = field(data, "context")
         .and_then(as_object)
         .ok_or(Violation::InvalidEnvelopeShape)?;
+    if has_unknown_field(
+        context,
+        &["org_id", "project_id", "repository_id", "git", "artifacts"],
+    ) {
+        return Err(Violation::UnknownContextField);
+    }
     ensure_string(context, "org_id")?;
     ensure_string(context, "project_id")?;
     if let Some(repository_id) = field(context, "repository_id") {
@@ -1341,6 +1348,9 @@ fn validate_context(data: &[(String, Value)]) -> Result<(), Violation> {
     if let Some(git) = field(context, "git") {
         if !matches!(git, Value::Null) {
             let git = as_object(git).ok_or(Violation::InvalidEnvelopeShape)?;
+            if has_unknown_field(git, &["base_oid", "plan_oid", "ref", "commit"]) {
+                return Err(Violation::UnknownContextField);
+            }
             for name in ["base_oid", "plan_oid", "ref", "commit"] {
                 if let Some(value) = field(git, name) {
                     if value.as_str().is_none() {
@@ -1355,6 +1365,9 @@ fn validate_context(data: &[(String, Value)]) -> Result<(), Violation> {
         .ok_or(Violation::InvalidEnvelopeShape)?;
     for artifact in artifacts {
         let artifact = as_object(artifact).ok_or(Violation::InvalidEnvelopeShape)?;
+        if has_unknown_field(artifact, &["kind", "id"]) {
+            return Err(Violation::UnknownContextField);
+        }
         ensure_string(artifact, "kind")?;
         if let Some(id) = field(artifact, "id") {
             if id.as_str().is_none() {
@@ -1363,6 +1376,12 @@ fn validate_context(data: &[(String, Value)]) -> Result<(), Violation> {
         }
     }
     Ok(())
+}
+
+fn has_unknown_field(fields: &[(String, Value)], allowed: &[&str]) -> bool {
+    fields
+        .iter()
+        .any(|(name, _)| !allowed.contains(&name.as_str()))
 }
 
 fn validate_payload_and_anchors(value: &Value) -> Result<(), Violation> {
@@ -1374,10 +1393,9 @@ fn validate_payload_and_anchors(value: &Value) -> Result<(), Violation> {
     let context = field(data, "context")
         .and_then(as_object)
         .ok_or(Violation::InvalidEnvelopeShape)?;
-    let repository_id = string_field(context, "repository_id")
-        .filter(|identifier| !identifier.is_empty())
-        .ok_or(Violation::MissingRepositoryId)?;
-    let _ = repository_id;
+    if string_field(context, "repository_id").is_none_or(str::is_empty) {
+        return Err(Violation::MissingRepositoryId);
+    }
     let payload = field(data, "payload").ok_or(Violation::InvalidEnvelopeShape)?;
     let git = field(context, "git").and_then(as_object);
     validate_supplied_git_anchors(git)?;
@@ -2208,6 +2226,36 @@ mod tests {
                 &observer,
             );
         }
+        let cases = json::parse(include_str!("../tests/fixtures/mqtt/extension-cases.json"))
+            .expect("extension corpus should parse");
+        let remote_case = cases
+            .as_array()
+            .and_then(|cases| {
+                cases.iter().find(|case| {
+                    case.get("name").and_then(Value::as_str) == Some("unconfigured_clone_remote")
+                })
+            })
+            .expect("clone-remote rejection case should exist");
+        let mut message =
+            json::parse(fixture("extension")).expect("extension fixture should parse");
+        for patch in remote_case
+            .get("patches")
+            .and_then(Value::as_array)
+            .expect("clone-remote case should have patches")
+        {
+            apply_fixture_patch(&mut message, patch);
+        }
+        assert_eq!(
+            validate_observed(
+                message.to_json().as_bytes(),
+                topic_for("extension"),
+                &authenticated_principal(),
+                &config,
+                now,
+                &observer,
+            ),
+            Err(Violation::UnknownContextField)
+        );
 
         assert_eq!(observer.attempts.get(), 0);
         let process_files = ["checkpoint.rs", "codegraph.rs", "main.rs", "state.rs"];
@@ -2319,7 +2367,7 @@ mod tests {
     fn rendered_message_has_no_plain_string_conversion_or_execution_surface() {
         let source = include_str!("envelope.rs");
         let production = source
-            .split("#[cfg(test)]\nmod tests")
+            .split("mod tests {")
             .next()
             .expect("module should contain its test boundary");
         for forbidden in [
@@ -2456,7 +2504,14 @@ mod tests {
                     .find(|(name, _)| name == segment)
                     .map(|(_, value)| value)
                     .expect("parent path should exist"),
-                _ => panic!("parent path should be an object"),
+                Value::Array(items) => items
+                    .get_mut(
+                        segment
+                            .parse::<usize>()
+                            .expect("array path segment should be an index"),
+                    )
+                    .expect("array path index should exist"),
+                _ => panic!("parent path should be an object or array"),
             };
         }
         let Value::Object(fields) = current else {
@@ -2599,6 +2654,9 @@ mod tests {
             "core_dataschema_mismatch" | "extension_dataschema_mismatch" => {
                 Violation::DataschemaMismatch
             }
+            "unconfigured_clone_remote" | "unconfigured_git_remote" | "unknown_artifact_field" => {
+                Violation::UnknownContextField
+            }
             "breaking_without_new_major" => Violation::InvalidWorkState,
             _ => panic!("unmapped extension fixture {name}"),
         }
@@ -2620,7 +2678,7 @@ mod tests {
                 let source =
                     std::fs::read_to_string(&path).expect("Rust source should be readable");
                 let production = source
-                    .split("#[cfg(test)]\nmod tests")
+                    .split("mod tests {")
                     .next()
                     .expect("split always returns one item")
                     .to_owned();

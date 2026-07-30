@@ -21,8 +21,7 @@
       "project_id": "project-7M3",
       "repository_id": "repo-2F8",
       "git": {"base_oid": "84be000000000000000000000000000000000002"},
-      "artifacts": [],
-      "clone_remote": "https://unconfigured.example.invalid/repository.git"
+      "artifacts": []
     },
     "expires_at": "2026-07-24T14:30:00Z",
     "summary": "Regression detected by the configured suite.",
