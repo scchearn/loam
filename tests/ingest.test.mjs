@@ -129,7 +129,7 @@ test('boundary gate honors config and environment precedence and blocks worker r
 
 test('visibility config accepts supported values and silently normalizes everything else', async () => {
   const globalRoot = await mkdtemp(join(tmpdir(), 'loam-visibility-config-'));
-  assert.equal((await readIngestConfig(globalRoot, {})).visibility, 'silent');
+  assert.equal((await readIngestConfig(globalRoot, {})).visibility, 'native');
   assert.equal((await readIngestConfig(globalRoot, {})).require_visible_worker, false);
   for (const visibility of ['silent', 'toast', 'native']) {
     await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { visibility } }));
@@ -140,7 +140,7 @@ test('visibility config accepts supported values and silently normalizes everyth
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { require_visible_worker: 'true' } }));
   assert.equal((await readIngestConfig(globalRoot, {})).require_visible_worker, false);
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'loud' } }));
-  assert.equal((await readIngestConfig(globalRoot, {})).visibility, 'silent');
+  assert.equal((await readIngestConfig(globalRoot, {})).visibility, 'native');
 });
 
 test('Claude session name is deterministic, Loam-attributable, and workspace scoped', () => {
@@ -254,6 +254,8 @@ test('Codex native boundary records one intent and falls back exactly once on th
   const first = await dispatchBoundary(options);
   assert.equal(first.action, 'spawn_worker');
   assert.equal(first.native_continuation.decision, 'block');
+  assert.match(first.native_continuation.reason, /fork_turns set to "none"/u);
+  assert.match(first.native_continuation.reason, /task_name set to "loam_ingest_stop_<N>"/u);
   assert.equal(spawns.length, 0, 'first native Stop must not start a detached worker');
   const intentPath = join(runRoot(root, workspace), 'native-intent.json');
   const intent = JSON.parse(await readFile(intentPath, 'utf8'));
