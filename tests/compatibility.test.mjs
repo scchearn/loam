@@ -16,6 +16,7 @@ const hookPath = join(packageRoot, 'hooks', 'session-start.mjs');
 const marketplaceRoot = join(packageRoot, 'plugins', 'loam-adapter');
 const marketplaceHookPath = join(marketplaceRoot, 'hooks', 'session-start.mjs');
 const marketplaceStopPath = join(marketplaceRoot, 'hooks', 'stop.mjs');
+const codexStopPath = join(packageRoot, 'adapters', 'codex-stop.mjs');
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 async function runHook(env, payload = {}, path = hookPath) {
@@ -260,6 +261,65 @@ test('marketplace plugin owns SessionStart and Stop for Claude and Codex', async
     { loadHooks: async () => { throw new Error('old integration'); }, loadIngest },
   ), {});
   assert.deepEqual(calls.map(([kind]) => kind), ['ingest']);
+});
+
+test('Codex systemMessage reports only immediate toast dispatch failures', async () => {
+  const direct = await import(`${pathToFileURL(codexStopPath).href}?toast-failure=${Date.now()}`);
+  const input = { cwd: '/workspace', session_id: 'codex-session' };
+  const loadIngest = ({ visibility = 'toast', outcome, failure } = {}) => async () => ({
+    resolveGlobalRoot: () => '/global',
+    resolveSkillsRoot: () => '/skills',
+    readIngestConfig: async () => ({ visibility }),
+    dispatchBoundary: async () => {
+      if (failure) throw failure;
+      return outcome;
+    },
+  });
+  const runDirect = (options) => direct.main({
+    input,
+    env: {},
+    errorOutput: { write: () => {} },
+    loadIngest: loadIngest(options),
+  });
+
+  assert.match((await runDirect({ outcome: { action: 'skip', reason: 'unavailable' } })).systemMessage, /could not start/u);
+  assert.match((await runDirect({ failure: new Error('gate failed') })).systemMessage, /could not start/u);
+  assert.deepEqual(await runDirect({ outcome: { action: 'spawn_worker' } }), {});
+  assert.deepEqual(await runDirect({ outcome: { action: 'skip', reason: 'nothing_to_do' } }), {});
+  assert.deepEqual(await runDirect({ visibility: 'silent', outcome: { action: 'skip', reason: 'unavailable' } }), {});
+  assert.deepEqual(await runDirect({ visibility: 'native', outcome: { action: 'skip', reason: 'unavailable' } }), {});
+});
+
+test('Codex marketplace Stop matches direct one-shot warning semantics', async () => {
+  const stop = await import(`${pathToFileURL(marketplaceStopPath).href}?codex-toast=${Date.now()}`);
+  const options = (visibility, dispatchBoundary) => ({
+    loadHooks: async () => { throw new Error('logging unavailable'); },
+    loadIngest: async () => ({
+      resolveGlobalRoot: () => '/global',
+      resolveSkillsRoot: () => '/skills',
+      readIngestConfig: async () => ({ visibility }),
+      dispatchBoundary,
+    }),
+  });
+  const input = { cwd: '/workspace', session_id: 'codex-session' };
+  const env = { PLUGIN_ROOT: marketplaceRoot };
+
+  const reported = await stop.handleStop(
+    input,
+    env,
+    options('toast', async () => ({ action: 'skip', reason: 'unavailable' })),
+  );
+  assert.match(reported.systemMessage, /could not start/u);
+  assert.deepEqual(await stop.handleStop(
+    input,
+    env,
+    options('toast', async () => ({ action: 'spawn_worker' })),
+  ), {});
+  assert.deepEqual(await stop.handleStop(
+    input,
+    env,
+    options('native', async () => { throw new Error('native failure'); }),
+  ), {});
 });
 
 test('marketplace Stop writes exact hook JSON when logging is unavailable', async () => {

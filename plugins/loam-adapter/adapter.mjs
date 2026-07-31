@@ -3,6 +3,14 @@ import { readFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+const CODEX_START_FAILURE_MESSAGE = 'Loam background ingestion could not start. Run npx @scchearn/loam setup to repair the installation.';
+
+function stopResponse({ harness, visibility, outcome, failure }) {
+  return harness === 'codex' && visibility === 'toast' && (failure || outcome?.reason === 'unavailable')
+    ? { systemMessage: CODEX_START_FAILURE_MESSAGE }
+    : {};
+}
+
 async function defaultIntegrationPath() {
   if (process.env.LOAM_INTEGRATION_PATH) return process.env.LOAM_INTEGRATION_PATH;
   const fallback = join(homedir(), '.agents', 'loam', 'integration', 'loam.mjs');
@@ -109,9 +117,12 @@ export async function handleMarketplaceStop(payload = {}, {
 
   let failure;
   let outcome;
+  let visibility = 'silent';
   try {
-    const { resolveGlobalRoot, resolveSkillsRoot, dispatchBoundary } = await loadIngest();
+    const { resolveGlobalRoot, resolveSkillsRoot, readIngestConfig, dispatchBoundary } = await loadIngest();
     if (!dispatchBoundary) throw new Error('Loam ingestion integration is unavailable');
+    const globalRoot = env.LOAM_INGEST_GLOBAL_ROOT || resolveGlobalRoot({ env });
+    if (harness === 'codex') visibility = (await readIngestConfig?.(globalRoot, env))?.visibility || 'silent';
     outcome = await dispatchBoundary({
       harness,
       payload: {
@@ -119,7 +130,7 @@ export async function handleMarketplaceStop(payload = {}, {
         cwd: typeof payload?.cwd === 'string' ? payload.cwd : undefined,
         stop_hook_active: payload?.stop_hook_active === true,
       },
-      globalRoot: env.LOAM_INGEST_GLOBAL_ROOT || resolveGlobalRoot({ env }),
+      globalRoot,
       skillsRoot: env.LOAM_INGEST_SKILLS_ROOT || resolveSkillsRoot({ env }),
       hookRunId: hookRun?.id,
       env,
@@ -143,7 +154,7 @@ export async function handleMarketplaceStop(payload = {}, {
       });
     } catch {}
   }
-  return {};
+  return stopResponse({ harness, visibility, outcome, failure });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
