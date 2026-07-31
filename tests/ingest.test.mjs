@@ -151,14 +151,15 @@ test('Claude session name is deterministic, Loam-attributable, and workspace sco
   assert.doesNotMatch(first, /workspace/u);
 });
 
-test('notification launch is non-blocking and terminal status follows persisted outcome', async () => {
+test('notification launch is non-blocking and terminal status follows persisted outcome', async (context) => {
+  context.mock.timers.enable({ apis: ['setTimeout'] });
   const { root, workspace, wiki, skills } = await fixture();
   await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'toast' } }));
   const calls = [];
   let modelCompleted = false;
+  let launchNotificationSettled = false;
   let markLaunchCalled;
   const launchCalled = new Promise((resolvePromise) => { markLaunchCalled = resolvePromise; });
-  const startedAt = Date.now();
   const resultPromise = runWorker({
     harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
     readiness: { ready: true, runtimePath: '/private/loam' },
@@ -170,22 +171,29 @@ test('notification launch is non-blocking and terminal status follows persisted 
     }),
     notify: async (event) => {
       calls.push(event);
-      if (event.phase === 'launch') { markLaunchCalled(); return new Promise(() => {}); }
+      if (event.phase === 'launch') {
+        markLaunchCalled();
+        await new Promise((resolvePromise) => event.signal.addEventListener('abort', resolvePromise, { once: true }));
+        launchNotificationSettled = true;
+      }
     },
   });
 
   await launchCalled;
   assert.equal(modelCompleted, true, 'launch notification must not block worker completion');
+  context.mock.timers.tick(249);
+  assert.equal(calls[0].signal.aborted, false, 'notification deadline must not fire early');
+  assert.equal(launchNotificationSettled, false);
+  context.mock.timers.tick(1);
+  assert.equal(calls[0].signal.aborted, true, 'notification deadline must fire at 250 ms');
   const result = await resultPromise;
-  const elapsed = Date.now() - startedAt;
   const stored = JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8'));
   assert.equal(result.reason, 'ok');
   assert.equal(stored.status, 'failed');
   assert.deepEqual(calls.map(({ phase }) => phase), ['launch', 'terminal']);
-  assert.equal(calls[0].signal.aborted, true, 'deadline must cancel a hanging notification resource');
+  assert.equal(launchNotificationSettled, true, 'deadline must settle an abort-aware notification resource');
   assert.equal(calls[1].signal.aborted, false);
   assert.equal(calls[1].status, stored.status);
-  assert.ok(elapsed >= 200 && elapsed < 1000, `bounded notification elapsed ${elapsed}ms`);
 });
 
 test('silent and failing notifications cannot change ingestion state or exceed two calls', async () => {
