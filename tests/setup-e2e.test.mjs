@@ -168,7 +168,7 @@ test('setup reconciles an install from an older plugin version', async () => {
   assert.equal(await readFile(databasePath, 'utf8'), 'operational history');
 });
 
-test('marketplace-owned Claude and Codex satisfy readiness without user hooks', async () => {
+test('marketplace-owned Claude and Codex satisfy readiness with the Codex agent profile and without user hooks', async () => {
   const fixture = await baseFixture();
   await mkdir(join(fixture.home, '.claude'), { recursive: true });
   await mkdir(join(fixture.home, '.codex'), { recursive: true });
@@ -203,6 +203,55 @@ test('marketplace-owned Claude and Codex satisfy readiness without user hooks', 
   assert.deepEqual(claude.hooks.SessionStart, []);
   assert.equal((claude.hooks.Stop || []).flatMap((entry) => entry.hooks || []).length, 0);
   await assert.rejects(() => readFile(join(fixture.home, '.codex', 'hooks.json')), { code: 'ENOENT' });
+  assert.equal(
+    await readFile(join(fixture.home, '.codex', 'agents', 'loam_ingestor.toml'), 'utf8'),
+    await readFile(join(packageRoot, 'adapters', 'loam_ingestor.toml'), 'utf8'),
+  );
+
+  const profilePath = join(fixture.home, '.codex', 'agents', 'loam_ingestor.toml');
+  await writeFile(profilePath, '# Managed by @scchearn/loam setup.\nname = "loam_ingestor"\n');
+  const tampered = await verifyInstallation({
+    discovery: await discover({ home: fixture.home, workspace: fixture.workspace, packageRoot }),
+    packageRoot,
+    runtimeRunner: fixture.smokeRunner,
+  });
+  assert.equal(tampered.harnesses.codex.category, 'agent_profile_mismatch');
+
+  const updateCode = await runSetup(parseArgs(['update']), {
+    ...fixture,
+    packageRoot,
+    output: outputCapture().output,
+  });
+  assert.equal(updateCode, 0);
+  assert.equal(
+    await readFile(profilePath, 'utf8'),
+    await readFile(join(packageRoot, 'adapters', 'loam_ingestor.toml'), 'utf8'),
+  );
+});
+
+test('failed setup restores a pre-existing Codex agent profile collision', async () => {
+  const fixture = await baseFixture();
+  const profilePath = join(fixture.home, '.codex', 'agents', 'loam_ingestor.toml');
+  const original = 'name = "personal_ingestor"\ndescription = "User profile"\ndeveloper_instructions = "Keep me"\n';
+  await mkdir(join(fixture.home, '.codex', 'agents'), { recursive: true });
+  await writeFile(profilePath, original);
+
+  let observedManagedProfile = false;
+  const code = await runSetup(parseArgs(['setup', '--yes']), {
+    ...fixture,
+    packageRoot,
+    beforeActivate: async () => {
+      observedManagedProfile = (await readFile(profilePath, 'utf8')).includes('name = "loam_ingestor"');
+      assert.equal(await readFile(`${profilePath}.loam-backup`, 'utf8'), original);
+      throw new Error('controlled interruption');
+    },
+    output: outputCapture().output,
+  });
+
+  assert.equal(code, 1);
+  assert.equal(observedManagedProfile, true);
+  assert.equal(await readFile(profilePath, 'utf8'), original);
+  await assert.rejects(() => readFile(`${profilePath}.loam-backup`), { code: 'ENOENT' });
 });
 
 test('setup verifies an updated marketplace plugin from disk instead of trusting CLI success', async () => {

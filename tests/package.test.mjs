@@ -140,7 +140,7 @@ process.exit(1);
   }
 });
 
-test('packed Claude and Codex marketplaces point to one skill-free adapter', async () => {
+test('packed marketplaces expose loam:ingestor, the loam_ingestor profile, and subagent hooks', async () => {
   const fixture = await packedRoot();
   try {
     const claudeMarketplace = JSON.parse(await readFile(join(fixture.root, '.claude-plugin', 'marketplace.json'), 'utf8'));
@@ -154,8 +154,20 @@ test('packed Claude and Codex marketplaces point to one skill-free adapter', asy
     assert.equal('skills' in claudePlugin, false);
     assert.equal('skills' in codexPlugin, false);
     await assert.rejects(() => readdir(join(adapterRoot, 'skills')));
+    const agent = await readFile(join(adapterRoot, 'agents', 'ingestor.md'), 'utf8');
+    assert.match(agent, /^---\r?\n[\s\S]*?^name: ingestor$/mu);
+    assert.match(agent, /^tools: .*\bSkill\b.*$/mu);
+    assert.doesNotMatch(agent.match(/^tools: (.*)$/mu)?.[1] || '', /(?:^|,\s*)Agent(?:,|$)/u);
+    assert.match(agent, /Never spawn or delegate to another agent or subagent/u);
+    const codexAgent = await readFile(join(fixture.root, 'adapters', 'loam_ingestor.toml'), 'utf8');
+    assert.match(codexAgent, /^name = "loam_ingestor"$/mu);
+    assert.match(codexAgent, /^description = "[^"\r\n]+"$/mu);
+    assert.match(codexAgent, /^developer_instructions = """$/mu);
+    assert.doesNotMatch(codexAgent, /^(?:model|model_reasoning_effort|sandbox_mode)\s*=/mu);
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'session-start.mjs'), 'utf8'));
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'stop.mjs'), 'utf8'));
+    await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'subagent-start.mjs'), 'utf8'));
+    await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'subagent-stop.mjs'), 'utf8'));
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
   }

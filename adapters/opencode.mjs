@@ -131,6 +131,23 @@ export function createOpenCodeAdapter({
           env,
         });
         if (gated.action === 'spawn_worker' && sdk?.session) {
+          const notify = typeof sdk?.tui?.showToast === 'function'
+            ? ({ phase, status, visibility, signal }) => {
+                if (visibility !== 'toast') return;
+                const failed = phase === 'terminal' && status !== 'ok';
+                return sdk.tui.showToast({
+                  query: { directory: workspace },
+                  body: {
+                    title: 'Loam',
+                    message: phase === 'launch'
+                      ? 'Background code ingestion started.'
+                      : failed ? 'Background code ingestion failed.' : 'Background code ingestion completed.',
+                    variant: phase === 'launch' ? 'info' : failed ? 'error' : 'success',
+                  },
+                  signal,
+                });
+              }
+            : undefined;
           const childSession = {
             parentSessionId: childId,
             createChild: async ({ parentId, title }) => {
@@ -173,6 +190,7 @@ export function createOpenCodeAdapter({
                 env,
                 openCodeSession: childSession,
                 hookRun,
+                notify,
               });
               if (hookRun && hookWorkerFinish) {
                 try {

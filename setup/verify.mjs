@@ -84,7 +84,25 @@ async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, 
 }
 
 async function verifyHarness(id, harness, { packageRoot, globalRoot, install, workspace }) {
-  if (harness.state === 'absent' || harness.state === 'skipped') return { ...harness, ready: true };
+  if (harness.state === 'absent') return { ...harness, ready: true };
+  if (id === 'codex') {
+    const profilePath = join(harness.root, 'agents', 'loam_ingestor.toml');
+    try {
+      const [actual, expected] = await Promise.all([
+        readFile(profilePath, 'utf8'),
+        readFile(join(packageRoot, 'adapters', 'loam_ingestor.toml'), 'utf8'),
+      ]);
+      if (actual !== expected) return { ...harness, ready: false, category: 'agent_profile_mismatch' };
+    } catch (error) {
+      return {
+        ...harness,
+        ready: false,
+        category: error?.code === 'ENOENT' ? 'agent_profile_missing' : 'agent_profile_invalid',
+        detail: error instanceof Error ? error.message : String(error),
+      };
+    }
+    if (harness.state === 'skipped') return { ...harness, ready: true, owner: 'setup' };
+  } else if (harness.state === 'skipped') return { ...harness, ready: true };
   if (!install) return { ...harness, ready: false, category: 'install_metadata_missing' };
   const assetRoot = install.adapter_root;
   const assetName = id === 'opencode' ? 'opencode.mjs' : `${id}-session-start.mjs`;

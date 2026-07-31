@@ -1,7 +1,8 @@
 import { loadIngestModules } from './ingest-modules.mjs';
 
 const {
-  resolveGlobalRoot, resolveSkillsRoot, runWorker, startHookWorker, finishHookWorker,
+  resolveGlobalRoot, resolveSkillsRoot, runWorker, prepareNativeAgentRun,
+  startHookWorker, finishHookWorker,
 } = await loadIngestModules().catch(() => ({}));
 
 function args(argv) {
@@ -10,15 +11,30 @@ function args(argv) {
     if (argv[index] === '--harness') result.harness = argv[++index];
     else if (argv[index] === '--workspace') result.workspace = argv[++index];
     else if (argv[index] === '--hook-run-id') result.hookRunId = argv[++index];
+    else if (argv[index] === '--global-root') result.globalRoot = argv[++index];
+    else if (argv[index] === '--agent-id') result.agentId = argv[++index];
+    else if (argv[index] === '--native-prepare') result.nativePrepare = true;
   }
   return result;
 }
 
 export async function main(options = {}) {
-  const parsed = options.harness ? options : args(process.argv.slice(2));
-  if (!parsed.harness || !parsed.workspace) throw new Error('worker requires --harness and --workspace');
+  const parsed = options.harness || options.nativePrepare ? options : args(process.argv.slice(2));
+  if (!parsed.workspace) throw new Error('worker requires --workspace');
   const env = options.env || process.env;
-  const globalRoot = options.globalRoot || env.LOAM_INGEST_GLOBAL_ROOT || resolveGlobalRoot?.({ env });
+  const globalRoot = parsed.globalRoot || env.LOAM_INGEST_GLOBAL_ROOT || resolveGlobalRoot?.({ env });
+  if (parsed.nativePrepare) {
+    const prepare = options.prepareNativeAgentRun || prepareNativeAgentRun;
+    if (!prepare || !parsed.agentId) throw new Error('native preparation requires --agent-id');
+    return prepare({
+      globalRoot,
+      workspace: parsed.workspace,
+      agentId: parsed.agentId,
+      skillsRoot: options.skillsRoot || env.LOAM_INGEST_SKILLS_ROOT || resolveSkillsRoot?.({ env }),
+      env,
+    });
+  }
+  if (!parsed.harness) throw new Error('worker requires --harness');
   const worker = options.runWorker || runWorker;
   const workerStart = options.startHookWorker || startHookWorker;
   const workerFinish = options.finishHookWorker || finishHookWorker;
@@ -57,5 +73,8 @@ export async function main(options = {}) {
 }
 
 if (process.argv[1] && process.argv[1].endsWith('ingest-worker.mjs')) {
-  try { await main(); } catch (error) { process.stderr.write('loam ingest worker: ' + String(error?.message || error) + '\n'); process.exitCode = 1; }
+  try {
+    const result = await main();
+    if (process.argv.includes('--native-prepare')) process.stdout.write(`${JSON.stringify(result)}\n`);
+  } catch (error) { process.stderr.write('loam ingest worker: ' + String(error?.message || error) + '\n'); process.exitCode = 1; }
 }

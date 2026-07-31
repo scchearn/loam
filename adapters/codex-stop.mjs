@@ -1,9 +1,21 @@
 import { readFile } from 'node:fs/promises';
 import { loadIngestModules } from './ingest-modules.mjs';
 
-const { resolveGlobalRoot, resolveSkillsRoot, dispatchBoundary } = await loadIngestModules().catch(() => ({}));
+const START_FAILURE_MESSAGE = 'Loam background ingestion could not start. Run npx @scchearn/loam setup to repair the installation.';
 
-export async function main({ env = process.env, input = null } = {}) {
+function response({ visibility, outcome, failure }) {
+  if (visibility === 'native' && outcome?.native_continuation) return outcome.native_continuation;
+  return visibility === 'toast' && (failure || outcome?.reason === 'unavailable')
+    ? { systemMessage: START_FAILURE_MESSAGE }
+    : {};
+}
+
+export async function main({
+  env = process.env,
+  input = null,
+  loadIngest = loadIngestModules,
+  errorOutput = process.stderr,
+} = {}) {
   let payload = input;
   if (!payload) {
     try { payload = JSON.parse(await readFile(0, 'utf8')); } catch { payload = {}; }
@@ -13,19 +25,26 @@ export async function main({ env = process.env, input = null } = {}) {
     cwd: typeof payload?.cwd === 'string' ? payload.cwd : undefined,
     stop_hook_active: payload?.stop_hook_active === true,
   };
+  let failure;
+  let outcome;
+  let configuredVisibility = 'silent';
   try {
+    const { resolveGlobalRoot, resolveSkillsRoot, readIngestConfig, dispatchBoundary } = await loadIngest();
     if (!dispatchBoundary) return {};
-    await dispatchBoundary({
+    const globalRoot = env.LOAM_INGEST_GLOBAL_ROOT || resolveGlobalRoot({ env });
+    configuredVisibility = (await readIngestConfig?.(globalRoot, env))?.visibility || 'silent';
+    outcome = await dispatchBoundary({
       harness: 'codex',
       payload,
-      globalRoot: env.LOAM_INGEST_GLOBAL_ROOT || resolveGlobalRoot({ env }),
+      globalRoot,
       skillsRoot: env.LOAM_INGEST_SKILLS_ROOT || resolveSkillsRoot({ env }),
       env,
     });
   } catch (error) {
-    process.stderr.write('loam ingest: ' + String(error?.message || error) + '\n');
+    failure = error;
+    errorOutput.write('loam ingest: ' + String(error?.message || error) + '\n');
   }
-  return {};
+  return response({ visibility: configuredVisibility, outcome, failure });
 }
 
 if (process.argv[1] && process.argv[1].endsWith('codex-stop.mjs')) {

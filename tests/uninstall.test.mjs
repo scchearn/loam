@@ -29,7 +29,7 @@ function skillsRunner({ installed = true, calls = [] } = {}) {
   };
 }
 
-async function readyFixture() {
+async function readyFixture({ codexProfile } = {}) {
   const home = await mkdtemp(join(tmpdir(), 'loam-uninstall-'));
   const globalRoot = join(home, '.agents', 'loam');
   await mkdir(join(home, '.config', 'opencode'), { recursive: true });
@@ -37,6 +37,10 @@ async function readyFixture() {
   await mkdir(join(home, '.codex'), { recursive: true });
   await mkdir(join(home, '.cursor'), { recursive: true });
   await mkdir(join(home, '.agents', 'skills', 'loam-using'), { recursive: true });
+  if (codexProfile !== undefined) {
+    await mkdir(join(home, '.codex', 'agents'), { recursive: true });
+    await writeFile(join(home, '.codex', 'agents', 'loam_ingestor.toml'), codexProfile);
+  }
   await writeFile(join(home, '.agents', 'skills', 'loam-using', 'SKILL.md'), '# using\n');
   const detected = await detectHarnesses({ home });
   const installed = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', detected });
@@ -114,6 +118,7 @@ test('uninstall removes the global root, skills, adapter, and Loam-owned hooks; 
   assert.match(output, /local operational history/);
   assert.equal(await exists(join(home, '.config', 'opencode', 'plugins', 'loam.js')), false, 'opencode adapter removed');
   assert.equal(await exists(join(home, '.config', 'opencode', 'plugins', 'loam.mjs')), false, 'legacy opencode adapter removed');
+  assert.equal(await exists(join(home, '.codex', 'agents', 'loam_ingestor.toml')), false, 'Loam Codex agent profile removed');
   assert.equal(await exists(join(home, '.agents', 'skills', 'loam-using', 'SKILL.md')), true, 'fixture skill tree is not touched directly');
 
   const claudeAfter = JSON.parse(await readFile(claudePath, 'utf8'));
@@ -131,6 +136,31 @@ test('uninstall removes the global root, skills, adapter, and Loam-owned hooks; 
   assert.equal(codexSessionHooks.filter((h) => h.command === `node ${JSON.stringify(installed.codex.sessionPath)}`).length, 0, 'loam codex SessionStart hook removed');
   assert.equal(codexStopHooks.filter((h) => h.command === `node ${JSON.stringify(installed.codex.stopPath)}`).length, 0, 'loam codex Stop hook removed');
   assert.equal(cursorHooks.filter((h) => h.command === 'node' && h.args?.[0] === installed.cursor.path).length, 0, 'loam cursor hook removed');
+});
+
+test('uninstall restores a Codex profile preserved during setup', async () => {
+  const original = 'name = "personal_ingestor"\ndescription = "User profile"\ndeveloper_instructions = "Keep me"\n';
+  const { home, globalRoot } = await readyFixture({ codexProfile: original });
+  const profilePath = join(home, '.codex', 'agents', 'loam_ingestor.toml');
+  assert.notEqual(await readFile(profilePath, 'utf8'), original, 'setup installed the Loam profile');
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
+
+  assert.equal(code, 0);
+  assert.equal(await readFile(profilePath, 'utf8'), original);
+  assert.equal(await exists(`${profilePath}.loam-backup`), false);
+});
+
+test('uninstall preserves a Codex profile the user replaced after setup', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const profilePath = join(home, '.codex', 'agents', 'loam_ingestor.toml');
+  const replacement = 'name = "personal_ingestor"\ndescription = "User replacement"\ndeveloper_instructions = "Keep me"\n';
+  await writeFile(profilePath, replacement);
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
+
+  assert.equal(code, 0);
+  assert.equal(await readFile(profilePath, 'utf8'), replacement);
 });
 
 test('uninstall removes backup files created by setup', async () => {

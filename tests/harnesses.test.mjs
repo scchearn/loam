@@ -54,8 +54,9 @@ test('OpenCode background events queue work and normalize the all-session status
       gate: async () => { order.push('gate'); gateCalls += 1; return { action: 'spawn_worker', workspace: '/workspace' }; },
       resolveGlobalRoot: () => root,
       resolveSkillsRoot: () => root,
-      runWorker: async ({ openCodeSession, hookRun }) => {
+      runWorker: async ({ openCodeSession, hookRun, notify }) => {
         assert.deepEqual(hookRun, { id: 9 });
+        assert.equal(notify, undefined, 'missing showToast must be detected before use');
         const child = await openCodeSession.createChild({ parentId: 'parent-1', title: 'test' });
         await openCodeSession.promptAsync({ sessionId: child.id, parts: [] });
         observed = await openCodeSession.status(child.id);
@@ -101,6 +102,134 @@ test('OpenCode background events queue work and normalize the all-session status
     ['start', { run: { id: 9 } }],
     ['finish', { run: { id: 9 }, reason: 'ok' }],
   ]);
+});
+
+test('OpenCode toast visibility uses the pinned SDK shape for launch and terminal outcomes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loam-opencode-toast-'));
+  const calls = [];
+  let finished;
+  const done = new Promise((resolvePromise) => { finished = resolvePromise; });
+  const plugin = await createOpenCodeAdapter({
+    client: {
+      session: {},
+      tui: { showToast: async (input) => { calls.push(input); return true; } },
+    },
+    ingestion: {
+      gate: async () => ({ action: 'spawn_worker', workspace: '/workspace' }),
+      resolveGlobalRoot: () => root,
+      resolveSkillsRoot: () => root,
+      runWorker: async ({ notify }) => {
+        const launch = new AbortController();
+        const terminal = new AbortController();
+        await notify({ phase: 'launch', visibility: 'toast', signal: launch.signal });
+        await notify({ phase: 'terminal', visibility: 'toast', status: 'failed', signal: terminal.signal });
+        await notify({ phase: 'terminal', visibility: 'native', status: 'ok', signal: terminal.signal });
+        return { reason: 'ok' };
+      },
+    },
+    hookRuns: {
+      resolveGlobalRoot: () => root,
+      beginHookRun: async () => ({ id: 1 }),
+      finishHookRun: async () => undefined,
+      startHookWorker: async () => undefined,
+      finishHookWorker: async () => { finished(); },
+    },
+  })({ directory: '/workspace' });
+
+  await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-toast' } });
+  await done;
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map(({ query, body }) => ({ query, body })), [
+    {
+      query: { directory: '/workspace' },
+      body: { title: 'Loam', message: 'Background code ingestion started.', variant: 'info' },
+    },
+    {
+      query: { directory: '/workspace' },
+      body: { title: 'Loam', message: 'Background code ingestion failed.', variant: 'error' },
+    },
+  ]);
+  assert.ok(calls.every(({ signal }) => signal instanceof AbortSignal));
+});
+
+test('OpenCode toast request rejects with AbortError when the seam aborts its signal', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loam-opencode-toast-abort-'));
+  let aborted = false;
+  let finished;
+  const done = new Promise((resolvePromise) => { finished = resolvePromise; });
+  const plugin = await createOpenCodeAdapter({
+    client: {
+      session: {},
+      tui: {
+        showToast: ({ signal }) => new Promise((_resolvePromise, reject) => {
+          signal.addEventListener('abort', () => {
+            aborted = true;
+            reject(new DOMException('toast aborted', 'AbortError'));
+          }, { once: true });
+        }),
+      },
+    },
+    ingestion: {
+      gate: async () => ({ action: 'spawn_worker', workspace: '/workspace' }),
+      resolveGlobalRoot: () => root,
+      resolveSkillsRoot: () => root,
+      runWorker: async ({ notify }) => {
+        const controller = new AbortController();
+        const request = notify({ phase: 'launch', visibility: 'toast', signal: controller.signal });
+        controller.abort();
+        await assert.rejects(request, { name: 'AbortError' });
+        return { reason: 'ok' };
+      },
+    },
+    hookRuns: {
+      resolveGlobalRoot: () => root,
+      beginHookRun: async () => ({ id: 2 }),
+      finishHookRun: async () => undefined,
+      startHookWorker: async () => undefined,
+      finishHookWorker: async () => { finished(); },
+    },
+  })({ directory: '/workspace' });
+
+  await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-abort' } });
+  await done;
+  assert.equal(aborted, true);
+});
+
+test('OpenCode toast maps a successful persisted terminal outcome to success', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loam-opencode-toast-success-'));
+  const calls = [];
+  let finished;
+  const done = new Promise((resolvePromise) => { finished = resolvePromise; });
+  const plugin = await createOpenCodeAdapter({
+    client: {
+      session: {},
+      tui: { showToast: async (input) => { calls.push(input); return true; } },
+    },
+    ingestion: {
+      gate: async () => ({ action: 'spawn_worker', workspace: '/workspace' }),
+      resolveGlobalRoot: () => root,
+      resolveSkillsRoot: () => root,
+      runWorker: async ({ notify }) => {
+        const controller = new AbortController();
+        await notify({ phase: 'terminal', visibility: 'toast', status: 'ok', signal: controller.signal });
+        return { reason: 'ok' };
+      },
+    },
+    hookRuns: {
+      resolveGlobalRoot: () => root,
+      beginHookRun: async () => ({ id: 3 }),
+      finishHookRun: async () => undefined,
+      startHookWorker: async () => undefined,
+      finishHookWorker: async () => { finished(); },
+    },
+  })({ directory: '/workspace' });
+
+  await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-success' } });
+  await done;
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].body, {
+    title: 'Loam', message: 'Background code ingestion completed.', variant: 'success',
+  });
 });
 
 test('detached workers report their result without changing worker failures', async () => {

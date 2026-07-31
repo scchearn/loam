@@ -81,7 +81,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
   const selected = new Set(selectedMarketplaceHarnesses);
   const requestedHarnesses = Object.fromEntries(Object.entries(discovery.harnesses).map(([id, harness]) => [
     id,
-    (id === 'claude' || id === 'codex') && !selected.has(id) && !harness.marketplaceReady
+    (id === 'claude' || id === 'codex') && harness.state !== 'absent' && !selected.has(id) && !harness.marketplaceReady
       ? { ...harness, state: 'skipped' }
       : harness,
   ]));

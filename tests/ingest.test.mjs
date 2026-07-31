@@ -7,7 +7,11 @@ import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
 import { fingerprintActionable } from '../integration/ingest-fingerprint.mjs';
-import { gate, ingestStatus, runRoot, runWorker, startWorker } from '../integration/ingest.mjs';
+import {
+  bindNativeAgent, claudeSessionName, dispatchBoundary, finalizeNativeAgentRun,
+  finalizeWorkerRun, gate, ingestStatus, prepareNativeAgentRun, prepareWorkerRun,
+  readIngestConfig, runRoot, runWorker, startWorker,
+} from '../integration/ingest.mjs';
 import { bootIdentity, childIdentity, processDescriptor, resolveExecutable, startTracked } from '../integration/ingest-process.mjs';
 
 async function fixture() {
@@ -22,6 +26,29 @@ async function fixture() {
   const exclusions = join(skills, 'loam-ingesting-codebase', 'references', 'ingestion-exclusions.md');
   await writeFile(exclusions, '# exclusions\n');
   return { root, workspace, wiki, skills, exclusions };
+}
+
+async function nativeInstall(root) {
+  const adapterRoot = join(root, 'plugins', '0.9.10');
+  const integrationPath = join(root, 'integration', 'loam.mjs');
+  await mkdir(adapterRoot, { recursive: true });
+  await mkdir(join(root, 'integration'), { recursive: true });
+  await writeFile(join(adapterRoot, 'ingest-worker.mjs'), '// installed worker\n');
+  await writeFile(integrationPath, '// installed integration\n');
+  await writeFile(join(root, 'install.json'), JSON.stringify({
+    schema_version: 1,
+    plugin_version: '0.9.10',
+    runtime_version: '0.9.5',
+    target: 'x86_64-unknown-linux-musl',
+    runtime_sha256: 'a'.repeat(64),
+    runtime_path: join(root, 'bin', 'loam'),
+    adapter_root: adapterRoot,
+    integration_path: integrationPath,
+    skills_scope: 'global',
+    skills_source: 'scchearn/loam',
+    configured_harnesses: ['codex'],
+  }));
+  return { adapterRoot, integrationPath };
 }
 
 test('fingerprints the complete UTF-8 actionable set and includes exclusions identity', async () => {
@@ -96,6 +123,99 @@ test('boundary gate honors config and environment precedence and blocks worker r
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { enabled: true } }));
   assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
   assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_WORKER: '1' } }), { action: 'skip', reason: 'disabled' });
+  assert.deepEqual(await gate({ ...options, payload: { cwd: workspace, agent_type: 'loam:ingestor' }, env: {} }), { action: 'skip', reason: 'disabled' });
+  assert.equal((await gate({ ...options, payload: { cwd: workspace, agent_type: 'other-agent' }, env: {} })).action, 'spawn_worker');
+});
+
+test('visibility config accepts supported values and silently normalizes everything else', async () => {
+  const globalRoot = await mkdtemp(join(tmpdir(), 'loam-visibility-config-'));
+  assert.equal((await readIngestConfig(globalRoot, {})).visibility, 'silent');
+  assert.equal((await readIngestConfig(globalRoot, {})).require_visible_worker, false);
+  for (const visibility of ['silent', 'toast', 'native']) {
+    await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { visibility } }));
+    assert.equal((await readIngestConfig(globalRoot, {})).visibility, visibility);
+  }
+  await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { require_visible_worker: true } }));
+  assert.equal((await readIngestConfig(globalRoot, {})).require_visible_worker, true);
+  await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { require_visible_worker: 'true' } }));
+  assert.equal((await readIngestConfig(globalRoot, {})).require_visible_worker, false);
+  await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'loud' } }));
+  assert.equal((await readIngestConfig(globalRoot, {})).visibility, 'silent');
+});
+
+test('Claude session name is deterministic, Loam-attributable, and workspace scoped', () => {
+  const first = claudeSessionName('/workspace/one');
+  assert.equal(first, claudeSessionName('/workspace/one'));
+  assert.notEqual(first, claudeSessionName('/workspace/two'));
+  assert.match(first, /^loam-ingest-[a-f0-9]{10}$/u);
+  assert.doesNotMatch(first, /workspace/u);
+});
+
+test('notification launch is non-blocking and terminal status follows persisted outcome', async (context) => {
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  const { root, workspace, wiki, skills } = await fixture();
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'toast' } }));
+  const calls = [];
+  let modelCompleted = false;
+  let launchNotificationSettled = false;
+  let markLaunchCalled;
+  const launchCalled = new Promise((resolvePromise) => { markLaunchCalled = resolvePromise; });
+  const resultPromise = runWorker({
+    harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' },
+    runtimeRunner: async ({ args }) => args[0] === 'state'
+      ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+      : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
+    modelRunner: async () => ({
+      completion: Promise.resolve().then(() => { modelCompleted = true; return { code: 0 }; }),
+    }),
+    notify: async (event) => {
+      calls.push(event);
+      if (event.phase === 'launch') {
+        markLaunchCalled();
+        await new Promise((resolvePromise) => event.signal.addEventListener('abort', resolvePromise, { once: true }));
+        launchNotificationSettled = true;
+      }
+    },
+  });
+
+  await launchCalled;
+  assert.equal(modelCompleted, true, 'launch notification must not block worker completion');
+  context.mock.timers.tick(249);
+  assert.equal(calls[0].signal.aborted, false, 'notification deadline must not fire early');
+  assert.equal(launchNotificationSettled, false);
+  context.mock.timers.tick(1);
+  assert.equal(calls[0].signal.aborted, true, 'notification deadline must fire at 250 ms');
+  const result = await resultPromise;
+  const stored = JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8'));
+  assert.equal(result.reason, 'ok');
+  assert.equal(stored.status, 'failed');
+  assert.deepEqual(calls.map(({ phase }) => phase), ['launch', 'terminal']);
+  assert.equal(launchNotificationSettled, true, 'deadline must settle an abort-aware notification resource');
+  assert.equal(calls[1].signal.aborted, false);
+  assert.equal(calls[1].status, stored.status);
+});
+
+test('silent and failing notifications cannot change ingestion state or exceed two calls', async () => {
+  for (const visibility of ['silent', 'toast']) {
+    const { root, workspace, wiki, skills } = await fixture();
+    await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility } }));
+    const calls = [];
+    const result = await runWorker({
+      harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
+      readiness: { ready: true, runtimePath: '/private/loam' },
+      runtimeRunner: async ({ args }) => args[0] === 'state'
+        ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+        : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
+      modelRunner: async () => ({ completion: Promise.resolve({ code: 0 }) }),
+      notify: async (event) => { calls.push(event); throw new Error('toast failed'); },
+    });
+    const stored = JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8'));
+    assert.equal(result.reason, 'ok');
+    assert.equal(stored.status, 'failed');
+    assert.equal(await readFile(join(runRoot(root, workspace), 'lease.json')).then(() => true).catch(() => false), false);
+    assert.equal(calls.length, visibility === 'silent' ? 0 : 2);
+  }
 });
 
 test('detached worker launch forwards the hook-run correlation id', () => {
@@ -115,6 +235,230 @@ test('detached worker launch forwards the hook-run correlation id', () => {
   assert.deepEqual(request.args, [
     '/worker.mjs', '--harness', 'codex', '--workspace', workspace, '--hook-run-id', '17',
   ]);
+});
+
+test('Codex native boundary records one intent and falls back exactly once on the continuation Stop', async () => {
+  const { root, workspace, skills } = await fixture();
+  const adapterRoot = join(root, 'plugins', 'version');
+  await mkdir(adapterRoot, { recursive: true });
+  await writeFile(join(root, 'install.json'), JSON.stringify({ adapter_root: adapterRoot }));
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native', min_interval_seconds: 0 } }));
+  const spawns = [];
+  const options = {
+    harness: 'codex', globalRoot: root, skillsRoot: skills, env: {},
+    payload: { cwd: workspace, session_id: 'session-1', stop_hook_active: false },
+    hookRunId: 41,
+    spawn: (request) => { spawns.push(request); return { pid: 123 }; },
+  };
+
+  const first = await dispatchBoundary(options);
+  assert.equal(first.action, 'spawn_worker');
+  assert.equal(first.native_continuation.decision, 'block');
+  assert.equal(spawns.length, 0, 'first native Stop must not start a detached worker');
+  const intentPath = join(runRoot(root, workspace), 'native-intent.json');
+  const intent = JSON.parse(await readFile(intentPath, 'utf8'));
+  assert.equal(intent.workspace, workspace);
+  assert.equal(intent.session_id, 'session-1');
+  assert.equal(intent.claim, 'pending');
+
+  assert.deepEqual(await dispatchBoundary(options), { action: 'skip', reason: 'busy', workspace });
+  assert.equal(spawns.length, 0, 'duplicate first Stop must not issue another continuation or spawn');
+
+  const fallback = await dispatchBoundary({
+    ...options,
+    hookRunId: 42,
+    payload: { ...options.payload, stop_hook_active: true },
+  });
+  assert.equal(fallback.action, 'spawn_worker');
+  assert.equal(fallback.native_fallback, true);
+  assert.equal(spawns.length, 1);
+  assert.ok(spawns[0].args.includes('42'));
+  const claim = JSON.parse(await readFile(join(runRoot(root, workspace), 'native-claim.json'), 'utf8'));
+  assert.equal(claim.claim, 'fallback');
+  assert.equal(claim.intent_id, intent.intent_id);
+
+  assert.deepEqual(await dispatchBoundary({
+    ...options,
+    payload: { ...options.payload, stop_hook_active: true },
+  }), { action: 'skip', reason: 'busy', workspace });
+  assert.equal(spawns.length, 1, 'duplicate continuation must not start a second fallback');
+});
+
+test('Codex native cheap skips, bound intents, stale intents, and corrupt state are deterministic', async () => {
+  const { root, workspace, skills } = await fixture();
+  const adapterRoot = join(root, 'plugins', 'version');
+  await mkdir(adapterRoot, { recursive: true });
+  await writeFile(join(root, 'install.json'), JSON.stringify({ adapter_root: adapterRoot }));
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native', timeout_seconds: 1 } }));
+  const intentRoot = runRoot(root, workspace);
+  let spawns = 0;
+  const base = {
+    harness: 'codex', globalRoot: root, skillsRoot: skills, now: 100,
+    payload: { cwd: workspace, session_id: 'session-2' }, env: {},
+    spawn: () => { spawns += 1; return { pid: 1 }; },
+  };
+
+  assert.deepEqual(await dispatchBoundary({ ...base, env: { LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
+  await assert.rejects(() => readFile(join(intentRoot, 'native-intent.json')), { code: 'ENOENT' });
+
+  const first = await dispatchBoundary(base);
+  assert.equal(first.native_continuation.decision, 'block');
+  const intent = JSON.parse(await readFile(join(intentRoot, 'native-intent.json'), 'utf8'));
+  await writeFile(join(intentRoot, 'native-claim.json'), JSON.stringify({ ...intent, claim: 'agent', agent_id: 'agent-1' }));
+  await rm(join(intentRoot, 'native-intent.json'));
+  assert.deepEqual(await dispatchBoundary({
+    ...base,
+    payload: { ...base.payload, stop_hook_active: true },
+  }), { action: 'skip', reason: 'busy', workspace });
+  assert.equal(spawns, 0, 'a bound native intent must never fall back');
+
+  await rm(join(intentRoot, 'native-claim.json'));
+  const replacement = await dispatchBoundary({ ...base, now: 2_000 });
+  assert.equal(replacement.native_continuation.decision, 'block', 'an expired intent must not suppress a later continuation');
+  const replacedIntent = JSON.parse(await readFile(join(intentRoot, 'native-intent.json'), 'utf8'));
+  assert.notEqual(replacedIntent.intent_id, intent.intent_id);
+
+  await writeFile(join(intentRoot, 'native-intent.json'), '{malformed');
+  const degraded = await dispatchBoundary({
+    ...base,
+    now: 2_001,
+    payload: { ...base.payload, stop_hook_active: true },
+  });
+  assert.equal(degraded.action, 'spawn_worker');
+  assert.equal(degraded.native_fallback, true);
+  assert.equal(spawns, 1, 'corrupt intent state must degrade to one detached worker');
+});
+
+test('Codex native fallback launch failure clears its claim for a later attempt', async () => {
+  const { root, workspace, skills } = await fixture();
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native' } }));
+  const options = {
+    harness: 'codex', globalRoot: root, skillsRoot: skills, env: {},
+    payload: { cwd: workspace, session_id: 'retry-session' },
+  };
+
+  assert.equal((await dispatchBoundary(options)).native_continuation.decision, 'block');
+  assert.deepEqual(await dispatchBoundary({
+    ...options,
+    payload: { ...options.payload, stop_hook_active: true },
+  }), { action: 'skip', reason: 'unavailable', detail: 'installed ingestion worker is unavailable' });
+  await assert.rejects(() => readFile(join(runRoot(root, workspace), 'native-claim.json')), { code: 'ENOENT' });
+  assert.equal((await dispatchBoundary(options)).native_continuation.decision, 'block');
+});
+
+test('Codex native race admits only the first lease holder in either ordering', async () => {
+  for (const order of ['fallback-first', 'native-first']) {
+    const { root, workspace, wiki, skills } = await fixture();
+    let diffCalls = 0;
+    const runtimeRunner = async ({ args }) => args[0] === 'state'
+      ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+      : { code: 0, stdout: JSON.stringify(diffCalls++ === 0 ? [{ path: 'src/a.js', mtime: '1', reason: 'new' }] : []), stderr: '' };
+    const options = {
+      harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
+      readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner,
+      env: { LOAM_INGEST_BACKGROUND: '1' },
+    };
+
+    const first = await prepareWorkerRun(options);
+    const late = await prepareWorkerRun(options);
+    assert.equal(first.action, 'run', order);
+    assert.deepEqual(late, { action: 'skip', result: { reason: 'busy' } }, order);
+    await finalizeWorkerRun(first, { launch: { background: false }, result: { code: 0 } });
+    await assert.rejects(() => readFile(join(runRoot(root, workspace), 'lease.json')), { code: 'ENOENT' });
+  }
+});
+
+test('Codex loam_ingestor binding prepares first and finalizes from verified state', async () => {
+  const { root, workspace, wiki, skills } = await fixture();
+  const { adapterRoot, integrationPath } = await nativeInstall(root);
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native', min_interval_seconds: 0 } }));
+
+  const boundary = { harness: 'codex', payload: { cwd: workspace, session_id: 'parent-1' }, globalRoot: root, skillsRoot: skills, env: {} };
+  assert.equal((await dispatchBoundary(boundary)).native_continuation.decision, 'block');
+  const bound = await bindNativeAgent({ globalRoot: root, workspace, agentId: 'agent-1' });
+  assert.equal(bound.status, 'bound');
+  assert.equal(bound.owns_claim, true);
+  assert.equal(bound.integration_path, integrationPath);
+  assert.equal(bound.adapter_path, adapterRoot);
+  assert.equal(bound.worker_path, join(adapterRoot, 'ingest-worker.mjs'));
+  const claim = JSON.parse(await readFile(join(runRoot(root, workspace), 'native-claim.json'), 'utf8'));
+  assert.equal(claim.claim, 'agent');
+  assert.equal(claim.agent_id, 'agent-1');
+
+  let ingested = false;
+  const runtimeRunner = async ({ args }) => args[0] === 'state'
+    ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: ingested ? 0 : 1 } }] }), stderr: '' }
+    : { code: 0, stdout: JSON.stringify(ingested ? [] : [{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' };
+  const prepared = await prepareNativeAgentRun({
+    globalRoot: root, workspace, agentId: 'agent-1', skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner, env: {},
+  });
+  assert.deepEqual(prepared, { action: 'run' });
+  const lease = JSON.parse(await readFile(join(runRoot(root, workspace), 'lease.json'), 'utf8'));
+  assert.equal(lease.launch_mode, 'codex_native');
+  assert.equal(lease.child_identity.agent_id, 'agent-1');
+  const agentFile = (await readdir(runRoot(root, workspace))).find((name) => name.startsWith('native-agent-'));
+  const agentRecord = JSON.parse(await readFile(join(runRoot(root, workspace), agentFile), 'utf8'));
+  await writeFile(join(runRoot(root, workspace), agentFile), JSON.stringify({ ...agentRecord, expires_at: 0 }));
+
+  ingested = true;
+  const finalized = await finalizeNativeAgentRun({
+    globalRoot: root, workspace, agentId: 'agent-1', runtimeRunner, env: {},
+  });
+  assert.equal(finalized.reason, 'ok');
+  assert.equal(finalized.owns_claim, true);
+  const stored = JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8'));
+  assert.equal(stored.status, 'ok');
+  await assert.rejects(() => readFile(join(runRoot(root, workspace), 'lease.json')), { code: 'ENOENT' });
+  assert.deepEqual(await finalizeNativeAgentRun({ globalRoot: root, workspace, agentId: 'agent-1', env: {} }), { reason: 'busy' });
+});
+
+test('Codex loam_ingestor preparation skips after fallback wins and missing or malformed intents stay inert', async () => {
+  const { root, workspace, wiki, skills } = await fixture();
+  await nativeInstall(root);
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native', min_interval_seconds: 0 } }));
+  const options = {
+    harness: 'codex', payload: { cwd: workspace, session_id: 'parent-2' }, globalRoot: root,
+    skillsRoot: skills, env: {}, spawn: () => ({ pid: 1 }),
+  };
+  assert.equal((await dispatchBoundary(options)).native_continuation.decision, 'block');
+  assert.equal((await dispatchBoundary({ ...options, payload: { ...options.payload, stop_hook_active: true } })).native_fallback, true);
+  const late = await bindNativeAgent({ globalRoot: root, workspace, agentId: 'agent-late' });
+  assert.equal(late.status, 'late');
+  assert.equal(late.owns_claim, false);
+
+  const runtimeRunner = async ({ args }) => args[0] === 'state'
+    ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+    : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' };
+  const fallback = await prepareWorkerRun({
+    harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner, env: {},
+  });
+  assert.equal(fallback.action, 'run');
+  assert.deepEqual(await prepareNativeAgentRun({
+    globalRoot: root, workspace, agentId: 'agent-late', skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner, env: {},
+  }), { action: 'skip', reason: 'busy' });
+  await finalizeWorkerRun(fallback, { launch: { background: false }, result: { code: 0 } });
+
+  const missingWorkspace = join(root, 'missing-workspace');
+  await mkdir(missingWorkspace);
+  assert.deepEqual(await bindNativeAgent({ globalRoot: root, workspace: missingWorkspace, agentId: 'agent-none' }), { status: 'missing' });
+  await mkdir(runRoot(root, missingWorkspace), { recursive: true });
+  await writeFile(join(runRoot(root, missingWorkspace), 'native-intent.json'), '{malformed');
+  assert.deepEqual(await bindNativeAgent({ globalRoot: root, workspace: missingWorkspace, agentId: 'agent-bad' }), { status: 'malformed' });
+  assert.deepEqual(await bindNativeAgent({ globalRoot: root, workspace, agentId: 'bad\nagent' }), { status: 'invalid' });
+});
+
+test('Codex loam_ingestor stop aborts an unprepared bound intent without trusting assistant text', async () => {
+  const { root, workspace, skills } = await fixture();
+  await nativeInstall(root);
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native' } }));
+  assert.equal((await dispatchBoundary({ harness: 'codex', payload: { cwd: workspace }, globalRoot: root, skillsRoot: skills, env: {} })).native_continuation.decision, 'block');
+  await bindNativeAgent({ globalRoot: root, workspace, agentId: 'agent-abort' });
+  const aborted = await finalizeNativeAgentRun({ globalRoot: root, workspace, agentId: 'agent-abort', env: {} });
+  assert.equal(aborted.reason, 'unavailable');
+  assert.equal(aborted.owns_claim, true);
 });
 
 test('worker leases before full state and issues the exact exclusions-aware diff argv', async () => {
@@ -155,6 +499,113 @@ test('worker leases before full state and issues the exact exclusions-aware diff
   assert.equal(calls[2][0], 'state');
   assert.equal(calls[2].includes('--fast'), false);
   assert.equal(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8').then((value) => value.includes('"status":"failed"')), true);
+});
+
+test('worker preparation and finalization expose one reusable safety lifecycle', async () => {
+  const lifecycle = await import('../integration/ingest.mjs');
+  assert.equal(typeof lifecycle.prepareWorkerRun, 'function');
+  assert.equal(typeof lifecycle.finalizeWorkerRun, 'function');
+  const { root, workspace, wiki, skills } = await fixture();
+  let diffCalls = 0;
+  const runtimeRunner = async ({ args }) => {
+    if (args[0] === 'state') {
+      return { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' };
+    }
+    diffCalls += 1;
+    return {
+      code: 0,
+      stdout: JSON.stringify(diffCalls === 1 ? [{ path: 'src/a.js', mtime: '1', reason: 'new' }] : []),
+      stderr: '',
+    };
+  };
+  const prepared = await lifecycle.prepareWorkerRun({
+    harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner,
+    env: { LOAM_INGEST_BACKGROUND: '1' },
+  });
+  assert.equal(prepared.action, 'run');
+  assert.equal(prepared.intent.lease_id, prepared.lease.lease_id);
+  assert.equal(prepared.intent.actionable_fingerprint.length, 64);
+  const persistedIntent = JSON.parse(await readFile(join(runRoot(root, workspace), 'lease.json'), 'utf8'));
+  assert.equal(persistedIntent.lease_id, prepared.intent.lease_id);
+  assert.equal(persistedIntent.actionable_count, 1);
+
+  const result = await lifecycle.finalizeWorkerRun(prepared, {
+    launch: { background: false },
+    result: { code: 0 },
+  });
+  assert.equal(result.reason, 'ok');
+  assert.equal(JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8')).status, 'ok');
+  await assert.rejects(() => readFile(join(runRoot(root, workspace), 'lease.json')), (error) => error.code === 'ENOENT');
+
+  const skippedRoot = join(root, 'skip');
+  const skipped = await lifecycle.prepareWorkerRun({
+    harness: 'codex', workspace, globalRoot: skippedRoot, skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' },
+    runtimeRunner: async () => ({ code: 0, stdout: JSON.stringify({ wiki_root: '', hints: [] }), stderr: '' }),
+    env: { LOAM_INGEST_BACKGROUND: '1' },
+  });
+  assert.deepEqual(skipped, { action: 'skip', result: { reason: 'nothing_to_do' } });
+  await assert.rejects(() => readFile(join(runRoot(skippedRoot, workspace), 'lease.json')), (error) => error.code === 'ENOENT');
+});
+
+test('worker preparation preserves skip classifications and never strands its lease', async () => {
+  const { prepareWorkerRun } = await import('../integration/ingest.mjs');
+  const cases = [
+    { name: 'disabled', expected: 'disabled', detail: undefined, config: { enabled: false }, env: {} },
+    { name: 'backoff', expected: 'too_soon', detail: 'backoff', previous: { schema: 1, backoff_until: Date.now() + 60_000 } },
+    { name: 'debounced', expected: 'too_soon', detail: 'debounced', previous: { schema: 1, status: 'ok', completed_at: Date.now() } },
+    { name: 'runtime', expected: 'unavailable', detail: 'runtime_missing', readiness: { ready: false, category: 'runtime_missing' } },
+    { name: 'probe-timeout', expected: 'unavailable', detail: 'probe_timeout', stateResponse: { code: null, category: 'timeout', stdout: '', stderr: '' } },
+    { name: 'probe-malformed', expected: 'unavailable', detail: 'malformed_state', stateResponse: { code: 0, stdout: '{', stderr: '' } },
+    { name: 'probe-failed', expected: 'unavailable', detail: 'probe_failed', stateResponse: { code: 1, stdout: '', stderr: 'failed' } },
+    { name: 'wiki', expected: 'nothing_to_do', detail: 'wiki_missing', state: { wiki_root: '', hints: [] } },
+    { name: 'codegraph', expected: 'nothing_to_do', detail: 'codegraph_missing', removeCodegraph: true },
+    { name: 'pending', expected: 'nothing_to_do', detail: 'no_pending', state: { hints: [] } },
+    { name: 'exclusions', expected: 'unavailable', detail: 'exclusions_unavailable', missingSkills: true },
+    { name: 'diff-timeout', expected: 'unavailable', detail: 'probe_timeout', diffResponse: { code: null, category: 'timeout', stdout: '', stderr: '' } },
+    { name: 'diff-failed', expected: 'unavailable', detail: 'probe_failed', diffResponse: { code: 1, stdout: '', stderr: 'failed' } },
+    { name: 'diff-malformed', expected: 'unavailable', detail: 'malformed_state', diffResponse: { code: 0, stdout: '{', stderr: '' } },
+    { name: 'fingerprint', expected: 'unavailable', detail: 'fingerprint_unavailable', entries: [{ path: '../outside.js', mtime: '1', reason: 'new' }] },
+    { name: 'empty', expected: 'nothing_to_do', detail: 'no_actionable_work', entries: [] },
+  ];
+  for (const item of cases) {
+    const { root, workspace, wiki, skills } = await fixture();
+    const globalRoot = join(root, `global-${item.name}`);
+    await mkdir(globalRoot, { recursive: true });
+    if (item.config) await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: item.config }));
+    if (item.previous) {
+      await mkdir(runRoot(globalRoot, workspace), { recursive: true });
+      await writeFile(join(runRoot(globalRoot, workspace), 'last-run.json'), JSON.stringify(item.previous));
+    }
+    if (item.removeCodegraph) await rm(join(wiki, 'code'), { recursive: true });
+    const defaultState = {
+      wiki_root: wiki,
+      hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }],
+    };
+    const state = { ...defaultState, ...(item.state || {}) };
+    const runtimeRunner = async ({ args }) => {
+      if (args[0] === 'state') {
+        return item.stateResponse || { code: 0, stdout: JSON.stringify(state), stderr: '' };
+      }
+      return item.diffResponse || {
+        code: 0,
+        stdout: JSON.stringify(item.entries === undefined ? [{ path: 'src/a.js', mtime: '1', reason: 'new' }] : item.entries),
+        stderr: '',
+      };
+    };
+    const skipped = await prepareWorkerRun({
+      harness: 'codex', workspace, globalRoot,
+      skillsRoot: item.missingSkills ? join(root, 'missing-skills') : skills,
+      readiness: item.readiness || { ready: true, runtimePath: '/private/loam' },
+      runtimeRunner, env: item.env || { LOAM_INGEST_BACKGROUND: '1' },
+    });
+    assert.deepEqual(skipped, { action: 'skip', result: { reason: item.expected } }, item.name);
+    const stored = JSON.parse(await readFile(join(runRoot(globalRoot, workspace), 'last-run.json'), 'utf8'));
+    assert.equal(stored.status, 'skipped', item.name);
+    assert.equal(stored.detail, item.detail, item.name);
+    await assert.rejects(() => readFile(join(runRoot(globalRoot, workspace), 'lease.json')), (error) => error.code === 'ENOENT');
+  }
 });
 
 test('maintenance worker distinguishes missing wiki and missing codegraph before diff or model launch', async () => {
@@ -355,6 +806,10 @@ test('published adapters load only the staged integration after the source tree 
   try {
     const claude = await import(`${pathToFileURL(join(adapterRoot, 'claude-stop.mjs')).href}?test=claude`);
     assert.equal((await claude.main({ env, payload: { cwd: root } })).reason, 'disabled');
+    assert.equal((await claude.main({
+      env: { ...env, LOAM_INGEST_BACKGROUND: '1' },
+      payload: { cwd: root, agent_type: 'loam:ingestor' },
+    })).reason, 'disabled');
     const codex = await import(`${pathToFileURL(join(adapterRoot, 'codex-stop.mjs')).href}?test=codex`);
     assert.deepEqual(await codex.main({ env, input: { cwd: root } }), {});
     const stdout = await new Promise((resolvePromise, reject) => {
@@ -440,6 +895,7 @@ test('Windows batch launch executes from a spaced path', { skip: process.platfor
 
 test('Claude uses a help-only capability check, falls back cleanly, and receives the source-safety prompt', async () => {
   const { root, workspace, wiki, skills } = await fixture();
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'toast' } }));
   const bin = await mkdtemp(join(tmpdir(), 'loam-claude-'));
   const command = join(bin, process.platform === 'win32' ? 'claude.cmd' : 'claude');
   const script = process.platform === 'win32' ? join(bin, 'claude-shim.cjs') : command;
@@ -457,6 +913,7 @@ process.exit(args[0] === '--bg' ? 1 : 0);
     await chmod(command, 0o700);
   }
   const source = await readFile(join(workspace, 'src', 'a.js'), 'utf8');
+  const notifications = [];
   const result = await runWorker({
     harness: 'claude', workspace, globalRoot: root, skillsRoot: skills,
     readiness: { ready: true, runtimePath: '/private/loam' },
@@ -464,13 +921,150 @@ process.exit(args[0] === '--bg' ? 1 : 0);
     runtimeRunner: async ({ args }) => args[0] === 'state'
       ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
       : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
+    notify: async (event) => {
+      if (event.phase === 'launch' && event.launchMode === 'claude_bg') notifications.push(event);
+    },
   });
   const argv = (await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse);
   assert.equal(result.reason, 'ok');
   assert.deepEqual(argv.map((args) => args[0]), ['--help', '--bg', '-p']);
   assert.match(argv.at(-1)[1], /Do not modify source files, commit, or push/u);
   assert.match(argv.at(-1)[1], /Do not spawn other agents or subagents\./u);
+  assert.equal(notifications.length, 0, 'failed background registration must not report a planned Agent View name');
   assert.equal(await readFile(join(workspace, 'src', 'a.js'), 'utf8'), source);
+});
+
+test('Claude loam:ingestor visibility uses one registered Agent View session name for command and launch event', async () => {
+  const { root, workspace, wiki, skills } = await fixture();
+  const bin = await mkdtemp(join(tmpdir(), 'loam-claude-visible-'));
+  const command = join(bin, process.platform === 'win32' ? 'claude.cmd' : 'claude');
+  const script = process.platform === 'win32' ? join(bin, 'claude-shim.cjs') : command;
+  const calls = join(bin, 'calls.jsonl');
+  const state = join(bin, 'agent.json');
+  await writeFile(script, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.LOAM_TEST_CALLS, JSON.stringify(args) + '\\n');
+if (args[0] === '--help') { process.stdout.write('--bg'); process.exit(0); }
+if (args[0] === '--bg') {
+  fs.writeFileSync(process.env.LOAM_TEST_AGENT, JSON.stringify({ name: args[args.indexOf('--name') + 1] }));
+  process.stdout.write('backgrounded · stdout-wrong');
+  process.exit(0);
+}
+if (args[0] === 'agents') {
+  const agent = JSON.parse(fs.readFileSync(process.env.LOAM_TEST_AGENT, 'utf8'));
+  process.stdout.write(JSON.stringify([
+    { name: 'unrelated-agent', id: 'agent-wrong', status: 'done' },
+    { ...agent, id: 'agent-42', status: 'done' },
+  ]));
+  process.exit(0);
+}
+process.exit(0);
+`);
+  if (process.platform === 'win32') {
+    await writeFile(command, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+  } else {
+    await chmod(command, 0o700);
+  }
+
+  const expectedName = claudeSessionName(workspace);
+  for (const configuredVisibility of ['toast', 'native', 'silent']) {
+    const globalRoot = join(root, `global-${configuredVisibility}`);
+    await mkdir(globalRoot, { recursive: true });
+    await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { visibility: configuredVisibility } }));
+    const launchEvents = [];
+    const result = await runWorker({
+      harness: 'claude', workspace, globalRoot, skillsRoot: skills,
+      readiness: { ready: true, runtimePath: '/private/loam' },
+      env: {
+        ...process.env,
+        PATH: [bin, process.env.PATH || ''].filter(Boolean).join(delimiter),
+        LOAM_TEST_CALLS: calls,
+        LOAM_TEST_AGENT: state,
+        LOAM_INGEST_BACKGROUND: '1',
+      },
+      runtimeRunner: async ({ args }) => args[0] === 'state'
+        ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+        : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
+      notify: async (event) => { if (event.phase === 'launch') launchEvents.push(event); },
+    });
+    const argv = (await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse);
+    const background = argv.filter((args) => args[0] === '--bg').at(-1);
+    assert.equal(result.reason, 'ok');
+    assert.equal(background[background.indexOf('--agent') + 1], 'loam:ingestor');
+    assert.equal(background[background.indexOf('--name') + 1], expectedName);
+    assert.equal(background[background.indexOf('--permission-mode') + 1], 'dontAsk');
+    assert.equal(launchEvents.length, configuredVisibility === 'silent' ? 0 : 1);
+    if (launchEvents.length) {
+      assert.equal(launchEvents[0].launchMode, 'claude_bg');
+      assert.equal(launchEvents[0].identity.manager_name, expectedName);
+      assert.equal(launchEvents[0].identity.manager_id, 'agent-42');
+    }
+  }
+});
+
+test('Claude downgrade reasons survive every visibility tier and require_visible_worker can refuse fallback', async () => {
+  const cases = [
+    ['disabled', 'agent_view_disabled', []],
+    ['unavailable', 'agent_view_unavailable', ['--help']],
+    ['launch_failed', 'agent_view_launch_failed', ['--help', '--bg']],
+  ];
+  for (const visibility of ['silent', 'toast', 'native']) {
+    for (const [mode, reason, refusedCalls] of cases) {
+      for (const requireVisibleWorker of [false, true]) {
+        const { root, workspace, wiki, skills } = await fixture();
+        await writeFile(join(root, 'config.json'), JSON.stringify({
+          background_ingest: { visibility, require_visible_worker: requireVisibleWorker },
+        }));
+        const bin = await mkdtemp(join(tmpdir(), 'loam-claude-downgrade-'));
+        const command = join(bin, process.platform === 'win32' ? 'claude.cmd' : 'claude');
+        const script = process.platform === 'win32' ? join(bin, 'claude-shim.cjs') : command;
+        const calls = join(bin, 'calls.jsonl');
+        await writeFile(calls, '');
+        await writeFile(script, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.LOAM_TEST_CALLS, JSON.stringify(args) + '\\n');
+if (args[0] === '--help') {
+  process.stdout.write(process.env.LOAM_TEST_AGENT_VIEW_MODE === 'unavailable' ? 'usage' : '--bg');
+  process.exit(0);
+}
+if (args[0] === '--bg') process.exit(process.env.LOAM_TEST_AGENT_VIEW_MODE === 'launch_failed' ? 1 : 0);
+process.exit(0);
+`);
+        if (process.platform === 'win32') {
+          await writeFile(command, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+        } else {
+          await chmod(command, 0o700);
+        }
+        const result = await runWorker({
+          harness: 'claude', workspace, globalRoot: root, skillsRoot: skills,
+          readiness: { ready: true, runtimePath: '/private/loam' },
+          env: {
+            ...process.env,
+            PATH: [bin, process.env.PATH || ''].filter(Boolean).join(delimiter),
+            LOAM_TEST_CALLS: calls,
+            LOAM_TEST_AGENT_VIEW_MODE: mode,
+            LOAM_INGEST_BACKGROUND: '1',
+            ...(mode === 'disabled' ? { CLAUDE_CODE_DISABLE_AGENT_VIEW: '1' } : {}),
+          },
+          runtimeRunner: async ({ args }) => args[0] === 'state'
+            ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+            : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
+        });
+        const argv = await readFile(calls, 'utf8').then((value) => value.trim() ? value.trim().split('\n').map(JSON.parse) : []);
+        const stored = JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8'));
+        assert.equal(stored.downgrade_reason, reason, `${visibility}/${mode}/${requireVisibleWorker}`);
+        assert.equal(result.reason, requireVisibleWorker ? 'unavailable' : 'ok');
+        assert.deepEqual(
+          argv.map((args) => args[0]),
+          requireVisibleWorker ? refusedCalls : [...refusedCalls, '-p'],
+          `${visibility}/${mode}/${requireVisibleWorker}`,
+        );
+        if (requireVisibleWorker) assert.equal(stored.status, 'skipped');
+      }
+    }
+  }
 });
 
 test('separate workspaces proceed independently while a live workspace lease remains held', async () => {
