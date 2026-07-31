@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import { fingerprintActionable } from '../integration/ingest-fingerprint.mjs';
 import {
   bindNativeAgent, claudeSessionName, dispatchBoundary, finalizeNativeAgentRun,
-  finalizeWorkerRun, gate, ingestStatus, prepareNativeAgentRun, prepareWorkerRun,
+  finalizeWorkerRun, gate, ingestStatus, inspectIntent, prepareNativeAgentRun, prepareWorkerRun,
   readIngestConfig, runRoot, runWorker, startWorker,
 } from '../integration/ingest.mjs';
 import { bootIdentity, childIdentity, processDescriptor, resolveExecutable, startTracked } from '../integration/ingest-process.mjs';
@@ -748,6 +748,81 @@ test('a dead worker and dead child lease is recovered before the first runtime p
   assert.equal(result.reason, 'ok');
   assert.equal(calls[0][0], 'state');
   assert.equal(await readFile(join(runPath, 'lease.json')).then(() => true).catch(() => false), false);
+});
+
+test('expired orphan deadlines are terminal across every launch mode', async () => {
+  for (const launchMode of ['opencode_child', 'claude_bg', 'claude_print', 'codex_exec', 'codex_native']) {
+    const intent = await inspectIntent({
+      present: true,
+      malformed: false,
+      value: {
+        schema: 1,
+        launch_mode: launchMode,
+        launch_state: 'launched',
+        hard_deadline: '1970-01-01T00:00:00.000Z',
+        child_identity: { agent_id: 'agent-1' },
+      },
+    }, '/workspace', undefined, { PATH: '/definitely-missing' });
+    assert.equal(intent.state, 'terminal', launchMode);
+  }
+});
+
+test('expired deadlines do not reclaim a child still known to be live', async () => {
+  const processChild = await childIdentity(process.pid);
+  const common = {
+    schema: 1,
+    launch_state: 'launched',
+    hard_deadline: '1970-01-01T00:00:00.000Z',
+  };
+  const processIntent = await inspectIntent({
+    present: true,
+    malformed: false,
+    value: { ...common, launch_mode: 'codex_exec', child_identity: processChild },
+  }, '/workspace');
+  const openCodeIntent = await inspectIntent({
+    present: true,
+    malformed: false,
+    value: { ...common, launch_mode: 'opencode_child', child_identity: { session_id: 'child-live' } },
+  }, '/workspace', { status: async () => ({ type: 'busy' }) });
+
+  assert.equal(processIntent.state, 'live');
+  assert.equal(openCodeIntent.state, 'live');
+});
+
+test('an expired unknown OpenCode orphan is reclaimed before a new run', async () => {
+  const { root, workspace, wiki, skills } = await fixture();
+  const runPath = runRoot(root, workspace);
+  await mkdir(runPath, { recursive: true });
+  await writeFile(join(runPath, 'lease.json'), JSON.stringify({
+    schema: 1,
+    lease_id: 'expired-opencode',
+    workspace,
+    harness: 'opencode',
+    owner_pid: 999998,
+    boot_id: await bootIdentity(),
+    process_start: '1',
+    launch_mode: 'opencode_child',
+    launch_state: 'launched',
+    hard_deadline: '1970-01-01T00:00:00.000Z',
+    child_identity: { session_id: 'unknown-child' },
+  }));
+  let launches = 0;
+  const result = await runWorker({
+    harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' }, env: { LOAM_INGEST_BACKGROUND: '1' },
+    runtimeRunner: async ({ args }) => args[0] === 'state'
+      ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+      : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
+    openCodeSession: {
+      parentSessionId: 'new-parent',
+      status: async () => ({ type: 'mystery' }),
+    },
+    modelRunner: async () => { launches += 1; return { completion: Promise.resolve({ code: 0 }) }; },
+  });
+
+  assert.equal(result.reason, 'ok');
+  assert.equal(launches, 1);
+  await assert.rejects(() => readFile(join(runPath, 'lease.json')), { code: 'ENOENT' });
 });
 
 test('OpenCode live child keeps the lease and intent when abort/requery cannot verify death', async () => {
