@@ -4,10 +4,20 @@
   <img src="loam.svg" alt="loam" width="120">
 </p>
 
+<p align="center">
+  <a href="./WHY.md"><img alt="Why Loam exists" src="https://img.shields.io/badge/why-Loam%3F-6b5b45"></a>
+  <a href="https://www.npmjs.com/package/@scchearn/loam"><img alt="npm version" src="https://img.shields.io/npm/v/@scchearn/loam?logo=npm&amp;label=npm"></a>
+  <a href="https://github.com/scchearn/loam/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/scchearn/loam/ci.yml?branch=main&amp;label=CI&amp;logo=githubactions"></a>
+  <a href="https://github.com/scchearn/loam/releases"><img alt="runtime version" src="https://img.shields.io/github/v/tag/scchearn/loam?filter=cli-v*&amp;label=runtime&amp;logo=rust"></a>
+  <a href="./LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/scchearn/loam"></a>
+</p>
+
 loam is a collection of workflow skills for AI coding agents.
 It gives an agent a structured way to plan work, research questions,
 execute plans, and maintain a persistent knowledge base, so
 sessions build on each other instead of starting from scratch.
+
+[Why Loam exists →](./WHY.md)
 
 ## Install
 
