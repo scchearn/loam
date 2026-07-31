@@ -1,0 +1,52 @@
+{
+  "specversion": "1.0",
+  "id": "01K6Q6ESWMT48TPC",
+  "source": "urn:loam:instance:instance-01",
+  "type": "io.loam.message",
+  "time": "2026-07-24T14:20:00Z",
+  "datacontenttype": "application/json",
+  "dataschema": "urn:loam:schema:message:1",
+  "data": {
+    "intent": "request",
+    "from": {
+      "principal_id": "employee-184",
+      "agent_id": "agent-72",
+      "instance_id": "instance-01",
+      "runtime": "opencode"
+    },
+    "to": [
+      {"kind": "agent", "id": "agent-91"}
+    ],
+    "delivery": {"class": "inbox"},
+    "thread": {
+      "id": "thread-01K6Q5",
+      "correlation_id": "01K6Q6ESWMT48TPC",
+      "causation_id": null
+    },
+    "context": {
+      "org_id": "org-3A1",
+      "project_id": "project-7M3",
+      "repository_id": "repo-2F8",
+      "git": {
+        "base_oid": "84be000000000000000000000000000000000002",
+        "plan_oid": "61af000000000000000000000000000000000001",
+        "ref": "refs/heads/feat/review",
+        "commit": "84be000000000000000000000000000000000003"
+      },
+      "artifacts": [
+        {"kind": "task", "id": "SB-42"}
+      ]
+    },
+    "expires_at": "2026-07-25T14:20:00Z",
+    "summary": "Review the anchored change.",
+    "body": "Please review the configured ref at the named commit.",
+    "payload": {
+      "action": "review.request",
+      "params": {
+        "ref": "refs/heads/feat/review",
+        "commit": "84be000000000000000000000000000000000003"
+      },
+      "response_status": null
+    }
+  }
+}
