@@ -1076,13 +1076,13 @@ fn is_plan_local_task_label(subject: &str) -> bool {
     })
 }
 
-struct ParsedTopic<'a> {
-    organization: &'a str,
-    project: &'a str,
-    delivery: TopicDelivery<'a>,
+pub(crate) struct ParsedTopic<'a> {
+    pub(crate) organization: &'a str,
+    pub(crate) project: &'a str,
+    pub(crate) delivery: TopicDelivery<'a>,
 }
 
-enum TopicDelivery<'a> {
+pub(crate) enum TopicDelivery<'a> {
     Event {
         origin: &'a str,
     },
@@ -1099,7 +1099,7 @@ enum TopicDelivery<'a> {
 }
 
 impl TopicDelivery<'_> {
-    fn origin(&self) -> &str {
+    pub(crate) fn origin(&self) -> &str {
         match self {
             Self::Event { origin } | Self::State { origin, .. } | Self::Inbox { origin, .. } => {
                 origin
@@ -1107,7 +1107,7 @@ impl TopicDelivery<'_> {
         }
     }
 
-    fn envelope_class(&self) -> &str {
+    pub(crate) fn envelope_class(&self) -> &str {
         match self {
             Self::Event { .. } => "event",
             Self::State { .. } => "latest-state",
@@ -1116,7 +1116,7 @@ impl TopicDelivery<'_> {
     }
 }
 
-fn parse_topic(topic: &str) -> Result<ParsedTopic<'_>, Violation> {
+pub(crate) fn parse_topic(topic: &str) -> Result<ParsedTopic<'_>, Violation> {
     if topic.len() > MAX_MQTT_TOPIC_BYTES || topic.contains('\0') {
         return Err(Violation::MalformedTopic);
     }
