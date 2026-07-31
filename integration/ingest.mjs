@@ -576,6 +576,15 @@ async function queryClaude(workspace, lease, env = process.env) {
 
 function sessionState(record) { return record?.type; }
 
+function boundedIntent(state, lease, fields = {}) {
+  const hardDeadline = Date.parse(lease.hard_deadline);
+  return {
+    state: state === 'unknown' && Number.isFinite(hardDeadline) && hardDeadline <= Date.now() ? 'terminal' : state,
+    ...fields,
+    intent: lease,
+  };
+}
+
 async function inspectIntent(leaseRecord, workspace, openCodeSession, env = process.env) {
   if (!leaseRecord.present) return { state: 'dead', intent: null };
   if (leaseRecord.malformed || !leaseRecord.value || typeof leaseRecord.value !== 'object' || Array.isArray(leaseRecord.value)) {
@@ -584,28 +593,31 @@ async function inspectIntent(leaseRecord, workspace, openCodeSession, env = proc
   const lease = leaseRecord.value;
   if (lease.schema !== 1) return { state: 'unknown', intent: lease };
   if (!lease.launch_mode) return { state: 'dead', intent: lease };
-  if (lease.launch_mode === 'claude_bg') return { ...(await queryClaude(workspace, lease, env)), intent: lease };
+  if (lease.launch_mode === 'claude_bg') {
+    const { state, ...fields } = await queryClaude(workspace, lease, env);
+    return boundedIntent(state, lease, fields);
+  }
   if (lease.launch_mode === 'codex_native') {
     if (lease.launch_state === 'terminal') return { state: 'terminal', intent: lease };
     if (!NATIVE_AGENT_ID.test(lease.child_identity?.agent_id || '')) return { state: 'unknown', intent: lease };
     return { state: Date.parse(lease.hard_deadline) > Date.now() ? 'live' : 'terminal', intent: lease };
   }
-  if (!lease.child_identity) return { state: 'unknown', intent: lease };
+  if (!lease.child_identity) return boundedIntent('unknown', lease);
   if (lease.launch_mode === 'claude_print' || lease.launch_mode === 'codex_exec') {
-    return { state: await classifyChild(lease.child_identity), intent: lease };
+    return boundedIntent(await classifyChild(lease.child_identity), lease);
   }
   if (lease.launch_mode === 'opencode_child') {
     const sessionId = lease.child_identity?.session_id;
-    if (!sessionId || typeof openCodeSession?.status !== 'function') return { state: 'unknown', intent: lease };
+    if (!sessionId || typeof openCodeSession?.status !== 'function') return boundedIntent('unknown', lease);
     try {
       const record = await openCodeSession.status(sessionId);
       const state = sessionState(record);
       if (['working', 'running', 'pending', 'busy', 'retry'].includes(state)) return { state: 'live', record, intent: lease };
       if (['idle', 'done', 'completed', 'failed', 'stopped'].includes(state)) return { state: 'terminal', record, intent: lease };
     } catch {}
-    return { state: 'unknown', intent: lease };
+    return boundedIntent('unknown', lease);
   }
-  return { state: 'unknown', intent: lease };
+  return boundedIntent('unknown', lease);
 }
 
 async function acquireLease(root, workspace, harness, config, openCodeSession, env = process.env) {
