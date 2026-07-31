@@ -40,6 +40,7 @@ function visibility(value) { return ['silent', 'toast', 'native'].includes(value
 
 async function sendNotification(notify, configuredVisibility, event) {
   if (configuredVisibility === 'silent' || typeof notify !== 'function') return;
+  // Contract: notifiers must pass this signal to every resource they open; the seam cannot cancel resources that ignore it.
   const controller = new AbortController();
   let timer;
   try {
