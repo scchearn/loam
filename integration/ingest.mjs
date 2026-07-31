@@ -793,27 +793,17 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease,
   }
   if (mode === 'claude_bg') {
       const name = lease.planned_identity.name;
-      const settingsPath = join(root, 'claude-settings.json');
-      await atomicJson(settingsPath, { worktree: { bgIsolation: 'none' } });
-      let started;
-      try {
-        started = startTracked({
+      const started = startTracked({
           command: 'claude',
-          args: ['--bg', '--agent', 'loam:ingestor', '--name', name, '--settings', settingsPath, '--permission-mode', 'dontAsk', '--allowedTools', 'Read Glob Grep Write Edit Bash', prompt],
+          args: ['--bg', '--agent', 'loam:ingestor', '--name', name, '--settings', JSON.stringify({ worktree: { bgIsolation: 'none' } }), '--setting-sources', 'user', '--strict-mcp-config', '--permission-mode', 'dontAsk', '--allowedTools', 'Read Glob Grep Write Edit Bash Skill', '--', prompt],
           cwd: workspace, env, timeoutMs,
           detached: true, captureOutput: false,
-        });
-      } catch (error) {
-        await rm(settingsPath, { force: true });
-        throw error;
-      }
+      });
       if (!(await updateLease(root, lease, { launch_state: 'launched', child_identity: { manager_name: name } }))) {
         await terminateChild(started.child);
-        await rm(settingsPath, { force: true });
         return { category: 'orphan_unknown' };
       }
-      const completion = started.completion.finally(() => rm(settingsPath, { force: true }));
-      const result = await completion;
+      const result = await started.completion;
       if (result.code !== 0) {
         const reset = await updateLease(root, lease, {
           launch_mode: 'claude_print', launch_state: 'planned', child_identity: null,
@@ -949,7 +939,7 @@ export async function prepareWorkerRun({
       ? { agent_id: nativeAgentId }
       : selectedLaunchMode === 'claude_bg'
       ? {
-          name: claudeSessionName(canonical),
+          name: `${claudeSessionName(canonical)}-${lease.lease_id.slice(0, 8)}`,
           owner_identity: { pid: lease.owner_pid, boot_id: lease.boot_id, process_start: lease.process_start },
         }
       : selectedLaunchMode === 'opencode_child'

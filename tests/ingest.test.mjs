@@ -1011,7 +1011,7 @@ process.exit(args[0] === '--bg' ? 1 : 0);
   assert.equal(await readFile(join(workspace, 'src', 'a.js'), 'utf8'), source);
 });
 
-test('Claude loam:ingestor visibility uses one registered Agent View session name for command and launch event', async () => {
+test('Claude loam:ingestor uses a unique registered Agent View session with non-interactive launch arguments', async () => {
   const { root, workspace, wiki, skills } = await fixture();
   const bin = await mkdtemp(join(tmpdir(), 'loam-claude-visible-'));
   const command = join(bin, process.platform === 'win32' ? 'claude.cmd' : 'claude');
@@ -1024,15 +1024,23 @@ const args = process.argv.slice(2);
 fs.appendFileSync(process.env.LOAM_TEST_CALLS, JSON.stringify(args) + '\\n');
 if (args[0] === '--help') { process.stdout.write('--bg'); process.exit(0); }
 if (args[0] === '--bg') {
-  fs.writeFileSync(process.env.LOAM_TEST_AGENT, JSON.stringify({ name: args[args.indexOf('--name') + 1] }));
+  let agents = [];
+  try { agents = JSON.parse(fs.readFileSync(process.env.LOAM_TEST_AGENT, 'utf8')); } catch {}
+  agents.push({ name: args[args.indexOf('--name') + 1], id: 'agent-' + (agents.length + 1), queries: 0 });
+  fs.writeFileSync(process.env.LOAM_TEST_AGENT, JSON.stringify(agents));
   process.stdout.write('backgrounded · stdout-wrong');
   process.exit(0);
 }
 if (args[0] === 'agents') {
-  const agent = JSON.parse(fs.readFileSync(process.env.LOAM_TEST_AGENT, 'utf8'));
+  const agents = JSON.parse(fs.readFileSync(process.env.LOAM_TEST_AGENT, 'utf8'));
+  agents[agents.length - 1].queries += 1;
+  fs.writeFileSync(process.env.LOAM_TEST_AGENT, JSON.stringify(agents));
   process.stdout.write(JSON.stringify([
     { name: 'unrelated-agent', id: 'agent-wrong', status: 'done' },
-    { ...agent, id: 'agent-42', status: 'done' },
+    ...agents.map((agent, index) => ({
+      ...agent,
+      status: index === agents.length - 1 && agent.queries === 1 ? 'working' : 'done',
+    })),
   ]));
   process.exit(0);
 }
@@ -1044,7 +1052,8 @@ process.exit(0);
     await chmod(command, 0o700);
   }
 
-  const expectedName = claudeSessionName(workspace);
+  const namePrefix = claudeSessionName(workspace);
+  const sessionNames = [];
   for (const configuredVisibility of ['toast', 'native', 'silent']) {
     const globalRoot = join(root, `global-${configuredVisibility}`);
     await mkdir(globalRoot, { recursive: true });
@@ -1067,17 +1076,27 @@ process.exit(0);
     });
     const argv = (await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse);
     const background = argv.filter((args) => args[0] === '--bg').at(-1);
+    const sessionName = background[background.indexOf('--name') + 1];
+    const settings = background[background.indexOf('--settings') + 1];
+    sessionNames.push(sessionName);
     assert.equal(result.reason, 'ok');
     assert.equal(background[background.indexOf('--agent') + 1], 'loam:ingestor');
-    assert.equal(background[background.indexOf('--name') + 1], expectedName);
+    assert.match(sessionName, new RegExp(`^${namePrefix}-[a-f0-9]{8}$`, 'u'));
+    assert.deepEqual(JSON.parse(settings), { worktree: { bgIsolation: 'none' } });
+    assert.equal(background[background.indexOf('--setting-sources') + 1], 'user');
+    assert.notEqual(background.indexOf('--strict-mcp-config'), -1);
     assert.equal(background[background.indexOf('--permission-mode') + 1], 'dontAsk');
+    assert.match(background[background.indexOf('--allowedTools') + 1], /\bSkill\b/u);
+    assert.equal(background.at(-2), '--');
+    assert.match(background.at(-1), /Run the existing loam::ingesting-codebase skill/u);
     assert.equal(launchEvents.length, configuredVisibility === 'silent' ? 0 : 1);
     if (launchEvents.length) {
       assert.equal(launchEvents[0].launchMode, 'claude_bg');
-      assert.equal(launchEvents[0].identity.manager_name, expectedName);
-      assert.equal(launchEvents[0].identity.manager_id, 'agent-42');
+      assert.equal(launchEvents[0].identity.manager_name, sessionName);
+      assert.equal(launchEvents[0].identity.manager_id, `agent-${sessionNames.length}`);
     }
   }
+  assert.equal(new Set(sessionNames).size, sessionNames.length);
 });
 
 test('Claude downgrade reasons survive every visibility tier and require_visible_worker can refuse fallback', async () => {
