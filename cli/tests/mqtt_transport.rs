@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use loam::envelope::{AuthenticatedPrincipal, ValidatedEnvelope, ValidationConfig, Violation};
 use loam::transport::{
     self, AuthenticatedTransportPrincipal, DeliveryProcessor, ReceiveOutcome, TransportError,
+    WorkStatus, WorkTracker,
 };
 use mqtt_broker::BrokerFixture;
 use rumqttc::v5::mqttbytes::{
@@ -14,6 +15,247 @@ use rumqttc::v5::mqttbytes::{
 use rumqttc::v5::{Client, Connection, Event, MqttOptions, RecvTimeoutError};
 use rumqttc::Transport;
 use std::time::{Duration, Instant};
+
+#[test]
+#[ignore = "requires LOAM_MQTT_TEST=1 and a real Mosquitto/OpenSSL installation"]
+fn collaboration_semantics() {
+    if std::env::var("LOAM_MQTT_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set LOAM_MQTT_TEST=1 to require the real broker tier");
+        return;
+    }
+
+    let broker = BrokerFixture::provision("collaboration-semantics")
+        .expect("the real broker fixture should provision");
+    let project = format!("{}/project-a", broker.namespace());
+    let now = test_time("2026-07-24T14:21:00Z");
+    let request_topic = format!("{project}/inbox/agent/agent-91/instance-01/01K6Q6ESWMT48TPC");
+    let request = scoped_envelope(
+        include_bytes!("fixtures/mqtt/message.json"),
+        &request_topic,
+        &broker,
+        now,
+    );
+    let (response_topic, response) = scoped_response_envelope(&broker, now);
+    let (ack_topic, ack) = scoped_ack_envelope(&broker, now);
+
+    let mut sender = TestClient::password(&broker, "collaboration-sender")
+        .expect("collaboration sender should authenticate");
+    let mut peer = TestClient::password(&broker, "collaboration-peer")
+        .expect("collaboration peer should authenticate");
+    peer.subscribe(format!("{project}/#"))
+        .expect("collaboration peer should subscribe");
+
+    publish_validated(&mut sender, request.clone(), now);
+    let request_publish = peer
+        .receive(&request_topic, Duration::from_secs(3))
+        .expect("request should cross the broker");
+    let mut idle = TestClient::password(&broker, "idle-recipient")
+        .expect("idle recipient should authenticate");
+    idle.subscribe(&request_topic)
+        .expect("idle recipient should subscribe after the PUBACK");
+    assert_eq!(
+        idle.receive(&request_topic, Duration::from_secs(3))
+            .expect("unanswered request must remain retained")
+            .payload,
+        request_publish.payload
+    );
+    assert_eq!(
+        transport::publish_inbox_tombstone_after(&sender.client, request.clone(), &request),
+        Err(TransportError::SemanticReplyMismatch),
+        "a transport acknowledgement must not clear an inbox request"
+    );
+
+    publish_validated(&mut sender, response.clone(), now);
+    publish_validated(&mut sender, ack.clone(), now);
+    let response_publish = peer
+        .receive(&response_topic, Duration::from_secs(3))
+        .expect("response should cross the broker");
+    let ack_publish = peer
+        .receive(&ack_topic, Duration::from_secs(3))
+        .expect("semantic acknowledgement should cross the broker");
+
+    let claims = ["employee-184", "employee-191"];
+    let origins = ["instance-01", "instance-02"];
+    let identity = AuthenticatedTransportPrincipal::new(
+        AuthenticatedPrincipal::new("broker-user-7", &claims),
+        &origins,
+    );
+    let mut processor = DeliveryProcessor::new(ValidationConfig::default(), 16, 16, 16)
+        .expect("bounded collaboration processor should configure");
+    let received_request =
+        accepted(processor.receive(&request_topic, &request_publish.payload, &identity, now));
+    let received_response =
+        accepted(processor.receive(&response_topic, &response_publish.payload, &identity, now));
+    let received_ack =
+        accepted(processor.receive(&ack_topic, &ack_publish.payload, &identity, now));
+    let response_thread = received_response
+        .as_envelope()
+        .data
+        .thread
+        .as_ref()
+        .expect("response should preserve its thread");
+    assert_eq!(response_thread.correlation_id, "01K6Q6ESWMT48TPC");
+    assert_eq!(
+        response_thread
+            .causation_id
+            .as_ref()
+            .and_then(|id| id.as_str()),
+        Some("01K6Q6ESWMT48TPC")
+    );
+    let ack_thread = received_ack
+        .as_envelope()
+        .data
+        .thread
+        .as_ref()
+        .expect("ack should preserve its thread");
+    assert_eq!(ack_thread.correlation_id, "01K6Q6ESWMT48TPC");
+    assert_eq!(
+        ack_thread.causation_id.as_ref().and_then(|id| id.as_str()),
+        Some("01K6Q6ESWMT48TPD")
+    );
+
+    publish_semantic_clear(&mut sender, received_request, &received_response);
+    publish_semantic_clear(&mut sender, received_response, &received_ack);
+    assert_publish_accepted(
+        sender
+            .publish(&ack_topic, Vec::new(), true, None)
+            .expect("observed terminal ack should be cleaned from the test namespace"),
+    );
+
+    let mut tracker = WorkTracker::new(16).expect("bounded work tracker should configure");
+    let mut final_first = None;
+    for (revision, status) in [(1, "active"), (2, "blocked"), (3, "active"), (4, "ready")] {
+        let (topic, state) = scoped_work_state(
+            &broker,
+            "instance-01",
+            "employee-184",
+            revision,
+            status,
+            "SB-42",
+            now,
+        );
+        publish_validated(&mut sender, state.clone(), now);
+        let publish = peer
+            .receive(&topic, Duration::from_secs(3))
+            .expect("work-state transition should cross the broker");
+        let received = accepted(processor.receive(&topic, &publish.payload, &identity, now));
+        tracker
+            .observe(&received)
+            .expect("legal work-state transition should be accepted");
+        final_first = Some((topic, state));
+    }
+    assert_eq!(
+        tracker.status("instance-01", "activity-01K6Q5"),
+        Some(WorkStatus::Ready)
+    );
+
+    let (second_topic, second_active) = scoped_work_state(
+        &broker,
+        "instance-02",
+        "employee-191",
+        1,
+        "active",
+        "SB-42",
+        now,
+    );
+    publish_validated(&mut sender, second_active, now);
+    let second_publish = peer
+        .receive(&second_topic, Duration::from_secs(3))
+        .expect("overlapping activity should cross the broker");
+    let second_received =
+        accepted(processor.receive(&second_topic, &second_publish.payload, &identity, now));
+    let overlap = tracker
+        .observe(&second_received)
+        .expect("overlap should warn without rejecting either activity");
+    assert_eq!(overlap.warnings.len(), 2);
+    assert_eq!(tracker.len(), 2);
+
+    let (_, second_abandoned) = scoped_work_state(
+        &broker,
+        "instance-02",
+        "employee-191",
+        2,
+        "abandoned",
+        "SB-42",
+        now,
+    );
+    publish_validated(&mut sender, second_abandoned.clone(), now);
+    let abandoned_publish = peer
+        .receive(&second_topic, Duration::from_secs(3))
+        .expect("explicit abandonment should cross the broker");
+    let abandoned =
+        accepted(processor.receive(&second_topic, &abandoned_publish.payload, &identity, now));
+    assert!(tracker
+        .observe(&abandoned)
+        .expect("explicit abandonment should be accepted")
+        .warnings
+        .is_empty());
+    assert_eq!(
+        tracker.status("instance-02", "activity-01K6Q5"),
+        Some(WorkStatus::Abandoned)
+    );
+
+    let offline_id = "01K6Q6ESWMT48TPX";
+    let offline_topic = format!("{project}/inbox/agent/agent-91/instance-01/{offline_id}");
+    let offline_request = scoped_message_with_id(&broker, &offline_topic, offline_id, now);
+    publish_validated(&mut sender, offline_request, now);
+    peer.receive(&offline_topic, Duration::from_secs(3))
+        .expect("retained offline request positive control should be live before disconnect");
+    let old_event_topic = format!("{project}/event/instance-01");
+    publish_validated(
+        &mut sender,
+        scoped_event_with_id(&broker, &old_event_topic, "old-event", now),
+        now,
+    );
+    peer.receive(&old_event_topic, Duration::from_secs(3))
+        .expect("pre-disconnect event positive control should be live");
+    drop(peer);
+
+    let mut recovered = TestClient::password(&broker, "clean-session-recovery")
+        .expect("clean-session peer should reconnect");
+    recovered
+        .subscribe(format!("{project}/#"))
+        .expect("clean-session peer should resubscribe");
+    let restored = recovered.collect(Duration::from_secs(2));
+    let final_first = final_first.expect("ready state should have been published");
+    assert!(restored
+        .iter()
+        .any(|publish| publish.topic.as_ref() == final_first.0.as_bytes()));
+    assert!(restored
+        .iter()
+        .any(|publish| publish.topic.as_ref() == offline_topic.as_bytes()));
+    assert!(
+        restored
+            .iter()
+            .all(|publish| publish.topic.as_ref() != old_event_topic.as_bytes()),
+        "old event replayed through a clean session: {restored:?}"
+    );
+    let live_event = scoped_event_with_id(&broker, &old_event_topic, "live-event", now);
+    publish_validated(&mut sender, live_event, now);
+    recovered
+        .receive(&old_event_topic, Duration::from_secs(3))
+        .expect("post-reconnect live event proves the event subscription is active");
+
+    publish_state_clear(&mut sender, final_first.1);
+    publish_state_clear(&mut sender, second_abandoned);
+    assert_publish_accepted(
+        sender
+            .publish(&offline_topic, Vec::new(), true, None)
+            .expect("test-owned unresolved request should be removed during teardown"),
+    );
+    let mut final_scan = TestClient::password(&broker, "collaboration-final-scan")
+        .expect("final retained scan should authenticate");
+    final_scan
+        .subscribe(format!("{project}/#"))
+        .expect("final retained scan should subscribe");
+    assert!(
+        final_scan.collect(Duration::from_secs(2)).is_empty(),
+        "collaboration test left retained values under its namespace"
+    );
+    broker
+        .finish()
+        .expect("broker fixture should remove only its temporary directory");
+}
 
 #[test]
 #[ignore = "requires LOAM_MQTT_TEST=1 and a real Mosquitto/OpenSSL installation"]
@@ -150,7 +392,7 @@ fn delivery_classes() {
             .wait_for_puback()
             .expect("validated state tombstone should be acknowledged"),
     );
-    let semantic_reply = scoped_response_envelope(&broker, now);
+    let (_, semantic_reply) = scoped_response_envelope(&broker, now);
     transport::publish_inbox_tombstone_after(&publisher.client, inbox, &semantic_reply)
         .expect("correlated semantic reply should clear the retained inbox request");
     assert_publish_accepted(
@@ -607,6 +849,7 @@ fn tls_options(
             None,
         ))
         .set_keep_alive(Duration::from_secs(5))
+        .set_clean_start(true)
         .set_max_packet_size(Some(400_000));
     Ok(options)
 }
@@ -651,7 +894,10 @@ fn scoped_frame(fixture: &[u8], broker: &BrokerFixture) -> String {
         .replace("project-7M3", "project-a")
 }
 
-fn scoped_response_envelope(broker: &BrokerFixture, now: DateTime<Utc>) -> ValidatedEnvelope {
+fn scoped_response_envelope(
+    broker: &BrokerFixture,
+    now: DateTime<Utc>,
+) -> (String, ValidatedEnvelope) {
     let response_topic = format!(
         "{}/project-a/inbox/principal/employee-184/instance-02/01K6Q6ESWMT48TPD",
         broker.namespace()
@@ -685,14 +931,167 @@ fn scoped_response_envelope(broker: &BrokerFixture, now: DateTime<Utc>) -> Valid
             "\"causation_id\": \"01K6Q6ESWMT48TPC\"",
         );
     let principal = AuthenticatedPrincipal::new("employee-191", &[]);
-    loam::envelope::validate(
+    let envelope = loam::envelope::validate(
         response.as_bytes(),
         &response_topic,
         &principal,
         &ValidationConfig::default(),
         now,
     )
-    .expect("scoped semantic response should validate")
+    .expect("scoped semantic response should validate");
+    (response_topic, envelope)
+}
+
+fn scoped_ack_envelope(broker: &BrokerFixture, now: DateTime<Utc>) -> (String, ValidatedEnvelope) {
+    let topic = format!(
+        "{}/project-a/inbox/agent/agent-91/instance-01/01K6Q6ESWMT48TPE",
+        broker.namespace()
+    );
+    let frame = scoped_frame(include_bytes!("fixtures/mqtt/message.json"), broker)
+        .replacen(
+            "\"id\": \"01K6Q6ESWMT48TPC\"",
+            "\"id\": \"01K6Q6ESWMT48TPE\"",
+            1,
+        )
+        .replace("\"intent\": \"request\"", "\"intent\": \"ack\"")
+        .replace(
+            "\"causation_id\": null",
+            "\"causation_id\": \"01K6Q6ESWMT48TPD\"",
+        );
+    let principal = AuthenticatedPrincipal::new("employee-184", &[]);
+    let envelope = loam::envelope::validate(
+        frame.as_bytes(),
+        &topic,
+        &principal,
+        &ValidationConfig::default(),
+        now,
+    )
+    .expect("scoped semantic ack should validate");
+    (topic, envelope)
+}
+
+fn scoped_work_state(
+    broker: &BrokerFixture,
+    origin: &str,
+    principal_id: &str,
+    revision: u64,
+    status: &str,
+    artifact_id: &str,
+    now: DateTime<Utc>,
+) -> (String, ValidatedEnvelope) {
+    let topic = format!(
+        "{}/project-a/state/{origin}/activity-01K6Q5",
+        broker.namespace()
+    );
+    let frame = scoped_frame(include_bytes!("fixtures/mqtt/work-state.json"), broker)
+        .replace(
+            "urn:loam:instance:instance-01",
+            &format!("urn:loam:instance:{origin}"),
+        )
+        .replace(
+            "\"principal_id\": \"employee-184\"",
+            &format!("\"principal_id\": \"{principal_id}\""),
+        )
+        .replace(
+            "\"instance_id\": \"instance-01\"",
+            &format!("\"instance_id\": \"{origin}\""),
+        )
+        .replace("01K6Q6ESWMT48TPB", &format!("work-{origin}-{revision}"))
+        .replace("\"revision\": 7", &format!("\"revision\": {revision}"))
+        .replace("\"state\": \"ready\"", &format!("\"state\": \"{status}\""))
+        .replace("SB-42", artifact_id);
+    let principal = AuthenticatedPrincipal::new(principal_id, &[]);
+    let envelope = loam::envelope::validate(
+        frame.as_bytes(),
+        &topic,
+        &principal,
+        &ValidationConfig::default(),
+        now,
+    )
+    .expect("scoped work-state should validate");
+    (topic, envelope)
+}
+
+fn scoped_message_with_id(
+    broker: &BrokerFixture,
+    topic: &str,
+    id: &str,
+    now: DateTime<Utc>,
+) -> ValidatedEnvelope {
+    let frame = scoped_frame(include_bytes!("fixtures/mqtt/message.json"), broker)
+        .replace("01K6Q6ESWMT48TPC", id);
+    let principal = AuthenticatedPrincipal::new("employee-184", &[]);
+    loam::envelope::validate(
+        frame.as_bytes(),
+        topic,
+        &principal,
+        &ValidationConfig::default(),
+        now,
+    )
+    .expect("scoped inbox message should validate")
+}
+
+fn scoped_event_with_id(
+    broker: &BrokerFixture,
+    topic: &str,
+    id: &str,
+    now: DateTime<Utc>,
+) -> ValidatedEnvelope {
+    let frame = scoped_frame(
+        include_bytes!("fixtures/mqtt/git-refs-changed.json"),
+        broker,
+    )
+    .replace("01K6Q6ESWMT48TPA", id);
+    let principal = AuthenticatedPrincipal::new("employee-184", &[]);
+    loam::envelope::validate(
+        frame.as_bytes(),
+        topic,
+        &principal,
+        &ValidationConfig::default(),
+        now,
+    )
+    .expect("scoped event should validate")
+}
+
+fn publish_validated(client: &mut TestClient, envelope: ValidatedEnvelope, now: DateTime<Utc>) {
+    transport::publish(&client.client, envelope, now)
+        .expect("validated envelope should queue for publication");
+    assert_publish_accepted(
+        client
+            .wait_for_puback()
+            .expect("validated publication should be acknowledged"),
+    );
+}
+
+fn publish_semantic_clear(
+    client: &mut TestClient,
+    request: ValidatedEnvelope,
+    reply: &ValidatedEnvelope,
+) {
+    transport::publish_inbox_tombstone_after(&client.client, request, reply)
+        .expect("validated semantic reply should queue the predecessor tombstone");
+    assert_publish_accepted(
+        client
+            .wait_for_puback()
+            .expect("semantic tombstone should be acknowledged"),
+    );
+}
+
+fn publish_state_clear(client: &mut TestClient, state: ValidatedEnvelope) {
+    transport::publish_tombstone(&client.client, state)
+        .expect("validated state tombstone should queue");
+    assert_publish_accepted(
+        client
+            .wait_for_puback()
+            .expect("state tombstone should be acknowledged"),
+    );
+}
+
+fn accepted(outcome: Result<ReceiveOutcome, TransportError>) -> ValidatedEnvelope {
+    match outcome {
+        Ok(ReceiveOutcome::Accepted(envelope)) => *envelope,
+        other => panic!("expected accepted delivery, got {other:?}"),
+    }
 }
 
 fn test_time(value: &str) -> DateTime<Utc> {

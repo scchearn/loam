@@ -1,0 +1,10 @@
+[
+  {"name": "active_blocked_ready", "states": ["active", "blocked", "active", "ready"], "expected": "ready"},
+  {"name": "active_abandoned", "states": ["active", "abandoned"], "expected": "abandoned"},
+  {"name": "blocked_abandoned", "states": ["blocked", "abandoned"], "expected": "abandoned"},
+  {"name": "ready_abandoned", "states": ["ready", "abandoned"], "expected": "abandoned"},
+  {"name": "terminal_rejects_active", "states": ["active", "abandoned", "active"], "expected": "terminal_transition"},
+  {"name": "ready_rejects_active", "states": ["ready", "active"], "expected": "invalid_transition"},
+  {"name": "non_increasing_revision", "states": ["active"], "expected": "revision_not_newer"},
+  {"name": "stable_artifact_overlap", "states": ["overlap"], "expected": "two_warnings"}
+]

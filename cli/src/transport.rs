@@ -37,6 +37,11 @@ pub enum TransportError {
     InvalidStateRevision,
     EventTombstone,
     SemanticReplyMismatch,
+    InvalidWorkEnvelope,
+    InvalidWorkTransition,
+    TerminalWorkState,
+    PublicationUnverified,
+    WorkRevisionNotNewer,
     OriginNotAuthorized,
     ClientQueue,
     Validation(Violation),
@@ -63,6 +68,11 @@ impl std::fmt::Display for TransportError {
             Self::SemanticReplyMismatch => {
                 "inbox clearing requires a correlated semantic response or acknowledgement"
             }
+            Self::InvalidWorkEnvelope => "validated envelope is not a usable work-state claim",
+            Self::InvalidWorkTransition => "work-state transition is not allowed",
+            Self::TerminalWorkState => "terminal work state cannot transition",
+            Self::PublicationUnverified => "published work state requires Git reachability proof",
+            Self::WorkRevisionNotNewer => "work-state revision must increase",
             Self::OriginNotAuthorized => "authenticated transport identity cannot use topic origin",
             Self::ClientQueue => "MQTT client request queue is unavailable",
             Self::Validation(violation) => {
@@ -245,14 +255,14 @@ fn validate_semantic_clear(
         });
     if request.message_type != "io.loam.message"
         || request.data.delivery.class != "inbox"
-        || request.data.intent != Intent::Request
+        || !matches!(request.data.intent, Intent::Request | Intent::Response)
         || reply.message_type != "io.loam.message"
         || reply.data.delivery.class != "inbox"
         || !matches!(reply.data.intent, Intent::Response | Intent::Ack)
         || request.data.context.org_id != reply.data.context.org_id
         || request.data.context.project_id != reply.data.context.project_id
         || request_thread.id != reply_thread.id
-        || reply_thread.correlation_id != request.id
+        || reply_thread.correlation_id != request_thread.correlation_id
         || !references_request
         || !responder_was_addressed
         || !sender_is_addressed
@@ -568,6 +578,222 @@ fn digest(payload: &[u8]) -> String {
     sha256.finish()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkStatus {
+    Active,
+    Blocked,
+    Ready,
+    Published,
+    Abandoned,
+}
+
+impl WorkStatus {
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "blocked" => Some(Self::Blocked),
+            "ready" => Some(Self::Ready),
+            "published" => Some(Self::Published),
+            "abandoned" => Some(Self::Abandoned),
+            _ => None,
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Published | Self::Abandoned)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlapWarning {
+    pub artifact_kind: String,
+    pub artifact_id: String,
+    pub activity_origin: String,
+    pub activity_key: String,
+    pub conflicting_origin: String,
+    pub conflicting_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkObservation {
+    pub status: WorkStatus,
+    pub warnings: Vec<OverlapWarning>,
+}
+
+pub struct WorkTracker {
+    capacity: usize,
+    activities: VecDeque<TrackedWork>,
+}
+
+struct TrackedWork {
+    origin: String,
+    key: String,
+    revision: u64,
+    status: WorkStatus,
+    artifacts: Vec<(String, String)>,
+}
+
+impl WorkTracker {
+    pub fn new(capacity: usize) -> Result<Self, TransportError> {
+        if capacity == 0 {
+            return Err(TransportError::ZeroTrackingCapacity);
+        }
+        Ok(Self {
+            capacity,
+            activities: VecDeque::with_capacity(capacity),
+        })
+    }
+
+    pub fn observe(
+        &mut self,
+        envelope: &ValidatedEnvelope,
+    ) -> Result<WorkObservation, TransportError> {
+        let envelope = envelope.as_envelope();
+        if envelope.message_type != "io.loam.work.state"
+            || envelope.data.delivery.class != "latest-state"
+        {
+            return Err(TransportError::InvalidWorkEnvelope);
+        }
+        let status = envelope
+            .data
+            .payload
+            .get("state")
+            .and_then(crate::json::Value::as_str)
+            .and_then(WorkStatus::from_wire)
+            .ok_or(TransportError::InvalidWorkEnvelope)?;
+        if status == WorkStatus::Published {
+            return Err(TransportError::PublicationUnverified);
+        }
+        let key = envelope
+            .data
+            .delivery
+            .key
+            .as_deref()
+            .ok_or(TransportError::InvalidWorkEnvelope)?;
+        let revision = envelope
+            .data
+            .delivery
+            .revision
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(TransportError::InvalidWorkEnvelope)?;
+        let origin = &envelope.data.from.instance_id;
+        let previous = self
+            .activities
+            .iter()
+            .position(|activity| activity.origin == *origin && activity.key == key);
+        if let Some(index) = previous {
+            if revision <= self.activities[index].revision {
+                return Err(TransportError::WorkRevisionNotNewer);
+            }
+            let current = self.activities[index].status;
+            if current.is_terminal() {
+                return Err(TransportError::TerminalWorkState);
+            }
+            if !valid_work_transition(current, status) {
+                return Err(TransportError::InvalidWorkTransition);
+            }
+            self.activities.remove(index);
+        }
+        let artifacts = envelope
+            .data
+            .context
+            .artifacts
+            .iter()
+            .map(|artifact| (artifact.kind.clone(), artifact.id.clone()))
+            .collect();
+        push_bounded(
+            &mut self.activities,
+            self.capacity,
+            TrackedWork {
+                origin: origin.clone(),
+                key: key.to_owned(),
+                revision,
+                status,
+                artifacts,
+            },
+        );
+        Ok(WorkObservation {
+            status,
+            warnings: self.overlap_warnings(origin, key),
+        })
+    }
+
+    pub fn status(&self, origin: &str, key: &str) -> Option<WorkStatus> {
+        self.activities
+            .iter()
+            .find(|activity| activity.origin == origin && activity.key == key)
+            .map(|activity| activity.status)
+    }
+
+    pub fn len(&self) -> usize {
+        self.activities.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.activities.is_empty()
+    }
+
+    fn overlap_warnings(&self, origin: &str, key: &str) -> Vec<OverlapWarning> {
+        let Some(activity) = self
+            .activities
+            .iter()
+            .find(|activity| activity.origin == origin && activity.key == key)
+        else {
+            return Vec::new();
+        };
+        if activity.status.is_terminal() {
+            return Vec::new();
+        }
+        let mut warnings = Vec::new();
+        for other in self.activities.iter().filter(|other| {
+            (other.origin != activity.origin || other.key != activity.key)
+                && !other.status.is_terminal()
+        }) {
+            for (kind, id) in activity
+                .artifacts
+                .iter()
+                .filter(|artifact| other.artifacts.contains(artifact))
+            {
+                warnings.push(overlap_warning(activity, other, kind, id));
+                warnings.push(overlap_warning(other, activity, kind, id));
+            }
+        }
+        warnings
+    }
+}
+
+fn valid_work_transition(current: WorkStatus, next: WorkStatus) -> bool {
+    match current {
+        WorkStatus::Active => matches!(
+            next,
+            WorkStatus::Active | WorkStatus::Blocked | WorkStatus::Ready | WorkStatus::Abandoned
+        ),
+        WorkStatus::Blocked => matches!(
+            next,
+            WorkStatus::Active | WorkStatus::Blocked | WorkStatus::Ready | WorkStatus::Abandoned
+        ),
+        WorkStatus::Ready => matches!(next, WorkStatus::Ready | WorkStatus::Abandoned),
+        WorkStatus::Published | WorkStatus::Abandoned => false,
+    }
+}
+
+fn overlap_warning(
+    activity: &TrackedWork,
+    other: &TrackedWork,
+    artifact_kind: &str,
+    artifact_id: &str,
+) -> OverlapWarning {
+    OverlapWarning {
+        artifact_kind: artifact_kind.to_owned(),
+        artifact_id: artifact_id.to_owned(),
+        activity_origin: activity.origin.clone(),
+        activity_key: activity.key.clone(),
+        conflicting_origin: other.origin.clone(),
+        conflicting_key: other.key.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,6 +937,97 @@ mod tests {
             validate_semantic_clear(&request, &request),
             Err(TransportError::SemanticReplyMismatch)
         );
+    }
+
+    #[test]
+    fn collaboration_fixture_enforces_state_machine_and_overlap() {
+        let cases = json::parse(include_str!(
+            "../tests/fixtures/mqtt/collaboration-cases.json"
+        ))
+        .expect("collaboration cases should parse");
+        for case in cases
+            .as_array()
+            .expect("collaboration cases should be an array")
+        {
+            let name = case
+                .get("name")
+                .and_then(Value::as_str)
+                .expect("collaboration case should have a name");
+            let expected = case
+                .get("expected")
+                .and_then(Value::as_str)
+                .expect("collaboration case should have an expected result");
+            assert_eq!(
+                exercise_collaboration_case(name, case),
+                expected,
+                "case {name}"
+            );
+        }
+    }
+
+    fn exercise_collaboration_case(name: &str, case: &Value) -> &'static str {
+        let now = test_time("2026-07-24T14:21:00Z");
+        let mut tracker = WorkTracker::new(8).expect("bounded work tracker should configure");
+        if name == "stable_artifact_overlap" {
+            let first =
+                validated_work_state("instance-01", "employee-184", 1, "active", "SB-42", now);
+            let second =
+                validated_work_state("instance-02", "employee-191", 1, "active", "SB-42", now);
+            tracker
+                .observe(&first)
+                .expect("first activity should be accepted");
+            let observed = tracker
+                .observe(&second)
+                .expect("overlap should warn, not reject");
+            return if observed.warnings.len() == 2 && tracker.len() == 2 {
+                "two_warnings"
+            } else {
+                "wrong_overlap"
+            };
+        }
+        if name == "non_increasing_revision" {
+            let first =
+                validated_work_state("instance-01", "employee-184", 2, "active", "SB-42", now);
+            let stale =
+                validated_work_state("instance-01", "employee-184", 1, "blocked", "SB-42", now);
+            tracker
+                .observe(&first)
+                .expect("first activity should be accepted");
+            return match tracker.observe(&stale) {
+                Err(TransportError::WorkRevisionNotNewer) => "revision_not_newer",
+                other => panic!("unexpected stale work revision outcome: {other:?}"),
+            };
+        }
+
+        for (index, state) in case
+            .get("states")
+            .and_then(Value::as_array)
+            .expect("transition case should have states")
+            .iter()
+            .enumerate()
+        {
+            let state = state.as_str().expect("state should be a string");
+            let envelope = validated_work_state(
+                "instance-01",
+                "employee-184",
+                index as u64 + 1,
+                state,
+                "SB-42",
+                now,
+            );
+            if let Err(error) = tracker.observe(&envelope) {
+                return match error {
+                    TransportError::TerminalWorkState => "terminal_transition",
+                    TransportError::InvalidWorkTransition => "invalid_transition",
+                    other => panic!("unexpected work transition error: {other:?}"),
+                };
+            }
+        }
+        match tracker.status("instance-01", "activity-01K6Q5") {
+            Some(WorkStatus::Ready) => "ready",
+            Some(WorkStatus::Abandoned) => "abandoned",
+            other => panic!("unexpected final work state: {other:?}"),
+        }
     }
 
     #[test]
@@ -892,6 +1209,45 @@ mod tests {
             now,
         )
         .expect("fixture should validate")
+    }
+
+    fn validated_work_state(
+        origin: &str,
+        principal_id: &str,
+        revision: u64,
+        state: &str,
+        artifact_id: &str,
+        now: DateTime<Utc>,
+    ) -> ValidatedEnvelope {
+        let topic = format!("loam/v1/org-3A1/project-7M3/state/{origin}/activity-01K6Q5");
+        let frame =
+            String::from_utf8(include_bytes!("../tests/fixtures/mqtt/work-state.json").to_vec())
+                .expect("work-state fixture should be UTF-8")
+                .replace(
+                    "urn:loam:instance:instance-01",
+                    &format!("urn:loam:instance:{origin}"),
+                )
+                .replace(
+                    "\"principal_id\": \"employee-184\"",
+                    &format!("\"principal_id\": \"{principal_id}\""),
+                )
+                .replace(
+                    "\"instance_id\": \"instance-01\"",
+                    &format!("\"instance_id\": \"{origin}\""),
+                )
+                .replace("01K6Q6ESWMT48TPB", &format!("work-{origin}-{revision}"))
+                .replace("\"revision\": 7", &format!("\"revision\": {revision}"))
+                .replace("\"state\": \"ready\"", &format!("\"state\": \"{state}\""))
+                .replace("SB-42", artifact_id);
+        let principal = AuthenticatedPrincipal::new(principal_id, &[]);
+        crate::envelope::validate(
+            frame.as_bytes(),
+            &topic,
+            &principal,
+            &ValidationConfig::default(),
+            now,
+        )
+        .expect("generated work-state fixture should validate")
     }
 
     fn state_frame(revision: u64, id: &str, summary: &str) -> String {
