@@ -11,7 +11,7 @@ import {
 import { FingerprintError, fingerprintActionable } from './ingest-fingerprint.mjs';
 
 const PROMPT = 'Run the existing loam::ingesting-codebase skill for the provided workspace. Do not modify source files, commit, or push. Do not spawn other agents or subagents.';
-const DEFAULTS = Object.freeze({ enabled: true, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800, visibility: 'silent' });
+const DEFAULTS = Object.freeze({ enabled: true, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800, visibility: 'silent', require_visible_worker: false });
 // Notification surfaces are local IPC; 250 ms caps terminal teardown without making a hung surface part of ingestion latency.
 const NOTIFICATION_TIMEOUT_MS = 250;
 function hash(value) { return createHash('sha256').update(String(value)).digest('hex'); }
@@ -66,6 +66,7 @@ export async function readIngestConfig(globalRoot, env = process.env) {
     timeout_seconds: numeric(env.LOAM_INGEST_TIMEOUT, numeric(section.timeout_seconds, DEFAULTS.timeout_seconds)),
     lease_ttl_seconds: numeric(env.LOAM_INGEST_LEASE_TTL, numeric(section.lease_ttl_seconds, DEFAULTS.lease_ttl_seconds)),
     visibility: visibility(section.visibility),
+    require_visible_worker: section.require_visible_worker === true,
   };
 }
 
@@ -265,7 +266,7 @@ async function acquireLease(root, workspace, harness, config, openCodeSession, e
       schema: 1, lease_id: randomUUID(), workspace, harness, owner_pid: owner.pid,
       boot_id: owner.boot_id, process_start: owner.process_start, started_at: Date.now(),
       hard_deadline: new Date(Date.now() + config.lease_ttl_seconds * 1000).toISOString(),
-      launch_mode: null, launch_state: null, planned_identity: null, child_identity: null,
+      launch_mode: null, launch_state: null, planned_identity: null, child_identity: null, downgrade_reason: null,
     };
     try {
       await writeFile(path, JSON.stringify(lease) + '\n', { flag: 'wx', mode: 0o600 });
@@ -327,14 +328,17 @@ async function updateLease(root, lease, update) {
   }
 }
 
-async function launchMode({ harness, workspace, env }) {
-  if (harness === 'opencode') return 'opencode_child';
-  if (harness === 'codex') return 'codex_exec';
+async function launchPlan({ harness, workspace, env }) {
+  if (harness === 'opencode') return { mode: 'opencode_child' };
+  if (harness === 'codex') return { mode: 'codex_exec' };
+  if (env.CLAUDE_CODE_DISABLE_AGENT_VIEW === '1') {
+    return { mode: 'claude_print', downgradeReason: 'agent_view_disabled' };
+  }
   // ponytail: --help grep is a capability heuristic; replace it if Claude exposes a versioned capability API.
   const help = await execFile('claude', ['--help'], { cwd: workspace, timeout: 5000, env });
-  const supportsBg = help.code === 0 && /--bg|--background/.test(help.stdout)
-    && env.CLAUDE_CODE_DISABLE_AGENT_VIEW !== '1';
-  return supportsBg ? 'claude_bg' : 'claude_print';
+  return help.code === 0 && /--bg|--background/.test(help.stdout)
+    ? { mode: 'claude_bg' }
+    : { mode: 'claude_print', downgradeReason: 'agent_view_unavailable' };
 }
 
 async function waitForClaude(workspace, lease, deadline, env = process.env) {
@@ -377,7 +381,7 @@ async function waitForOpenCode(openCodeSession, sessionId, deadline) {
   return last;
 }
 
-async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease, openCodeSession, root }) {
+async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease, openCodeSession, root, requireVisibleWorker = false }) {
   const prompt = PROMPT + ' Workspace: ' + workspace;
   if (mode === 'opencode_child') {
     if (!openCodeSession?.createChild || !openCodeSession?.promptAsync || !openCodeSession.parentSessionId) return { category: 'runtime_unavailable' };
@@ -433,9 +437,13 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease,
       const completion = started.completion.finally(() => rm(settingsPath, { force: true }));
       const result = await completion;
       if (result.code !== 0) {
-        const reset = await updateLease(root, lease, { launch_mode: 'claude_print', launch_state: 'planned', child_identity: null });
+        const reset = await updateLease(root, lease, {
+          launch_mode: 'claude_print', launch_state: 'planned', child_identity: null,
+          downgrade_reason: 'agent_view_launch_failed',
+        });
         if (!reset) return { category: 'orphan_unknown' };
-        return launchModel({ launchMode: 'claude_print', workspace, env, timeoutMs, lease, openCodeSession, root });
+        if (requireVisibleWorker) return { category: 'agent_view_launch_failed' };
+        return launchModel({ launchMode: 'claude_print', workspace, env, timeoutMs, lease, openCodeSession, root, requireVisibleWorker });
       }
       const registered = await queryClaude(workspace, lease, env);
       const managerId = registered.record?.id || registered.record?.session_id || registered.record?.sessionID || null;
@@ -490,6 +498,7 @@ async function recordProgress(root, pre, post, count, lease) {
       pre_fingerprint: pre.fingerprint, post_fingerprint: post.fingerprint,
       fingerprint_complete: post.complete, actionable_count: count,
       failure_count: failureCount, backoff_until: backoff,
+      ...(lease.downgrade_reason ? { downgrade_reason: lease.downgrade_reason } : {}),
     });
     return { recorded: true, status };
   } catch {
@@ -510,7 +519,10 @@ export async function runWorker({
   if (leaseResult.status !== 'acquired') return { reason: 'unavailable' };
   const lease = leaseResult.lease;
   const skip = async (reason, fields = {}) => {
-    await writeSkip(root, reason, fields, lease.lease_id);
+    await writeSkip(root, reason, {
+      ...(lease.downgrade_reason ? { downgrade_reason: lease.downgrade_reason } : {}),
+      ...fields,
+    }, lease.lease_id);
     return { reason: publicReason(reason) };
   };
   let retainLease = false;
@@ -552,7 +564,8 @@ export async function runWorker({
     if (!fingerprint.complete) return skip('fingerprint_unavailable', { actionable_count: fingerprint.count, actionable_fingerprint: fingerprint.fingerprint });
     const previousRecord = await json(join(root, 'last-run.json'));
     if (previousRecord && previousRecord.schema !== 1) return skip('schema_unknown');
-    const selectedLaunchMode = await launchMode({ harness, workspace: canonical, env });
+    const selectedLaunch = await launchPlan({ harness, workspace: canonical, env });
+    const selectedLaunchMode = selectedLaunch.mode;
     const plannedIdentity = selectedLaunchMode === 'claude_bg'
       ? {
           name: claudeSessionName(canonical),
@@ -575,13 +588,20 @@ export async function runWorker({
       launch_state: 'planned',
       planned_identity: plannedIdentity,
       child_identity: null,
+      downgrade_reason: selectedLaunch.downgradeReason || null,
       hard_deadline: new Date(Date.now() + config.timeout_seconds * 1000).toISOString(),
     }))) return skip('orphan_unknown');
+    if (selectedLaunch.downgradeReason && config.require_visible_worker) return skip(selectedLaunch.downgradeReason);
     let launch;
     try {
       launch = modelRunner
         ? await modelRunner({ harness, workspace: canonical, lease, root })
-        : await launchModel({ launchMode: lease.launch_mode, workspace: canonical, env: { ...env, LOAM_INGEST_GLOBAL_ROOT: globalRoot }, timeoutMs: config.timeout_seconds * 1000, lease, openCodeSession, root });
+        : await launchModel({
+            launchMode: lease.launch_mode, workspace: canonical,
+            env: { ...env, LOAM_INGEST_GLOBAL_ROOT: globalRoot },
+            timeoutMs: config.timeout_seconds * 1000, lease, openCodeSession, root,
+            requireVisibleWorker: config.require_visible_worker,
+          });
     } catch (error) {
       if (lease.child_identity) retainLease = true;
       return skip('runtime_unavailable', { detail: error instanceof Error ? error.message.slice(0, 256) : String(error).slice(0, 256) });

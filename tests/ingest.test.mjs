@@ -103,10 +103,15 @@ test('boundary gate honors config and environment precedence and blocks worker r
 test('visibility config accepts supported values and silently normalizes everything else', async () => {
   const globalRoot = await mkdtemp(join(tmpdir(), 'loam-visibility-config-'));
   assert.equal((await readIngestConfig(globalRoot, {})).visibility, 'silent');
+  assert.equal((await readIngestConfig(globalRoot, {})).require_visible_worker, false);
   for (const visibility of ['silent', 'toast', 'native']) {
     await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { visibility } }));
     assert.equal((await readIngestConfig(globalRoot, {})).visibility, visibility);
   }
+  await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { require_visible_worker: true } }));
+  assert.equal((await readIngestConfig(globalRoot, {})).require_visible_worker, true);
+  await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { require_visible_worker: 'true' } }));
+  assert.equal((await readIngestConfig(globalRoot, {})).require_visible_worker, false);
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'loud' } }));
   assert.equal((await readIngestConfig(globalRoot, {})).visibility, 'silent');
 });
@@ -628,6 +633,70 @@ process.exit(0);
       assert.equal(launchEvents[0].launchMode, 'claude_bg');
       assert.equal(launchEvents[0].identity.manager_name, expectedName);
       assert.equal(launchEvents[0].identity.manager_id, 'agent-42');
+    }
+  }
+});
+
+test('Claude downgrade reasons survive every visibility tier and require_visible_worker can refuse fallback', async () => {
+  const cases = [
+    ['disabled', 'agent_view_disabled', []],
+    ['unavailable', 'agent_view_unavailable', ['--help']],
+    ['launch_failed', 'agent_view_launch_failed', ['--help', '--bg']],
+  ];
+  for (const visibility of ['silent', 'toast', 'native']) {
+    for (const [mode, reason, refusedCalls] of cases) {
+      for (const requireVisibleWorker of [false, true]) {
+        const { root, workspace, wiki, skills } = await fixture();
+        await writeFile(join(root, 'config.json'), JSON.stringify({
+          background_ingest: { visibility, require_visible_worker: requireVisibleWorker },
+        }));
+        const bin = await mkdtemp(join(tmpdir(), 'loam-claude-downgrade-'));
+        const command = join(bin, process.platform === 'win32' ? 'claude.cmd' : 'claude');
+        const script = process.platform === 'win32' ? join(bin, 'claude-shim.cjs') : command;
+        const calls = join(bin, 'calls.jsonl');
+        await writeFile(calls, '');
+        await writeFile(script, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.LOAM_TEST_CALLS, JSON.stringify(args) + '\\n');
+if (args[0] === '--help') {
+  process.stdout.write(process.env.LOAM_TEST_AGENT_VIEW_MODE === 'unavailable' ? 'usage' : '--bg');
+  process.exit(0);
+}
+if (args[0] === '--bg') process.exit(process.env.LOAM_TEST_AGENT_VIEW_MODE === 'launch_failed' ? 1 : 0);
+process.exit(0);
+`);
+        if (process.platform === 'win32') {
+          await writeFile(command, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+        } else {
+          await chmod(command, 0o700);
+        }
+        const result = await runWorker({
+          harness: 'claude', workspace, globalRoot: root, skillsRoot: skills,
+          readiness: { ready: true, runtimePath: '/private/loam' },
+          env: {
+            ...process.env,
+            PATH: [bin, process.env.PATH || ''].filter(Boolean).join(delimiter),
+            LOAM_TEST_CALLS: calls,
+            LOAM_TEST_AGENT_VIEW_MODE: mode,
+            LOAM_INGEST_BACKGROUND: '1',
+            ...(mode === 'disabled' ? { CLAUDE_CODE_DISABLE_AGENT_VIEW: '1' } : {}),
+          },
+          runtimeRunner: async ({ args }) => args[0] === 'state'
+            ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+            : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
+        });
+        const argv = await readFile(calls, 'utf8').then((value) => value.trim() ? value.trim().split('\n').map(JSON.parse) : []);
+        const stored = JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8'));
+        assert.equal(stored.downgrade_reason, reason, `${visibility}/${mode}/${requireVisibleWorker}`);
+        assert.equal(result.reason, requireVisibleWorker ? 'unavailable' : 'ok');
+        assert.deepEqual(
+          argv.map((args) => args[0]),
+          requireVisibleWorker ? refusedCalls : [...refusedCalls, '-p'],
+          `${visibility}/${mode}/${requireVisibleWorker}`,
+        );
+        if (requireVisibleWorker) assert.equal(stored.status, 'skipped');
+      }
     }
   }
 });
