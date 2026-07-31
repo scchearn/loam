@@ -953,6 +953,24 @@ fn continued_and_delegated_worker_lanes_require_causal_proof() {
         Some(1)
     );
     assert_eq!(
+        record_event(
+            &root,
+            fallback,
+            "subagent",
+            Some("start"),
+            "observed",
+            &[
+                "--agent-type",
+                "loam_ingestor",
+                "--session-id",
+                "late-agent",
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
         worker_finish_with_origin(
             &root,
             fallback,

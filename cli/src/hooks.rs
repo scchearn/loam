@@ -1278,11 +1278,16 @@ fn record_event(args: EventArgs) -> Result<(), String> {
                    AND agent_type = 'loam_ingestor'
              )"
         }
-        (EventKind::CodexNative, Some(_), _) => {
+        (EventKind::CodexNative, Some(EventPhase::Continuation), _) => {
             "harness = 'codex' AND status = 'continued' AND action = 'request_worker'"
         }
         (EventKind::Subagent, Some(EventPhase::Start), Some("loam_ingestor")) => {
-            "harness = 'codex' AND status = 'continued' AND action = 'request_worker'"
+            "harness = 'codex' AND status = 'continued' AND action = 'request_worker'
+             AND NOT EXISTS (
+                 SELECT 1 FROM hook_event
+                 WHERE hook_run_id = hook_run.id AND event = 'codex_native'
+                   AND phase = 'fallback' AND outcome = 'taken'
+             )"
         }
         (EventKind::Subagent, Some(EventPhase::Start), Some("loam:ingestor")) => {
             "harness = 'claude' AND status = 'succeeded' AND action = 'spawn_worker'"
