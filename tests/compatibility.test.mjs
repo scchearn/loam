@@ -279,8 +279,9 @@ test('shared SubagentStart and SubagentStop hooks match both separators but only
   const unavailable = { loadIngest: async () => { throw new Error('must stay inert'); } };
   for (const [payload, env] of [
     [{ cwd: '/workspace', agent_id: 'agent-1', agent_type: 'loam:ingestor' }, { CLAUDE_PLUGIN_ROOT: marketplaceRoot }],
-    [{ cwd: '/workspace', agent_id: 'agent-1', agent_type: 'foreign' }, { PLUGIN_ROOT: marketplaceRoot }],
+    [{ cwd: '/workspace', turn_id: 'turn-1', agent_id: 'agent-1', agent_type: 'foreign' }, { PLUGIN_ROOT: marketplaceRoot }],
     [{ cwd: '/workspace', agent_id: 'agent-1', agent_type: 'loam_ingestor' }, { CLAUDE_PLUGIN_ROOT: marketplaceRoot }],
+    [{ cwd: '/workspace', agent_id: 'agent-1', agent_type: 'loam_ingestor' }, { PLUGIN_ROOT: marketplaceRoot }],
   ]) {
     assert.deepEqual(await start.handleSubagentStart(payload, env, unavailable), {});
     assert.deepEqual(await stop.handleSubagentStop(payload, env, unavailable), {});
@@ -312,8 +313,8 @@ test('Codex SubagentStart injects resolved preparation-first context and Subagen
       return { reason: 'ok', owns_claim: true, hook_run_id: 17, workspace: '/workspace' };
     },
   });
-  const env = { PLUGIN_ROOT: marketplaceRoot, LOAM_INGEST_GLOBAL_ROOT: '/global' };
-  const payload = { cwd: '/workspace', agent_id: 'agent-17', agent_type: 'loam_ingestor', last_assistant_message: 'I definitely succeeded' };
+  const env = { CLAUDE_PLUGIN_ROOT: marketplaceRoot, LOAM_INGEST_GLOBAL_ROOT: '/global' };
+  const payload = { cwd: '/workspace', turn_id: 'turn-17', agent_id: 'agent-17', agent_type: 'loam_ingestor', last_assistant_message: 'I definitely succeeded' };
   const response = await start.handleSubagentStart(payload, env, { loadHooks, loadIngest });
   assert.equal(response.hookSpecificOutput.hookEventName, 'SubagentStart');
   const context = response.hookSpecificOutput.additionalContext;
@@ -360,7 +361,7 @@ test('packaged SubagentStart and SubagentStop handlers emit one inert JSON respo
   for (const path of [marketplaceSubagentStartPath, marketplaceSubagentStopPath]) {
     const result = await runHook({
       HOME: home, USERPROFILE: home, LOAM_HOME: join(home, '.agents', 'loam'), PLUGIN_ROOT: marketplaceRoot,
-    }, { cwd: home, agent_id: 'agent-missing', agent_type: 'loam_ingestor' }, path);
+    }, { cwd: home, turn_id: 'turn-missing', agent_id: 'agent-missing', agent_type: 'loam_ingestor' }, path);
     assert.equal(result.code, 0, result.stderr);
     assert.equal(result.stdout, '{}\n');
     assert.equal(result.stderr, '');

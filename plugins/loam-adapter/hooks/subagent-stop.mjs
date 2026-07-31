@@ -12,15 +12,17 @@ async function readPayload() {
   catch { return {}; }
 }
 
-export function marketplaceHarness(env = process.env) {
-  return env.PLUGIN_ROOT ? 'codex' : 'claude';
+export function marketplaceHarness(payload = {}) {
+  return payload.agent_type === 'loam_ingestor'
+    && typeof payload.turn_id === 'string' && payload.turn_id.length > 0
+    ? 'codex' : 'claude';
 }
 
 export async function handleSubagentStop(payload = {}, env = process.env, options = {}) {
   return handleMarketplaceSubagentStop(payload, {
     ...options,
     env,
-    harness: marketplaceHarness(env),
+    harness: marketplaceHarness(payload),
   });
 }
 
