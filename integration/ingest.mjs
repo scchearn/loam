@@ -436,9 +436,10 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease,
         if (!reset) return { category: 'orphan_unknown' };
         return launchModel({ launchMode: 'claude_print', workspace, env, timeoutMs, lease, openCodeSession, root });
       }
-      const match = result.stdout.match(/(?:backgrounded|session|id)[^A-Za-z0-9_-]+([A-Za-z0-9_-]{4,})/i);
-      if (!(await updateLease(root, lease, { child_identity: { manager_id: match?.[1] || null, manager_name: name } }))) {
-        if (match?.[1]) await execFile('claude', ['stop', match[1]], { cwd: workspace, timeout: 5000 });
+      const registered = await queryClaude(workspace, lease, env);
+      const managerId = registered.record?.id || registered.record?.session_id || registered.record?.sessionID || null;
+      if (!(await updateLease(root, lease, { child_identity: { manager_id: managerId, manager_name: name } }))) {
+        if (managerId) await execFile('claude', ['stop', managerId], { cwd: workspace, timeout: 5000, env });
         return { category: 'orphan_unknown' };
       }
       return { category: null, completion: Promise.resolve(result), background: true };

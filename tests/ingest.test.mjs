@@ -571,12 +571,15 @@ fs.appendFileSync(process.env.LOAM_TEST_CALLS, JSON.stringify(args) + '\\n');
 if (args[0] === '--help') { process.stdout.write('--bg'); process.exit(0); }
 if (args[0] === '--bg') {
   fs.writeFileSync(process.env.LOAM_TEST_AGENT, JSON.stringify({ name: args[args.indexOf('--name') + 1] }));
-  process.stdout.write('backgrounded · agent-42');
+  process.stdout.write('backgrounded · stdout-wrong');
   process.exit(0);
 }
 if (args[0] === 'agents') {
   const agent = JSON.parse(fs.readFileSync(process.env.LOAM_TEST_AGENT, 'utf8'));
-  process.stdout.write(JSON.stringify([{ ...agent, id: 'agent-42', status: 'done' }]));
+  process.stdout.write(JSON.stringify([
+    { name: 'unrelated-agent', id: 'agent-wrong', status: 'done' },
+    { ...agent, id: 'agent-42', status: 'done' },
+  ]));
   process.exit(0);
 }
 process.exit(0);
@@ -616,6 +619,7 @@ process.exit(0);
     if (launchEvents.length) {
       assert.equal(launchEvents[0].launchMode, 'claude_bg');
       assert.equal(launchEvents[0].identity.manager_name, expectedName);
+      assert.equal(launchEvents[0].identity.manager_id, 'agent-42');
     }
   }
 });
