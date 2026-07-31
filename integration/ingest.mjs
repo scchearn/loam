@@ -40,11 +40,14 @@ function visibility(value) { return ['silent', 'toast', 'native'].includes(value
 
 async function sendNotification(notify, configuredVisibility, event) {
   if (configuredVisibility === 'silent' || typeof notify !== 'function') return;
+  const controller = new AbortController();
   let timer;
   try {
     await Promise.race([
-      Promise.resolve().then(() => notify({ ...event, visibility: configuredVisibility })),
-      new Promise((resolvePromise) => { timer = setTimeout(resolvePromise, NOTIFICATION_TIMEOUT_MS); }),
+      Promise.resolve().then(() => notify({ ...event, visibility: configuredVisibility, signal: controller.signal })),
+      new Promise((resolvePromise) => {
+        timer = setTimeout(() => { controller.abort(); resolvePromise(); }, NOTIFICATION_TIMEOUT_MS);
+      }),
     ]);
   } catch {}
   finally { clearTimeout(timer); }

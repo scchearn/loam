@@ -140,6 +140,8 @@ test('notification launch is non-blocking and terminal status follows persisted 
   assert.equal(result.reason, 'ok');
   assert.equal(stored.status, 'failed');
   assert.deepEqual(calls.map(({ phase }) => phase), ['launch', 'terminal']);
+  assert.equal(calls[0].signal.aborted, true, 'deadline must cancel a hanging notification resource');
+  assert.equal(calls[1].signal.aborted, false);
   assert.equal(calls[1].status, stored.status);
   assert.ok(elapsed >= 200 && elapsed < 1000, `bounded notification elapsed ${elapsed}ms`);
 });
