@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -12,8 +12,6 @@ const execFileAsync = promisify(execFile);
 import { EXIT_CODES, HELP_TEXT, PACKAGE_VERSION, SKILLS_CLI_VERSION } from '../setup/constants.mjs';
 import { parseArgs, UsageError } from '../setup/args.mjs';
 
-const root = fileURLToPath(new URL('..', import.meta.url));
-
 test('package exposes the scoped setup executable and pinned Skills CLI', async () => {
   const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 
@@ -22,8 +20,6 @@ test('package exposes the scoped setup executable and pinned Skills CLI', async 
   assert.equal(packageJson.bin.loam, 'bin/loam.mjs');
   assert.equal(packageJson.dependencies.skills, SKILLS_CLI_VERSION);
   assert.match(HELP_TEXT, /@scchearn\/loam setup/);
-  const base = basename(resolve(root));
-  assert.ok(base === 'loam' || resolve(root).includes(join('.claude', 'worktrees')));
 });
 
 test('setup accepts the confirmation and dry-run flags', () => {
