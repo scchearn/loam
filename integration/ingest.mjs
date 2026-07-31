@@ -12,8 +12,8 @@ import {
 import { FingerprintError, fingerprintActionable } from './ingest-fingerprint.mjs';
 
 const PROMPT = 'Run the existing loam::ingesting-codebase skill for the provided workspace. Do not modify source files, commit, or push. Do not spawn other agents or subagents.';
-const DEFAULTS = Object.freeze({ enabled: true, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800, visibility: 'silent', require_visible_worker: false });
-const CODEX_NATIVE_REASON = 'Call spawn_agent exactly once using the loam_ingestor agent profile to run the pending Loam code-memory ingestion, then finish this continuation immediately without doing any other work or spawning any additional agents.';
+const DEFAULTS = Object.freeze({ enabled: true, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800, visibility: 'native', require_visible_worker: false });
+const CODEX_NATIVE_REASON = 'Call spawn_agent exactly once using the loam_ingestor agent profile, fork_turns set to "none", and task_name set to "loam_ingest_stop_<N>" where <N> is the numeric component of this hook_prompt\'s hook_run_id. Run the pending Loam code-memory ingestion, then finish this continuation immediately without doing any other work or spawning any additional agents.';
 const NATIVE_AGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 // Notification surfaces are local IPC; 250 ms caps terminal teardown without making a hung surface part of ingestion latency.
 const NOTIFICATION_TIMEOUT_MS = 250;
