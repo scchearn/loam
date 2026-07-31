@@ -43,14 +43,14 @@
       {"op": "set", "path": ["data", "to"], "value": [{"kind": "team", "id": "team-1"}]}
     ]
   },
-  {"name": "inbox_recipient_mismatch", "base": "message", "topic": "loam/v1/org-3A1/project-7M3/inbox/agent-99/instance-01/01K6Q6ESWMT48TPC"},
+  {"name": "inbox_recipient_mismatch", "base": "message", "topic": "loam/v1/org-3A1/project-7M3/inbox/agent/agent-99/instance-01/01K6Q6ESWMT48TPC"},
   {
     "name": "inbox_recipient_kind_mismatch",
     "base": "message",
-    "topic": "loam/v1/org-3A1/project-7M3/inbox/project-7M3/instance-01/01K6Q6ESWMT48TPC",
+    "topic": "loam/v1/org-3A1/project-7M3/inbox/principal/shared-42/instance-01/01K6Q6ESWMT48TPC",
     "patches": [
-      {"op": "set", "path": ["data", "to"], "value": [{"kind": "project", "id": "project-7M3"}]}
+      {"op": "set", "path": ["data", "to"], "value": [{"kind": "agent", "id": "shared-42"}]}
     ]
   },
-  {"name": "inbox_message_mismatch", "base": "message", "topic": "loam/v1/org-3A1/project-7M3/inbox/agent-91/instance-01/01K6Q6ESWMT48TPZ"}
+  {"name": "inbox_message_mismatch", "base": "message", "topic": "loam/v1/org-3A1/project-7M3/inbox/agent/agent-91/instance-01/01K6Q6ESWMT48TPZ"}
 ]

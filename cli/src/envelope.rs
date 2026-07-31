@@ -4,17 +4,13 @@
 //! layer inherit one identity and validation boundary instead of re-creating
 //! it around live infrastructure.
 
-// Slice B (`specs/loam-mqtt-transport.md`) is the first runtime consumer and
-// will retire this allowance when it wires validated messages to transport.
-#![allow(dead_code)]
-
 use crate::json::{self, Value};
 use chrono::{DateTime, Duration, Utc};
 
 const DEFAULT_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_DOCUMENT_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_FUTURE_EXPIRY_SECONDS: i64 = 7 * 24 * 60 * 60;
-const MAX_MQTT_TOPIC_BYTES: usize = 65_535;
+pub(crate) const MAX_MQTT_TOPIC_BYTES: usize = 65_535;
 
 #[cfg(test)]
 std::thread_local! {
@@ -132,6 +128,7 @@ pub enum BindingAxis {
     DeliveryClass,
     StateKey,
     Audience,
+    RecipientKind,
     Recipient,
     MessageId,
 }
@@ -170,7 +167,7 @@ impl ValidatedEnvelope {
         &self.0
     }
 
-    pub fn into_envelope(self) -> Envelope {
+    pub(crate) fn into_envelope(self) -> Envelope {
         self.0
     }
 
@@ -410,7 +407,7 @@ impl Envelope {
 
     /// Reconstructs the structured JSON value rather than a display rendering;
     /// downstream transport must publish the complete validated envelope.
-    pub fn into_value(self) -> Value {
+    fn into_value(self) -> Value {
         let mut fields = Vec::with_capacity(10 + self.extra.len());
         push_string(&mut fields, "specversion", self.specversion);
         push_string(&mut fields, "id", self.id);
@@ -429,7 +426,7 @@ impl Envelope {
 
     /// Uses Loam's dependency-free JSON writer so the envelope layer does not
     /// introduce a second parser or change the runtime's portability boundary.
-    pub fn to_json(&self) -> String {
+    pub(crate) fn to_json(&self) -> String {
         self.clone().into_value().to_json()
     }
 }
@@ -793,7 +790,7 @@ pub fn validate(
     #[cfg(test)]
     let started =
         VALIDATION_PROFILE.with(|profile| profile.get().map(|_| std::time::Instant::now()));
-    let verdict = validate_observed(input, topic, principal, config, now, &IgnoreNetwork);
+    let verdict = validate_observed(input, topic, principal, config, now);
     #[cfg(test)]
     if let Some(started) = started {
         VALIDATION_PROFILE.with(|profile| {
@@ -807,23 +804,12 @@ pub fn validate(
     verdict
 }
 
-trait NetworkAttemptObserver {
-    fn outbound_attempt(&self, target: &str);
-}
-
-struct IgnoreNetwork;
-
-impl NetworkAttemptObserver for IgnoreNetwork {
-    fn outbound_attempt(&self, _target: &str) {}
-}
-
 fn validate_observed(
     input: &[u8],
     topic: &str,
     principal: &AuthenticatedPrincipal<'_>,
     config: &ValidationConfig,
     now: DateTime<Utc>,
-    _network: &dyn NetworkAttemptObserver,
 ) -> Result<ValidatedEnvelope, Violation> {
     if input.len() > config.max_document_bytes {
         return Err(Violation::DocumentTooLarge);
@@ -1105,6 +1091,7 @@ enum TopicDelivery<'a> {
         key: &'a str,
     },
     Inbox {
+        recipient_kind: &'a str,
         recipient: &'a str,
         origin: &'a str,
         message_id: &'a str,
@@ -1160,14 +1147,21 @@ fn parse_topic(topic: &str) -> Result<ParsedTopic<'_>, Violation> {
             TopicDelivery::State { origin, key }
         }
         "inbox" => {
-            let recipient = segments.next().filter(|value| valid_topic_segment(value));
-            let origin = segments.next().filter(|value| valid_topic_segment(value));
-            let message_id = segments.next().filter(|value| valid_topic_segment(value));
-            let (Some(recipient), Some(origin), Some(message_id)) = (recipient, origin, message_id)
-            else {
+            let remaining = segments.by_ref().collect::<Vec<_>>();
+            let [recipient_kind, recipient, origin, message_id] = remaining.as_slice() else {
                 return Err(Violation::MalformedTopic);
             };
+            if ![*recipient_kind, *recipient, *origin, *message_id]
+                .into_iter()
+                .all(valid_topic_segment)
+            {
+                return Err(Violation::MalformedTopic);
+            }
+            if !matches!(*recipient_kind, "agent" | "principal" | "instance") {
+                return Err(Violation::UnknownRecipientKind);
+            }
             TopicDelivery::Inbox {
+                recipient_kind,
                 recipient,
                 origin,
                 message_id,
@@ -1223,7 +1217,11 @@ fn validate_topic(value: &Value, topic: &str) -> Result<(), Violation> {
         return Err(Violation::BindingMismatch(BindingAxis::Audience));
     }
     let inbox_recipient = match &topic.delivery {
-        TopicDelivery::Inbox { recipient, .. } => Some(*recipient),
+        TopicDelivery::Inbox {
+            recipient_kind,
+            recipient,
+            ..
+        } => Some((*recipient_kind, *recipient)),
         TopicDelivery::Event { .. } | TopicDelivery::State { .. } => None,
     };
     let mut directly_addressed = false;
@@ -1241,10 +1239,13 @@ fn validate_topic(value: &Value, topic: &str) -> Result<(), Violation> {
             }
             "project" => {}
             "agent" | "principal" | "instance" => {
-                let Some(expected) = inbox_recipient else {
+                let Some((expected_kind, expected_id)) = inbox_recipient else {
                     return Err(Violation::BindingMismatch(BindingAxis::Audience));
                 };
-                if id != expected {
+                if kind != expected_kind {
+                    return Err(Violation::BindingMismatch(BindingAxis::RecipientKind));
+                }
+                if id != expected_id {
                     return Err(Violation::BindingMismatch(BindingAxis::Recipient));
                 }
                 directly_addressed = true;
@@ -1616,7 +1617,6 @@ mod tests {
     use super::*;
     use crate::json;
     use chrono::{DateTime, Duration, Utc};
-    use std::cell::Cell;
 
     const CORE_FIXTURES: &[&str] = &[
         include_str!("../tests/fixtures/mqtt/git-refs-changed.json"),
@@ -1890,6 +1890,14 @@ mod tests {
             .as_array()
             .expect("recipient-kind corpus should be an array")
         {
+            let name = case
+                .get("name")
+                .and_then(Value::as_str)
+                .expect("case should have a name");
+            let expected = case
+                .get("expected")
+                .and_then(Value::as_str)
+                .expect("case should have an expected verdict");
             let base = case
                 .get("base")
                 .and_then(Value::as_str)
@@ -1906,14 +1914,23 @@ mod tests {
             {
                 apply_fixture_patch(&mut message, patch);
             }
-            assert!(validate(
+            let verdict = validate(
                 message.to_json().as_bytes(),
                 topic,
                 &authenticated_principal(),
                 &config,
                 now,
-            )
-            .is_ok());
+            );
+            let expected = match expected {
+                "ok" => Ok(()),
+                "recipient_kind_mismatch" => {
+                    Err(Violation::BindingMismatch(BindingAxis::RecipientKind))
+                }
+                "unknown_recipient_kind" => Err(Violation::UnknownRecipientKind),
+                "malformed_topic" => Err(Violation::MalformedTopic),
+                _ => panic!("unmapped recipient-kind verdict {expected}"),
+            };
+            assert_eq!(verdict.map(|_| ()), expected, "case {name}");
         }
     }
 
@@ -2210,8 +2227,7 @@ mod tests {
     }
 
     #[test]
-    fn extension_validation_attempts_no_network_for_the_fixture_corpus() {
-        let observer = DenyNetwork::default();
+    fn extension_validation_has_no_network_capability_for_the_fixture_corpus() {
         let config = ValidationConfig::default();
         let now = DateTime::parse_from_rfc3339("2026-07-24T14:21:00Z")
             .expect("test time should parse")
@@ -2223,7 +2239,6 @@ mod tests {
                 &authenticated_principal(),
                 &config,
                 now,
-                &observer,
             );
         }
         let cases = json::parse(include_str!("../tests/fixtures/mqtt/extension-cases.json"))
@@ -2252,12 +2267,10 @@ mod tests {
                 &authenticated_principal(),
                 &config,
                 now,
-                &observer,
             ),
             Err(Violation::UnknownContextField)
         );
 
-        assert_eq!(observer.attempts.get(), 0);
         let process_files = ["checkpoint.rs", "codegraph.rs", "main.rs", "state.rs"];
         let filesystem_files = [
             "check.rs",
@@ -2311,11 +2324,6 @@ mod tests {
         // This absence is load-bearing: the borrowed ExtensionView is data-only,
         // and callable capabilities anywhere in the crate require explicit review.
         for (path, production) in crate_production_sources() {
-            let production = if path == "envelope.rs" {
-                production.replace("&dyn NetworkAttemptObserver", "")
-            } else {
-                production
-            };
             assert!(
                 !production.contains("dyn "),
                 "trait-object capability introduced in {path}"
@@ -2384,17 +2392,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct DenyNetwork {
-        attempts: Cell<usize>,
-    }
-
-    impl NetworkAttemptObserver for DenyNetwork {
-        fn outbound_attempt(&self, _target: &str) {
-            self.attempts.set(self.attempts.get() + 1);
-        }
-    }
-
     #[test]
     fn validate_request_and_response_thread_constructors_preserve_causality() {
         let request = Thread::for_request("thread-1", "request-1");
@@ -2456,7 +2453,9 @@ mod tests {
     fn topic_for(name: &str) -> &'static str {
         match name {
             "git-refs-changed" => "loam/v1/org-3A1/project-7M3/event/instance-01",
-            "message" => "loam/v1/org-3A1/project-7M3/inbox/agent-91/instance-01/01K6Q6ESWMT48TPC",
+            "message" => {
+                "loam/v1/org-3A1/project-7M3/inbox/agent/agent-91/instance-01/01K6Q6ESWMT48TPC"
+            }
             "extension" => "loam/v1/org-3A1/project-7M3/event/instance-01",
             _ => "loam/v1/org-3A1/project-7M3/state/instance-01/activity-01K6Q5",
         }
@@ -2610,8 +2609,9 @@ mod tests {
             | "organization_audience_mismatch"
             | "direct_recipient_on_state"
             | "empty_audience" => Violation::BindingMismatch(BindingAxis::Audience),
-            "inbox_recipient_mismatch" | "inbox_recipient_kind_mismatch" => {
-                Violation::BindingMismatch(BindingAxis::Recipient)
+            "inbox_recipient_mismatch" => Violation::BindingMismatch(BindingAxis::Recipient),
+            "inbox_recipient_kind_mismatch" => {
+                Violation::BindingMismatch(BindingAxis::RecipientKind)
             }
             "unknown_recipient_kind" => Violation::UnknownRecipientKind,
             "inbox_message_mismatch" => Violation::BindingMismatch(BindingAxis::MessageId),
@@ -2745,7 +2745,7 @@ mod tests {
 
     fn assert_allowed_dependency(name: &str) {
         assert!(
-            ["chrono", "pulldown-cmark", "rusqlite"].contains(&name),
+            ["chrono", "pulldown-cmark", "rumqttc", "rusqlite"].contains(&name),
             "network-capable dependency requires review: {name}"
         );
     }
