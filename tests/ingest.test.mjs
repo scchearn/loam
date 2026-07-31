@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
 import { fingerprintActionable } from '../integration/ingest-fingerprint.mjs';
-import { gate, ingestStatus, readIngestConfig, runRoot, runWorker, startWorker } from '../integration/ingest.mjs';
+import { claudeSessionName, gate, ingestStatus, readIngestConfig, runRoot, runWorker, startWorker } from '../integration/ingest.mjs';
 import { bootIdentity, childIdentity, processDescriptor, resolveExecutable, startTracked } from '../integration/ingest-process.mjs';
 
 async function fixture() {
@@ -107,6 +107,14 @@ test('visibility config accepts supported values and silently normalizes everyth
   }
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'loud' } }));
   assert.equal((await readIngestConfig(globalRoot, {})).visibility, 'silent');
+});
+
+test('Claude session name is deterministic, Loam-attributable, and workspace scoped', () => {
+  const first = claudeSessionName('/workspace/one');
+  assert.equal(first, claudeSessionName('/workspace/one'));
+  assert.notEqual(first, claudeSessionName('/workspace/two'));
+  assert.match(first, /^loam-ingest-[a-f0-9]{10}$/u);
+  assert.doesNotMatch(first, /workspace/u);
 });
 
 test('notification launch is non-blocking and terminal status follows persisted outcome', async () => {
@@ -510,6 +518,7 @@ test('Windows batch launch executes from a spaced path', { skip: process.platfor
 
 test('Claude uses a help-only capability check, falls back cleanly, and receives the source-safety prompt', async () => {
   const { root, workspace, wiki, skills } = await fixture();
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'toast' } }));
   const bin = await mkdtemp(join(tmpdir(), 'loam-claude-'));
   const command = join(bin, process.platform === 'win32' ? 'claude.cmd' : 'claude');
   const script = process.platform === 'win32' ? join(bin, 'claude-shim.cjs') : command;
@@ -527,6 +536,7 @@ process.exit(args[0] === '--bg' ? 1 : 0);
     await chmod(command, 0o700);
   }
   const source = await readFile(join(workspace, 'src', 'a.js'), 'utf8');
+  const notifications = [];
   const result = await runWorker({
     harness: 'claude', workspace, globalRoot: root, skillsRoot: skills,
     readiness: { ready: true, runtimePath: '/private/loam' },
@@ -534,13 +544,80 @@ process.exit(args[0] === '--bg' ? 1 : 0);
     runtimeRunner: async ({ args }) => args[0] === 'state'
       ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
       : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
+    notify: async (event) => {
+      if (event.phase === 'launch' && event.launchMode === 'claude_bg') notifications.push(event);
+    },
   });
   const argv = (await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse);
   assert.equal(result.reason, 'ok');
   assert.deepEqual(argv.map((args) => args[0]), ['--help', '--bg', '-p']);
   assert.match(argv.at(-1)[1], /Do not modify source files, commit, or push/u);
   assert.match(argv.at(-1)[1], /Do not spawn other agents or subagents\./u);
+  assert.equal(notifications.length, 0, 'failed background registration must not report a planned Agent View name');
   assert.equal(await readFile(join(workspace, 'src', 'a.js'), 'utf8'), source);
+});
+
+test('Claude visibility uses one registered Agent View session name for command and launch event', async () => {
+  const { root, workspace, wiki, skills } = await fixture();
+  const bin = await mkdtemp(join(tmpdir(), 'loam-claude-visible-'));
+  const command = join(bin, process.platform === 'win32' ? 'claude.cmd' : 'claude');
+  const script = process.platform === 'win32' ? join(bin, 'claude-shim.cjs') : command;
+  const calls = join(bin, 'calls.jsonl');
+  const state = join(bin, 'agent.json');
+  await writeFile(script, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.LOAM_TEST_CALLS, JSON.stringify(args) + '\\n');
+if (args[0] === '--help') { process.stdout.write('--bg'); process.exit(0); }
+if (args[0] === '--bg') {
+  fs.writeFileSync(process.env.LOAM_TEST_AGENT, JSON.stringify({ name: args[args.indexOf('--name') + 1] }));
+  process.stdout.write('backgrounded · agent-42');
+  process.exit(0);
+}
+if (args[0] === 'agents') {
+  const agent = JSON.parse(fs.readFileSync(process.env.LOAM_TEST_AGENT, 'utf8'));
+  process.stdout.write(JSON.stringify([{ ...agent, id: 'agent-42', status: 'done' }]));
+  process.exit(0);
+}
+process.exit(0);
+`);
+  if (process.platform === 'win32') {
+    await writeFile(command, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+  } else {
+    await chmod(command, 0o700);
+  }
+
+  const expectedName = claudeSessionName(workspace);
+  for (const configuredVisibility of ['toast', 'native', 'silent']) {
+    const globalRoot = join(root, `global-${configuredVisibility}`);
+    await mkdir(globalRoot, { recursive: true });
+    await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { visibility: configuredVisibility } }));
+    const launchEvents = [];
+    const result = await runWorker({
+      harness: 'claude', workspace, globalRoot, skillsRoot: skills,
+      readiness: { ready: true, runtimePath: '/private/loam' },
+      env: {
+        ...process.env,
+        PATH: [bin, process.env.PATH || ''].filter(Boolean).join(delimiter),
+        LOAM_TEST_CALLS: calls,
+        LOAM_TEST_AGENT: state,
+        LOAM_INGEST_BACKGROUND: '1',
+      },
+      runtimeRunner: async ({ args }) => args[0] === 'state'
+        ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+        : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
+      notify: async (event) => { if (event.phase === 'launch') launchEvents.push(event); },
+    });
+    const argv = (await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse);
+    const background = argv.filter((args) => args[0] === '--bg').at(-1);
+    assert.equal(result.reason, 'ok');
+    assert.equal(background[background.indexOf('--name') + 1], expectedName);
+    assert.equal(launchEvents.length, configuredVisibility === 'silent' ? 0 : 1);
+    if (launchEvents.length) {
+      assert.equal(launchEvents[0].launchMode, 'claude_bg');
+      assert.equal(launchEvents[0].identity.manager_name, expectedName);
+    }
+  }
 });
 
 test('separate workspaces proceed independently while a live workspace lease remains held', async () => {
