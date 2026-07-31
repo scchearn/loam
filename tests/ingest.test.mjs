@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
 import { fingerprintActionable } from '../integration/ingest-fingerprint.mjs';
-import { gate, ingestStatus, runRoot, runWorker, startWorker } from '../integration/ingest.mjs';
+import { gate, ingestStatus, readIngestConfig, runRoot, runWorker, startWorker } from '../integration/ingest.mjs';
 import { bootIdentity, childIdentity, processDescriptor, resolveExecutable, startTracked } from '../integration/ingest-process.mjs';
 
 async function fixture() {
@@ -96,6 +96,74 @@ test('boundary gate honors config and environment precedence and blocks worker r
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { enabled: true } }));
   assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
   assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_WORKER: '1' } }), { action: 'skip', reason: 'disabled' });
+});
+
+test('visibility config accepts supported values and silently normalizes everything else', async () => {
+  const globalRoot = await mkdtemp(join(tmpdir(), 'loam-visibility-config-'));
+  assert.equal((await readIngestConfig(globalRoot, {})).visibility, 'silent');
+  for (const visibility of ['silent', 'toast', 'native']) {
+    await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { visibility } }));
+    assert.equal((await readIngestConfig(globalRoot, {})).visibility, visibility);
+  }
+  await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'loud' } }));
+  assert.equal((await readIngestConfig(globalRoot, {})).visibility, 'silent');
+});
+
+test('notification launch is non-blocking and terminal status follows persisted outcome', async () => {
+  const { root, workspace, wiki, skills } = await fixture();
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'toast' } }));
+  const calls = [];
+  let modelCompleted = false;
+  let markLaunchCalled;
+  const launchCalled = new Promise((resolvePromise) => { markLaunchCalled = resolvePromise; });
+  const startedAt = Date.now();
+  const resultPromise = runWorker({
+    harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' },
+    runtimeRunner: async ({ args }) => args[0] === 'state'
+      ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+      : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
+    modelRunner: async () => ({
+      completion: Promise.resolve().then(() => { modelCompleted = true; return { code: 0 }; }),
+    }),
+    notify: async (event) => {
+      calls.push(event);
+      if (event.phase === 'launch') { markLaunchCalled(); return new Promise(() => {}); }
+    },
+  });
+
+  await launchCalled;
+  assert.equal(modelCompleted, true, 'launch notification must not block worker completion');
+  const result = await resultPromise;
+  const elapsed = Date.now() - startedAt;
+  const stored = JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8'));
+  assert.equal(result.reason, 'ok');
+  assert.equal(stored.status, 'failed');
+  assert.deepEqual(calls.map(({ phase }) => phase), ['launch', 'terminal']);
+  assert.equal(calls[1].status, stored.status);
+  assert.ok(elapsed >= 200 && elapsed < 1000, `bounded notification elapsed ${elapsed}ms`);
+});
+
+test('silent and failing notifications cannot change ingestion state or exceed two calls', async () => {
+  for (const visibility of ['silent', 'toast']) {
+    const { root, workspace, wiki, skills } = await fixture();
+    await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility } }));
+    const calls = [];
+    const result = await runWorker({
+      harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
+      readiness: { ready: true, runtimePath: '/private/loam' },
+      runtimeRunner: async ({ args }) => args[0] === 'state'
+        ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+        : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
+      modelRunner: async () => ({ completion: Promise.resolve({ code: 0 }) }),
+      notify: async (event) => { calls.push(event); throw new Error('toast failed'); },
+    });
+    const stored = JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8'));
+    assert.equal(result.reason, 'ok');
+    assert.equal(stored.status, 'failed');
+    assert.equal(await readFile(join(runRoot(root, workspace), 'lease.json')).then(() => true).catch(() => false), false);
+    assert.equal(calls.length, visibility === 'silent' ? 0 : 2);
+  }
 });
 
 test('detached worker launch forwards the hook-run correlation id', () => {

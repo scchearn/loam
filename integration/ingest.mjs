@@ -11,7 +11,9 @@ import {
 import { FingerprintError, fingerprintActionable } from './ingest-fingerprint.mjs';
 
 const PROMPT = 'Run the existing loam::ingesting-codebase skill for the provided workspace. Do not modify source files, commit, or push. Do not spawn other agents or subagents.';
-const DEFAULTS = Object.freeze({ enabled: true, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800 });
+const DEFAULTS = Object.freeze({ enabled: true, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800, visibility: 'silent' });
+// Notification surfaces are local IPC; 250 ms caps terminal teardown without making a hung surface part of ingestion latency.
+const NOTIFICATION_TIMEOUT_MS = 250;
 function hash(value) { return createHash('sha256').update(String(value)).digest('hex'); }
 export function runRoot(globalRoot, workspace) { return join(resolve(globalRoot), 'run', hash(workspace).slice(0, 16)); }
 async function json(path, fallback = null) { try { return JSON.parse(await readFile(path, 'utf8')); } catch { return fallback; } }
@@ -34,6 +36,19 @@ async function writeAtomicFile(path, contents) {
   }
 }
 function numeric(value, fallback) { const parsed = Number(value); return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback; }
+function visibility(value) { return ['silent', 'toast', 'native'].includes(value) ? value : DEFAULTS.visibility; }
+
+async function sendNotification(notify, configuredVisibility, event) {
+  if (configuredVisibility === 'silent' || typeof notify !== 'function') return;
+  let timer;
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => notify({ ...event, visibility: configuredVisibility })),
+      new Promise((resolvePromise) => { timer = setTimeout(resolvePromise, NOTIFICATION_TIMEOUT_MS); }),
+    ]);
+  } catch {}
+  finally { clearTimeout(timer); }
+}
 
 export async function readIngestConfig(globalRoot, env = process.env) {
   const file = await json(join(resolve(globalRoot), 'config.json'), {});
@@ -45,6 +60,7 @@ export async function readIngestConfig(globalRoot, env = process.env) {
     min_interval_seconds: numeric(env.LOAM_INGEST_MIN_INTERVAL, numeric(section.min_interval_seconds, DEFAULTS.min_interval_seconds)),
     timeout_seconds: numeric(env.LOAM_INGEST_TIMEOUT, numeric(section.timeout_seconds, DEFAULTS.timeout_seconds)),
     lease_ttl_seconds: numeric(env.LOAM_INGEST_LEASE_TTL, numeric(section.lease_ttl_seconds, DEFAULTS.lease_ttl_seconds)),
+    visibility: visibility(section.visibility),
   };
 }
 
@@ -453,9 +469,9 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease,
 async function recordProgress(root, pre, post, count, lease) {
   try {
     const current = await json(join(root, 'lease.json'));
-    if (current?.lease_id !== lease.lease_id) return false;
+    if (current?.lease_id !== lease.lease_id) return { recorded: false, status: 'failed' };
     const loaded = await json(join(root, 'last-run.json'));
-    if (loaded && loaded.schema !== 1) return false;
+    if (loaded && loaded.schema !== 1) return { recorded: false, status: 'failed' };
     const previous = loaded || {};
     const same = pre.complete && post.complete && pre.fingerprint === post.fingerprint;
     const progress = post.complete && (post.count === 0 || post.fingerprint !== pre.fingerprint);
@@ -468,15 +484,15 @@ async function recordProgress(root, pre, post, count, lease) {
       fingerprint_complete: post.complete, actionable_count: count,
       failure_count: failureCount, backoff_until: backoff,
     });
-    return true;
+    return { recorded: true, status };
   } catch {
-    return false;
+    return { recorded: false, status: 'failed' };
   }
 }
 
 export async function runWorker({
   harness, workspace, globalRoot, skillsRoot, env = process.env, platform = process.platform,
-  runtimeRunner, readiness, modelRunner, openCodeSession,
+  runtimeRunner, readiness, modelRunner, openCodeSession, notify,
 } = {}) {
   const canonical = await canonicalWorkspace(workspace);
   const root = runRoot(globalRoot, canonical);
@@ -491,6 +507,7 @@ export async function runWorker({
     return { reason: publicReason(reason) };
   };
   let retainLease = false;
+  let launchNotification = Promise.resolve();
   try {
     if (!config.enabled) return skip('disabled');
     const localOutcome = await json(join(root, 'last-run.json'));
@@ -566,6 +583,10 @@ export async function runWorker({
       if (['orphan_live', 'orphan_unknown'].includes(launch.category)) retainLease = true;
       return skip(launch.category);
     }
+    launchNotification = sendNotification(notify, config.visibility, {
+      phase: 'launch', harness, workspace: canonical, launchMode: lease.launch_mode,
+      identity: lease.child_identity || lease.planned_identity,
+    });
     const result = await (launch.completion || Promise.resolve({ code: 0 }));
     if (!launch.background && result.category === 'timeout' && lease.child_identity) {
       const childState = await classifyChild(lease.child_identity, { platform });
@@ -604,7 +625,12 @@ export async function runWorker({
       }
     } catch {}
     if (result.category || (typeof result.code === 'number' && result.code !== 0)) post.complete = false;
-    await recordProgress(root, fingerprint, post, fingerprint.count, lease);
+    const recorded = await recordProgress(root, fingerprint, post, fingerprint.count, lease);
+    await launchNotification;
+    await sendNotification(notify, config.visibility, {
+      phase: 'terminal', harness, workspace: canonical, launchMode: lease.launch_mode,
+      status: recorded.status,
+    });
     return { reason: result?.category === 'timeout' ? 'unavailable' : 'ok' };
   } finally {
     if (!retainLease && await liveOwnedChild(root, canonical, openCodeSession, lease.lease_id)) retainLease = true;
