@@ -2271,7 +2271,13 @@ mod tests {
             Err(Violation::UnknownContextField)
         );
 
-        let process_files = ["checkpoint.rs", "codegraph.rs", "main.rs", "state.rs"];
+        let process_files = [
+            "checkpoint.rs",
+            "codegraph.rs",
+            "main.rs",
+            "state.rs",
+            "transport.rs",
+        ];
         let filesystem_files = [
             "check.rs",
             "checkpoint.rs",

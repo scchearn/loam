@@ -9,6 +9,7 @@ use rumqttc::v5::{Client, MqttOptions};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 // Conservative room for the MQTT header, packet ID, property lengths, expiry,
 // payload-format indicator, and application/json content type.
@@ -44,6 +45,8 @@ pub enum TransportError {
     TerminalWorkState,
     PublicationUnverified,
     WorkRevisionNotNewer,
+    InvalidLifecycleDuration,
+    InvalidRenewalInterval,
     OriginNotAuthorized,
     ClientQueue,
     Validation(Violation),
@@ -75,6 +78,10 @@ impl std::fmt::Display for TransportError {
             Self::TerminalWorkState => "terminal work state cannot transition",
             Self::PublicationUnverified => "published work state requires Git reachability proof",
             Self::WorkRevisionNotNewer => "work-state revision must increase",
+            Self::InvalidLifecycleDuration => "lifecycle durations must be positive and bounded",
+            Self::InvalidRenewalInterval => {
+                "renewal interval must be shorter than the lease duration"
+            }
             Self::OriginNotAuthorized => "authenticated transport identity cannot use topic origin",
             Self::ClientQueue => "MQTT client request queue is unavailable",
             Self::Validation(violation) => {
@@ -86,6 +93,56 @@ impl std::fmt::Display for TransportError {
 }
 
 impl std::error::Error for TransportError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleConfig {
+    lease_duration: chrono::Duration,
+    renewal_interval: chrono::Duration,
+    event_expiry: chrono::Duration,
+    inbox_expiry: chrono::Duration,
+    clock_skew_tolerance: chrono::Duration,
+}
+
+impl LifecycleConfig {
+    pub fn new(
+        lease_duration: chrono::Duration,
+        renewal_interval: chrono::Duration,
+        event_expiry: chrono::Duration,
+        inbox_expiry: chrono::Duration,
+        clock_skew_tolerance: chrono::Duration,
+    ) -> Result<Self, TransportError> {
+        if [lease_duration, renewal_interval, event_expiry, inbox_expiry]
+            .into_iter()
+            .any(|duration| duration.num_seconds() <= 0)
+            || clock_skew_tolerance < chrono::Duration::zero()
+            || clock_skew_tolerance > lease_duration
+        {
+            return Err(TransportError::InvalidLifecycleDuration);
+        }
+        if renewal_interval >= lease_duration {
+            return Err(TransportError::InvalidRenewalInterval);
+        }
+        Ok(Self {
+            lease_duration,
+            renewal_interval,
+            event_expiry,
+            inbox_expiry,
+            clock_skew_tolerance,
+        })
+    }
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        Self {
+            lease_duration: chrono::Duration::minutes(30),
+            renewal_interval: chrono::Duration::minutes(10),
+            event_expiry: chrono::Duration::minutes(5),
+            inbox_expiry: chrono::Duration::hours(24),
+            clock_skew_tolerance: chrono::Duration::seconds(30),
+        }
+    }
+}
 
 impl TransportConfig {
     pub fn new(
@@ -154,14 +211,41 @@ pub fn prepare_publish(
     envelope: ValidatedEnvelope,
     now: DateTime<Utc>,
 ) -> Result<PreparedPublish, TransportError> {
+    prepare_publish_with_lifecycle(envelope, now, &LifecycleConfig::default())
+}
+
+pub fn prepare_publish_with_lifecycle(
+    envelope: ValidatedEnvelope,
+    now: DateTime<Utc>,
+    lifecycle: &LifecycleConfig,
+) -> Result<PreparedPublish, TransportError> {
     let topic = topic_for(&envelope)?;
-    let retain = envelope.as_envelope().data.delivery.class != "event";
+    let data = &envelope.as_envelope().data;
+    let retain = data.delivery.class != "event";
     let expires_at = DateTime::parse_from_rfc3339(&envelope.as_envelope().data.expires_at)
         .map_err(|_| TransportError::InvalidExpiry)?
         .with_timezone(&Utc);
-    let seconds = expires_at.signed_duration_since(now).num_seconds();
+    let mut seconds = expires_at.signed_duration_since(now).num_seconds();
     if seconds <= 0 {
         return Err(TransportError::Expired);
+    }
+    let configured_expiry = match data.delivery.class.as_str() {
+        "event" => Some(lifecycle.event_expiry),
+        "inbox" => Some(lifecycle.inbox_expiry),
+        "latest-state"
+            if data
+                .payload
+                .get("state")
+                .and_then(crate::json::Value::as_str)
+                .and_then(WorkStatus::from_wire)
+                .is_some_and(|status| !status.is_terminal()) =>
+        {
+            Some(lifecycle.lease_duration)
+        }
+        _ => None,
+    };
+    if let Some(configured_expiry) = configured_expiry {
+        seconds = seconds.min(configured_expiry.num_seconds());
     }
     let message_expiry_interval =
         u32::try_from(seconds).map_err(|_| TransportError::InvalidExpiry)?;
@@ -181,6 +265,18 @@ pub fn publish(
     now: DateTime<Utc>,
 ) -> Result<(), TransportError> {
     send_prepared(client, prepare_publish(envelope, now)?)
+}
+
+pub fn publish_with_lifecycle(
+    client: &Client,
+    envelope: ValidatedEnvelope,
+    now: DateTime<Utc>,
+    lifecycle: &LifecycleConfig,
+) -> Result<(), TransportError> {
+    send_prepared(
+        client,
+        prepare_publish_with_lifecycle(envelope, now, lifecycle)?,
+    )
 }
 
 pub fn publish_tombstone(
@@ -377,6 +473,7 @@ pub enum ReceiveOutcome {
 
 pub struct DeliveryProcessor {
     validation: ValidationConfig,
+    lifecycle: LifecycleConfig,
     event_capacity: usize,
     state_capacity: usize,
     inbox_capacity: usize,
@@ -405,11 +502,28 @@ impl DeliveryProcessor {
         state_capacity: usize,
         inbox_capacity: usize,
     ) -> Result<Self, TransportError> {
+        Self::with_lifecycle(
+            validation,
+            event_capacity,
+            state_capacity,
+            inbox_capacity,
+            LifecycleConfig::default(),
+        )
+    }
+
+    pub fn with_lifecycle(
+        validation: ValidationConfig,
+        event_capacity: usize,
+        state_capacity: usize,
+        inbox_capacity: usize,
+        lifecycle: LifecycleConfig,
+    ) -> Result<Self, TransportError> {
         if event_capacity == 0 || state_capacity == 0 || inbox_capacity == 0 {
             return Err(TransportError::ZeroTrackingCapacity);
         }
         Ok(Self {
             validation,
+            lifecycle,
             event_capacity,
             state_capacity,
             inbox_capacity,
@@ -437,13 +551,26 @@ impl DeliveryProcessor {
             return self.remove(parsed_topic.delivery);
         }
 
-        let validated =
-            envelope::validate(payload, topic, &identity.principal, &self.validation, now)
-                .map_err(TransportError::Validation)?;
+        let validation_now = now
+            .checked_sub_signed(self.lifecycle.clock_skew_tolerance)
+            .ok_or(TransportError::InvalidExpiry)?;
+        let mut validation = self.validation.clone();
+        validation.max_future_expiry = validation
+            .max_future_expiry
+            .checked_add(&self.lifecycle.clock_skew_tolerance)
+            .ok_or(TransportError::InvalidExpiry)?;
+        let validated = envelope::validate(
+            payload,
+            topic,
+            &identity.principal,
+            &validation,
+            validation_now,
+        )
+        .map_err(TransportError::Validation)?;
         let expires_at = DateTime::parse_from_rfc3339(&validated.as_envelope().data.expires_at)
             .map_err(|_| TransportError::InvalidExpiry)?
             .with_timezone(&Utc);
-        self.prune(now);
+        self.prune(validation_now);
 
         match parsed_topic.delivery {
             TopicDelivery::Event { .. } => self.receive_event(validated, expires_at),
@@ -622,8 +749,15 @@ pub struct WorkObservation {
     pub warnings: Vec<OverlapWarning>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkClassification {
+    Current(WorkStatus),
+    StaleInterrupted,
+}
+
 pub struct WorkTracker {
     capacity: usize,
+    lifecycle: LifecycleConfig,
     activities: VecDeque<TrackedWork>,
 }
 
@@ -633,15 +767,25 @@ struct TrackedWork {
     revision: u64,
     status: WorkStatus,
     artifacts: Vec<(String, String)>,
+    lease_expires_at: DateTime<Utc>,
+    renewal_due_at: DateTime<Utc>,
 }
 
 impl WorkTracker {
     pub fn new(capacity: usize) -> Result<Self, TransportError> {
+        Self::with_lifecycle(capacity, LifecycleConfig::default())
+    }
+
+    pub fn with_lifecycle(
+        capacity: usize,
+        lifecycle: LifecycleConfig,
+    ) -> Result<Self, TransportError> {
         if capacity == 0 {
             return Err(TransportError::ZeroTrackingCapacity);
         }
         Ok(Self {
             capacity,
+            lifecycle,
             activities: VecDeque::with_capacity(capacity),
         })
     }
@@ -705,6 +849,22 @@ impl WorkTracker {
             .and_then(|value| value.parse::<u64>().ok())
             .ok_or(TransportError::InvalidWorkEnvelope)?;
         let origin = &envelope.data.from.instance_id;
+        let observed_at = DateTime::parse_from_rfc3339(&envelope.time)
+            .map_err(|_| TransportError::InvalidWorkEnvelope)?
+            .with_timezone(&Utc);
+        let claimed_expiry = DateTime::parse_from_rfc3339(&envelope.data.expires_at)
+            .map_err(|_| TransportError::InvalidWorkEnvelope)?
+            .with_timezone(&Utc);
+        let maximum_lease = observed_at
+            .checked_add_signed(self.lifecycle.lease_duration)
+            .ok_or(TransportError::InvalidWorkEnvelope)?;
+        let lease_expires_at = claimed_expiry.min(maximum_lease);
+        if lease_expires_at <= observed_at {
+            return Err(TransportError::InvalidWorkEnvelope);
+        }
+        let renewal_due_at = observed_at
+            .checked_add_signed(self.lifecycle.renewal_interval)
+            .ok_or(TransportError::InvalidWorkEnvelope)?;
         let previous = self
             .activities
             .iter()
@@ -738,6 +898,8 @@ impl WorkTracker {
                 revision,
                 status,
                 artifacts,
+                lease_expires_at,
+                renewal_due_at,
             },
         );
         Ok(WorkObservation {
@@ -751,6 +913,38 @@ impl WorkTracker {
             .iter()
             .find(|activity| activity.origin == origin && activity.key == key)
             .map(|activity| activity.status)
+    }
+
+    pub fn classification(
+        &self,
+        origin: &str,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Option<WorkClassification> {
+        let activity = self
+            .activities
+            .iter()
+            .find(|activity| activity.origin == origin && activity.key == key)?;
+        let stale_after = activity
+            .lease_expires_at
+            .checked_add_signed(self.lifecycle.clock_skew_tolerance)?;
+        if !activity.status.is_terminal() && now > stale_after {
+            Some(WorkClassification::StaleInterrupted)
+        } else {
+            Some(WorkClassification::Current(activity.status))
+        }
+    }
+
+    pub fn renewal_due(&self, origin: &str, key: &str, now: DateTime<Utc>) -> bool {
+        self.activities
+            .iter()
+            .find(|activity| activity.origin == origin && activity.key == key)
+            .is_some_and(|activity| {
+                !activity.status.is_terminal()
+                    && now >= activity.renewal_due_at
+                    && self.classification(origin, key, now)
+                        != Some(WorkClassification::StaleInterrupted)
+            })
     }
 
     pub fn len(&self) -> usize {
@@ -824,6 +1018,29 @@ fn overlap_warning(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartInspection {
+    Clean,
+    Dirty,
+    Degraded,
+}
+
+pub fn inspect_restart_worktree(repository: impl AsRef<Path>) -> RestartInspection {
+    let output = Command::new("git")
+        .current_dir(repository.as_ref())
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() && output.stdout.is_empty() => {
+            RestartInspection::Clean
+        }
+        Ok(output) if output.status.success() => RestartInspection::Dirty,
+        Ok(_) | Err(_) => RestartInspection::Degraded,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitOracleError {
     InvalidRepository,
@@ -835,11 +1052,13 @@ pub enum GitOracleError {
     UnauthorizedHintOrigin,
     HintDoesNotMatchRemote,
     NoAllowedRemoteRefs,
+    AdvertisedOidFetchUnsupported,
     UnreachableCommit,
     DirtyWorktree,
     GitFailure,
     DerivedStateFailure,
     ForbiddenMutation,
+    InvalidReconciliationFreshness,
 }
 
 impl std::fmt::Display for GitOracleError {
@@ -854,11 +1073,17 @@ impl std::fmt::Display for GitOracleError {
             Self::UnauthorizedHintOrigin => "ref-change hint origin is not allowed",
             Self::HintDoesNotMatchRemote => "ref-change hint does not match an allowed remote tip",
             Self::NoAllowedRemoteRefs => "configured remote advertised no allowed refs",
+            Self::AdvertisedOidFetchUnsupported => {
+                "configured Git server refuses fetching an advertised tip by object ID"
+            }
             Self::UnreachableCommit => "claimed commit is not reachable from an allowed remote ref",
             Self::DirtyWorktree => "handoff requires a clean worktree",
             Self::GitFailure => "configured Git operation failed",
             Self::DerivedStateFailure => "read-only codegraph recomputation failed",
             Self::ForbiddenMutation => "Git verification changed a worktree or ref",
+            Self::InvalidReconciliationFreshness => {
+                "Git reconciliation freshness must be between one millisecond and five minutes"
+            }
         })
     }
 }
@@ -926,6 +1151,13 @@ pub struct GitOracle {
     scope: GitScope,
     allowed_refs: Vec<String>,
     allowed_origins: Vec<String>,
+    reconciliation_freshness: Duration,
+    cached_reconciliation: Option<CachedReconciliation>,
+}
+
+struct CachedReconciliation {
+    observed_at: Instant,
+    value: Reconciliation,
 }
 
 impl GitOracle {
@@ -936,6 +1168,7 @@ impl GitOracle {
         scope: GitScope,
         allowed_refs: R,
         allowed_origins: O,
+        reconciliation_freshness: Duration,
     ) -> Result<Self, GitOracleError>
     where
         R: IntoIterator<Item = RF>,
@@ -980,6 +1213,11 @@ impl GitOracle {
         {
             return Err(GitOracleError::InvalidAllowedOrigin);
         }
+        if reconciliation_freshness.is_zero()
+            || reconciliation_freshness > Duration::from_secs(5 * 60)
+        {
+            return Err(GitOracleError::InvalidReconciliationFreshness);
+        }
         Ok(Self {
             repository,
             wiki_root,
@@ -987,11 +1225,13 @@ impl GitOracle {
             scope,
             allowed_refs,
             allowed_origins,
+            reconciliation_freshness,
+            cached_reconciliation: None,
         })
     }
 
     pub fn evaluate_work_state(
-        &self,
+        &mut self,
         envelope: &ValidatedEnvelope,
     ) -> Result<PublicationStatus, GitOracleError> {
         let envelope = envelope.as_envelope();
@@ -1020,11 +1260,16 @@ impl GitOracle {
         }
     }
 
-    pub fn reconcile(&self) -> Result<Reconciliation, GitOracleError> {
+    pub fn reconcile(&mut self) -> Result<Reconciliation, GitOracleError> {
+        if let Some(cached) = &self.cached_reconciliation {
+            if cached.observed_at.elapsed() <= self.reconciliation_freshness {
+                return Ok(cached.value.clone());
+            }
+        }
         let before = self.snapshot()?;
         let tips = self.remote_tips()?;
         for tip in &tips {
-            self.git(&[
+            let output = self.git_output(&[
                 "fetch",
                 "--quiet",
                 "--no-write-fetch-head",
@@ -1032,6 +1277,9 @@ impl GitOracle {
                 &self.remote,
                 &tip.oid,
             ])?;
+            if !output.status.success() {
+                return Err(classify_advertised_oid_fetch_failure(&output.stderr));
+            }
         }
         let derived = tips
             .into_iter()
@@ -1052,11 +1300,16 @@ impl GitOracle {
         if self.snapshot()? != before {
             return Err(GitOracleError::ForbiddenMutation);
         }
-        Ok(Reconciliation { tips: derived })
+        let reconciliation = Reconciliation { tips: derived };
+        self.cached_reconciliation = Some(CachedReconciliation {
+            observed_at: Instant::now(),
+            value: reconciliation.clone(),
+        });
+        Ok(reconciliation)
     }
 
     pub fn reconcile_ref_change(
-        &self,
+        &mut self,
         envelope: &ValidatedEnvelope,
     ) -> Result<Reconciliation, GitOracleError> {
         let envelope = envelope.as_envelope();
@@ -1083,7 +1336,7 @@ impl GitOracle {
         Ok(reconciliation)
     }
 
-    pub fn check_handoff(&self, commit: &str) -> Result<PublicationProof, GitOracleError> {
+    pub fn check_handoff(&mut self, commit: &str) -> Result<PublicationProof, GitOracleError> {
         if !self.status_bytes()?.is_empty() {
             return Err(GitOracleError::DirtyWorktree);
         }
@@ -1098,7 +1351,7 @@ impl GitOracle {
         &self.allowed_refs
     }
 
-    fn verify_commit(&self, commit: &str) -> Result<PublicationProof, GitOracleError> {
+    fn verify_commit(&mut self, commit: &str) -> Result<PublicationProof, GitOracleError> {
         if !valid_oid(commit) {
             return Err(GitOracleError::InvalidWorkClaim);
         }
@@ -1227,6 +1480,23 @@ fn git_success(repository: &Path, args: &[&str]) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+fn classify_advertised_oid_fetch_failure(stderr: &[u8]) -> GitOracleError {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if [
+        "not our ref",
+        "unadvertised object",
+        "does not allow request for unadvertised object",
+        "is not a valid object",
+    ]
+    .iter()
+    .any(|message| stderr.contains(message))
+    {
+        GitOracleError::AdvertisedOidFetchUnsupported
+    } else {
+        GitOracleError::GitFailure
+    }
+}
+
 fn valid_config_atom(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 255
@@ -1334,6 +1604,99 @@ mod tests {
         let options = config.mqtt_options();
         assert_eq!(options.request_channel_capacity(), 8);
         assert_eq!(options.max_packet_size(), Some(400_000));
+    }
+
+    #[test]
+    fn advertised_oid_fetch_refusal_is_typed() {
+        assert_eq!(
+            classify_advertised_oid_fetch_failure(
+                b"fatal: remote error: upload-pack: not our ref 0123456789abcdef"
+            ),
+            GitOracleError::AdvertisedOidFetchUnsupported
+        );
+        assert_eq!(
+            classify_advertised_oid_fetch_failure(b"fatal: unable to access remote"),
+            GitOracleError::GitFailure
+        );
+    }
+
+    #[test]
+    fn lifecycle_configuration_bounds_wire_expiry() {
+        let now = test_time("2026-07-24T14:21:00Z");
+        let lifecycle = LifecycleConfig::new(
+            chrono::Duration::minutes(3),
+            chrono::Duration::minutes(1),
+            chrono::Duration::seconds(45),
+            chrono::Duration::seconds(90),
+            chrono::Duration::seconds(10),
+        )
+        .expect("bounded lifecycle should validate");
+        let event = prepare_publish_with_lifecycle(
+            validated_fixture(
+                include_bytes!("../tests/fixtures/mqtt/git-refs-changed.json"),
+                "loam/v1/org-3A1/project-7M3/event/instance-01",
+                now,
+            ),
+            now,
+            &lifecycle,
+        )
+        .expect("event should prepare with configured expiry");
+        let inbox = prepare_publish_with_lifecycle(
+            validated_fixture(
+                include_bytes!("../tests/fixtures/mqtt/message.json"),
+                "loam/v1/org-3A1/project-7M3/inbox/agent/agent-91/instance-01/01K6Q6ESWMT48TPC",
+                now,
+            ),
+            now,
+            &lifecycle,
+        )
+        .expect("inbox should prepare with configured expiry");
+        assert_eq!(
+            event
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.message_expiry_interval),
+            Some(45)
+        );
+        assert_eq!(
+            inbox
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.message_expiry_interval),
+            Some(90)
+        );
+        let max_future_frame = String::from_utf8(
+            include_bytes!("../tests/fixtures/mqtt/git-refs-changed.json").to_vec(),
+        )
+        .expect("event fixture should be UTF-8")
+        .replace("2026-07-24T14:25:00Z", "2026-07-31T14:21:00Z");
+        let mut processor = DeliveryProcessor::with_lifecycle(
+            ValidationConfig::default(),
+            2,
+            2,
+            2,
+            lifecycle.clone(),
+        )
+        .expect("skew-aware processor should configure");
+        assert!(matches!(
+            processor.receive(
+                "loam/v1/org-3A1/project-7M3/event/instance-01",
+                max_future_frame.as_bytes(),
+                &transport_identity(),
+                now,
+            ),
+            Ok(ReceiveOutcome::Accepted(_))
+        ));
+        assert_eq!(
+            LifecycleConfig::new(
+                chrono::Duration::minutes(3),
+                chrono::Duration::minutes(3),
+                chrono::Duration::seconds(45),
+                chrono::Duration::seconds(90),
+                chrono::Duration::seconds(10),
+            ),
+            Err(TransportError::InvalidRenewalInterval)
+        );
     }
 
     #[test]

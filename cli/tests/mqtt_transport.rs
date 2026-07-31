@@ -5,7 +5,8 @@ use chrono::{DateTime, Utc};
 use loam::envelope::{AuthenticatedPrincipal, ValidatedEnvelope, ValidationConfig, Violation};
 use loam::transport::{
     self, AuthenticatedTransportPrincipal, DeliveryProcessor, GitOracle, GitOracleError, GitScope,
-    PublicationStatus, ReceiveOutcome, TransportError, WorkStatus, WorkTracker,
+    LifecycleConfig, PublicationStatus, ReceiveOutcome, RestartInspection, TransportError,
+    WorkClassification, WorkStatus, WorkTracker,
 };
 use mqtt_broker::BrokerFixture;
 use rumqttc::v5::mqttbytes::{
@@ -18,6 +19,216 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[test]
+#[ignore = "requires LOAM_MQTT_TEST=1, Git, and a real Mosquitto/OpenSSL installation"]
+fn lease_tombstone() {
+    if std::env::var("LOAM_MQTT_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set LOAM_MQTT_TEST=1 to require the real broker tier");
+        return;
+    }
+
+    let cases = include_str!("fixtures/mqtt/lease-cases.json");
+    for name in [
+        "active_lease_current",
+        "renewal_interval_elapsed",
+        "expired_within_skew",
+        "expired_beyond_skew",
+        "origin_tombstone",
+        "cross_origin_tombstone",
+        "clean_restart",
+        "dirty_restart",
+        "degraded_restart",
+    ] {
+        assert!(cases.contains(name), "missing lease case {name}");
+    }
+
+    let lifecycle = LifecycleConfig::new(
+        chrono::Duration::minutes(30),
+        chrono::Duration::minutes(10),
+        chrono::Duration::minutes(5),
+        chrono::Duration::hours(24),
+        chrono::Duration::seconds(30),
+    )
+    .expect("bounded lifecycle configuration should validate");
+    let broker = BrokerFixture::provision("lease-tombstone")
+        .expect("the real broker fixture should provision");
+    let project = format!("{}/project-a", broker.namespace());
+    let state_topic = format!("{project}/state/instance-01/activity-01K6Q5");
+    let foreign_topic = format!("{project}/state/instance-02/activity-01K6Q5");
+    let now = test_time("2026-07-24T14:21:00Z");
+    let (_, active) = scoped_work_state(
+        &broker,
+        "instance-01",
+        "employee-184",
+        1,
+        "active",
+        "SB-42",
+        now,
+    );
+
+    let mut publisher = TestClient::password(&broker, "lease-publisher")
+        .expect("lease publisher should authenticate");
+    let mut observer = TestClient::password(&broker, "lease-observer")
+        .expect("lease observer should authenticate");
+    observer
+        .subscribe(format!("{project}/#"))
+        .expect("lease observer should subscribe");
+    transport::publish_with_lifecycle(&publisher.client, active.clone(), now, &lifecycle)
+        .expect("active lease should queue for publication");
+    assert_publish_accepted(
+        publisher
+            .wait_for_puback()
+            .expect("active lease should be acknowledged"),
+    );
+    let active_publish = observer
+        .receive(&state_topic, Duration::from_secs(3))
+        .expect("active lease should cross the broker");
+
+    let claims = ["employee-184"];
+    let origins = ["instance-01"];
+    let identity = AuthenticatedTransportPrincipal::new(
+        AuthenticatedPrincipal::new("broker-user-7", &claims),
+        &origins,
+    );
+    let mut processor =
+        DeliveryProcessor::with_lifecycle(ValidationConfig::default(), 8, 8, 8, lifecycle.clone())
+            .expect("bounded lease processor should configure");
+    let received =
+        accepted(processor.receive(&state_topic, &active_publish.payload, &identity, now));
+    let mut tracker = WorkTracker::with_lifecycle(8, lifecycle.clone())
+        .expect("bounded lease tracker should configure");
+    tracker
+        .observe(&received)
+        .expect("active lease should be observed");
+    assert_eq!(
+        tracker.classification(
+            "instance-01",
+            "activity-01K6Q5",
+            test_time("2026-07-24T14:29:59Z")
+        ),
+        Some(WorkClassification::Current(WorkStatus::Active))
+    );
+    assert!(tracker.renewal_due(
+        "instance-01",
+        "activity-01K6Q5",
+        test_time("2026-07-24T14:30:00Z")
+    ));
+    assert_eq!(
+        tracker.classification(
+            "instance-01",
+            "activity-01K6Q5",
+            test_time("2026-07-24T14:50:29Z")
+        ),
+        Some(WorkClassification::Current(WorkStatus::Active))
+    );
+    assert_eq!(
+        tracker.classification(
+            "instance-01",
+            "activity-01K6Q5",
+            test_time("2026-07-24T14:50:31Z")
+        ),
+        Some(WorkClassification::StaleInterrupted)
+    );
+    assert_eq!(
+        tracker.status("instance-01", "activity-01K6Q5"),
+        Some(WorkStatus::Active),
+        "lease expiry must not manufacture a terminal transition"
+    );
+
+    let mut within_skew =
+        DeliveryProcessor::with_lifecycle(ValidationConfig::default(), 8, 8, 8, lifecycle.clone())
+            .expect("within-skew processor should configure");
+    assert!(matches!(
+        within_skew.receive(
+            &state_topic,
+            &active_publish.payload,
+            &identity,
+            test_time("2026-07-24T14:50:29Z")
+        ),
+        Ok(ReceiveOutcome::Accepted(_))
+    ));
+    let mut beyond_skew =
+        DeliveryProcessor::with_lifecycle(ValidationConfig::default(), 8, 8, 8, lifecycle.clone())
+            .expect("beyond-skew processor should configure");
+    assert_eq!(
+        beyond_skew.receive(
+            &state_topic,
+            &active_publish.payload,
+            &identity,
+            test_time("2026-07-24T14:50:31Z")
+        ),
+        Err(TransportError::Validation(Violation::Expired))
+    );
+
+    let mut late = TestClient::password(&broker, "lease-late-positive")
+        .expect("late retained-state control should authenticate");
+    late.subscribe(&state_topic)
+        .expect("late retained-state control should subscribe");
+    assert_eq!(
+        late.receive(&state_topic, Duration::from_secs(3))
+            .expect("retained state must exist before either tombstone probe")
+            .payload,
+        active_publish.payload
+    );
+
+    assert_publish_accepted(
+        publisher
+            .publish(&foreign_topic, Vec::new(), true, None)
+            .expect("foreign tombstone should reach the application boundary"),
+    );
+    let foreign_tombstone = observer
+        .receive(&foreign_topic, Duration::from_secs(3))
+        .expect("foreign tombstone should cross the broker for application rejection");
+    assert_eq!(
+        processor.receive(&foreign_topic, &foreign_tombstone.payload, &identity, now),
+        Err(TransportError::OriginNotAuthorized)
+    );
+
+    publish_state_clear(&mut publisher, active);
+    let tombstone = observer
+        .receive(&state_topic, Duration::from_secs(3))
+        .expect("same-origin tombstone should cross the broker");
+    assert!(tombstone.payload.is_empty());
+    assert_eq!(
+        processor.receive(&state_topic, &tombstone.payload, &identity, now),
+        Ok(ReceiveOutcome::Removed)
+    );
+
+    let mut git = GitOracleFixture::provision();
+    let clean_snapshot = git.snapshot();
+    assert_eq!(
+        transport::inspect_restart_worktree(git.peer()),
+        RestartInspection::Clean
+    );
+    assert_eq!(git.snapshot(), clean_snapshot);
+    git.make_dirty();
+    let dirty_snapshot = git.snapshot();
+    assert_eq!(
+        transport::inspect_restart_worktree(git.peer()),
+        RestartInspection::Dirty
+    );
+    assert_eq!(git.snapshot(), dirty_snapshot);
+    git.clean_dirty_probe();
+    assert_eq!(
+        transport::inspect_restart_worktree(git.wiki()),
+        RestartInspection::Degraded
+    );
+    git.finish();
+
+    let mut final_scan = TestClient::password(&broker, "lease-final-scan")
+        .expect("final retained scan should authenticate");
+    final_scan
+        .subscribe(format!("{project}/#"))
+        .expect("final retained scan should subscribe");
+    assert!(
+        final_scan.collect(Duration::from_secs(2)).is_empty(),
+        "lease/tombstone test left retained values under its namespace"
+    );
+    broker
+        .finish()
+        .expect("broker fixture should remove only its temporary directory");
+}
 
 #[test]
 #[ignore = "requires LOAM_MQTT_TEST=1, Git, and a real Mosquitto/OpenSSL installation"]
@@ -47,13 +258,14 @@ fn git_oracle() {
     let state_topic = format!("{project}/state/instance-01/activity-01K6Q5");
     let event_topic = format!("{project}/event/instance-01");
     let now = test_time("2026-07-24T14:21:00Z");
-    let oracle = GitOracle::new(
+    let mut oracle = GitOracle::new(
         fixture.peer(),
         fixture.wiki(),
         "origin",
         git_scope(&broker),
         ["refs/heads/main"],
         ["instance-01"],
+        Duration::from_secs(30),
     )
     .expect("configured Git oracle should validate");
     let ready = scoped_work_state_with_commit(
@@ -134,13 +346,14 @@ fn git_oracle() {
         oracle.evaluate_work_state(&disallowed),
         Err(GitOracleError::UnreachableCommit)
     );
-    let broken = GitOracle::new(
+    let mut broken = GitOracle::new(
         fixture.peer(),
         fixture.wiki(),
         "broken",
         git_scope(&broker),
         ["refs/heads/main"],
         ["instance-01"],
+        Duration::from_secs(30),
     )
     .expect("configured but unreachable remote should validate locally");
     assert_eq!(
@@ -213,6 +426,36 @@ fn git_oracle() {
     assert_eq!(hinted, without_hint);
     assert!(hinted.tips.iter().all(|tip| tip.pending_count > 0));
     assert_eq!(fixture.snapshot(), before);
+
+    let mut short_cache = GitOracle::new(
+        fixture.peer(),
+        fixture.wiki(),
+        "origin",
+        git_scope(&broker),
+        ["refs/heads/main"],
+        ["instance-01"],
+        Duration::from_millis(50),
+    )
+    .expect("short bounded reconciliation freshness should validate");
+    let cached_control = short_cache
+        .reconcile()
+        .expect("initial reconciliation should populate the successful-result cache");
+    fixture.hide_remote();
+    assert_eq!(
+        short_cache
+            .reconcile()
+            .expect("a fresh successful reconciliation should coalesce the retry"),
+        cached_control
+    );
+    std::thread::sleep(Duration::from_millis(75));
+    assert_eq!(short_cache.reconcile(), Err(GitOracleError::GitFailure));
+    fixture.restore_remote();
+    assert_eq!(
+        short_cache
+            .reconcile()
+            .expect("a failed refresh must not be cached"),
+        cached_control
+    );
 
     let foreign_hint_topic = format!("{project}/event/instance-02");
     let foreign_hint = scoped_refs_changed_from(
@@ -1441,6 +1684,7 @@ struct RepoSnapshot {
 
 struct GitOracleFixture {
     root: PathBuf,
+    remote: PathBuf,
     peer: PathBuf,
     wiki: PathBuf,
     plan: PathBuf,
@@ -1530,6 +1774,7 @@ impl GitOracleFixture {
 
         Self {
             root,
+            remote,
             peer,
             wiki,
             plan,
@@ -1594,6 +1839,16 @@ impl GitOracleFixture {
     fn clean_dirty_probe(&self) {
         fs::remove_file(self.peer.join("dirty-probe"))
             .expect("dirty handoff probe should be removed");
+    }
+
+    fn hide_remote(&self) {
+        fs::rename(&self.remote, self.root.join("origin.hidden"))
+            .expect("Git oracle remote should be hidden for the freshness probe");
+    }
+
+    fn restore_remote(&self) {
+        fs::rename(self.root.join("origin.hidden"), &self.remote)
+            .expect("Git oracle remote should be restored after the freshness probe");
     }
 
     fn finish(&mut self) {
