@@ -1,6 +1,8 @@
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Barrier};
@@ -125,8 +127,20 @@ fn finish_result(
 }
 
 fn worker_start(root: &Path, id: i64, session_id: Option<&str>) -> Output {
+    worker_start_with_origin(root, id, None, session_id)
+}
+
+fn worker_start_with_origin(
+    root: &Path,
+    id: i64,
+    origin: Option<&str>,
+    session_id: Option<&str>,
+) -> Output {
     let id = id.to_string();
     let mut args = vec!["hooks", "worker-start", root.to_str().unwrap(), "--id", &id];
+    if let Some(origin) = origin {
+        args.extend(["--origin", origin]);
+    }
     if let Some(session_id) = session_id {
         args.extend(["--session-id", session_id]);
     }
@@ -134,6 +148,18 @@ fn worker_start(root: &Path, id: i64, session_id: Option<&str>) -> Output {
 }
 
 fn worker_finish(root: &Path, id: i64, status: &str, reason: &str, detail: Option<&str>) -> Output {
+    worker_finish_with_origin(root, id, status, reason, None, None, detail)
+}
+
+fn worker_finish_with_origin(
+    root: &Path,
+    id: i64,
+    status: &str,
+    reason: &str,
+    origin: Option<&str>,
+    session_id: Option<&str>,
+    detail: Option<&str>,
+) -> Output {
     let id = id.to_string();
     let mut args = vec![
         "hooks",
@@ -146,9 +172,41 @@ fn worker_finish(root: &Path, id: i64, status: &str, reason: &str, detail: Optio
         "--reason",
         reason,
     ];
+    if let Some(origin) = origin {
+        args.extend(["--origin", origin]);
+    }
+    if let Some(session_id) = session_id {
+        args.extend(["--session-id", session_id]);
+    }
     if let Some(detail) = detail {
         args.extend(["--detail", detail]);
     }
+    loam(&args)
+}
+
+fn record_event(
+    root: &Path,
+    id: i64,
+    event: &str,
+    phase: Option<&str>,
+    outcome: &str,
+    fields: &[&str],
+) -> Output {
+    let id = id.to_string();
+    let mut args = vec![
+        "hooks",
+        "event",
+        root.to_str().unwrap(),
+        "--id",
+        &id,
+        "--event",
+        event,
+    ];
+    if let Some(phase) = phase {
+        args.extend(["--phase", phase]);
+    }
+    args.extend(["--outcome", outcome]);
+    args.extend(fields);
     loam(&args)
 }
 
@@ -171,6 +229,41 @@ fn create_v1_store(root: &Path) {
                 runtime_version TEXT NOT NULL
             );
             INSERT INTO hook_run VALUES (7, 1000, 1250, 'codex', 'stop', 'succeeded', NULL, 'old-session', '/', '0.9.5', '0.9.2');
+            PRAGMA user_version = 1;",
+        )
+        .unwrap();
+}
+
+fn create_complete_v1_store(root: &Path) {
+    fs::create_dir_all(root).unwrap();
+    let connection = Connection::open(root.join("loam.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE hook_run (
+                id INTEGER PRIMARY KEY,
+                started_at_ms INTEGER NOT NULL,
+                finished_at_ms INTEGER,
+                harness TEXT NOT NULL,
+                hook TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('started', 'succeeded', 'failed')),
+                detail TEXT,
+                action TEXT,
+                reason TEXT,
+                session_id TEXT,
+                workspace TEXT NOT NULL,
+                plugin_version TEXT NOT NULL,
+                runtime_version TEXT NOT NULL,
+                worker_status TEXT CHECK (worker_status IN ('requested', 'running', 'succeeded', 'skipped', 'failed')),
+                worker_started_at_ms INTEGER,
+                worker_finished_at_ms INTEGER,
+                worker_reason TEXT,
+                worker_detail TEXT,
+                worker_session_id TEXT
+            );
+            INSERT INTO hook_run VALUES
+                (1, 100, NULL, 'claude', 'stop', 'started', NULL, NULL, NULL, NULL, '/', '0.9.5', '0.9.5', NULL, NULL, NULL, NULL, NULL, NULL),
+                (2, 200, 250, 'codex', 'stop', 'succeeded', NULL, 'spawn_worker', NULL, 'parent', '/', '0.9.5', '0.9.5', 'succeeded', 210, 240, 'ok', NULL, 'child'),
+                (3, 300, 350, 'opencode', 'session_idle', 'failed', 'boom', NULL, NULL, NULL, '/', '0.9.5', '0.9.5', NULL, NULL, NULL, NULL, NULL, NULL);
             PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -203,6 +296,9 @@ fn begin_lazily_creates_one_private_started_run() {
     assert!(line.contains("\"session_id\":null"), "stdout: {line}");
     assert!(line.contains("\"harness\":\"claude\""), "stdout: {line}");
     assert!(line.contains("\"hook\":\"stop\""), "stdout: {line}");
+    assert!(line.contains("\"schema\":2"), "stdout: {line}");
+    assert!(line.contains("\"worker_origin\":null"), "stdout: {line}");
+    assert!(line.contains("\"events\":[]"), "stdout: {line}");
     assert!(line.contains(concat!(
         "\"runtime_version\":\"",
         env!("CARGO_PKG_VERSION"),
@@ -215,7 +311,7 @@ fn begin_lazily_creates_one_private_started_run() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         connection
@@ -231,7 +327,7 @@ fn begin_lazily_creates_one_private_started_run() {
                 |row| row.get::<_, String>(0),
             )
             .unwrap(),
-        "hook_run"
+        "hook_run,hook_event"
     );
     drop(connection);
     fs::remove_dir_all(root).unwrap();
@@ -443,7 +539,7 @@ fn an_unknown_schema_is_rejected_without_mutation() {
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
-            "PRAGMA user_version = 2; CREATE TABLE sentinel (value TEXT); INSERT INTO sentinel VALUES ('kept');",
+            "PRAGMA user_version = 3; CREATE TABLE sentinel (value TEXT); INSERT INTO sentinel VALUES ('kept');",
         )
         .unwrap();
     drop(connection);
@@ -457,7 +553,7 @@ fn an_unknown_schema_is_rejected_without_mutation() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     assert_eq!(
         connection
@@ -478,7 +574,7 @@ fn earlier_v1_listing_is_read_only_and_exposes_null_result_fields() {
     let listed = loam(&["hooks", "list", root.to_str().unwrap()]);
     assert_eq!(listed.status.code(), Some(0));
     let line = String::from_utf8(listed.stdout).unwrap();
-    assert!(line.contains("\"schema\":1"), "stdout: {line}");
+    assert!(line.contains("\"schema\":2"), "stdout: {line}");
     assert!(line.contains("\"action\":null"), "stdout: {line}");
     assert!(line.contains("\"reason\":null"), "stdout: {line}");
     assert!(line.contains("\"duration_ms\":250"), "stdout: {line}");
@@ -487,6 +583,8 @@ fn earlier_v1_listing_is_read_only_and_exposes_null_result_fields() {
         line.contains("\"worker_duration_ms\":null"),
         "stdout: {line}"
     );
+    assert!(line.contains("\"worker_origin\":null"), "stdout: {line}");
+    assert!(line.contains("\"events\":[]"), "stdout: {line}");
 
     let connection = Connection::open(root.join("loam.sqlite3")).unwrap();
     assert_eq!(
@@ -500,7 +598,7 @@ fn earlier_v1_listing_is_read_only_and_exposes_null_result_fields() {
 }
 
 #[test]
-fn the_next_write_completes_v1_and_preserves_old_rows() {
+fn the_next_write_migrates_sparse_v1_and_preserves_old_rows() {
     let root = temporary_root("schema-v1-write");
     let workspace = temporary_root("workspace");
     create_v1_store(&root);
@@ -514,7 +612,7 @@ fn the_next_write_completes_v1_and_preserves_old_rows() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         connection
@@ -530,6 +628,13 @@ fn the_next_write_completes_v1_and_preserves_old_rows() {
             })
             .unwrap(),
         None
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM hook_event", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
     );
     drop(connection);
     fs::remove_dir_all(root).unwrap();
@@ -579,6 +684,10 @@ fn immediate_results_and_worker_lifecycle_are_guarded_and_listed() {
         line.contains("\"worker_status\":\"succeeded\""),
         "stdout: {line}"
     );
+    assert!(
+        line.contains("\"worker_origin\":\"direct\""),
+        "stdout: {line}"
+    );
     assert!(line.contains("\"worker_reason\":\"ok\""), "stdout: {line}");
     assert!(
         line.contains("\"worker_session_id\":\"worker-session\""),
@@ -623,6 +732,1123 @@ fn worker_finish_accepts_requested_and_validates_result_mapping() {
 }
 
 #[test]
+fn continued_and_delegated_worker_lanes_require_causal_proof() {
+    let root = temporary_root("delegated");
+    let workspace = temporary_root("workspace");
+    let external = begin_id(&root, "codex", "stop", &workspace);
+
+    assert_eq!(
+        finish_result(
+            &root,
+            external,
+            "succeeded",
+            Some("request_worker"),
+            None,
+            None,
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        finish_result(
+            &root,
+            external,
+            "continued",
+            Some("spawn_worker"),
+            None,
+            None,
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        finish_result(
+            &root,
+            external,
+            "continued",
+            Some("request_worker"),
+            None,
+            None,
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(worker_start(&root, external, None).status.code(), Some(1));
+    assert_eq!(
+        worker_start_with_origin(&root, external, Some("external"), Some("agent-1"))
+            .status
+            .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            external,
+            "codex_native",
+            Some("continuation"),
+            "returned",
+            &["--visibility", "native"],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            external,
+            "subagent",
+            Some("start"),
+            "observed",
+            &["--agent-type", "loam_ingestor", "--session-id", "agent-1"],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        worker_start_with_origin(&root, external, Some("fallback"), None)
+            .status
+            .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            external,
+            "codex_native",
+            Some("fallback"),
+            "taken",
+            &["--visibility", "native"],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        worker_start_with_origin(&root, external, Some("external"), Some("agent-1"))
+            .status
+            .code(),
+        Some(0)
+    );
+    let delegated_digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert_eq!(
+        record_event(
+            &root,
+            external,
+            "ingest_preparation",
+            None,
+            "admitted",
+            &[
+                "--launch-mode",
+                "codex_native",
+                "--lease-id",
+                "lease-external",
+                "--actionable-digest",
+                delegated_digest,
+                "--actionable-count",
+                "1",
+                "--deadline-ms",
+                "1785492000000",
+            ],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            external,
+            "ingest_finalization",
+            None,
+            "ok",
+            &[
+                "--lease-id",
+                "lease-external",
+                "--pre-digest",
+                delegated_digest,
+                "--post-digest",
+                delegated_digest,
+                "--actionable-count",
+                "1",
+                "--failure-count",
+                "0",
+            ],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        worker_finish_with_origin(
+            &root,
+            external,
+            "succeeded",
+            "ok",
+            Some("external"),
+            Some("agent-1"),
+            None,
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+
+    let fallback = begin_id(&root, "codex", "stop", &workspace);
+    assert_eq!(
+        finish_result(
+            &root,
+            fallback,
+            "continued",
+            Some("request_worker"),
+            None,
+            None,
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        worker_finish_with_origin(
+            &root,
+            fallback,
+            "succeeded",
+            "ok",
+            Some("fallback"),
+            None,
+            None,
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            fallback,
+            "codex_native",
+            Some("fallback"),
+            "taken",
+            &["--visibility", "native"],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            fallback,
+            "codex_native",
+            Some("fallback"),
+            "taken",
+            &["--visibility", "native"],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            fallback,
+            "subagent",
+            Some("start"),
+            "observed",
+            &[
+                "--agent-type",
+                "loam_ingestor",
+                "--session-id",
+                "late-agent",
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        worker_finish_with_origin(
+            &root,
+            fallback,
+            "succeeded",
+            "ok",
+            Some("fallback"),
+            None,
+            None,
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+
+    let listed =
+        String::from_utf8(loam(&["hooks", "list", root.to_str().unwrap()]).stdout).unwrap();
+    assert!(listed.contains("\"status\":\"continued\""));
+    assert!(listed.contains("\"action\":\"request_worker\""));
+    assert!(listed.contains("\"worker_origin\":\"external\""));
+    assert!(listed.contains("\"worker_origin\":\"fallback\""));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_visibility_events_enforce_shape_order_and_bounds() {
+    let root = temporary_root("visibility-events");
+    let workspace = temporary_root("workspace");
+    let id = begin_id(&root, "opencode", "session_idle", &workspace);
+    assert_eq!(
+        finish_result(&root, id, "succeeded", Some("spawn_worker"), None, None)
+            .status
+            .code(),
+        Some(0)
+    );
+
+    let visibility = ["--visibility", "toast", "--launch-mode", "opencode"];
+    assert_eq!(
+        record_event(
+            &root,
+            id + 100,
+            "ingest_visibility",
+            Some("launch"),
+            "started",
+            &visibility,
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "visibility_delivery",
+            Some("launch"),
+            "ok",
+            &visibility,
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    let oversized_detail = "x".repeat(1025);
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "visibility_delivery",
+            Some("launch"),
+            "failed",
+            &[
+                "--visibility",
+                "toast",
+                "--launch-mode",
+                "opencode",
+                "--detail",
+                oversized_detail.as_str(),
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "ingest_visibility",
+            Some("terminal"),
+            "ok",
+            &visibility,
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "ingest_visibility",
+            Some("launch"),
+            "started",
+            &visibility,
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "ingest_visibility",
+            Some("launch"),
+            "started",
+            &visibility,
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "visibility_delivery",
+            Some("terminal"),
+            "aborted",
+            &[
+                "--visibility",
+                "toast",
+                "--launch-mode",
+                "opencode",
+                "--detail",
+                "250 ms deadline",
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "ingest_visibility",
+            Some("terminal"),
+            "partial",
+            &visibility,
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "visibility_delivery",
+            Some("terminal"),
+            "aborted",
+            &[
+                "--visibility",
+                "toast",
+                "--launch-mode",
+                "opencode",
+                "--detail",
+                "250 ms deadline",
+            ],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "visibility_delivery",
+            Some("launch"),
+            "emitted",
+            &[
+                "--visibility",
+                "toast",
+                "--launch-mode",
+                "opencode",
+                "--detail",
+                "not admitted",
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "ingest_visibility",
+            Some("launch"),
+            "started",
+            &["--visibility", "silent", "--launch-mode", "opencode",],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+
+    let line = String::from_utf8(loam(&["hooks", "list", root.to_str().unwrap()]).stdout).unwrap();
+    assert!(line.contains("\"events\":[{"));
+    assert!(line.contains("\"outcome\":\"partial\""));
+    assert!(line.contains("\"outcome\":\"aborted\""));
+    assert!(line.contains("\"detail\":\"250 ms deadline\""));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn preparation_and_finalization_admit_only_bounded_causal_telemetry() {
+    const PRE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const POST: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    let root = temporary_root("worker-phase-events");
+    let workspace = temporary_root("workspace");
+    let id = begin_id(&root, "opencode", "session_idle", &workspace);
+    assert_eq!(
+        finish_result(&root, id, "succeeded", Some("spawn_worker"), None, None)
+            .status
+            .code(),
+        Some(0)
+    );
+
+    let preparation = [
+        "--launch-mode",
+        "opencode",
+        "--lease-id",
+        "lease-1",
+        "--actionable-digest",
+        PRE,
+        "--actionable-count",
+        "3",
+        "--deadline-ms",
+        "1785492000000",
+    ];
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "ingest_preparation",
+            None,
+            "admitted",
+            &preparation,
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(worker_start(&root, id, None).status.code(), Some(0));
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "ingest_preparation",
+            None,
+            "admitted",
+            &[
+                "--launch-mode",
+                "opencode",
+                "--lease-id",
+                "lease-1",
+                "--actionable-digest",
+                "ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                "--actionable-count",
+                "3",
+                "--deadline-ms",
+                "1785492000000",
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "ingest_preparation",
+            None,
+            "admitted",
+            &[
+                "--launch-mode",
+                "opencode",
+                "--lease-id",
+                "lease-1",
+                "--actionable-digest",
+                PRE,
+                "--actionable-count",
+                "-1",
+                "--deadline-ms",
+                "1785492000000",
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "ingest_preparation",
+            None,
+            "admitted",
+            &[
+                "--launch-mode",
+                "opencode",
+                "--lease-id",
+                "lease-1",
+                "--actionable-digest",
+                PRE,
+                "--actionable-count",
+                "3",
+                "--deadline-ms",
+                "1785492000000",
+                "--workspace-files",
+                "/secret/path",
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "ingest_finalization",
+            None,
+            "partial",
+            &[
+                "--lease-id",
+                "lease-1",
+                "--pre-digest",
+                PRE,
+                "--post-digest",
+                POST,
+                "--actionable-count",
+                "3",
+                "--failure-count",
+                "1",
+                "--backoff-until-ms",
+                "1785492060000",
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "ingest_preparation",
+            None,
+            "admitted",
+            &preparation,
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "ingest_finalization",
+            None,
+            "partial",
+            &[
+                "--lease-id",
+                "lease-1",
+                "--pre-digest",
+                POST,
+                "--post-digest",
+                POST,
+                "--actionable-count",
+                "3",
+                "--failure-count",
+                "1",
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            id,
+            "ingest_finalization",
+            None,
+            "partial",
+            &[
+                "--lease-id",
+                "lease-1",
+                "--pre-digest",
+                PRE,
+                "--post-digest",
+                POST,
+                "--actionable-count",
+                "3",
+                "--failure-count",
+                "1",
+                "--backoff-until-ms",
+                "1785492060000",
+            ],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+
+    let skipped = begin_id(&root, "claude", "stop", &workspace);
+    assert_eq!(
+        finish_result(
+            &root,
+            skipped,
+            "succeeded",
+            Some("spawn_worker"),
+            None,
+            None,
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(worker_start(&root, skipped, None).status.code(), Some(0));
+    assert_eq!(
+        record_event(
+            &root,
+            skipped,
+            "ingest_preparation",
+            None,
+            "skipped",
+            &["--reason", "too_soon"],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+
+    let listed =
+        String::from_utf8(loam(&["hooks", "list", root.to_str().unwrap()]).stdout).unwrap();
+    assert!(listed.contains("\"event\":\"ingest_preparation\""));
+    assert!(listed.contains("\"event\":\"ingest_finalization\""));
+    assert!(listed.contains("\"outcome\":\"partial\""));
+    assert!(listed.contains(&format!("\"actionable_digest\":\"{PRE}\"")));
+    assert!(listed.contains("\"actionable_count\":3"));
+    assert!(listed.contains("\"failure_count\":1"));
+    assert!(listed.contains("\"backoff_until_ms\":1785492060000"));
+    assert!(!listed.contains("/secret/path"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn claude_events_reject_foreign_missing_and_out_of_order_facts() {
+    let root = temporary_root("claude-events");
+    let workspace = temporary_root("workspace");
+    let spawned = begin_id(&root, "claude", "stop", &workspace);
+    assert_eq!(
+        finish_result(
+            &root,
+            spawned,
+            "succeeded",
+            Some("spawn_worker"),
+            None,
+            None,
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+
+    assert_eq!(
+        record_event(
+            &root,
+            spawned,
+            "subagent",
+            Some("stop"),
+            "aborted",
+            &["--agent-type", "loam:ingestor", "--session-id", "claude-1"],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    let oversized_identity = "x".repeat(257);
+    assert_eq!(
+        record_event(
+            &root,
+            spawned,
+            "subagent",
+            Some("start"),
+            "observed",
+            &[
+                "--agent-type",
+                "loam:ingestor",
+                "--session-id",
+                oversized_identity.as_str(),
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            spawned,
+            "subagent",
+            Some("start"),
+            "observed",
+            &["--agent-type", "foreign", "--session-id", "claude-1"],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            spawned,
+            "subagent",
+            Some("start"),
+            "observed",
+            &[
+                "--agent-type",
+                "loam:ingestor",
+                "--session-id",
+                "bad\nsession"
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            spawned,
+            "claude_agent_profile",
+            None,
+            "selected",
+            &[
+                "--agent-type",
+                "loam:ingestor",
+                "--launch-mode",
+                "claude_bg",
+                "--manager-name",
+                "loam-ingest-1234567890",
+                "--manager-id",
+                "manager-1",
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            spawned,
+            "claude_agent_profile",
+            None,
+            "selected",
+            &[
+                "--agent-type",
+                "loam:ingestor",
+                "--launch-mode",
+                "claude_bg",
+                "--manager-name",
+                "loam-ingest-1234567890",
+                "--manager-id",
+                "manager-1",
+                "--lease-id",
+                "lease-1",
+            ],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            spawned,
+            "claude_agent_view",
+            None,
+            "fallback",
+            &[
+                "--reason",
+                "unavailable",
+                "--visibility",
+                "silent",
+                "--launch-mode",
+                "claude_bg",
+                "--fallback-launch-mode",
+                "claude_print",
+                "--lease-id",
+                "lease-1",
+                "--require-visible-worker",
+                "false",
+            ],
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            spawned,
+            "claude_agent_view",
+            None,
+            "fallback",
+            &[
+                "--reason",
+                "agent_view_unavailable",
+                "--visibility",
+                "silent",
+                "--launch-mode",
+                "claude_bg",
+                "--fallback-launch-mode",
+                "claude_print",
+                "--lease-id",
+                "lease-1",
+                "--require-visible-worker",
+                "false",
+            ],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            spawned,
+            "subagent",
+            Some("start"),
+            "observed",
+            &["--agent-type", "loam:ingestor", "--session-id", "claude-1"],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            spawned,
+            "subagent",
+            Some("stop"),
+            "succeeded",
+            &["--agent-type", "loam:ingestor", "--session-id", "claude-1"],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+
+    let skipped = begin_id(&root, "claude", "stop", &workspace);
+    assert_eq!(
+        finish_result(
+            &root,
+            skipped,
+            "succeeded",
+            Some("skip"),
+            Some("disabled"),
+            None,
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            skipped,
+            "claude_recursion_guard",
+            None,
+            "refused",
+            &["--agent-type", "loam:ingestor"],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn complete_v1_migration_is_lossless_race_safe_and_accepts_v2() {
+    let root = temporary_root("schema-v1-race");
+    let workspace = temporary_root("workspace");
+    create_complete_v1_store(&root);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.join("loam.sqlite3"), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let barrier = Arc::new(Barrier::new(2));
+    let writers: Vec<_> = (0..2)
+        .map(|_| {
+            let root = root.clone();
+            let workspace = workspace.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                begin_id(&root, "codex", "stop", &workspace)
+            })
+        })
+        .collect();
+    let ids: HashSet<_> = writers
+        .into_iter()
+        .map(|writer| writer.join().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+
+    let database = root.join("loam.sqlite3");
+    let connection = Connection::open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status || ':' || COALESCE(action, '-') || ':' || COALESCE(worker_origin, '-') || ':' || COALESCE(worker_session_id, '-') FROM hook_run WHERE id = 2",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "succeeded:spawn_worker:direct:child"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM hook_run", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        5
+    );
+    drop(connection);
+
+    let continued = begin_id(&root, "codex", "stop", &workspace);
+    assert_eq!(
+        finish_result(
+            &root,
+            continued,
+            "continued",
+            Some("request_worker"),
+            None,
+            None,
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    assert_eq!(
+        record_event(
+            &root,
+            continued,
+            "codex_native",
+            Some("continuation"),
+            "returned",
+            &["--visibility", "native"],
+        )
+        .status
+        .code(),
+        Some(0)
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(database).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_v1_rebuild_rolls_back_every_schema_change() {
+    let root = temporary_root("schema-v1-rollback");
+    let workspace = temporary_root("workspace");
+    create_complete_v1_store(&root);
+    let database = root.join("loam.sqlite3");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute("UPDATE hook_run SET action = 'invalid' WHERE id = 1", [])
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        begin(&root, "codex", "stop", &workspace).status.code(),
+        Some(1)
+    );
+    let connection = Connection::open(database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT group_concat(name, ',') FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "hook_run"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM hook_run", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn v1_rebuild_handles_the_full_retention_cap() {
+    let root = temporary_root("schema-v1-cap");
+    let workspace = temporary_root("workspace");
+    create_complete_v1_store(&root);
+    let database = root.join("loam.sqlite3");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "WITH RECURSIVE n(id) AS (
+                 VALUES(4) UNION ALL SELECT id + 1 FROM n WHERE id < 10000
+             )
+             INSERT INTO hook_run (
+                 id, started_at_ms, harness, hook, status, workspace,
+                 plugin_version, runtime_version
+             )
+             SELECT id, id, 'codex', 'stop', 'started', '/', '0.9.5', '0.9.5' FROM n;",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        begin(&root, "codex", "stop", &workspace).status.code(),
+        Some(0)
+    );
+    let connection = Connection::open(database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM hook_run", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        10_000
+    );
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn begin_prunes_only_old_hook_runs() {
     let root = temporary_root("retention");
     let workspace = temporary_root("workspace");
@@ -644,6 +1870,14 @@ fn begin_prunes_only_old_hook_runs() {
             )
             .unwrap();
     }
+    transaction
+        .execute(
+            "INSERT INTO hook_event (hook_run_id, occurred_at_ms, event, phase, outcome)
+             VALUES (2, 1, 'codex_native', 'continuation', 'returned'),
+                    (10006, 2, 'codex_native', 'continuation', 'returned')",
+            [],
+        )
+        .unwrap();
     transaction.commit().unwrap();
     drop(connection);
 
@@ -655,6 +1889,16 @@ fn begin_prunes_only_old_hook_runs() {
                 .get::<_, i64>(0))
             .unwrap(),
         10_000
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT group_concat(hook_run_id, ',') FROM hook_event",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "10006"
     );
     assert_eq!(
         connection
