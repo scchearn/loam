@@ -2,7 +2,9 @@
 mod mqtt_broker;
 
 use chrono::{DateTime, Utc};
-use loam::envelope::{AuthenticatedPrincipal, ValidatedEnvelope, ValidationConfig, Violation};
+use loam::envelope::{
+    AuthenticatedPrincipal, BindingAxis, ValidatedEnvelope, ValidationConfig, Violation,
+};
 use loam::transport::{
     self, AuthenticatedTransportPrincipal, DeliveryProcessor, GitOracle, GitOracleError, GitScope,
     LifecycleConfig, PublicationStatus, ReceiveOutcome, RestartInspection, TransportError,
@@ -19,6 +21,407 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[test]
+#[ignore = "requires LOAM_MQTT_TEST=1, Git, and a real Mosquitto/OpenSSL installation"]
+fn isolation() {
+    if std::env::var("LOAM_MQTT_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set LOAM_MQTT_TEST=1 to require the real broker tier");
+        return;
+    }
+
+    let mut broker =
+        BrokerFixture::provision("isolation").expect("the real broker fixture should provision");
+    broker
+        .enable_isolation()
+        .expect("strict isolation ACLs should replace the broad broker-contract fixture");
+    let organization_a = broker.namespace().to_owned();
+    let organization_b = broker.foreign_namespace().to_owned();
+    let project_a = format!("{organization_a}/project-a");
+    let project_b = format!("{organization_a}/project-b");
+    let other_org_project = format!("{organization_b}/project-a");
+    let state_a = format!("{project_a}/state/instance-01/sentinel");
+    let state_b = format!("{project_b}/state/instance-01/sentinel");
+    let state_c = format!("{other_org_project}/state/instance-01/sentinel");
+
+    let mut actor_a = TestClient::password(&broker, "isolation-actor-a")
+        .expect("organization A/project A client should authenticate");
+    let mut actor_b = TestClient::credentials(
+        &broker,
+        "isolation-actor-b",
+        "actor-b",
+        broker.foreign_password(),
+    )
+    .expect("organization A/project B client should authenticate");
+    let mut actor_c = TestClient::credentials(
+        &broker,
+        "isolation-actor-c",
+        "actor-c",
+        broker.other_org_password(),
+    )
+    .expect("organization B/project A client should authenticate");
+    let mut mtls =
+        TestClient::mtls(&broker, "isolation-mtls").expect("mTLS project peer should authenticate");
+
+    actor_a
+        .subscribe(format!("{project_a}/state/#"))
+        .expect("actor A should subscribe to its project state");
+    actor_a
+        .subscribe(format!("{project_b}/state/#"))
+        .expect("broker should return a SUBACK before filtering the foreign project");
+    actor_a
+        .subscribe(format!("{other_org_project}/state/#"))
+        .expect("broker should return a SUBACK before filtering the foreign org");
+    actor_b
+        .subscribe(format!("{project_b}/state/#"))
+        .expect("actor B should subscribe to its project state");
+    actor_c
+        .subscribe(format!("{other_org_project}/state/#"))
+        .expect("actor C should subscribe to its organization state");
+    mtls.subscribe(format!("{project_a}/state/#"))
+        .expect("mTLS peer should subscribe to project state");
+
+    assert_publish_accepted(
+        actor_a
+            .publish(&state_a, b"organization-a-project-a", true, None)
+            .expect("actor A should publish under its own origin"),
+    );
+    assert_publish_accepted(
+        actor_b
+            .publish(&state_b, b"organization-a-project-b", true, None)
+            .expect("actor B should publish under its own project"),
+    );
+    assert_publish_accepted(
+        actor_c
+            .publish(&state_c, b"organization-b-project-a", true, None)
+            .expect("actor C should publish under its own organization"),
+    );
+    assert_eq!(
+        actor_a
+            .receive(&state_a, Duration::from_secs(3))
+            .expect("actor A should receive its retained control")
+            .payload
+            .as_ref(),
+        b"organization-a-project-a"
+    );
+    assert_eq!(
+        actor_b
+            .receive(&state_b, Duration::from_secs(3))
+            .expect("actor B should receive its retained control")
+            .payload
+            .as_ref(),
+        b"organization-a-project-b"
+    );
+    assert_eq!(
+        actor_c
+            .receive(&state_c, Duration::from_secs(3))
+            .expect("actor C should receive its retained control")
+            .payload
+            .as_ref(),
+        b"organization-b-project-a"
+    );
+    assert!(
+        actor_a
+            .collect(Duration::from_secs(1))
+            .iter()
+            .all(|publish| {
+                publish.topic.as_ref() != state_b.as_bytes()
+                    && publish.topic.as_ref() != state_c.as_bytes()
+            }),
+        "actor A received retained state across a project or organization boundary"
+    );
+    assert_eq!(
+        actor_a
+            .publish(
+                format!("{project_b}/state/instance-01/forbidden"),
+                b"cross-project",
+                true,
+                None,
+            )
+            .expect("cross-project publish should return a broker reason"),
+        PubAckReason::NotAuthorized
+    );
+    assert_eq!(
+        actor_a
+            .publish(
+                format!("{other_org_project}/state/instance-01/forbidden"),
+                b"cross-org",
+                true,
+                None,
+            )
+            .expect("cross-organization publish should return a broker reason"),
+        PubAckReason::NotAuthorized
+    );
+    assert_eq!(
+        actor_a
+            .publish(
+                format!("{project_a}/state/instance-02/forbidden"),
+                b"cross-origin",
+                true,
+                None,
+            )
+            .expect("cross-origin publish should return a broker reason"),
+        PubAckReason::NotAuthorized
+    );
+
+    let now = test_time("2026-07-24T14:21:00Z");
+    let allowed_inbox = format!("{project_a}/inbox/agent/shared-42/instance-02/01K6Q6ESWMT48TPX");
+    let colliding_inbox =
+        format!("{project_a}/inbox/principal/shared-42/instance-02/01K6Q6ESWMT48TPX");
+    actor_a
+        .subscribe(&allowed_inbox)
+        .expect("actor A should subscribe to its agent recipient namespace");
+    actor_a
+        .subscribe(&colliding_inbox)
+        .expect("broker should SUBACK before filtering the colliding principal namespace");
+    mtls.subscribe(&allowed_inbox)
+        .expect("mTLS control should subscribe to the agent inbox");
+    mtls.subscribe(&colliding_inbox)
+        .expect("mTLS control should subscribe to the principal inbox");
+    let inbox_frame = scoped_frame(include_bytes!("fixtures/mqtt/message.json"), &broker)
+        .replace(
+            "urn:loam:instance:instance-01",
+            "urn:loam:instance:instance-02",
+        )
+        .replace(
+            "\"principal_id\": \"employee-184\"",
+            "\"principal_id\": \"employee-191\"",
+        )
+        .replace(
+            "\"instance_id\": \"instance-01\"",
+            "\"instance_id\": \"instance-02\"",
+        )
+        .replace("agent-91", "shared-42")
+        .replace("01K6Q6ESWMT48TPC", "01K6Q6ESWMT48TPX");
+    let inbox_principal = AuthenticatedPrincipal::new("employee-191", &[]);
+    let valid_inbox = loam::envelope::validate(
+        inbox_frame.as_bytes(),
+        &allowed_inbox,
+        &inbox_principal,
+        &ValidationConfig::default(),
+        now,
+    )
+    .expect("typed colliding-ID inbox control should validate");
+    publish_validated(&mut mtls, valid_inbox.clone(), now);
+    let allowed_publish = actor_a
+        .receive(&allowed_inbox, Duration::from_secs(3))
+        .expect("actor A should receive the authorized agent recipient");
+    let allowed_control = mtls
+        .receive(&allowed_inbox, Duration::from_secs(3))
+        .expect("mTLS control should receive the authorized agent recipient");
+    assert_eq!(allowed_publish.payload, allowed_control.payload);
+
+    assert_publish_accepted(
+        mtls.publish(
+            &colliding_inbox,
+            transport::encode_validated(valid_inbox.clone()),
+            true,
+            None,
+        )
+        .expect("mismatched recipient-kind probe should reach receiver validation"),
+    );
+    let colliding_publish = mtls
+        .receive(&colliding_inbox, Duration::from_secs(3))
+        .expect("mTLS control should receive the colliding principal probe");
+    let claims = ["employee-191"];
+    let origins = ["instance-02"];
+    let identity = AuthenticatedTransportPrincipal::new(
+        AuthenticatedPrincipal::new("mtls-actor", &claims),
+        &origins,
+    );
+    let mut processor = DeliveryProcessor::new(ValidationConfig::default(), 8, 8, 8)
+        .expect("bounded isolation processor should configure");
+    assert!(matches!(
+        processor.receive(&allowed_inbox, &allowed_control.payload, &identity, now),
+        Ok(ReceiveOutcome::Accepted(_))
+    ));
+    assert_eq!(
+        processor.receive(&colliding_inbox, &colliding_publish.payload, &identity, now),
+        Err(TransportError::Validation(Violation::BindingMismatch(
+            BindingAxis::RecipientKind
+        )))
+    );
+    assert!(
+        actor_a
+            .collect(Duration::from_secs(1))
+            .iter()
+            .all(|publish| publish.topic.as_ref() != colliding_inbox.as_bytes()),
+        "colliding principal inbox crossed the typed recipient ACL"
+    );
+
+    let application_oversize_topic = format!("{project_a}/event/instance-02");
+    mtls.subscribe(&application_oversize_topic)
+        .expect("mTLS control should subscribe to its event origin");
+    let application_oversize = vec![b'x'; ValidationConfig::default().max_document_bytes + 1];
+    assert_publish_accepted(
+        mtls.publish(
+            &application_oversize_topic,
+            application_oversize,
+            false,
+            None,
+        )
+        .expect("application-quota probe should fit under the broker packet limit"),
+    );
+    let oversized_publish = mtls
+        .receive(&application_oversize_topic, Duration::from_secs(3))
+        .expect("application-quota probe should reach receiver validation");
+    assert_eq!(
+        processor.receive(
+            &application_oversize_topic,
+            &oversized_publish.payload,
+            &identity,
+            now
+        ),
+        Err(TransportError::Validation(Violation::DocumentTooLarge))
+    );
+    let mut broker_oversize = TestClient::password(&broker, "isolation-broker-oversize")
+        .expect("broker quota probe should authenticate");
+    assert_eq!(broker_oversize.server_max_packet_size(), Some(400_000));
+    let broker_oversize_result = broker_oversize.publish(
+        format!("{project_a}/event/instance-01"),
+        vec![b'x'; 400_001],
+        false,
+        None,
+    );
+    assert!(
+        broker_oversize_result.is_err(),
+        "broker accepted a packet beyond its configured maximum"
+    );
+
+    for (client, topic) in [
+        (&mut actor_a, &state_a),
+        (&mut actor_b, &state_b),
+        (&mut actor_c, &state_c),
+    ] {
+        assert_publish_accepted(
+            client
+                .publish(topic, Vec::new(), true, None)
+                .expect("authorized retained cleanup should be acknowledged"),
+        );
+    }
+    for topic in [&allowed_inbox, &colliding_inbox] {
+        assert_publish_accepted(
+            mtls.publish(topic, Vec::new(), true, None)
+                .expect("mTLS retained inbox cleanup should be acknowledged"),
+        );
+    }
+    let revoked_topic = format!("{project_a}/state/instance-01/revoked");
+    assert_publish_accepted(
+        actor_a
+            .publish(&revoked_topic, b"expires-on-revocation", true, Some(1))
+            .expect("revoked-origin expiry probe should publish before revocation"),
+    );
+    mtls.receive(&revoked_topic, Duration::from_secs(3))
+        .expect("revoked-origin retained value must exist before revocation");
+
+    let mut git = GitOracleFixture::provision();
+    let git_before = git.snapshot();
+    drop(actor_a);
+    drop(actor_b);
+    drop(actor_c);
+    drop(mtls);
+    drop(broker_oversize);
+    broker
+        .revoke_password("actor-a")
+        .expect("broker credential should be revoked independently");
+    assert_eq!(git.snapshot(), git_before);
+    assert!(git.peer_has_object(git.base_oid()));
+    let revoked = match TestClient::password(&broker, "isolation-revoked") {
+        Ok(_) => panic!("revoked credential reconnected"),
+        Err(error) => error,
+    };
+    assert!(
+        revoked.contains("NotAuthorized") || revoked.contains("not authorised"),
+        "unexpected revoked-credential refusal: {revoked}"
+    );
+    let anonymous = match TestClient::anonymous(&broker, "isolation-anonymous") {
+        Ok(_) => panic!("anonymous connection must remain refused"),
+        Err(error) => error,
+    };
+    assert!(
+        anonymous.contains("NotAuthorized") || anonymous.contains("not authorised"),
+        "unexpected anonymous refusal: {anonymous}"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+
+    let post_revoke_control = format!("{project_a}/state/instance-02/post-revoke");
+    let mut post_revoke = TestClient::mtls(&broker, "isolation-post-revoke")
+        .expect("unrevoked mTLS peer should reconnect");
+    post_revoke
+        .subscribe(format!("{project_a}/state/#"))
+        .expect("unrevoked peer should retain its read scope");
+    assert_publish_accepted(
+        post_revoke
+            .publish(&post_revoke_control, b"still-authorized", true, None)
+            .expect("unrevoked peer should publish its retained control"),
+    );
+    let post_revoke_values = post_revoke.collect(Duration::from_secs(2));
+    assert!(post_revoke_values.iter().any(|publish| {
+        publish.topic.as_ref() == post_revoke_control.as_bytes()
+            && publish.payload.as_ref() == b"still-authorized"
+    }));
+    assert!(post_revoke_values
+        .iter()
+        .all(|publish| publish.topic.as_ref() != revoked_topic.as_bytes()));
+    assert_publish_accepted(
+        post_revoke
+            .publish(&post_revoke_control, Vec::new(), true, None)
+            .expect("post-revocation control should clean up"),
+    );
+
+    broker
+        .wait_for_log("Denied PUBLISH")
+        .expect("broker log should prove forbidden publication reached the ACL");
+    broker
+        .wait_for_log("not authorised")
+        .expect("broker log should prove revoked or anonymous authentication refusal");
+    let mut final_mtls = TestClient::mtls(&broker, "isolation-final-a")
+        .expect("final organization A scan should authenticate");
+    assert_retained_round_trip_and_clear(
+        &mut final_mtls,
+        format!("{project_a}/state/#"),
+        format!("{project_a}/state/instance-02/final-control"),
+    );
+    assert_retained_round_trip_and_clear(
+        &mut final_mtls,
+        format!("{project_a}/inbox/agent/shared-42/#"),
+        format!("{project_a}/inbox/agent/shared-42/instance-02/final-agent"),
+    );
+    assert_retained_round_trip_and_clear(
+        &mut final_mtls,
+        format!("{project_a}/inbox/principal/shared-42/#"),
+        format!("{project_a}/inbox/principal/shared-42/instance-02/final-principal"),
+    );
+    let mut final_b = TestClient::credentials(
+        &broker,
+        "isolation-final-b",
+        "actor-b",
+        broker.foreign_password(),
+    )
+    .expect("final project B scan should authenticate");
+    assert_retained_round_trip_and_clear(
+        &mut final_b,
+        format!("{project_b}/state/#"),
+        format!("{project_b}/state/instance-01/final-control"),
+    );
+    let mut final_c = TestClient::credentials(
+        &broker,
+        "isolation-final-c",
+        "actor-c",
+        broker.other_org_password(),
+    )
+    .expect("final organization B scan should authenticate");
+    assert_retained_round_trip_and_clear(
+        &mut final_c,
+        format!("{other_org_project}/state/#"),
+        format!("{other_org_project}/state/instance-01/final-control"),
+    );
+
+    broker
+        .finish()
+        .expect("broker fixture should remove only its temporary directory");
+    git.finish();
+}
 
 #[test]
 #[ignore = "requires LOAM_MQTT_TEST=1, Git, and a real Mosquitto/OpenSSL installation"]
@@ -1142,6 +1545,7 @@ struct TestClient {
     client: Client,
     connection: Connection,
     pending: Vec<rumqttc::v5::mqttbytes::v5::Publish>,
+    server_max_packet_size: Option<u32>,
 }
 
 impl TestClient {
@@ -1177,10 +1581,15 @@ impl TestClient {
             client,
             connection,
             pending: Vec::new(),
+            server_max_packet_size: None,
         };
         loop {
             match connected.next_packet(Duration::from_secs(5))? {
                 Packet::ConnAck(ack) if ack.code == ConnectReturnCode::Success => {
+                    connected.server_max_packet_size = ack
+                        .properties
+                        .as_ref()
+                        .and_then(|properties| properties.max_packet_size);
                     return Ok(connected);
                 }
                 Packet::ConnAck(ack) => {
@@ -1190,6 +1599,10 @@ impl TestClient {
                 _ => {}
             }
         }
+    }
+
+    fn server_max_packet_size(&self) -> Option<u32> {
+        self.server_max_packet_size
     }
 
     fn subscribe(&mut self, topic: impl Into<String>) -> Result<SubscribeReasonCode, String> {
@@ -1351,6 +1764,47 @@ fn assert_publish_accepted(reason: PubAckReason) {
             PubAckReason::Success | PubAckReason::NoMatchingSubscribers
         ),
         "broker rejected publish with {reason:?}"
+    );
+}
+
+fn assert_retained_round_trip_and_clear(
+    client: &mut TestClient,
+    filter: impl Into<String>,
+    topic: impl Into<String>,
+) {
+    let topic = topic.into();
+    assert_eq!(
+        client
+            .subscribe(filter)
+            .expect("retained cleanup control should subscribe"),
+        SubscribeReasonCode::Success(QoS::AtLeastOnce)
+    );
+    assert_publish_accepted(
+        client
+            .publish(&topic, b"retained-cleanup-control", true, None)
+            .expect("retained cleanup control should publish"),
+    );
+    assert_eq!(
+        client
+            .receive(&topic, Duration::from_secs(3))
+            .unwrap_or_else(|error| panic!("retained cleanup control {topic} failed: {error}"))
+            .payload
+            .as_ref(),
+        b"retained-cleanup-control"
+    );
+    assert_publish_accepted(
+        client
+            .publish(&topic, Vec::new(), true, None)
+            .expect("retained cleanup control should clear"),
+    );
+    assert!(client
+        .receive(&topic, Duration::from_secs(3))
+        .expect("retained cleanup tombstone should be observed")
+        .payload
+        .is_empty());
+    assert!(
+        client.collect(Duration::from_secs(2)).is_empty(),
+        "retained values remained after positive cleanup control under {topic}"
     );
 }
 

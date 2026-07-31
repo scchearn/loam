@@ -10,8 +10,10 @@ const START_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct BrokerFixture {
     root: PathBuf,
     namespace: String,
+    foreign_namespace: String,
     password: String,
     foreign_password: String,
+    other_org_password: String,
     password_port: u16,
     mtls_port: u16,
     backend: Backend,
@@ -78,10 +80,13 @@ impl BrokerFixture {
         write_certificates(&openssl, &root)?;
         let password = format!("loam-{run_id}");
         let foreign_password = format!("foreign-{run_id}");
+        let other_org_password = format!("other-org-{run_id}");
         backend.write_password_entry(&root, "actor-a", &password, true)?;
         backend.write_password_entry(&root, "actor-b", &foreign_password, false)?;
+        backend.write_password_entry(&root, "actor-c", &other_org_password, false)?;
 
         let namespace = format!("loam/v1/test-{run_id}");
+        let foreign_namespace = format!("loam/v1/foreign-{run_id}");
         let acl =
             include_str!("../fixtures/mqtt/broker/acl.template").replace("@NAMESPACE@", &namespace);
         fs::write(root.join("acl"), acl).map_err(|error| format!("write broker ACL: {error}"))?;
@@ -112,8 +117,10 @@ impl BrokerFixture {
         let mut fixture = Self {
             root,
             namespace,
+            foreign_namespace,
             password,
             foreign_password,
+            other_org_password,
             password_port,
             mtls_port,
             backend,
@@ -132,8 +139,16 @@ impl BrokerFixture {
         &self.password
     }
 
+    pub fn foreign_namespace(&self) -> &str {
+        &self.foreign_namespace
+    }
+
     pub fn foreign_password(&self) -> &str {
         &self.foreign_password
+    }
+
+    pub fn other_org_password(&self) -> &str {
+        &self.other_org_password
     }
 
     pub fn password_port(&self) -> u16 {
@@ -182,6 +197,31 @@ impl BrokerFixture {
 
     pub fn restart(&mut self) -> Result<(), String> {
         self.stop()?;
+        self.start()
+    }
+
+    pub fn enable_isolation(&mut self) -> Result<(), String> {
+        self.stop()?;
+        let acl = include_str!("../fixtures/mqtt/broker/acl-isolation.template")
+            .replace("@ORG_A@", &self.namespace)
+            .replace("@ORG_B@", &self.foreign_namespace);
+        fs::write(self.root.join("acl"), acl)
+            .map_err(|error| format!("write isolation broker ACL: {error}"))?;
+        set_private_permissions(&self.root.join("acl"), false)?;
+        self.start()
+    }
+
+    pub fn revoke_password(&mut self, username: &str) -> Result<(), String> {
+        if username.is_empty()
+            || username.starts_with('-')
+            || !username
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err("credential username is invalid".to_owned());
+        }
+        self.stop()?;
+        self.backend.delete_password_entry(&self.root, username)?;
         self.start()
     }
 
@@ -308,6 +348,40 @@ impl Backend {
                 }
                 command.arg(&password_file).arg(username).arg(password);
                 run_checked(&mut command, "write Mosquitto password entry in Docker")
+            }
+        }
+    }
+
+    fn delete_password_entry(&self, root: &Path, username: &str) -> Result<(), String> {
+        let password_file = root.join("passwords");
+        match self {
+            Self::Native {
+                mosquitto_passwd, ..
+            } => {
+                let mut command = Command::new(mosquitto_passwd);
+                command.arg("-D").arg(&password_file).arg(username);
+                run_checked(&mut command, "delete Mosquitto password entry")
+            }
+            Self::Docker {
+                docker,
+                image,
+                user,
+                ..
+            } => {
+                let mut command = Command::new(docker);
+                command.arg("run").arg("--rm");
+                if let Some(user) = user {
+                    command.arg("--user").arg(user);
+                }
+                command
+                    .arg("--volume")
+                    .arg(format!("{}:{}", root.display(), root.display()))
+                    .arg(image)
+                    .arg("mosquitto_passwd")
+                    .arg("-D")
+                    .arg(&password_file)
+                    .arg(username);
+                run_checked(&mut command, "delete Mosquitto password entry in Docker")
             }
         }
     }
