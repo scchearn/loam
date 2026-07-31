@@ -7,7 +7,10 @@ import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
 import { fingerprintActionable } from '../integration/ingest-fingerprint.mjs';
-import { claudeSessionName, gate, ingestStatus, readIngestConfig, runRoot, runWorker, startWorker } from '../integration/ingest.mjs';
+import {
+  claudeSessionName, dispatchBoundary, finalizeWorkerRun, gate, ingestStatus,
+  prepareWorkerRun, readIngestConfig, runRoot, runWorker, startWorker,
+} from '../integration/ingest.mjs';
 import { bootIdentity, childIdentity, processDescriptor, resolveExecutable, startTracked } from '../integration/ingest-process.mjs';
 
 async function fixture() {
@@ -200,6 +203,137 @@ test('detached worker launch forwards the hook-run correlation id', () => {
   assert.deepEqual(request.args, [
     '/worker.mjs', '--harness', 'codex', '--workspace', workspace, '--hook-run-id', '17',
   ]);
+});
+
+test('Codex native boundary records one intent and falls back exactly once on the continuation Stop', async () => {
+  const { root, workspace, skills } = await fixture();
+  const adapterRoot = join(root, 'plugins', 'version');
+  await mkdir(adapterRoot, { recursive: true });
+  await writeFile(join(root, 'install.json'), JSON.stringify({ adapter_root: adapterRoot }));
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native', min_interval_seconds: 0 } }));
+  const spawns = [];
+  const options = {
+    harness: 'codex', globalRoot: root, skillsRoot: skills, env: {},
+    payload: { cwd: workspace, session_id: 'session-1', stop_hook_active: false },
+    hookRunId: 41,
+    spawn: (request) => { spawns.push(request); return { pid: 123 }; },
+  };
+
+  const first = await dispatchBoundary(options);
+  assert.equal(first.action, 'spawn_worker');
+  assert.equal(first.native_continuation.decision, 'block');
+  assert.equal(spawns.length, 0, 'first native Stop must not start a detached worker');
+  const intentPath = join(runRoot(root, workspace), 'native-intent.json');
+  const intent = JSON.parse(await readFile(intentPath, 'utf8'));
+  assert.equal(intent.workspace, workspace);
+  assert.equal(intent.session_id, 'session-1');
+  assert.equal(intent.claim, 'pending');
+
+  assert.deepEqual(await dispatchBoundary(options), { action: 'skip', reason: 'busy', workspace });
+  assert.equal(spawns.length, 0, 'duplicate first Stop must not issue another continuation or spawn');
+
+  const fallback = await dispatchBoundary({
+    ...options,
+    hookRunId: 42,
+    payload: { ...options.payload, stop_hook_active: true },
+  });
+  assert.equal(fallback.action, 'spawn_worker');
+  assert.equal(fallback.native_fallback, true);
+  assert.equal(spawns.length, 1);
+  assert.ok(spawns[0].args.includes('42'));
+  const claim = JSON.parse(await readFile(join(runRoot(root, workspace), 'native-claim.json'), 'utf8'));
+  assert.equal(claim.claim, 'fallback');
+  assert.equal(claim.intent_id, intent.intent_id);
+
+  assert.deepEqual(await dispatchBoundary({
+    ...options,
+    payload: { ...options.payload, stop_hook_active: true },
+  }), { action: 'skip', reason: 'busy', workspace });
+  assert.equal(spawns.length, 1, 'duplicate continuation must not start a second fallback');
+});
+
+test('Codex native cheap skips, bound intents, stale intents, and corrupt state are deterministic', async () => {
+  const { root, workspace, skills } = await fixture();
+  const adapterRoot = join(root, 'plugins', 'version');
+  await mkdir(adapterRoot, { recursive: true });
+  await writeFile(join(root, 'install.json'), JSON.stringify({ adapter_root: adapterRoot }));
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native', timeout_seconds: 1 } }));
+  const intentRoot = runRoot(root, workspace);
+  let spawns = 0;
+  const base = {
+    harness: 'codex', globalRoot: root, skillsRoot: skills, now: 100,
+    payload: { cwd: workspace, session_id: 'session-2' }, env: {},
+    spawn: () => { spawns += 1; return { pid: 1 }; },
+  };
+
+  assert.deepEqual(await dispatchBoundary({ ...base, env: { LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
+  await assert.rejects(() => readFile(join(intentRoot, 'native-intent.json')), { code: 'ENOENT' });
+
+  const first = await dispatchBoundary(base);
+  assert.equal(first.native_continuation.decision, 'block');
+  const intent = JSON.parse(await readFile(join(intentRoot, 'native-intent.json'), 'utf8'));
+  await writeFile(join(intentRoot, 'native-claim.json'), JSON.stringify({ ...intent, claim: 'agent', agent_id: 'agent-1' }));
+  await rm(join(intentRoot, 'native-intent.json'));
+  assert.deepEqual(await dispatchBoundary({
+    ...base,
+    payload: { ...base.payload, stop_hook_active: true },
+  }), { action: 'skip', reason: 'busy', workspace });
+  assert.equal(spawns, 0, 'a bound native intent must never fall back');
+
+  await rm(join(intentRoot, 'native-claim.json'));
+  const replacement = await dispatchBoundary({ ...base, now: 2_000 });
+  assert.equal(replacement.native_continuation.decision, 'block', 'an expired intent must not suppress a later continuation');
+  const replacedIntent = JSON.parse(await readFile(join(intentRoot, 'native-intent.json'), 'utf8'));
+  assert.notEqual(replacedIntent.intent_id, intent.intent_id);
+
+  await writeFile(join(intentRoot, 'native-intent.json'), '{malformed');
+  const degraded = await dispatchBoundary({
+    ...base,
+    now: 2_001,
+    payload: { ...base.payload, stop_hook_active: true },
+  });
+  assert.equal(degraded.action, 'spawn_worker');
+  assert.equal(degraded.native_fallback, true);
+  assert.equal(spawns, 1, 'corrupt intent state must degrade to one detached worker');
+});
+
+test('Codex native fallback launch failure clears its claim for a later attempt', async () => {
+  const { root, workspace, skills } = await fixture();
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native' } }));
+  const options = {
+    harness: 'codex', globalRoot: root, skillsRoot: skills, env: {},
+    payload: { cwd: workspace, session_id: 'retry-session' },
+  };
+
+  assert.equal((await dispatchBoundary(options)).native_continuation.decision, 'block');
+  assert.deepEqual(await dispatchBoundary({
+    ...options,
+    payload: { ...options.payload, stop_hook_active: true },
+  }), { action: 'skip', reason: 'unavailable', detail: 'installed ingestion worker is unavailable' });
+  await assert.rejects(() => readFile(join(runRoot(root, workspace), 'native-claim.json')), { code: 'ENOENT' });
+  assert.equal((await dispatchBoundary(options)).native_continuation.decision, 'block');
+});
+
+test('Codex native race admits only the first lease holder in either ordering', async () => {
+  for (const order of ['fallback-first', 'native-first']) {
+    const { root, workspace, wiki, skills } = await fixture();
+    let diffCalls = 0;
+    const runtimeRunner = async ({ args }) => args[0] === 'state'
+      ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+      : { code: 0, stdout: JSON.stringify(diffCalls++ === 0 ? [{ path: 'src/a.js', mtime: '1', reason: 'new' }] : []), stderr: '' };
+    const options = {
+      harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
+      readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner,
+      env: { LOAM_INGEST_BACKGROUND: '1' },
+    };
+
+    const first = await prepareWorkerRun(options);
+    const late = await prepareWorkerRun(options);
+    assert.equal(first.action, 'run', order);
+    assert.deepEqual(late, { action: 'skip', result: { reason: 'busy' } }, order);
+    await finalizeWorkerRun(first, { launch: { background: false }, result: { code: 0 } });
+    await assert.rejects(() => readFile(join(runRoot(root, workspace), 'lease.json')), { code: 'ENOENT' });
+  }
 });
 
 test('worker leases before full state and issues the exact exclusions-aware diff argv', async () => {

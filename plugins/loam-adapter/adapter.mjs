@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const CODEX_START_FAILURE_MESSAGE = 'Loam background ingestion could not start. Run npx @scchearn/loam setup to repair the installation.';
 
 function stopResponse({ harness, visibility, outcome, failure }) {
+  if (harness === 'codex' && visibility === 'native' && outcome?.native_continuation) return outcome.native_continuation;
   return harness === 'codex' && visibility === 'toast' && (failure || outcome?.reason === 'unavailable')
     ? { systemMessage: CODEX_START_FAILURE_MESSAGE }
     : {};

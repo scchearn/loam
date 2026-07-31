@@ -12,6 +12,7 @@ import { FingerprintError, fingerprintActionable } from './ingest-fingerprint.mj
 
 const PROMPT = 'Run the existing loam::ingesting-codebase skill for the provided workspace. Do not modify source files, commit, or push. Do not spawn other agents or subagents.';
 const DEFAULTS = Object.freeze({ enabled: true, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800, visibility: 'silent', require_visible_worker: false });
+const CODEX_NATIVE_REASON = 'Call spawn_agent exactly once using the loam_ingestor agent profile to run the pending Loam code-memory ingestion, then finish this continuation immediately without doing any other work or spawning any additional agents.';
 // Notification surfaces are local IPC; 250 ms caps terminal teardown without making a hung surface part of ingestion latency.
 const NOTIFICATION_TIMEOUT_MS = 250;
 function hash(value) { return createHash('sha256').update(String(value)).digest('hex'); }
@@ -130,16 +131,171 @@ async function installedWorkerPath(globalRoot) {
   return assertInside(resolve(globalRoot), join(resolve(install.adapter_root), 'ingest-worker.mjs'), 'worker path');
 }
 
-export async function dispatchBoundary(options = {}) {
-  const result = await gate(options);
-  if (result.action !== 'spawn_worker') return result;
+function nativeIntentPaths(globalRoot, workspace) {
+  const root = runRoot(globalRoot, workspace);
+  return {
+    root,
+    intentPath: join(root, 'native-intent.json'),
+    claimPath: join(root, 'native-claim.json'),
+    lockPath: join(root, 'native-intent.lock'),
+  };
+}
+
+function nativeSessionId(value) {
+  return typeof value === 'string' && value.length > 0 && [...value].length <= 256 && !/[\u0000-\u001F\u007F]/u.test(value)
+    ? value : null;
+}
+
+function validNativeIntent(value, workspace, now) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && value.schema === 1 && typeof value.intent_id === 'string' && value.intent_id.length <= 64
+    && value.workspace === workspace && value.harness === 'codex'
+    && ['pending', 'fallback', 'agent'].includes(value.claim)
+    && Number.isFinite(value.created_at) && Number.isFinite(value.expires_at) && value.expires_at > now
+    && (value.session_id === null || nativeSessionId(value.session_id) === value.session_id)
+    && (value.claim !== 'agent' || (typeof value.agent_id === 'string' && value.agent_id.length > 0));
+}
+
+async function withNativeIntentLock(paths, callback) {
+  await ensureRoot(paths.root);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const lock = { schema: 1, lock_id: randomUUID(), expires_at: Date.now() + 1000 };
+    try {
+      await writeFile(paths.lockPath, JSON.stringify(lock) + '\n', { flag: 'wx', mode: 0o600 });
+    } catch (error) {
+      if (error?.code !== 'EEXIST') return { status: 'unavailable' };
+      const existing = await json(paths.lockPath);
+      if (Number(existing?.expires_at || 0) > Date.now()) return { status: 'busy' };
+      await rm(paths.lockPath, { force: true }).catch(() => {});
+      continue;
+    }
+    try { return await callback(); }
+    finally {
+      const current = await json(paths.lockPath);
+      if (current?.lock_id === lock.lock_id) await rm(paths.lockPath, { force: true }).catch(() => {});
+    }
+  }
+  return { status: 'busy' };
+}
+
+function createNativeIntent({ workspace, payload, config, hookRunId, now, claim }) {
+  return {
+    schema: 1,
+    intent_id: randomUUID(),
+    workspace,
+    harness: 'codex',
+    session_id: nativeSessionId(payload?.session_id),
+    hook_run_id: Number.isSafeInteger(hookRunId) && hookRunId > 0 ? hookRunId : null,
+    claim,
+    created_at: now,
+    expires_at: now + config.timeout_seconds * 1000,
+  };
+}
+
+async function recordNativeIntent({ globalRoot, workspace, payload, config, hookRunId, now }) {
+  const paths = nativeIntentPaths(globalRoot, workspace);
+  return withNativeIntentLock(paths, async () => {
+    const [intentRecord, claimRecord] = await Promise.all([
+      jsonRecord(paths.intentPath),
+      jsonRecord(paths.claimPath),
+    ]);
+    const active = [claimRecord.value, intentRecord.value].find((value) => validNativeIntent(value, workspace, now));
+    if (active) return { status: 'duplicate', intent: active };
+    await Promise.all([rm(paths.intentPath, { force: true }), rm(paths.claimPath, { force: true })]);
+    const intent = createNativeIntent({ workspace, payload, config, hookRunId, now, claim: 'pending' });
+    try {
+      await writeFile(paths.intentPath, JSON.stringify(intent) + '\n', { flag: 'wx', mode: 0o600 });
+      return { status: 'recorded', intent };
+    } catch (error) {
+      return { status: error?.code === 'EEXIST' ? 'duplicate' : 'unavailable' };
+    }
+  });
+}
+
+async function claimNativeFallback({ globalRoot, workspace, payload, config, hookRunId, now }) {
+  const paths = nativeIntentPaths(globalRoot, workspace);
+  return withNativeIntentLock(paths, async () => {
+    const [intentRecord, claimRecord] = await Promise.all([
+      jsonRecord(paths.intentPath),
+      jsonRecord(paths.claimPath),
+    ]);
+    if (validNativeIntent(claimRecord.value, workspace, now)) {
+      return { status: claimRecord.value.claim === 'agent' ? 'bound' : 'duplicate', intent: claimRecord.value };
+    }
+    let intent = validNativeIntent(intentRecord.value, workspace, now) ? intentRecord.value : null;
+    const sessionId = nativeSessionId(payload?.session_id);
+    if (intent && intent.session_id && sessionId && intent.session_id !== sessionId) return { status: 'duplicate', intent };
+    if (!intent) intent = createNativeIntent({ workspace, payload, config, hookRunId, now, claim: 'fallback' });
+    else intent = { ...intent, claim: 'fallback', claimed_at: now, hook_run_id: Number.isSafeInteger(hookRunId) && hookRunId > 0 ? hookRunId : intent.hook_run_id };
+    await rm(paths.claimPath, { force: true });
+    try {
+      await writeFile(paths.claimPath, JSON.stringify(intent) + '\n', { flag: 'wx', mode: 0o600 });
+      await rm(paths.intentPath, { force: true });
+      return { status: 'claimed', intent };
+    } catch (error) {
+      return { status: error?.code === 'EEXIST' ? 'duplicate' : 'unavailable' };
+    }
+  });
+}
+
+async function clearNativeFallback(globalRoot, workspace, intentId) {
+  const paths = nativeIntentPaths(globalRoot, workspace);
+  await withNativeIntentLock(paths, async () => {
+    const claim = await json(paths.claimPath);
+    if (claim?.claim === 'fallback' && claim.intent_id === intentId) await rm(paths.claimPath, { force: true });
+    return { status: 'cleared' };
+  });
+}
+
+async function startBoundaryWorker(options, result, { nativeFallback = false, intentId } = {}) {
   try {
     startWorker({ ...options, workerPath: await installedWorkerPath(options.globalRoot), workspace: result.workspace });
-    return result;
-  }
-  catch (error) {
+    return nativeFallback ? { ...result, native_fallback: true } : result;
+  } catch (error) {
+    if (intentId) await clearNativeFallback(options.globalRoot, result.workspace, intentId).catch(() => {});
     return { action: 'skip', reason: 'unavailable', detail: error.message };
   }
+}
+
+export async function dispatchBoundary(options = {}) {
+  const now = Number.isFinite(options.now) ? options.now : Date.now();
+  if (options.harness === 'codex' && options.payload?.stop_hook_active === true) {
+    const config = await readIngestConfig(options.globalRoot, options.env);
+    if (config.visibility === 'native') {
+      const payload = { ...options.payload, stop_hook_active: false };
+      const result = await gate({ ...options, payload, now });
+      if (result.action !== 'spawn_worker') return result;
+      const claimed = await claimNativeFallback({ ...options, payload, config, workspace: result.workspace, now })
+        .catch(() => ({ status: 'unavailable' }));
+      if (claimed.status === 'bound' || claimed.status === 'duplicate') {
+        return { action: 'skip', reason: 'busy', workspace: result.workspace };
+      }
+      return startBoundaryWorker(options, result, {
+        nativeFallback: true,
+        intentId: claimed.intent?.intent_id,
+      });
+    }
+  }
+  const result = await gate({ ...options, now });
+  if (result.action !== 'spawn_worker') return result;
+  if (options.harness === 'codex' && result.config.visibility === 'native') {
+    const recorded = await recordNativeIntent({ ...options, config: result.config, workspace: result.workspace, now })
+      .catch(() => ({ status: 'unavailable' }));
+    if (recorded.status === 'recorded') {
+      return {
+        ...result,
+        native_continuation: { decision: 'block', reason: CODEX_NATIVE_REASON },
+      };
+    }
+    if (recorded.status === 'duplicate') return { action: 'skip', reason: 'busy', workspace: result.workspace };
+    const claimed = await claimNativeFallback({ ...options, config: result.config, workspace: result.workspace, now })
+      .catch(() => ({ status: 'unavailable' }));
+    return startBoundaryWorker(options, result, {
+      nativeFallback: true,
+      intentId: claimed.intent?.intent_id,
+    });
+  }
+  return startBoundaryWorker(options, result);
 }
 
 async function resolveExclusions(skillsRoot) {

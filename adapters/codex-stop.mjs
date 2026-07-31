@@ -4,6 +4,7 @@ import { loadIngestModules } from './ingest-modules.mjs';
 const START_FAILURE_MESSAGE = 'Loam background ingestion could not start. Run npx @scchearn/loam setup to repair the installation.';
 
 function response({ visibility, outcome, failure }) {
+  if (visibility === 'native' && outcome?.native_continuation) return outcome.native_continuation;
   return visibility === 'toast' && (failure || outcome?.reason === 'unavailable')
     ? { systemMessage: START_FAILURE_MESSAGE }
     : {};

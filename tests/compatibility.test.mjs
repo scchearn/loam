@@ -322,6 +322,79 @@ test('Codex marketplace Stop matches direct one-shot warning semantics', async (
   ), {});
 });
 
+test('Codex native Stop returns one spawn_agent continuation with identical direct and marketplace logging semantics', async () => {
+  const direct = await import(`${pathToFileURL(codexStopPath).href}?native=${Date.now()}`);
+  const stop = await import(`${pathToFileURL(marketplaceStopPath).href}?native=${Date.now()}`);
+  const run = { id: 91 };
+  const finishCalls = [];
+  const continuation = {
+    action: 'spawn_worker',
+    workspace: '/workspace',
+    native_continuation: {
+      decision: 'block',
+      reason: 'Call spawn_agent exactly once using the loam_ingestor agent profile, then finish this continuation immediately.',
+    },
+  };
+  const loadIngest = async () => ({
+    resolveGlobalRoot: () => '/global',
+    resolveSkillsRoot: () => '/skills',
+    readIngestConfig: async () => ({ visibility: 'native' }),
+    dispatchBoundary: async () => continuation,
+  });
+  const input = { cwd: '/workspace', session_id: 'native-session', stop_hook_active: false };
+
+  const directResponse = await direct.main({ input, env: {}, loadIngest });
+  const marketplaceResponse = await stop.handleStop(input, { PLUGIN_ROOT: marketplaceRoot }, {
+    loadIngest,
+    loadHooks: async () => ({
+      resolveGlobalRoot: () => '/global',
+      beginHookRun: async () => run,
+      finishHookRun: async (call) => finishCalls.push(call),
+    }),
+  });
+
+  assert.deepEqual(marketplaceResponse, directResponse);
+  assert.equal(directResponse.decision, 'block');
+  assert.equal((directResponse.reason.match(/spawn_agent/gu) || []).length, 1);
+  assert.match(directResponse.reason, /loam_ingestor/u);
+  assert.match(directResponse.reason, /finish (?:this )?continuation immediately/iu);
+  assert.deepEqual(finishCalls, [{ run, status: 'succeeded', action: 'spawn_worker' }]);
+
+  finishCalls.length = 0;
+  const fallbackLoad = async () => ({
+    resolveGlobalRoot: () => '/global',
+    resolveSkillsRoot: () => '/skills',
+    readIngestConfig: async () => ({ visibility: 'native' }),
+    dispatchBoundary: async () => ({ action: 'spawn_worker', workspace: '/workspace', native_fallback: true }),
+  });
+  assert.deepEqual(await stop.handleStop(
+    { ...input, stop_hook_active: true },
+    { PLUGIN_ROOT: marketplaceRoot },
+    {
+      loadIngest: fallbackLoad,
+      loadHooks: async () => ({
+        resolveGlobalRoot: () => '/global',
+        beginHookRun: async () => run,
+        finishHookRun: async (call) => finishCalls.push(call),
+      }),
+    },
+  ), {});
+  assert.deepEqual(finishCalls, [{ run, status: 'succeeded', action: 'spawn_worker' }]);
+
+  const boundLoad = async () => ({
+    resolveGlobalRoot: () => '/global',
+    resolveSkillsRoot: () => '/skills',
+    readIngestConfig: async () => ({ visibility: 'native' }),
+    dispatchBoundary: async () => ({ action: 'skip', reason: 'busy', workspace: '/workspace' }),
+  });
+  assert.deepEqual(await direct.main({ input: { ...input, stop_hook_active: true }, env: {}, loadIngest: boundLoad }), {});
+  assert.deepEqual(await stop.handleStop(
+    { ...input, stop_hook_active: true },
+    { PLUGIN_ROOT: marketplaceRoot },
+    { loadIngest: boundLoad, loadHooks: async () => { throw new Error('logging unavailable'); } },
+  ), {});
+});
+
 test('marketplace Stop writes exact hook JSON when logging is unavailable', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-stop-output-'));
   const result = await runHook({
