@@ -7,7 +7,8 @@ use std::time::Duration;
 const DATABASE_NAME: &str = "loam.sqlite3";
 // This is a wait ceiling under contention, not a delay on uncontended operations.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+const LEGACY_SCHEMA_VERSION: i64 = 1;
 const RETENTION: i64 = 10_000;
 const SUPPORTED_TARGETS: [&str; 5] = [
     "x86_64-apple-darwin",
@@ -34,10 +35,83 @@ fn execute(mut args: Vec<String>) -> Result<(), String> {
     match args.remove(0).as_str() {
         "begin" => begin(parse_begin(args)?),
         "finish" => finish(parse_finish(args)?),
+        "event" => record_event(parse_event(args)?),
         "worker-start" => worker_start(parse_worker_start(args)?),
         "worker-finish" => worker_finish(parse_worker_finish(args)?),
         "list" => list(parse_list(args)?),
         _ => Err(usage()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinishStatus {
+    Succeeded,
+    Failed,
+    Continued,
+}
+
+impl FinishStatus {
+    fn parse(value: Option<String>) -> Result<Self, String> {
+        match value.as_deref() {
+            Some("succeeded") => Ok(Self::Succeeded),
+            Some("failed") => Ok(Self::Failed),
+            Some("continued") => Ok(Self::Continued),
+            Some(_) => Err("status must be succeeded, failed, or continued".to_owned()),
+            None => Err("missing --status".to_owned()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Continued => "continued",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinishAction {
+    SpawnWorker,
+    Skip,
+    RequestWorker,
+}
+
+impl FinishAction {
+    fn parse(value: Option<String>) -> Result<Option<Self>, String> {
+        value
+            .map(|value| match value.as_str() {
+                "spawn_worker" => Ok(Self::SpawnWorker),
+                "skip" => Ok(Self::Skip),
+                "request_worker" => Ok(Self::RequestWorker),
+                _ => Err("action must be spawn_worker, skip, or request_worker".to_owned()),
+            })
+            .transpose()
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SpawnWorker => "spawn_worker",
+            Self::Skip => "skip",
+            Self::RequestWorker => "request_worker",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerOrigin {
+    Direct,
+    External,
+    Fallback,
+}
+
+impl WorkerOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::External => "external",
+            Self::Fallback => "fallback",
+        }
     }
 }
 
@@ -92,8 +166,8 @@ fn parse_begin(args: Vec<String>) -> Result<BeginArgs, String> {
 struct FinishArgs {
     root: PathBuf,
     id: i64,
-    status: String,
-    action: Option<String>,
+    status: FinishStatus,
+    action: Option<FinishAction>,
     reason: Option<String>,
     detail: Option<String>,
 }
@@ -117,28 +191,39 @@ fn parse_finish(args: Vec<String>) -> Result<FinishArgs, String> {
         }
     }
     let id = positive_id(id)?;
-    let status = status.ok_or_else(|| "missing --status".to_owned())?;
-    match status.as_str() {
-        "failed"
+    let status = FinishStatus::parse(status)?;
+    let action = FinishAction::parse(action)?;
+    match status {
+        FinishStatus::Failed
             if detail.as_ref().is_some_and(|value| valid_detail(value))
                 && action.is_none()
                 && reason.is_none() => {}
-        "succeeded" => {
+        FinishStatus::Succeeded => {
             if detail.as_ref().is_some_and(|value| !valid_detail(value)) {
                 return Err("detail must be 1..1024 characters".to_owned());
             }
-            match action.as_deref() {
-                Some("spawn_worker") => {
+            match action {
+                Some(FinishAction::SpawnWorker) => {
                     reason = optional_identifier(reason, "reason")?;
                 }
-                Some("skip") => {
+                Some(FinishAction::Skip) => {
                     reason = Some(valid_identifier(reason, "reason")?);
                 }
                 _ => return Err("succeeded status requires action spawn_worker or skip".to_owned()),
             }
         }
-        "failed" => return Err("failed status requires detail of 1..1024 characters".to_owned()),
-        _ => return Err("status must be succeeded or failed".to_owned()),
+        FinishStatus::Continued => {
+            if action != Some(FinishAction::RequestWorker) {
+                return Err("continued status requires action request_worker".to_owned());
+            }
+            reason = optional_identifier(reason, "reason")?;
+            if detail.as_ref().is_some_and(|value| !valid_detail(value)) {
+                return Err("detail must be 1..1024 characters".to_owned());
+            }
+        }
+        FinishStatus::Failed => {
+            return Err("failed status requires detail of 1..1024 characters".to_owned());
+        }
     }
     Ok(FinishArgs {
         root,
@@ -153,6 +238,7 @@ fn parse_finish(args: Vec<String>) -> Result<FinishArgs, String> {
 struct WorkerStartArgs {
     root: PathBuf,
     id: i64,
+    origin: WorkerOrigin,
     session_id: Option<String>,
 }
 
@@ -160,18 +246,31 @@ fn parse_worker_start(args: Vec<String>) -> Result<WorkerStartArgs, String> {
     let mut args = args.into_iter();
     let root = absolute_path(args.next(), "global root")?;
     let mut id = None;
+    let mut origin = None;
     let mut session_id = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--id" => take_value(&mut id, &flag, &mut args)?,
+            "--origin" => take_value(&mut origin, &flag, &mut args)?,
             "--session-id" => take_value(&mut session_id, &flag, &mut args)?,
             _ => return Err(format!("unknown option {flag}")),
         }
     }
+    let origin = match origin.as_deref() {
+        None => WorkerOrigin::Direct,
+        Some("external") => WorkerOrigin::External,
+        Some("fallback") => WorkerOrigin::Fallback,
+        Some(_) => return Err("worker origin must be external or fallback".to_owned()),
+    };
+    let session_id = optional_session_id(session_id)?;
+    if origin == WorkerOrigin::External && session_id.is_none() {
+        return Err("external worker origin requires --session-id".to_owned());
+    }
     Ok(WorkerStartArgs {
         root,
         id: positive_id(id)?,
-        session_id: optional_session_id(session_id)?,
+        origin,
+        session_id,
     })
 }
 
@@ -180,6 +279,8 @@ struct WorkerFinishArgs {
     id: i64,
     status: String,
     reason: String,
+    origin: WorkerOrigin,
+    session_id: Option<String>,
     detail: Option<String>,
 }
 
@@ -189,12 +290,16 @@ fn parse_worker_finish(args: Vec<String>) -> Result<WorkerFinishArgs, String> {
     let mut id = None;
     let mut status = None;
     let mut reason = None;
+    let mut origin = None;
+    let mut session_id = None;
     let mut detail = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--id" => take_value(&mut id, &flag, &mut args)?,
             "--status" => take_value(&mut status, &flag, &mut args)?,
             "--reason" => take_value(&mut reason, &flag, &mut args)?,
+            "--origin" => take_value(&mut origin, &flag, &mut args)?,
+            "--session-id" => take_value(&mut session_id, &flag, &mut args)?,
             "--detail" => take_value(&mut detail, &flag, &mut args)?,
             _ => return Err(format!("unknown option {flag}")),
         }
@@ -216,13 +321,580 @@ fn parse_worker_finish(args: Vec<String>) -> Result<WorkerFinishArgs, String> {
     if detail.as_ref().is_some_and(|value| !valid_detail(value)) {
         return Err("detail must be 1..1024 characters".to_owned());
     }
+    let origin = match origin.as_deref() {
+        None => WorkerOrigin::Direct,
+        Some("external") => WorkerOrigin::External,
+        Some("fallback") => WorkerOrigin::Fallback,
+        Some(_) => return Err("worker origin must be external or fallback".to_owned()),
+    };
+    let session_id = optional_session_id(session_id)?;
+    if origin == WorkerOrigin::External && session_id.is_none() {
+        return Err("external worker origin requires --session-id".to_owned());
+    }
     Ok(WorkerFinishArgs {
         root,
         id: positive_id(id)?,
         status,
         reason,
+        origin,
+        session_id,
         detail,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventKind {
+    IngestVisibility,
+    VisibilityDelivery,
+    IngestPreparation,
+    IngestFinalization,
+    ClaudeAgentProfile,
+    ClaudeRecursionGuard,
+    ClaudeAgentView,
+    CodexNative,
+    Subagent,
+}
+
+impl EventKind {
+    fn parse(value: Option<String>) -> Result<Self, String> {
+        match value.as_deref() {
+            Some("ingest_visibility") => Ok(Self::IngestVisibility),
+            Some("visibility_delivery") => Ok(Self::VisibilityDelivery),
+            Some("ingest_preparation") => Ok(Self::IngestPreparation),
+            Some("ingest_finalization") => Ok(Self::IngestFinalization),
+            Some("claude_agent_profile") => Ok(Self::ClaudeAgentProfile),
+            Some("claude_recursion_guard") => Ok(Self::ClaudeRecursionGuard),
+            Some("claude_agent_view") => Ok(Self::ClaudeAgentView),
+            Some("codex_native") => Ok(Self::CodexNative),
+            Some("subagent") => Ok(Self::Subagent),
+            Some(_) => Err("unsupported hook event".to_owned()),
+            None => Err("missing --event".to_owned()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::IngestVisibility => "ingest_visibility",
+            Self::VisibilityDelivery => "visibility_delivery",
+            Self::IngestPreparation => "ingest_preparation",
+            Self::IngestFinalization => "ingest_finalization",
+            Self::ClaudeAgentProfile => "claude_agent_profile",
+            Self::ClaudeRecursionGuard => "claude_recursion_guard",
+            Self::ClaudeAgentView => "claude_agent_view",
+            Self::CodexNative => "codex_native",
+            Self::Subagent => "subagent",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventPhase {
+    Launch,
+    Terminal,
+    Continuation,
+    Fallback,
+    Start,
+    Stop,
+}
+
+impl EventPhase {
+    fn parse(value: Option<String>) -> Result<Option<Self>, String> {
+        value
+            .map(|value| match value.as_str() {
+                "launch" => Ok(Self::Launch),
+                "terminal" => Ok(Self::Terminal),
+                "continuation" => Ok(Self::Continuation),
+                "fallback" => Ok(Self::Fallback),
+                "start" => Ok(Self::Start),
+                "stop" => Ok(Self::Stop),
+                _ => Err("unsupported hook-event phase".to_owned()),
+            })
+            .transpose()
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Launch => "launch",
+            Self::Terminal => "terminal",
+            Self::Continuation => "continuation",
+            Self::Fallback => "fallback",
+            Self::Start => "start",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventOutcome {
+    Started,
+    Admitted,
+    Ok,
+    Partial,
+    Failed,
+    Emitted,
+    Aborted,
+    Selected,
+    Refused,
+    Fallback,
+    Returned,
+    Taken,
+    Skipped,
+    Succeeded,
+    Observed,
+}
+
+impl EventOutcome {
+    fn parse(value: Option<String>) -> Result<Self, String> {
+        match value.as_deref() {
+            Some("started") => Ok(Self::Started),
+            Some("admitted") => Ok(Self::Admitted),
+            Some("ok") => Ok(Self::Ok),
+            Some("partial") => Ok(Self::Partial),
+            Some("failed") => Ok(Self::Failed),
+            Some("emitted") => Ok(Self::Emitted),
+            Some("aborted") => Ok(Self::Aborted),
+            Some("selected") => Ok(Self::Selected),
+            Some("refused") => Ok(Self::Refused),
+            Some("fallback") => Ok(Self::Fallback),
+            Some("returned") => Ok(Self::Returned),
+            Some("taken") => Ok(Self::Taken),
+            Some("skipped") => Ok(Self::Skipped),
+            Some("succeeded") => Ok(Self::Succeeded),
+            Some("observed") => Ok(Self::Observed),
+            Some(_) => Err("unsupported hook-event outcome".to_owned()),
+            None => Err("missing --outcome".to_owned()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Admitted => "admitted",
+            Self::Ok => "ok",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Emitted => "emitted",
+            Self::Aborted => "aborted",
+            Self::Selected => "selected",
+            Self::Refused => "refused",
+            Self::Fallback => "fallback",
+            Self::Returned => "returned",
+            Self::Taken => "taken",
+            Self::Skipped => "skipped",
+            Self::Succeeded => "succeeded",
+            Self::Observed => "observed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Visibility {
+    Silent,
+    Toast,
+    Native,
+}
+
+impl Visibility {
+    fn parse(value: Option<String>) -> Result<Option<Self>, String> {
+        value
+            .map(|value| match value.as_str() {
+                "silent" => Ok(Self::Silent),
+                "toast" => Ok(Self::Toast),
+                "native" => Ok(Self::Native),
+                _ => Err("visibility must be silent, toast, or native".to_owned()),
+            })
+            .transpose()
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Silent => "silent",
+            Self::Toast => "toast",
+            Self::Native => "native",
+        }
+    }
+}
+
+const EVENT_REASON: u32 = 1 << 0;
+const EVENT_VISIBILITY: u32 = 1 << 1;
+const EVENT_LAUNCH_MODE: u32 = 1 << 2;
+const EVENT_FALLBACK_MODE: u32 = 1 << 3;
+const EVENT_AGENT_TYPE: u32 = 1 << 4;
+const EVENT_SESSION_ID: u32 = 1 << 5;
+const EVENT_PARENT_SESSION_ID: u32 = 1 << 6;
+const EVENT_MANAGER_NAME: u32 = 1 << 7;
+const EVENT_MANAGER_ID: u32 = 1 << 8;
+const EVENT_LEASE_ID: u32 = 1 << 9;
+const EVENT_REQUIRE_VISIBLE: u32 = 1 << 10;
+const EVENT_DETAIL: u32 = 1 << 11;
+const EVENT_ACTIONABLE_DIGEST: u32 = 1 << 12;
+const EVENT_PRE_DIGEST: u32 = 1 << 13;
+const EVENT_POST_DIGEST: u32 = 1 << 14;
+const EVENT_ACTIONABLE_COUNT: u32 = 1 << 15;
+const EVENT_FAILURE_COUNT: u32 = 1 << 16;
+const EVENT_DEADLINE_MS: u32 = 1 << 17;
+const EVENT_BACKOFF_UNTIL_MS: u32 = 1 << 18;
+
+struct EventArgs {
+    root: PathBuf,
+    id: i64,
+    event: EventKind,
+    phase: Option<EventPhase>,
+    outcome: EventOutcome,
+    reason: Option<String>,
+    visibility: Option<Visibility>,
+    launch_mode: Option<String>,
+    fallback_launch_mode: Option<String>,
+    agent_type: Option<String>,
+    session_id: Option<String>,
+    parent_session_id: Option<String>,
+    manager_name: Option<String>,
+    manager_id: Option<String>,
+    lease_id: Option<String>,
+    require_visible_worker: Option<bool>,
+    detail: Option<String>,
+    actionable_digest: Option<String>,
+    pre_digest: Option<String>,
+    post_digest: Option<String>,
+    actionable_count: Option<i64>,
+    failure_count: Option<i64>,
+    deadline_ms: Option<i64>,
+    backoff_until_ms: Option<i64>,
+}
+
+impl EventArgs {
+    fn present_fields(&self) -> u32 {
+        let fields = [
+            (self.reason.is_some(), EVENT_REASON),
+            (self.visibility.is_some(), EVENT_VISIBILITY),
+            (self.launch_mode.is_some(), EVENT_LAUNCH_MODE),
+            (self.fallback_launch_mode.is_some(), EVENT_FALLBACK_MODE),
+            (self.agent_type.is_some(), EVENT_AGENT_TYPE),
+            (self.session_id.is_some(), EVENT_SESSION_ID),
+            (self.parent_session_id.is_some(), EVENT_PARENT_SESSION_ID),
+            (self.manager_name.is_some(), EVENT_MANAGER_NAME),
+            (self.manager_id.is_some(), EVENT_MANAGER_ID),
+            (self.lease_id.is_some(), EVENT_LEASE_ID),
+            (self.require_visible_worker.is_some(), EVENT_REQUIRE_VISIBLE),
+            (self.detail.is_some(), EVENT_DETAIL),
+            (self.actionable_digest.is_some(), EVENT_ACTIONABLE_DIGEST),
+            (self.pre_digest.is_some(), EVENT_PRE_DIGEST),
+            (self.post_digest.is_some(), EVENT_POST_DIGEST),
+            (self.actionable_count.is_some(), EVENT_ACTIONABLE_COUNT),
+            (self.failure_count.is_some(), EVENT_FAILURE_COUNT),
+            (self.deadline_ms.is_some(), EVENT_DEADLINE_MS),
+            (self.backoff_until_ms.is_some(), EVENT_BACKOFF_UNTIL_MS),
+        ];
+        fields
+            .into_iter()
+            .filter_map(|(present, field)| present.then_some(field))
+            .fold(0, |mask, field| mask | field)
+    }
+
+    fn only_fields(&self, allowed: u32) -> Result<(), String> {
+        if self.present_fields() & !allowed == 0 {
+            Ok(())
+        } else {
+            Err("hook event contains fields not admitted by its type".to_owned())
+        }
+    }
+}
+
+fn parse_event(args: Vec<String>) -> Result<EventArgs, String> {
+    let mut args = args.into_iter();
+    let root = absolute_path(args.next(), "global root")?;
+    let mut id = None;
+    let mut event = None;
+    let mut phase = None;
+    let mut outcome = None;
+    let mut reason = None;
+    let mut visibility = None;
+    let mut launch_mode = None;
+    let mut fallback_launch_mode = None;
+    let mut agent_type = None;
+    let mut session_id = None;
+    let mut parent_session_id = None;
+    let mut manager_name = None;
+    let mut manager_id = None;
+    let mut lease_id = None;
+    let mut require_visible_worker = None;
+    let mut detail = None;
+    let mut actionable_digest = None;
+    let mut pre_digest = None;
+    let mut post_digest = None;
+    let mut actionable_count = None;
+    let mut failure_count = None;
+    let mut deadline_ms = None;
+    let mut backoff_until_ms = None;
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--id" => take_value(&mut id, &flag, &mut args)?,
+            "--event" => take_value(&mut event, &flag, &mut args)?,
+            "--phase" => take_value(&mut phase, &flag, &mut args)?,
+            "--outcome" => take_value(&mut outcome, &flag, &mut args)?,
+            "--reason" => take_value(&mut reason, &flag, &mut args)?,
+            "--visibility" => take_value(&mut visibility, &flag, &mut args)?,
+            "--launch-mode" => take_value(&mut launch_mode, &flag, &mut args)?,
+            "--fallback-launch-mode" => take_value(&mut fallback_launch_mode, &flag, &mut args)?,
+            "--agent-type" => take_value(&mut agent_type, &flag, &mut args)?,
+            "--session-id" => take_value(&mut session_id, &flag, &mut args)?,
+            "--parent-session-id" => take_value(&mut parent_session_id, &flag, &mut args)?,
+            "--manager-name" => take_value(&mut manager_name, &flag, &mut args)?,
+            "--manager-id" => take_value(&mut manager_id, &flag, &mut args)?,
+            "--lease-id" => take_value(&mut lease_id, &flag, &mut args)?,
+            "--require-visible-worker" => {
+                take_value(&mut require_visible_worker, &flag, &mut args)?
+            }
+            "--detail" => take_value(&mut detail, &flag, &mut args)?,
+            "--actionable-digest" => take_value(&mut actionable_digest, &flag, &mut args)?,
+            "--pre-digest" => take_value(&mut pre_digest, &flag, &mut args)?,
+            "--post-digest" => take_value(&mut post_digest, &flag, &mut args)?,
+            "--actionable-count" => take_value(&mut actionable_count, &flag, &mut args)?,
+            "--failure-count" => take_value(&mut failure_count, &flag, &mut args)?,
+            "--deadline-ms" => take_value(&mut deadline_ms, &flag, &mut args)?,
+            "--backoff-until-ms" => take_value(&mut backoff_until_ms, &flag, &mut args)?,
+            _ => return Err(format!("unknown option {flag}")),
+        }
+    }
+    let mut parsed = EventArgs {
+        root,
+        id: positive_id(id)?,
+        event: EventKind::parse(event)?,
+        phase: EventPhase::parse(phase)?,
+        outcome: EventOutcome::parse(outcome)?,
+        reason: optional_identifier(reason, "reason")?,
+        visibility: Visibility::parse(visibility)?,
+        launch_mode: optional_identifier(launch_mode, "launch-mode")?,
+        fallback_launch_mode: optional_identifier(fallback_launch_mode, "fallback-launch-mode")?,
+        agent_type,
+        session_id: optional_event_identity(session_id, "session id")?,
+        parent_session_id: optional_event_identity(parent_session_id, "parent session id")?,
+        manager_name: optional_event_identity(manager_name, "manager name")?,
+        manager_id: optional_event_identity(manager_id, "manager id")?,
+        lease_id: optional_event_identity(lease_id, "lease id")?,
+        require_visible_worker: require_visible_worker
+            .map(|value| match value.as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err("require-visible-worker must be true or false".to_owned()),
+            })
+            .transpose()?,
+        detail,
+        actionable_digest: optional_digest(actionable_digest, "actionable digest")?,
+        pre_digest: optional_digest(pre_digest, "pre digest")?,
+        post_digest: optional_digest(post_digest, "post digest")?,
+        actionable_count: optional_non_negative_i64(actionable_count, "actionable count")?,
+        failure_count: optional_non_negative_i64(failure_count, "failure count")?,
+        deadline_ms: optional_positive_i64(deadline_ms, "deadline")?,
+        backoff_until_ms: optional_positive_i64(backoff_until_ms, "backoff deadline")?,
+    };
+    if parsed
+        .detail
+        .as_ref()
+        .is_some_and(|value| !valid_detail(value))
+    {
+        return Err("detail must be 1..1024 characters".to_owned());
+    }
+    parsed.agent_type = parsed
+        .agent_type
+        .map(|value| match value.as_str() {
+            "loam_ingestor" | "loam:ingestor" => Ok(value),
+            _ => Err("agent type must be loam_ingestor or loam:ingestor".to_owned()),
+        })
+        .transpose()?;
+    validate_event(&parsed)?;
+    Ok(parsed)
+}
+
+/// The matrix prevents diagnostic metadata from becoming an unbounded payload channel.
+fn validate_event(args: &EventArgs) -> Result<(), String> {
+    let active_visibility = matches!(
+        args.visibility,
+        Some(Visibility::Toast | Visibility::Native)
+    );
+    match (args.event, args.phase, args.outcome) {
+        (EventKind::IngestVisibility, Some(EventPhase::Launch), EventOutcome::Started)
+        | (
+            EventKind::IngestVisibility,
+            Some(EventPhase::Terminal),
+            EventOutcome::Ok | EventOutcome::Partial | EventOutcome::Failed,
+        ) => {
+            args.only_fields(
+                EVENT_VISIBILITY
+                    | EVENT_LAUNCH_MODE
+                    | EVENT_SESSION_ID
+                    | EVENT_PARENT_SESSION_ID
+                    | EVENT_MANAGER_NAME
+                    | EVENT_MANAGER_ID
+                    | EVENT_LEASE_ID,
+            )?;
+            if !active_visibility || args.launch_mode.is_none() {
+                return Err(
+                    "visibility events require active visibility and launch mode".to_owned(),
+                );
+            }
+        }
+        (
+            EventKind::VisibilityDelivery,
+            Some(EventPhase::Launch | EventPhase::Terminal),
+            EventOutcome::Emitted | EventOutcome::Failed | EventOutcome::Aborted,
+        ) => {
+            let allowed = EVENT_VISIBILITY
+                | EVENT_LAUNCH_MODE
+                | if args.outcome == EventOutcome::Emitted {
+                    0
+                } else {
+                    EVENT_DETAIL
+                };
+            args.only_fields(allowed)?;
+            if !active_visibility || args.launch_mode.is_none() {
+                return Err("delivery events require active visibility and launch mode".to_owned());
+            }
+        }
+        (EventKind::IngestPreparation, None, EventOutcome::Admitted) => {
+            args.only_fields(
+                EVENT_LAUNCH_MODE
+                    | EVENT_LEASE_ID
+                    | EVENT_ACTIONABLE_DIGEST
+                    | EVENT_ACTIONABLE_COUNT
+                    | EVENT_DEADLINE_MS,
+            )?;
+            if args.launch_mode.is_none()
+                || args.lease_id.is_none()
+                || args.actionable_digest.is_none()
+                || args.actionable_count.is_none()
+                || args.deadline_ms.is_none()
+            {
+                return Err("admitted preparation requires its bounded work identity".to_owned());
+            }
+        }
+        (EventKind::IngestPreparation, None, EventOutcome::Skipped) => {
+            args.only_fields(
+                EVENT_REASON
+                    | EVENT_LAUNCH_MODE
+                    | EVENT_LEASE_ID
+                    | EVENT_ACTIONABLE_DIGEST
+                    | EVENT_ACTIONABLE_COUNT
+                    | EVENT_DEADLINE_MS,
+            )?;
+            if args.reason.is_none() {
+                return Err("skipped preparation requires a normalized reason".to_owned());
+            }
+        }
+        (
+            EventKind::IngestFinalization,
+            None,
+            EventOutcome::Ok | EventOutcome::Partial | EventOutcome::Failed,
+        ) => {
+            args.only_fields(
+                EVENT_LEASE_ID
+                    | EVENT_PRE_DIGEST
+                    | EVENT_POST_DIGEST
+                    | EVENT_ACTIONABLE_COUNT
+                    | EVENT_FAILURE_COUNT
+                    | EVENT_BACKOFF_UNTIL_MS,
+            )?;
+            if args.lease_id.is_none()
+                || args.pre_digest.is_none()
+                || args.post_digest.is_none()
+                || args.actionable_count.is_none()
+                || args.failure_count.is_none()
+            {
+                return Err("finalization requires its bounded progress identity".to_owned());
+            }
+        }
+        (EventKind::ClaudeAgentProfile, None, EventOutcome::Selected) => {
+            args.only_fields(
+                EVENT_LAUNCH_MODE
+                    | EVENT_AGENT_TYPE
+                    | EVENT_MANAGER_NAME
+                    | EVENT_MANAGER_ID
+                    | EVENT_LEASE_ID,
+            )?;
+            if args.launch_mode.as_deref() != Some("claude_bg")
+                || args.agent_type.as_deref() != Some("loam:ingestor")
+                || args.manager_name.is_none()
+                || args.manager_id.is_none()
+                || args.lease_id.is_none()
+            {
+                return Err(
+                    "Claude agent selection requires its exact profile and identity".to_owned(),
+                );
+            }
+        }
+        (EventKind::ClaudeRecursionGuard, None, EventOutcome::Refused) => {
+            args.only_fields(EVENT_AGENT_TYPE | EVENT_PARENT_SESSION_ID)?;
+            if args.agent_type.as_deref() != Some("loam:ingestor") {
+                return Err("Claude recursion refusal requires loam:ingestor".to_owned());
+            }
+        }
+        (EventKind::ClaudeAgentView, None, EventOutcome::Fallback | EventOutcome::Refused) => {
+            args.only_fields(
+                EVENT_REASON
+                    | EVENT_VISIBILITY
+                    | EVENT_LAUNCH_MODE
+                    | EVENT_FALLBACK_MODE
+                    | EVENT_LEASE_ID
+                    | EVENT_REQUIRE_VISIBLE,
+            )?;
+            if !matches!(
+                args.reason.as_deref(),
+                Some("agent_view_disabled" | "agent_view_unavailable" | "agent_view_launch_failed")
+            ) || args.launch_mode.as_deref() != Some("claude_bg")
+                || args.fallback_launch_mode.as_deref() != Some("claude_print")
+                || args.visibility.is_none()
+                || args.lease_id.is_none()
+                || args.require_visible_worker.is_none()
+                || (args.outcome == EventOutcome::Fallback
+                    && args.require_visible_worker != Some(false))
+                || (args.outcome == EventOutcome::Refused
+                    && args.require_visible_worker != Some(true))
+            {
+                return Err("invalid Claude Agent View downgrade event".to_owned());
+            }
+        }
+        (EventKind::CodexNative, Some(phase), outcome) => {
+            let valid = matches!(
+                (phase, outcome),
+                (EventPhase::Continuation, EventOutcome::Returned)
+                    | (EventPhase::Fallback, EventOutcome::Taken)
+            );
+            args.only_fields(EVENT_VISIBILITY | EVENT_LEASE_ID)?;
+            if !valid || args.visibility != Some(Visibility::Native) {
+                return Err("invalid Codex native event".to_owned());
+            }
+        }
+        (EventKind::Subagent, Some(EventPhase::Start), EventOutcome::Observed) => {
+            args.only_fields(EVENT_AGENT_TYPE | EVENT_SESSION_ID | EVENT_LEASE_ID)?;
+            if args.agent_type.is_none() || args.session_id.is_none() {
+                return Err("subagent start requires agent type and session id".to_owned());
+            }
+        }
+        (
+            EventKind::Subagent,
+            Some(EventPhase::Stop),
+            EventOutcome::Succeeded
+            | EventOutcome::Skipped
+            | EventOutcome::Failed
+            | EventOutcome::Aborted,
+        ) => {
+            args.only_fields(
+                EVENT_AGENT_TYPE
+                    | EVENT_SESSION_ID
+                    | EVENT_LEASE_ID
+                    | if matches!(args.outcome, EventOutcome::Failed | EventOutcome::Aborted) {
+                        EVENT_DETAIL
+                    } else {
+                        0
+                    },
+            )?;
+            if args.agent_type.is_none() || args.session_id.is_none() {
+                return Err("subagent stop requires agent type and session id".to_owned());
+            }
+        }
+        _ => return Err("event, phase, and outcome do not match".to_owned()),
+    }
+    Ok(())
 }
 
 struct ListArgs {
@@ -260,8 +932,8 @@ fn parse_list(mut args: Vec<String>) -> Result<ListArgs, String> {
     let hook = optional_identifier(hook, "hook")?;
     let status = status
         .map(|value| match value.as_str() {
-            "started" | "succeeded" | "failed" => Ok(value),
-            _ => Err("status must be started, succeeded, or failed".to_owned()),
+            "started" | "succeeded" | "failed" | "continued" => Ok(value),
+            _ => Err("status must be started, succeeded, failed, or continued".to_owned()),
         })
         .transpose()?;
     let session_id = optional_session_id(session_id)?;
@@ -350,6 +1022,49 @@ fn optional_identifier(value: Option<String>, name: &str) -> Result<Option<Strin
         .transpose()
 }
 
+fn optional_digest(value: Option<String>, name: &str) -> Result<Option<String>, String> {
+    value
+        .map(|value| {
+            if value.len() == 64
+                && value
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                Ok(value)
+            } else {
+                Err(format!(
+                    "{name} must be 64 lowercase hexadecimal characters"
+                ))
+            }
+        })
+        .transpose()
+}
+
+fn optional_non_negative_i64(value: Option<String>, name: &str) -> Result<Option<i64>, String> {
+    value
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .ok()
+                .filter(|value| *value >= 0)
+                .ok_or_else(|| format!("{name} must be a non-negative integer"))
+        })
+        .transpose()
+}
+
+fn optional_positive_i64(value: Option<String>, name: &str) -> Result<Option<i64>, String> {
+    value
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| format!("{name} must be a positive integer"))
+        })
+        .transpose()
+}
+
 fn valid_identifier(value: Option<String>, name: &str) -> Result<String, String> {
     let value = value.ok_or_else(|| format!("missing --{name}"))?;
     let mut bytes = value.bytes();
@@ -373,6 +1088,20 @@ fn optional_session_id(value: Option<String>) -> Result<Option<String>, String> 
                 || value.chars().any(char::is_control)
             {
                 return Err("session id must be 1..256 characters without controls".to_owned());
+            }
+            Ok(value)
+        })
+        .transpose()
+}
+
+fn optional_event_identity(value: Option<String>, name: &str) -> Result<Option<String>, String> {
+    value
+        .map(|value| {
+            if value.is_empty()
+                || value.chars().count() > 256
+                || value.chars().any(char::is_control)
+            {
+                return Err(format!("{name} must be 1..256 characters without controls"));
             }
             Ok(value)
         })
@@ -428,6 +1157,15 @@ fn begin(args: BeginArgs) -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
     let id = transaction.last_insert_rowid();
+    // Foreign keys are disabled by default per connection, so retention owns child cleanup.
+    transaction
+        .execute(
+            "DELETE FROM hook_event WHERE hook_run_id IN (
+                SELECT id FROM hook_run ORDER BY id DESC LIMIT -1 OFFSET ?1
+            )",
+            params![RETENTION],
+        )
+        .map_err(|error| error.to_string())?;
     transaction
         .execute(
             "DELETE FROM hook_run WHERE id IN (
@@ -455,17 +1193,19 @@ fn finish(args: FinishArgs) -> Result<(), String> {
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
     ensure_write_schema(&transaction)?;
+    let action = args.action.map(FinishAction::as_str);
     let changed = transaction
         .execute(
             "UPDATE hook_run
              SET finished_at_ms = ?1, status = ?2, detail = ?3, action = ?4, reason = ?5,
-                 worker_status = CASE WHEN ?4 = 'spawn_worker' THEN 'requested' ELSE NULL END
+                 worker_status = CASE WHEN ?4 IN ('spawn_worker', 'request_worker') THEN 'requested' ELSE NULL END,
+                 worker_origin = CASE WHEN ?4 = 'spawn_worker' THEN 'direct' ELSE NULL END
              WHERE id = ?6 AND status = 'started'",
             params![
                 Utc::now().timestamp_millis(),
-                args.status,
+                args.status.as_str(),
                 args.detail,
-                args.action,
+                action,
                 args.reason,
                 args.id
             ],
@@ -477,19 +1217,192 @@ fn finish(args: FinishArgs) -> Result<(), String> {
     transaction.commit().map_err(|error| error.to_string())
 }
 
+/// Events use guarded inserts so a valid enum cannot be attached to an incompatible parent.
+fn record_event(args: EventArgs) -> Result<(), String> {
+    let mut connection = writable_store(&args.root)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    ensure_write_schema(&transaction)?;
+    let guard = match (args.event, args.phase, args.agent_type.as_deref()) {
+        (EventKind::IngestVisibility, Some(EventPhase::Launch), _) => {
+            "status = 'succeeded' AND action = 'spawn_worker'"
+        }
+        (EventKind::IngestVisibility, Some(EventPhase::Terminal), _) => {
+            "status = 'succeeded' AND action = 'spawn_worker'
+             AND EXISTS (
+                 SELECT 1 FROM hook_event
+                 WHERE hook_run_id = hook_run.id AND event = 'ingest_visibility'
+                   AND phase = 'launch' AND visibility = ?7 AND launch_mode = ?8
+             )"
+        }
+        (EventKind::VisibilityDelivery, Some(_), _) => {
+            "status = 'succeeded' AND action = 'spawn_worker'
+             AND EXISTS (
+                 SELECT 1 FROM hook_event
+                 WHERE hook_run_id = hook_run.id AND event = 'ingest_visibility'
+                   AND phase = ?4 AND visibility = ?7 AND launch_mode = ?8
+             )"
+        }
+        (EventKind::IngestPreparation, None, _) => {
+            "worker_status = 'running'
+             AND ((status = 'succeeded' AND action = 'spawn_worker' AND worker_origin = 'direct')
+                  OR (harness = 'codex' AND status = 'continued' AND action = 'request_worker'
+                      AND worker_origin IN ('external', 'fallback')))"
+        }
+        (EventKind::IngestFinalization, None, _) => {
+            "worker_status = 'running'
+             AND ((status = 'succeeded' AND action = 'spawn_worker' AND worker_origin = 'direct')
+                  OR (harness = 'codex' AND status = 'continued' AND action = 'request_worker'
+                      AND worker_origin IN ('external', 'fallback')))
+             AND EXISTS (
+                 SELECT 1 FROM hook_event
+                 WHERE hook_run_id = hook_run.id AND event = 'ingest_preparation'
+                   AND outcome = 'admitted' AND lease_id = ?16
+                   AND actionable_digest = ?19 AND actionable_count = ?21
+             )"
+        }
+        (EventKind::ClaudeAgentProfile, None, _) | (EventKind::ClaudeAgentView, None, _) => {
+            "harness = 'claude' AND status = 'succeeded' AND action = 'spawn_worker'"
+        }
+        (EventKind::ClaudeRecursionGuard, None, _) => {
+            "harness = 'claude' AND status = 'succeeded' AND action = 'skip'
+             AND reason = 'disabled'"
+        }
+        (EventKind::CodexNative, Some(EventPhase::Fallback), _) => {
+            "harness = 'codex' AND status = 'continued' AND action = 'request_worker'
+             AND worker_origin IS NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM hook_event
+                 WHERE hook_run_id = hook_run.id AND event = 'subagent' AND phase = 'start'
+                   AND agent_type = 'loam_ingestor'
+             )"
+        }
+        (EventKind::CodexNative, Some(EventPhase::Continuation), _) => {
+            "harness = 'codex' AND status = 'continued' AND action = 'request_worker'"
+        }
+        (EventKind::Subagent, Some(EventPhase::Start), Some("loam_ingestor")) => {
+            "harness = 'codex' AND status = 'continued' AND action = 'request_worker'
+             AND NOT EXISTS (
+                 SELECT 1 FROM hook_event
+                 WHERE hook_run_id = hook_run.id AND event = 'codex_native'
+                   AND phase = 'fallback' AND outcome = 'taken'
+             )"
+        }
+        (EventKind::Subagent, Some(EventPhase::Start), Some("loam:ingestor")) => {
+            "harness = 'claude' AND status = 'succeeded' AND action = 'spawn_worker'"
+        }
+        (EventKind::Subagent, Some(EventPhase::Stop), Some("loam_ingestor")) => {
+            "harness = 'codex' AND status = 'continued' AND action = 'request_worker'
+             AND EXISTS (
+                 SELECT 1 FROM hook_event
+                 WHERE hook_run_id = hook_run.id AND event = 'subagent' AND phase = 'start'
+                   AND agent_type = ?11 AND session_id = ?12
+             )"
+        }
+        (EventKind::Subagent, Some(EventPhase::Stop), Some("loam:ingestor")) => {
+            "harness = 'claude' AND status = 'succeeded' AND action = 'spawn_worker'
+             AND EXISTS (
+                 SELECT 1 FROM hook_event
+                 WHERE hook_run_id = hook_run.id AND event = 'subagent' AND phase = 'start'
+                   AND agent_type = ?11 AND session_id = ?12
+             )"
+        }
+        _ => return Err("hook event has no causal parent rule".to_owned()),
+    };
+    let statement = format!(
+        "INSERT INTO hook_event (
+             hook_run_id, occurred_at_ms, event, phase, outcome, reason, visibility,
+             launch_mode, fallback_launch_mode, require_visible_worker, agent_type,
+             session_id, parent_session_id, manager_name, manager_id, lease_id, detail,
+             actionable_digest, pre_digest, post_digest, actionable_count, failure_count,
+             deadline_ms, backoff_until_ms
+         )
+         SELECT ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                ?18, ?19, ?20, ?21, ?22, ?23, ?24
+         FROM hook_run WHERE id = ?2 AND {guard}"
+    );
+    let phase = args.phase.map(EventPhase::as_str);
+    let visibility = args.visibility.map(Visibility::as_str);
+    let changed = transaction
+        .execute(
+            &statement,
+            params![
+                Utc::now().timestamp_millis(),
+                args.id,
+                args.event.as_str(),
+                phase,
+                args.outcome.as_str(),
+                args.reason,
+                visibility,
+                args.launch_mode,
+                args.fallback_launch_mode,
+                args.require_visible_worker.map(i64::from),
+                args.agent_type,
+                args.session_id,
+                args.parent_session_id,
+                args.manager_name,
+                args.manager_id,
+                args.lease_id,
+                args.detail,
+                args.actionable_digest,
+                args.pre_digest,
+                args.post_digest,
+                args.actionable_count,
+                args.failure_count,
+                args.deadline_ms,
+                args.backoff_until_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed != 1 {
+        return Err("hook event parent is missing or incompatible".to_owned());
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
 fn worker_start(args: WorkerStartArgs) -> Result<(), String> {
     let mut connection = writable_store(&args.root)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
     ensure_write_schema(&transaction)?;
+    let guard = match args.origin {
+        WorkerOrigin::Direct => {
+            "status = 'succeeded' AND action = 'spawn_worker' AND worker_origin = 'direct'"
+        }
+        WorkerOrigin::External => {
+            "status = 'continued' AND action = 'request_worker' AND worker_origin IS NULL
+             AND EXISTS (
+                 SELECT 1 FROM hook_event
+                 WHERE hook_run_id = hook_run.id AND event = 'subagent' AND phase = 'start'
+                   AND agent_type = 'loam_ingestor' AND session_id = ?2
+             )"
+        }
+        WorkerOrigin::Fallback => {
+            "status = 'continued' AND action = 'request_worker' AND worker_origin IS NULL
+             AND EXISTS (
+                 SELECT 1 FROM hook_event
+                 WHERE hook_run_id = hook_run.id AND event = 'codex_native'
+                   AND phase = 'fallback' AND outcome = 'taken'
+             )"
+        }
+    };
+    let statement = format!(
+        "UPDATE hook_run
+         SET worker_status = 'running', worker_origin = ?4,
+             worker_started_at_ms = ?1, worker_session_id = ?2
+         WHERE id = ?3 AND worker_status = 'requested' AND {guard}"
+    );
     let changed = transaction
         .execute(
-            "UPDATE hook_run
-             SET worker_status = 'running', worker_started_at_ms = ?1, worker_session_id = ?2
-             WHERE id = ?3 AND status = 'succeeded' AND action = 'spawn_worker'
-               AND worker_status = 'requested'",
-            params![Utc::now().timestamp_millis(), args.session_id, args.id],
+            &statement,
+            params![
+                Utc::now().timestamp_millis(),
+                args.session_id,
+                args.id,
+                args.origin.as_str()
+            ],
         )
         .map_err(|error| error.to_string())?;
     if changed != 1 {
@@ -504,19 +1417,47 @@ fn worker_finish(args: WorkerFinishArgs) -> Result<(), String> {
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
     ensure_write_schema(&transaction)?;
+    let guard = match args.origin {
+        WorkerOrigin::Direct => {
+            "status = 'succeeded' AND action = 'spawn_worker' AND worker_origin = 'direct'"
+        }
+        WorkerOrigin::External => {
+            "status = 'continued' AND action = 'request_worker'
+             AND (worker_origin IS NULL OR worker_origin = 'external')
+             AND EXISTS (
+                 SELECT 1 FROM hook_event
+                 WHERE hook_run_id = hook_run.id AND event = 'subagent' AND phase = 'start'
+                   AND agent_type = 'loam_ingestor' AND session_id = ?6
+             )"
+        }
+        WorkerOrigin::Fallback => {
+            "status = 'continued' AND action = 'request_worker'
+             AND (worker_origin IS NULL OR worker_origin = 'fallback')
+             AND EXISTS (
+                 SELECT 1 FROM hook_event
+                 WHERE hook_run_id = hook_run.id AND event = 'codex_native'
+                   AND phase = 'fallback' AND outcome = 'taken'
+             )"
+        }
+    };
+    let statement = format!(
+        "UPDATE hook_run
+         SET worker_status = ?1, worker_finished_at_ms = ?2, worker_reason = ?3,
+             worker_detail = ?4, worker_origin = ?7,
+             worker_session_id = COALESCE(worker_session_id, ?6)
+         WHERE id = ?5 AND worker_status IN ('requested', 'running') AND {guard}"
+    );
     let changed = transaction
         .execute(
-            "UPDATE hook_run
-             SET worker_status = ?1, worker_finished_at_ms = ?2,
-                 worker_reason = ?3, worker_detail = ?4
-             WHERE id = ?5 AND status = 'succeeded' AND action = 'spawn_worker'
-               AND worker_status IN ('requested', 'running')",
+            &statement,
             params![
                 args.status,
                 Utc::now().timestamp_millis(),
                 args.reason,
                 args.detail,
-                args.id
+                args.id,
+                args.session_id,
+                args.origin.as_str()
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -550,18 +1491,24 @@ fn list(args: ListArgs) -> Result<(), String> {
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| error.to_string())?;
     let version = schema_version(&connection)?;
-    if version != SCHEMA_VERSION {
+    if !matches!(version, LEGACY_SCHEMA_VERSION | SCHEMA_VERSION) {
         return Err(format!("unsupported database schema version {version}"));
     }
     let query = if !has_result_columns(&connection)? {
         "SELECT id, started_at_ms, finished_at_ms, harness, hook, status, detail,
                 NULL, NULL, session_id, workspace, plugin_version, runtime_version,
-                NULL, NULL, NULL, NULL, NULL, NULL
+                NULL, NULL, NULL, NULL, NULL, NULL, NULL
+         FROM hook_run ORDER BY id DESC LIMIT 10000"
+    } else if version == LEGACY_SCHEMA_VERSION {
+        "SELECT id, started_at_ms, finished_at_ms, harness, hook, status, detail,
+                action, reason, session_id, workspace, plugin_version, runtime_version,
+                worker_status, NULL, worker_started_at_ms, worker_finished_at_ms,
+                worker_reason, worker_detail, worker_session_id
          FROM hook_run ORDER BY id DESC LIMIT 10000"
     } else {
         "SELECT id, started_at_ms, finished_at_ms, harness, hook, status, detail,
                 action, reason, session_id, workspace, plugin_version, runtime_version,
-                worker_status, worker_started_at_ms, worker_finished_at_ms,
+                worker_status, worker_origin, worker_started_at_ms, worker_finished_at_ms,
                 worker_reason, worker_detail, worker_session_id
          FROM hook_run ORDER BY id DESC LIMIT 10000"
     };
@@ -585,11 +1532,12 @@ fn list(args: ListArgs) -> Result<(), String> {
                 plugin_version: row.get(11)?,
                 runtime_version: row.get(12)?,
                 worker_status: row.get(13)?,
-                worker_started_at_ms: row.get(14)?,
-                worker_finished_at_ms: row.get(15)?,
-                worker_reason: row.get(16)?,
-                worker_detail: row.get(17)?,
-                worker_session_id: row.get(18)?,
+                worker_origin: row.get(14)?,
+                worker_started_at_ms: row.get(15)?,
+                worker_finished_at_ms: row.get(16)?,
+                worker_reason: row.get(17)?,
+                worker_detail: row.get(18)?,
+                worker_session_id: row.get(19)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -612,13 +1560,122 @@ fn list(args: ListArgs) -> Result<(), String> {
         {
             continue;
         }
-        println!("{}", run.json()?);
+        let events = if version == SCHEMA_VERSION {
+            events_for(&connection, run.id)?
+        } else {
+            Vec::new()
+        };
+        println!("{}", run.json(&events)?);
         emitted += 1;
         if emitted == args.limit {
             break;
         }
     }
     Ok(())
+}
+
+struct HookEvent {
+    id: i64,
+    occurred_at_ms: i64,
+    event: String,
+    phase: Option<String>,
+    outcome: String,
+    reason: Option<String>,
+    visibility: Option<String>,
+    launch_mode: Option<String>,
+    fallback_launch_mode: Option<String>,
+    require_visible_worker: Option<i64>,
+    agent_type: Option<String>,
+    session_id: Option<String>,
+    parent_session_id: Option<String>,
+    manager_name: Option<String>,
+    manager_id: Option<String>,
+    lease_id: Option<String>,
+    detail: Option<String>,
+    actionable_digest: Option<String>,
+    pre_digest: Option<String>,
+    post_digest: Option<String>,
+    actionable_count: Option<i64>,
+    failure_count: Option<i64>,
+    deadline_ms: Option<i64>,
+    backoff_until_ms: Option<i64>,
+}
+
+impl HookEvent {
+    fn json(&self) -> Result<String, String> {
+        Ok(format!(
+            "{{\"id\":{},\"occurred_at\":\"{}\",\"event\":\"{}\",\"phase\":{},\"outcome\":\"{}\",\"reason\":{},\"visibility\":{},\"launch_mode\":{},\"fallback_launch_mode\":{},\"require_visible_worker\":{},\"agent_type\":{},\"session_id\":{},\"parent_session_id\":{},\"manager_name\":{},\"manager_id\":{},\"lease_id\":{},\"detail\":{},\"actionable_digest\":{},\"pre_digest\":{},\"post_digest\":{},\"actionable_count\":{},\"failure_count\":{},\"deadline_ms\":{},\"backoff_until_ms\":{}}}",
+            self.id,
+            timestamp(self.occurred_at_ms)?,
+            json_escape(&self.event),
+            optional_json_string(self.phase.as_deref()),
+            json_escape(&self.outcome),
+            optional_json_string(self.reason.as_deref()),
+            optional_json_string(self.visibility.as_deref()),
+            optional_json_string(self.launch_mode.as_deref()),
+            optional_json_string(self.fallback_launch_mode.as_deref()),
+            optional_bool(self.require_visible_worker),
+            optional_json_string(self.agent_type.as_deref()),
+            optional_json_string(self.session_id.as_deref()),
+            optional_json_string(self.parent_session_id.as_deref()),
+            optional_json_string(self.manager_name.as_deref()),
+            optional_json_string(self.manager_id.as_deref()),
+            optional_json_string(self.lease_id.as_deref()),
+            optional_json_string(self.detail.as_deref()),
+            optional_json_string(self.actionable_digest.as_deref()),
+            optional_json_string(self.pre_digest.as_deref()),
+            optional_json_string(self.post_digest.as_deref()),
+            optional_i64(self.actionable_count),
+            optional_i64(self.failure_count),
+            optional_i64(self.deadline_ms),
+            optional_i64(self.backoff_until_ms),
+        ))
+    }
+}
+
+fn events_for(connection: &Connection, hook_run_id: i64) -> Result<Vec<HookEvent>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, occurred_at_ms, event, phase, outcome, reason, visibility,
+                    launch_mode, fallback_launch_mode, require_visible_worker, agent_type,
+                    session_id, parent_session_id, manager_name, manager_id, lease_id, detail,
+                    actionable_digest, pre_digest, post_digest, actionable_count, failure_count,
+                    deadline_ms, backoff_until_ms
+             FROM hook_event WHERE hook_run_id = ?1 ORDER BY id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![hook_run_id], |row| {
+            Ok(HookEvent {
+                id: row.get(0)?,
+                occurred_at_ms: row.get(1)?,
+                event: row.get(2)?,
+                phase: row.get(3)?,
+                outcome: row.get(4)?,
+                reason: row.get(5)?,
+                visibility: row.get(6)?,
+                launch_mode: row.get(7)?,
+                fallback_launch_mode: row.get(8)?,
+                require_visible_worker: row.get(9)?,
+                agent_type: row.get(10)?,
+                session_id: row.get(11)?,
+                parent_session_id: row.get(12)?,
+                manager_name: row.get(13)?,
+                manager_id: row.get(14)?,
+                lease_id: row.get(15)?,
+                detail: row.get(16)?,
+                actionable_digest: row.get(17)?,
+                pre_digest: row.get(18)?,
+                post_digest: row.get(19)?,
+                actionable_count: row.get(20)?,
+                failure_count: row.get(21)?,
+                deadline_ms: row.get(22)?,
+                backoff_until_ms: row.get(23)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| row.map_err(|error| error.to_string()))
+        .collect()
 }
 
 struct HookRun {
@@ -636,6 +1693,7 @@ struct HookRun {
     plugin_version: String,
     runtime_version: String,
     worker_status: Option<String>,
+    worker_origin: Option<String>,
     worker_started_at_ms: Option<i64>,
     worker_finished_at_ms: Option<i64>,
     worker_reason: Option<String>,
@@ -644,9 +1702,14 @@ struct HookRun {
 }
 
 impl HookRun {
-    fn json(&self) -> Result<String, String> {
+    fn json(&self, events: &[HookEvent]) -> Result<String, String> {
+        let events = events
+            .iter()
+            .map(HookEvent::json)
+            .collect::<Result<Vec<_>, _>>()?
+            .join(",");
         Ok(format!(
-            "{{\"schema\":1,\"id\":{},\"started_at\":\"{}\",\"finished_at\":{},\"duration_ms\":{},\"harness\":\"{}\",\"hook\":\"{}\",\"status\":\"{}\",\"detail\":{},\"action\":{},\"reason\":{},\"session_id\":{},\"workspace\":\"{}\",\"plugin_version\":\"{}\",\"runtime_version\":\"{}\",\"worker_status\":{},\"worker_started_at\":{},\"worker_finished_at\":{},\"worker_duration_ms\":{},\"worker_reason\":{},\"worker_detail\":{},\"worker_session_id\":{}}}",
+            "{{\"schema\":2,\"id\":{},\"started_at\":\"{}\",\"finished_at\":{},\"duration_ms\":{},\"harness\":\"{}\",\"hook\":\"{}\",\"status\":\"{}\",\"detail\":{},\"action\":{},\"reason\":{},\"session_id\":{},\"workspace\":\"{}\",\"plugin_version\":\"{}\",\"runtime_version\":\"{}\",\"worker_status\":{},\"worker_origin\":{},\"worker_started_at\":{},\"worker_finished_at\":{},\"worker_duration_ms\":{},\"worker_reason\":{},\"worker_detail\":{},\"worker_session_id\":{},\"events\":[{}]}}",
             self.id,
             timestamp(self.started_at_ms)?,
             optional_timestamp(self.finished_at_ms)?,
@@ -662,6 +1725,7 @@ impl HookRun {
             json_escape(&self.plugin_version),
             json_escape(&self.runtime_version),
             optional_json_string(self.worker_status.as_deref()),
+            optional_json_string(self.worker_origin.as_deref()),
             optional_timestamp(self.worker_started_at_ms)?,
             optional_timestamp(self.worker_finished_at_ms)?,
             optional_i64(
@@ -672,6 +1736,7 @@ impl HookRun {
             optional_json_string(self.worker_reason.as_deref()),
             optional_json_string(self.worker_detail.as_deref()),
             optional_json_string(self.worker_session_id.as_deref()),
+            events,
         ))
     }
 }
@@ -701,6 +1766,14 @@ fn optional_i64(value: Option<i64>) -> String {
         .unwrap_or_else(|| "null".to_owned())
 }
 
+fn optional_bool(value: Option<i64>) -> &'static str {
+    match value {
+        Some(0) => "false",
+        Some(_) => "true",
+        None => "null",
+    }
+}
+
 fn schema_version(connection: &Connection) -> Result<i64, String> {
     connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -721,47 +1794,161 @@ fn has_result_columns(connection: &Connection) -> Result<bool, String> {
         .map_err(|error| error.to_string())
 }
 
+fn has_worker_origin(connection: &Connection) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('hook_run') WHERE name = 'worker_origin'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count == 1)
+        .map_err(|error| error.to_string())
+}
+
+fn has_event_table(connection: &Connection) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'hook_event'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count == 1)
+        .map_err(|error| error.to_string())
+}
+
+const CREATE_V2_TABLES: &str = "
+    CREATE TABLE hook_run (
+        id INTEGER PRIMARY KEY,
+        started_at_ms INTEGER NOT NULL,
+        finished_at_ms INTEGER,
+        harness TEXT NOT NULL,
+        hook TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('started', 'succeeded', 'failed', 'continued')),
+        detail TEXT,
+        action TEXT CHECK (action IS NULL OR action IN ('spawn_worker', 'skip', 'request_worker')),
+        reason TEXT,
+        session_id TEXT,
+        workspace TEXT NOT NULL,
+        plugin_version TEXT NOT NULL,
+        runtime_version TEXT NOT NULL,
+        worker_status TEXT CHECK (worker_status IS NULL OR worker_status IN ('requested', 'running', 'succeeded', 'skipped', 'failed')),
+        worker_origin TEXT CHECK (worker_origin IS NULL OR worker_origin IN ('direct', 'external', 'fallback')),
+        worker_started_at_ms INTEGER,
+        worker_finished_at_ms INTEGER,
+        worker_reason TEXT,
+        worker_detail TEXT,
+        worker_session_id TEXT
+    );
+    CREATE TABLE hook_event (
+        id INTEGER PRIMARY KEY,
+        hook_run_id INTEGER NOT NULL,
+        occurred_at_ms INTEGER NOT NULL,
+        event TEXT NOT NULL CHECK (event IN (
+            'ingest_visibility', 'visibility_delivery', 'ingest_preparation',
+            'ingest_finalization', 'claude_agent_profile', 'claude_recursion_guard',
+            'claude_agent_view', 'codex_native', 'subagent'
+        )),
+        phase TEXT CHECK (phase IS NULL OR phase IN (
+            'launch', 'terminal', 'continuation', 'fallback', 'start', 'stop'
+        )),
+        outcome TEXT NOT NULL CHECK (outcome IN (
+            'started', 'admitted', 'ok', 'partial', 'failed', 'emitted', 'aborted', 'selected',
+            'refused', 'fallback', 'returned', 'taken', 'skipped', 'succeeded', 'observed'
+        )),
+        reason TEXT,
+        visibility TEXT CHECK (visibility IS NULL OR visibility IN ('silent', 'toast', 'native')),
+        launch_mode TEXT,
+        fallback_launch_mode TEXT,
+        require_visible_worker INTEGER CHECK (
+            require_visible_worker IS NULL OR require_visible_worker IN (0, 1)
+        ),
+        agent_type TEXT CHECK (
+            agent_type IS NULL OR agent_type IN ('loam_ingestor', 'loam:ingestor')
+        ),
+        session_id TEXT,
+        parent_session_id TEXT,
+        manager_name TEXT,
+        manager_id TEXT,
+        lease_id TEXT,
+        detail TEXT CHECK (detail IS NULL OR length(detail) BETWEEN 1 AND 1024),
+        actionable_digest TEXT CHECK (
+            actionable_digest IS NULL OR
+            (length(actionable_digest) = 64 AND actionable_digest NOT GLOB '*[^0-9a-f]*')
+        ),
+        pre_digest TEXT CHECK (
+            pre_digest IS NULL OR
+            (length(pre_digest) = 64 AND pre_digest NOT GLOB '*[^0-9a-f]*')
+        ),
+        post_digest TEXT CHECK (
+            post_digest IS NULL OR
+            (length(post_digest) = 64 AND post_digest NOT GLOB '*[^0-9a-f]*')
+        ),
+        actionable_count INTEGER CHECK (actionable_count IS NULL OR actionable_count >= 0),
+        failure_count INTEGER CHECK (failure_count IS NULL OR failure_count >= 0),
+        deadline_ms INTEGER CHECK (deadline_ms IS NULL OR deadline_ms > 0),
+        backoff_until_ms INTEGER CHECK (backoff_until_ms IS NULL OR backoff_until_ms > 0)
+    );
+    CREATE INDEX hook_event_run ON hook_event (hook_run_id, id);
+    CREATE UNIQUE INDEX hook_event_once
+        ON hook_event (hook_run_id, event, IFNULL(phase, ''))
+        WHERE event != 'subagent';
+    CREATE UNIQUE INDEX hook_subagent_event_once
+        ON hook_event (hook_run_id, event, phase, session_id)
+        WHERE event = 'subagent';";
+
+fn complete_sparse_v1(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "ALTER TABLE hook_run ADD COLUMN action TEXT;
+             ALTER TABLE hook_run ADD COLUMN reason TEXT;
+             ALTER TABLE hook_run ADD COLUMN worker_status TEXT CHECK (worker_status IN ('requested', 'running', 'succeeded', 'skipped', 'failed'));
+             ALTER TABLE hook_run ADD COLUMN worker_started_at_ms INTEGER;
+             ALTER TABLE hook_run ADD COLUMN worker_finished_at_ms INTEGER;
+             ALTER TABLE hook_run ADD COLUMN worker_reason TEXT;
+             ALTER TABLE hook_run ADD COLUMN worker_detail TEXT;
+             ALTER TABLE hook_run ADD COLUMN worker_session_id TEXT;",
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// SQLite cannot widen a CHECK in place, so v1 is rebuilt under the caller's immediate lock.
+fn migrate_v1(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(&format!(
+            "ALTER TABLE hook_run RENAME TO hook_run_v1;
+             {CREATE_V2_TABLES}
+             INSERT INTO hook_run (
+                 id, started_at_ms, finished_at_ms, harness, hook, status, detail,
+                 action, reason, session_id, workspace, plugin_version, runtime_version,
+                 worker_status, worker_origin, worker_started_at_ms, worker_finished_at_ms,
+                 worker_reason, worker_detail, worker_session_id
+             )
+             SELECT id, started_at_ms, finished_at_ms, harness, hook, status, detail,
+                    action, reason, session_id, workspace, plugin_version, runtime_version,
+                    worker_status,
+                    CASE WHEN action = 'spawn_worker' THEN 'direct' ELSE NULL END,
+                    worker_started_at_ms, worker_finished_at_ms, worker_reason,
+                    worker_detail, worker_session_id
+             FROM hook_run_v1;
+             DROP TABLE hook_run_v1;
+             PRAGMA user_version = 2;"
+        ))
+        .map_err(|error| error.to_string())
+}
+
 fn ensure_write_schema(connection: &Connection) -> Result<(), String> {
     match schema_version(connection)? {
         0 => connection
-            .execute_batch(
-                "CREATE TABLE hook_run (
-                    id INTEGER PRIMARY KEY,
-                    started_at_ms INTEGER NOT NULL,
-                    finished_at_ms INTEGER,
-                    harness TEXT NOT NULL,
-                    hook TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (status IN ('started', 'succeeded', 'failed')),
-                    detail TEXT,
-                    action TEXT,
-                    reason TEXT,
-                    session_id TEXT,
-                    workspace TEXT NOT NULL,
-                    plugin_version TEXT NOT NULL,
-                    runtime_version TEXT NOT NULL,
-                    worker_status TEXT CHECK (worker_status IN ('requested', 'running', 'succeeded', 'skipped', 'failed')),
-                    worker_started_at_ms INTEGER,
-                    worker_finished_at_ms INTEGER,
-                    worker_reason TEXT,
-                    worker_detail TEXT,
-                    worker_session_id TEXT
-                );
-                PRAGMA user_version = 1;",
-            )
+            .execute_batch(&format!("{CREATE_V2_TABLES} PRAGMA user_version = 2;"))
             .map_err(|error| error.to_string()),
-        SCHEMA_VERSION if !has_result_columns(connection)? => connection
-            .execute_batch(
-                "ALTER TABLE hook_run ADD COLUMN action TEXT;
-                 ALTER TABLE hook_run ADD COLUMN reason TEXT;
-                 ALTER TABLE hook_run ADD COLUMN worker_status TEXT CHECK (worker_status IN ('requested', 'running', 'succeeded', 'skipped', 'failed'));
-                 ALTER TABLE hook_run ADD COLUMN worker_started_at_ms INTEGER;
-                 ALTER TABLE hook_run ADD COLUMN worker_finished_at_ms INTEGER;
-                 ALTER TABLE hook_run ADD COLUMN worker_reason TEXT;
-                 ALTER TABLE hook_run ADD COLUMN worker_detail TEXT;
-                 ALTER TABLE hook_run ADD COLUMN worker_session_id TEXT;",
-            )
-            .map_err(|error| error.to_string()),
-        SCHEMA_VERSION => Ok(()),
+        LEGACY_SCHEMA_VERSION => {
+            if !has_result_columns(connection)? {
+                complete_sparse_v1(connection)?;
+            }
+            migrate_v1(connection)
+        }
+        SCHEMA_VERSION if has_worker_origin(connection)? && has_event_table(connection)? => Ok(()),
+        SCHEMA_VERSION => Err("incomplete database schema version 2".to_owned()),
         version => Err(format!("unsupported database schema version {version}")),
     }
 }
@@ -796,5 +1983,5 @@ fn private_permissions(_path: &Path, _mode: u32) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: loam hooks begin <global-root> --harness <id> --hook <id> --workspace <absolute-path> --plugin-version <semver> [--session-id <id>]\n       loam hooks finish <global-root> --id <positive-integer> --status <succeeded|failed> [--action <spawn_worker|skip>] [--reason <id>] [--detail <diagnostic>]\n       loam hooks worker-start <global-root> --id <positive-integer> [--session-id <id>]\n       loam hooks worker-finish <global-root> --id <positive-integer> --status <succeeded|skipped|failed> --reason <id> [--detail <diagnostic>]\n       loam hooks list [<global-root>] [--harness <id>] [--hook <id>] [--status <started|succeeded|failed>] [--session-id <id>] [--limit <1..1000>]".to_owned()
+    "usage: loam hooks begin <global-root> --harness <id> --hook <id> --workspace <absolute-path> --plugin-version <semver> [--session-id <id>]\n       loam hooks finish <global-root> --id <positive-integer> --status <succeeded|failed|continued> [--action <spawn_worker|skip|request_worker>] [--reason <id>] [--detail <diagnostic>]\n       loam hooks event <global-root> --id <positive-integer> --event <type> [--phase <phase>] --outcome <outcome> [typed event fields]\n       loam hooks worker-start <global-root> --id <positive-integer> [--origin <external|fallback>] [--session-id <id>]\n       loam hooks worker-finish <global-root> --id <positive-integer> --status <succeeded|skipped|failed> --reason <id> [--origin <external|fallback>] [--session-id <id>] [--detail <diagnostic>]\n       loam hooks list [<global-root>] [--harness <id>] [--hook <id>] [--status <started|succeeded|failed|continued>] [--session-id <id>] [--limit <1..1000>]".to_owned()
 }
