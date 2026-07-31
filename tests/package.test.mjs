@@ -140,7 +140,7 @@ process.exit(1);
   }
 });
 
-test('packed Claude and Codex marketplaces expose the loam:ingestor component inventory', async () => {
+test('packed Claude and Codex marketplaces expose the loam:ingestor component inventory and Codex agent profile', async () => {
   const fixture = await packedRoot();
   try {
     const claudeMarketplace = JSON.parse(await readFile(join(fixture.root, '.claude-plugin', 'marketplace.json'), 'utf8'));
@@ -159,6 +159,11 @@ test('packed Claude and Codex marketplaces expose the loam:ingestor component in
     assert.match(agent, /^tools: .*\bSkill\b.*$/mu);
     assert.doesNotMatch(agent.match(/^tools: (.*)$/mu)?.[1] || '', /(?:^|,\s*)Agent(?:,|$)/u);
     assert.match(agent, /Never spawn or delegate to another agent or subagent/u);
+    const codexAgent = await readFile(join(fixture.root, 'adapters', 'loam_ingestor.toml'), 'utf8');
+    assert.match(codexAgent, /^name = "loam_ingestor"$/mu);
+    assert.match(codexAgent, /^description = "[^"\r\n]+"$/mu);
+    assert.match(codexAgent, /^developer_instructions = """$/mu);
+    assert.doesNotMatch(codexAgent, /^(?:model|model_reasoning_effort|sandbox_mode)\s*=/mu);
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'session-start.mjs'), 'utf8'));
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'stop.mjs'), 'utf8'));
   } finally {

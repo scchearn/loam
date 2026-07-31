@@ -9,6 +9,8 @@ import { mergeJsonConfig } from './config.mjs';
 
 const adapterRoot = fileURLToPath(new URL('../adapters', import.meta.url));
 const marketplaceAdapterPath = fileURLToPath(new URL('../plugins/loam-adapter/adapter.mjs', import.meta.url));
+const codexAgentSourcePath = join(adapterRoot, 'loam_ingestor.toml');
+const codexAgentMarker = '# Managed by @scchearn/loam setup.';
 
 async function exists(path) {
   try {
@@ -261,6 +263,29 @@ async function installCodex({ home, globalRoot, sessionAssetPath, stopAssetPath,
   });
 }
 
+function codexAgentPaths(home) {
+  const profilePath = join(home, '.codex', 'agents', 'loam_ingestor.toml');
+  return { profilePath, backupPath: `${profilePath}.loam-backup` };
+}
+
+async function installCodexAgent({ home }) {
+  const { profilePath, backupPath } = codexAgentPaths(home);
+  const source = await readFile(codexAgentSourcePath, 'utf8');
+  let existing;
+  let backup;
+  try { existing = await readFile(profilePath, 'utf8'); }
+  catch (error) { if (error?.code !== 'ENOENT') throw error; }
+  try { backup = await readFile(backupPath, 'utf8'); }
+  catch (error) { if (error?.code !== 'ENOENT') throw error; }
+
+  if (existing !== undefined && existing !== source && !existing.startsWith(codexAgentMarker)) {
+    if (backup !== undefined) throw new Error(`Codex agent profile collision with existing backup: ${profilePath}`);
+    await writeAtomicFile(backupPath, existing);
+  }
+  await writeAtomicFile(profilePath, source);
+  return { profilePath, profileBackupPath: backupPath };
+}
+
 async function installCursor({ home, globalRoot, assetPath }) {
   const filePath = join(home, '.cursor', 'hooks.json');
   return mergeJsonConfig({
@@ -285,9 +310,13 @@ export async function installHarnesses({
   detected ||= await detectHarnesses({ home, pluginVersion });
   const affectedFiles = Object.entries(detected)
     .filter(([, harness]) => harness.state !== 'absent')
-    .flatMap(([id]) => id === 'opencode'
-      ? ['loam.js', 'loam.mjs'].map((name) => join(home, '.config', 'opencode', 'plugins', name))
-      : [join(home, id === 'claude' ? '.claude' : id === 'codex' ? '.codex' : '.cursor', id === 'claude' ? 'settings.json' : 'hooks.json')]);
+    .flatMap(([id]) => {
+      if (id === 'opencode') return ['loam.js', 'loam.mjs'].map((name) => join(home, '.config', 'opencode', 'plugins', name));
+      const configPath = join(home, id === 'claude' ? '.claude' : id === 'codex' ? '.codex' : '.cursor', id === 'claude' ? 'settings.json' : 'hooks.json');
+      if (id !== 'codex') return [configPath];
+      const { profilePath, backupPath } = codexAgentPaths(home);
+      return [configPath, profilePath, backupPath];
+    });
   const snapshots = await Promise.all(affectedFiles.map(snapshotFile));
   const directories = await Promise.all([...new Set(affectedFiles.map(dirname))].map(snapshotDirectory));
   let assets;
@@ -346,6 +375,7 @@ export async function installHarnesses({
           stopAssetPath: assets.assets['codex-stop'],
           marketplaceOwned: harness.marketplaceOwned,
         });
+        const profile = await installCodexAgent({ home });
         if (config.backupPath) backupPaths.push(config.backupPath);
         result[id] = {
           ...harness,
@@ -355,6 +385,7 @@ export async function installHarnesses({
           sessionPath: assets.assets['codex-session-start'],
           stopPath: assets.assets['codex-stop'],
           backupPath: config.backupPath,
+          ...profile,
         };
       } else {
         const config = await installCursor({ home, globalRoot, assetPath: assets.assets['cursor-session-start'] });

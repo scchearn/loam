@@ -13,6 +13,8 @@ import { runSkills } from './process.mjs';
 import { announce, confirmUninstall, finish } from './wizard.mjs';
 import { removeMarketplacePlugins } from './marketplace.mjs';
 
+const codexAgentMarker = '# Managed by @scchearn/loam setup.';
+
 // Harness configs are cleaned in-place (remove only Loam-owned hook entries,
 // preserve unrelated config) rather than blind-restoring backups, because a
 // later setup rerun may have superseded the backup. If no Loam entries remain
@@ -132,6 +134,42 @@ async function removeBackups(dir) {
   return removed;
 }
 
+async function inspectCodexAgentProfile(home) {
+  const path = join(home, '.codex', 'agents', 'loam_ingestor.toml');
+  const backupPath = `${path}.loam-backup`;
+  let contents;
+  let backup;
+  try { contents = await readFile(path, 'utf8'); }
+  catch (error) { if (error?.code !== 'ENOENT') throw error; }
+  try { backup = await readFile(backupPath, 'utf8'); }
+  catch (error) { if (error?.code !== 'ENOENT') throw error; }
+  return {
+    path,
+    backupPath,
+    contents,
+    backup,
+    owned: contents?.startsWith(codexAgentMarker) === true,
+  };
+}
+
+async function removeCodexAgentProfile(profile) {
+  if (profile.owned) {
+    if (profile.backup !== undefined) {
+      await writeAtomicFile(profile.path, profile.backup);
+      await rm(profile.backupPath, { force: true });
+      return { path: profile.path, action: 'restored' };
+    }
+    await rm(profile.path, { force: true });
+    return { path: profile.path, action: 'removed' };
+  }
+  if (profile.contents === undefined && profile.backup !== undefined) {
+    await writeAtomicFile(profile.path, profile.backup);
+    await rm(profile.backupPath, { force: true });
+    return { path: profile.path, action: 'restored' };
+  }
+  return { path: profile.path, action: profile.contents === undefined ? 'absent' : 'preserved' };
+}
+
 async function blockingWorkers(root) {
   const blocked = [];
   const runRoot = join(root, 'run');
@@ -241,9 +279,11 @@ export async function uninstall({
     return 1;
   }
   const detectedHarnesses = await detectHarnesses({ home });
+  const codexAgentProfile = await inspectCodexAgentProfile(home);
   const hasMarketplacePlugin = ['claude', 'codex'].some((id) =>
     detectedHarnesses[id]?.marketplaceInstalled || detectedHarnesses[id]?.marketplaceConfigured);
-  if (!install && !listedSkills.names.length && !hasMarketplacePlugin) {
+  if (!install && !listedSkills.names.length && !hasMarketplacePlugin
+    && !codexAgentProfile.owned && codexAgentProfile.backup === undefined) {
     output.write('No Loam installation found at %s. Nothing to uninstall.\n'.replace('%s', root));
     return 0;
   }
@@ -251,6 +291,7 @@ export async function uninstall({
   await announce(output, 'Loam uninstall will:', [
     `- Remove ${listedSkills.names.length || 'any remaining'} globally installed Loam skills via the Skills CLI`,
     '- Remove Loam-owned hook entries from the Claude, Codex, and Cursor configs',
+    '- Remove the Loam-owned Codex ingestion profile, restoring any pre-existing profile preserved by setup',
     '- Remove the Loam plugin file from OpenCode, which integrates by plugin rather than hooks',
     '- Remove installed Claude and Codex marketplace plugins through their native CLIs',
     '- Remove the global Loam root (install.json, runtime, integration, plugins, local operational history)',
@@ -268,7 +309,7 @@ export async function uninstall({
     return 1;
   }
 
-  const results = { configs: [], opencode: null, globalRoot: null, backups: [], skills: null, marketplace: null };
+  const results = { configs: [], codexAgentProfile: null, opencode: null, globalRoot: null, backups: [], skills: null, marketplace: null };
 
   results.marketplace = await removeMarketplacePlugins({
     harnesses: detectedHarnesses,
@@ -290,6 +331,8 @@ export async function uninstall({
     output.write(`Skills removal failed: ${results.skills.detail || results.skills.category}\n`);
     return 1;
   }
+
+  results.codexAgentProfile = await removeCodexAgentProfile(codexAgentProfile);
 
   // Clean harness configs in-place
   if (install?.configured_harnesses?.includes('claude')) {
