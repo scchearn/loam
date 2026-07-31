@@ -506,64 +506,65 @@ async function recordProgress(root, pre, post, count, lease) {
   }
 }
 
-export async function runWorker({
+export async function prepareWorkerRun({
   harness, workspace, globalRoot, skillsRoot, env = process.env, platform = process.platform,
-  runtimeRunner, readiness, modelRunner, openCodeSession, notify,
+  runtimeRunner, readiness, openCodeSession, notify,
 } = {}) {
   const canonical = await canonicalWorkspace(workspace);
   const root = runRoot(globalRoot, canonical);
   const config = await readIngestConfig(globalRoot, env);
   await ensureRoot(root);
   const leaseResult = await acquireLease(root, canonical, harness, config, openCodeSession, env);
-  if (['held', 'orphan_live', 'orphan_unknown'].includes(leaseResult.status)) return { reason: 'busy' };
-  if (leaseResult.status !== 'acquired') return { reason: 'unavailable' };
+  if (['held', 'orphan_live', 'orphan_unknown'].includes(leaseResult.status)) return { action: 'skip', result: { reason: 'busy' } };
+  if (leaseResult.status !== 'acquired') return { action: 'skip', result: { reason: 'unavailable' } };
   const lease = leaseResult.lease;
+  let leaseHandled = false;
   const skip = async (reason, fields = {}) => {
     await writeSkip(root, reason, {
       ...(lease.downgrade_reason ? { downgrade_reason: lease.downgrade_reason } : {}),
       ...fields,
     }, lease.lease_id);
-    return { reason: publicReason(reason) };
+    await releaseLease(root, lease.lease_id);
+    leaseHandled = true;
+    return { action: 'skip', result: { reason: publicReason(reason) } };
   };
-  let retainLease = false;
-  let launchNotification = Promise.resolve();
   try {
-    if (!config.enabled) return skip('disabled');
+    if (!config.enabled) return await skip('disabled');
     const localOutcome = await json(join(root, 'last-run.json'));
-    if (localOutcome && localOutcome.schema !== 1) return skip('schema_unknown');
+    if (localOutcome && localOutcome.schema !== 1) return await skip('schema_unknown');
     if (Number(localOutcome?.backoff_until || 0) > Date.now()) {
-      return skip('backoff');
+      return await skip('backoff');
     }
     if (Number(localOutcome?.completed_at || 0) + config.min_interval_seconds * 1000 > Date.now()
       && localOutcome?.status === 'ok') {
-      return skip('debounced');
+      return await skip('debounced');
     }
     const ready = readiness || await checkReadiness({ globalRoot, skillsRoot, env, platform });
-    if (!ready.ready) return skip(ready.category || 'runtime_unavailable');
+    if (!ready.ready) return await skip(ready.category || 'runtime_unavailable');
     const stateResult = await probeFullState({ readiness: ready, workspace: canonical, timeoutMs: 20000, runner: runtimeRunner });
     if (!stateResult.ready) {
       const reason = stateResult.category === 'timeout' ? 'probe_timeout' : stateResult.category === 'malformed_state' ? 'malformed_state' : stateResult.category === 'runtime_failed' ? 'probe_failed' : 'runtime_unavailable';
-      return skip(reason);
+      return await skip(reason);
     }
     const state = stateResult.state;
-    if (!validState(state)) return skip('schema_unknown');
-    if (!state.wiki_root) return skip('wiki_missing');
-    if (!(await hasExistingWiki(state.wiki_root))) return skip('wiki_missing');
-    if (!(await hasExistingCodegraph(state.wiki_root))) return skip('codegraph_missing');
+    if (!validState(state)) return await skip('schema_unknown');
+    if (!state.wiki_root) return await skip('wiki_missing');
+    if (!(await hasExistingWiki(state.wiki_root))) return await skip('wiki_missing');
+    if (!(await hasExistingCodegraph(state.wiki_root))) return await skip('codegraph_missing');
     const pending = pendingHint(state);
-    if (!pending || pendingCount(pending) === 0) return skip('no_pending');
+    if (!pending || pendingCount(pending) === 0) return await skip('no_pending');
     let exclusionsPath;
     try { exclusionsPath = await resolveExclusions(skillsRoot || env.LOAM_INGEST_SKILLS_ROOT); }
-    catch { return skip('exclusions_unavailable'); }
+    catch { return await skip('exclusions_unavailable'); }
     const diffResult = await diff({ readiness: ready, workspace: canonical, wikiRoot: state.wiki_root, exclusionsPath, runner: runtimeRunner });
-    if (diffResult.error) return skip(diffResult.error);
+    if (diffResult.error) return await skip(diffResult.error);
     let fingerprint;
     try { fingerprint = await fingerprintActionable({ workspace: canonical, entries: diffResult.entries, exclusionsPath, deadlineMs: 20000 }); }
-    catch (error) { return skip(error.reason || 'fingerprint_unavailable'); }
-    if (fingerprint.count === 0) return skip('no_actionable_work', { actionable_count: 0, actionable_fingerprint: fingerprint.fingerprint });
-    if (!fingerprint.complete) return skip('fingerprint_unavailable', { actionable_count: fingerprint.count, actionable_fingerprint: fingerprint.fingerprint });
+    catch (error) { return await skip(error.reason || 'fingerprint_unavailable'); }
+    if (fingerprint.count === 0) return await skip('no_actionable_work', { actionable_count: 0, actionable_fingerprint: fingerprint.fingerprint });
+    if (!fingerprint.complete) return await skip('fingerprint_unavailable', { actionable_count: fingerprint.count, actionable_fingerprint: fingerprint.fingerprint });
     const previousRecord = await json(join(root, 'last-run.json'));
-    if (previousRecord && previousRecord.schema !== 1) return skip('schema_unknown');
+    if (previousRecord && previousRecord.schema !== 1) return await skip('schema_unknown');
     const selectedLaunch = await launchPlan({ harness, workspace: canonical, env });
     const selectedLaunchMode = selectedLaunch.mode;
     const plannedIdentity = selectedLaunchMode === 'claude_bg'
@@ -584,53 +585,69 @@ export async function runWorker({
           };
     if (!(await updateLease(root, lease, {
       actionable_fingerprint: fingerprint.fingerprint,
+      actionable_count: fingerprint.count,
       launch_mode: selectedLaunchMode,
       launch_state: 'planned',
       planned_identity: plannedIdentity,
       child_identity: null,
       downgrade_reason: selectedLaunch.downgradeReason || null,
       hard_deadline: new Date(Date.now() + config.timeout_seconds * 1000).toISOString(),
-    }))) return skip('orphan_unknown');
-    if (selectedLaunch.downgradeReason && config.require_visible_worker) return skip(selectedLaunch.downgradeReason);
-    let launch;
-    try {
-      launch = modelRunner
-        ? await modelRunner({ harness, workspace: canonical, lease, root })
-        : await launchModel({
-            launchMode: lease.launch_mode, workspace: canonical,
-            env: { ...env, LOAM_INGEST_GLOBAL_ROOT: globalRoot },
-            timeoutMs: config.timeout_seconds * 1000, lease, openCodeSession, root,
-            requireVisibleWorker: config.require_visible_worker,
-          });
-    } catch (error) {
-      if (lease.child_identity) retainLease = true;
-      return skip('runtime_unavailable', { detail: error instanceof Error ? error.message.slice(0, 256) : String(error).slice(0, 256) });
-    }
-    if (launch.category) {
-      if (['orphan_live', 'orphan_unknown'].includes(launch.category)) retainLease = true;
-      return skip(launch.category);
-    }
-    launchNotification = sendNotification(notify, config.visibility, {
-      phase: 'launch', harness, workspace: canonical, launchMode: lease.launch_mode,
-      identity: lease.child_identity || lease.planned_identity,
-    });
-    const result = await (launch.completion || Promise.resolve({ code: 0 }));
+    }))) return await skip('orphan_unknown');
+    if (selectedLaunch.downgradeReason && config.require_visible_worker) return await skip(selectedLaunch.downgradeReason);
+    leaseHandled = true;
+    return {
+      action: 'run', harness, workspace: canonical, globalRoot, skillsRoot, env, platform,
+      runtimeRunner, openCodeSession, notify, root, config, lease, readiness: ready,
+      exclusionsPath, fingerprint,
+      intent: {
+        schema: 1, lease_id: lease.lease_id, workspace: canonical, harness,
+        actionable_fingerprint: fingerprint.fingerprint, actionable_count: fingerprint.count,
+        launch_mode: lease.launch_mode, hard_deadline: lease.hard_deadline,
+      },
+    };
+  } finally {
+    if (!leaseHandled) await releaseLease(root, lease.lease_id);
+  }
+}
+
+export async function finalizeWorkerRun(prepared, {
+  launch,
+  result,
+  launchNotification = Promise.resolve(),
+  skipReason,
+  skipFields = {},
+  retainLease = false,
+} = {}) {
+  if (prepared?.action !== 'run' || !prepared.lease?.lease_id) throw new Error('prepared worker run is required');
+  const {
+    harness, workspace, env, platform, runtimeRunner, openCodeSession, notify,
+    root, config, lease, readiness, exclusionsPath, fingerprint,
+  } = prepared;
+  const skip = async (reason, fields = {}) => {
+    await writeSkip(root, reason, {
+      ...(lease.downgrade_reason ? { downgrade_reason: lease.downgrade_reason } : {}),
+      ...fields,
+    }, lease.lease_id);
+    return { reason: publicReason(reason) };
+  };
+  try {
+    if (skipReason) return await skip(skipReason, skipFields);
     if (!launch.background && result.category === 'timeout' && lease.child_identity) {
       const childState = await classifyChild(lease.child_identity, { platform });
       if (childState === 'live' || childState === 'unknown') {
         retainLease = true;
         const reason = childState === 'live' ? 'orphan_live' : 'orphan_unknown';
-        return skip(reason);
+        return await skip(reason);
       }
     }
     if (launch.background) {
       let manager = lease.launch_mode === 'claude_bg'
-        ? await waitForClaude(canonical, lease, Date.parse(lease.hard_deadline), env)
+        ? await waitForClaude(workspace, lease, Date.parse(lease.hard_deadline), env)
         : await waitForOpenCode(openCodeSession, launch.sessionId, Date.parse(lease.hard_deadline));
       if (manager.state === 'live') {
         if (lease.launch_mode === 'claude_bg') {
-          await stopClaude(canonical, lease, env);
-          manager = await waitForClaude(canonical, lease, Date.now() + 5000, env);
+          await stopClaude(workspace, lease, env);
+          manager = await waitForClaude(workspace, lease, Date.now() + 5000, env);
         } else if (typeof openCodeSession?.abort === 'function') {
           try { await openCodeSession.abort(launch.sessionId); } catch {}
           manager = await waitForOpenCode(openCodeSession, launch.sessionId, Date.now() + 5000);
@@ -639,29 +656,63 @@ export async function runWorker({
       if (manager.state === 'live' || manager.state === 'unknown') {
         retainLease = true;
         const reason = manager.state === 'live' ? 'orphan_live' : 'orphan_unknown';
-        return skip(reason);
+        return await skip(reason);
       }
     }
-    const postState = await probeFullState({ readiness: ready, workspace: canonical, timeoutMs: 20000, runner: runtimeRunner });
+    const postState = await probeFullState({ readiness, workspace, timeoutMs: 20000, runner: runtimeRunner });
     let post = { fingerprint: '', complete: false, count: 0 };
     try {
       if (postState.ready && postState.state?.wiki_root && await hasExistingWiki(postState.state.wiki_root)
         && await hasExistingCodegraph(postState.state.wiki_root)) {
-        const postDiff = await diff({ readiness: ready, workspace: canonical, wikiRoot: postState.state.wiki_root, exclusionsPath, runner: runtimeRunner });
-        if (!postDiff.error) post = await fingerprintActionable({ workspace: canonical, entries: postDiff.entries, exclusionsPath, deadlineMs: 20000 });
+        const postDiff = await diff({ readiness, workspace, wikiRoot: postState.state.wiki_root, exclusionsPath, runner: runtimeRunner });
+        if (!postDiff.error) post = await fingerprintActionable({ workspace, entries: postDiff.entries, exclusionsPath, deadlineMs: 20000 });
       }
     } catch {}
     if (result.category || (typeof result.code === 'number' && result.code !== 0)) post.complete = false;
     const recorded = await recordProgress(root, fingerprint, post, fingerprint.count, lease);
     await launchNotification;
     await sendNotification(notify, config.visibility, {
-      phase: 'terminal', harness, workspace: canonical, launchMode: lease.launch_mode,
+      phase: 'terminal', harness, workspace, launchMode: lease.launch_mode,
       status: recorded.status,
     });
     return { reason: result?.category === 'timeout' ? 'unavailable' : 'ok' };
   } finally {
-    if (!retainLease && await liveOwnedChild(root, canonical, openCodeSession, lease.lease_id, env)) retainLease = true;
+    if (!retainLease && await liveOwnedChild(root, workspace, openCodeSession, lease.lease_id, env)) retainLease = true;
     if (!retainLease) await releaseLease(root, lease.lease_id);
+  }
+}
+
+export async function runWorker(options = {}) {
+  const prepared = await prepareWorkerRun(options);
+  if (prepared.action !== 'run') return prepared.result || prepared;
+  const { harness, workspace, globalRoot, env, root, config, lease, openCodeSession, notify } = prepared;
+  try {
+    const launch = options.modelRunner
+      ? await options.modelRunner({ harness, workspace, lease, root })
+      : await launchModel({
+          launchMode: lease.launch_mode, workspace,
+          env: { ...env, LOAM_INGEST_GLOBAL_ROOT: globalRoot },
+          timeoutMs: config.timeout_seconds * 1000, lease, openCodeSession, root,
+          requireVisibleWorker: config.require_visible_worker,
+        });
+    if (launch.category) {
+      return finalizeWorkerRun(prepared, {
+        skipReason: launch.category,
+        retainLease: ['orphan_live', 'orphan_unknown'].includes(launch.category),
+      });
+    }
+    const launchNotification = sendNotification(notify, config.visibility, {
+      phase: 'launch', harness, workspace, launchMode: lease.launch_mode,
+      identity: lease.child_identity || lease.planned_identity,
+    });
+    const result = await (launch.completion || Promise.resolve({ code: 0 }));
+    return finalizeWorkerRun(prepared, { launch, result, launchNotification });
+  } catch (error) {
+    return finalizeWorkerRun(prepared, {
+      skipReason: 'runtime_unavailable',
+      skipFields: { detail: error instanceof Error ? error.message.slice(0, 256) : String(error).slice(0, 256) },
+      retainLease: Boolean(lease.child_identity),
+    });
   }
 }
 

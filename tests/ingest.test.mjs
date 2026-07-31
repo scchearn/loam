@@ -242,6 +242,113 @@ test('worker leases before full state and issues the exact exclusions-aware diff
   assert.equal(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8').then((value) => value.includes('"status":"failed"')), true);
 });
 
+test('worker preparation and finalization expose one reusable safety lifecycle', async () => {
+  const lifecycle = await import('../integration/ingest.mjs');
+  assert.equal(typeof lifecycle.prepareWorkerRun, 'function');
+  assert.equal(typeof lifecycle.finalizeWorkerRun, 'function');
+  const { root, workspace, wiki, skills } = await fixture();
+  let diffCalls = 0;
+  const runtimeRunner = async ({ args }) => {
+    if (args[0] === 'state') {
+      return { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' };
+    }
+    diffCalls += 1;
+    return {
+      code: 0,
+      stdout: JSON.stringify(diffCalls === 1 ? [{ path: 'src/a.js', mtime: '1', reason: 'new' }] : []),
+      stderr: '',
+    };
+  };
+  const prepared = await lifecycle.prepareWorkerRun({
+    harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner,
+    env: { LOAM_INGEST_BACKGROUND: '1' },
+  });
+  assert.equal(prepared.action, 'run');
+  assert.equal(prepared.intent.lease_id, prepared.lease.lease_id);
+  assert.equal(prepared.intent.actionable_fingerprint.length, 64);
+  const persistedIntent = JSON.parse(await readFile(join(runRoot(root, workspace), 'lease.json'), 'utf8'));
+  assert.equal(persistedIntent.lease_id, prepared.intent.lease_id);
+  assert.equal(persistedIntent.actionable_count, 1);
+
+  const result = await lifecycle.finalizeWorkerRun(prepared, {
+    launch: { background: false },
+    result: { code: 0 },
+  });
+  assert.equal(result.reason, 'ok');
+  assert.equal(JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8')).status, 'ok');
+  await assert.rejects(() => readFile(join(runRoot(root, workspace), 'lease.json')), (error) => error.code === 'ENOENT');
+
+  const skippedRoot = join(root, 'skip');
+  const skipped = await lifecycle.prepareWorkerRun({
+    harness: 'codex', workspace, globalRoot: skippedRoot, skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' },
+    runtimeRunner: async () => ({ code: 0, stdout: JSON.stringify({ wiki_root: '', hints: [] }), stderr: '' }),
+    env: { LOAM_INGEST_BACKGROUND: '1' },
+  });
+  assert.deepEqual(skipped, { action: 'skip', result: { reason: 'nothing_to_do' } });
+  await assert.rejects(() => readFile(join(runRoot(skippedRoot, workspace), 'lease.json')), (error) => error.code === 'ENOENT');
+});
+
+test('worker preparation preserves skip classifications and never strands its lease', async () => {
+  const { prepareWorkerRun } = await import('../integration/ingest.mjs');
+  const cases = [
+    { name: 'disabled', expected: 'disabled', detail: undefined, config: { enabled: false }, env: {} },
+    { name: 'backoff', expected: 'too_soon', detail: 'backoff', previous: { schema: 1, backoff_until: Date.now() + 60_000 } },
+    { name: 'debounced', expected: 'too_soon', detail: 'debounced', previous: { schema: 1, status: 'ok', completed_at: Date.now() } },
+    { name: 'runtime', expected: 'unavailable', detail: 'runtime_missing', readiness: { ready: false, category: 'runtime_missing' } },
+    { name: 'probe-timeout', expected: 'unavailable', detail: 'probe_timeout', stateResponse: { code: null, category: 'timeout', stdout: '', stderr: '' } },
+    { name: 'probe-malformed', expected: 'unavailable', detail: 'malformed_state', stateResponse: { code: 0, stdout: '{', stderr: '' } },
+    { name: 'probe-failed', expected: 'unavailable', detail: 'probe_failed', stateResponse: { code: 1, stdout: '', stderr: 'failed' } },
+    { name: 'wiki', expected: 'nothing_to_do', detail: 'wiki_missing', state: { wiki_root: '', hints: [] } },
+    { name: 'codegraph', expected: 'nothing_to_do', detail: 'codegraph_missing', removeCodegraph: true },
+    { name: 'pending', expected: 'nothing_to_do', detail: 'no_pending', state: { hints: [] } },
+    { name: 'exclusions', expected: 'unavailable', detail: 'exclusions_unavailable', missingSkills: true },
+    { name: 'diff-timeout', expected: 'unavailable', detail: 'probe_timeout', diffResponse: { code: null, category: 'timeout', stdout: '', stderr: '' } },
+    { name: 'diff-failed', expected: 'unavailable', detail: 'probe_failed', diffResponse: { code: 1, stdout: '', stderr: 'failed' } },
+    { name: 'diff-malformed', expected: 'unavailable', detail: 'malformed_state', diffResponse: { code: 0, stdout: '{', stderr: '' } },
+    { name: 'fingerprint', expected: 'unavailable', detail: 'fingerprint_unavailable', entries: [{ path: '../outside.js', mtime: '1', reason: 'new' }] },
+    { name: 'empty', expected: 'nothing_to_do', detail: 'no_actionable_work', entries: [] },
+  ];
+  for (const item of cases) {
+    const { root, workspace, wiki, skills } = await fixture();
+    const globalRoot = join(root, `global-${item.name}`);
+    await mkdir(globalRoot, { recursive: true });
+    if (item.config) await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: item.config }));
+    if (item.previous) {
+      await mkdir(runRoot(globalRoot, workspace), { recursive: true });
+      await writeFile(join(runRoot(globalRoot, workspace), 'last-run.json'), JSON.stringify(item.previous));
+    }
+    if (item.removeCodegraph) await rm(join(wiki, 'code'), { recursive: true });
+    const defaultState = {
+      wiki_root: wiki,
+      hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }],
+    };
+    const state = { ...defaultState, ...(item.state || {}) };
+    const runtimeRunner = async ({ args }) => {
+      if (args[0] === 'state') {
+        return item.stateResponse || { code: 0, stdout: JSON.stringify(state), stderr: '' };
+      }
+      return item.diffResponse || {
+        code: 0,
+        stdout: JSON.stringify(item.entries === undefined ? [{ path: 'src/a.js', mtime: '1', reason: 'new' }] : item.entries),
+        stderr: '',
+      };
+    };
+    const skipped = await prepareWorkerRun({
+      harness: 'codex', workspace, globalRoot,
+      skillsRoot: item.missingSkills ? join(root, 'missing-skills') : skills,
+      readiness: item.readiness || { ready: true, runtimePath: '/private/loam' },
+      runtimeRunner, env: item.env || { LOAM_INGEST_BACKGROUND: '1' },
+    });
+    assert.deepEqual(skipped, { action: 'skip', result: { reason: item.expected } }, item.name);
+    const stored = JSON.parse(await readFile(join(runRoot(globalRoot, workspace), 'last-run.json'), 'utf8'));
+    assert.equal(stored.status, 'skipped', item.name);
+    assert.equal(stored.detail, item.detail, item.name);
+    await assert.rejects(() => readFile(join(runRoot(globalRoot, workspace), 'lease.json')), (error) => error.code === 'ENOENT');
+  }
+});
+
 test('maintenance worker distinguishes missing wiki and missing codegraph before diff or model launch', async () => {
   const { root, workspace, skills, wiki } = await fixture();
   const cases = [
