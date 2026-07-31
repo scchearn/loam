@@ -291,39 +291,45 @@ test('shared SubagentStart and SubagentStop hooks match both separators but only
 test('Codex SubagentStart injects resolved preparation-first context and SubagentStop finalizes by agent_id', async () => {
   const start = await import(`${pathToFileURL(marketplaceSubagentStartPath).href}?start=${Date.now()}`);
   const stop = await import(`${pathToFileURL(marketplaceSubagentStopPath).href}?stop=${Date.now()}`);
+  const globalRoot = resolve('/global');
+  const workspace = resolve('/workspace');
+  const integrationPath = join(globalRoot, 'integration', 'loam.mjs');
+  const adapterPath = join(globalRoot, 'plugins', '0.9.10');
+  const workerPath = join(adapterPath, 'ingest-worker.mjs');
   const calls = [];
   const loadHooks = async () => ({
     startHookWorker: async (input) => calls.push(['worker-start', input]),
     finishHookWorker: async (input) => calls.push(['worker-finish', input]),
   });
   const loadIngest = async () => ({
-    resolveGlobalRoot: () => '/global',
+    resolveGlobalRoot: () => globalRoot,
     bindNativeAgent: async (input) => {
       calls.push(['bind', input]);
       return {
         status: 'bound', owns_claim: true, hook_run_id: 17,
-        workspace: '/workspace', agent_id: 'agent-17',
-        integration_path: '/global/integration/loam.mjs',
-        adapter_path: '/global/plugins/0.9.10',
-        worker_path: '/global/plugins/0.9.10/ingest-worker.mjs',
+        workspace, agent_id: 'agent-17',
+        integration_path: integrationPath,
+        adapter_path: adapterPath,
+        worker_path: workerPath,
       };
     },
     finalizeNativeAgentRun: async (input) => {
       calls.push(['finalize', input]);
-      return { reason: 'ok', owns_claim: true, hook_run_id: 17, workspace: '/workspace' };
+      return { reason: 'ok', owns_claim: true, hook_run_id: 17, workspace };
     },
   });
-  const env = { CLAUDE_PLUGIN_ROOT: marketplaceRoot, LOAM_INGEST_GLOBAL_ROOT: '/global' };
-  const payload = { cwd: '/workspace', turn_id: 'turn-17', agent_id: 'agent-17', agent_type: 'loam_ingestor', last_assistant_message: 'I definitely succeeded' };
+  const env = { CLAUDE_PLUGIN_ROOT: marketplaceRoot, LOAM_INGEST_GLOBAL_ROOT: globalRoot };
+  const payload = { cwd: workspace, turn_id: 'turn-17', agent_id: 'agent-17', agent_type: 'loam_ingestor', last_assistant_message: 'I definitely succeeded' };
   const response = await start.handleSubagentStart(payload, env, { loadHooks, loadIngest });
   assert.equal(response.hookSpecificOutput.hookEventName, 'SubagentStart');
   const context = response.hookSpecificOutput.additionalContext;
   assert.match(context, /Agent identity: agent-17/u);
-  assert.match(context, /Workspace: \/workspace/u);
-  assert.match(context, /Installed integration: \/global\/integration\/loam\.mjs/u);
-  assert.match(context, /Installed adapter: \/global\/plugins\/0\.9\.10/u);
+  assert.ok(context.includes(`Workspace: ${workspace}`));
+  assert.ok(context.includes(`Installed integration: ${integrationPath}`));
+  assert.ok(context.includes(`Installed adapter: ${adapterPath}`));
   assert.match(context, /first action must be exactly this preparation command/iu);
-  assert.match(context, /ingest-worker\.mjs.*--native-prepare.*--agent-id.*agent-17/u);
+  assert.ok(context.includes(workerPath));
+  assert.match(context, /--native-prepare.*--agent-id.*agent-17/u);
   assert.ok(context.indexOf('--native-prepare') < context.indexOf('loam::ingesting-codebase'));
   assert.match(context, /action.*skip.*stop immediately/iu);
   assert.deepEqual(calls.map(([kind]) => kind), ['bind', 'worker-start']);
@@ -331,7 +337,7 @@ test('Codex SubagentStart injects resolved preparation-first context and Subagen
   calls.length = 0;
   assert.deepEqual(await stop.handleSubagentStop(payload, env, { loadHooks, loadIngest }), {});
   assert.deepEqual(calls.map(([kind]) => kind), ['finalize', 'worker-finish']);
-  assert.deepEqual(calls[0][1], { globalRoot: '/global', workspace: '/workspace', agentId: 'agent-17', env });
+  assert.deepEqual(calls[0][1], { globalRoot, workspace, agentId: 'agent-17', env });
   assert.equal(JSON.stringify(calls[0][1]).includes('definitely succeeded'), false, 'assistant text is not completion evidence');
   assert.equal(calls[1][1].reason, 'ok');
   assert.equal(calls[1][1].run.id, 17);
