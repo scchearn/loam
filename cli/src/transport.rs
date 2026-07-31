@@ -7,6 +7,8 @@ use chrono::{DateTime, Utc};
 use rumqttc::v5::mqttbytes::{v5::PublishProperties, QoS};
 use rumqttc::v5::{Client, MqttOptions};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 // Conservative room for the MQTT header, packet ID, property lengths, expiry,
 // payload-format indicator, and application/json content type.
@@ -648,6 +650,22 @@ impl WorkTracker {
         &mut self,
         envelope: &ValidatedEnvelope,
     ) -> Result<WorkObservation, TransportError> {
+        self.observe_with_proof(envelope, None)
+    }
+
+    pub fn observe_verified(
+        &mut self,
+        envelope: &ValidatedEnvelope,
+        proof: &PublicationProof,
+    ) -> Result<WorkObservation, TransportError> {
+        self.observe_with_proof(envelope, Some(proof))
+    }
+
+    fn observe_with_proof(
+        &mut self,
+        envelope: &ValidatedEnvelope,
+        proof: Option<&PublicationProof>,
+    ) -> Result<WorkObservation, TransportError> {
         let envelope = envelope.as_envelope();
         if envelope.message_type != "io.loam.work.state"
             || envelope.data.delivery.class != "latest-state"
@@ -661,7 +679,16 @@ impl WorkTracker {
             .and_then(crate::json::Value::as_str)
             .and_then(WorkStatus::from_wire)
             .ok_or(TransportError::InvalidWorkEnvelope)?;
-        if status == WorkStatus::Published {
+        if status == WorkStatus::Published
+            && proof.is_none_or(|proof| {
+                let context = &envelope.data.context;
+                context.git.as_ref().and_then(|git| git.commit.as_deref())
+                    != Some(proof.commit.as_str())
+                    || context.org_id != proof.scope.organization_id
+                    || context.project_id != proof.scope.project_id
+                    || context.repository_id != proof.scope.repository_id
+            })
+        {
             return Err(TransportError::PublicationUnverified);
         }
         let key = envelope
@@ -773,7 +800,10 @@ fn valid_work_transition(current: WorkStatus, next: WorkStatus) -> bool {
             next,
             WorkStatus::Active | WorkStatus::Blocked | WorkStatus::Ready | WorkStatus::Abandoned
         ),
-        WorkStatus::Ready => matches!(next, WorkStatus::Ready | WorkStatus::Abandoned),
+        WorkStatus::Ready => matches!(
+            next,
+            WorkStatus::Ready | WorkStatus::Published | WorkStatus::Abandoned
+        ),
         WorkStatus::Published | WorkStatus::Abandoned => false,
     }
 }
@@ -792,6 +822,452 @@ fn overlap_warning(
         conflicting_origin: other.origin.clone(),
         conflicting_key: other.key.clone(),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitOracleError {
+    InvalidRepository,
+    InvalidWikiRoot,
+    InvalidRemote,
+    InvalidAllowedRef,
+    InvalidAllowedOrigin,
+    InvalidWorkClaim,
+    UnauthorizedHintOrigin,
+    HintDoesNotMatchRemote,
+    NoAllowedRemoteRefs,
+    UnreachableCommit,
+    DirtyWorktree,
+    GitFailure,
+    DerivedStateFailure,
+    ForbiddenMutation,
+}
+
+impl std::fmt::Display for GitOracleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidRepository => "Git repository is not available",
+            Self::InvalidWikiRoot => "codegraph wiki root is not available",
+            Self::InvalidRemote => "configured Git remote is invalid",
+            Self::InvalidAllowedRef => "configured allowed Git ref is invalid",
+            Self::InvalidAllowedOrigin => "configured ref-change origin is invalid",
+            Self::InvalidWorkClaim => "envelope is not a ready or published work-state claim",
+            Self::UnauthorizedHintOrigin => "ref-change hint origin is not allowed",
+            Self::HintDoesNotMatchRemote => "ref-change hint does not match an allowed remote tip",
+            Self::NoAllowedRemoteRefs => "configured remote advertised no allowed refs",
+            Self::UnreachableCommit => "claimed commit is not reachable from an allowed remote ref",
+            Self::DirtyWorktree => "handoff requires a clean worktree",
+            Self::GitFailure => "configured Git operation failed",
+            Self::DerivedStateFailure => "read-only codegraph recomputation failed",
+            Self::ForbiddenMutation => "Git verification changed a worktree or ref",
+        })
+    }
+}
+
+impl std::error::Error for GitOracleError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationProof {
+    commit: String,
+    scope: GitScope,
+    pub remote: String,
+    pub reference: String,
+    pub tip: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationStatus {
+    Provisional,
+    Verified(PublicationProof),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedTip {
+    pub reference: String,
+    pub oid: String,
+    pub pending_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reconciliation {
+    pub tips: Vec<DerivedTip>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitScope {
+    organization_id: String,
+    project_id: String,
+    repository_id: String,
+}
+
+impl GitScope {
+    pub fn new(
+        organization_id: &str,
+        project_id: &str,
+        repository_id: &str,
+    ) -> Result<Self, GitOracleError> {
+        if [organization_id, project_id, repository_id]
+            .into_iter()
+            .any(|value| !valid_scope_id(value))
+        {
+            return Err(GitOracleError::InvalidWorkClaim);
+        }
+        Ok(Self {
+            organization_id: organization_id.to_owned(),
+            project_id: project_id.to_owned(),
+            repository_id: repository_id.to_owned(),
+        })
+    }
+}
+
+pub struct GitOracle {
+    repository: PathBuf,
+    wiki_root: PathBuf,
+    remote: String,
+    scope: GitScope,
+    allowed_refs: Vec<String>,
+    allowed_origins: Vec<String>,
+}
+
+impl GitOracle {
+    pub fn new<R, RF, O, OF>(
+        repository: impl Into<PathBuf>,
+        wiki_root: impl Into<PathBuf>,
+        remote: &str,
+        scope: GitScope,
+        allowed_refs: R,
+        allowed_origins: O,
+    ) -> Result<Self, GitOracleError>
+    where
+        R: IntoIterator<Item = RF>,
+        RF: AsRef<str>,
+        O: IntoIterator<Item = OF>,
+        OF: AsRef<str>,
+    {
+        let repository = repository.into();
+        let wiki_root = wiki_root.into();
+        if !repository.is_dir() || !git_success(&repository, &["rev-parse", "--git-dir"]) {
+            return Err(GitOracleError::InvalidRepository);
+        }
+        if !wiki_root.is_dir() {
+            return Err(GitOracleError::InvalidWikiRoot);
+        }
+        if !valid_config_atom(remote)
+            || !git_success(&repository, &["remote", "get-url", "--all", remote])
+        {
+            return Err(GitOracleError::InvalidRemote);
+        }
+        let allowed_refs = allowed_refs
+            .into_iter()
+            .map(|value| value.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        if allowed_refs.is_empty()
+            || allowed_refs.len() > 64
+            || allowed_refs
+                .iter()
+                .any(|reference| !valid_ref_pattern(reference))
+        {
+            return Err(GitOracleError::InvalidAllowedRef);
+        }
+        let allowed_origins = allowed_origins
+            .into_iter()
+            .map(|value| value.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        if allowed_origins.is_empty()
+            || allowed_origins.len() > 64
+            || allowed_origins.iter().any(|origin| {
+                origin.is_empty() || origin.len() > 255 || origin.chars().any(char::is_control)
+            })
+        {
+            return Err(GitOracleError::InvalidAllowedOrigin);
+        }
+        Ok(Self {
+            repository,
+            wiki_root,
+            remote: remote.to_owned(),
+            scope,
+            allowed_refs,
+            allowed_origins,
+        })
+    }
+
+    pub fn evaluate_work_state(
+        &self,
+        envelope: &ValidatedEnvelope,
+    ) -> Result<PublicationStatus, GitOracleError> {
+        let envelope = envelope.as_envelope();
+        if envelope.message_type != "io.loam.work.state" {
+            return Err(GitOracleError::InvalidWorkClaim);
+        }
+        self.validate_scope(&envelope.data.context)?;
+        match envelope
+            .data
+            .payload
+            .get("state")
+            .and_then(crate::json::Value::as_str)
+        {
+            Some("ready") => Ok(PublicationStatus::Provisional),
+            Some("published") => {
+                let commit = envelope
+                    .data
+                    .context
+                    .git
+                    .as_ref()
+                    .and_then(|git| git.commit.as_deref())
+                    .ok_or(GitOracleError::InvalidWorkClaim)?;
+                self.verify_commit(commit).map(PublicationStatus::Verified)
+            }
+            _ => Err(GitOracleError::InvalidWorkClaim),
+        }
+    }
+
+    pub fn reconcile(&self) -> Result<Reconciliation, GitOracleError> {
+        let before = self.snapshot()?;
+        let tips = self.remote_tips()?;
+        for tip in &tips {
+            self.git(&[
+                "fetch",
+                "--quiet",
+                "--no-write-fetch-head",
+                "--no-tags",
+                &self.remote,
+                &tip.oid,
+            ])?;
+        }
+        let derived = tips
+            .into_iter()
+            .map(|tip| {
+                let pending_count = crate::codegraph::pending_count_at_ref(
+                    &self.repository,
+                    &self.wiki_root,
+                    &tip.oid,
+                )
+                .ok_or(GitOracleError::DerivedStateFailure)?;
+                Ok(DerivedTip {
+                    reference: tip.reference,
+                    oid: tip.oid,
+                    pending_count,
+                })
+            })
+            .collect::<Result<Vec<_>, GitOracleError>>()?;
+        if self.snapshot()? != before {
+            return Err(GitOracleError::ForbiddenMutation);
+        }
+        Ok(Reconciliation { tips: derived })
+    }
+
+    pub fn reconcile_ref_change(
+        &self,
+        envelope: &ValidatedEnvelope,
+    ) -> Result<Reconciliation, GitOracleError> {
+        let envelope = envelope.as_envelope();
+        if envelope.message_type != "io.loam.git.refs.changed" {
+            return Err(GitOracleError::InvalidWorkClaim);
+        }
+        self.validate_scope(&envelope.data.context)?;
+        if !self
+            .allowed_origins
+            .contains(&envelope.data.from.instance_id)
+        {
+            return Err(GitOracleError::UnauthorizedHintOrigin);
+        }
+        let new_oid = envelope
+            .data
+            .payload
+            .get("new_oid")
+            .and_then(crate::json::Value::as_str)
+            .ok_or(GitOracleError::InvalidWorkClaim)?;
+        let reconciliation = self.reconcile()?;
+        if reconciliation.tips.iter().all(|tip| tip.oid != new_oid) {
+            return Err(GitOracleError::HintDoesNotMatchRemote);
+        }
+        Ok(reconciliation)
+    }
+
+    pub fn check_handoff(&self, commit: &str) -> Result<PublicationProof, GitOracleError> {
+        if !self.status_bytes()?.is_empty() {
+            return Err(GitOracleError::DirtyWorktree);
+        }
+        self.verify_commit(commit)
+    }
+
+    pub fn configured_remote(&self) -> &str {
+        &self.remote
+    }
+
+    pub fn configured_refs(&self) -> &[String] {
+        &self.allowed_refs
+    }
+
+    fn verify_commit(&self, commit: &str) -> Result<PublicationProof, GitOracleError> {
+        if !valid_oid(commit) {
+            return Err(GitOracleError::InvalidWorkClaim);
+        }
+        let reconciliation = self.reconcile()?;
+        if !git_success(
+            &self.repository,
+            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+        ) {
+            return Err(GitOracleError::UnreachableCommit);
+        }
+        for tip in reconciliation.tips {
+            let output = self.git_output(&["merge-base", "--is-ancestor", commit, &tip.oid])?;
+            if output.status.success() {
+                return Ok(PublicationProof {
+                    commit: commit.to_owned(),
+                    scope: self.scope.clone(),
+                    remote: self.remote.clone(),
+                    reference: tip.reference,
+                    tip: tip.oid,
+                });
+            }
+            if output.status.code() != Some(1) {
+                return Err(GitOracleError::GitFailure);
+            }
+        }
+        Err(GitOracleError::UnreachableCommit)
+    }
+
+    fn remote_tips(&self) -> Result<Vec<RemoteTip>, GitOracleError> {
+        let mut args = vec!["ls-remote", "--refs", self.remote.as_str()];
+        args.extend(self.allowed_refs.iter().map(String::as_str));
+        let output = self.git(&args)?;
+        let text = std::str::from_utf8(&output.stdout).map_err(|_| GitOracleError::GitFailure)?;
+        let mut tips = Vec::new();
+        for line in text.lines() {
+            let Some((oid, reference)) = line.split_once('\t') else {
+                return Err(GitOracleError::GitFailure);
+            };
+            if !valid_oid(oid)
+                || !self
+                    .allowed_refs
+                    .iter()
+                    .any(|pattern| ref_matches(pattern, reference))
+            {
+                return Err(GitOracleError::GitFailure);
+            }
+            tips.push(RemoteTip {
+                reference: reference.to_owned(),
+                oid: oid.to_owned(),
+            });
+            if tips.len() > 128 {
+                return Err(GitOracleError::GitFailure);
+            }
+        }
+        tips.sort_by(|left, right| left.reference.cmp(&right.reference));
+        tips.dedup_by(|left, right| left.reference == right.reference && left.oid == right.oid);
+        if tips.is_empty() {
+            return Err(GitOracleError::NoAllowedRemoteRefs);
+        }
+        Ok(tips)
+    }
+
+    fn validate_scope(&self, context: &crate::envelope::Context) -> Result<(), GitOracleError> {
+        if context.org_id != self.scope.organization_id
+            || context.project_id != self.scope.project_id
+            || context.repository_id != self.scope.repository_id
+        {
+            return Err(GitOracleError::InvalidWorkClaim);
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Result<GitSnapshot, GitOracleError> {
+        Ok(GitSnapshot {
+            status: self.status_bytes()?,
+            refs: self
+                .git(&["for-each-ref", "--format=%(refname)%00%(objectname)"])?
+                .stdout,
+        })
+    }
+
+    fn status_bytes(&self) -> Result<Vec<u8>, GitOracleError> {
+        Ok(self
+            .git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?
+            .stdout)
+    }
+
+    fn git(&self, args: &[&str]) -> Result<Output, GitOracleError> {
+        let output = self.git_output(args)?;
+        if output.status.success() {
+            Ok(output)
+        } else {
+            Err(GitOracleError::GitFailure)
+        }
+    }
+
+    fn git_output(&self, args: &[&str]) -> Result<Output, GitOracleError> {
+        Command::new("git")
+            .current_dir(&self.repository)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(args)
+            .output()
+            .map_err(|_| GitOracleError::GitFailure)
+    }
+}
+
+struct RemoteTip {
+    reference: String,
+    oid: String,
+}
+
+#[derive(PartialEq, Eq)]
+struct GitSnapshot {
+    status: Vec<u8>,
+    refs: Vec<u8>,
+}
+
+fn git_success(repository: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .current_dir(repository)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn valid_config_atom(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_ref_pattern(value: &str) -> bool {
+    value.starts_with("refs/heads/")
+        && value.len() <= 1024
+        && !value.ends_with('/')
+        && !value.ends_with('.')
+        && !value.ends_with(".lock")
+        && !value.contains("..")
+        && !value.contains("//")
+        && !value.contains("/.")
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'*')
+        })
+        && value.bytes().filter(|byte| *byte == b'*').count() <= 1
+}
+
+fn ref_matches(pattern: &str, reference: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => reference.starts_with(prefix) && reference.ends_with(suffix),
+        None => pattern == reference,
+    }
+}
+
+fn valid_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_scope_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
 }
 
 #[cfg(test)]

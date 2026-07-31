@@ -4,8 +4,8 @@ mod mqtt_broker;
 use chrono::{DateTime, Utc};
 use loam::envelope::{AuthenticatedPrincipal, ValidatedEnvelope, ValidationConfig, Violation};
 use loam::transport::{
-    self, AuthenticatedTransportPrincipal, DeliveryProcessor, ReceiveOutcome, TransportError,
-    WorkStatus, WorkTracker,
+    self, AuthenticatedTransportPrincipal, DeliveryProcessor, GitOracle, GitOracleError, GitScope,
+    PublicationStatus, ReceiveOutcome, TransportError, WorkStatus, WorkTracker,
 };
 use mqtt_broker::BrokerFixture;
 use rumqttc::v5::mqttbytes::{
@@ -14,7 +14,254 @@ use rumqttc::v5::mqttbytes::{
 };
 use rumqttc::v5::{Client, Connection, Event, MqttOptions, RecvTimeoutError};
 use rumqttc::Transport;
-use std::time::{Duration, Instant};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[test]
+#[ignore = "requires LOAM_MQTT_TEST=1, Git, and a real Mosquitto/OpenSSL installation"]
+fn git_oracle() {
+    if std::env::var("LOAM_MQTT_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set LOAM_MQTT_TEST=1 to require the real broker tier");
+        return;
+    }
+
+    let cases = include_str!("fixtures/mqtt/git-transport-cases.json");
+    for name in [
+        "ready_only",
+        "unreachable_published",
+        "allowed_ref_published",
+        "disallowed_ref",
+        "fetch_failure",
+        "dropped_hint",
+        "dirty_handoff",
+        "unfetchable_handoff",
+    ] {
+        assert!(cases.contains(name), "missing Git oracle case {name}");
+    }
+    let mut fixture = GitOracleFixture::provision();
+    let broker =
+        BrokerFixture::provision("git-oracle").expect("the real broker fixture should provision");
+    let project = format!("{}/project-a", broker.namespace());
+    let state_topic = format!("{project}/state/instance-01/activity-01K6Q5");
+    let event_topic = format!("{project}/event/instance-01");
+    let now = test_time("2026-07-24T14:21:00Z");
+    let oracle = GitOracle::new(
+        fixture.peer(),
+        fixture.wiki(),
+        "origin",
+        git_scope(&broker),
+        ["refs/heads/main"],
+        ["instance-01"],
+    )
+    .expect("configured Git oracle should validate");
+    let ready = scoped_work_state_with_commit(
+        &broker,
+        "instance-01",
+        "employee-184",
+        1,
+        "ready",
+        "SB-42",
+        None,
+        now,
+    )
+    .1;
+    assert_eq!(
+        oracle
+            .evaluate_work_state(&ready)
+            .expect("ready should remain provisional"),
+        PublicationStatus::Provisional
+    );
+
+    let published = scoped_work_state_with_commit(
+        &broker,
+        "instance-01",
+        "employee-184",
+        2,
+        "published",
+        "SB-42",
+        Some(fixture.allowed_oid()),
+        now,
+    )
+    .1;
+    assert!(
+        !fixture.peer_has_object(fixture.allowed_oid()),
+        "allowed publication object was already present before the oracle fetch"
+    );
+    let before = fixture.snapshot();
+    let configured_remote = oracle.configured_remote().to_owned();
+    let configured_refs = oracle.configured_refs().to_vec();
+    let proof = match oracle
+        .evaluate_work_state(&published)
+        .expect("allowed-ref publication should verify")
+    {
+        PublicationStatus::Verified(proof) => proof,
+        PublicationStatus::Provisional => panic!("published state remained provisional"),
+    };
+    assert!(fixture.peer_has_object(fixture.allowed_oid()));
+    assert_eq!(fixture.snapshot(), before);
+    assert_eq!(oracle.configured_remote(), configured_remote);
+    assert_eq!(oracle.configured_refs(), configured_refs);
+
+    let missing = scoped_work_state_with_commit(
+        &broker,
+        "instance-01",
+        "employee-184",
+        2,
+        "published",
+        "SB-42",
+        Some("0000000000000000000000000000000000000001"),
+        now,
+    )
+    .1;
+    assert_eq!(
+        oracle.evaluate_work_state(&missing),
+        Err(GitOracleError::UnreachableCommit)
+    );
+    let disallowed = scoped_work_state_with_commit(
+        &broker,
+        "instance-01",
+        "employee-184",
+        2,
+        "published",
+        "SB-42",
+        Some(fixture.disallowed_oid()),
+        now,
+    )
+    .1;
+    assert_eq!(
+        oracle.evaluate_work_state(&disallowed),
+        Err(GitOracleError::UnreachableCommit)
+    );
+    let broken = GitOracle::new(
+        fixture.peer(),
+        fixture.wiki(),
+        "broken",
+        git_scope(&broker),
+        ["refs/heads/main"],
+        ["instance-01"],
+    )
+    .expect("configured but unreachable remote should validate locally");
+    assert_eq!(
+        broken.evaluate_work_state(&disallowed),
+        Err(GitOracleError::GitFailure)
+    );
+
+    let mut publisher = TestClient::password(&broker, "git-oracle-publisher")
+        .expect("Git oracle publisher should authenticate");
+    let mut observer = TestClient::password(&broker, "git-oracle-observer")
+        .expect("Git oracle observer should authenticate");
+    observer
+        .subscribe(format!("{project}/#"))
+        .expect("Git oracle observer should subscribe");
+    let claims = ["employee-184"];
+    let origins = ["instance-01"];
+    let identity = AuthenticatedTransportPrincipal::new(
+        AuthenticatedPrincipal::new("broker-user-7", &claims),
+        &origins,
+    );
+    let mut processor = DeliveryProcessor::new(ValidationConfig::default(), 8, 8, 8)
+        .expect("bounded Git oracle processor should configure");
+    let mut tracker = WorkTracker::new(8).expect("bounded work tracker should configure");
+    publish_validated(&mut publisher, ready, now);
+    let ready_publish = observer
+        .receive(&state_topic, Duration::from_secs(3))
+        .expect("ready claim should cross the broker");
+    let received_ready =
+        accepted(processor.receive(&state_topic, &ready_publish.payload, &identity, now));
+    tracker
+        .observe(&received_ready)
+        .expect("ready claim should remain provisional");
+    publish_validated(&mut publisher, published.clone(), now);
+    let published_frame = observer
+        .receive(&state_topic, Duration::from_secs(3))
+        .expect("published claim should cross the broker");
+    let received_published =
+        accepted(processor.receive(&state_topic, &published_frame.payload, &identity, now));
+    assert_eq!(
+        tracker.observe(&received_published),
+        Err(TransportError::PublicationUnverified)
+    );
+    tracker
+        .observe_verified(&received_published, &proof)
+        .expect("Git proof should admit ready to published");
+    assert_eq!(
+        tracker.status("instance-01", "activity-01K6Q5"),
+        Some(WorkStatus::Published)
+    );
+
+    let refs_changed = scoped_refs_changed(
+        &broker,
+        &event_topic,
+        fixture.base_oid(),
+        fixture.allowed_oid(),
+        now,
+    );
+    publish_validated(&mut publisher, refs_changed, now);
+    let hint_publish = observer
+        .receive(&event_topic, Duration::from_secs(3))
+        .expect("ref-change hint should cross the broker");
+    let received_hint =
+        accepted(processor.receive(&event_topic, &hint_publish.payload, &identity, now));
+    let hinted = oracle
+        .reconcile_ref_change(&received_hint)
+        .expect("allowed ref-change hint should fetch and recompute");
+    let without_hint = oracle
+        .reconcile()
+        .expect("dropped hint should converge through ordinary reconciliation");
+    assert_eq!(hinted, without_hint);
+    assert!(hinted.tips.iter().all(|tip| tip.pending_count > 0));
+    assert_eq!(fixture.snapshot(), before);
+
+    let foreign_hint_topic = format!("{project}/event/instance-02");
+    let foreign_hint = scoped_refs_changed_from(
+        &broker,
+        &foreign_hint_topic,
+        "instance-02",
+        "employee-191",
+        fixture.base_oid(),
+        fixture.allowed_oid(),
+        now,
+    );
+    assert_eq!(
+        oracle.reconcile_ref_change(&foreign_hint),
+        Err(GitOracleError::UnauthorizedHintOrigin)
+    );
+
+    oracle
+        .check_handoff(fixture.allowed_oid())
+        .expect("clean fetchable handoff should pass");
+    assert_eq!(
+        oracle.check_handoff(fixture.disallowed_oid()),
+        Err(GitOracleError::UnreachableCommit)
+    );
+    fixture.make_dirty();
+    assert_eq!(
+        oracle.check_handoff(fixture.allowed_oid()),
+        Err(GitOracleError::DirtyWorktree)
+    );
+    fixture.clean_dirty_probe();
+    assert_eq!(
+        broken.check_handoff(fixture.allowed_oid()),
+        Err(GitOracleError::GitFailure)
+    );
+
+    publish_state_clear(&mut publisher, published);
+    let mut final_scan = TestClient::password(&broker, "git-oracle-final-scan")
+        .expect("final retained scan should authenticate");
+    final_scan
+        .subscribe(format!("{project}/#"))
+        .expect("final retained scan should subscribe");
+    assert!(
+        final_scan.collect(Duration::from_secs(2)).is_empty(),
+        "Git oracle test left retained values under its namespace"
+    );
+    broker
+        .finish()
+        .expect("broker fixture should remove only its temporary directory");
+    fixture.finish();
+}
 
 #[test]
 #[ignore = "requires LOAM_MQTT_TEST=1 and a real Mosquitto/OpenSSL installation"]
@@ -979,11 +1226,34 @@ fn scoped_work_state(
     artifact_id: &str,
     now: DateTime<Utc>,
 ) -> (String, ValidatedEnvelope) {
+    scoped_work_state_with_commit(
+        broker,
+        origin,
+        principal_id,
+        revision,
+        status,
+        artifact_id,
+        None,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scoped_work_state_with_commit(
+    broker: &BrokerFixture,
+    origin: &str,
+    principal_id: &str,
+    revision: u64,
+    status: &str,
+    artifact_id: &str,
+    commit: Option<&str>,
+    now: DateTime<Utc>,
+) -> (String, ValidatedEnvelope) {
     let topic = format!(
         "{}/project-a/state/{origin}/activity-01K6Q5",
         broker.namespace()
     );
-    let frame = scoped_frame(include_bytes!("fixtures/mqtt/work-state.json"), broker)
+    let mut frame = scoped_frame(include_bytes!("fixtures/mqtt/work-state.json"), broker)
         .replace(
             "urn:loam:instance:instance-01",
             &format!("urn:loam:instance:{origin}"),
@@ -1000,6 +1270,14 @@ fn scoped_work_state(
         .replace("\"revision\": 7", &format!("\"revision\": {revision}"))
         .replace("\"state\": \"ready\"", &format!("\"state\": \"{status}\""))
         .replace("SB-42", artifact_id);
+    if let Some(commit) = commit {
+        frame = frame.replace(
+            "\"plan_oid\": \"61af000000000000000000000000000000000001\"",
+            &format!(
+                "\"plan_oid\": \"61af000000000000000000000000000000000001\",\n        \"commit\": \"{commit}\""
+            ),
+        );
+    }
     let principal = AuthenticatedPrincipal::new(principal_id, &[]);
     let envelope = loam::envelope::validate(
         frame.as_bytes(),
@@ -1010,6 +1288,63 @@ fn scoped_work_state(
     )
     .expect("scoped work-state should validate");
     (topic, envelope)
+}
+
+fn scoped_refs_changed(
+    broker: &BrokerFixture,
+    topic: &str,
+    old_oid: &str,
+    new_oid: &str,
+    now: DateTime<Utc>,
+) -> ValidatedEnvelope {
+    scoped_refs_changed_from(
+        broker,
+        topic,
+        "instance-01",
+        "employee-184",
+        old_oid,
+        new_oid,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scoped_refs_changed_from(
+    broker: &BrokerFixture,
+    topic: &str,
+    origin: &str,
+    principal_id: &str,
+    old_oid: &str,
+    new_oid: &str,
+    now: DateTime<Utc>,
+) -> ValidatedEnvelope {
+    let frame = scoped_frame(
+        include_bytes!("fixtures/mqtt/git-refs-changed.json"),
+        broker,
+    )
+    .replace(
+        "urn:loam:instance:instance-01",
+        &format!("urn:loam:instance:{origin}"),
+    )
+    .replace(
+        "\"principal_id\": \"employee-184\"",
+        &format!("\"principal_id\": \"{principal_id}\""),
+    )
+    .replace(
+        "\"instance_id\": \"instance-01\"",
+        &format!("\"instance_id\": \"{origin}\""),
+    )
+    .replace("84be000000000000000000000000000000000001", old_oid)
+    .replace("84be000000000000000000000000000000000002", new_oid);
+    let principal = AuthenticatedPrincipal::new(principal_id, &[]);
+    loam::envelope::validate(
+        frame.as_bytes(),
+        topic,
+        &principal,
+        &ValidationConfig::default(),
+        now,
+    )
+    .expect("scoped ref-change hint should validate")
 }
 
 fn scoped_message_with_id(
@@ -1092,6 +1427,254 @@ fn accepted(outcome: Result<ReceiveOutcome, TransportError>) -> ValidatedEnvelop
         Ok(ReceiveOutcome::Accepted(envelope)) => *envelope,
         other => panic!("expected accepted delivery, got {other:?}"),
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RepoSnapshot {
+    status: Vec<u8>,
+    refs: Vec<u8>,
+    fetch_head: Option<Vec<u8>>,
+    plan: Vec<u8>,
+    spec: Vec<u8>,
+    remote_url: Vec<u8>,
+}
+
+struct GitOracleFixture {
+    root: PathBuf,
+    peer: PathBuf,
+    wiki: PathBuf,
+    plan: PathBuf,
+    spec: PathBuf,
+    base_oid: String,
+    allowed_oid: String,
+    disallowed_oid: String,
+    finished: bool,
+}
+
+impl GitOracleFixture {
+    fn provision() -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock should be after the Unix epoch")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("loam-git-oracle-{}-{nonce:x}", std::process::id()));
+        let remote = root.join("origin.git");
+        let seed = root.join("seed");
+        let peer = root.join("peer");
+        let wiki = root.join("wiki");
+        fs::create_dir_all(&root).expect("Git oracle fixture root should be created");
+        git_at(&root, &["init", "--bare", path_text(&remote)]);
+        git_at(&root, &["init", "-b", "main", path_text(&seed)]);
+        git_at(&seed, &["config", "user.name", "Loam Test"]);
+        git_at(&seed, &["config", "user.email", "loam@example.invalid"]);
+        git_at(&seed, &["config", "commit.gpgsign", "false"]);
+        fs::write(seed.join("app.rs"), "pub fn base() {}\n")
+            .expect("seed source should be written");
+        git_at(&seed, &["add", "app.rs"]);
+        git_at(&seed, &["commit", "-m", "base"]);
+        let base_oid = git_text_at(&seed, &["rev-parse", "HEAD"]);
+        git_at(&seed, &["remote", "add", "origin", path_text(&remote)]);
+        git_at(&seed, &["push", "-u", "origin", "main"]);
+        git_at(
+            &root,
+            &[
+                "clone",
+                "--branch",
+                "main",
+                path_text(&remote),
+                path_text(&peer),
+            ],
+        );
+        git_at(&peer, &["config", "user.name", "Loam Peer"]);
+        git_at(&peer, &["config", "user.email", "peer@example.invalid"]);
+        git_at(&peer, &["config", "commit.gpgsign", "false"]);
+
+        git_at(&seed, &["switch", "-c", "feature/disallowed"]);
+        fs::write(seed.join("disallowed.rs"), "pub fn disallowed() {}\n")
+            .expect("disallowed source should be written");
+        git_at(&seed, &["add", "disallowed.rs"]);
+        git_at(&seed, &["commit", "-m", "disallowed"]);
+        let disallowed_oid = git_text_at(&seed, &["rev-parse", "HEAD"]);
+        git_at(
+            &seed,
+            &["push", "origin", "HEAD:refs/heads/feature/disallowed"],
+        );
+
+        git_at(&seed, &["switch", "main"]);
+        fs::write(seed.join("allowed.rs"), "pub fn allowed() {}\n")
+            .expect("allowed source should be written");
+        git_at(&seed, &["add", "allowed.rs"]);
+        git_at(&seed, &["commit", "-m", "allowed"]);
+        let allowed_oid = git_text_at(&seed, &["rev-parse", "HEAD"]);
+        git_at(&seed, &["push", "origin", "main"]);
+
+        git_at(
+            &peer,
+            &[
+                "remote",
+                "add",
+                "broken",
+                path_text(&root.join("missing.git")),
+            ],
+        );
+        fs::create_dir_all(wiki.join("code")).expect("external codegraph wiki should be created");
+        for name in ["SCHEMA.md", "index.md", "log.md"] {
+            fs::write(wiki.join(name), format!("# {name}\n"))
+                .expect("wiki contract file should be written");
+        }
+        let plan = root.join("plan.md");
+        let spec = root.join("spec.md");
+        fs::write(&plan, "plan bytes stay fixed\n").expect("plan snapshot should be written");
+        fs::write(&spec, "spec bytes stay fixed\n").expect("spec snapshot should be written");
+
+        Self {
+            root,
+            peer,
+            wiki,
+            plan,
+            spec,
+            base_oid,
+            allowed_oid,
+            disallowed_oid,
+            finished: false,
+        }
+    }
+
+    fn peer(&self) -> &Path {
+        &self.peer
+    }
+
+    fn wiki(&self) -> &Path {
+        &self.wiki
+    }
+
+    fn base_oid(&self) -> &str {
+        &self.base_oid
+    }
+
+    fn allowed_oid(&self) -> &str {
+        &self.allowed_oid
+    }
+
+    fn disallowed_oid(&self) -> &str {
+        &self.disallowed_oid
+    }
+
+    fn peer_has_object(&self, oid: &str) -> bool {
+        Command::new("git")
+            .current_dir(&self.peer)
+            .args(["cat-file", "-e", &format!("{oid}^{{commit}}")])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn snapshot(&self) -> RepoSnapshot {
+        RepoSnapshot {
+            status: git_bytes_at(
+                &self.peer,
+                &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            ),
+            refs: git_bytes_at(
+                &self.peer,
+                &["for-each-ref", "--format=%(refname)%00%(objectname)"],
+            ),
+            fetch_head: fs::read(self.peer.join(".git/FETCH_HEAD")).ok(),
+            plan: fs::read(&self.plan).expect("plan snapshot should remain readable"),
+            spec: fs::read(&self.spec).expect("spec snapshot should remain readable"),
+            remote_url: git_bytes_at(&self.peer, &["remote", "get-url", "--all", "origin"]),
+        }
+    }
+
+    fn make_dirty(&self) {
+        fs::write(self.peer.join("dirty-probe"), "uncommitted\n")
+            .expect("dirty handoff probe should be written");
+    }
+
+    fn clean_dirty_probe(&self) {
+        fs::remove_file(self.peer.join("dirty-probe"))
+            .expect("dirty handoff probe should be removed");
+    }
+
+    fn finish(&mut self) {
+        let name = self
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(
+            self.root.starts_with(std::env::temp_dir()) && name.starts_with("loam-git-oracle-"),
+            "refusing to remove unexpected Git oracle fixture root"
+        );
+        fs::remove_dir_all(&self.root).expect("Git oracle fixture should be removed");
+        self.finished = true;
+    }
+}
+
+impl Drop for GitOracleFixture {
+    fn drop(&mut self) {
+        if !self.finished {
+            eprintln!(
+                "Git oracle fixture artifacts preserved for diagnosis: {}",
+                self.root.display()
+            );
+        }
+    }
+}
+
+fn git_at(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args)
+        .output()
+        .expect("Git fixture command should start");
+    assert!(
+        output.status.success(),
+        "Git fixture command failed: git {}\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_text_at(root: &Path, args: &[&str]) -> String {
+    String::from_utf8(git_bytes_at(root, args))
+        .expect("Git fixture text should be UTF-8")
+        .trim()
+        .to_owned()
+}
+
+fn git_bytes_at(root: &Path, args: &[&str]) -> Vec<u8> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args)
+        .output()
+        .expect("Git fixture command should start");
+    assert!(
+        output.status.success(),
+        "Git fixture command failed: git {}\nstderr: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn path_text(path: &Path) -> &str {
+    path.to_str().expect("test path should be UTF-8")
+}
+
+fn git_scope(broker: &BrokerFixture) -> GitScope {
+    GitScope::new(
+        broker
+            .namespace()
+            .strip_prefix("loam/v1/")
+            .expect("broker namespace should have a Loam v1 prefix"),
+        "project-a",
+        "repo-2F8",
+    )
+    .expect("Git oracle scope should validate")
 }
 
 fn test_time(value: &str) -> DateTime<Utc> {
