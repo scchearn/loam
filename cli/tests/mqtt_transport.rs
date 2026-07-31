@@ -20,13 +20,13 @@ fn broker_contract() {
 
     let mut broker = BrokerFixture::provision("broker-contract")
         .expect("the real broker fixture should provision");
-    let project = format!("{}/org-a/project-a", broker.namespace());
+    let project = format!("{}/project-a", broker.namespace());
     let password_topic = format!("{project}/state/password-sentinel");
     let mtls_topic = format!("{project}/state/mtls-sentinel");
     let expired_topic = format!("{project}/expiry/expired");
     let live_topic = format!("{project}/expiry/live");
     let expiry_filter = format!("{project}/expiry/#");
-    let foreign_topic = format!("{}/org-b/project-b/state/forbidden", broker.namespace());
+    let foreign_topic = format!("{}/project-b/state/forbidden", broker.namespace());
 
     {
         let mut password = TestClient::password(&broker, "password-client")
@@ -204,7 +204,7 @@ fn broker_contract() {
                 .expect("foreign retained tombstone should be acknowledged"),
         );
         foreign_cleanup
-            .subscribe(format!("{}/org-b/project-b/#", broker.namespace()))
+            .subscribe(format!("{}/project-b/#", broker.namespace()))
             .expect("foreign retained scan should subscribe successfully");
         assert!(
             foreign_cleanup.collect(Duration::from_secs(2)).is_empty(),
