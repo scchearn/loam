@@ -140,7 +140,7 @@ process.exit(1);
   }
 });
 
-test('packed Claude and Codex marketplaces expose the loam:ingestor component inventory and Codex agent profile', async () => {
+test('packed marketplaces expose loam:ingestor, the loam_ingestor profile, and subagent hooks', async () => {
   const fixture = await packedRoot();
   try {
     const claudeMarketplace = JSON.parse(await readFile(join(fixture.root, '.claude-plugin', 'marketplace.json'), 'utf8'));
@@ -166,6 +166,8 @@ test('packed Claude and Codex marketplaces expose the loam:ingestor component in
     assert.doesNotMatch(codexAgent, /^(?:model|model_reasoning_effort|sandbox_mode)\s*=/mu);
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'session-start.mjs'), 'utf8'));
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'stop.mjs'), 'utf8'));
+    await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'subagent-start.mjs'), 'utf8'));
+    await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'subagent-stop.mjs'), 'utf8'));
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
   }

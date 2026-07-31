@@ -16,7 +16,10 @@ const hookPath = join(packageRoot, 'hooks', 'session-start.mjs');
 const marketplaceRoot = join(packageRoot, 'plugins', 'loam-adapter');
 const marketplaceHookPath = join(marketplaceRoot, 'hooks', 'session-start.mjs');
 const marketplaceStopPath = join(marketplaceRoot, 'hooks', 'stop.mjs');
+const marketplaceSubagentStartPath = join(marketplaceRoot, 'hooks', 'subagent-start.mjs');
+const marketplaceSubagentStopPath = join(marketplaceRoot, 'hooks', 'subagent-stop.mjs');
 const codexStopPath = join(packageRoot, 'adapters', 'codex-stop.mjs');
+const ingestWorkerPath = join(packageRoot, 'adapters', 'ingest-worker.mjs');
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 async function runHook(env, payload = {}, path = hookPath) {
@@ -261,6 +264,107 @@ test('marketplace plugin owns SessionStart and Stop for Claude and Codex', async
     { loadHooks: async () => { throw new Error('old integration'); }, loadIngest },
   ), {});
   assert.deepEqual(calls.map(([kind]) => kind), ['ingest']);
+});
+
+test('shared SubagentStart and SubagentStop hooks match both separators but only Codex loam_ingestor acts', async () => {
+  const hooks = JSON.parse(await readFile(join(marketplaceRoot, 'hooks', 'hooks.json'), 'utf8'));
+  assert.match(hooks.hooks.SubagentStart[0].matcher, /loam_ingestor/u);
+  assert.match(hooks.hooks.SubagentStart[0].matcher, /loam:ingestor/u);
+  assert.equal(hooks.hooks.SubagentStop[0].matcher, hooks.hooks.SubagentStart[0].matcher);
+  assert.match(hooks.hooks.SubagentStart[0].hooks[0].command, /subagent-start\.mjs/u);
+  assert.match(hooks.hooks.SubagentStop[0].hooks[0].command, /subagent-stop\.mjs/u);
+
+  const start = await import(`${pathToFileURL(marketplaceSubagentStartPath).href}?subagent=${Date.now()}`);
+  const stop = await import(`${pathToFileURL(marketplaceSubagentStopPath).href}?subagent=${Date.now()}`);
+  const unavailable = { loadIngest: async () => { throw new Error('must stay inert'); } };
+  for (const [payload, env] of [
+    [{ cwd: '/workspace', agent_id: 'agent-1', agent_type: 'loam:ingestor' }, { CLAUDE_PLUGIN_ROOT: marketplaceRoot }],
+    [{ cwd: '/workspace', agent_id: 'agent-1', agent_type: 'foreign' }, { PLUGIN_ROOT: marketplaceRoot }],
+    [{ cwd: '/workspace', agent_id: 'agent-1', agent_type: 'loam_ingestor' }, { CLAUDE_PLUGIN_ROOT: marketplaceRoot }],
+  ]) {
+    assert.deepEqual(await start.handleSubagentStart(payload, env, unavailable), {});
+    assert.deepEqual(await stop.handleSubagentStop(payload, env, unavailable), {});
+  }
+});
+
+test('Codex SubagentStart injects resolved preparation-first context and SubagentStop finalizes by agent_id', async () => {
+  const start = await import(`${pathToFileURL(marketplaceSubagentStartPath).href}?start=${Date.now()}`);
+  const stop = await import(`${pathToFileURL(marketplaceSubagentStopPath).href}?stop=${Date.now()}`);
+  const calls = [];
+  const loadHooks = async () => ({
+    startHookWorker: async (input) => calls.push(['worker-start', input]),
+    finishHookWorker: async (input) => calls.push(['worker-finish', input]),
+  });
+  const loadIngest = async () => ({
+    resolveGlobalRoot: () => '/global',
+    bindNativeAgent: async (input) => {
+      calls.push(['bind', input]);
+      return {
+        status: 'bound', owns_claim: true, hook_run_id: 17,
+        workspace: '/workspace', agent_id: 'agent-17',
+        integration_path: '/global/integration/loam.mjs',
+        adapter_path: '/global/plugins/0.9.10',
+        worker_path: '/global/plugins/0.9.10/ingest-worker.mjs',
+      };
+    },
+    finalizeNativeAgentRun: async (input) => {
+      calls.push(['finalize', input]);
+      return { reason: 'ok', owns_claim: true, hook_run_id: 17, workspace: '/workspace' };
+    },
+  });
+  const env = { PLUGIN_ROOT: marketplaceRoot, LOAM_INGEST_GLOBAL_ROOT: '/global' };
+  const payload = { cwd: '/workspace', agent_id: 'agent-17', agent_type: 'loam_ingestor', last_assistant_message: 'I definitely succeeded' };
+  const response = await start.handleSubagentStart(payload, env, { loadHooks, loadIngest });
+  assert.equal(response.hookSpecificOutput.hookEventName, 'SubagentStart');
+  const context = response.hookSpecificOutput.additionalContext;
+  assert.match(context, /Agent identity: agent-17/u);
+  assert.match(context, /Workspace: \/workspace/u);
+  assert.match(context, /Installed integration: \/global\/integration\/loam\.mjs/u);
+  assert.match(context, /Installed adapter: \/global\/plugins\/0\.9\.10/u);
+  assert.match(context, /first action must be exactly this preparation command/iu);
+  assert.match(context, /ingest-worker\.mjs.*--native-prepare.*--agent-id.*agent-17/u);
+  assert.ok(context.indexOf('--native-prepare') < context.indexOf('loam::ingesting-codebase'));
+  assert.match(context, /action.*skip.*stop immediately/iu);
+  assert.deepEqual(calls.map(([kind]) => kind), ['bind', 'worker-start']);
+
+  calls.length = 0;
+  assert.deepEqual(await stop.handleSubagentStop(payload, env, { loadHooks, loadIngest }), {});
+  assert.deepEqual(calls.map(([kind]) => kind), ['finalize', 'worker-finish']);
+  assert.deepEqual(calls[0][1], { globalRoot: '/global', workspace: '/workspace', agentId: 'agent-17', env });
+  assert.equal(JSON.stringify(calls[0][1]).includes('definitely succeeded'), false, 'assistant text is not completion evidence');
+  assert.equal(calls[1][1].reason, 'ok');
+  assert.equal(calls[1][1].run.id, 17);
+});
+
+test('loam_ingestor native preparation command routes through the installed worker without launching a model', async () => {
+  const worker = await import(`${pathToFileURL(ingestWorkerPath).href}?native-prepare=${Date.now()}`);
+  let received;
+  const result = await worker.main({
+    nativePrepare: true,
+    globalRoot: '/global',
+    workspace: '/workspace',
+    agentId: 'agent-17',
+    skillsRoot: '/skills',
+    env: {},
+    prepareNativeAgentRun: async (input) => { received = input; return { action: 'skip', reason: 'busy' }; },
+    runWorker: async () => { throw new Error('native preparation must not launch a model'); },
+  });
+  assert.deepEqual(result, { action: 'skip', reason: 'busy' });
+  assert.deepEqual(received, {
+    globalRoot: '/global', workspace: '/workspace', agentId: 'agent-17', skillsRoot: '/skills', env: {},
+  });
+});
+
+test('packaged SubagentStart and SubagentStop handlers emit one inert JSON response on missing intent', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-subagent-output-'));
+  for (const path of [marketplaceSubagentStartPath, marketplaceSubagentStopPath]) {
+    const result = await runHook({
+      HOME: home, USERPROFILE: home, LOAM_HOME: join(home, '.agents', 'loam'), PLUGIN_ROOT: marketplaceRoot,
+    }, { cwd: home, agent_id: 'agent-missing', agent_type: 'loam_ingestor' }, path);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout, '{}\n');
+    assert.equal(result.stderr, '');
+  }
 });
 
 test('Codex systemMessage reports only immediate toast dispatch failures', async () => {

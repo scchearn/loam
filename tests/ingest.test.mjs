@@ -8,8 +8,9 @@ import { test } from 'node:test';
 
 import { fingerprintActionable } from '../integration/ingest-fingerprint.mjs';
 import {
-  claudeSessionName, dispatchBoundary, finalizeWorkerRun, gate, ingestStatus,
-  prepareWorkerRun, readIngestConfig, runRoot, runWorker, startWorker,
+  bindNativeAgent, claudeSessionName, dispatchBoundary, finalizeNativeAgentRun,
+  finalizeWorkerRun, gate, ingestStatus, prepareNativeAgentRun, prepareWorkerRun,
+  readIngestConfig, runRoot, runWorker, startWorker,
 } from '../integration/ingest.mjs';
 import { bootIdentity, childIdentity, processDescriptor, resolveExecutable, startTracked } from '../integration/ingest-process.mjs';
 
@@ -25,6 +26,29 @@ async function fixture() {
   const exclusions = join(skills, 'loam-ingesting-codebase', 'references', 'ingestion-exclusions.md');
   await writeFile(exclusions, '# exclusions\n');
   return { root, workspace, wiki, skills, exclusions };
+}
+
+async function nativeInstall(root) {
+  const adapterRoot = join(root, 'plugins', '0.9.10');
+  const integrationPath = join(root, 'integration', 'loam.mjs');
+  await mkdir(adapterRoot, { recursive: true });
+  await mkdir(join(root, 'integration'), { recursive: true });
+  await writeFile(join(adapterRoot, 'ingest-worker.mjs'), '// installed worker\n');
+  await writeFile(integrationPath, '// installed integration\n');
+  await writeFile(join(root, 'install.json'), JSON.stringify({
+    schema_version: 1,
+    plugin_version: '0.9.10',
+    runtime_version: '0.9.5',
+    target: 'x86_64-unknown-linux-musl',
+    runtime_sha256: 'a'.repeat(64),
+    runtime_path: join(root, 'bin', 'loam'),
+    adapter_root: adapterRoot,
+    integration_path: integrationPath,
+    skills_scope: 'global',
+    skills_source: 'scchearn/loam',
+    configured_harnesses: ['codex'],
+  }));
+  return { adapterRoot, integrationPath };
 }
 
 test('fingerprints the complete UTF-8 actionable set and includes exclusions identity', async () => {
@@ -334,6 +358,99 @@ test('Codex native race admits only the first lease holder in either ordering', 
     await finalizeWorkerRun(first, { launch: { background: false }, result: { code: 0 } });
     await assert.rejects(() => readFile(join(runRoot(root, workspace), 'lease.json')), { code: 'ENOENT' });
   }
+});
+
+test('Codex loam_ingestor binding prepares first and finalizes from verified state', async () => {
+  const { root, workspace, wiki, skills } = await fixture();
+  const { adapterRoot, integrationPath } = await nativeInstall(root);
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native', min_interval_seconds: 0 } }));
+
+  const boundary = { harness: 'codex', payload: { cwd: workspace, session_id: 'parent-1' }, globalRoot: root, skillsRoot: skills, env: {} };
+  assert.equal((await dispatchBoundary(boundary)).native_continuation.decision, 'block');
+  const bound = await bindNativeAgent({ globalRoot: root, workspace, agentId: 'agent-1' });
+  assert.equal(bound.status, 'bound');
+  assert.equal(bound.owns_claim, true);
+  assert.equal(bound.integration_path, integrationPath);
+  assert.equal(bound.adapter_path, adapterRoot);
+  assert.equal(bound.worker_path, join(adapterRoot, 'ingest-worker.mjs'));
+  const claim = JSON.parse(await readFile(join(runRoot(root, workspace), 'native-claim.json'), 'utf8'));
+  assert.equal(claim.claim, 'agent');
+  assert.equal(claim.agent_id, 'agent-1');
+
+  let ingested = false;
+  const runtimeRunner = async ({ args }) => args[0] === 'state'
+    ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: ingested ? 0 : 1 } }] }), stderr: '' }
+    : { code: 0, stdout: JSON.stringify(ingested ? [] : [{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' };
+  const prepared = await prepareNativeAgentRun({
+    globalRoot: root, workspace, agentId: 'agent-1', skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner, env: {},
+  });
+  assert.deepEqual(prepared, { action: 'run' });
+  const lease = JSON.parse(await readFile(join(runRoot(root, workspace), 'lease.json'), 'utf8'));
+  assert.equal(lease.launch_mode, 'codex_native');
+  assert.equal(lease.child_identity.agent_id, 'agent-1');
+  const agentFile = (await readdir(runRoot(root, workspace))).find((name) => name.startsWith('native-agent-'));
+  const agentRecord = JSON.parse(await readFile(join(runRoot(root, workspace), agentFile), 'utf8'));
+  await writeFile(join(runRoot(root, workspace), agentFile), JSON.stringify({ ...agentRecord, expires_at: 0 }));
+
+  ingested = true;
+  const finalized = await finalizeNativeAgentRun({
+    globalRoot: root, workspace, agentId: 'agent-1', runtimeRunner, env: {},
+  });
+  assert.equal(finalized.reason, 'ok');
+  assert.equal(finalized.owns_claim, true);
+  const stored = JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8'));
+  assert.equal(stored.status, 'ok');
+  await assert.rejects(() => readFile(join(runRoot(root, workspace), 'lease.json')), { code: 'ENOENT' });
+  assert.deepEqual(await finalizeNativeAgentRun({ globalRoot: root, workspace, agentId: 'agent-1', env: {} }), { reason: 'busy' });
+});
+
+test('Codex loam_ingestor preparation skips after fallback wins and missing or malformed intents stay inert', async () => {
+  const { root, workspace, wiki, skills } = await fixture();
+  await nativeInstall(root);
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native', min_interval_seconds: 0 } }));
+  const options = {
+    harness: 'codex', payload: { cwd: workspace, session_id: 'parent-2' }, globalRoot: root,
+    skillsRoot: skills, env: {}, spawn: () => ({ pid: 1 }),
+  };
+  assert.equal((await dispatchBoundary(options)).native_continuation.decision, 'block');
+  assert.equal((await dispatchBoundary({ ...options, payload: { ...options.payload, stop_hook_active: true } })).native_fallback, true);
+  const late = await bindNativeAgent({ globalRoot: root, workspace, agentId: 'agent-late' });
+  assert.equal(late.status, 'late');
+  assert.equal(late.owns_claim, false);
+
+  const runtimeRunner = async ({ args }) => args[0] === 'state'
+    ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+    : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' };
+  const fallback = await prepareWorkerRun({
+    harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner, env: {},
+  });
+  assert.equal(fallback.action, 'run');
+  assert.deepEqual(await prepareNativeAgentRun({
+    globalRoot: root, workspace, agentId: 'agent-late', skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner, env: {},
+  }), { action: 'skip', reason: 'busy' });
+  await finalizeWorkerRun(fallback, { launch: { background: false }, result: { code: 0 } });
+
+  const missingWorkspace = join(root, 'missing-workspace');
+  await mkdir(missingWorkspace);
+  assert.deepEqual(await bindNativeAgent({ globalRoot: root, workspace: missingWorkspace, agentId: 'agent-none' }), { status: 'missing' });
+  await mkdir(runRoot(root, missingWorkspace), { recursive: true });
+  await writeFile(join(runRoot(root, missingWorkspace), 'native-intent.json'), '{malformed');
+  assert.deepEqual(await bindNativeAgent({ globalRoot: root, workspace: missingWorkspace, agentId: 'agent-bad' }), { status: 'malformed' });
+  assert.deepEqual(await bindNativeAgent({ globalRoot: root, workspace, agentId: 'bad\nagent' }), { status: 'invalid' });
+});
+
+test('Codex loam_ingestor stop aborts an unprepared bound intent without trusting assistant text', async () => {
+  const { root, workspace, skills } = await fixture();
+  await nativeInstall(root);
+  await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native' } }));
+  assert.equal((await dispatchBoundary({ harness: 'codex', payload: { cwd: workspace }, globalRoot: root, skillsRoot: skills, env: {} })).native_continuation.decision, 'block');
+  await bindNativeAgent({ globalRoot: root, workspace, agentId: 'agent-abort' });
+  const aborted = await finalizeNativeAgentRun({ globalRoot: root, workspace, agentId: 'agent-abort', env: {} });
+  assert.equal(aborted.reason, 'unavailable');
+  assert.equal(aborted.owns_claim, true);
 });
 
 test('worker leases before full state and issues the exact exclusions-aware diff argv', async () => {

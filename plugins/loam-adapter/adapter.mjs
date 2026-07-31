@@ -159,6 +159,98 @@ export async function handleMarketplaceStop(payload = {}, {
   return stopResponse({ harness, visibility, outcome, failure });
 }
 
+function shellArg(value, platform = process.platform) {
+  const text = String(value);
+  return platform === 'win32'
+    ? `'${text.replaceAll("'", "''")}'`
+    : `'${text.replaceAll("'", `'"'"'`)}'`;
+}
+
+function nativeAgentContext(bound, { globalRoot, platform = process.platform } = {}) {
+  const command = [
+    process.execPath,
+    bound.worker_path,
+    '--native-prepare',
+    '--global-root', globalRoot,
+    '--workspace', bound.workspace,
+    '--agent-id', bound.agent_id,
+  ].map((value) => shellArg(value, platform)).join(' ');
+  return [
+    'You are the Codex loam_ingestor subagent for this pending Loam run.',
+    `Workspace: ${bound.workspace}`,
+    `Agent identity: ${bound.agent_id}`,
+    `Installed integration: ${bound.integration_path}`,
+    `Installed adapter: ${bound.adapter_path}`,
+    'Your first action must be exactly this preparation command:',
+    command,
+    'Parse its one-line JSON output. If action is "skip", stop immediately without invoking any ingestion skill.',
+    `Only if action is "run", invoke loam::ingesting-codebase exactly once for ${bound.workspace}.`,
+    'Do not spawn or delegate to any other agent.',
+  ].join('\n');
+}
+
+function nativeHookRun(result, globalRoot) {
+  return Number.isSafeInteger(result?.hook_run_id) && result.hook_run_id > 0
+    ? { id: result.hook_run_id, globalRoot, workspace: result.workspace }
+    : null;
+}
+
+export async function handleMarketplaceSubagentStart(payload = {}, {
+  harness = 'claude',
+  env = process.env,
+  loadHooks = defaultHookModules,
+  loadIngest = defaultIngestModules,
+  platform = process.platform,
+} = {}) {
+  if (harness !== 'codex' || payload?.agent_type !== 'loam_ingestor') return {};
+  try {
+    const ingest = await loadIngest();
+    const globalRoot = env.LOAM_INGEST_GLOBAL_ROOT || ingest.resolveGlobalRoot({ env });
+    const bound = await ingest.bindNativeAgent({
+      globalRoot,
+      workspace: workspaceFromPayload(payload),
+      agentId: payload.agent_id,
+    });
+    if (bound?.status !== 'bound' && bound?.status !== 'late') return {};
+    const run = bound.owns_claim ? nativeHookRun(bound, globalRoot) : null;
+    if (run) {
+      try { await (await loadHooks()).startHookWorker?.({ run, sessionId: bound.agent_id }); } catch {}
+    }
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'SubagentStart',
+        additionalContext: nativeAgentContext(bound, { globalRoot, platform }),
+      },
+    };
+  } catch {
+    return {};
+  }
+}
+
+export async function handleMarketplaceSubagentStop(payload = {}, {
+  harness = 'claude',
+  env = process.env,
+  loadHooks = defaultHookModules,
+  loadIngest = defaultIngestModules,
+} = {}) {
+  if (harness !== 'codex' || payload?.agent_type !== 'loam_ingestor') return {};
+  try {
+    const ingest = await loadIngest();
+    const globalRoot = env.LOAM_INGEST_GLOBAL_ROOT || ingest.resolveGlobalRoot({ env });
+    const result = await ingest.finalizeNativeAgentRun({
+      globalRoot,
+      workspace: workspaceFromPayload(payload),
+      agentId: payload.agent_id,
+      env,
+    });
+    const run = result?.owns_claim ? nativeHookRun(result, globalRoot) : null;
+    if (run) {
+      try { await (await loadHooks()).finishHookWorker?.({ run, reason: result.reason }); } catch {}
+    }
+  } catch {}
+  return {};
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
   let input = '';
   process.stdin.setEncoding('utf8');

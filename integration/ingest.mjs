@@ -3,6 +3,7 @@ import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/
 import { join, resolve } from 'node:path';
 
 import { assertInside, resolveSkillsRoot } from './paths.mjs';
+import { readInstallMetadata } from './metadata.mjs';
 import { checkReadiness, invokeRuntime, probeFullState } from './runtime.mjs';
 import {
   bootIdentity, childIdentity, classifyChild, execFile, processStartIdentity,
@@ -13,6 +14,7 @@ import { FingerprintError, fingerprintActionable } from './ingest-fingerprint.mj
 const PROMPT = 'Run the existing loam::ingesting-codebase skill for the provided workspace. Do not modify source files, commit, or push. Do not spawn other agents or subagents.';
 const DEFAULTS = Object.freeze({ enabled: true, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800, visibility: 'silent', require_visible_worker: false });
 const CODEX_NATIVE_REASON = 'Call spawn_agent exactly once using the loam_ingestor agent profile to run the pending Loam code-memory ingestion, then finish this continuation immediately without doing any other work or spawning any additional agents.';
+const NATIVE_AGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 // Notification surfaces are local IPC; 250 ms caps terminal teardown without making a hung surface part of ingestion latency.
 const NOTIFICATION_TIMEOUT_MS = 250;
 function hash(value) { return createHash('sha256').update(String(value)).digest('hex'); }
@@ -141,6 +143,10 @@ function nativeIntentPaths(globalRoot, workspace) {
   };
 }
 
+function nativeAgentPath(root, agentId) {
+  return join(root, `native-agent-${hash(agentId).slice(0, 16)}.json`);
+}
+
 function nativeSessionId(value) {
   return typeof value === 'string' && value.length > 0 && [...value].length <= 256 && !/[\u0000-\u001F\u007F]/u.test(value)
     ? value : null;
@@ -153,7 +159,26 @@ function validNativeIntent(value, workspace, now) {
     && ['pending', 'fallback', 'agent'].includes(value.claim)
     && Number.isFinite(value.created_at) && Number.isFinite(value.expires_at) && value.expires_at > now
     && (value.session_id === null || nativeSessionId(value.session_id) === value.session_id)
-    && (value.claim !== 'agent' || (typeof value.agent_id === 'string' && value.agent_id.length > 0));
+    && (value.claim !== 'agent' || NATIVE_AGENT_ID.test(value.agent_id));
+}
+
+function validNativeAgent(value, workspace, agentId, now) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && value.schema === 1 && value.workspace === workspace && value.harness === 'codex'
+    && value.agent_id === agentId && NATIVE_AGENT_ID.test(value.agent_id)
+    && typeof value.intent_id === 'string' && value.intent_id.length <= 64
+    && Number.isFinite(value.expires_at) && (now === undefined || value.expires_at > now);
+}
+
+async function installedNativePaths(globalRoot) {
+  const root = resolve(globalRoot);
+  const install = await readInstallMetadata(root);
+  const adapterPath = install.adapter_root;
+  const integrationPath = install.integration_path;
+  const workerPath = assertInside(root, join(adapterPath, 'ingest-worker.mjs'), 'worker path');
+  const [adapter, integration, worker] = await Promise.all([stat(adapterPath), stat(integrationPath), stat(workerPath)]);
+  if (!adapter.isDirectory() || !integration.isFile() || !worker.isFile()) throw new Error('installed native paths are unavailable');
+  return { adapter_path: adapterPath, integration_path: integrationPath, worker_path: workerPath };
 }
 
 async function withNativeIntentLock(paths, callback) {
@@ -245,6 +270,186 @@ async function clearNativeFallback(globalRoot, workspace, intentId) {
     if (claim?.claim === 'fallback' && claim.intent_id === intentId) await rm(paths.claimPath, { force: true });
     return { status: 'cleared' };
   });
+}
+
+export async function bindNativeAgent({ globalRoot, workspace, agentId, now = Date.now() } = {}) {
+  if (!NATIVE_AGENT_ID.test(agentId || '')) return { status: 'invalid' };
+  const canonical = await canonicalWorkspace(workspace);
+  let installed;
+  try { installed = await installedNativePaths(globalRoot); }
+  catch { return { status: 'unavailable' }; }
+  const paths = nativeIntentPaths(globalRoot, canonical);
+  return withNativeIntentLock(paths, async () => {
+    const agentPath = nativeAgentPath(paths.root, agentId);
+    const existing = await jsonRecord(agentPath);
+    if (validNativeAgent(existing.value, canonical, agentId, now)
+      && ['bound', 'preparing', 'prepared'].includes(existing.value.state)) {
+      return {
+        status: existing.value.owns_claim ? 'bound' : 'late',
+        ...installed,
+        ...existing.value,
+      };
+    }
+    const [intentRecord, claimRecord] = await Promise.all([
+      jsonRecord(paths.intentPath),
+      jsonRecord(paths.claimPath),
+    ]);
+    if (intentRecord.malformed || claimRecord.malformed) return { status: 'malformed' };
+    const intent = validNativeIntent(intentRecord.value, canonical, now) ? intentRecord.value : null;
+    const claim = validNativeIntent(claimRecord.value, canonical, now) ? claimRecord.value : null;
+    const source = claim || intent;
+    if (!source) return { status: 'missing' };
+    const ownsClaim = source.claim === 'pending' || (source.claim === 'agent' && source.agent_id === agentId);
+    if (source.claim === 'pending') {
+      const bound = { ...source, claim: 'agent', agent_id: agentId, claimed_at: now };
+      await atomicJson(paths.claimPath, bound);
+      await rm(paths.intentPath, { force: true });
+    }
+    const record = {
+      ...source,
+      ...installed,
+      schema: 1,
+      claim: ownsClaim ? 'agent' : source.claim,
+      agent_id: agentId,
+      owns_claim: ownsClaim,
+      state: 'bound',
+      bound_at: now,
+    };
+    await atomicJson(agentPath, record);
+    return { status: ownsClaim ? 'bound' : 'late', ...record };
+  });
+}
+
+function persistedPreparation(prepared) {
+  const {
+    action, harness, workspace, globalRoot, skillsRoot, platform, root,
+    config, lease, readiness, exclusionsPath, fingerprint,
+  } = prepared;
+  return {
+    action, harness, workspace, globalRoot, skillsRoot, platform, root,
+    config, lease, readiness, exclusionsPath, fingerprint,
+  };
+}
+
+async function updateNativeAgent(paths, agentId, prepareId, update) {
+  return withNativeIntentLock(paths, async () => {
+    const path = nativeAgentPath(paths.root, agentId);
+    const record = await json(path);
+    if (!record || (prepareId && record.prepare_id !== prepareId)) return { status: 'missing' };
+    await atomicJson(path, { ...record, ...update, updated_at: Date.now() });
+    return { status: 'updated' };
+  });
+}
+
+export async function prepareNativeAgentRun({
+  globalRoot, workspace, agentId, skillsRoot, env = process.env, platform = process.platform,
+  runtimeRunner, readiness,
+} = {}) {
+  if (!NATIVE_AGENT_ID.test(agentId || '')) return { action: 'skip', reason: 'unavailable' };
+  const canonical = await canonicalWorkspace(workspace);
+  const paths = nativeIntentPaths(globalRoot, canonical);
+  const prepareId = randomUUID();
+  const admitted = await withNativeIntentLock(paths, async () => {
+    const path = nativeAgentPath(paths.root, agentId);
+    const record = await json(path);
+    if (!validNativeAgent(record, canonical, agentId, Date.now()) || record.state !== 'bound') return { status: 'busy' };
+    await atomicJson(path, { ...record, state: 'preparing', prepare_id: prepareId, updated_at: Date.now() });
+    return { status: 'admitted' };
+  });
+  if (admitted.status !== 'admitted') return { action: 'skip', reason: admitted.status === 'busy' ? 'busy' : 'unavailable' };
+  try {
+    const prepared = await prepareWorkerRun({
+      harness: 'codex', workspace: canonical, globalRoot, skillsRoot, env, platform,
+      runtimeRunner, readiness, nativeAgentId: agentId,
+    });
+    if (prepared.action !== 'run') {
+      const result = prepared.result || { reason: 'unavailable' };
+      await updateNativeAgent(paths, agentId, prepareId, { state: 'skipped', result });
+      return { action: 'skip', reason: result.reason };
+    }
+    if (!(await updateLease(prepared.root, prepared.lease, { launch_state: 'launched' }))) {
+      await finalizeWorkerRun(prepared, { launch: { background: false }, skipReason: 'orphan_unknown' });
+      await updateNativeAgent(paths, agentId, prepareId, { state: 'failed', result: { reason: 'unavailable' } });
+      return { action: 'skip', reason: 'unavailable' };
+    }
+    const updated = await updateNativeAgent(paths, agentId, prepareId, {
+      state: 'prepared',
+      prepared: persistedPreparation(prepared),
+    });
+    if (updated.status !== 'updated') {
+      await finalizeWorkerRun(prepared, { launch: { background: false }, skipReason: 'orphan_unknown' });
+      return { action: 'skip', reason: 'unavailable' };
+    }
+    return { action: 'run' };
+  } catch {
+    await updateNativeAgent(paths, agentId, prepareId, { state: 'failed', result: { reason: 'unavailable' } });
+    return { action: 'skip', reason: 'unavailable' };
+  }
+}
+
+async function finishNativeRecord(paths, record, update) {
+  await withNativeIntentLock(paths, async () => {
+    const path = nativeAgentPath(paths.root, record.agent_id);
+    const current = await json(path);
+    if (!current || current.intent_id !== record.intent_id) return { status: 'missing' };
+    await atomicJson(path, { ...current, ...update, updated_at: Date.now() });
+    if (current.owns_claim) {
+      const claim = await json(paths.claimPath);
+      if (claim?.intent_id === current.intent_id && claim.agent_id === current.agent_id) {
+        await rm(paths.claimPath, { force: true });
+      }
+    }
+    return { status: 'finished' };
+  });
+}
+
+export async function finalizeNativeAgentRun({
+  globalRoot, workspace, agentId, env = process.env, runtimeRunner,
+} = {}) {
+  if (!NATIVE_AGENT_ID.test(agentId || '')) return { reason: 'unavailable' };
+  const canonical = await canonicalWorkspace(workspace);
+  const paths = nativeIntentPaths(globalRoot, canonical);
+  const claimed = await withNativeIntentLock(paths, async () => {
+    const path = nativeAgentPath(paths.root, agentId);
+    const record = await json(path);
+    if (!validNativeAgent(record, canonical, agentId)) return { status: 'missing' };
+    if (record.state === 'finished' || record.state === 'finalizing') return { status: 'busy' };
+    if (record.state === 'skipped' || record.state === 'failed') return { status: 'terminal', record };
+    await atomicJson(path, { ...record, state: 'finalizing', updated_at: Date.now() });
+    return { status: record.state === 'prepared' && record.prepared ? 'prepared' : 'abort', record };
+  });
+  if (claimed.status === 'missing' || claimed.status === 'busy') return { reason: 'busy' };
+  const record = claimed.record;
+  const resultBase = {
+    owns_claim: record.owns_claim,
+    hook_run_id: record.hook_run_id,
+    workspace: canonical,
+  };
+  if (claimed.status === 'terminal') {
+    const reason = record.result?.reason || 'unavailable';
+    await finishNativeRecord(paths, record, { state: 'finished', result: { reason } });
+    return { reason, ...resultBase };
+  }
+  if (claimed.status === 'abort') {
+    const lease = await json(join(paths.root, 'lease.json'));
+    if (lease?.launch_mode === 'codex_native' && lease.child_identity?.agent_id === agentId) {
+      await updateLease(paths.root, lease, { launch_state: 'terminal' });
+      await writeSkip(paths.root, 'runtime_unavailable', { detail: 'native agent stopped before preparation completed' }, lease.lease_id);
+      await releaseLease(paths.root, lease.lease_id);
+    }
+    await finishNativeRecord(paths, record, { state: 'finished', result: { reason: 'unavailable' } });
+    return { reason: 'unavailable', ...resultBase };
+  }
+  const prepared = { ...record.prepared, env, runtimeRunner };
+  await updateLease(paths.root, prepared.lease, { launch_state: 'terminal' });
+  let outcome;
+  try {
+    outcome = await finalizeWorkerRun(prepared, { launch: { background: false }, result: { code: 0 } });
+  } catch {
+    outcome = { reason: 'unavailable' };
+  }
+  await finishNativeRecord(paths, record, { state: 'finished', prepared: null, result: outcome });
+  return { reason: outcome.reason || 'unavailable', ...resultBase };
 }
 
 async function startBoundaryWorker(options, result, { nativeFallback = false, intentId } = {}) {
@@ -380,6 +585,11 @@ async function inspectIntent(leaseRecord, workspace, openCodeSession, env = proc
   if (lease.schema !== 1) return { state: 'unknown', intent: lease };
   if (!lease.launch_mode) return { state: 'dead', intent: lease };
   if (lease.launch_mode === 'claude_bg') return { ...(await queryClaude(workspace, lease, env)), intent: lease };
+  if (lease.launch_mode === 'codex_native') {
+    if (lease.launch_state === 'terminal') return { state: 'terminal', intent: lease };
+    if (!NATIVE_AGENT_ID.test(lease.child_identity?.agent_id || '')) return { state: 'unknown', intent: lease };
+    return { state: Date.parse(lease.hard_deadline) > Date.now() ? 'live' : 'terminal', intent: lease };
+  }
   if (!lease.child_identity) return { state: 'unknown', intent: lease };
   if (lease.launch_mode === 'claude_print' || lease.launch_mode === 'codex_exec') {
     return { state: await classifyChild(lease.child_identity), intent: lease };
@@ -664,7 +874,7 @@ async function recordProgress(root, pre, post, count, lease) {
 
 export async function prepareWorkerRun({
   harness, workspace, globalRoot, skillsRoot, env = process.env, platform = process.platform,
-  runtimeRunner, readiness, openCodeSession, notify,
+  runtimeRunner, readiness, openCodeSession, notify, nativeAgentId,
 } = {}) {
   const canonical = await canonicalWorkspace(workspace);
   const root = runRoot(globalRoot, canonical);
@@ -721,9 +931,11 @@ export async function prepareWorkerRun({
     if (!fingerprint.complete) return await skip('fingerprint_unavailable', { actionable_count: fingerprint.count, actionable_fingerprint: fingerprint.fingerprint });
     const previousRecord = await json(join(root, 'last-run.json'));
     if (previousRecord && previousRecord.schema !== 1) return await skip('schema_unknown');
-    const selectedLaunch = await launchPlan({ harness, workspace: canonical, env });
+    const selectedLaunch = nativeAgentId ? { mode: 'codex_native' } : await launchPlan({ harness, workspace: canonical, env });
     const selectedLaunchMode = selectedLaunch.mode;
-    const plannedIdentity = selectedLaunchMode === 'claude_bg'
+    const plannedIdentity = selectedLaunchMode === 'codex_native'
+      ? { agent_id: nativeAgentId }
+      : selectedLaunchMode === 'claude_bg'
       ? {
           name: claudeSessionName(canonical),
           owner_identity: { pid: lease.owner_pid, boot_id: lease.boot_id, process_start: lease.process_start },
@@ -745,7 +957,7 @@ export async function prepareWorkerRun({
       launch_mode: selectedLaunchMode,
       launch_state: 'planned',
       planned_identity: plannedIdentity,
-      child_identity: null,
+      child_identity: selectedLaunchMode === 'codex_native' ? { agent_id: nativeAgentId } : null,
       downgrade_reason: selectedLaunch.downgradeReason || null,
       hard_deadline: new Date(Date.now() + config.timeout_seconds * 1000).toISOString(),
     }))) return await skip('orphan_unknown');
