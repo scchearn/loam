@@ -1,0 +1,661 @@
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const START_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub struct BrokerFixture {
+    root: PathBuf,
+    namespace: String,
+    password: String,
+    foreign_password: String,
+    password_port: u16,
+    mtls_port: u16,
+    backend: Backend,
+    child: Option<Child>,
+    finished: bool,
+}
+
+enum Backend {
+    Native {
+        mosquitto: PathBuf,
+        mosquitto_passwd: PathBuf,
+    },
+    Docker {
+        docker: PathBuf,
+        image: String,
+        container: String,
+        user: Option<String>,
+    },
+}
+
+impl BrokerFixture {
+    pub fn provision(label: &str) -> Result<Self, String> {
+        if label.is_empty()
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err("broker fixture label must be ASCII alphanumeric or '-'".to_owned());
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
+            .as_nanos();
+        let run_id = format!("{}-{nonce:x}", std::process::id());
+        let root = std::env::temp_dir().join(format!("loam-mqtt-{label}-{run_id}"));
+        fs::create_dir(&root)
+            .map_err(|error| format!("create broker fixture {}: {error}", root.display()))?;
+        set_private_permissions(&root, true)?;
+        fs::create_dir(root.join("persistence")).map_err(|error| {
+            format!(
+                "create broker persistence directory {}: {error}",
+                root.display()
+            )
+        })?;
+        set_private_permissions(&root.join("persistence"), true)?;
+
+        let result = Self::build(root, run_id);
+        if let Err(error) = &result {
+            eprintln!("broker fixture setup failed; artifacts preserved: {error}");
+        }
+        result
+    }
+
+    fn build(root: PathBuf, run_id: String) -> Result<Self, String> {
+        let openssl = required_program("LOAM_OPENSSL_BIN", "openssl")?;
+        let backend = Backend::detect(&run_id)?;
+        let password_port = reserve_port()?;
+        let mtls_port = reserve_port()?;
+        if password_port == mtls_port {
+            return Err("broker listeners unexpectedly reserved the same port".to_owned());
+        }
+
+        write_certificates(&openssl, &root)?;
+        let password = format!("loam-{run_id}");
+        let foreign_password = format!("foreign-{run_id}");
+        backend.write_password_entry(&root, "actor-a", &password, true)?;
+        backend.write_password_entry(&root, "actor-b", &foreign_password, false)?;
+
+        let namespace = format!("loam/v1/test-{run_id}");
+        let acl =
+            include_str!("../fixtures/mqtt/broker/acl.template").replace("@NAMESPACE@", &namespace);
+        fs::write(root.join("acl"), acl).map_err(|error| format!("write broker ACL: {error}"))?;
+        set_private_permissions(&root.join("acl"), false)?;
+
+        let persistence = format!("{}/", root.join("persistence").display());
+        let config = include_str!("../fixtures/mqtt/broker/mosquitto.conf.template")
+            .replace("@PASSWORD_PORT@", &password_port.to_string())
+            .replace("@MTLS_PORT@", &mtls_port.to_string())
+            .replace("@PERSISTENCE@", &persistence)
+            .replace("@CA_CERT@", &root.join("ca.crt").display().to_string())
+            .replace(
+                "@SERVER_CERT@",
+                &root.join("server.crt").display().to_string(),
+            )
+            .replace(
+                "@SERVER_KEY@",
+                &root.join("server.key").display().to_string(),
+            )
+            .replace(
+                "@PASSWORD_FILE@",
+                &root.join("passwords").display().to_string(),
+            )
+            .replace("@ACL_FILE@", &root.join("acl").display().to_string());
+        fs::write(root.join("mosquitto.conf"), config)
+            .map_err(|error| format!("write broker configuration: {error}"))?;
+
+        let mut fixture = Self {
+            root,
+            namespace,
+            password,
+            foreign_password,
+            password_port,
+            mtls_port,
+            backend,
+            child: None,
+            finished: false,
+        };
+        fixture.start()?;
+        Ok(fixture)
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+
+    pub fn foreign_password(&self) -> &str {
+        &self.foreign_password
+    }
+
+    pub fn password_port(&self) -> u16 {
+        self.password_port
+    }
+
+    pub fn mtls_port(&self) -> u16 {
+        self.mtls_port
+    }
+
+    pub fn ca_certificate(&self) -> Result<Vec<u8>, String> {
+        read_file(&self.root.join("ca.crt"))
+    }
+
+    pub fn client_certificate(&self) -> Result<Vec<u8>, String> {
+        read_file(&self.root.join("client.crt"))
+    }
+
+    pub fn client_key(&self) -> Result<Vec<u8>, String> {
+        read_file(&self.root.join("client.key"))
+    }
+
+    pub fn logs(&self) -> Result<String, String> {
+        let mut log = String::new();
+        File::open(self.root.join("mosquitto.log"))
+            .and_then(|mut file| file.read_to_string(&mut log))
+            .map_err(|error| format!("read broker log: {error}"))?;
+        Ok(log)
+    }
+
+    pub fn wait_for_log(&self, needle: &str) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let log = self.logs()?;
+            if log.contains(needle) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "broker log did not contain {needle:?}; log follows:\n{log}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    pub fn restart(&mut self) -> Result<(), String> {
+        self.stop()?;
+        self.start()
+    }
+
+    pub fn finish(mut self) -> Result<(), String> {
+        self.stop()?;
+        validate_cleanup_root(&self.root)?;
+        fs::remove_dir_all(&self.root).map_err(|error| {
+            format!(
+                "remove broker fixture directory {}: {error}",
+                self.root.display()
+            )
+        })?;
+        self.finished = true;
+        Ok(())
+    }
+
+    fn start(&mut self) -> Result<(), String> {
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("mosquitto.log"))
+            .map_err(|error| format!("open broker log: {error}"))?;
+        let stderr = log
+            .try_clone()
+            .map_err(|error| format!("clone broker log handle: {error}"))?;
+        self.child = Some(self.backend.spawn(&self.root, log, stderr)?);
+        let child = self
+            .child
+            .as_mut()
+            .expect("broker child is present immediately after spawn");
+        wait_for_listener(self.password_port, child, &self.root)?;
+        wait_for_listener(self.mtls_port, child, &self.root)?;
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        self.backend.stop(&mut child)
+    }
+}
+
+impl Drop for BrokerFixture {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Err(error) = self.stop() {
+            eprintln!("broker fixture cleanup failed: {error}");
+        }
+        eprintln!(
+            "broker fixture artifacts preserved for diagnosis: {}",
+            self.root.display()
+        );
+    }
+}
+
+impl Backend {
+    fn detect(run_id: &str) -> Result<Self, String> {
+        let mosquitto = optional_program("LOAM_MOSQUITTO_BIN", "mosquitto");
+        let mosquitto_passwd = optional_program("LOAM_MOSQUITTO_PASSWD_BIN", "mosquitto_passwd");
+        if let (Some(mosquitto), Some(mosquitto_passwd)) = (mosquitto, mosquitto_passwd) {
+            return Ok(Self::Native {
+                mosquitto,
+                mosquitto_passwd,
+            });
+        }
+
+        let image = std::env::var("LOAM_MQTT_DOCKER_IMAGE")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "mosquitto and mosquitto_passwd are required; CI must install them, or local runs may set LOAM_MQTT_DOCKER_IMAGE explicitly".to_owned()
+            })?;
+        let docker = required_program("LOAM_DOCKER_BIN", "docker")?;
+        Ok(Self::Docker {
+            docker,
+            image,
+            container: format!("loam-mqtt-{run_id}"),
+            user: numeric_user(),
+        })
+    }
+
+    fn write_password_entry(
+        &self,
+        root: &Path,
+        username: &str,
+        password: &str,
+        create: bool,
+    ) -> Result<(), String> {
+        let password_file = root.join("passwords");
+        match self {
+            Self::Native {
+                mosquitto_passwd, ..
+            } => {
+                let mut command = Command::new(mosquitto_passwd);
+                command.arg("-b");
+                if create {
+                    command.arg("-c");
+                }
+                command.arg(&password_file).arg(username).arg(password);
+                run_checked(&mut command, "write Mosquitto password entry")
+            }
+            Self::Docker {
+                docker,
+                image,
+                user,
+                ..
+            } => {
+                let mut command = Command::new(docker);
+                command.arg("run").arg("--rm");
+                if let Some(user) = user {
+                    command.arg("--user").arg(user);
+                }
+                command
+                    .arg("--volume")
+                    .arg(format!("{}:{}", root.display(), root.display()))
+                    .arg(image)
+                    .arg("mosquitto_passwd")
+                    .arg("-b");
+                if create {
+                    command.arg("-c");
+                }
+                command.arg(&password_file).arg(username).arg(password);
+                run_checked(&mut command, "write Mosquitto password entry in Docker")
+            }
+        }
+    }
+
+    fn spawn(&self, root: &Path, stdout: File, stderr: File) -> Result<Child, String> {
+        let config = root.join("mosquitto.conf");
+        let mut command = match self {
+            Self::Native { mosquitto, .. } => {
+                let mut command = Command::new(mosquitto);
+                command.arg("-c").arg(&config).arg("-v");
+                command
+            }
+            Self::Docker {
+                docker,
+                image,
+                container,
+                user,
+            } => {
+                let mut command = Command::new(docker);
+                command
+                    .arg("run")
+                    .arg("--rm")
+                    .arg("--network")
+                    .arg("host")
+                    .arg("--name")
+                    .arg(container);
+                if let Some(user) = user {
+                    command.arg("--user").arg(user);
+                }
+                command
+                    .arg("--volume")
+                    .arg(format!("{}:{}", root.display(), root.display()))
+                    .arg(image)
+                    .arg("mosquitto")
+                    .arg("-c")
+                    .arg(&config)
+                    .arg("-v");
+                command
+            }
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .map_err(|error| format!("start Mosquitto broker: {error}"))
+    }
+
+    fn stop(&self, child: &mut Child) -> Result<(), String> {
+        if child
+            .try_wait()
+            .map_err(|error| format!("inspect Mosquitto process: {error}"))?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        match self {
+            Self::Docker {
+                docker, container, ..
+            } => {
+                let output = Command::new(docker)
+                    .arg("stop")
+                    .arg("--time")
+                    .arg("5")
+                    .arg(container)
+                    .output()
+                    .map_err(|error| format!("stop Mosquitto Docker container: {error}"))?;
+                if !output.status.success() {
+                    child
+                        .kill()
+                        .map_err(|error| format!("kill Mosquitto Docker process: {error}"))?;
+                }
+            }
+            Self::Native { .. } => terminate_native(child)?,
+        }
+        child
+            .wait()
+            .map_err(|error| format!("wait for Mosquitto process: {error}"))?;
+        Ok(())
+    }
+}
+
+fn write_certificates(openssl: &Path, root: &Path) -> Result<(), String> {
+    fs::write(
+        root.join("server.ext"),
+        "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n",
+    )
+    .map_err(|error| format!("write server certificate extensions: {error}"))?;
+    fs::write(root.join("client.ext"), "extendedKeyUsage=clientAuth\n")
+        .map_err(|error| format!("write client certificate extensions: {error}"))?;
+
+    openssl_checked(
+        openssl,
+        root,
+        &[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-nodes",
+            "-days",
+            "2",
+            "-subj",
+            "/CN=Loam MQTT Test CA",
+            "-keyout",
+            "ca.key",
+            "-out",
+            "ca.crt",
+        ],
+        "create test CA",
+    )?;
+    openssl_checked(
+        openssl,
+        root,
+        &[
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+            "-keyout",
+            "server.key",
+            "-out",
+            "server.csr",
+        ],
+        "create broker certificate request",
+    )?;
+    openssl_checked(
+        openssl,
+        root,
+        &[
+            "x509",
+            "-req",
+            "-in",
+            "server.csr",
+            "-CA",
+            "ca.crt",
+            "-CAkey",
+            "ca.key",
+            "-CAcreateserial",
+            "-days",
+            "2",
+            "-sha256",
+            "-extfile",
+            "server.ext",
+            "-out",
+            "server.crt",
+        ],
+        "sign broker certificate",
+    )?;
+    openssl_checked(
+        openssl,
+        root,
+        &[
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-nodes",
+            "-subj",
+            "/CN=mtls-actor",
+            "-keyout",
+            "client.key",
+            "-out",
+            "client.csr",
+        ],
+        "create client certificate request",
+    )?;
+    openssl_checked(
+        openssl,
+        root,
+        &[
+            "x509",
+            "-req",
+            "-in",
+            "client.csr",
+            "-CA",
+            "ca.crt",
+            "-CAkey",
+            "ca.key",
+            "-CAcreateserial",
+            "-days",
+            "2",
+            "-sha256",
+            "-extfile",
+            "client.ext",
+            "-out",
+            "client.crt",
+        ],
+        "sign client certificate",
+    )?;
+    for name in ["ca.key", "server.key", "client.key"] {
+        set_private_permissions(&root.join(name), false)?;
+    }
+    Ok(())
+}
+
+fn openssl_checked(
+    openssl: &Path,
+    root: &Path,
+    arguments: &[&str],
+    description: &str,
+) -> Result<(), String> {
+    let mut command = Command::new(openssl);
+    command.current_dir(root).args(arguments);
+    run_checked(&mut command, description)
+}
+
+fn run_checked(command: &mut Command, description: &str) -> Result<(), String> {
+    let output = command
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("{description}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format_output(description, &output))
+}
+
+fn format_output(description: &str, output: &Output) -> String {
+    format!(
+        "{description} exited {}: stdout={:?}, stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn wait_for_listener(port: u16, child: &mut Child, root: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + START_TIMEOUT;
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("inspect starting broker: {error}"))?
+        {
+            let log = fs::read_to_string(root.join("mosquitto.log")).unwrap_or_default();
+            return Err(format!("broker exited during startup ({status}):\n{log}"));
+        }
+        if Instant::now() >= deadline {
+            let log = fs::read_to_string(root.join("mosquitto.log")).unwrap_or_default();
+            return Err(format!(
+                "broker did not listen on 127.0.0.1:{port} within {START_TIMEOUT:?}:\n{log}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn reserve_port() -> Result<u16, String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|error| format!("reserve broker port: {error}"))?;
+    listener
+        .local_addr()
+        .map(|address| address.port())
+        .map_err(|error| format!("read reserved broker port: {error}"))
+}
+
+fn required_program(environment: &str, name: &str) -> Result<PathBuf, String> {
+    optional_program(environment, name).ok_or_else(|| {
+        format!("required executable {name:?} is unavailable; set {environment} to its exact path")
+    })
+}
+
+fn optional_program(environment: &str, name: &str) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(environment).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?).find_map(|directory| {
+        let candidate = directory.join(name);
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+fn read_file(path: &Path) -> Result<Vec<u8>, String> {
+    fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))
+}
+
+fn validate_cleanup_root(root: &Path) -> Result<(), String> {
+    let temporary = std::env::temp_dir();
+    let name = root.file_name().and_then(|name| name.to_str());
+    if !root.starts_with(&temporary) || !name.is_some_and(|name| name.starts_with("loam-mqtt-")) {
+        return Err(format!(
+            "refusing to remove unsafe broker fixture path {}",
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path, directory: bool) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = if directory { 0o700 } else { 0o600 };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|error| format!("set private permissions on {}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path, _directory: bool) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn terminate_native(child: &mut Child) -> Result<(), String> {
+    let output = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .output()
+        .map_err(|error| format!("terminate Mosquitto process: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        child
+            .kill()
+            .map_err(|error| format!("kill Mosquitto process: {error}"))
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_native(child: &mut Child) -> Result<(), String> {
+    child
+        .kill()
+        .map_err(|error| format!("kill Mosquitto process: {error}"))
+}
+
+#[cfg(unix)]
+fn numeric_user() -> Option<String> {
+    let uid = Command::new("id").arg("-u").output().ok()?;
+    let gid = Command::new("id").arg("-g").output().ok()?;
+    if !uid.status.success() || !gid.status.success() {
+        return None;
+    }
+    Some(format!(
+        "{}:{}",
+        String::from_utf8_lossy(&uid.stdout).trim(),
+        String::from_utf8_lossy(&gid.stdout).trim()
+    ))
+}
+
+#[cfg(not(unix))]
+fn numeric_user() -> Option<String> {
+    None
+}

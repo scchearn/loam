@@ -1,0 +1,8 @@
+user actor-a
+topic readwrite @NAMESPACE@/org-a/project-a/#
+
+user mtls-actor
+topic readwrite @NAMESPACE@/org-a/project-a/#
+
+user actor-b
+topic readwrite @NAMESPACE@/org-b/project-b/#
