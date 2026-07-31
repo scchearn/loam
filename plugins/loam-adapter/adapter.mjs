@@ -129,6 +129,7 @@ export async function handleMarketplaceStop(payload = {}, {
         session_id: typeof payload?.session_id === 'string' ? payload.session_id : undefined,
         cwd: typeof payload?.cwd === 'string' ? payload.cwd : undefined,
         stop_hook_active: payload?.stop_hook_active === true,
+        agent_type: typeof payload?.agent_type === 'string' ? payload.agent_type : undefined,
       },
       globalRoot,
       skillsRoot: env.LOAM_INGEST_SKILLS_ROOT || resolveSkillsRoot({ env }),

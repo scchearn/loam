@@ -86,7 +86,8 @@ function publicReason(reason) {
 
 function recursion(payload, env) {
   return env.LOAM_INGEST_WORKER === '1' || env.LOAM_INGEST_CHILD === '1'
-    || payload.stop_hook_active === true || payload.loam_ingest_child === true || payload.child_session === true;
+    || payload.stop_hook_active === true || payload.loam_ingest_child === true || payload.child_session === true
+    || payload.agent_type === 'loam:ingestor';
 }
 
 export async function gate({ harness, payload = {}, globalRoot, env = process.env, now = Date.now() } = {}) {

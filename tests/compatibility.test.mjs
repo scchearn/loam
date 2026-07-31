@@ -336,21 +336,26 @@ test('marketplace Stop writes exact hook JSON when logging is unavailable', asyn
   assert.equal(result.stderr, '');
 });
 
-test('Claude marketplace Stop makes no background-session registration claim', async () => {
+test('Claude marketplace Stop forwards agent_type without making a background-session registration claim', async () => {
   const stop = await import(`${pathToFileURL(marketplaceStopPath).href}?claude-visibility=${Date.now()}`);
+  let forwarded;
   const response = await stop.handleStop(
-    { cwd: '/workspace', session_id: 'claude-session' },
+    { cwd: '/workspace', session_id: 'claude-session', agent_type: 'loam:ingestor' },
     { CLAUDE_PLUGIN_ROOT: marketplaceRoot },
     {
       loadHooks: async () => { throw new Error('logging unavailable'); },
       loadIngest: async () => ({
         resolveGlobalRoot: () => '/global',
         resolveSkillsRoot: () => '/skills',
-        dispatchBoundary: async () => ({ action: 'spawn_worker', workspace: '/workspace' }),
+        dispatchBoundary: async (input) => {
+          forwarded = input;
+          return { action: 'spawn_worker', workspace: '/workspace' };
+        },
       }),
     },
   );
 
   assert.deepEqual(response, {});
   assert.equal('systemMessage' in response, false);
+  assert.equal(forwarded.payload.agent_type, 'loam:ingestor');
 });

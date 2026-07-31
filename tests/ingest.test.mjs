@@ -96,6 +96,8 @@ test('boundary gate honors config and environment precedence and blocks worker r
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { enabled: true } }));
   assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
   assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_WORKER: '1' } }), { action: 'skip', reason: 'disabled' });
+  assert.deepEqual(await gate({ ...options, payload: { cwd: workspace, agent_type: 'loam:ingestor' }, env: {} }), { action: 'skip', reason: 'disabled' });
+  assert.equal((await gate({ ...options, payload: { cwd: workspace, agent_type: 'other-agent' }, env: {} })).action, 'spawn_worker');
 });
 
 test('visibility config accepts supported values and silently normalizes everything else', async () => {
@@ -433,6 +435,10 @@ test('published adapters load only the staged integration after the source tree 
   try {
     const claude = await import(`${pathToFileURL(join(adapterRoot, 'claude-stop.mjs')).href}?test=claude`);
     assert.equal((await claude.main({ env, payload: { cwd: root } })).reason, 'disabled');
+    assert.equal((await claude.main({
+      env: { ...env, LOAM_INGEST_BACKGROUND: '1' },
+      payload: { cwd: root, agent_type: 'loam:ingestor' },
+    })).reason, 'disabled');
     const codex = await import(`${pathToFileURL(join(adapterRoot, 'codex-stop.mjs')).href}?test=codex`);
     assert.deepEqual(await codex.main({ env, input: { cwd: root } }), {});
     const stdout = await new Promise((resolvePromise, reject) => {
