@@ -416,7 +416,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease,
       try {
         started = startTracked({
           command: 'claude',
-          args: ['--bg', '--name', name, '--settings', settingsPath, '--permission-mode', 'dontAsk', '--allowedTools', 'Read Glob Grep Write Edit Bash', prompt],
+          args: ['--bg', '--agent', 'loam:ingestor', '--name', name, '--settings', settingsPath, '--permission-mode', 'dontAsk', '--allowedTools', 'Read Glob Grep Write Edit Bash', prompt],
           cwd: workspace, env, timeoutMs,
           detached: true, captureOutput: false,
         });

@@ -557,7 +557,7 @@ process.exit(args[0] === '--bg' ? 1 : 0);
   assert.equal(await readFile(join(workspace, 'src', 'a.js'), 'utf8'), source);
 });
 
-test('Claude visibility uses one registered Agent View session name for command and launch event', async () => {
+test('Claude loam:ingestor visibility uses one registered Agent View session name for command and launch event', async () => {
   const { root, workspace, wiki, skills } = await fixture();
   const bin = await mkdtemp(join(tmpdir(), 'loam-claude-visible-'));
   const command = join(bin, process.platform === 'win32' ? 'claude.cmd' : 'claude');
@@ -614,7 +614,9 @@ process.exit(0);
     const argv = (await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse);
     const background = argv.filter((args) => args[0] === '--bg').at(-1);
     assert.equal(result.reason, 'ok');
+    assert.equal(background[background.indexOf('--agent') + 1], 'loam:ingestor');
     assert.equal(background[background.indexOf('--name') + 1], expectedName);
+    assert.equal(background[background.indexOf('--permission-mode') + 1], 'dontAsk');
     assert.equal(launchEvents.length, configuredVisibility === 'silent' ? 0 : 1);
     if (launchEvents.length) {
       assert.equal(launchEvents[0].launchMode, 'claude_bg');

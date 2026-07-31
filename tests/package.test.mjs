@@ -140,7 +140,7 @@ process.exit(1);
   }
 });
 
-test('packed Claude and Codex marketplaces point to one skill-free adapter', async () => {
+test('packed Claude and Codex marketplaces expose the loam:ingestor component inventory', async () => {
   const fixture = await packedRoot();
   try {
     const claudeMarketplace = JSON.parse(await readFile(join(fixture.root, '.claude-plugin', 'marketplace.json'), 'utf8'));
@@ -154,6 +154,11 @@ test('packed Claude and Codex marketplaces point to one skill-free adapter', asy
     assert.equal('skills' in claudePlugin, false);
     assert.equal('skills' in codexPlugin, false);
     await assert.rejects(() => readdir(join(adapterRoot, 'skills')));
+    const agent = await readFile(join(adapterRoot, 'agents', 'ingestor.md'), 'utf8');
+    assert.match(agent, /^---\r?\n[\s\S]*?^name: ingestor$/mu);
+    assert.match(agent, /^tools: .*\bSkill\b.*$/mu);
+    assert.doesNotMatch(agent.match(/^tools: (.*)$/mu)?.[1] || '', /(?:^|,\s*)Agent(?:,|$)/u);
+    assert.match(agent, /Never spawn or delegate to another agent or subagent/u);
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'session-start.mjs'), 'utf8'));
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'stop.mjs'), 'utf8'));
   } finally {
