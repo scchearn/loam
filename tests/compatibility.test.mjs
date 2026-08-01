@@ -200,6 +200,7 @@ test('marketplace plugin owns SessionStart and Stop for Claude and Codex', async
   const hooks = JSON.parse(await readFile(join(marketplaceRoot, 'hooks', 'hooks.json'), 'utf8'));
   assert.match(hooks.hooks.SessionStart[0].hooks[0].command, /session-start\.mjs/);
   assert.match(hooks.hooks.Stop[0].hooks[0].command, /stop\.mjs/);
+  assert.equal(hooks.hooks.Stop[0].hooks[0].timeout, 90);
 
   const stop = await import(pathToFileURL(marketplaceStopPath).href);
   const calls = [];
