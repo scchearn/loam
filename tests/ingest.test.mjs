@@ -137,7 +137,7 @@ test('boundary gate honors config and environment precedence and blocks worker r
 });
 
 test('boundary debounce trusts only coherent successful or nothing-to-do outcomes', async () => {
-  const workspace = await mkdtemp(join(tmpdir(), 'loam-gate-outcomes-'));
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), 'loam-gate-outcomes-')));
   const globalRoot = await mkdtemp(join(tmpdir(), 'loam-gate-outcomes-global-'));
   const options = { harness: 'codex', payload: { cwd: workspace }, globalRoot, env: {}, now: 1_000 };
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { min_interval_seconds: 300 } }));
