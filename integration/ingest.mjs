@@ -556,11 +556,21 @@ async function leaseOwner() {
   return { pid: process.pid, boot_id: await bootIdentity(), process_start: await processStartIdentity(process.pid) };
 }
 
-async function queryClaude(workspace, lease, env = process.env) {
+const CLAUDE_TERMINAL_STATES = ['done', 'failed', 'stopped', 'idle', 'completed', 'error'];
+
+function claudeState(record) { return record?.state?.status || record?.state || record?.status; }
+function claudeId(record) { return record?.id || record?.session_id || record?.sessionID || null; }
+
+async function claudeAgentList(workspace, env = process.env) {
   const result = await execFile('claude', ['agents', '--json', '--cwd', workspace, '--all'], { cwd: workspace, timeout: 5000, env });
-  if (result.code !== 0 || result.category === 'runtime_error') return { state: 'unknown' };
-  let records; try { records = JSON.parse(result.stdout); } catch { return { state: 'unknown' }; }
-  const list = Array.isArray(records) ? records : records?.agents || [];
+  if (result.code !== 0 || result.category === 'runtime_error') return null;
+  let records; try { records = JSON.parse(result.stdout); } catch { return null; }
+  return Array.isArray(records) ? records : records?.agents || [];
+}
+
+async function queryClaude(workspace, lease, env = process.env) {
+  const list = await claudeAgentList(workspace, env);
+  if (!list) return { state: 'unknown' };
   const identity = lease.child_identity || {};
   const plannedName = lease.planned_identity?.name;
   const match = plannedName
@@ -568,10 +578,32 @@ async function queryClaude(workspace, lease, env = process.env) {
       || list.find((item) => identity.manager_id && (item.id === identity.manager_id || item.session_id === identity.manager_id))
     : list.find((item) => identity.manager_id && (item.id === identity.manager_id || item.session_id === identity.manager_id));
   if (!match) return { state: 'dead' };
-  const state = match.state?.status || match.state || match.status;
+  const state = claudeState(match);
   if (['working', 'blocked', 'running', 'pending'].includes(state)) return { state: 'live', record: match };
-  if (['done', 'failed', 'stopped', 'idle', 'completed', 'error'].includes(state)) return { state: 'terminal', record: match };
+  if (CLAUDE_TERMINAL_STATES.includes(state)) return { state: 'terminal', record: match };
   return { state: 'unknown', record: match };
+}
+
+// Every `claude --bg` ingestion leaves a permanent Agent View row and Claude never collects them, so the
+// one surface Loam gives the user fills with its own dead records. Retaining the newest few keeps a
+// failed run inspectable without letting the list grow without bound.
+// ponytail: fixed retention count; make it configurable if anyone actually wants a different depth.
+const CLAUDE_SESSION_RETENTION = 5;
+
+async function pruneClaudeSessions(workspace, lease, env = process.env) {
+  const list = await claudeAgentList(workspace, env);
+  if (!list) return;
+  const prefix = claudeSessionName(workspace);
+  const current = lease.child_identity?.manager_id || null;
+  const stale = list
+    .filter((item) => typeof item?.name === 'string' && item.name.startsWith(prefix))
+    .filter((item) => CLAUDE_TERMINAL_STATES.includes(claudeState(item)))
+    .sort((a, b) => (Number(b?.startedAt) || 0) - (Number(a?.startedAt) || 0))
+    .slice(CLAUDE_SESSION_RETENTION)
+    .filter((item) => claudeId(item) && claudeId(item) !== current);
+  for (const item of stale) {
+    await execFile('claude', ['rm', String(claudeId(item))], { cwd: workspace, timeout: 5000, env });
+  }
 }
 
 function sessionState(record) { return record?.type; }
@@ -736,7 +768,7 @@ async function waitForClaude(workspace, lease, deadline, env = process.env) {
 async function stopClaude(workspace, lease, env = process.env) {
   const queried = await queryClaude(workspace, lease, env);
   const record = queried.record;
-  const id = record?.id || record?.session_id || record?.sessionID || lease.child_identity?.manager_id;
+  const id = claudeId(record) || lease.child_identity?.manager_id;
   if (!id) return { state: 'unknown' };
   const result = await execFile('claude', ['stop', id], { cwd: workspace, timeout: 5000, env });
   return result.code === 0 ? { state: 'stopping' } : { state: 'unknown' };
@@ -814,7 +846,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease,
         return launchModel({ launchMode: 'claude_print', workspace, env, timeoutMs, lease, openCodeSession, root, requireVisibleWorker });
       }
       const registered = await queryClaude(workspace, lease, env);
-      const managerId = registered.record?.id || registered.record?.session_id || registered.record?.sessionID || null;
+      const managerId = claudeId(registered.record);
       if (!(await updateLease(root, lease, { child_identity: { manager_id: managerId, manager_name: name } }))) {
         if (managerId) await execFile('claude', ['stop', managerId], { cwd: workspace, timeout: 5000, env });
         return { category: 'orphan_unknown' };
@@ -1040,6 +1072,7 @@ export async function finalizeWorkerRun(prepared, {
     } catch {}
     if (result.category || (typeof result.code === 'number' && result.code !== 0)) post.complete = false;
     const recorded = await recordProgress(root, fingerprint, post, fingerprint.count, lease);
+    if (lease.launch_mode === 'claude_bg') await pruneClaudeSessions(workspace, lease, env);
     await launchNotification;
     await sendNotification(notify, config.visibility, {
       phase: 'terminal', harness, workspace, launchMode: lease.launch_mode,

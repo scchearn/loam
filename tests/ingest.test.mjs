@@ -1099,6 +1099,64 @@ process.exit(0);
   assert.equal(new Set(sessionNames).size, sessionNames.length);
 });
 
+test('Claude ingest sessions are pruned to the newest few and never touch records Loam did not create', async () => {
+  const { root, workspace, wiki, skills } = await fixture();
+  const bin = await mkdtemp(join(tmpdir(), 'loam-claude-prune-'));
+  const command = join(bin, process.platform === 'win32' ? 'claude.cmd' : 'claude');
+  const script = process.platform === 'win32' ? join(bin, 'claude-shim.cjs') : command;
+  const calls = join(bin, 'calls.jsonl');
+  const prefix = claudeSessionName(workspace);
+  // Eight prior runs plus the one this worker registers; only the newest five may survive.
+  const existing = Array.from({ length: 8 }, (unused, index) => ({
+    name: `${prefix}-old${index + 1}`, id: `old-${index + 1}`, state: 'done', startedAt: index + 1,
+  }));
+  await writeFile(script, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.LOAM_TEST_CALLS, JSON.stringify(args) + '\\n');
+if (args[0] === '--help') { process.stdout.write('--bg'); process.exit(0); }
+if (args[0] === '--bg') { fs.writeFileSync(process.env.LOAM_TEST_AGENT, args[args.indexOf('--name') + 1]); process.exit(0); }
+if (args[0] === 'agents') {
+  const current = fs.readFileSync(process.env.LOAM_TEST_AGENT, 'utf8');
+  process.stdout.write(JSON.stringify([
+    { name: 'someone-elses-agent', id: 'keep-me', state: 'done', startedAt: 0 },
+    { name: ${JSON.stringify(prefix)} + '-busy', id: 'still-working', state: 'working', startedAt: 9 },
+    ...${JSON.stringify(existing)},
+    { name: current, id: 'current', state: 'done', startedAt: 100 },
+  ]));
+  process.exit(0);
+}
+process.exit(0);
+`);
+  if (process.platform === 'win32') {
+    await writeFile(command, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+  } else {
+    await chmod(command, 0o700);
+  }
+  const result = await runWorker({
+    harness: 'claude', workspace, globalRoot: root, skillsRoot: skills,
+    readiness: { ready: true, runtimePath: '/private/loam' },
+    env: {
+      ...process.env,
+      PATH: [bin, process.env.PATH || ''].filter(Boolean).join(delimiter),
+      LOAM_TEST_CALLS: calls,
+      LOAM_TEST_AGENT: join(bin, 'current.txt'),
+      LOAM_INGEST_BACKGROUND: '1',
+    },
+    runtimeRunner: async ({ args }) => args[0] === 'state'
+      ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
+      : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
+  });
+  const argv = (await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse);
+  const removed = argv.filter((args) => args[0] === 'rm').map((args) => args[1]);
+  assert.equal(result.reason, 'ok');
+  // Newest five of the nine terminal Loam records survive: current, old8, old7, old6, old5.
+  assert.deepEqual(removed, ['old-4', 'old-3', 'old-2', 'old-1']);
+  assert.equal(removed.includes('keep-me'), false, 'a record Loam did not create must never be removed');
+  assert.equal(removed.includes('still-working'), false, 'a live session must never be removed');
+  assert.equal(removed.includes('current'), false, 'this run must never remove its own record');
+});
+
 test('Claude downgrade reasons survive every visibility tier and require_visible_worker can refuse fallback', async () => {
   const cases = [
     ['disabled', 'agent_view_disabled', []],
