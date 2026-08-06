@@ -162,7 +162,7 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::adding-to-memory | 592 | 116 | 217 | 2,301 |
 | loam::amending-memory | 505 | 114 | 180 | 1,951 |
 | loam::auditing-guidance | 410 | 85 | 252 | 2,528 |
-| loam::ingesting-codebase | 329 | 76 | 287 | 3,511 |
+| loam::ingesting-codebase | 329 | 76 | 288 | 3,640 |
 | loam::learning-from-session | 487 | 101 | 365 | 4,202 |
 | loam::linting-memory | 471 | 102 | 312 | 4,985 |
 | loam::normalizing-memory | 457 | 101 | 261 | 2,665 |

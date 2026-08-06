@@ -280,17 +280,46 @@ fn run_diff(mut args: impl Iterator<Item = String>) -> i32 {
         .map(|entry| (entry.content_id.as_str(), entry))
         .collect();
 
+    // The store is repo-scoped and shared by every worktree. Publishing local bodies here
+    // keeps it current without adding a step for the agent, and back-fills an existing
+    // corpus the first time a repository sees this version. Absent outside Git.
+    let store_root = GitRepo::discover(&codebase_root).and_then(|git| git.store_root());
+    if let Some(store_root) = store_root.as_deref() {
+        store_sync(store_root, &wiki_root, &index);
+    }
+
     let mut entries = Vec::new();
     for item in &walk.items {
         let Some(record) = by_source.get(item.path.as_str()) else {
             let reuse = by_content.get(item.content_id.as_str()).copied();
-            entries.push(diff_record_json(item, "new", None, reuse));
+            // Only consult the store when no local page already carries these bytes: a local
+            // page is the better hint because it also names a slug and a source path.
+            let stored = (reuse.is_none() && !item.content_id.is_empty())
+                .then(|| {
+                    store_root
+                        .as_deref()
+                        .and_then(|root| store_lookup(root, &item.content_id))
+                })
+                .flatten();
+            entries.push(diff_record_json(
+                item,
+                "new",
+                None,
+                reuse,
+                stored.as_deref(),
+            ));
             continue;
         };
         if !is_stale(item, record, &options.generator_version) {
             continue;
         }
-        entries.push(diff_record_json(item, "stale", Some(&record.slug), None));
+        entries.push(diff_record_json(
+            item,
+            "stale",
+            Some(&record.slug),
+            None,
+            None,
+        ));
     }
     println!("[{}]", entries.join(","));
     0
@@ -301,6 +330,7 @@ fn diff_record_json(
     reason: &str,
     slug: Option<&str>,
     reuse: Option<&IndexEntry>,
+    reuse_body_path: Option<&Path>,
 ) -> String {
     let mut record = format!(
         "{{\"path\":\"{}\",\"mtime\":\"{}\",\"reason\":\"{}\"",
@@ -324,6 +354,12 @@ fn diff_record_json(
             ",\"reuse_slug\":\"{}\",\"reuse_source_path\":\"{}\"",
             json_escape(&reuse.slug),
             json_escape(&reuse.source_path)
+        ));
+    }
+    if let Some(path) = reuse_body_path {
+        record.push_str(&format!(
+            ",\"reuse_body_path\":\"{}\"",
+            json_escape(&slash_path(path))
         ));
     }
     record.push('}');
@@ -599,6 +635,7 @@ struct GitRepo {
     prefix: String,
     object_format: String,
     head_commit: Option<String>,
+    common_dir: Option<PathBuf>,
 }
 
 impl GitRepo {
@@ -633,12 +670,31 @@ impl GitRepo {
             &root,
             &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
         );
+        // Every worktree of a repository resolves this to the same absolute path, which is
+        // what makes it the store's identity key. `--path-format=absolute` is required: the
+        // bare form returns a relative `.git` in the main worktree and an absolute path in a
+        // linked one.
+        let common_dir = git_text(
+            &root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .map(PathBuf::from);
         Some(Self {
             root,
             prefix,
             object_format,
             head_commit,
+            common_dir,
         })
+    }
+
+    /// Root of the shared summary-body store, or `None` when Git cannot name a common
+    /// directory. Lives beside the repository's Git metadata so it is shared by every
+    /// worktree, survives `git worktree remove`, is never committed, and dies with the repo.
+    fn store_root(&self) -> Option<PathBuf> {
+        self.common_dir
+            .as_ref()
+            .map(|dir| dir.join("loam").join("code-bodies"))
     }
 
     fn repo_path(&self, relative: &str) -> String {
@@ -1077,6 +1133,16 @@ fn collect_candidates(
             if excluded_directory(&relative_string, &exclusions.patterns) {
                 continue;
             }
+            // A directory carrying a `.git` marker belongs to another repository: a linked
+            // worktree, a submodule, or a nested clone. Git will not recurse past that
+            // boundary, so `git ls-files --others --ignored` reports the whole subtree as one
+            // directory entry, which `gitignored_paths` then drops for having no extension.
+            // Gating on the boundary rather than on ignore status also covers a nested
+            // repository nobody remembered to ignore. The codebase root is never reached here
+            // because only its children are iterated.
+            if is_repository_boundary(&path) {
+                continue;
+            }
             collect_candidates(
                 root,
                 &path,
@@ -1311,6 +1377,126 @@ fn gitignored_paths(root: &Path, extensions: &HashSet<String>) -> Option<HashSet
         paths.insert(path.replace('\\', "/"));
     }
     Some(paths)
+}
+
+/// Relative location of a stored body for `content_id`, sharded so a large repository does
+/// not put every blob in one directory. `content_id` is `git:<format>:<oid>` or
+/// `sha256:<hex>`; the shard comes from the digest rather than the scheme prefix, which is
+/// identical across entries. Returns `None` for an identity that is empty or not
+/// filename-safe, so a malformed page can never escape the store directory.
+fn store_key(content_id: &str) -> Option<PathBuf> {
+    let digest = content_id.rsplit(':').next().unwrap_or_default();
+    if digest.len() < 2 || !digest.chars().all(|value| value.is_ascii_alphanumeric()) {
+        return None;
+    }
+    if !content_id
+        .chars()
+        .all(|value| value.is_ascii_alphanumeric() || matches!(value, ':' | '.' | '-' | '_'))
+    {
+        return None;
+    }
+    // ':' is legal on POSIX but not on Windows, and the store is read by every worktree.
+    let name = content_id.replace(':', "-");
+    Some(Path::new(&digest[..2]).join(format!("{name}.md")))
+}
+
+/// Body of a code page: everything after the closing frontmatter delimiter. Frontmatter is
+/// deliberately excluded because it carries the producing worktree's `source_path`, and the
+/// consuming worktree writes its own.
+fn page_body(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut lines = content.lines();
+    if lines.next()? != "---" {
+        return None;
+    }
+    let mut body = String::new();
+    let mut closed = false;
+    for line in lines {
+        if !closed {
+            closed = line == "---";
+            continue;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    let trimmed = body.trim_start_matches('\n');
+    (closed && !trimmed.trim().is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Publish a body into the store unless it is already there. Best effort throughout: the
+/// store is an optimization, and no failure to populate it may change diff output.
+fn store_publish(store_root: &Path, content_id: &str, body: &str) {
+    let Some(key) = store_key(content_id) else {
+        return;
+    };
+    let destination = store_root.join(key);
+    if destination.exists() {
+        return;
+    }
+    let Some(parent) = destination.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    // Write-then-rename so a concurrent reader never observes a partial body. Several agents
+    // ingest the same repository at once; rename is atomic within a directory, and identical
+    // content makes a lost race harmless.
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        destination_stem(&destination)
+    ));
+    if fs::write(&temporary, body).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return;
+    }
+    if fs::rename(&temporary, &destination).is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+}
+
+fn destination_stem(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("body")
+        .to_owned()
+}
+
+/// Path of a stored body for `content_id`, when one exists.
+fn store_lookup(store_root: &Path, content_id: &str) -> Option<PathBuf> {
+    let candidate = store_root.join(store_key(content_id)?);
+    candidate.is_file().then_some(candidate)
+}
+
+/// Copy every local page body into the store so a sibling worktree can reuse it later,
+/// including after this worktree is removed. Back-fills an existing corpus on first run.
+fn store_sync(store_root: &Path, wiki_root: &Path, index: &[IndexEntry]) {
+    for entry in index {
+        if entry.content_id.is_empty() {
+            continue;
+        }
+        let Some(key) = store_key(&entry.content_id) else {
+            continue;
+        };
+        if store_root.join(key).exists() {
+            continue;
+        }
+        for directory in ["code", "entities"] {
+            let page = wiki_root.join(directory).join(format!("{}.md", entry.slug));
+            if let Some(body) = page_body(&page) {
+                store_publish(store_root, &entry.content_id, &body);
+                break;
+            }
+        }
+    }
+}
+
+/// True when `path` is the root of another Git repository. A linked worktree and a
+/// submodule carry `.git` as a file holding a `gitdir:` pointer; a nested clone carries
+/// it as a directory. Either marker is the boundary.
+fn is_repository_boundary(path: &Path) -> bool {
+    path.join(".git").exists()
 }
 
 fn excluded_directory(relative: &str, patterns: &[String]) -> bool {
