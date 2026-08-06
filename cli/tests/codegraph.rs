@@ -321,3 +321,76 @@ fn codegraph_walk_ref_rejects_an_unknown_commit() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot resolve Git ref"));
 }
+
+#[test]
+fn codegraph_walk_skips_a_nested_linked_worktree() {
+    let codebase = temporary_codebase();
+    init_git(&codebase);
+    fs::write(codebase.join("src/main.rs"), "fn main() {}\n").expect("source should be written");
+    git(&codebase, &["add", "-A"]);
+    git(&codebase, &["commit", "-qm", "initial"]);
+    // Git reports an ignored linked worktree as one directory entry, which the ignore set
+    // drops for having no file extension. The boundary check is what stops the walk.
+    fs::write(codebase.join(".gitignore"), ".worktrees/\n").expect("gitignore should be written");
+    git(
+        &codebase,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            ".worktrees/child",
+            "HEAD",
+        ],
+    );
+    fs::write(
+        codebase.join(".worktrees/child/src/nested.rs"),
+        "fn nested() {}\n",
+    )
+    .expect("nested source should be written");
+
+    let output = loam(
+        &codebase,
+        &["codegraph", "walk", codebase.to_str().unwrap()],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("walk output should be UTF-8");
+    git(
+        &codebase,
+        &["worktree", "remove", "--force", ".worktrees/child"],
+    );
+    fs::remove_dir_all(&codebase).ok();
+
+    assert!(
+        stdout.contains("\"path\":\"src/main.rs\""),
+        "output: {stdout}"
+    );
+    assert!(!stdout.contains(".worktrees/"), "output: {stdout}");
+    assert!(!stdout.contains("nested.rs"), "output: {stdout}");
+}
+
+#[test]
+fn codegraph_walk_skips_a_nested_repository_that_is_not_ignored() {
+    let codebase = temporary_codebase();
+    init_git(&codebase);
+    fs::write(codebase.join("src/main.rs"), "fn main() {}\n").expect("source should be written");
+    // No .gitignore entry for vendored/: the gate is the repository boundary, not ignore
+    // status, so an un-ignored nested clone is skipped too.
+    let nested = codebase.join("vendored");
+    fs::create_dir_all(nested.join("src")).expect("nested repo should be created");
+    init_git(&nested);
+    fs::write(nested.join("src/inner.rs"), "fn inner() {}\n").expect("inner should be written");
+
+    let output = loam(
+        &codebase,
+        &["codegraph", "walk", codebase.to_str().unwrap()],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("walk output should be UTF-8");
+    fs::remove_dir_all(&codebase).ok();
+
+    assert!(
+        stdout.contains("\"path\":\"src/main.rs\""),
+        "output: {stdout}"
+    );
+    assert!(!stdout.contains("inner.rs"), "output: {stdout}");
+    assert!(!stdout.contains("vendored/"), "output: {stdout}");
+}

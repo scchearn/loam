@@ -90,7 +90,7 @@ Run the diff subcommand to get the files that need ingestion or re-summarization
   --generator-version loam-code-page-v1 [--ref <commit>]
 ```
 
-Omit the bracketed `--ref` pair in default mode. Parse the additive JSON records, retaining `path`, `mtime`, `reason`, optional `slug`, `content_id`, `blob_oid`, `source_commit`, `source_state`, `generator_version`, and optional `reuse_slug`/`reuse_source_path`. In explicit-ref mode, `mtime` is the selected commit timestamp because Git trees have no per-file mtime.
+Omit the bracketed `--ref` pair in default mode. Parse the additive JSON records, retaining `path`, `mtime`, `reason`, optional `slug`, `content_id`, `blob_oid`, `source_commit`, `source_state`, `generator_version`, optional `reuse_slug`/`reuse_source_path`, and optional `reuse_body_path`. In explicit-ref mode, `mtime` is the selected commit timestamp because Git trees have no per-file mtime.
 
 - **`reason: "new"`** → new ingest (create code page)
 - **`reason: "stale"`** → re-summarize (overwrite the same code page; `slug` is provided)
@@ -99,7 +99,8 @@ Omit the bracketed `--ref` pair in default mode. Parse the additive JSON records
 Legacy pages without `content_id` or the current generator version are stale once and migrate incrementally. For a new record carrying reuse fields:
 
 - If `reuse_source_path` is absent from the selected projection, treat it as a rename: reuse that page's semantic body and readable slug, then replace its source metadata.
-- If both paths exist, treat it as a copy: reuse the semantic body in a collision-safe readable page and replace its source metadata. Do not add a separate cache or content-addressed filename layer.
+- If both paths exist, treat it as a copy: reuse the semantic body in a collision-safe readable page and replace its source metadata. Keep `code/` pages human-readable: do not name wiki pages by content hash and do not add a cache layer inside the wiki.
+- If a record carries `reuse_body_path`, those exact bytes were already summarized in another worktree of this repository. Read that file, write its content as the body of a normal readable `code/<slug>.md` page with this worktree's own source metadata, and do not re-summarize the file. The path points into the repository's shared body store, which is maintained by `codegraph diff` outside any wiki; never link to it, list it in the hub, or treat it as a wiki page.
 
 **Cap the work set at 200 files.** If more remain, stop after 200 and report the pending count. The user re-invokes to continue; resumability (Step 1's index rebuild) means the next run picks up exactly where this one stopped.
 

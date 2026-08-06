@@ -140,5 +140,6 @@ Files with these extensions are ingestion candidates (after exclusions pass):
 - SQL migrations and GraphQL schemas are code — include them.
 - Generated code (e.g. `*.generated.*`) is excluded by default. If generated code is semantically important (e.g. generated protobuf types that other code depends on), the user can override by removing the pattern from their local exclusions or ingesting those files explicitly.
 - Git ignore: when the codebase root is inside a Git worktree, ignored files are skipped by default. Use `--no-gitignore` only when intentionally ingesting ignored local source.
+- Repository boundaries: a subdirectory containing a `.git` file or directory belongs to another repository — a linked worktree, a submodule, or a nested clone — and is never walked. This is independent of `.gitignore` and is not affected by `--no-gitignore`, because Git does not recurse past that boundary and would otherwise report the whole subtree as a single unfiltered directory entry. Ingest such a checkout by running against it directly.
 - Empty or whitespace-only files are skipped before classification. Non-empty package markers, barrel files, and re-export files remain candidates because they can describe meaningful graph edges.
 - Monorepo roots: walk all sub-projects. The 200-file cap handles large monorepos; the user re-invokes to continue.
