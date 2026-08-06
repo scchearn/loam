@@ -105,7 +105,8 @@ export async function gate({ harness, payload = {}, globalRoot, env = process.en
   if (last && last.schema !== 1) return { action: 'skip', reason: publicReason('schema_unknown'), workspace };
   const previous = last || {};
   if (Number(previous.backoff_until || 0) > now) return { action: 'skip', reason: publicReason('backoff'), workspace };
-  if (Number(previous.completed_at || 0) + config.min_interval_seconds * 1000 > now && previous.status === 'ok') {
+  if (Number(previous.completed_at || 0) + config.min_interval_seconds * 1000 > now
+    && (previous.status === 'ok' || (previous.status === 'skipped' && previous.reason === 'nothing_to_do'))) {
     return { action: 'skip', reason: publicReason('debounced'), workspace };
   }
   return { action: 'spawn_worker', workspace, config };
@@ -462,6 +463,23 @@ async function startBoundaryWorker(options, result, { nativeFallback = false, in
   }
 }
 
+async function preflightNativeBoundary(options, result) {
+  const root = runRoot(options.globalRoot, result.workspace);
+  const leaseResult = await acquireLease(root, result.workspace, 'codex', result.config, undefined, options.env);
+  if (['held', 'orphan_live', 'orphan_unknown'].includes(leaseResult.status)) {
+    return { action: 'skip', reason: 'busy', workspace: result.workspace };
+  }
+  if (leaseResult.status !== 'acquired') return { action: 'skip', reason: 'unavailable', workspace: result.workspace };
+  try {
+    const checked = await actionablePreflight({ ...options, workspace: result.workspace });
+    if (checked.action === 'run') return result;
+    await writeSkip(root, checked.reason, checked.fields, leaseResult.lease.lease_id);
+    return { action: 'skip', reason: publicReason(checked.reason), workspace: result.workspace };
+  } finally {
+    await releaseLease(root, leaseResult.lease.lease_id);
+  }
+}
+
 export async function dispatchBoundary(options = {}) {
   const now = Number.isFinite(options.now) ? options.now : Date.now();
   if (options.harness === 'codex' && options.payload?.stop_hook_active === true) {
@@ -484,6 +502,9 @@ export async function dispatchBoundary(options = {}) {
   const result = await gate({ ...options, now });
   if (result.action !== 'spawn_worker') return result;
   if (options.harness === 'codex' && result.config.visibility === 'native') {
+    const preflight = await preflightNativeBoundary(options, result)
+      .catch(() => ({ action: 'skip', reason: 'unavailable', workspace: result.workspace }));
+    if (preflight.action !== 'spawn_worker') return preflight;
     const recorded = await recordNativeIntent({ ...options, config: result.config, workspace: result.workspace, now })
       .catch(() => ({ status: 'unavailable' }));
     if (recorded.status === 'recorded') {
@@ -550,6 +571,39 @@ function validState(state) {
   return state && typeof state === 'object' && !Array.isArray(state)
     && (!('schema' in state) || state.schema === 1)
     && Array.isArray(state.hints);
+}
+
+async function actionablePreflight({
+  workspace, globalRoot, skillsRoot, env = process.env, platform = process.platform,
+  runtimeRunner, readiness,
+} = {}) {
+  const ready = readiness || await checkReadiness({ globalRoot, skillsRoot, env, platform });
+  if (!ready.ready) return { action: 'skip', reason: ready.category || 'runtime_unavailable' };
+  const stateResult = await probeFullState({ readiness: ready, workspace, timeoutMs: 20000, runner: runtimeRunner });
+  if (!stateResult.ready) {
+    const reason = stateResult.category === 'timeout' ? 'probe_timeout'
+      : stateResult.category === 'malformed_state' ? 'malformed_state'
+      : stateResult.category === 'runtime_failed' ? 'probe_failed' : 'runtime_unavailable';
+    return { action: 'skip', reason };
+  }
+  const state = stateResult.state;
+  if (!validState(state)) return { action: 'skip', reason: 'schema_unknown' };
+  if (!state.wiki_root || !(await hasExistingWiki(state.wiki_root))) return { action: 'skip', reason: 'wiki_missing' };
+  if (!(await hasExistingCodegraph(state.wiki_root))) return { action: 'skip', reason: 'codegraph_missing' };
+  const pending = pendingHint(state);
+  if (!pending || pendingCount(pending) === 0) return { action: 'skip', reason: 'no_pending' };
+  let exclusionsPath;
+  try { exclusionsPath = await resolveExclusions(skillsRoot || env.LOAM_INGEST_SKILLS_ROOT); }
+  catch { return { action: 'skip', reason: 'exclusions_unavailable' }; }
+  const diffResult = await diff({ readiness: ready, workspace, wikiRoot: state.wiki_root, exclusionsPath, runner: runtimeRunner });
+  if (diffResult.error) return { action: 'skip', reason: diffResult.error };
+  let fingerprint;
+  try { fingerprint = await fingerprintActionable({ workspace, entries: diffResult.entries, exclusionsPath, deadlineMs: 20000 }); }
+  catch (error) { return { action: 'skip', reason: error.reason || 'fingerprint_unavailable' }; }
+  const fields = { actionable_count: fingerprint.count, actionable_fingerprint: fingerprint.fingerprint };
+  if (fingerprint.count === 0) return { action: 'skip', reason: 'no_actionable_work', fields };
+  if (!fingerprint.complete) return { action: 'skip', reason: 'fingerprint_unavailable', fields };
+  return { action: 'run', readiness: ready, exclusionsPath, fingerprint };
 }
 
 async function leaseOwner() {
@@ -907,30 +961,11 @@ export async function prepareWorkerRun({
       && localOutcome?.status === 'ok') {
       return await skip('debounced');
     }
-    const ready = readiness || await checkReadiness({ globalRoot, skillsRoot, env, platform });
-    if (!ready.ready) return await skip(ready.category || 'runtime_unavailable');
-    const stateResult = await probeFullState({ readiness: ready, workspace: canonical, timeoutMs: 20000, runner: runtimeRunner });
-    if (!stateResult.ready) {
-      const reason = stateResult.category === 'timeout' ? 'probe_timeout' : stateResult.category === 'malformed_state' ? 'malformed_state' : stateResult.category === 'runtime_failed' ? 'probe_failed' : 'runtime_unavailable';
-      return await skip(reason);
-    }
-    const state = stateResult.state;
-    if (!validState(state)) return await skip('schema_unknown');
-    if (!state.wiki_root) return await skip('wiki_missing');
-    if (!(await hasExistingWiki(state.wiki_root))) return await skip('wiki_missing');
-    if (!(await hasExistingCodegraph(state.wiki_root))) return await skip('codegraph_missing');
-    const pending = pendingHint(state);
-    if (!pending || pendingCount(pending) === 0) return await skip('no_pending');
-    let exclusionsPath;
-    try { exclusionsPath = await resolveExclusions(skillsRoot || env.LOAM_INGEST_SKILLS_ROOT); }
-    catch { return await skip('exclusions_unavailable'); }
-    const diffResult = await diff({ readiness: ready, workspace: canonical, wikiRoot: state.wiki_root, exclusionsPath, runner: runtimeRunner });
-    if (diffResult.error) return await skip(diffResult.error);
-    let fingerprint;
-    try { fingerprint = await fingerprintActionable({ workspace: canonical, entries: diffResult.entries, exclusionsPath, deadlineMs: 20000 }); }
-    catch (error) { return await skip(error.reason || 'fingerprint_unavailable'); }
-    if (fingerprint.count === 0) return await skip('no_actionable_work', { actionable_count: 0, actionable_fingerprint: fingerprint.fingerprint });
-    if (!fingerprint.complete) return await skip('fingerprint_unavailable', { actionable_count: fingerprint.count, actionable_fingerprint: fingerprint.fingerprint });
+    const checked = await actionablePreflight({
+      workspace: canonical, globalRoot, skillsRoot, env, platform, runtimeRunner, readiness,
+    });
+    if (checked.action !== 'run') return await skip(checked.reason, checked.fields);
+    const { readiness: ready, exclusionsPath, fingerprint } = checked;
     const previousRecord = await json(join(root, 'last-run.json'));
     if (previousRecord && previousRecord.schema !== 1) return await skip('schema_unknown');
     const selectedLaunch = nativeAgentId ? { mode: 'codex_native' } : await launchPlan({ harness, workspace: canonical, env });
