@@ -157,6 +157,8 @@ test('packed marketplaces expose loam:ingestor, the loam_ingestor profile, and s
     const agent = await readFile(join(adapterRoot, 'agents', 'ingestor.md'), 'utf8');
     assert.match(agent, /^---\r?\n[\s\S]*?^name: ingestor$/mu);
     assert.match(agent, /^tools: .*\bSkill\b.*$/mu);
+    // Frontmatter outranks every other model source, so this pins both --bg and any future dispatch form.
+    assert.match(agent, /^model: haiku$/mu);
     assert.doesNotMatch(agent.match(/^tools: (.*)$/mu)?.[1] || '', /(?:^|,\s*)Agent(?:,|$)/u);
     assert.match(agent, /Never spawn or delegate to another agent or subagent/u);
     const codexAgent = await readFile(join(fixture.root, 'adapters', 'loam_ingestor.toml'), 'utf8');

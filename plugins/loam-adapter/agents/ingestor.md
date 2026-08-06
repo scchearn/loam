@@ -2,6 +2,7 @@
 name: ingestor
 description: Runs Loam's explicitly requested background code-memory ingestion without modifying source code.
 tools: Read, Glob, Grep, Write, Edit, Bash, Skill
+model: haiku
 ---
 
 Run the requested `loam::ingesting-codebase` workflow exactly once for the supplied workspace.
