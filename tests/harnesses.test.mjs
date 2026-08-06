@@ -581,3 +581,74 @@ test('Codex cleanup preserves unrelated hook groups without adding setup hooks',
   assert.equal(config.hooks.Stop.length, 1);
   assert.deepEqual(config.hooks.Stop[0].hooks, [unrelated]);
 });
+
+test('Claude readiness follows the plugin cache when installed_plugins.json lags behind', async () => {
+  // Reproduces the observed race: `claude plugin install` creates the 0.9.15 cache directory,
+  // but installed_plugins.json still names 0.9.14 when setup writes install.json. Reading the
+  // registry alone dropped Claude from configured_harnesses for the whole release.
+  const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-lag-'));
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({
+    enabledPlugins: { 'loam@loam': true },
+  }));
+  const stale = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.14');
+  const fresh = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.15');
+  for (const cache of [stale, fresh]) {
+    await mkdir(join(cache, 'hooks'), { recursive: true });
+    await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  }
+  // The registry has not caught up: it still points at the previous version.
+  await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'user', installPath: stale, version: '0.9.14' }] },
+  }));
+
+  const detected = await detectHarnesses({ home, pluginVersion: '0.9.15' });
+  assert.equal(detected.claude.marketplaceInstalled, true);
+  assert.equal(detected.claude.marketplaceOwned, true);
+  assert.equal(detected.claude.marketplaceReady, true, 'the freshly installed cache version must count as ready');
+
+  // installHarnesses is what writes the harness state that becomes configured_harnesses.
+  const installed = await installHarnesses({
+    home,
+    globalRoot: join(home, '.agents', 'loam'),
+    pluginVersion: '0.9.15',
+    detected,
+  });
+  assert.equal(installed.claude.state, 'ready');
+  assert.equal(installed.claude.owner, 'marketplace');
+
+  // A version that was never installed still must not report ready.
+  const missing = await detectHarnesses({ home, pluginVersion: '0.9.99' });
+  assert.equal(missing.claude.marketplaceReady, false);
+});
+
+test('Claude readiness works from the plugin cache with no registry file at all', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-noregistry-'));
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({
+    enabledPlugins: { 'loam@loam': true },
+  }));
+  const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.15');
+  await mkdir(join(cache, 'hooks'), { recursive: true });
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+
+  const detected = await detectHarnesses({ home, pluginVersion: '0.9.15' });
+  assert.equal(detected.claude.marketplaceInstalled, true);
+  assert.equal(detected.claude.marketplaceReady, true);
+});
+
+test('Claude is not ready when the cached plugin is missing its required hooks', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-nohooks-'));
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({
+    enabledPlugins: { 'loam@loam': true },
+  }));
+  const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.15');
+  await mkdir(join(cache, 'hooks'), { recursive: true });
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}] } }));
+
+  const detected = await detectHarnesses({ home, pluginVersion: '0.9.15' });
+  assert.equal(detected.claude.marketplaceInstalled, true);
+  assert.equal(detected.claude.marketplaceReady, false, 'a cache without a Stop hook is not ready');
+});

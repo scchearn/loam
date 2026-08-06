@@ -30,22 +30,48 @@ async function hasRequiredHooks(pluginRoot) {
   }
 }
 
+/// Claude Code writes the plugin cache directory during `plugin install`, but refreshes
+/// `installed_plugins.json` on its own schedule — observed 32 minutes behind the install.
+/// Reading the registry alone therefore misses a version setup just installed, and the
+/// harness is recorded as skipped for the rest of that release. Fall back to the cache
+/// directory, which is what `codexMarketplaceInstall` already reads.
+async function claudeMarketplaceCache(root, name, pluginVersion) {
+  const [plugin, marketplace, extra] = name.split('@');
+  if (plugin !== 'loam' || !marketplace || extra) return { installed: false, ready: false };
+  const pluginRoot = join(root, 'plugins', 'cache', marketplace, plugin);
+  if (!(await exists(pluginRoot))) return { installed: false, ready: false };
+  const versions = await readdir(pluginRoot, { withFileTypes: true }).catch(() => []);
+  const ready = (await Promise.all(versions
+    .filter((entry) => entry.isDirectory() && (!pluginVersion || entry.name === pluginVersion))
+    .map((entry) => hasRequiredHooks(join(pluginRoot, entry.name))))).some(Boolean);
+  return { installed: versions.some((entry) => entry.isDirectory()), ready };
+}
+
 async function claudeMarketplaceInstall(root, name, pluginVersion) {
+  const cache = await claudeMarketplaceCache(root, name, pluginVersion);
+  let registryEntries;
   try {
     const registry = JSON.parse(await readFile(join(root, 'plugins', 'installed_plugins.json'), 'utf8'));
-    const installs = registry.plugins?.[name];
-    const candidates = Array.isArray(installs)
-      ? installs.filter(({ scope, installPath }) => scope === 'user' && typeof installPath === 'string' && installPath)
-      : [];
-    const present = await Promise.all(candidates.map(async (entry) => ({ ...entry, exists: await exists(entry.installPath) })));
-    const installed = present.some((entry) => entry.exists);
-    const ready = (await Promise.all(present
-      .filter((entry) => entry.exists && (!pluginVersion || entry.version === pluginVersion || basename(entry.installPath) === pluginVersion))
-      .map((entry) => hasRequiredHooks(entry.installPath)))).some(Boolean);
-    return { installed, ready };
+    registryEntries = registry.plugins?.[name];
   } catch {
-    return { installed: false, ready: false };
+    // No readable registry yet. Claude Code writes it after the install, so the cache is the
+    // only evidence available and there is no recorded scope to contradict it.
+    return cache;
   }
+  const installs = Array.isArray(registryEntries) ? registryEntries : [];
+  const candidates = installs.filter(({ scope, installPath }) => scope === 'user' && typeof installPath === 'string' && installPath);
+  const present = await Promise.all(candidates.map(async (entry) => ({ ...entry, exists: await exists(entry.installPath) })));
+  const installed = present.some((entry) => entry.exists);
+  const ready = (await Promise.all(present
+    .filter((entry) => entry.exists && (!pluginVersion || entry.version === pluginVersion || basename(entry.installPath) === pluginVersion))
+    .map((entry) => hasRequiredHooks(entry.installPath)))).some(Boolean);
+  // The cache directory records no scope, so it may only stand in where the registry does not
+  // contradict a user-scoped install: either it names one already, or it names none at all. A
+  // registry listing only project-scoped installs still fails, which is the point of scoping.
+  const scopeAllowsCache = installs.length === 0 || candidates.length > 0;
+  return scopeAllowsCache
+    ? { installed: installed || cache.installed, ready: ready || cache.ready }
+    : { installed, ready };
 }
 
 async function codexMarketplaceInstall(root, name, pluginVersion) {
