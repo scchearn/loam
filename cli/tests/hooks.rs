@@ -2438,6 +2438,42 @@ fn fallback_worker_lane_records_taken_and_finishes() {
 }
 
 #[test]
+fn external_worker_finish_flushes_native_preparation_finalization_and_stop() {
+    // The native subagent SubagentStop batch: preparation and finalization
+    // (buffered across the prepare/stop boundary) flush before subagent/stop.
+    let root = temporary_root("native-subagent-finalize");
+    let id = continued_request_worker(&root);
+    let id_str = id.to_string();
+    ok(&loam_stdin(
+        &[
+            "hooks", "worker-start", root.to_str().unwrap(), "--id", &id_str,
+            "--origin", "external", "--session-id", "agent-9", "--events-stdin",
+        ],
+        r#"{"schema":1,"events":[{"event":"subagent","phase":"start","outcome":"observed","agent_type":"loam_ingestor","session_id":"agent-9"}]}"#,
+    ));
+    let digest = "b".repeat(64);
+    let batch = format!(
+        "{{\"schema\":1,\"events\":[\
+            {{\"event\":\"ingest_preparation\",\"outcome\":\"admitted\",\"launch_mode\":\"codex_native\",\"lease_id\":\"l9\",\"actionable_digest\":\"{d}\",\"actionable_count\":2,\"deadline_ms\":1893456000000}},\
+            {{\"event\":\"ingest_finalization\",\"outcome\":\"ok\",\"lease_id\":\"l9\",\"pre_digest\":\"{d}\",\"post_digest\":\"{d}\",\"actionable_count\":2,\"failure_count\":0}},\
+            {{\"event\":\"subagent\",\"phase\":\"stop\",\"outcome\":\"succeeded\",\"agent_type\":\"loam_ingestor\",\"session_id\":\"agent-9\"}}\
+        ]}}",
+        d = digest
+    );
+    ok(&loam_stdin(
+        &[
+            "hooks", "worker-finish", root.to_str().unwrap(), "--id", &id_str,
+            "--status", "succeeded", "--reason", "ok", "--origin", "external",
+            "--session-id", "agent-9", "--events-stdin",
+        ],
+        &batch,
+    ));
+    assert_eq!(worker_status(&root, id).as_deref(), Some("succeeded"));
+    assert_eq!(event_count(&root), 4);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn lifecycle_without_events_stdin_is_unchanged() {
     let root = temporary_root("no-events-flag");
     let id = finished_spawn_worker(&root, "claude");

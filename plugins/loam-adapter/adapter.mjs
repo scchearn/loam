@@ -312,7 +312,12 @@ export async function handleMarketplaceSubagentStop(payload = {}, {
           reason: result.reason,
           origin: 'external',
           sessionId: payload.agent_id,
-          events: [{ event: 'subagent', phase: 'stop', outcome: stopOutcome, agent_type: 'loam_ingestor', session_id: payload.agent_id }],
+          // The native run's preparation/finalization (buffered across the
+          // prepare/stop boundary) flush before the subagent/stop proof.
+          events: [
+            ...(Array.isArray(result.events) ? result.events : []),
+            { event: 'subagent', phase: 'stop', outcome: stopOutcome, agent_type: 'loam_ingestor', session_id: payload.agent_id },
+          ],
         });
       } catch {}
     }

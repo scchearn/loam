@@ -332,11 +332,14 @@ export async function bindNativeAgent({ globalRoot, workspace, agentId, now = Da
 function persistedPreparation(prepared) {
   const {
     action, harness, workspace, globalRoot, skillsRoot, platform, root,
-    config, lease, readiness, exclusionsPath, fingerprint,
+    config, lease, readiness, exclusionsPath, fingerprint, events,
   } = prepared;
   return {
     action, harness, workspace, globalRoot, skillsRoot, platform, root,
     config, lease, readiness, exclusionsPath, fingerprint,
+    // Carry the buffered preparation event across the native prepare/stop
+    // process boundary so finalization can find its causal parent.
+    events: Array.isArray(events) ? events : [],
   };
 }
 
@@ -458,7 +461,7 @@ export async function finalizeNativeAgentRun({
     outcome = { reason: 'unavailable' };
   }
   await finishNativeRecord(paths, record, { state: 'finished', prepared: null, result: outcome });
-  return { reason: outcome.reason || 'unavailable', ...resultBase };
+  return { reason: outcome.reason || 'unavailable', events: prepared.events, ...resultBase };
 }
 
 async function startBoundaryWorker(options, result, { nativeFallback = false, intentId } = {}) {
