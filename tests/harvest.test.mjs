@@ -732,11 +732,14 @@ test('harvest_tick: makes zero runtime/model/network calls; returns before the w
   let resolved = false;
   let tickReturned = false;
   let calls = 0;
-  const spawnPromise = (async () => {
-    await new Promise((r) => setTimeout(r, 50));
+  // Deterministic, not a wall-clock race: this promise only resolves when the
+  // test calls resolveSpawn() below, which happens after asserting tickReturned.
+  // A fixed setTimeout race is flaky under slow/loaded CI I/O.
+  let resolveSpawn;
+  const spawnPromise = new Promise((r) => { resolveSpawn = r; }).then(() => {
     resolved = true;
     return { child: { pid: 1 } };
-  })();
+  });
   const result = await harvestTick({
     harness: 'opencode', payload: { cwd: workspace, session_id: 'sess-clean' },
     globalRoot, env: {}, now: 1000, storePath: join(root, 'store.jsonl'),
@@ -748,6 +751,8 @@ test('harvest_tick: makes zero runtime/model/network calls; returns before the w
   assert.equal(calls, 1);
   assert.equal(resolved, false, 'the tick must not await the spawned worker');
   assert.equal(tickReturned, true);
+  resolveSpawn();
+  await spawnPromise;
 });
 
 test('harvest_tick: a harvest-agent identity is refused on each harness', async () => {
@@ -986,7 +991,16 @@ test('harvest_run: two sessions in one workspace serialize on the shared lease w
   await writeFile(storeA, 'user-a\nassistant-a\nuser-a2\n');
   await writeFile(storeB, 'user-b\nassistant-b\nuser-b2\n');
   let launches = 0;
-  const runOne = (sessionId, storePath) => runHarvest({
+  // sess-a's launch blocks on a gate we control, so sess-b's attempt is
+  // guaranteed to happen while sess-a still holds the lease. Racing two
+  // Promise.all-started runs against each other's incidental I/O timing is
+  // flaky under slow/loaded CI (both can legitimately run back-to-back with
+  // no actual overlap), so this test enforces the overlap explicitly instead.
+  let releaseA;
+  const gateA = new Promise((r) => { releaseA = r; });
+  let enteredA;
+  const enteredAPromise = new Promise((r) => { enteredA = r; });
+  const runOne = (sessionId, storePath, { blocks = false } = {}) => runHarvest({
     harness: 'claude', workspace, sessionId, globalRoot,
     env: {}, probeFullState: async () => ({ ready: true, state: { wiki_root: join(workspace, 'wiki'), exists: true } }),
     backend: {
@@ -997,24 +1011,28 @@ test('harvest_run: two sessions in one workspace serialize on the shared lease w
         return { records: tail.lines.map((line, index) => ({ cursor: line.offset, kind: index === 1 ? 'assistant' : 'user', session_id: sessionId, text: line.text, timestamp: '' })) };
       },
     },
-    launch: async () => { launches += 1; return { category: null, completion: Promise.resolve({ code: 0 }) }; },
+    launch: async () => {
+      launches += 1;
+      if (blocks) { enteredA(); await gateA; }
+      return { category: null, completion: Promise.resolve({ code: 0 }) };
+    },
     readWindow: async () => ({ records: [], boundaryCursor: 0 }),
   });
-  const [first, second] = await Promise.all([runOne('sess-a', storeA), runOne('sess-b', storeB)]);
+  const runningA = runOne('sess-a', storeA, { blocks: true });
+  await enteredAPromise;
+  const busy = await runOne('sess-b', storeB);
+  assert.equal(busy.reason, 'busy', 'the other session records busy while the lease is held');
+  assert.equal(busy.cursorChanged, false, 'the busy session leaves its cursor unchanged, so its material is reconsidered');
+  releaseA();
+  const ran = await runningA;
   assert.equal(launches, 1, 'concurrent same-workspace runs serialize: exactly one holds the shared lease');
-  const ran = first.reason === 'busy' ? second : first;
-  const busy = first.reason === 'busy' ? first : second;
   assert.equal(ran.reason, 'ok', 'the lease-holding session harvests');
   assert.equal(ran.cursorChanged, true, 'the lease-holding session advances its cursor');
-  assert.equal(busy.reason, 'busy', 'the other session records busy');
-  assert.equal(busy.cursorChanged, false, 'the busy session leaves its cursor unchanged, so its material is reconsidered');
 
   const stateA = await readHarvestState(globalRoot, workspace, 'sess-a');
   const stateB = await readHarvestState(globalRoot, workspace, 'sess-b');
-  const ranState = ran.sessionId === 'sess-a' ? stateA : stateB;
-  const busyState = ran.sessionId === 'sess-a' ? stateB : stateA;
-  assert.ok(ranState?.cursor?.value > 0, 'the harvested session advanced its cursor');
-  assert.equal(busyState?.cursor?.value ?? null, null, 'the busy session never advanced (no material lost)');
+  assert.ok(stateA?.cursor?.value > 0, 'the harvested session advanced its cursor');
+  assert.equal(stateB?.cursor?.value ?? null, null, 'the busy session never advanced (no material lost)');
 });
 
 test('harvest_run: the detached worker parses its argv and reports through hook bookkeeping', async () => {
