@@ -3,12 +3,13 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { cleanupStaging, createStagingDirectory, writeAtomicFile, publishJson } from './atomic.mjs';
-import { confirmSetup, finish, renderDiscovery, selectMarketplaceHarnesses, stage } from './wizard.mjs';
+import { confirmSetup, finish, harnessLabel, renderDiscovery, selectHarnesses, stepDetail, stepDone, stepSkip, stepStart, summaryNote } from './wizard.mjs';
 import { ensureGlobalSkills, verifyGlobalSkills } from './skills.mjs';
 import { installRuntime } from './runtime.mjs';
 import { detectHarnesses, installHarnesses } from './harnesses.mjs';
 import { installMarketplacePlugins } from './marketplace.mjs';
 import { migrateLegacyProject } from './migration.mjs';
+import { removeHarnesses } from './uninstall.mjs';
 import { verifyInstallation } from './verify.mjs';
 
 // ponytail: trivial lockfile — no polling, no stale-PID detection.
@@ -59,6 +60,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
   const errorOutput = options.errorOutput || process.stderr;
   const refresh = parsed.command === 'update';
   const yes = parsed.yes || refresh;
+  const tilde = (p) => (typeof p === 'string' && p.startsWith(discovery.home) ? `~${p.slice(discovery.home.length)}` : p);
   await renderDiscovery(discovery, output, { action: refresh ? 'Update' : 'Setup', dryRun: parsed.dryRun });
   if (parsed.dryRun) {
     finish(output, 'Dry run', 'no files, configuration, downloads, or mutating Skills CLI commands will run');
@@ -68,23 +70,37 @@ export async function executeSetup(parsed, discovery, options = {}) {
     finish(output, 'Setup cancelled');
     return 130;
   }
-  const selectedMarketplaceHarnesses = await selectMarketplaceHarnesses({
+  let previouslyConfigured = [];
+  try {
+    const existing = JSON.parse(await readFile(join(discovery.globalRoot, 'install.json'), 'utf8'));
+    if (Array.isArray(existing.configured_harnesses)) previouslyConfigured = existing.configured_harnesses;
+  } catch {}
+
+  const selection = await selectHarnesses({
     yes,
+    refresh,
     harnesses: discovery.harnesses,
+    previouslyConfigured,
     select: options.marketplaceSelect,
+    input: options.input,
+    output,
   });
-  if (selectedMarketplaceHarnesses === null) {
+  if (selection === null) {
     finish(output, 'Setup cancelled');
     return 130;
   }
+  const selectedSet = new Set(selection.selected);
+  const toRemove = selection.toRemove;
+  const selectedMarketplaceHarnesses = selection.selected.filter((id) => id === 'claude' || id === 'codex');
 
-  const selected = new Set(selectedMarketplaceHarnesses);
-  const requestedHarnesses = Object.fromEntries(Object.entries(discovery.harnesses).map(([id, harness]) => [
-    id,
-    (id === 'claude' || id === 'codex') && harness.state !== 'absent' && !selected.has(id) && !harness.marketplaceReady
-      ? { ...harness, state: 'skipped' }
-      : harness,
-  ]));
+  const requestedHarnesses = Object.fromEntries(Object.entries(discovery.harnesses).map(([id, harness]) => {
+    if (harness.state === 'absent') return [id, harness];
+    if (id === 'claude' || id === 'codex') {
+      return [id, !selectedSet.has(id) && !harness.marketplaceReady ? { ...harness, state: 'skipped' } : harness];
+    }
+    // opencode / cursor: adapters gated purely by selection.
+    return [id, selectedSet.has(id) ? harness : { ...harness, state: 'absent' }];
+  }));
   const requestedDiscovery = { ...discovery, harnesses: requestedHarnesses };
 
   return withSetupLock({ globalRoot: discovery.globalRoot, ...(options.lockOptions || {}) }, async () => {
@@ -94,17 +110,20 @@ export async function executeSetup(parsed, discovery, options = {}) {
       runner: options.runner,
       runtimeRunner: options.smokeRunner,
     });
-    if (alreadyReady.ready && !refresh) {
-      finish(output, 'Loam is ready', 'already ready; no replacement or network operation required');
+    if (alreadyReady.ready && !refresh && toRemove.length === 0) {
+      finish(output, '🌱 Loam is ready', 'already ready; no replacement or network operation required');
       return 0;
     }
 
-    stage(output, 'Environment checked');
+    stepStart(output, 'Checking environment');
+    stepDone(output, refresh ? 'Environment checked — refreshing existing install' : 'Environment checked');
     const metadataPath = join(discovery.globalRoot, 'install.json');
     let candidateIntegration;
     let harnessInstall;
     let activated = false;
+    let skillCount;
     try {
+      stepStart(output, 'Installing global skills via the Skills CLI');
       const skills = await ensureGlobalSkills({
         packageRoot: discovery.packageRoot,
         skillsRoot: discovery.skillsRoot,
@@ -116,8 +135,10 @@ export async function executeSetup(parsed, discovery, options = {}) {
         errorOutput.write(`Skills CLI: ${skills.detail || skills.category}\n`);
         return 1;
       }
-      stage(output, 'Global Loam skills installed by Skills CLI');
+      skillCount = skills.inventory?.skills?.length;
+      stepDone(output, `Skills ${skills.changed ? 'installed' : 'already current'}${skillCount ? ` — ${skillCount} skills` : ''} · runtime v${skills.requiredVersion}  →  ${tilde(discovery.skillsRoot)}`);
 
+      stepStart(output, `Preparing native runtime v${skills.requiredVersion} (${discovery.target})`);
       const runtime = await installRuntime({
         globalRoot: discovery.globalRoot,
         version: skills.requiredVersion,
@@ -129,16 +150,26 @@ export async function executeSetup(parsed, discovery, options = {}) {
         smokeRunner: options.smokeRunner,
         expectedSha256: alreadyReady.install?.runtime_sha256,
       });
-      stage(output, runtime.reused ? 'Runtime reused' : 'Runtime downloaded and verified');
+      const shortSha = typeof runtime.sha256 === 'string' ? runtime.sha256.slice(0, 12) : '';
+      if (runtime.reused) {
+        stepDetail(output, `reused verified binary${shortSha ? ` (sha256 ${shortSha}…)` : ''}`);
+      } else {
+        stepDetail(output, 'downloaded from github.com/scchearn/loam releases');
+        if (shortSha) stepDetail(output, `checksum sha256 ${shortSha}…  ✓`);
+        stepDetail(output, 'smoke test: state --fast  ✓');
+      }
+      stepDone(output, `Runtime ready  →  ${tilde(runtime.path)}`);
 
+      stepStart(output, `Staging shared integration (v${discovery.packageVersion})`);
       candidateIntegration = await stageIntegration({
         packageRoot: discovery.packageRoot,
         globalRoot: discovery.globalRoot,
         pluginVersion: discovery.packageVersion,
       });
       const integrationPath = candidateIntegration.path;
-      stage(output, 'Shared integration staged');
+      stepDone(output, 'Shared integration staged');
 
+      if (selectedMarketplaceHarnesses.length) stepStart(output, 'Installing marketplace plugins');
       const marketplace = await installMarketplacePlugins({
         selected: selectedMarketplaceHarnesses,
         harnesses: discovery.harnesses,
@@ -154,12 +185,20 @@ export async function executeSetup(parsed, discovery, options = {}) {
         if (marketplace[id]?.state === 'ready' && !refreshedHarnesses[id]?.marketplaceReady) {
           marketplace[id] = { ...marketplace[id], state: 'partial', category: 'verification_failed' };
         }
+        const st = marketplace[id];
+        if (st?.state === 'ready') {
+          const verb = st.action === 'existing' ? 'already installed' : st.action === 'updated' ? 'updated' : 'installed';
+          stepDone(output, `${harnessLabel(id)} — plugin loam@loam ${verb}`);
+        } else if (st?.state === 'partial') {
+          stepSkip(output, `${harnessLabel(id)} — plugin verification failed`);
+        }
       }
       const effectiveHarnesses = Object.fromEntries(Object.entries(requestedHarnesses).map(([id, harness]) => [
         id,
         marketplace[id]?.state === 'partial' ? marketplace[id] : marketplace[id] ? refreshedHarnesses[id] : harness,
       ]));
 
+      stepStart(output, 'Configuring harnesses');
       harnessInstall = await installHarnesses({
         home: discovery.home,
         globalRoot: discovery.globalRoot,
@@ -177,9 +216,32 @@ export async function executeSetup(parsed, discovery, options = {}) {
         errorOutput.write('Harness integration is incomplete.\n');
         return 1;
       }
+      for (const id of ['claude', 'codex', 'opencode', 'cursor']) {
+        const h = harnesses[id];
+        if (h?.state === 'ready') {
+          const detail = id === 'opencode' ? `adapter written to ${tilde(h.path)}`
+            : id === 'cursor' ? 'session hook registered'
+            : 'session hooks ready';
+          stepDone(output, `${harnessLabel(id)} — ${detail}`);
+        } else if (h?.state === 'skipped') {
+          stepSkip(output, `${harnessLabel(id)} — skipped (plugin not selected)`);
+        }
+      }
       if (marketplaceFailed) errorOutput.write('Marketplace plugin installation is incomplete.\n');
-      stage(output, 'Supported integrations configured');
 
+      if (toRemove.length) {
+        stepStart(output, 'Removing deselected harnesses');
+        await removeHarnesses({
+          ids: toRemove,
+          home: discovery.home,
+          globalRoot: discovery.globalRoot,
+          runner: options.runner,
+          cwd: discovery.workspace,
+        });
+        for (const id of toRemove) stepDone(output, `${harnessLabel(id)} — removed`);
+      }
+
+      stepStart(output, 'Verifying installation');
       const globalSkills = await verifyGlobalSkills({
         packageRoot: discovery.packageRoot,
         skillsRoot: discovery.skillsRoot,
@@ -204,7 +266,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
           errorOutput.write(`Migration incomplete: ${migration.category || 'legacy project remains'}\n`);
           return 1;
         }
-        stage(output, 'Legacy project Loam migrated');
+        stepDone(output, 'Legacy project Loam migrated');
       }
 
       const install = {
@@ -240,10 +302,21 @@ export async function executeSetup(parsed, discovery, options = {}) {
         errorOutput.write('Final readiness verification failed.\n');
         return 1;
       }
+      stepDone(output, 'All checks passed');
       await options.beforeActivate?.({ install, metadataPath, integrationPath });
       await publishJson({ filePath: metadataPath, value: install });
       activated = true;
-      finish(output, marketplaceFailed ? 'Loam core is ready' : 'Loam is ready');
+
+      const configuredLabels = install.configured_harnesses.map((id) => harnessLabel(id));
+      summaryNote(output, 'Installed', [
+        `Plugin     v${discovery.packageVersion}`,
+        `Runtime    v${skills.requiredVersion}  (${discovery.target})`,
+        `Skills     ${skillCount ?? '?'} · ${tilde(discovery.skillsRoot)}`,
+        `Harnesses  ${configuredLabels.length ? configuredLabels.join(', ') : 'none'}`,
+        '',
+        'Next: open a coding session and say "set up a wiki" or "plan this work".',
+      ].join('\n'));
+      finish(output, marketplaceFailed ? '🌱 Loam core is ready' : '🌱 Loam is ready');
       return marketplaceFailed ? 1 : 0;
     } finally {
       if (!activated) {

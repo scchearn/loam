@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { installMarketplacePlugins, removeMarketplacePlugins } from '../setup/marketplace.mjs';
-import { selectMarketplaceHarnesses } from '../setup/wizard.mjs';
+import { selectHarnesses } from '../setup/wizard.mjs';
 
 const harnesses = {
   opencode: { id: 'opencode', state: 'detected' },
@@ -11,23 +11,37 @@ const harnesses = {
   cursor: { id: 'cursor', state: 'detected' },
 };
 
-test('--yes selects every detected marketplace-capable harness', async () => {
-  assert.deepEqual(await selectMarketplaceHarnesses({ yes: true, harnesses }), ['claude', 'codex']);
+test('--yes selects every detected harness', async () => {
+  assert.deepEqual(await selectHarnesses({ yes: true, harnesses }), {
+    selected: ['claude', 'codex', 'opencode', 'cursor'],
+    toRemove: [],
+  });
 });
 
-test('interactive selection offers only detected Claude and Codex with both preselected', async () => {
+test('update --yes maintains only the previously-configured set', async () => {
+  assert.deepEqual(await selectHarnesses({
+    yes: true,
+    refresh: true,
+    harnesses,
+    previouslyConfigured: ['claude', 'opencode'],
+  }), { selected: ['claude', 'opencode'], toRemove: [] });
+});
+
+test('interactive selection offers every detected harness, all preselected', async () => {
   let prompt;
-  const selected = await selectMarketplaceHarnesses({
+  const result = await selectHarnesses({
     harnesses: { ...harnesses, codex: { id: 'codex', state: 'absent' } },
+    previouslyConfigured: ['opencode'],
     select: async (input) => {
       prompt = input;
       return ['claude'];
     },
   });
 
-  assert.deepEqual(selected, ['claude']);
-  assert.deepEqual(prompt.options.map(({ value }) => value), ['claude']);
-  assert.deepEqual(prompt.initialValues, ['claude']);
+  assert.deepEqual(result.selected, ['claude']);
+  assert.deepEqual(result.toRemove, ['opencode']);
+  assert.deepEqual(prompt.options.map(({ value }) => value), ['claude', 'opencode', 'cursor']);
+  assert.deepEqual(prompt.initialValues, ['claude', 'opencode', 'cursor']);
 });
 
 test('marketplace installation uses exact native argv and skips existing plugins', async () => {
