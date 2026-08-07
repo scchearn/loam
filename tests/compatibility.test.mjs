@@ -474,7 +474,7 @@ test('Codex native Stop returns one spawn_agent continuation with identical dire
     run,
     status: 'continued',
     action: 'request_worker',
-    events: [{ event: 'codex_native', phase: 'continuation', outcome: 'returned' }],
+    events: [{ event: 'codex_native', phase: 'continuation', outcome: 'returned', visibility: 'native' }],
   }]);
 
   finishCalls.length = 0;

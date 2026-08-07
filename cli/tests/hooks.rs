@@ -2348,6 +2348,26 @@ fn worker_finish_batch_records_preparation_and_finalization() {
 }
 
 #[test]
+fn finish_batch_records_codex_native_continuation() {
+    // Guards the exact continuation DTO the adapter emits, including visibility.
+    let root = temporary_root("codex-continuation");
+    let workspace = temporary_root("workspace");
+    let id = begin_id(&root, "codex", "stop", &workspace);
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[{"event":"codex_native","phase":"continuation","outcome":"returned","visibility":"native"}]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks", "finish", root.to_str().unwrap(), "--id", &id_str,
+            "--status", "continued", "--action", "request_worker", "--events-stdin",
+        ],
+        batch,
+    );
+    ok(&output);
+    assert_eq!(event_count(&root), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn worker_finish_batch_records_visibility_and_delivery() {
     // Proves the T5 visibility DTO shapes and their ordering satisfy the guards:
     // launch before terminal, each visibility event before its delivery.
@@ -2369,6 +2389,28 @@ fn worker_finish_batch_records_visibility_and_delivery() {
     );
     ok(&output);
     assert_eq!(event_count(&root), 4);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_finish_batch_records_claude_agent_events() {
+    // Guards the exact claude_agent_profile and claude_agent_view DTO shapes.
+    let root = temporary_root("claude-agent-events");
+    let id = finished_spawn_worker(&root, "claude");
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[
+        {"event":"claude_agent_profile","outcome":"selected","launch_mode":"claude_bg","agent_type":"loam:ingestor","manager_name":"mgr","manager_id":"mid-1","lease_id":"lease-1"},
+        {"event":"claude_agent_view","outcome":"fallback","reason":"agent_view_disabled","launch_mode":"claude_bg","fallback_launch_mode":"claude_print","visibility":"native","lease_id":"lease-1","require_visible_worker":false}
+    ]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks", "worker-finish", root.to_str().unwrap(), "--id", &id_str,
+            "--status", "succeeded", "--reason", "ok", "--events-stdin",
+        ],
+        batch,
+    );
+    ok(&output);
+    assert_eq!(event_count(&root), 2);
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -1051,6 +1051,18 @@ export async function prepareWorkerRun({
       downgrade_reason: selectedLaunch.downgradeReason || null,
       hard_deadline: new Date(hardDeadlineMs).toISOString(),
     }))) return await skip('orphan_unknown');
+    if (harness === 'claude' && selectedLaunch.downgradeReason) {
+      // Agent View downgraded to the invisible claude_print path: record whether
+      // the fallback was taken or refused by policy (S: claude_agent_view).
+      events.push({
+        event: 'claude_agent_view',
+        outcome: config.require_visible_worker ? 'refused' : 'fallback',
+        reason: selectedLaunch.downgradeReason,
+        launch_mode: 'claude_bg', fallback_launch_mode: 'claude_print',
+        visibility: config.visibility, lease_id: lease.lease_id,
+        require_visible_worker: config.require_visible_worker,
+      });
+    }
     if (selectedLaunch.downgradeReason && config.require_visible_worker) return await skip(selectedLaunch.downgradeReason);
     leaseHandled = true;
     events.push({
@@ -1143,6 +1155,20 @@ export async function finalizeWorkerRun(prepared, {
         actionable_count: fingerprint.count, failure_count: recorded.failureCount,
         ...(recorded.backoff ? { backoff_until_ms: recorded.backoff } : {}),
       });
+    }
+    if (harness === 'claude' && lease.launch_mode === 'claude_bg') {
+      // Agent View registered: record the selected profile and its manager
+      // identity from the freshly persisted lease (S: claude_agent_profile).
+      const finalLease = await json(join(root, 'lease.json'));
+      const managerId = finalLease?.child_identity?.manager_id;
+      const managerName = finalLease?.child_identity?.manager_name;
+      if (managerId && managerName) {
+        (prepared.events ||= []).push({
+          event: 'claude_agent_profile', outcome: 'selected',
+          launch_mode: 'claude_bg', agent_type: 'loam:ingestor',
+          manager_name: managerName, manager_id: managerId, lease_id: lease.lease_id,
+        });
+      }
     }
     if (lease.launch_mode === 'claude_bg') await pruneClaudeSessions(workspace, lease, env);
     const launchDelivery = await launchNotification;

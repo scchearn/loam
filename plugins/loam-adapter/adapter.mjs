@@ -184,7 +184,7 @@ export async function handleMarketplaceStop(payload = {}, {
         finishArgs = {
           status: 'continued',
           action: 'request_worker',
-          events: [{ event: 'codex_native', phase: 'continuation', outcome: 'returned' }],
+          events: [{ event: 'codex_native', phase: 'continuation', outcome: 'returned', visibility: 'native' }],
         };
       } else if (harvestOutcome?.action === 'spawn_worker') {
         finishArgs = { status: 'succeeded', action: 'spawn_worker', reason: 'harvest_dispatched' };
