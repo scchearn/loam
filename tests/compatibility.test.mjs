@@ -334,6 +334,11 @@ test('Codex SubagentStart injects resolved preparation-first context and Subagen
   assert.ok(context.indexOf('--native-prepare') < context.indexOf('loam::ingesting-codebase'));
   assert.match(context, /action.*skip.*stop immediately/iu);
   assert.deepEqual(calls.map(([kind]) => kind), ['bind', 'worker-start']);
+  assert.equal(calls[1][1].origin, 'external');
+  assert.equal(calls[1][1].sessionId, 'agent-17');
+  assert.deepEqual(calls[1][1].events, [
+    { event: 'subagent', phase: 'start', outcome: 'observed', agent_type: 'loam_ingestor', session_id: 'agent-17' },
+  ]);
 
   calls.length = 0;
   assert.deepEqual(await stop.handleSubagentStop(payload, env, { loadHooks, loadIngest }), {});
@@ -342,6 +347,11 @@ test('Codex SubagentStart injects resolved preparation-first context and Subagen
   assert.equal(JSON.stringify(calls[0][1]).includes('definitely succeeded'), false, 'assistant text is not completion evidence');
   assert.equal(calls[1][1].reason, 'ok');
   assert.equal(calls[1][1].run.id, 17);
+  assert.equal(calls[1][1].origin, 'external');
+  assert.equal(calls[1][1].sessionId, 'agent-17');
+  assert.deepEqual(calls[1][1].events, [
+    { event: 'subagent', phase: 'stop', outcome: 'succeeded', agent_type: 'loam_ingestor', session_id: 'agent-17' },
+  ]);
 });
 
 test('loam_ingestor native preparation command routes through the installed worker without launching a model', async () => {

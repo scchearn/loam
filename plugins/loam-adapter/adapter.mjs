@@ -264,7 +264,16 @@ export async function handleMarketplaceSubagentStart(payload = {}, {
     if (bound?.status !== 'bound' && bound?.status !== 'late') return {};
     const run = bound.owns_claim ? nativeHookRun(bound, globalRoot) : null;
     if (run) {
-      try { await (await loadHooks()).startHookWorker?.({ run, sessionId: bound.agent_id }); } catch {}
+      // The observed native subagent is the external worker-start proof; the
+      // native command inserts it and the transition together, all-or-nothing.
+      try {
+        await (await loadHooks()).startHookWorker?.({
+          run,
+          sessionId: bound.agent_id,
+          origin: 'external',
+          events: [{ event: 'subagent', phase: 'start', outcome: 'observed', agent_type: 'loam_ingestor', session_id: bound.agent_id }],
+        });
+      } catch {}
     }
     return {
       hookSpecificOutput: {
@@ -295,7 +304,17 @@ export async function handleMarketplaceSubagentStop(payload = {}, {
     });
     const run = result?.owns_claim ? nativeHookRun(result, globalRoot) : null;
     if (run) {
-      try { await (await loadHooks()).finishHookWorker?.({ run, reason: result.reason }); } catch {}
+      const stopOutcome = result.reason === 'ok' ? 'succeeded'
+        : result.reason === 'unavailable' ? 'failed' : 'skipped';
+      try {
+        await (await loadHooks()).finishHookWorker?.({
+          run,
+          reason: result.reason,
+          origin: 'external',
+          sessionId: payload.agent_id,
+          events: [{ event: 'subagent', phase: 'stop', outcome: stopOutcome, agent_type: 'loam_ingestor', session_id: payload.agent_id }],
+        });
+      } catch {}
     }
   } catch {}
   return {};

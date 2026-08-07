@@ -151,6 +151,7 @@ export async function finishHookRun({
 export async function startHookWorker({
   run,
   sessionId,
+  origin,
   events,
   timeoutMs = 300,
   runner,
@@ -159,6 +160,7 @@ export async function startHookWorker({
     run = await preparedRun(run);
     if (!run || !validSessionId(sessionId)) return false;
     const args = ['hooks', 'worker-start', run.globalRoot, '--id', String(run.id)];
+    if (origin === 'external' || origin === 'fallback') args.push('--origin', origin);
     if (sessionId !== undefined) args.push('--session-id', sessionId);
     const input = eventsEnvelope(events);
     if (input !== null) args.push('--events-stdin');
@@ -180,6 +182,8 @@ export async function finishHookWorker({
   run,
   reason,
   detail,
+  origin,
+  sessionId,
   events,
   timeoutMs = 300,
   runner,
@@ -187,13 +191,15 @@ export async function finishHookWorker({
   try {
     run = await preparedRun(run);
     const status = WORKER_STATUS[reason];
-    if (!run || !status) return false;
+    if (!run || !status || !validSessionId(sessionId)) return false;
     const args = [
       'hooks', 'worker-finish', run.globalRoot,
       '--id', String(run.id),
       '--status', status,
       '--reason', reason,
     ];
+    if (origin === 'external' || origin === 'fallback') args.push('--origin', origin);
+    if (sessionId !== undefined) args.push('--session-id', sessionId);
     if (detail !== undefined) args.push('--detail', boundedDetail(detail));
     const input = eventsEnvelope(events);
     if (input !== null) args.push('--events-stdin');
