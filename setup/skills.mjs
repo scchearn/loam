@@ -7,6 +7,31 @@ import { runSkills } from './process.mjs';
 
 const defaultPackageRoot = fileURLToPath(new URL('..', import.meta.url));
 
+// Read-back of a large global inventory across many agent roots can outrun the
+// default 120s command timeout on Windows (issue #50). The list is read-only,
+// so a generous ceiling is safe; scoping by --agent is what actually keeps it fast.
+export const SKILLS_LIST_TIMEOUT_MS = 600_000;
+
+// loam harness id -> Skills CLI agent id (as accepted by `skills list --agent`).
+const HARNESS_SKILL_AGENTS = {
+  claude: 'claude-code',
+  codex: 'codex',
+  cursor: 'cursor',
+  opencode: 'opencode',
+};
+
+// The agents to scope verification to. Loam installs with `--agent *`, so its
+// skills are linked under every detected agent; listing just the harnesses Loam
+// models confirms presence without scanning all 60+ agent roots. Falls back to
+// a single known agent so verification never reverts to a full unfiltered scan.
+export function skillsAgentsFor(harnesses = {}) {
+  const agents = Object.entries(harnesses)
+    .filter(([, harness]) => harness && harness.state !== 'absent')
+    .map(([id]) => HARNESS_SKILL_AGENTS[id])
+    .filter(Boolean);
+  return agents.length ? [...new Set(agents)] : ['claude-code'];
+}
+
 function parseJsonOutput(stdout) {
   const text = String(stdout || '').trim();
   try {
@@ -40,10 +65,11 @@ export function skillEntrySource(entry, listSource = '') {
     .find((value) => typeof value === 'string' && value) || '';
 }
 
-export async function listSkills({ global = false, cwd, runner } = {}) {
+export async function listSkills({ global = false, cwd, runner, agents, timeoutMs = SKILLS_LIST_TIMEOUT_MS } = {}) {
   const args = ['list', '--json'];
   if (global) args.push('--global');
-  const result = await runSkills(args, { cwd, runner });
+  if (agents?.length) args.push('--agent', ...agents);
+  const result = await runSkills(args, { cwd, runner, timeoutMs });
   if (!result.ok) return { ...result, entries: [], source: '' };
   try {
     return { ...result, ...normalizeSkillList(result.stdout) };
@@ -57,6 +83,7 @@ export async function verifyGlobalSkills({
   skillsRoot,
   runner,
   cwd,
+  agents,
 } = {}) {
   const inventory = await loadSkillInventory({ packageRoot });
   let requiredVersion = '';
@@ -68,7 +95,7 @@ export async function verifyGlobalSkills({
   } catch (error) {
     localError = error instanceof Error ? error.message : String(error);
   }
-  const listed = await listSkills({ global: true, cwd, runner });
+  const listed = await listSkills({ global: true, cwd, runner, agents });
   if (!listed.ok) {
     return { ready: false, category: listed.category || 'skills_list_failed', detail: listed.stderr || localError, inventory };
   }

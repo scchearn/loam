@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { readInstallMetadata, readRequiredVersion, readSkillContent } from '../integration/metadata.mjs';
 import { resolveExclusions } from '../integration/ingest.mjs';
 import { checkReadiness, probeState } from '../integration/runtime.mjs';
-import { verifyGlobalSkills } from './skills.mjs';
+import { verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
 import { isOwnedCommand } from './harnesses.mjs';
 
 async function fileExists(path) {
@@ -197,7 +197,7 @@ export async function verifyInstallation({
 
   const skills = install
     ? await localSkills(discovery.skillsRoot)
-    : await verifyGlobalSkills({ packageRoot, skillsRoot: discovery.skillsRoot, runner });
+    : await verifyGlobalSkills({ packageRoot, skillsRoot: discovery.skillsRoot, runner, agents: skillsAgentsFor(discovery.harnesses) });
   let runtime = install
     ? await checkReadiness({
         globalRoot: discovery.globalRoot,
