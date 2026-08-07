@@ -472,6 +472,90 @@ test('a stdin write to a child that exits without reading stays fail-open', asyn
   assert.equal(result.code, 0, result.stderr);
 });
 
+const syntheticRun = () => ({ id: 42, globalRoot: '/g', workspace: '/w', runtimePath: '/r' });
+
+test('finishHookRun attaches a bounded event batch on the same subprocess call', async () => {
+  const calls = [];
+  const runner = async (request) => {
+    calls.push(request);
+    return { code: 0, signal: null, stdout: '', stderr: '' };
+  };
+  const events = [
+    { event: 'ingest_visibility', phase: 'launch', outcome: 'started', visibility: 'native', launch_mode: 'claude_bg' },
+  ];
+  const ok = await finishHookRun({
+    run: syntheticRun(), status: 'succeeded', action: 'spawn_worker', events, runner,
+  });
+
+  assert.equal(ok, true);
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].args.includes('--events-stdin'));
+  assert.equal(calls[0].input, JSON.stringify({ schema: 1, events }));
+});
+
+test('finishHookRun without events keeps the closed-stdin call unchanged', async () => {
+  const calls = [];
+  const runner = async (request) => {
+    calls.push(request);
+    return { code: 0, signal: null, stdout: '', stderr: '' };
+  };
+  const ok = await finishHookRun({
+    run: syntheticRun(), status: 'succeeded', action: 'skip', reason: 'nothing_to_do', runner,
+  });
+
+  assert.equal(ok, true);
+  assert.equal(calls.length, 1);
+  assert.ok(!calls[0].args.includes('--events-stdin'));
+  assert.equal(calls[0].input, undefined);
+});
+
+test('an out-of-bounds event batch is dropped without a flag, process, or lost transition', async () => {
+  for (const events of [
+    Array.from({ length: 17 }, () => ({ event: 'ingest_visibility' })),
+    [{ event: 'ingest_visibility', detail: 'z'.repeat(20000) }],
+    [{ event: 'ingest_visibility' }, 'not-an-object'],
+    [],
+  ]) {
+    const calls = [];
+    const runner = async (request) => {
+      calls.push(request);
+      return { code: 0, signal: null, stdout: '', stderr: '' };
+    };
+    const ok = await finishHookRun({
+      run: syntheticRun(), status: 'succeeded', action: 'spawn_worker', events, runner,
+    });
+
+    assert.equal(ok, true);
+    assert.equal(calls.length, 1, 'the transition still runs as one subprocess');
+    assert.ok(!calls[0].args.includes('--events-stdin'));
+    assert.equal(calls[0].input, undefined);
+  }
+});
+
+test('worker lifecycle wrappers forward their batch on their own single call', async () => {
+  const calls = [];
+  const runner = async (request) => {
+    calls.push(request);
+    return { code: 0, signal: null, stdout: '', stderr: '' };
+  };
+  const run = syntheticRun();
+  const startEvents = [
+    { event: 'subagent', phase: 'start', outcome: 'observed', agent_type: 'loam_ingestor', session_id: 'c1' },
+  ];
+  const finishEvents = [
+    { event: 'subagent', phase: 'stop', outcome: 'succeeded', agent_type: 'loam_ingestor', session_id: 'c1' },
+  ];
+
+  assert.equal(await startHookWorker({ run, sessionId: 'c1', events: startEvents, runner }), true);
+  assert.equal(await finishHookWorker({ run, reason: 'ok', events: finishEvents, runner }), true);
+
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].args.includes('--events-stdin'));
+  assert.equal(calls[0].input, JSON.stringify({ schema: 1, events: startEvents }));
+  assert.ok(calls[1].args.includes('--events-stdin'));
+  assert.equal(calls[1].input, JSON.stringify({ schema: 1, events: finishEvents }));
+});
+
 test('malformed native state is reported without synthetic fields', async () => {
   const fixtureData = await fixture();
   const result = await probeState({
