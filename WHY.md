@@ -48,6 +48,31 @@ If real sessions don't show these, the project failed and we should say so out l
 
 ---
 
+## Principles
+
+A change that breaks one of these is a different project, not a new feature.
+
+- **Distributed, not centralized.** loam is not a service, and no single agent, machine, or vendor owns it. The skills are portable markdown any harness can load, and the memory lives in your git repo. Nothing central has to be running for loam to work, and there is no hub that, if it went down, would take your memory with it.
+- **Harness-agnostic.** The plan and the memory are the assets, not any one runtime's private state. What one harness writes, another can pick up. loam adapts to Claude Code, Codex, OpenCode, and Cursor through thin adapters over shared logic; the substrate underneath is identical for all of them.
+- **Graceful fallback to plain files.** The optional tools only accelerate: qmd speeds up search, the native runtime speeds up probes. Take either away and loam still works, because underneath everything it is just markdown files on your system that you can open, grep, and git-diff by hand. The floor is always plain files.
+
+---
+
+## Where this is heading
+
+> Working notes, not a committed roadmap. We are thinking about this out loud, and it stays subordinate to the principles above.
+
+loam started as a fix for one developer's rediscovery cost. The direction we are exploring now is bigger: **loam as the base a whole team, or a whole company, works from.**
+
+Picture each person's loam as its own project, directory, or repo. What we are working toward is letting those separate loams see and work with each other, and letting a shared company knowledge base grow out of them, without giving up a single principle above. That means resolving an apparent contradiction on purpose:
+
+- **A shared company base, still with no central server.** "Centralized" here means one reference a team can rely on, not a hub someone has to keep running or that owns your data. It is federation between many loams, not memory moved into someone's cloud.
+- **Still distributed. Still in git. Still yours.** Every workspace keeps its own memory as plain markdown in its own repo. Sharing adds provenance, access boundaries, and explicit conflict handling on top; it never moves the source of truth off your machines, and it stays safe and self-owned.
+
+If a team's separate loams can compound into one base that is still just markdown in git, safe and not sitting on anyone's central server, that is the version of loam a company runs on.
+
+---
+
 ## What it explicitly does *not* try to be
 
 - **Not a knowledge graph database.** No triples, no SPARQL, no graph engine. Wikilinks and grep cover the problems agents actually face.
