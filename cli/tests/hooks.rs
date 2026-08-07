@@ -1970,3 +1970,367 @@ fn a_new_store_is_private() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+// --- T1: --events-stdin batch ingest on the lifecycle commands ---
+
+fn loam_stdin(args: &[&str], input: &str) -> Output {
+    use std::io::Write as _;
+    let mut child =
+        Command::new(std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide loam"))
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("loam should spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(input.as_bytes())
+        .expect("stdin write should succeed");
+    child.wait_with_output().expect("loam should finish")
+}
+
+fn store(root: &Path) -> Connection {
+    Connection::open(root.join("loam.sqlite3")).unwrap()
+}
+
+fn event_count(root: &Path) -> i64 {
+    store(root)
+        .query_row("SELECT count(*) FROM hook_event", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn worker_status(root: &Path, id: i64) -> Option<String> {
+    store(root)
+        .query_row(
+            "SELECT worker_status FROM hook_run WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn ok(output: &Output) {
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn finished_spawn_worker(root: &Path, harness: &str) -> i64 {
+    let workspace = temporary_root("workspace");
+    let id = begin_id(root, harness, "stop", &workspace);
+    ok(&finish_result(
+        root,
+        id,
+        "succeeded",
+        Some("spawn_worker"),
+        None,
+        None,
+    ));
+    id
+}
+
+fn continued_request_worker(root: &Path) -> i64 {
+    let workspace = temporary_root("workspace");
+    let id = begin_id(root, "codex", "stop", &workspace);
+    ok(&finish_result(
+        root,
+        id,
+        "continued",
+        Some("request_worker"),
+        None,
+        None,
+    ));
+    id
+}
+
+#[test]
+fn finish_batch_records_launch_events_after_the_transition() {
+    let root = temporary_root("finish-batch-ok");
+    let workspace = temporary_root("workspace");
+    let id = begin_id(&root, "claude", "stop", &workspace);
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"native","launch_mode":"claude_bg"}]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--action",
+            "spawn_worker",
+            "--events-stdin",
+        ],
+        batch,
+    );
+    ok(&output);
+    assert_eq!(event_count(&root), 1);
+    let (event, phase, launch) = store(&root)
+        .query_row(
+            "SELECT event, phase, launch_mode FROM hook_event WHERE hook_run_id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (event.as_str(), phase.as_str(), launch.as_str()),
+        ("ingest_visibility", "launch", "claude_bg")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn finish_stays_ok_and_inserts_nothing_when_the_batch_is_rejected() {
+    // One invalid member (recursion guard has no spawn_worker parent) rejects the
+    // whole batch, and the batch failure is fail-open: finish still succeeds.
+    let root = temporary_root("finish-batch-atomic");
+    let workspace = temporary_root("workspace");
+    let id = begin_id(&root, "claude", "stop", &workspace);
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"native","launch_mode":"claude_bg"},{"event":"claude_recursion_guard","outcome":"refused","agent_type":"loam:ingestor"}]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--action",
+            "spawn_worker",
+            "--events-stdin",
+        ],
+        batch,
+    );
+    ok(&output);
+    assert_eq!(event_count(&root), 0);
+    assert_eq!(
+        store(&root)
+            .query_row(
+                "SELECT status FROM hook_run WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "succeeded"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn finish_ignores_a_malformed_or_oversized_or_wrong_schema_batch() {
+    for batch in [
+        // unknown envelope key
+        r#"{"schema":1,"events":[{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"native","launch_mode":"x"}],"extra":1}"#.to_owned(),
+        // unknown event field
+        r#"{"schema":1,"events":[{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"native","launch_mode":"x","bogus":"y"}]}"#.to_owned(),
+        // wrong schema
+        r#"{"schema":2,"events":[{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"native","launch_mode":"x"}]}"#.to_owned(),
+        // empty events array
+        r#"{"schema":1,"events":[]}"#.to_owned(),
+        // empty stdin
+        String::new(),
+        // seventeen events (over the 16 cap)
+        format!(
+            "{{\"schema\":1,\"events\":[{}]}}",
+            vec![r#"{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"native","launch_mode":"x"}"#; 17].join(",")
+        ),
+    ] {
+        let root = temporary_root("finish-batch-malformed");
+        let workspace = temporary_root("workspace");
+        let id = begin_id(&root, "claude", "stop", &workspace);
+        let id_str = id.to_string();
+        let output = loam_stdin(
+            &[
+                "hooks", "finish", root.to_str().unwrap(), "--id", &id_str,
+                "--status", "succeeded", "--action", "spawn_worker", "--events-stdin",
+            ],
+            &batch,
+        );
+        ok(&output);
+        assert_eq!(event_count(&root), 0, "batch should have been rejected: {batch}");
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn external_worker_start_persists_proof_and_transition_atomically() {
+    let root = temporary_root("worker-start-external");
+    let id = continued_request_worker(&root);
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[{"event":"subagent","phase":"start","outcome":"observed","agent_type":"loam_ingestor","session_id":"child-1"}]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "worker-start",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--origin",
+            "external",
+            "--session-id",
+            "child-1",
+            "--events-stdin",
+        ],
+        batch,
+    );
+    ok(&output);
+    assert_eq!(worker_status(&root, id).as_deref(), Some("running"));
+    assert_eq!(event_count(&root), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn external_worker_start_rolls_back_proof_when_the_transition_fails() {
+    // Proof session id and the transition session id disagree, so the external
+    // guard fails; neither the proof event nor the transition may persist.
+    let root = temporary_root("worker-start-atomic");
+    let id = continued_request_worker(&root);
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[{"event":"subagent","phase":"start","outcome":"observed","agent_type":"loam_ingestor","session_id":"child-1"}]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "worker-start",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--origin",
+            "external",
+            "--session-id",
+            "child-2",
+            "--events-stdin",
+        ],
+        batch,
+    );
+    assert_ne!(output.status.code(), Some(0));
+    assert_eq!(worker_status(&root, id).as_deref(), Some("requested"));
+    assert_eq!(event_count(&root), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_finish_flushes_its_batch_then_always_finishes() {
+    let root = temporary_root("worker-finish-batch");
+    let id = continued_request_worker(&root);
+    let id_str = id.to_string();
+    // Bind the external worker with its start proof.
+    ok(&loam_stdin(
+        &[
+            "hooks",
+            "worker-start",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--origin",
+            "external",
+            "--session-id",
+            "child-1",
+            "--events-stdin",
+        ],
+        r#"{"schema":1,"events":[{"event":"subagent","phase":"start","outcome":"observed","agent_type":"loam_ingestor","session_id":"child-1"}]}"#,
+    ));
+    // Worker-finish flushes a subagent/stop while still running, then finishes.
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--origin",
+            "external",
+            "--session-id",
+            "child-1",
+            "--events-stdin",
+        ],
+        r#"{"schema":1,"events":[{"event":"subagent","phase":"stop","outcome":"succeeded","agent_type":"loam_ingestor","session_id":"child-1"}]}"#,
+    );
+    ok(&output);
+    assert_eq!(worker_status(&root, id).as_deref(), Some("succeeded"));
+    assert_eq!(event_count(&root), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_finish_terminal_survives_a_rejected_batch() {
+    let root = temporary_root("worker-finish-failopen");
+    let id = continued_request_worker(&root);
+    let id_str = id.to_string();
+    ok(&loam_stdin(
+        &[
+            "hooks",
+            "worker-start",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--origin",
+            "external",
+            "--session-id",
+            "child-1",
+            "--events-stdin",
+        ],
+        r#"{"schema":1,"events":[{"event":"subagent","phase":"start","outcome":"observed","agent_type":"loam_ingestor","session_id":"child-1"}]}"#,
+    ));
+    // A malformed batch is dropped, but the terminal transition still applies.
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--origin",
+            "external",
+            "--session-id",
+            "child-1",
+            "--events-stdin",
+        ],
+        r#"{"schema":1,"events":[{"event":"subagent","phase":"stop","outcome":"succeeded","bogus":"x"}]}"#,
+    );
+    ok(&output);
+    assert_eq!(worker_status(&root, id).as_deref(), Some("succeeded"));
+    assert_eq!(event_count(&root), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lifecycle_without_events_stdin_is_unchanged() {
+    let root = temporary_root("no-events-flag");
+    let id = finished_spawn_worker(&root, "claude");
+    assert_eq!(event_count(&root), 0);
+    assert_eq!(
+        store(&root)
+            .query_row(
+                "SELECT action FROM hook_run WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "spawn_worker"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
