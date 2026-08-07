@@ -120,7 +120,7 @@ export async function gate({ harness, payload = {}, globalRoot, env = process.en
 }
 
 export function startWorker({
-  harness, workspace, globalRoot, skillsRoot, workerPath, hookRunId,
+  harness, workspace, globalRoot, skillsRoot, workerPath, hookRunId, workerOrigin,
   env = process.env, spawn = spawnDetached,
 } = {}) {
   if (!workerPath) throw new Error('installed ingestion worker is unavailable');
@@ -129,6 +129,7 @@ export function startWorker({
     args: [
       workerPath, '--harness', harness, '--workspace', resolve(workspace),
       ...(Number.isSafeInteger(hookRunId) && hookRunId > 0 ? ['--hook-run-id', String(hookRunId)] : []),
+      ...(workerOrigin === 'fallback' ? ['--worker-origin', 'fallback'] : []),
     ],
     cwd: resolve(workspace),
     env: { ...env, LOAM_INGEST_WORKER: '1', LOAM_INGEST_GLOBAL_ROOT: resolve(globalRoot), ...(skillsRoot ? { LOAM_INGEST_SKILLS_ROOT: resolve(skillsRoot) } : {}) },
@@ -463,7 +464,10 @@ export async function finalizeNativeAgentRun({
 async function startBoundaryWorker(options, result, { nativeFallback = false, intentId } = {}) {
   try {
     const workerPath = await installedWorkerPath(options.globalRoot);
-    const launch = () => startWorker({ ...options, workerPath, workspace: result.workspace });
+    const launch = () => startWorker({
+      ...options, workerPath, workspace: result.workspace,
+      ...(nativeFallback ? { workerOrigin: 'fallback' } : {}),
+    });
     const outcome = nativeFallback ? { ...result, native_fallback: true } : result;
     if (options.deferSpawn) {
       // S1: hand the physical spawn back so the caller runs it only after

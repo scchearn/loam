@@ -269,6 +269,25 @@ test('detached workers report their result without changing worker failures', as
   assert.match(calls[0][1].detail, /worker crashed/);
 });
 
+test('a detached fallback worker records codex_native/fallback/taken and finishes as fallback', async () => {
+  const calls = [];
+  await runIngestWorker({
+    harness: 'codex', workspace: '/workspace', hookRunId: 12, globalRoot: '/global',
+    skillsRoot: '/skills', env: {}, workerOrigin: 'fallback',
+    startHookWorker: async (input) => calls.push(['start', input]),
+    finishHookWorker: async (input) => calls.push(['finish', input]),
+    runWorker: async () => ({ reason: 'ok' }),
+  });
+  assert.equal(calls[0][0], 'start');
+  assert.equal(calls[0][1].origin, 'fallback');
+  assert.deepEqual(calls[0][1].events, [
+    { event: 'codex_native', phase: 'fallback', outcome: 'taken', visibility: 'native' },
+  ]);
+  assert.equal(calls[1][0], 'finish');
+  assert.equal(calls[1][1].origin, 'fallback');
+  assert.equal(calls[1][1].reason, 'ok');
+});
+
 test('OpenCode hook-run logging remains fail-open', async () => {
   let calls = 0;
   const plugin = await createOpenCodeAdapter({

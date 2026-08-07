@@ -2415,6 +2415,29 @@ fn worker_finish_batch_records_claude_agent_events() {
 }
 
 #[test]
+fn fallback_worker_lane_records_taken_and_finishes() {
+    // The fallback worker carries codex_native/fallback/taken in its worker-start
+    // batch; it inserts (worker_origin NULL) then the fallback transition sees it.
+    let root = temporary_root("fallback-lane");
+    let id = continued_request_worker(&root);
+    let id_str = id.to_string();
+    ok(&loam_stdin(
+        &[
+            "hooks", "worker-start", root.to_str().unwrap(), "--id", &id_str,
+            "--origin", "fallback", "--events-stdin",
+        ],
+        r#"{"schema":1,"events":[{"event":"codex_native","phase":"fallback","outcome":"taken","visibility":"native"}]}"#,
+    ));
+    assert_eq!(worker_status(&root, id).as_deref(), Some("running"));
+    ok(&worker_finish_with_origin(
+        &root, id, "succeeded", "ok", Some("fallback"), None, None,
+    ));
+    assert_eq!(worker_status(&root, id).as_deref(), Some("succeeded"));
+    assert_eq!(event_count(&root), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn lifecycle_without_events_stdin_is_unchanged() {
     let root = temporary_root("no-events-flag");
     let id = finished_spawn_worker(&root, "claude");
