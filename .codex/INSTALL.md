@@ -55,3 +55,19 @@ computes a complete actionable fingerprint. Live or uncertain workers,
 missing exclusions, unreadable/racing files, and unknown process identity fail
 closed. Check `ingest-status --workspace <path> --json` through the installed
 integration. It never modifies source files, commits, or pushes.
+
+## Background session harvest
+
+Background session-learning harvest is enabled by default. On every turn end
+the hook measures what has been said since the last harvest; when enough new
+conversation exists, a detached agent reviews the window and routes durable
+learnings through `loam::learning-from-session`. To opt out, set
+`LOAM_HARVEST_BACKGROUND=0` as the unconditional kill switch, or set
+`background_harvest.enabled` to `false` in `~/.agents/loam/config.json`.
+
+Each session keeps its own cursor and harvests into its workspace's memory.
+Harvest shares the per-workspace memory-writer lease with code ingestion and
+never runs while another worker holds it. The harvest agent's own turn ends
+are never re-harvested. Check `harvest-status --workspace <path> --json`
+through the installed integration to inspect per-session cursors, the wiki
+cache, last run, and the shared lease.

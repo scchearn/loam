@@ -57,6 +57,17 @@ changing it. `uninstall` also removes Loam's globally installed skills.
 For agent-specific setup notes, see [`.opencode/INSTALL.md`](./.opencode/INSTALL.md)
 and [`.codex/INSTALL.md`](./.codex/INSTALL.md).
 
+### Background session harvest
+
+Background session-learning harvest is enabled by default: on every turn end
+the hook measures what has been said since the last harvest, and when enough
+new conversation exists a detached agent reviews the window and routes durable
+learnings through `loam::learning-from-session`. Each session keeps its own
+cursor and harvests into its workspace's memory; harvest shares the
+per-workspace memory-writer lease with code ingestion and never runs while
+another worker holds it. To opt out, set `LOAM_HARVEST_BACKGROUND=0` or
+`background_harvest.enabled: false` in `~/.agents/loam/config.json`.
+
 ## What you get
 
 21 skills, grouped by what they're for:

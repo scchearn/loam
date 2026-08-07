@@ -11,7 +11,7 @@ import {
 } from './ingest-process.mjs';
 import { FingerprintError, fingerprintActionable } from './ingest-fingerprint.mjs';
 
-const PROMPT = 'Run the existing loam::ingesting-codebase skill for the provided workspace. Do not modify source files, commit, or push. Do not spawn other agents or subagents.';
+export const PROMPT = 'Run the existing loam::ingesting-codebase skill for the provided workspace. Do not modify source files, commit, or push. Do not spawn other agents or subagents.';
 const DEFAULTS = Object.freeze({ enabled: true, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800, visibility: 'native', require_visible_worker: false });
 const CODEX_NATIVE_REASON = 'Call spawn_agent exactly once using the loam_ingestor agent profile, fork_turns set to "none", and task_name set to "loam_ingest_stop_<N>" where <N> is the numeric component of this hook_prompt\'s hook_run_id. Run the pending Loam code-memory ingestion, then finish this continuation immediately without doing any other work or spawning any additional agents.';
 const NATIVE_AGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -845,8 +845,8 @@ async function waitForOpenCode(openCodeSession, sessionId, deadline) {
   return last;
 }
 
-async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease, openCodeSession, root, requireVisibleWorker = false }) {
-  const prompt = PROMPT + ' Workspace: ' + workspace;
+async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease, openCodeSession, root, requireVisibleWorker = false, prompt = PROMPT, agentId = 'loam:ingestor' }) {
+  const resolvedPrompt = prompt + ' Workspace: ' + workspace;
   if (mode === 'opencode_child') {
     if (!openCodeSession?.createChild || !openCodeSession?.promptAsync || !openCodeSession.parentSessionId) return { category: 'runtime_unavailable' };
     const child = await openCodeSession.createChild({
@@ -865,7 +865,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease,
       return { category: 'orphan_unknown' };
     }
     try {
-      await openCodeSession.promptAsync({ sessionId: String(sessionId), parts: [{ type: 'text', text: prompt }] });
+      await openCodeSession.promptAsync({ sessionId: String(sessionId), parts: [{ type: 'text', text: resolvedPrompt }] });
     } catch {
       try {
         const record = await openCodeSession.status(String(sessionId));
@@ -881,7 +881,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease,
       const name = lease.planned_identity.name;
       const started = startTracked({
           command: 'claude',
-          args: ['--bg', '--agent', 'loam:ingestor', '--name', name, '--settings', JSON.stringify({ worktree: { bgIsolation: 'none' } }), '--setting-sources', 'user', '--strict-mcp-config', '--permission-mode', 'dontAsk', '--allowedTools', 'Read Glob Grep Write Edit Bash Skill', '--', prompt],
+          args: ['--bg', '--agent', agentId, '--name', name, '--settings', JSON.stringify({ worktree: { bgIsolation: 'none' } }), '--setting-sources', 'user', '--strict-mcp-config', '--permission-mode', 'dontAsk', '--allowedTools', 'Read Glob Grep Write Edit Bash Skill', '--', resolvedPrompt],
           cwd: workspace, env, timeoutMs,
           detached: true, captureOutput: false,
       });
@@ -910,7 +910,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease,
   if (mode === 'claude_print') {
     const started = startTracked({
       command: 'claude',
-      args: ['-p', prompt, '--permission-mode', 'dontAsk', '--allowedTools', 'Read Glob Grep Write Edit Bash'],
+      args: ['-p', resolvedPrompt, '--permission-mode', 'dontAsk', '--allowedTools', 'Read Glob Grep Write Edit Bash'],
       cwd: workspace, env, timeoutMs,
         detached: true, captureOutput: false,
       });
@@ -924,7 +924,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease,
   const started = startTracked({
     command: 'codex',
     args: ['-a', 'never', 'exec', '--ephemeral', '-s', 'workspace-write', '-C', workspace, '--color', 'never', '-'],
-    cwd: workspace, env, input: prompt, timeoutMs,
+    cwd: workspace, env, input: resolvedPrompt, timeoutMs,
     detached: true, captureOutput: false,
   });
   const identity = await childIdentity(started.child.pid);
@@ -1186,4 +1186,4 @@ export async function ingestStatus({ globalRoot, workspace, env = process.env } 
   };
 }
 
-export { inspectIntent, resolveExclusions };
+export { inspectIntent, resolveExclusions, launchModel, acquireLease, releaseLease, updateLease, writeSkip, liveOwnedChild, launchPlan };

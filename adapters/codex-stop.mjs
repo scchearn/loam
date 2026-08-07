@@ -40,6 +40,18 @@ export async function main({
       skillsRoot: env.LOAM_INGEST_SKILLS_ROOT || resolveSkillsRoot({ env }),
       env,
     });
+    const { resolveGlobalRoot: harvestRoot } = await loadIngest();
+    const harvest = await import('./harvest-modules.mjs').catch(() => null);
+    if (harvest?.harvestTick) {
+      try {
+        await harvest.harvestTick({
+          harness: 'codex',
+          payload,
+          globalRoot: harvestRoot({ env }),
+          env,
+        });
+      } catch {}
+    }
   } catch (error) {
     failure = error;
     errorOutput.write('loam ingest: ' + String(error?.message || error) + '\n');

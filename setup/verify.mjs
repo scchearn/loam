@@ -156,6 +156,27 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
   }
 }
 
+async function verifyHarvesterAgent(packageRoot, install, installPluginVersion) {
+  const packageAgent = join(packageRoot, 'plugins', 'loam-adapter', 'agents', 'harvester.md');
+  try {
+    if (!(await fileExists(packageAgent))) return { ready: false, category: 'harvester_agent_missing' };
+    if (!install) return { ready: true, source: 'package' };
+    const version = installPluginVersion || install.plugin_version;
+    const cacheAgent = join(install.adapter_root, '..', '..', 'plugins', 'loam-adapter', 'agents', 'harvester.md');
+    try {
+      const [expected, actual] = await Promise.all([
+        readFile(packageAgent, 'utf8'),
+        readFile(cacheAgent, 'utf8'),
+      ]);
+      return { ready: actual === expected, source: 'installed', category: actual === expected ? null : 'harvester_agent_mismatch' };
+    } catch {
+      return { ready: true, source: 'package' };
+    }
+  } catch {
+    return { ready: false, category: 'harvester_agent_missing' };
+  }
+}
+
 export async function verifyInstallation({
   discovery,
   packageRoot,
@@ -208,6 +229,7 @@ export async function verifyInstallation({
   const harnessReady = Object.values(harnesses).every((harness) => harness.ready);
   const pluginVersionReady = install?.plugin_version === discovery.packageVersion;
   const ingestExclusions = await verifyIngestExclusions(discovery.skillsRoot);
+  const harvestAgent = await verifyHarvesterAgent(packageRoot, install, discovery.packageVersion);
   return {
     ready: Boolean(pluginVersionReady && skills.ready && runtime.ready && harnessReady && migration.ready && ingestExclusions.ready),
     install,
@@ -215,6 +237,7 @@ export async function verifyInstallation({
     runtime,
     harnesses,
     ingestExclusions,
+    harvestAgent,
     migration,
     native: { ready: runtime.ready },
   };
