@@ -146,7 +146,7 @@ async function publishAssets(globalRoot, pluginVersion) {
   const versionRoot = join(resolve(globalRoot), 'plugins', `${pluginVersion}-${randomUUID()}`);
   try {
     await mkdir(versionRoot, { recursive: true, mode: 0o700 });
-    const names = ['opencode.mjs', 'claude-session-start.mjs', 'claude-stop.mjs', 'codex-session-start.mjs', 'codex-stop.mjs', 'ingest-worker.mjs', 'ingest-modules.mjs', 'cursor-session-start.mjs'];
+    const names = ['opencode.mjs', 'claude-session-start.mjs', 'claude-stop.mjs', 'codex-session-start.mjs', 'codex-stop.mjs', 'ingest-worker.mjs', 'ingest-modules.mjs', 'harvest-worker.mjs', 'harvest-modules.mjs', 'cursor-session-start.mjs'];
     const assets = {};
     for (const name of names) {
       const source = await readFile(

@@ -187,6 +187,46 @@ test('uninstall without install.json reports nothing to remove', async () => {
   assert.match(message, /Nothing to uninstall/);
 });
 
+test('harvest_packaging: uninstall removes harvest state and window files with the global root', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const runRoot = join(globalRoot, 'run', 'workspace-hash');
+  await mkdir(join(runRoot, 'harvest'), { recursive: true });
+  await writeFile(join(runRoot, 'harvest', 'abc123.window.md'), '# window\n');
+  await writeFile(join(runRoot, 'harvest', 'abc123.json'), '{"schema":1}\n');
+  await writeFile(join(runRoot, 'harvest-last-run.json'), '{"schema":1}\n');
+  await writeFile(join(runRoot, 'lease.json'), JSON.stringify({
+    schema: 1, lease_id: 'lease-dead', workspace: '/workspace', harness: 'opencode',
+    owner_pid: 99999999, boot_id: 'dead', process_start: 'dead',
+    started_at: 0, hard_deadline: new Date(0).toISOString(),
+    launch_mode: 'opencode_child', launch_state: 'launched', planned_identity: null, child_identity: null,
+  }) + '\n');
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
+
+  assert.equal(code, 0);
+  assert.equal(await exists(join(runRoot, 'harvest', 'abc123.window.md')), false, 'window file removed');
+  assert.equal(await exists(join(runRoot, 'harvest-last-run.json')), false, 'harvest last-run removed');
+  assert.equal(await exists(join(globalRoot, 'run')), false, 'run root removed');
+});
+
+test('harvest_packaging: uninstall is blocked while a harvest lease is live', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const runRoot = join(globalRoot, 'run', 'workspace-hash');
+  await mkdir(join(runRoot, 'harvest'), { recursive: true });
+  const identity = await childIdentity(process.pid);
+  await writeFile(join(runRoot, 'lease.json'), JSON.stringify({
+    schema: 1, lease_id: 'lease-live', workspace: '/workspace', harness: 'opencode',
+    owner_pid: identity.pid, boot_id: identity.boot_id, process_start: identity.process_start,
+    started_at: Date.now(), hard_deadline: new Date(Date.now() + 60000).toISOString(),
+    launch_mode: 'opencode_child', launch_state: 'launched', planned_identity: null, child_identity: null,
+  }) + '\n');
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
+
+  assert.equal(code, 1, 'uninstall blocked by live lease');
+  assert.equal(await exists(join(runRoot, 'harvest')), true, 'harvest state retained while a worker is live');
+});
+
 test('uninstall cancelled without --yes returns 130', async () => {
   const { home, globalRoot } = await readyFixture();
   const code = await uninstall({

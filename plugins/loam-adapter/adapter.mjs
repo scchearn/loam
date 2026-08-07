@@ -95,11 +95,26 @@ export async function handleClaudeHook(payload, options = {}) {
   return handleMarketplaceHook(payload, { ...options, harness: 'claude' });
 }
 
+async function defaultHarvestModules({ integrationPath } = {}) {
+  integrationPath ||= await defaultIntegrationPath();
+  const root = new URL('./', pathToFileURL(integrationPath));
+  try {
+    const [paths, harvest] = await Promise.all([
+      import(new URL('paths.mjs', root).href),
+      import(new URL('harvest.mjs', root).href),
+    ]);
+    return { ...paths, ...harvest };
+  } catch {
+    return null;
+  }
+}
+
 export async function handleMarketplaceStop(payload = {}, {
   harness = 'claude',
   env = process.env,
   loadHooks = defaultHookModules,
   loadIngest = defaultIngestModules,
+  loadHarvest = defaultHarvestModules,
 } = {}) {
   const workspace = workspaceFromPayload(payload);
   let hookRun = null;
@@ -118,37 +133,54 @@ export async function handleMarketplaceStop(payload = {}, {
 
   let failure;
   let outcome;
+  let harvestOutcome;
   let visibility = 'silent';
   try {
     const { resolveGlobalRoot, resolveSkillsRoot, readIngestConfig, dispatchBoundary } = await loadIngest();
     if (!dispatchBoundary) throw new Error('Loam ingestion integration is unavailable');
     const globalRoot = env.LOAM_INGEST_GLOBAL_ROOT || resolveGlobalRoot({ env });
     if (harness === 'codex') visibility = (await readIngestConfig?.(globalRoot, env))?.visibility || 'silent';
+    const dispatchPayload = {
+      session_id: typeof payload?.session_id === 'string' ? payload.session_id : undefined,
+      cwd: typeof payload?.cwd === 'string' ? payload.cwd : undefined,
+      stop_hook_active: payload?.stop_hook_active === true,
+      agent_type: typeof payload?.agent_type === 'string' ? payload.agent_type : undefined,
+    };
     outcome = await dispatchBoundary({
       harness,
-      payload: {
-        session_id: typeof payload?.session_id === 'string' ? payload.session_id : undefined,
-        cwd: typeof payload?.cwd === 'string' ? payload.cwd : undefined,
-        stop_hook_active: payload?.stop_hook_active === true,
-        agent_type: typeof payload?.agent_type === 'string' ? payload.agent_type : undefined,
-      },
+      payload: dispatchPayload,
       globalRoot,
       skillsRoot: env.LOAM_INGEST_SKILLS_ROOT || resolveSkillsRoot({ env }),
       hookRunId: hookRun?.id,
       env,
     });
+    const harvest = await loadHarvest();
+    if (harvest?.harvestTick) {
+      try {
+        harvestOutcome = await harvest.harvestTick({
+          harness,
+          payload: dispatchPayload,
+          globalRoot,
+          env,
+          hookRunId: hookRun?.id,
+        });
+      } catch {}
+    }
   } catch (error) {
     failure = error;
   }
 
   if (hookRun && finishHookRun) {
     try {
+      const recorded = harvestOutcome?.action === 'spawn_worker'
+        ? { action: harvestOutcome.action, reason: 'harvest_dispatched' }
+        : null;
       await finishHookRun({
         run: hookRun,
         status: failure ? 'failed' : 'succeeded',
         ...(failure
           ? { detail: failure instanceof Error ? failure.message : String(failure) }
-          : {
+          : recorded || {
               action: outcome?.action,
               ...(outcome?.reason !== undefined ? { reason: outcome.reason } : {}),
               ...(outcome?.detail !== undefined ? { detail: outcome.detail } : {}),

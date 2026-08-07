@@ -15,6 +15,7 @@ import { PACKAGE_VERSION } from '../setup/constants.mjs';
 import { discover } from '../setup/discovery.mjs';
 import { verifyInstallation } from '../setup/verify.mjs';
 import { detectTarget, runtimePath } from '../setup/target.mjs';
+import { uninstall } from '../setup/uninstall.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 const target = detectTarget();
@@ -77,6 +78,54 @@ async function baseFixture() {
     smokeRunner: async () => ({ code: 0, stdout: '{"exists":false}', stderr: '' }),
   };
 }
+
+test('harvest_packaging: fresh install stages every harvest module and the harvest worker', async () => {
+  const fixture = await baseFixture();
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['setup', '--yes']), {
+    ...fixture,
+    packageRoot,
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+  assert.equal(code, 0, capture.text());
+  const globalRoot = join(fixture.home, '.agents', 'loam');
+  const install = JSON.parse(await readFile(join(globalRoot, 'install.json'), 'utf8'));
+  const integrationPath = install.integration_path;
+  const integrationRoot = join(integrationPath, '..');
+  for (const module of [
+    'harvest-state.mjs', 'harvest-window.mjs', 'harvest-store.mjs',
+    'harvest-claude.mjs', 'harvest-codex.mjs', 'harvest-opencode.mjs', 'harvest.mjs',
+  ]) {
+    assert.ok(
+      (await readdir(integrationRoot)).includes(module),
+      `fresh install must stage ${module}`,
+    );
+  }
+  const adapterRoot = install.adapter_root;
+  assert.ok(
+    (await readdir(adapterRoot)).includes('harvest-worker.mjs'),
+    'fresh install must stage harvest-worker.mjs in the adapter root',
+  );
+});
+
+test('harvest_packaging: upgrade stages harvest modules idempotently and final verification passes', async () => {
+  const fixture = await baseFixture();
+  const first = outputCapture();
+  await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, output: first.output, errorOutput: first.output });
+  const second = outputCapture();
+  const code = await runSetup(parseArgs(['setup', '--yes']), {
+    ...fixture,
+    packageRoot,
+    output: second.output,
+    errorOutput: second.output,
+  });
+  assert.equal(code, 0, second.text());
+  const globalRoot = join(fixture.home, '.agents', 'loam');
+  const install = JSON.parse(await readFile(join(globalRoot, 'install.json'), 'utf8'));
+  const integrationRoot = join(install.integration_path, '..');
+  assert.ok((await readdir(integrationRoot)).includes('harvest.mjs'), 'upgrade is idempotent');
+});
 
 test('clean --yes setup completes and publishes verified install metadata', async () => {
   const fixture = await baseFixture();

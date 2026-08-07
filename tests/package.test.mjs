@@ -161,6 +161,12 @@ test('packed marketplaces expose loam:ingestor, the loam_ingestor profile, and s
     assert.match(agent, /^model: haiku$/mu);
     assert.doesNotMatch(agent.match(/^tools: (.*)$/mu)?.[1] || '', /(?:^|,\s*)Agent(?:,|$)/u);
     assert.match(agent, /Never spawn or delegate to another agent or subagent/u);
+    const harvester = await readFile(join(adapterRoot, 'agents', 'harvester.md'), 'utf8');
+    assert.match(harvester, /^---\r?\n[\s\S]*?^name: harvester$/mu);
+    assert.match(harvester, /^tools: .*\bSkill\b.*$/mu);
+    assert.match(harvester, /^model: haiku$/mu);
+    assert.match(harvester, /loam::learning-from-session/u);
+    assert.match(harvester, /Never spawn or delegate to another agent or subagent/u);
     const codexAgent = await readFile(join(fixture.root, 'adapters', 'loam_ingestor.toml'), 'utf8');
     assert.match(codexAgent, /^name = "loam_ingestor"$/mu);
     assert.match(codexAgent, /^description = "[^"\r\n]+"$/mu);

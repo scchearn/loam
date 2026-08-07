@@ -1,0 +1,12 @@
+{
+  "captured": "2026-08-07T07:49:53Z",
+  "harness": "claude",
+  "command": "claude -p --settings '{\"hooks\":{\"Stop\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"node /tmp/harvest-payloads/claude-stop-dump.mjs\"}]}]}}' --permission-mode dontAsk --allowedTools 'Read Bash' -- 'Reply with only: OK. Then run: ls /tmp'",
+  "keys_present": ["session_id", "transcript_path", "cwd", "prompt_id", "permission_mode", "effort", "hook_event_name", "stop_hook_active", "last_assistant_message", "background_tasks", "session_crons"],
+  "requirement_diff": {
+    "session_id": "present",
+    "workspace": "present via cwd",
+    "recursion_identity": "stop_hook_active present; agent_type absent; child_session absent",
+    "content_fields": "last_assistant_message present; user_prompt absent"
+  }
+}
