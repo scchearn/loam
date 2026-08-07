@@ -2348,6 +2348,31 @@ fn worker_finish_batch_records_preparation_and_finalization() {
 }
 
 #[test]
+fn worker_finish_batch_records_visibility_and_delivery() {
+    // Proves the T5 visibility DTO shapes and their ordering satisfy the guards:
+    // launch before terminal, each visibility event before its delivery.
+    let root = temporary_root("worker-visibility");
+    let id = finished_spawn_worker(&root, "opencode");
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[
+        {"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"toast","launch_mode":"opencode_child"},
+        {"event":"ingest_visibility","phase":"terminal","outcome":"ok","visibility":"toast","launch_mode":"opencode_child"},
+        {"event":"visibility_delivery","phase":"launch","outcome":"aborted","visibility":"toast","launch_mode":"opencode_child"},
+        {"event":"visibility_delivery","phase":"terminal","outcome":"emitted","visibility":"toast","launch_mode":"opencode_child"}
+    ]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks", "worker-finish", root.to_str().unwrap(), "--id", &id_str,
+            "--status", "succeeded", "--reason", "ok", "--events-stdin",
+        ],
+        batch,
+    );
+    ok(&output);
+    assert_eq!(event_count(&root), 4);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn lifecycle_without_events_stdin_is_unchanged() {
     let root = temporary_root("no-events-flag");
     let id = finished_spawn_worker(&root, "claude");

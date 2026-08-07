@@ -42,19 +42,24 @@ async function writeAtomicFile(path, contents) {
 function numeric(value, fallback) { const parsed = Number(value); return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback; }
 function visibility(value) { return ['silent', 'toast', 'native'].includes(value) ? value : DEFAULTS.visibility; }
 
+// Returns the delivery outcome so callers can emit a matching visibility_delivery
+// event: 'emitted' (fulfilled), 'failed' (threw/rejected), 'aborted' (250 ms
+// deadline won), or null when no attempt was made (silent, or no notifier).
 async function sendNotification(notify, configuredVisibility, event) {
-  if (configuredVisibility === 'silent' || typeof notify !== 'function') return;
+  if (configuredVisibility === 'silent' || typeof notify !== 'function') return null;
   // Contract: notifiers must pass this signal to every resource they open; the seam cannot cancel resources that ignore it.
   const controller = new AbortController();
   let timer;
   try {
-    await Promise.race([
-      Promise.resolve().then(() => notify({ ...event, visibility: configuredVisibility, signal: controller.signal })),
+    return await Promise.race([
+      Promise.resolve()
+        .then(() => notify({ ...event, visibility: configuredVisibility, signal: controller.signal }))
+        .then(() => 'emitted', () => 'failed'),
       new Promise((resolvePromise) => {
-        timer = setTimeout(() => { controller.abort(); resolvePromise(); }, NOTIFICATION_TIMEOUT_MS);
+        timer = setTimeout(() => { controller.abort(); resolvePromise('aborted'); }, NOTIFICATION_TIMEOUT_MS);
       }),
     ]);
-  } catch {}
+  } catch { return 'failed'; }
   finally { clearTimeout(timer); }
 }
 
@@ -1140,11 +1145,29 @@ export async function finalizeWorkerRun(prepared, {
       });
     }
     if (lease.launch_mode === 'claude_bg') await pruneClaudeSessions(workspace, lease, env);
-    await launchNotification;
-    await sendNotification(notify, config.visibility, {
+    const launchDelivery = await launchNotification;
+    const terminalDelivery = await sendNotification(notify, config.visibility, {
       phase: 'terminal', harness, workspace, launchMode: lease.launch_mode,
       status: recorded.status,
     });
+    if (config.visibility !== 'silent' && typeof notify === 'function') {
+      (prepared.events ||= []).push({
+        event: 'ingest_visibility', phase: 'terminal', outcome: recorded.status,
+        visibility: config.visibility, launch_mode: lease.launch_mode,
+      });
+      if (launchDelivery) {
+        prepared.events.push({
+          event: 'visibility_delivery', phase: 'launch', outcome: launchDelivery,
+          visibility: config.visibility, launch_mode: lease.launch_mode,
+        });
+      }
+      if (terminalDelivery) {
+        prepared.events.push({
+          event: 'visibility_delivery', phase: 'terminal', outcome: terminalDelivery,
+          visibility: config.visibility, launch_mode: lease.launch_mode,
+        });
+      }
+    }
     return { reason: result?.category === 'timeout' ? 'unavailable' : 'ok' };
   } finally {
     if (!retainLease && await liveOwnedChild(root, workspace, openCodeSession, lease.lease_id, env)) retainLease = true;
@@ -1173,6 +1196,12 @@ export async function runWorker(options = {}) {
         skipReason: launch.category,
         retainLease: ['orphan_live', 'orphan_unknown'].includes(launch.category),
       }));
+    }
+    if (config.visibility !== 'silent' && typeof notify === 'function') {
+      prepared.events.push({
+        event: 'ingest_visibility', phase: 'launch', outcome: 'started',
+        visibility: config.visibility, launch_mode: lease.launch_mode,
+      });
     }
     const launchNotification = sendNotification(notify, config.visibility, {
       phase: 'launch', harness, workspace, launchMode: lease.launch_mode,

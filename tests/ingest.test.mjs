@@ -226,6 +226,20 @@ test('notification launch is non-blocking and terminal status follows persisted 
   assert.equal(launchNotificationSettled, true, 'deadline must settle an abort-aware notification resource');
   assert.equal(calls[1].signal.aborted, false);
   assert.equal(calls[1].status, stored.status);
+  // T5: the worker buffered visibility launch/terminal + delivery events in order.
+  assert.deepEqual(result.events.map((e) => `${e.event}/${e.phase ?? 'none'}`), [
+    'ingest_preparation/none',
+    'ingest_visibility/launch',
+    'ingest_finalization/none',
+    'ingest_visibility/terminal',
+    'visibility_delivery/launch',
+    'visibility_delivery/terminal',
+  ]);
+  assert.equal(result.events[1].visibility, 'toast');
+  assert.equal(result.events[1].launch_mode, result.events[3].launch_mode);
+  assert.equal(result.events[3].outcome, stored.status);
+  assert.ok(['emitted', 'failed', 'aborted'].includes(result.events[4].outcome));
+  assert.ok(['emitted', 'failed', 'aborted'].includes(result.events[5].outcome));
 });
 
 test('silent and failing notifications cannot change ingestion state or exceed two calls', async () => {
