@@ -249,6 +249,49 @@ async function removeGlobalSkills({ packageRoot, expectedSource, runner, initial
     : { ready: true, names: found.names };
 }
 
+// Tear down a specific set of harnesses (used when setup deselects a
+// previously-configured one). Reuses the same in-place cleaners as a full
+// uninstall, scoped to the given ids. Never touches the global root or skills.
+export async function removeHarnesses({
+  ids = [],
+  home = homedir(),
+  globalRoot,
+  runner,
+  cwd = process.cwd(),
+} = {}) {
+  const root = resolve(globalRoot || join(home, '.agents', 'loam'));
+  const idSet = new Set(ids);
+  const result = {};
+
+  const marketIds = ['claude', 'codex'].filter((id) => idSet.has(id));
+  if (marketIds.length) {
+    const detected = await detectHarnesses({ home });
+    const scoped = Object.fromEntries(marketIds.map((id) => [id, detected[id]]));
+    result.marketplace = await removeMarketplacePlugins({ harnesses: scoped, cwd, runner });
+  }
+
+  for (const id of ids) {
+    if (id === 'claude') {
+      result.claude = await cleanHarnessConfig(join(home, '.claude', 'settings.json'), root, cleanClaudeConfig);
+      await removeBackups(join(home, '.claude'));
+    } else if (id === 'codex') {
+      result.codex = await cleanHarnessConfig(join(home, '.codex', 'hooks.json'), root, cleanCodexConfig);
+      await removeBackups(join(home, '.codex'));
+      await removeCodexAgentProfile(await inspectCodexAgentProfile(home));
+    } else if (id === 'cursor') {
+      result.cursor = await cleanHarnessConfig(join(home, '.cursor', 'hooks.json'), root, cleanCursorConfig);
+      await removeBackups(join(home, '.cursor'));
+    } else if (id === 'opencode') {
+      for (const name of ['loam.js', 'loam.mjs']) {
+        const path = join(home, '.config', 'opencode', 'plugins', name);
+        if (await exists(path)) await rm(path, { force: true });
+      }
+      result.opencode = { action: 'removed' };
+    }
+  }
+  return result;
+}
+
 export async function uninstall({
   home = homedir(),
   globalRoot,
