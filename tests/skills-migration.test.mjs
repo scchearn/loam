@@ -80,6 +80,49 @@ test('setup commands execute a Windows batch file from a spaced path', { skip: p
   }
 });
 
+test('a timed-out command tears down the whole child tree on Windows (issue #50)', { skip: process.platform !== 'win32' }, async () => {
+  // Reproduces the #50 symptom: the Skills CLI verification hangs and Loam's
+  // timeout fires. Before the fix, child.kill() terminated only the cmd.exe/npx.cmd
+  // wrapper and left the node/skills descendants orphaned. Here the batch launches
+  // a long-lived grandchild that child.kill() would miss; the fix's taskkill /T
+  // must take the whole tree down.
+  const root = await mkdtemp(join(tmpdir(), 'loam-treekill-'));
+  const grandchild = join(root, 'grandchild.cjs');
+  const pidFile = join(root, 'pid.txt');
+  const batch = join(root, 'hang.cmd');
+  const alive = (p) => {
+    try { process.kill(p, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+  };
+  try {
+    await writeFile(grandchild, "require('fs').writeFileSync(process.argv[2], String(process.pid));\nsetInterval(() => {}, 1 << 30);\n");
+    // start "" /b runs the grandchild as a child of this cmd.exe, then ping keeps
+    // the batch itself alive so the timeout (not a natural exit) is what stops it.
+    await writeFile(batch, '@echo off\r\nstart "" /b "%~1" "%~2" "%~3"\r\nping -n 120 127.0.0.1 >nul\r\n');
+
+    const result = await runCommand({
+      command: batch,
+      args: [process.execPath, grandchild, pidFile],
+      cwd: root,
+      timeoutMs: 6000,
+    });
+    assert.equal(result.category, 'timeout');
+
+    const raw = await readFile(pidFile, 'utf8').catch(() => '');
+    const pid = Number(raw.trim());
+    assert.ok(Number.isInteger(pid) && pid > 0, `grandchild recorded its pid (got ${JSON.stringify(raw)})`);
+
+    // terminateChild awaits taskkill /T, so the descendant should already be gone;
+    // poll briefly to absorb teardown lag.
+    const deadline = Date.now() + 8000;
+    while (alive(pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(alive(pid), false, 'orphaned descendant survived the timeout: child tree was not killed');
+  } finally {
+    const pid = Number((await readFile(pidFile, 'utf8').catch(() => '')).trim());
+    if (Number.isInteger(pid) && pid > 0) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('complete global Skills CLI inventory skips mutation and verifies CLI_VERSION/source metadata', async () => {
   const skillsRoot = await skillsRootFixture();
   const calls = [];
