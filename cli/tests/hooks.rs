@@ -2336,8 +2336,16 @@ fn worker_finish_batch_records_preparation_and_finalization() {
     );
     let output = loam_stdin(
         &[
-            "hooks", "worker-finish", root.to_str().unwrap(), "--id", &id_str,
-            "--status", "succeeded", "--reason", "ok", "--events-stdin",
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--events-stdin",
         ],
         &batch,
     );
@@ -2357,8 +2365,16 @@ fn finish_batch_records_codex_native_continuation() {
     let batch = r#"{"schema":1,"events":[{"event":"codex_native","phase":"continuation","outcome":"returned","visibility":"native"}]}"#;
     let output = loam_stdin(
         &[
-            "hooks", "finish", root.to_str().unwrap(), "--id", &id_str,
-            "--status", "continued", "--action", "request_worker", "--events-stdin",
+            "hooks",
+            "finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "continued",
+            "--action",
+            "request_worker",
+            "--events-stdin",
         ],
         batch,
     );
@@ -2382,8 +2398,16 @@ fn worker_finish_batch_records_visibility_and_delivery() {
     ]}"#;
     let output = loam_stdin(
         &[
-            "hooks", "worker-finish", root.to_str().unwrap(), "--id", &id_str,
-            "--status", "succeeded", "--reason", "ok", "--events-stdin",
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--events-stdin",
         ],
         batch,
     );
@@ -2404,8 +2428,16 @@ fn worker_finish_batch_records_claude_agent_events() {
     ]}"#;
     let output = loam_stdin(
         &[
-            "hooks", "worker-finish", root.to_str().unwrap(), "--id", &id_str,
-            "--status", "succeeded", "--reason", "ok", "--events-stdin",
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--events-stdin",
         ],
         batch,
     );
@@ -2423,14 +2455,26 @@ fn fallback_worker_lane_records_taken_and_finishes() {
     let id_str = id.to_string();
     ok(&loam_stdin(
         &[
-            "hooks", "worker-start", root.to_str().unwrap(), "--id", &id_str,
-            "--origin", "fallback", "--events-stdin",
+            "hooks",
+            "worker-start",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--origin",
+            "fallback",
+            "--events-stdin",
         ],
         r#"{"schema":1,"events":[{"event":"codex_native","phase":"fallback","outcome":"taken","visibility":"native"}]}"#,
     ));
     assert_eq!(worker_status(&root, id).as_deref(), Some("running"));
     ok(&worker_finish_with_origin(
-        &root, id, "succeeded", "ok", Some("fallback"), None, None,
+        &root,
+        id,
+        "succeeded",
+        "ok",
+        Some("fallback"),
+        None,
+        None,
     ));
     assert_eq!(worker_status(&root, id).as_deref(), Some("succeeded"));
     assert_eq!(event_count(&root), 1);
@@ -2446,8 +2490,16 @@ fn external_worker_finish_flushes_native_preparation_finalization_and_stop() {
     let id_str = id.to_string();
     ok(&loam_stdin(
         &[
-            "hooks", "worker-start", root.to_str().unwrap(), "--id", &id_str,
-            "--origin", "external", "--session-id", "agent-9", "--events-stdin",
+            "hooks",
+            "worker-start",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--origin",
+            "external",
+            "--session-id",
+            "agent-9",
+            "--events-stdin",
         ],
         r#"{"schema":1,"events":[{"event":"subagent","phase":"start","outcome":"observed","agent_type":"loam_ingestor","session_id":"agent-9"}]}"#,
     ));
@@ -2462,9 +2514,20 @@ fn external_worker_finish_flushes_native_preparation_finalization_and_stop() {
     );
     ok(&loam_stdin(
         &[
-            "hooks", "worker-finish", root.to_str().unwrap(), "--id", &id_str,
-            "--status", "succeeded", "--reason", "ok", "--origin", "external",
-            "--session-id", "agent-9", "--events-stdin",
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--origin",
+            "external",
+            "--session-id",
+            "agent-9",
+            "--events-stdin",
         ],
         &batch,
     ));
@@ -2487,8 +2550,16 @@ fn worker_finish_batch_on_a_pruned_parent_inserts_nothing_and_does_not_crash() {
     let batch = r#"{"schema":1,"events":[{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"toast","launch_mode":"opencode_child"}]}"#;
     let output = loam_stdin(
         &[
-            "hooks", "worker-finish", root.to_str().unwrap(), "--id", &id_str,
-            "--status", "succeeded", "--reason", "ok", "--events-stdin",
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--events-stdin",
         ],
         batch,
     );
