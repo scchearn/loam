@@ -532,6 +532,31 @@ test('an out-of-bounds event batch is dropped without a flag, process, or lost t
   }
 });
 
+test('emitting events keeps the lifecycle subprocess count constant', async () => {
+  // Each wrapper makes exactly one runtime invocation whether or not it carries
+  // an event batch — the batch rides that call, never a per-observation process.
+  const run = syntheticRun();
+  const events = [
+    { event: 'ingest_visibility', phase: 'launch', outcome: 'started', visibility: 'native', launch_mode: 'claude_bg' },
+  ];
+  for (const withEvents of [false, true]) {
+    for (const [label, invoke] of [
+      ['finish', (extra) => finishHookRun({ run, status: 'succeeded', action: 'spawn_worker', ...extra })],
+      ['worker-start', (extra) => startHookWorker({ run, sessionId: 'w', ...extra })],
+      ['worker-finish', (extra) => finishHookWorker({ run, reason: 'ok', ...extra })],
+    ]) {
+      const calls = [];
+      const runner = async (request) => {
+        calls.push(request);
+        return { code: 0, signal: null, stdout: '', stderr: '' };
+      };
+      await invoke({ runner, ...(withEvents ? { events } : {}) });
+      assert.equal(calls.length, 1, `${label} is one subprocess (events=${withEvents})`);
+      assert.equal(calls[0].args.includes('--events-stdin'), withEvents, label);
+    }
+  }
+});
+
 test('worker lifecycle wrappers forward their batch on their own single call', async () => {
   const calls = [];
   const runner = async (request) => {

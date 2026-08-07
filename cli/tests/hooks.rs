@@ -2474,6 +2474,30 @@ fn external_worker_finish_flushes_native_preparation_finalization_and_stop() {
 }
 
 #[test]
+fn worker_finish_batch_on_a_pruned_parent_inserts_nothing_and_does_not_crash() {
+    // S9: retention pruned the parent before a long worker flushed. The batch is
+    // dropped fail-open and the terminal transition reports failure — no crash,
+    // no partial insert.
+    let root = temporary_root("pruned-parent");
+    let id = finished_spawn_worker(&root, "codex");
+    store(&root)
+        .execute("DELETE FROM hook_run WHERE id = ?1", params![id])
+        .unwrap();
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"toast","launch_mode":"opencode_child"}]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks", "worker-finish", root.to_str().unwrap(), "--id", &id_str,
+            "--status", "succeeded", "--reason", "ok", "--events-stdin",
+        ],
+        batch,
+    );
+    assert_ne!(output.status.code(), Some(0));
+    assert_eq!(event_count(&root), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn lifecycle_without_events_stdin_is_unchanged() {
     let root = temporary_root("no-events-flag");
     let id = finished_spawn_worker(&root, "claude");
