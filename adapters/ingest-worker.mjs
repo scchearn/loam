@@ -55,7 +55,14 @@ export async function main(options = {}) {
       env,
     });
     if (hookRun && workerFinish) {
-      try { await workerFinish({ run: hookRun, reason: result?.reason, detail: result?.detail }); } catch {}
+      try {
+        await workerFinish({
+          run: hookRun,
+          reason: result?.reason,
+          detail: result?.detail,
+          ...(result?.events?.length ? { events: result.events } : {}),
+        });
+      } catch {}
     }
     return result;
   } catch (error) {

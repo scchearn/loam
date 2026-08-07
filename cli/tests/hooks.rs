@@ -2318,6 +2318,36 @@ fn worker_finish_terminal_survives_a_rejected_batch() {
 }
 
 #[test]
+fn worker_finish_batch_records_preparation_and_finalization() {
+    // Proves the exact DTO shapes the T5 worker producer emits satisfy the
+    // native preparation/finalization guards, including pre_digest == the
+    // preparation's actionable_digest.
+    let root = temporary_root("worker-prep-fin");
+    let id = finished_spawn_worker(&root, "codex");
+    ok(&worker_start(&root, id, None));
+    let id_str = id.to_string();
+    let digest = "a".repeat(64);
+    let batch = format!(
+        "{{\"schema\":1,\"events\":[\
+            {{\"event\":\"ingest_preparation\",\"outcome\":\"admitted\",\"launch_mode\":\"codex_detached\",\"lease_id\":\"lease-1\",\"actionable_digest\":\"{d}\",\"actionable_count\":3,\"deadline_ms\":1893456000000}},\
+            {{\"event\":\"ingest_finalization\",\"outcome\":\"ok\",\"lease_id\":\"lease-1\",\"pre_digest\":\"{d}\",\"post_digest\":\"{d}\",\"actionable_count\":3,\"failure_count\":0}}\
+        ]}}",
+        d = digest
+    );
+    let output = loam_stdin(
+        &[
+            "hooks", "worker-finish", root.to_str().unwrap(), "--id", &id_str,
+            "--status", "succeeded", "--reason", "ok", "--events-stdin",
+        ],
+        &batch,
+    );
+    ok(&output);
+    assert_eq!(worker_status(&root, id).as_deref(), Some("succeeded"));
+    assert_eq!(event_count(&root), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn lifecycle_without_events_stdin_is_unchanged() {
     let root = temporary_root("no-events-flag");
     let id = finished_spawn_worker(&root, "claude");

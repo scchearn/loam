@@ -965,7 +965,7 @@ async function recordProgress(root, pre, post, count, lease) {
       failure_count: failureCount, backoff_until: backoff,
       ...(lease.downgrade_reason ? { downgrade_reason: lease.downgrade_reason } : {}),
     });
-    return { recorded: true, status };
+    return { recorded: true, status, failureCount, backoff };
   } catch {
     return { recorded: false, status: 'failed' };
   }
@@ -984,6 +984,9 @@ export async function prepareWorkerRun({
   if (leaseResult.status !== 'acquired') return { action: 'skip', result: { reason: 'unavailable' } };
   const lease = leaseResult.lease;
   let leaseHandled = false;
+  // Typed events buffered here and flushed at worker-finish (T5). Only the
+  // reusable preparation/finalization telemetry is projected at its point.
+  const events = [];
   const skip = async (reason, fields = {}) => {
     await writeSkip(root, reason, {
       ...(lease.downgrade_reason ? { downgrade_reason: lease.downgrade_reason } : {}),
@@ -991,7 +994,8 @@ export async function prepareWorkerRun({
     }, lease.lease_id);
     await releaseLease(root, lease.lease_id);
     leaseHandled = true;
-    return { action: 'skip', result: { reason: publicReason(reason) } };
+    events.push({ event: 'ingest_preparation', outcome: 'skipped', reason: publicReason(reason) });
+    return { action: 'skip', result: { reason: publicReason(reason), events } };
   };
   try {
     if (!config.enabled) return await skip('disabled');
@@ -1031,6 +1035,7 @@ export async function prepareWorkerRun({
             launch_at: new Date().toISOString(),
             owner_identity: { pid: lease.owner_pid, boot_id: lease.boot_id, process_start: lease.process_start },
           };
+    const hardDeadlineMs = Date.now() + config.timeout_seconds * 1000;
     if (!(await updateLease(root, lease, {
       actionable_fingerprint: fingerprint.fingerprint,
       actionable_count: fingerprint.count,
@@ -1039,14 +1044,20 @@ export async function prepareWorkerRun({
       planned_identity: plannedIdentity,
       child_identity: selectedLaunchMode === 'codex_native' ? { agent_id: nativeAgentId } : null,
       downgrade_reason: selectedLaunch.downgradeReason || null,
-      hard_deadline: new Date(Date.now() + config.timeout_seconds * 1000).toISOString(),
+      hard_deadline: new Date(hardDeadlineMs).toISOString(),
     }))) return await skip('orphan_unknown');
     if (selectedLaunch.downgradeReason && config.require_visible_worker) return await skip(selectedLaunch.downgradeReason);
     leaseHandled = true;
+    events.push({
+      event: 'ingest_preparation', outcome: 'admitted',
+      launch_mode: selectedLaunchMode, lease_id: lease.lease_id,
+      actionable_digest: fingerprint.fingerprint, actionable_count: fingerprint.count,
+      deadline_ms: hardDeadlineMs,
+    });
     return {
       action: 'run', harness, workspace: canonical, globalRoot, skillsRoot, env, platform,
       runtimeRunner, openCodeSession, notify, root, config, lease, readiness: ready,
-      exclusionsPath, fingerprint,
+      exclusionsPath, fingerprint, events,
       intent: {
         schema: 1, lease_id: lease.lease_id, workspace: canonical, harness,
         actionable_fingerprint: fingerprint.fingerprint, actionable_count: fingerprint.count,
@@ -1118,6 +1129,16 @@ export async function finalizeWorkerRun(prepared, {
     } catch {}
     if (result.category || (typeof result.code === 'number' && result.code !== 0)) post.complete = false;
     const recorded = await recordProgress(root, fingerprint, post, fingerprint.count, lease);
+    // Finalization telemetry: omit the event entirely when either digest is
+    // unavailable rather than storing a sentinel or invalid digest (S6).
+    if (recorded.recorded && /^[a-f0-9]{64}$/i.test(fingerprint.fingerprint) && /^[a-f0-9]{64}$/i.test(post.fingerprint)) {
+      (prepared.events ||= []).push({
+        event: 'ingest_finalization', outcome: recorded.status,
+        lease_id: lease.lease_id, pre_digest: fingerprint.fingerprint, post_digest: post.fingerprint,
+        actionable_count: fingerprint.count, failure_count: recorded.failureCount,
+        ...(recorded.backoff ? { backoff_until_ms: recorded.backoff } : {}),
+      });
+    }
     if (lease.launch_mode === 'claude_bg') await pruneClaudeSessions(workspace, lease, env);
     await launchNotification;
     await sendNotification(notify, config.visibility, {
@@ -1135,6 +1156,9 @@ export async function runWorker(options = {}) {
   const prepared = await prepareWorkerRun(options);
   if (prepared.action !== 'run') return prepared.result || prepared;
   const { harness, workspace, globalRoot, env, root, config, lease, openCodeSession, notify } = prepared;
+  // Attach the worker's buffered event batch to every terminal result so the
+  // detached worker can flush it at worker-finish.
+  const withEvents = (result) => ({ ...result, events: prepared.events });
   try {
     const launch = options.modelRunner
       ? await options.modelRunner({ harness, workspace, lease, root })
@@ -1145,23 +1169,23 @@ export async function runWorker(options = {}) {
           requireVisibleWorker: config.require_visible_worker,
         });
     if (launch.category) {
-      return finalizeWorkerRun(prepared, {
+      return withEvents(await finalizeWorkerRun(prepared, {
         skipReason: launch.category,
         retainLease: ['orphan_live', 'orphan_unknown'].includes(launch.category),
-      });
+      }));
     }
     const launchNotification = sendNotification(notify, config.visibility, {
       phase: 'launch', harness, workspace, launchMode: lease.launch_mode,
       identity: lease.child_identity || lease.planned_identity,
     });
     const result = await (launch.completion || Promise.resolve({ code: 0 }));
-    return finalizeWorkerRun(prepared, { launch, result, launchNotification });
+    return withEvents(await finalizeWorkerRun(prepared, { launch, result, launchNotification }));
   } catch (error) {
-    return finalizeWorkerRun(prepared, {
+    return withEvents(await finalizeWorkerRun(prepared, {
       skipReason: 'runtime_unavailable',
       skipFields: { detail: error instanceof Error ? error.message.slice(0, 256) : String(error).slice(0, 256) },
       retainLease: Boolean(lease.child_identity),
-    });
+    }));
   }
 }
 
