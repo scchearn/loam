@@ -114,12 +114,13 @@ export async function finishHookRun({
   try {
     run = await preparedRun(run);
     if (!run) return false;
-    if (status !== 'succeeded' && status !== 'failed') return false;
+    if (status !== 'succeeded' && status !== 'failed' && status !== 'continued') return false;
     if (status === 'succeeded') {
       if (action !== 'spawn_worker' && action !== 'skip') return false;
       if (action === 'skip' && !IDENTIFIER.test(reason)) return false;
       if (reason !== undefined && !IDENTIFIER.test(reason)) return false;
     }
+    if (status === 'continued' && action !== 'request_worker') return false;
     const args = [
       'hooks', 'finish', run.globalRoot,
       '--id', String(run.id),

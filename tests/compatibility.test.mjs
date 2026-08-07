@@ -470,7 +470,12 @@ test('Codex native Stop returns one spawn_agent continuation with identical dire
   assert.equal((directResponse.reason.match(/spawn_agent/gu) || []).length, 1);
   assert.match(directResponse.reason, /loam_ingestor/u);
   assert.match(directResponse.reason, /finish (?:this )?continuation immediately/iu);
-  assert.deepEqual(finishCalls, [{ run, status: 'succeeded', action: 'spawn_worker' }]);
+  assert.deepEqual(finishCalls, [{
+    run,
+    status: 'continued',
+    action: 'request_worker',
+    events: [{ event: 'codex_native', phase: 'continuation', outcome: 'returned' }],
+  }]);
 
   finishCalls.length = 0;
   const fallbackLoad = async () => ({
@@ -543,4 +548,35 @@ test('Claude marketplace Stop forwards agent_type without making a background-se
   assert.deepEqual(response, {});
   assert.equal('systemMessage' in response, false);
   assert.equal(forwarded.payload.agent_type, 'loam:ingestor');
+});
+
+test('Claude marketplace Stop records claude_recursion_guard when a loam:ingestor session is refused', async () => {
+  const stop = await import(`${pathToFileURL(marketplaceStopPath).href}?claude-recursion=${Date.now()}`);
+  const run = { id: 77 };
+  const finishCalls = [];
+  const response = await stop.handleStop(
+    { cwd: '/workspace', session_id: 'claude-session', agent_type: 'loam:ingestor' },
+    { CLAUDE_PLUGIN_ROOT: marketplaceRoot },
+    {
+      loadHooks: async () => ({
+        resolveGlobalRoot: () => '/global',
+        beginHookRun: async () => run,
+        finishHookRun: async (call) => finishCalls.push(call),
+      }),
+      loadIngest: async () => ({
+        resolveGlobalRoot: () => '/global',
+        resolveSkillsRoot: () => '/skills',
+        dispatchBoundary: async () => ({ action: 'skip', reason: 'disabled', recursion: true, workspace: '/workspace' }),
+      }),
+    },
+  );
+
+  assert.deepEqual(response, {});
+  assert.deepEqual(finishCalls, [{
+    run,
+    status: 'succeeded',
+    action: 'skip',
+    reason: 'disabled',
+    events: [{ event: 'claude_recursion_guard', outcome: 'refused', agent_type: 'loam:ingestor' }],
+  }]);
 });

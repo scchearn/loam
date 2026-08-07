@@ -172,20 +172,31 @@ export async function handleMarketplaceStop(payload = {}, {
 
   if (hookRun && finishHookRun) {
     try {
-      const recorded = harvestOutcome?.action === 'spawn_worker'
-        ? { action: harvestOutcome.action, reason: 'harvest_dispatched' }
-        : null;
-      await finishHookRun({
-        run: hookRun,
-        status: failure ? 'failed' : 'succeeded',
-        ...(failure
-          ? { detail: failure instanceof Error ? failure.message : String(failure) }
-          : recorded || {
-              action: outcome?.action,
-              ...(outcome?.reason !== undefined ? { reason: outcome.reason } : {}),
-              ...(outcome?.detail !== undefined ? { detail: outcome.detail } : {}),
-            }),
-      });
+      let finishArgs;
+      if (failure) {
+        finishArgs = { status: 'failed', detail: failure instanceof Error ? failure.message : String(failure) };
+      } else if (harness === 'codex' && outcome?.native_continuation) {
+        // The Codex native path requested a parent-model spawn without spawning
+        // one itself: record the distinct continued lane and its typed event.
+        finishArgs = {
+          status: 'continued',
+          action: 'request_worker',
+          events: [{ event: 'codex_native', phase: 'continuation', outcome: 'returned' }],
+        };
+      } else if (harvestOutcome?.action === 'spawn_worker') {
+        finishArgs = { status: 'succeeded', action: 'spawn_worker', reason: 'harvest_dispatched' };
+      } else {
+        finishArgs = {
+          status: 'succeeded',
+          action: outcome?.action,
+          ...(outcome?.reason !== undefined ? { reason: outcome.reason } : {}),
+          ...(outcome?.detail !== undefined ? { detail: outcome.detail } : {}),
+          ...(harness === 'claude' && outcome?.recursion
+            ? { events: [{ event: 'claude_recursion_guard', outcome: 'refused', agent_type: 'loam:ingestor' }] }
+            : {}),
+        };
+      }
+      await finishHookRun({ run: hookRun, ...finishArgs });
     } catch {}
   }
   return stopResponse({ harness, visibility, outcome, failure });

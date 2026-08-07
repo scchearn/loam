@@ -97,7 +97,9 @@ function recursion(payload, env) {
 export async function gate({ harness, payload = {}, globalRoot, env = process.env, now = Date.now() } = {}) {
   const config = await readIngestConfig(globalRoot, env);
   if (!config.enabled) return { action: 'skip', reason: 'disabled' };
-  if (recursion(payload, env)) return { action: 'skip', reason: 'disabled' };
+  // Mark the recursion refusal distinctly from a config-disabled skip so the
+  // hook-finish producer can emit claude_recursion_guard only for the former.
+  if (recursion(payload, env)) return { action: 'skip', reason: 'disabled', recursion: true };
   const workspace = await canonicalWorkspace(payloadWorkspace(payload));
   const root = runRoot(globalRoot, workspace);
   await ensureRoot(root);
