@@ -153,6 +153,9 @@ export async function handleMarketplaceStop(payload = {}, {
       skillsRoot: env.LOAM_INGEST_SKILLS_ROOT || resolveSkillsRoot({ env }),
       hookRunId: hookRun?.id,
       env,
+      // S1: defer the physical worker spawn so it runs after finishHookRun, so
+      // the worker's worker-start sees the finished, action-set parent.
+      deferSpawn: true,
     });
     const harvest = await loadHarvest();
     if (harvest?.harvestTick) {
@@ -198,6 +201,10 @@ export async function handleMarketplaceStop(payload = {}, {
       }
       await finishHookRun({ run: hookRun, ...finishArgs });
     } catch {}
+  }
+  // Spawn the detached worker only now that hook-finish has returned (S1).
+  if (typeof outcome?.spawn === 'function') {
+    try { await outcome.spawn(); } catch {}
   }
   return stopResponse({ harness, visibility, outcome, failure });
 }

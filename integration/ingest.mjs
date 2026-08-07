@@ -457,8 +457,17 @@ export async function finalizeNativeAgentRun({
 
 async function startBoundaryWorker(options, result, { nativeFallback = false, intentId } = {}) {
   try {
-    startWorker({ ...options, workerPath: await installedWorkerPath(options.globalRoot), workspace: result.workspace });
-    return nativeFallback ? { ...result, native_fallback: true } : result;
+    const workerPath = await installedWorkerPath(options.globalRoot);
+    const launch = () => startWorker({ ...options, workerPath, workspace: result.workspace });
+    const outcome = nativeFallback ? { ...result, native_fallback: true } : result;
+    if (options.deferSpawn) {
+      // S1: hand the physical spawn back so the caller runs it only after
+      // hook-finish returns, letting the worker's worker-start reliably see the
+      // finished parent. The spawn stays best-effort and fail-open.
+      return { ...outcome, spawn: async () => { try { launch(); } catch {} } };
+    }
+    launch();
+    return outcome;
   } catch (error) {
     if (intentId) await clearNativeFallback(options.globalRoot, result.workspace, intentId).catch(() => {});
     return { action: 'skip', reason: 'unavailable', detail: error.message };

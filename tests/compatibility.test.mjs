@@ -580,3 +580,30 @@ test('Claude marketplace Stop records claude_recursion_guard when a loam:ingesto
     events: [{ event: 'claude_recursion_guard', outcome: 'refused', agent_type: 'loam:ingestor' }],
   }]);
 });
+
+test('marketplace Stop spawns the detached worker only after hook-finish returns', async () => {
+  const stop = await import(`${pathToFileURL(marketplaceStopPath).href}?defer-spawn=${Date.now()}`);
+  const order = [];
+  const run = { id: 55 };
+  await stop.handleStop(
+    { cwd: '/workspace', session_id: 's' },
+    { CLAUDE_PLUGIN_ROOT: marketplaceRoot },
+    {
+      loadHooks: async () => ({
+        resolveGlobalRoot: () => '/global',
+        beginHookRun: async () => run,
+        finishHookRun: async () => { order.push('finish'); },
+      }),
+      loadIngest: async () => ({
+        resolveGlobalRoot: () => '/global',
+        resolveSkillsRoot: () => '/skills',
+        dispatchBoundary: async (input) => {
+          assert.equal(input.deferSpawn, true);
+          return { action: 'spawn_worker', workspace: '/workspace', spawn: async () => { order.push('spawn'); } };
+        },
+      }),
+    },
+  );
+
+  assert.deepEqual(order, ['finish', 'spawn']);
+});
