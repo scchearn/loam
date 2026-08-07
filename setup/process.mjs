@@ -69,6 +69,20 @@ export function runCommand({
   });
 }
 
+function killTree(child) {
+  // ponytail: on Windows the child is npx.cmd; child.kill() leaves the node/skills
+  // descendants running as orphans. taskkill /T tears down the whole tree. (issue #50)
+  if (process.platform === 'win32' && child.pid) {
+    try {
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
+      return;
+    } catch {
+      // fall through to the plain kill below
+    }
+  }
+  child.kill();
+}
+
 function spawnCommand({ command, args, cwd, env, timeoutMs }) {
   return new Promise((resolvePromise) => {
     const descriptor = processDescriptor({ command, args, env });
@@ -89,7 +103,7 @@ function spawnCommand({ command, args, cwd, env, timeoutMs }) {
       resolvePromise({ code, signal, stdout, stderr, ...(category ? { category } : {}) });
     };
     const timer = setTimeout(() => {
-      child.kill();
+      killTree(child);
       finish(null, 'SIGTERM', 'timeout');
     }, timeoutMs);
     child.stdout?.on('data', (chunk) => {

@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 
 import { cleanupStaging, createStagingDirectory, writeAtomicFile, publishJson } from './atomic.mjs';
 import { confirmSetup, finish, harnessLabel, renderDiscovery, selectHarnesses, stepDetail, stepDone, stepSkip, stepStart, summaryNote } from './wizard.mjs';
-import { ensureGlobalSkills, verifyGlobalSkills } from './skills.mjs';
+import { ensureGlobalSkills, verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
 import { installRuntime } from './runtime.mjs';
 import { detectHarnesses, installHarnesses } from './harnesses.mjs';
 import { installMarketplacePlugins } from './marketplace.mjs';
@@ -130,6 +130,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
         cwd: discovery.workspace,
         refresh,
         runner: options.runner,
+        agents: skillsAgentsFor(discovery.harnesses),
       });
       if (!skills.ready) {
         errorOutput.write(`Skills CLI: ${skills.detail || skills.category}\n`);
@@ -247,6 +248,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
         skillsRoot: discovery.skillsRoot,
         cwd: discovery.workspace,
         runner: options.runner,
+        agents: skillsAgentsFor(discovery.harnesses),
       });
       if (!globalSkills.ready) {
         errorOutput.write(`Skills verification: ${globalSkills.detail || globalSkills.category}\n`);

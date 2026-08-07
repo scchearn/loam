@@ -10,7 +10,7 @@ import { loadSkillInventory } from '../setup/inventory.mjs';
 import { discover } from '../setup/discovery.mjs';
 import { detectLegacyProject, migrateLegacyProject } from '../setup/migration.mjs';
 import { npxCommand, runCommand, runSkills } from '../setup/process.mjs';
-import { ensureGlobalSkills } from '../setup/skills.mjs';
+import { ensureGlobalSkills, skillsAgentsFor } from '../setup/skills.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 
@@ -96,6 +96,35 @@ test('complete global Skills CLI inventory skips mutation and verifies CLI_VERSI
   assert.equal(result.changed, false);
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].args, ['--yes', '--package', 'skills@1.5.20', 'skills', 'list', '--json', '--global']);
+});
+
+test('skillsAgentsFor maps detected harnesses to Skills CLI agent ids and falls back safely', () => {
+  assert.deepEqual(
+    skillsAgentsFor({ claude: { state: 'detected' }, codex: { state: 'detected' }, cursor: { state: 'absent' } }),
+    ['claude-code', 'codex'],
+  );
+  // No detected harness must never revert to an unbounded (unfiltered) scan.
+  assert.deepEqual(skillsAgentsFor({}), ['claude-code']);
+  assert.deepEqual(skillsAgentsFor({ opencode: { state: 'absent' } }), ['claude-code']);
+});
+
+test('verification scopes the global list to the selected harness agents (issue #50)', async () => {
+  const skillsRoot = await skillsRootFixture();
+  const calls = [];
+  const result = await ensureGlobalSkills({
+    packageRoot,
+    skillsRoot,
+    agents: ['claude-code', 'codex'],
+    runner: async (request) => {
+      calls.push(request);
+      return { code: 0, stdout: JSON.stringify(await completeList()), stderr: '' };
+    },
+  });
+
+  assert.equal(result.ready, true);
+  assert.deepEqual(calls[0].args, [
+    '--yes', '--package', 'skills@1.5.20', 'skills', 'list', '--json', '--global', '--agent', 'claude-code', 'codex',
+  ]);
 });
 
 test('refresh forces the Loam source add even when the global inventory is complete', async () => {
