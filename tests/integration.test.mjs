@@ -415,6 +415,63 @@ test('direct runtime invocation closes stdin', async () => {
   assert.equal(result.stdout, 'closed');
 });
 
+test('direct runtime invocation writes a supplied stdin payload then closes it', async () => {
+  const result = await invokeRuntime({
+    runtimePath: process.execPath,
+    args: ['-e', "let d=''; process.stdin.on('data', (c) => d += c); process.stdin.on('end', () => process.stdout.write(d))"],
+    cwd: process.cwd(),
+    // Generous timeout: node startup under a loaded pre-commit run can exceed a
+    // tight bound and this test is about the write path, not latency.
+    timeoutMs: 15000,
+    input: '{"schema":1,"events":[]}',
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout, '{"schema":1,"events":[]}');
+});
+
+test('invokeRuntime threads input through the runner seam', async () => {
+  let seen;
+  const result = await invokeRuntime({
+    runtimePath: '/runtime',
+    args: ['hooks', 'finish'],
+    cwd: process.cwd(),
+    timeoutMs: 100,
+    input: 'payload',
+    runner: async (request) => {
+      seen = request;
+      return { code: 0, signal: null, stdout: '', stderr: '' };
+    },
+  });
+
+  assert.equal(result.code, 0);
+  assert.equal(seen.input, 'payload');
+  // A call without input still reaches the runner with input undefined.
+  await invokeRuntime({
+    runtimePath: '/runtime',
+    args: ['hooks', 'begin'],
+    cwd: process.cwd(),
+    timeoutMs: 100,
+    runner: async (request) => {
+      seen = request;
+      return { code: 0, signal: null, stdout: '', stderr: '' };
+    },
+  });
+  assert.equal(seen.input, undefined);
+});
+
+test('a stdin write to a child that exits without reading stays fail-open', async () => {
+  const result = await invokeRuntime({
+    runtimePath: process.execPath,
+    args: ['-e', 'process.exit(0)'],
+    cwd: process.cwd(),
+    timeoutMs: 15000,
+    input: 'x'.repeat(4096),
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+});
+
 test('malformed native state is reported without synthetic fields', async () => {
   const fixtureData = await fixture();
   const result = await probeState({
