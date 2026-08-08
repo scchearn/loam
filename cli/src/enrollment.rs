@@ -882,6 +882,12 @@ mod registry {
         name TEXT NOT NULL,
         url_digest TEXT NOT NULL,
         allowed_refs TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS response_dedup (
+        causation_id TEXT NOT NULL,
+        responder_principal_id TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (causation_id, responder_principal_id)
     );";
 
     /// A backend or schema failure. Distinct from the descriptor rejections above so
@@ -1287,6 +1293,63 @@ mod registry {
     fn instance_id_for(enrolled: &ValidatedEnrollment) -> String {
         identity_key(&enrolled.workspace)
     }
+
+    // -------------------------------------------------------------------------
+    // Response-dedup ledger (2026-08-08 amendment, T17)
+    // -------------------------------------------------------------------------
+    //
+    // The multi-terminal single-response contract's HARD layer: exactly one
+    // response per `(causation_id, responder principal_id)` ships. Slice D's
+    // `emit` calls `record_response` before shipping; the first write for a pair
+    // wins under `BEGIN IMMEDIATE`, and every later attempt is `AlreadyResponded`.
+    // The ledger stores correlation identity only — never a message body,
+    // summary, or payload. Cross-connector races are out of scope and resolve
+    // through Slice B's inbox-clear-after-first-response (eventually consistent).
+
+    /// The outcome of a check-and-record against the response-dedup ledger.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum DedupOutcome {
+        /// This responder's response for this request was recorded; ship it.
+        Recorded,
+        /// A response for this `(causation_id, principal)` already exists; do not
+        /// ship a duplicate.
+        AlreadyResponded,
+    }
+
+    /// Record that `responder_principal_id` is responding to the request
+    /// identified by `causation_id`, first-write-wins. Same-machine only; the
+    /// caller ships the response only on [`DedupOutcome::Recorded`].
+    pub fn record_response(
+        connection: &mut Connection,
+        causation_id: &str,
+        responder_principal_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<DedupOutcome, RegistryError> {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(RegistryError::backend)?;
+        let existing: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM response_dedup
+                 WHERE causation_id = ?1 AND responder_principal_id = ?2",
+                rusqlite::params![causation_id, responder_principal_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if existing.is_some() {
+            transaction.rollback().map_err(RegistryError::backend)?;
+            return Ok(DedupOutcome::AlreadyResponded);
+        }
+        transaction
+            .execute(
+                "INSERT INTO response_dedup (causation_id, responder_principal_id, recorded_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![causation_id, responder_principal_id, now_rfc3339],
+            )
+            .map_err(RegistryError::backend)?;
+        transaction.commit().map_err(RegistryError::backend)?;
+        Ok(DedupOutcome::Recorded)
+    }
 } // mod registry
 
 #[cfg(test)]
@@ -1691,5 +1754,111 @@ mod registry_tests {
 
         drop(held);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- T17 response-dedup ledger ---
+
+    #[test]
+    fn first_response_wins_and_duplicate_is_already_responded() {
+        let path = temp_db("dedup-basic");
+        let mut connection = open_writable(&path).unwrap();
+        assert_eq!(
+            record_response(&mut connection, "cause-1", "employee-184", "t1").unwrap(),
+            DedupOutcome::Recorded
+        );
+        assert_eq!(
+            record_response(&mut connection, "cause-1", "employee-184", "t2").unwrap(),
+            DedupOutcome::AlreadyResponded
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn different_principal_or_causation_are_not_blocked() {
+        let path = temp_db("dedup-distinct");
+        let mut connection = open_writable(&path).unwrap();
+        assert_eq!(
+            record_response(&mut connection, "cause-1", "employee-184", "t").unwrap(),
+            DedupOutcome::Recorded
+        );
+        // Same request, a *different* principal still records.
+        assert_eq!(
+            record_response(&mut connection, "cause-1", "employee-999", "t").unwrap(),
+            DedupOutcome::Recorded
+        );
+        // Same principal, a *different* request still records.
+        assert_eq!(
+            record_response(&mut connection, "cause-2", "employee-184", "t").unwrap(),
+            DedupOutcome::Recorded
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_ledger_stores_no_message_body() {
+        let path = temp_db("dedup-bodyfree");
+        let mut connection = open_writable(&path).unwrap();
+        record_response(
+            &mut connection,
+            "cause-1",
+            "employee-184",
+            "2026-08-08T10:00:00Z",
+        )
+        .unwrap();
+        // The table's columns are correlation identity + timestamp only.
+        let columns: Vec<String> = {
+            let mut statement = connection
+                .prepare("SELECT name FROM pragma_table_info('response_dedup')")
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            columns,
+            vec![
+                "causation_id".to_owned(),
+                "responder_principal_id".to_owned(),
+                "recorded_at".to_owned()
+            ],
+            "the ledger must carry no body/summary/payload column"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn concurrent_emits_for_one_pair_ship_exactly_one() {
+        use std::sync::{Arc, Barrier};
+        let path = Arc::new(temp_db("dedup-race"));
+        // Create the schema up front so every worker opens an existing DB.
+        drop(open_writable(&path).unwrap());
+
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut connection = open_writable(&path).unwrap();
+                barrier.wait();
+                record_response(&mut connection, "cause-race", "employee-184", "t").unwrap()
+            }));
+        }
+        let outcomes: Vec<DedupOutcome> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let recorded = outcomes
+            .iter()
+            .filter(|o| **o == DedupOutcome::Recorded)
+            .count();
+        assert_eq!(recorded, 1, "exactly one concurrent responder may record");
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| **o == DedupOutcome::AlreadyResponded)
+                .count(),
+            workers - 1
+        );
+        let _ = std::fs::remove_file(&*path);
     }
 }
