@@ -107,6 +107,55 @@ fn enrollment_round_trip() {
         .expect("broker fixture should remove only its temporary directory");
 }
 
+#[test]
+#[ignore = "requires LOAM_MQTT_TEST=1 and a real Mosquitto/OpenSSL installation"]
+fn no_local_set_suppresses_the_self_delivery_the_probe_depends_on() {
+    if std::env::var("LOAM_MQTT_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set LOAM_MQTT_TEST=1 to require the real broker tier");
+        return;
+    }
+
+    // The committed negative control for `enrollment_round_trip`: the probe's
+    // self-receive proof only means something if this broker *would* have
+    // withheld the echo with No Local set. Same broker, same topic, same
+    // client — only the No Local flag differs.
+    let broker =
+        BrokerFixture::provision("nolocal").expect("the real broker fixture should provision");
+    let base = format!(
+        "loam/v1/{}/project-a",
+        broker
+            .namespace()
+            .strip_prefix("loam/v1/")
+            .expect("the broker namespace should carry the loam/v1 prefix")
+    );
+    let topic = format!("{base}/event/{INSTANCE}");
+
+    let mut suppressed = RawClient::connect(&broker, "connector-no-local-set");
+    suppressed.subscribe_no_local(&topic);
+    suppressed.publish(&topic, b"self-echo", false);
+    assert!(
+        suppressed.collect(OBSERVE).is_empty(),
+        "No Local set must suppress this client's own publication"
+    );
+
+    let mut delivered = RawClient::connect(&broker, "connector-no-local-unset");
+    delivered.subscribe(&topic);
+    delivered.publish(&topic, b"self-echo", false);
+    let received = delivered.collect(OBSERVE);
+    assert_eq!(
+        received
+            .iter()
+            .filter(|frame| frame.topic == topic && frame.payload == b"self-echo")
+            .count(),
+        1,
+        "No Local unset must deliver this client's own publication: {received:?}"
+    );
+
+    broker
+        .finish()
+        .expect("broker fixture should remove only its temporary directory");
+}
+
 /// The probe is non-retained: a subscriber arriving after it sees nothing. The
 /// positive control in the same run proves this observation *can* see a
 /// retained value, so the absence is evidence rather than a silent subscriber.
@@ -223,8 +272,21 @@ impl RawClient {
     }
 
     fn subscribe(&mut self, filter: &str) {
+        self.subscribe_with(filter, false);
+    }
+
+    /// Subscribe with MQTT 5 No Local set, so the broker must not deliver this
+    /// client's own publications back to it.
+    fn subscribe_no_local(&mut self, filter: &str) {
+        self.subscribe_with(filter, true);
+    }
+
+    fn subscribe_with(&mut self, filter: &str, no_local: bool) {
         self.client
-            .subscribe_many([Filter::new(filter, QoS::AtLeastOnce)])
+            .subscribe_many([Filter {
+                nolocal: no_local,
+                ..Filter::new(filter, QoS::AtLeastOnce)
+            }])
             .expect("the observation client should queue its subscription");
         match self.next_control(Duration::from_secs(10)) {
             Some(Packet::SubAck(ack)) => assert!(

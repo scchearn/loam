@@ -33,7 +33,7 @@ jobs:
         env:
           LOAM_MQTT_TEST: "1"
         run: cargo +1.94.1 test --locked --test mqtt_transport -- --ignored --test-threads=1 broker_contract
-      - name: Run the connector enrollment round trip
+      - name: Run the connector enrollment round trip and its No Local control
         env:
           LOAM_MQTT_TEST: "1"
-        run: cargo +1.94.1 test --locked --test mqtt_connector -- --ignored --test-threads=1 enrollment_round_trip
+        run: cargo +1.94.1 test --locked --test mqtt_connector -- --ignored --test-threads=1

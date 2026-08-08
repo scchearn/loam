@@ -1864,9 +1864,49 @@ mod service_tests {
 
     #[test]
     fn a_restart_starts_with_an_empty_registry() {
-        // A fresh registry (a new process) holds nothing — channels never persist.
-        let channels = ChannelRegistry::new();
-        assert!(channels.is_empty());
+        // Register a channel for real, against a real enrolled database, so the
+        // absence below is the *loss* of something that existed rather than a
+        // registry that was never populated.
+        let (path, key) = enrolled_db("restart", 8, 80);
+        let mut before = ChannelRegistry::new();
+        dispatch_for_key(
+            &register_request("sess-restart", "chan-restart"),
+            &key,
+            &path,
+            &mut before,
+        )
+        .expect("register");
+        assert!(before.contains("sess-restart"));
+
+        // The restart: the process-local registry is gone, the database is not.
+        drop(before);
+        let after = ChannelRegistry::new();
+        assert!(
+            after.is_empty(),
+            "a restarted connector must recover no channel"
+        );
+
+        // And the database it re-opens still holds no channel state to recover,
+        // so nothing could repopulate the registry behind our back.
+        let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+        let channel_rows: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type IN ('table','view') AND (name LIKE '%channel%' OR name LIKE '%session%')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            channel_rows, 0,
+            "no channel or session state may survive a restart in SQLite"
+        );
+        assert_eq!(
+            crate::enrollment::list_enrollments(&connection)
+                .unwrap()
+                .len(),
+            1,
+            "the enrollment itself must survive the restart"
+        );
     }
 }
 
