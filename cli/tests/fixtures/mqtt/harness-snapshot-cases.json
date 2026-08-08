@@ -1,0 +1,79 @@
+{
+  "comment": "Slice D T1 snapshot cases. Each case feeds frames through Slice B's DeliveryProcessor into the connector's bounded in-memory SnapshotStore, then reads the snapshot back. `frames` are published in order on the given topic; an empty `body` is a tombstone (an empty MQTT payload). `expect` is the ordered list of logical item keys the snapshot must serve, oldest first.",
+  "org_id": "org-3A1",
+  "project_id": "project-7M3",
+  "other_project_id": "project-9Q4",
+  "cases": [
+    {
+      "name": "empty-snapshot",
+      "capacity": 4,
+      "frames": [],
+      "expect": []
+    },
+    {
+      "name": "one-inbox-item",
+      "capacity": 4,
+      "frames": [
+        { "kind": "inbox", "message_id": "01K6Q6ESWMT48TP1", "summary": "Review the anchored change." }
+      ],
+      "expect": ["inbox:01K6Q6ESWMT48TP1"]
+    },
+    {
+      "name": "qos1-duplicate-collapses-to-one-logical-item",
+      "capacity": 4,
+      "frames": [
+        { "kind": "inbox", "message_id": "01K6Q6ESWMT48TP2", "summary": "Duplicated by QoS 1." },
+        { "kind": "inbox", "message_id": "01K6Q6ESWMT48TP2", "summary": "Duplicated by QoS 1." },
+        { "kind": "inbox", "message_id": "01K6Q6ESWMT48TP2", "summary": "Duplicated by QoS 1." }
+      ],
+      "expect": ["inbox:01K6Q6ESWMT48TP2"]
+    },
+    {
+      "name": "expired-item-is-dropped",
+      "capacity": 4,
+      "frames": [
+        { "kind": "inbox", "message_id": "01K6Q6ESWMT48TP3", "summary": "Already stale.", "expires_in_seconds": 30 },
+        { "kind": "inbox", "message_id": "01K6Q6ESWMT48TP4", "summary": "Still current.", "expires_in_seconds": 86400 }
+      ],
+      "read_after_seconds": 60,
+      "expect": ["inbox:01K6Q6ESWMT48TP4"]
+    },
+    {
+      "name": "unresolved-retained-item-reappears-on-a-later-read",
+      "capacity": 4,
+      "frames": [
+        { "kind": "state", "state_key": "work-SB-42", "revision": "1", "summary": "Work is active on SB-42." }
+      ],
+      "reads": 2,
+      "expect": ["state:instance-01/work-SB-42"]
+    },
+    {
+      "name": "tombstone-resolves-a-retained-item",
+      "capacity": 4,
+      "frames": [
+        { "kind": "state", "state_key": "work-SB-43", "revision": "1", "summary": "Work is active on SB-43." },
+        { "kind": "state", "state_key": "work-SB-43", "tombstone": true }
+      ],
+      "expect": []
+    },
+    {
+      "name": "capacity-overflow-evicts-oldest",
+      "capacity": 2,
+      "frames": [
+        { "kind": "inbox", "message_id": "01K6Q6ESWMT48TP5", "summary": "First." },
+        { "kind": "inbox", "message_id": "01K6Q6ESWMT48TP6", "summary": "Second." },
+        { "kind": "inbox", "message_id": "01K6Q6ESWMT48TP7", "summary": "Third." }
+      ],
+      "expect": ["inbox:01K6Q6ESWMT48TP6", "inbox:01K6Q6ESWMT48TP7"]
+    },
+    {
+      "name": "cross-project-frames-do-not-leak-into-this-projects-snapshot",
+      "capacity": 4,
+      "frames": [
+        { "kind": "inbox", "message_id": "01K6Q6ESWMT48TP8", "summary": "Mine." },
+        { "kind": "inbox", "message_id": "01K6Q6ESWMT48TP9", "summary": "Not mine.", "other_project": true }
+      ],
+      "expect": ["inbox:01K6Q6ESWMT48TP8"]
+    }
+  ]
+}

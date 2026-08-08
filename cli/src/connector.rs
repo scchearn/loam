@@ -450,7 +450,9 @@ use rumqttc::v5::mqttbytes::v5::{
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::{Client, Connection, Event, RecvTimeoutError};
 
-use crate::transport::{AuthenticatedTransportPrincipal, DeliveryProcessor, TransportConfig};
+use crate::transport::{
+    AuthenticatedTransportPrincipal, DeliveryProcessor, ReceiveOutcome, TransportConfig,
+};
 
 /// How long the adapter waits for one broker acknowledgement (CONNACK, SUBACK,
 /// PUBACK). The probe's own receive deadline is passed in separately.
@@ -668,6 +670,57 @@ impl Transport for MqttTransport {
 }
 
 impl MqttTransport {
+    /// Pump exactly one inbound frame through Slice B's `DeliveryProcessor` and
+    /// report the topic together with the delivery outcome.
+    ///
+    /// Unlike [`Transport::receive`], which exists to find the probe's own echo
+    /// and therefore swallows everything else, this reports duplicates, stale
+    /// state, and tombstones. The snapshot store needs them: a swallowed
+    /// tombstone would leave a resolved item on screen, and a swallowed
+    /// duplicate would hide the very property "one logical item per message"
+    /// asserts. `now` is passed per call because a live session outlives the
+    /// single timestamp the probe was constructed with.
+    ///
+    /// Read-only by construction: it never publishes.
+    pub fn receive_outcome(
+        &mut self,
+        deadline: Duration,
+        now: DateTime<Utc>,
+        roster: &PeerRoster,
+    ) -> Result<Option<(String, ReceiveOutcome)>, ProbeError> {
+        let identity = self
+            .identity
+            .clone()
+            .ok_or(ProbeError::AuthenticationFailed)?;
+        // The session admits its own principal and instance plus exactly the
+        // provisioned roster — nothing derived from the frame itself, or an
+        // untrusted sender would authorize itself.
+        let mut claims: Vec<&str> = identity.allowed_claims.iter().map(String::as_str).collect();
+        claims.extend(roster.principals.iter().map(String::as_str));
+        let mut origins: Vec<&str> = vec![identity.instance_id.as_str()];
+        origins.extend(roster.origins.iter().map(String::as_str));
+        let authenticated = AuthenticatedTransportPrincipal::new(
+            AuthenticatedPrincipal::new(&identity.principal_id, &claims),
+            &origins,
+        );
+        let deadline = Instant::now() + deadline;
+        let Some(publish) = self.take_publish(deadline) else {
+            return Ok(None);
+        };
+        let Ok(topic) = String::from_utf8(publish.topic.to_vec()) else {
+            return Err(ProbeError::WrongSelfReceive);
+        };
+        match self
+            .processor
+            .receive(&topic, &publish.payload, &authenticated, now)
+        {
+            Ok(outcome) => Ok(Some((topic, outcome))),
+            // A rejected frame is a sender's problem, not a session failure: the
+            // pump keeps running and the snapshot simply never sees it.
+            Err(_) => Ok(None),
+        }
+    }
+
     /// The next inbound publish: parked frames first, then the wire.
     fn take_publish(&mut self, deadline: Instant) -> Option<Publish> {
         if !self.pending.is_empty() {
@@ -727,9 +780,33 @@ fn await_control(
 // (owner-only), then a registry workspace/project-binding resolution — before a
 // closed operation is dispatched. There is no generic dispatch.
 
+use std::collections::VecDeque;
 use std::path::Path;
 
 use crate::ipc::{self, IpcConfig, Operation, Request};
+
+/// The connector's volatile in-process state: the Slice C inject-channel
+/// registry and Slice D's live project sessions with their snapshot store. All
+/// of it dies with the process and none of it is ever written to SQLite.
+pub struct ConnectorState {
+    pub channels: ChannelRegistry,
+    pub sessions: ProjectSessions,
+}
+
+impl ConnectorState {
+    pub fn new() -> Self {
+        ConnectorState {
+            channels: ChannelRegistry::new(),
+            sessions: ProjectSessions::new(SNAPSHOT_CAPACITY),
+        }
+    }
+}
+
+impl Default for ConnectorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Whether the service found work to host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -791,6 +868,406 @@ impl ChannelRegistry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bounded in-memory snapshot store and live project sessions (Slice D T1)
+// ---------------------------------------------------------------------------
+//
+// Slice B's `DeliveryProcessor` is the single validator, deduplicator, and
+// expiry tracker; it tracks *ids*, not bodies. The store below is the only place
+// a renderable body is retained, and it retains one per logical item so QoS 1
+// duplicates and redelivery collapse. It is in-memory only: there is no snapshot
+// table, no sidecar store, and no schema change, because MQTT is never durable
+// authority and retained state plus the inbox re-deliver on reconnect. A
+// restarted connector therefore serves nothing until state re-delivers, which is
+// correct rather than a bug.
+
+/// One renderable item in a project's snapshot: normalized, already-deduped, and
+/// already-expiry-filtered. Carries no envelope bytes, no credential, and no raw
+/// remote URL — only what a hook may render.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotItem {
+    /// The logical identity of this item. QoS 1 duplicates and redelivery of the
+    /// same message share it, so the snapshot holds exactly one entry per
+    /// message; a later state revision replaces the earlier one in place.
+    pub key: String,
+    pub source: String,
+    pub item_type: String,
+    pub summary: String,
+    pub to: Vec<(String, String)>,
+    pub org_id: String,
+    pub project_id: String,
+    pub repository_id: String,
+    pub from_principal_id: String,
+    pub from_agent_id: String,
+    pub from_instance_id: String,
+    pub payload: crate::json::Value,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// A bounded, per-project, in-memory item store with the same drop-on-restart
+/// lifetime as [`ChannelRegistry`]. Oldest is evicted at capacity.
+#[derive(Debug)]
+pub struct SnapshotStore {
+    capacity: usize,
+    projects: std::collections::HashMap<String, std::collections::VecDeque<SnapshotItem>>,
+}
+
+impl SnapshotStore {
+    pub fn new(capacity: usize) -> Result<Self, crate::transport::TransportError> {
+        if capacity == 0 {
+            return Err(crate::transport::TransportError::ZeroTrackingCapacity);
+        }
+        Ok(SnapshotStore {
+            capacity,
+            projects: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Admit one delivery outcome that `DeliveryProcessor` has already ruled on.
+    /// Only `Accepted` retains a body and only `Removed` resolves one; a
+    /// duplicate, stale, or conflicting outcome changes nothing here, which is
+    /// what makes one logical item per message hold under QoS 1. Returns whether
+    /// the store changed.
+    pub fn admit(&mut self, topic: &str, outcome: &ReceiveOutcome) -> bool {
+        let Ok(parsed) = crate::envelope::parse_topic(topic) else {
+            return false;
+        };
+        match outcome {
+            ReceiveOutcome::Accepted(validated) => {
+                let key = accepted_key(&parsed.delivery, &validated.as_envelope().id);
+                let Some(item) = snapshot_item(key, validated) else {
+                    return false;
+                };
+                self.store(parsed.project, item)
+            }
+            ReceiveOutcome::Removed => match tombstone_key(&parsed.delivery) {
+                Some(key) => self.remove(parsed.project, &key),
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn store(&mut self, project_id: &str, item: SnapshotItem) -> bool {
+        let items = self.projects.entry(project_id.to_owned()).or_default();
+        // A later revision of the same logical item replaces the earlier one in
+        // place, so a live state key never occupies two snapshot slots.
+        if let Some(existing) = items.iter_mut().find(|held| held.key == item.key) {
+            *existing = item;
+            return true;
+        }
+        if items.len() == self.capacity {
+            items.pop_front();
+        }
+        items.push_back(item);
+        true
+    }
+
+    fn remove(&mut self, project_id: &str, key: &str) -> bool {
+        match self.projects.get_mut(project_id) {
+            Some(items) => {
+                let before = items.len();
+                items.retain(|held| held.key != key);
+                items.len() != before
+            }
+            None => false,
+        }
+    }
+
+    /// The current snapshot for one project, oldest first, with expired items
+    /// dropped. An unresolved item is *not* dropped by a read, so it reappears on
+    /// a later hook until it expires or a tombstone resolves it.
+    pub fn snapshot(&mut self, project_id: &str, now: DateTime<Utc>) -> Vec<SnapshotItem> {
+        match self.projects.get_mut(project_id) {
+            Some(items) => {
+                items.retain(|held| held.expires_at > now);
+                items.iter().cloned().collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    pub fn len(&self, project_id: &str) -> usize {
+        self.projects.get(project_id).map_or(0, VecDeque::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.projects.values().all(VecDeque::is_empty)
+    }
+}
+
+fn accepted_key(delivery: &crate::envelope::TopicDelivery<'_>, envelope_id: &str) -> String {
+    use crate::envelope::TopicDelivery;
+    match delivery {
+        TopicDelivery::Event { .. } => format!("event:{envelope_id}"),
+        TopicDelivery::State { origin, key } => format!("state:{origin}/{key}"),
+        TopicDelivery::Inbox { message_id, .. } => format!("inbox:{message_id}"),
+    }
+}
+
+/// The logical key an empty-payload tombstone resolves. An event cannot be
+/// tombstoned (Slice B rejects that), so only state and inbox have one.
+fn tombstone_key(delivery: &crate::envelope::TopicDelivery<'_>) -> Option<String> {
+    use crate::envelope::TopicDelivery;
+    match delivery {
+        TopicDelivery::Event { .. } => None,
+        TopicDelivery::State { origin, key } => Some(format!("state:{origin}/{key}")),
+        TopicDelivery::Inbox { message_id, .. } => Some(format!("inbox:{message_id}")),
+    }
+}
+
+fn snapshot_item(key: String, validated: &ValidatedEnvelope) -> Option<SnapshotItem> {
+    let envelope = validated.as_envelope();
+    let expires_at = DateTime::parse_from_rfc3339(&envelope.data.expires_at)
+        .ok()?
+        .with_timezone(&Utc);
+    Some(SnapshotItem {
+        key,
+        source: envelope.source.clone(),
+        item_type: envelope.message_type.clone(),
+        summary: envelope.data.summary.clone(),
+        to: envelope
+            .data
+            .to
+            .iter()
+            .map(|recipient| (recipient.kind.clone(), recipient.id.clone()))
+            .collect(),
+        org_id: envelope.data.context.org_id.clone(),
+        project_id: envelope.data.context.project_id.clone(),
+        repository_id: envelope.data.context.repository_id.clone(),
+        from_principal_id: envelope.data.from.principal_id.clone(),
+        from_agent_id: envelope.data.from.agent_id.clone(),
+        from_instance_id: envelope.data.from.instance_id.clone(),
+        payload: envelope.data.payload.clone(),
+        expires_at,
+    })
+}
+
+/// Who a project's live session will admit frames from. Slice B checks every
+/// received frame's topic origin and `data.from.principal_id` against these, so
+/// a session with no roster hears only its own instance. Injected by the
+/// deployment at provisioning time — never invented here and never supplied by
+/// an IPC caller.
+#[derive(Debug, Clone, Default)]
+pub struct PeerRoster {
+    pub principals: Vec<String>,
+    pub origins: Vec<String>,
+}
+
+impl PeerRoster {
+    pub fn is_empty(&self) -> bool {
+        self.principals.is_empty() && self.origins.is_empty()
+    }
+}
+
+/// Resolve one enrolled project into a live broker session and the peer roster
+/// its received frames are checked against — the single injection point for both.
+///
+/// It returns `None` today, and that is the honest Phase-1 answer, not an
+/// oversight: `credential_ref` is a deployment-owned reference (`vault://…`) with
+/// no secret backend behind it yet, and no enrollment field carries a per-project
+/// peer roster. Both are **named residuals owned by the broker-provisioning and
+/// enrollment track**, not by harness integration, and until they are filled the
+/// federation is not operational — an agent cannot actually see a real colleague.
+/// `project.attach` therefore answers `credentials-unresolved` rather than
+/// fabricating a session.
+///
+/// The seam is a plain function rather than a stored callable on purpose: the
+/// crate capability guard bars function-pointer and trait-object capabilities,
+/// and a provisioner that could be swapped at runtime would be exactly that.
+/// ponytail: returns None. Fill it in when provisioning lands a secret backend
+/// and a peer roster; `ProjectSessions::attach` already takes the resolved value.
+pub fn provision_session(
+    _row: &crate::enrollment::EnrolledRow,
+) -> Option<(MqttSession, PeerRoster)> {
+    None
+}
+
+/// What a `project.attach` actually achieved. Reported honestly: an unopened
+/// session is never described as attached-and-live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionState {
+    /// A live subscribed broker session is held in this process for the project.
+    Live,
+    /// A session for this project was already live; attach is idempotent.
+    AlreadyLive,
+    /// No secret backend resolved this enrollment's `credential_ref`.
+    CredentialsUnresolved,
+    /// Credentials resolved but no peer roster was provisioned, so the session
+    /// could admit no colleague and was not opened.
+    NoPeerRoster,
+    /// Credentials and roster resolved but the broker refused the session.
+    Unreachable(String),
+}
+
+impl SessionState {
+    pub fn code(&self) -> &'static str {
+        match self {
+            SessionState::Live => "live",
+            SessionState::AlreadyLive => "already-live",
+            SessionState::CredentialsUnresolved => "credentials-unresolved",
+            SessionState::NoPeerRoster => "no-peer-roster",
+            SessionState::Unreachable(_) => "unreachable",
+        }
+    }
+}
+
+/// How long a pump thread blocks on one receive before re-checking its stop
+/// flag. Short enough that a detach is prompt, long enough that an idle project
+/// costs nothing.
+const PUMP_POLL: Duration = Duration::from_millis(500);
+/// Renderable items retained per project. The hook's own item budget is smaller;
+/// this is the store's ceiling, not the render budget.
+const SNAPSHOT_CAPACITY: usize = 64;
+
+/// The live broker sessions this connector process holds — one per enrolled
+/// project, in the same process, with no second daemon. Each pumps its received
+/// frames through Slice B's `DeliveryProcessor` into the shared snapshot store.
+pub struct ProjectSessions {
+    snapshots: std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
+    live: std::collections::HashMap<String, LiveSession>,
+}
+
+struct LiveSession {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProjectSessions {
+    pub fn new(capacity: usize) -> Self {
+        ProjectSessions {
+            snapshots: std::sync::Arc::new(std::sync::Mutex::new(
+                SnapshotStore::new(capacity).expect("snapshot capacity is a non-zero constant"),
+            )),
+            live: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The shared store, so a test (or a future in-process reader) can admit
+    /// frames and read them back without a broker.
+    pub fn store(&self) -> std::sync::Arc<std::sync::Mutex<SnapshotStore>> {
+        std::sync::Arc::clone(&self.snapshots)
+    }
+
+    pub fn snapshot(&self, project_id: &str, now: DateTime<Utc>) -> Vec<SnapshotItem> {
+        match self.snapshots.lock() {
+            Ok(mut store) => store.snapshot(project_id, now),
+            // A poisoned store means a pump thread panicked. Serving an empty
+            // snapshot is the honest answer; fabricating one is not.
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Open (or confirm) the project's live session from an already-resolved
+    /// provisioning result. Idempotent. Taking `provisioned` as an argument is
+    /// what lets a test drive a real session without the connector holding a
+    /// swappable callable.
+    pub fn attach(
+        &mut self,
+        row: &crate::enrollment::EnrolledRow,
+        provisioned: Option<(MqttSession, PeerRoster)>,
+        now: DateTime<Utc>,
+    ) -> SessionState {
+        if self.live.contains_key(&row.project_id) {
+            return SessionState::AlreadyLive;
+        }
+        let Some((session, roster)) = provisioned else {
+            return SessionState::CredentialsUnresolved;
+        };
+        if roster.is_empty() {
+            return SessionState::NoPeerRoster;
+        }
+        let mut transport = match MqttTransport::new(session, ValidationConfig::default(), now) {
+            Ok(transport) => transport,
+            Err(error) => return SessionState::Unreachable(error.code().to_owned()),
+        };
+        let identity = match transport.authenticate() {
+            Ok(identity) => identity,
+            Err(error) => return SessionState::Unreachable(error.code().to_owned()),
+        };
+        for filter in live_filters(&row.org_id, &row.project_id, &identity) {
+            if let Err(error) = transport.subscribe(&filter, false) {
+                return SessionState::Unreachable(error.code().to_owned());
+            }
+        }
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = std::thread::spawn({
+            let stop = std::sync::Arc::clone(&stop);
+            let snapshots = std::sync::Arc::clone(&self.snapshots);
+            move || pump(transport, roster, snapshots, stop)
+        });
+        self.live.insert(
+            row.project_id.clone(),
+            LiveSession {
+                stop,
+                thread: Some(thread),
+            },
+        );
+        SessionState::Live
+    }
+
+    /// Stop the project's session, if any. A detached project keeps no session
+    /// and no snapshot.
+    pub fn detach(&mut self, project_id: &str) -> bool {
+        let Some(mut session) = self.live.remove(project_id) else {
+            return false;
+        };
+        session
+            .stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = session.thread.take() {
+            let _ = thread.join();
+        }
+        if let Ok(mut store) = self.snapshots.lock() {
+            store.projects.remove(project_id);
+        }
+        true
+    }
+
+    pub fn is_live(&self, project_id: &str) -> bool {
+        self.live.contains_key(project_id)
+    }
+}
+
+/// A live session hears colleagues, not only itself: every origin's events and
+/// state for the project, plus this connector's own three typed inboxes. Slice
+/// B's per-frame origin and principal checks are what actually bound admission;
+/// the filters only decide what the broker sends.
+fn live_filters(org_id: &str, project_id: &str, identity: &SessionIdentity) -> Vec<String> {
+    let base = format!("loam/v1/{org_id}/{project_id}");
+    vec![
+        format!("{base}/event/+"),
+        format!("{base}/state/+/+"),
+        format!("{base}/inbox/instance/{}/+/+", identity.instance_id),
+        format!("{base}/inbox/principal/{}/+/+", identity.principal_id),
+        format!("{base}/inbox/agent/{}/+/+", identity.agent_id),
+    ]
+}
+
+/// Pump one project's received frames into the snapshot store until stopped. The
+/// pump only reads: it never publishes, and a lost session simply goes quiet
+/// rather than fabricating state.
+fn pump(
+    mut transport: MqttTransport,
+    roster: PeerRoster,
+    snapshots: std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        match transport.receive_outcome(PUMP_POLL, Utc::now(), &roster) {
+            Ok(Some((topic, outcome))) => {
+                if let Ok(mut store) = snapshots.lock() {
+                    store.admit(&topic, &outcome);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+    }
+    transport.disconnect();
+}
+
 /// Run the connector. Reconciles the registry before touching an endpoint: a
 /// missing database or an empty registry returns [`ServiceOutcome::Inert`]
 /// without binding a socket. Only a non-empty registry binds the owner-only
@@ -804,8 +1281,11 @@ pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
     let run_dir = global_root.join("run");
     let endpoint = ipc::unix::bind(&run_dir).map_err(ServiceError::Ipc)?;
     // The channel registry lives only for this process; a restart starts empty.
-    let mut channels = ChannelRegistry::new();
-    accept_loop(&endpoint, &db_path, &mut channels);
+    let mut state = ConnectorState::new();
+    // Bring up a live session for every already-enrolled project before serving,
+    // so a hook's first snapshot read does not have to wait for an attach.
+    attach_enrolled(&db_path, &mut state);
+    accept_loop(&endpoint, &db_path, &mut state);
     Ok(ServiceOutcome::Served)
 }
 
@@ -819,15 +1299,11 @@ fn registry_has_enrollments(db_path: &Path) -> Result<bool, ServiceError> {
 }
 
 #[cfg(unix)]
-fn accept_loop(
-    endpoint: &ipc::unix::OwnedEndpoint,
-    db_path: &Path,
-    channels: &mut ChannelRegistry,
-) {
+fn accept_loop(endpoint: &ipc::unix::OwnedEndpoint, db_path: &Path, state: &mut ConnectorState) {
     let config = IpcConfig::default();
     loop {
         // One failed connection never takes the connector down; keep serving.
-        let _ = serve_one(endpoint, db_path, &config, channels);
+        let _ = serve_one(endpoint, db_path, &config, state);
     }
 }
 
@@ -839,10 +1315,10 @@ pub fn serve_one(
     endpoint: &ipc::unix::OwnedEndpoint,
     db_path: &Path,
     config: &IpcConfig,
-    channels: &mut ChannelRegistry,
+    state: &mut ConnectorState,
 ) -> Result<(), ipc::IpcError> {
     let mut connection = endpoint.accept_verified()?;
-    serve_connection(&mut connection, db_path, config, channels)
+    serve_connection(&mut connection, db_path, config, state)
 }
 
 /// One request/response exchange on an already owner-proven connection. Both
@@ -852,11 +1328,11 @@ fn serve_connection<S: std::io::Read + std::io::Write>(
     connection: &mut S,
     db_path: &Path,
     config: &IpcConfig,
-    channels: &mut ChannelRegistry,
+    state: &mut ConnectorState,
 ) -> Result<(), ipc::IpcError> {
     let frame = ipc::read_frame(connection, config)?;
     let response = match ipc::parse_request(&frame, config) {
-        Ok(request) => dispatch(&request, db_path, config, channels),
+        Ok(request) => dispatch(&request, db_path, config, state),
         Err(error) => ipc::error_response("", &error, config),
     };
     ipc::write_frame(connection, &response, config)
@@ -872,7 +1348,8 @@ pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
         return Ok(ServiceOutcome::Inert);
     }
     let endpoint = ipc::windows::bind(global_root).map_err(ServiceError::Ipc)?;
-    let mut channels = ChannelRegistry::new();
+    let mut state = ConnectorState::new();
+    attach_enrolled(&db_path, &mut state);
     let config = IpcConfig::default();
     // The named-pipe accept is bounded, so the loop wakes regularly instead of
     // blocking forever; a timeout is simply "no client yet".
@@ -881,7 +1358,7 @@ pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
         match endpoint.accept_verified(accept_wait) {
             Ok(served) => {
                 let mut served = served.with_io_deadline(config.read_deadline);
-                let _ = serve_connection(&mut served, &db_path, &config, &mut channels);
+                let _ = serve_connection(&mut served, &db_path, &config, &mut state);
             }
             // Neither an idle wait nor a rejected peer takes the connector down.
             Err(ipc::IpcError::Timeout) | Err(ipc::IpcError::UnauthorizedPeer) => {}
@@ -896,9 +1373,9 @@ fn dispatch(
     request: &Request,
     db_path: &Path,
     config: &IpcConfig,
-    channels: &mut ChannelRegistry,
+    state: &mut ConnectorState,
 ) -> Vec<u8> {
-    match resolve_and_run(request, db_path, channels) {
+    match resolve_and_run(request, db_path, state) {
         Ok(result) => ipc::ok_response(&request.request_id, result),
         Err(error) => ipc::error_response(&request.request_id, &error, config),
     }
@@ -907,7 +1384,7 @@ fn dispatch(
 fn resolve_and_run(
     request: &Request,
     db_path: &Path,
-    channels: &mut ChannelRegistry,
+    state: &mut ConnectorState,
 ) -> Result<crate::json::Value, ipc::IpcError> {
     // Resolve the workspace to its physical identity exactly as enrollment did,
     // so a path alias resolves to the same enrollment and a non-workspace path is
@@ -915,7 +1392,7 @@ fn resolve_and_run(
     let workspace = crate::enrollment::PhysicalWorkspace::resolve(Path::new(&request.workspace))
         .map_err(|_| ipc::IpcError::WorkspaceUnenrolled)?;
     let key = crate::enrollment::identity_key(&workspace);
-    dispatch_for_key(request, &key, db_path, channels)
+    dispatch_for_key(request, &key, db_path, state)
 }
 
 /// Dispatch a request that has already been resolved to a physical identity key.
@@ -925,7 +1402,7 @@ fn dispatch_for_key(
     request: &Request,
     key: &str,
     db_path: &Path,
-    channels: &mut ChannelRegistry,
+    state: &mut ConnectorState,
 ) -> Result<crate::json::Value, ipc::IpcError> {
     let read = crate::enrollment::open_readonly(db_path)
         .map_err(|_| ipc::IpcError::Internal)?
@@ -946,9 +1423,14 @@ fn dispatch_for_key(
     match request.operation {
         Operation::StatusGet => Ok(status_json(&row)),
         Operation::ProjectAttach => {
-            // The enrollment already exists (looked up above); the broker session
-            // wiring is stubbed until the real adapter (T13). Acknowledge attach.
-            Ok(ack_json(&row, "attached"))
+            // The enrollment already exists (looked up above). Open the live
+            // subscribed broker session in this same process — no second daemon,
+            // no per-project process — and report what actually happened rather
+            // than an unconditional acknowledgement.
+            let session_state = state
+                .sessions
+                .attach(&row, provision_session(&row), Utc::now());
+            Ok(attach_json(&row, &session_state))
         }
         Operation::ProjectDetach => {
             let mut write =
@@ -957,7 +1439,10 @@ fn dispatch_for_key(
                 .map_err(|_| ipc::IpcError::Internal)?;
             if removed {
                 // Any live inject channels for this project become moot; the real
-                // per-session drop is driven by Slice E's session end.
+                // per-session drop is driven by Slice E's session end. The live
+                // broker session and its snapshot go now, so a detached project
+                // is never readable.
+                state.sessions.detach(&row.project_id);
                 Ok(ack_json(&row, "detached"))
             } else {
                 Err(ipc::IpcError::WorkspaceUnenrolled)
@@ -978,14 +1463,122 @@ fn dispatch_for_key(
                 .get("channel_ref")
                 .and_then(|v| v.as_str())
                 .ok_or(ipc::IpcError::InvalidRequest)?;
-            channels.register(InjectChannel {
+            state.channels.register(InjectChannel {
                 session_id: session_id.to_owned(),
                 project_id: row.project_id.clone(),
                 channel_ref: channel_ref.to_owned(),
             });
             Ok(register_ack_json(session_id, &row.project_id))
         }
+        Operation::SnapshotGet => {
+            // A read. Enrollment and project binding were already proven above,
+            // so an unenrolled or cross-project caller never reaches here. The
+            // snapshot is served from memory: nothing is opened for writing,
+            // nothing is persisted, and no envelope bytes leave the connector.
+            let items = state.sessions.snapshot(&row.project_id, Utc::now());
+            Ok(snapshot_json(&row.project_id, &items))
+        }
     }
+}
+
+/// Bring up a live session for every project already in the registry. Failure to
+/// provision one project never blocks the others or the endpoint.
+fn attach_enrolled(db_path: &Path, state: &mut ConnectorState) {
+    let rows = match crate::enrollment::open_readonly(db_path) {
+        Ok(Some(connection)) => {
+            crate::enrollment::list_enrollments(&connection).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    let now = Utc::now();
+    for row in &rows {
+        let _ = state.sessions.attach(row, provision_session(row), now);
+    }
+}
+
+/// The normalized snapshot projection. Already deduped and expiry-filtered by
+/// the store, and deliberately body-shaped: `source`, `type`, `summary`, `to`,
+/// `context`, sender attribution, and the preserved payload — never envelope
+/// bytes, a credential, or a raw remote URL.
+fn snapshot_json(project_id: &str, items: &[SnapshotItem]) -> crate::json::Value {
+    use crate::json::Value;
+    let rendered = items
+        .iter()
+        .map(|item| {
+            Value::Object(vec![
+                ("source".into(), Value::String(item.source.clone())),
+                ("type".into(), Value::String(item.item_type.clone())),
+                ("summary".into(), Value::String(item.summary.clone())),
+                (
+                    "to".into(),
+                    Value::Array(
+                        item.to
+                            .iter()
+                            .map(|(kind, id)| {
+                                Value::Object(vec![
+                                    ("kind".into(), Value::String(kind.clone())),
+                                    ("id".into(), Value::String(id.clone())),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+                (
+                    "context".into(),
+                    Value::Object(vec![
+                        ("org_id".into(), Value::String(item.org_id.clone())),
+                        ("project_id".into(), Value::String(item.project_id.clone())),
+                        (
+                            "repository_id".into(),
+                            Value::String(item.repository_id.clone()),
+                        ),
+                    ]),
+                ),
+                (
+                    "from".into(),
+                    Value::Object(vec![
+                        (
+                            "principal_id".into(),
+                            Value::String(item.from_principal_id.clone()),
+                        ),
+                        ("agent_id".into(), Value::String(item.from_agent_id.clone())),
+                        (
+                            "instance_id".into(),
+                            Value::String(item.from_instance_id.clone()),
+                        ),
+                    ]),
+                ),
+                ("payload".into(), item.payload.clone()),
+            ])
+        })
+        .collect();
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        ("project_id".into(), Value::String(project_id.to_owned())),
+        ("items".into(), Value::Array(rendered)),
+    ])
+}
+
+/// The attach projection. `session_state` is observational: an unopened session
+/// is reported as such, never as attached-and-live.
+fn attach_json(
+    row: &crate::enrollment::EnrolledRow,
+    session_state: &SessionState,
+) -> crate::json::Value {
+    use crate::json::Value;
+    let mut fields = vec![
+        ("schema".into(), Value::Number("1".into())),
+        ("action".into(), Value::String("attached".into())),
+        ("project_id".into(), Value::String(row.project_id.clone())),
+        (
+            "session_state".into(),
+            Value::String(session_state.code().to_owned()),
+        ),
+    ];
+    if let SessionState::Unreachable(reason) = session_state {
+        fields.push(("session_diagnostic".into(), Value::String(reason.clone())));
+    }
+    Value::Object(fields)
 }
 
 fn register_ack_json(session_id: &str, project_id: &str) -> crate::json::Value {
@@ -1765,7 +2358,7 @@ mod service_tests {
             &request(Operation::StatusGet, crate::json::Value::Object(vec![])),
             &key,
             &path,
-            &mut ChannelRegistry::new(),
+            &mut ConnectorState::new(),
         )
         .expect("status");
         let text = result.to_json();
@@ -1782,7 +2375,7 @@ mod service_tests {
             &request(Operation::StatusGet, crate::json::Value::Object(vec![])),
             "unix:999:999",
             &path,
-            &mut ChannelRegistry::new(),
+            &mut ConnectorState::new(),
         );
         assert_eq!(outcome.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
     }
@@ -1798,7 +2391,7 @@ mod service_tests {
             &request(Operation::StatusGet, payload),
             &key,
             &path,
-            &mut ChannelRegistry::new(),
+            &mut ConnectorState::new(),
         );
         assert_eq!(outcome.err(), Some(ipc::IpcError::ProjectBindingMismatch));
     }
@@ -1810,14 +2403,14 @@ mod service_tests {
             &request(Operation::ProjectDetach, crate::json::Value::Object(vec![])),
             &key,
             &path,
-            &mut ChannelRegistry::new(),
+            &mut ConnectorState::new(),
         )
         .expect("detach");
         let after = dispatch_for_key(
             &request(Operation::StatusGet, crate::json::Value::Object(vec![])),
             &key,
             &path,
-            &mut ChannelRegistry::new(),
+            &mut ConnectorState::new(),
         );
         assert_eq!(after.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
     }
@@ -1845,17 +2438,17 @@ mod service_tests {
     #[test]
     fn register_inject_admits_a_channel_without_persisting() {
         let (path, key) = enrolled_db("register", 6, 60);
-        let mut channels = ChannelRegistry::new();
+        let mut state = ConnectorState::new();
         let result = dispatch_for_key(
             &register_request("sess-1", "chan-token-1"),
             &key,
             &path,
-            &mut channels,
+            &mut state,
         )
         .expect("register");
         assert!(result.to_json().contains("inject-channel-registered"));
-        assert!(channels.contains("sess-1"));
-        assert_eq!(channels.len(), 1);
+        assert!(state.channels.contains("sess-1"));
+        assert_eq!(state.channels.len(), 1);
 
         // Nothing about the channel is written to SQLite: no table holds it, and
         // the enrollment row count is unchanged.
@@ -1876,6 +2469,157 @@ mod service_tests {
         );
     }
 
+    /// A whole snapshot session — attach, admit real frames, read repeatedly —
+    /// must leave the database byte-identical (Slice D T1). The snapshot is
+    /// in-memory only: no snapshot table, no schema bump, no enrollment churn.
+    #[test]
+    fn a_full_snapshot_session_leaves_sqlite_byte_unchanged() {
+        let (path, key) = enrolled_db("snapshot-nonpersistence", 9, 90);
+        // One long-lived read connection is the witness: SQLite bumps
+        // `data_version` on it whenever *another* connection commits a write, so
+        // an unchanged value is a real "nothing was written" proof — and unlike a
+        // byte comparison it needs no filesystem capability, which this module
+        // deliberately does not have.
+        let witness = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+        let data_version = |connection: &rusqlite::Connection| -> i64 {
+            connection
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        let schema_sql = |connection: &rusqlite::Connection| -> String {
+            let mut statement = connection
+                .prepare("SELECT COALESCE(group_concat(name || '|' || COALESCE(sql, '')), '') FROM sqlite_master ORDER BY name")
+                .unwrap();
+            statement.query_row([], |r| r.get(0)).unwrap()
+        };
+        let before_version = data_version(&witness);
+        let before_schema_sql = schema_sql(&witness);
+        let before_schema: i64 = witness
+            .query_row("SELECT version FROM federation_schema", [], |r| r.get(0))
+            .unwrap();
+
+        let mut state = ConnectorState::new();
+        // Attach opens no session here (nothing is provisioned) but must still
+        // answer honestly rather than claiming a live broker session.
+        let attach = dispatch_for_key(
+            &request(Operation::ProjectAttach, crate::json::Value::Object(vec![])),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("attach");
+        assert!(
+            attach.to_json().contains("credentials-unresolved"),
+            "an unprovisioned attach must report its real session state: {}",
+            attach.to_json()
+        );
+
+        // Admit real frames straight into the store the dispatch reads from, so
+        // the read below returns something and the absence of writes is not
+        // vacuous.
+        {
+            let store = state.sessions.store();
+            let mut store = store.lock().unwrap();
+            store.store(
+                "loam",
+                SnapshotItem {
+                    key: "state:instance-01/work-SB-42".into(),
+                    source: "urn:loam:instance:instance-01".into(),
+                    item_type: "io.loam.work.state".into(),
+                    summary: "Work is active.".into(),
+                    to: vec![("project".into(), "loam".into())],
+                    org_id: "org-3A1".into(),
+                    project_id: "loam".into(),
+                    repository_id: "repo-2F8".into(),
+                    from_principal_id: "employee-184".into(),
+                    from_agent_id: "agent-72".into(),
+                    from_instance_id: "instance-01".into(),
+                    payload: crate::json::Value::Object(vec![]),
+                    expires_at: Utc::now() + chrono::Duration::hours(1),
+                },
+            );
+        }
+
+        for _ in 0..3 {
+            let snapshot = dispatch_for_key(
+                &request(Operation::SnapshotGet, crate::json::Value::Object(vec![])),
+                &key,
+                &path,
+                &mut state,
+            )
+            .expect("snapshot");
+            let text = snapshot.to_json();
+            assert!(
+                text.contains("Work is active."),
+                "the snapshot read must serve the held item: {text}"
+            );
+            // A read never consumes: the same unresolved item is still there.
+        }
+
+        // The database is untouched: no committed write, the same table
+        // inventory, the same schema version, the same enrollment count, and no
+        // snapshot table was invented.
+        assert_eq!(
+            data_version(&witness),
+            before_version,
+            "a snapshot session must commit no write to SQLite"
+        );
+        assert_eq!(
+            schema_sql(&witness),
+            before_schema_sql,
+            "a snapshot session must add no table"
+        );
+        let after_schema: i64 = witness
+            .query_row("SELECT version FROM federation_schema", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before_schema, after_schema);
+        let snapshot_tables: i64 = witness
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE '%snapshot%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(snapshot_tables, 0, "no snapshot table may exist in SQLite");
+        assert_eq!(
+            crate::enrollment::list_enrollments(&witness).unwrap().len(),
+            1
+        );
+    }
+
+    /// The snapshot read inherits `dispatch_for_key`'s enrollment resolution and
+    /// project-binding proof rather than sitting beside them.
+    #[test]
+    fn the_snapshot_read_rejects_unenrolled_and_cross_project_callers() {
+        let (path, key) = enrolled_db("snapshot-binding", 10, 100);
+        let mut state = ConnectorState::new();
+
+        let unenrolled = dispatch_for_key(
+            &request(Operation::SnapshotGet, crate::json::Value::Object(vec![])),
+            "unix:404:404",
+            &path,
+            &mut state,
+        );
+        assert_eq!(unenrolled.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
+
+        let cross_project = dispatch_for_key(
+            &request(
+                Operation::SnapshotGet,
+                crate::json::Value::Object(vec![(
+                    "project_id".into(),
+                    crate::json::Value::String("someone-elses-project".into()),
+                )]),
+            ),
+            &key,
+            &path,
+            &mut state,
+        );
+        assert_eq!(
+            cross_project.err(),
+            Some(ipc::IpcError::ProjectBindingMismatch)
+        );
+    }
+
     #[test]
     fn register_inject_requires_an_enrolled_workspace() {
         let (path, _key) = enrolled_db("register-unenrolled", 7, 70);
@@ -1883,23 +2627,23 @@ mod service_tests {
             &register_request("sess-x", "chan"),
             "unix:404:404",
             &path,
-            &mut ChannelRegistry::new(),
+            &mut ConnectorState::new(),
         );
         assert_eq!(outcome.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
     }
 
     #[test]
     fn a_channel_is_dropped_on_session_end() {
-        let mut channels = ChannelRegistry::new();
-        channels.register(InjectChannel {
+        let mut state = ConnectorState::new();
+        state.channels.register(InjectChannel {
             session_id: "sess-2".into(),
             project_id: "loam".into(),
             channel_ref: "c".into(),
         });
-        assert!(channels.contains("sess-2"));
-        assert!(channels.drop_session("sess-2"));
-        assert!(!channels.contains("sess-2"));
-        assert!(!channels.drop_session("sess-2")); // idempotent
+        assert!(state.channels.contains("sess-2"));
+        assert!(state.channels.drop_session("sess-2"));
+        assert!(!state.channels.contains("sess-2"));
+        assert!(!state.channels.drop_session("sess-2")); // idempotent
     }
 
     #[test]
@@ -1908,7 +2652,7 @@ mod service_tests {
         // absence below is the *loss* of something that existed rather than a
         // registry that was never populated.
         let (path, key) = enrolled_db("restart", 8, 80);
-        let mut before = ChannelRegistry::new();
+        let mut before = ConnectorState::new();
         dispatch_for_key(
             &register_request("sess-restart", "chan-restart"),
             &key,
@@ -1916,13 +2660,13 @@ mod service_tests {
             &mut before,
         )
         .expect("register");
-        assert!(before.contains("sess-restart"));
+        assert!(before.channels.contains("sess-restart"));
 
         // The restart: the process-local registry is gone, the database is not.
         drop(before);
-        let after = ChannelRegistry::new();
+        let after = ConnectorState::new();
         assert!(
-            after.is_empty(),
+            after.channels.is_empty(),
             "a restarted connector must recover no channel"
         );
 
@@ -2519,5 +3263,471 @@ mod lifecycle_tests {
         let one = status_report(&db, &service, &ctx, Some(&key_of(&a)));
         let one_text = one.to_json();
         assert!(one_text.contains("proj-a") && !one_text.contains("proj-b"));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    //! The bounded in-memory snapshot contract (Slice D T1).
+    //!
+    //! Every case drives real frames through Slice B's `DeliveryProcessor` — the
+    //! single validator, deduplicator, and expiry tracker — and then reads the
+    //! store back, so "exactly one logical item per message" is proven against
+    //! the actual dedupe path rather than a hand-written stub of it.
+
+    use super::*;
+    use crate::json::Value;
+    use crate::transport::DeliveryProcessor;
+
+    const CASES: &str = include_str!("../tests/fixtures/mqtt/harness-snapshot-cases.json");
+    const SENDER_INSTANCE: &str = "instance-01";
+    const SENDER_PRINCIPAL: &str = "employee-184";
+    const RECIPIENT_INSTANCE: &str = "instance-02";
+
+    fn base_time() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-24T14:20:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn number(value: &Value, key: &str) -> Option<i64> {
+        match value.get(key) {
+            Some(Value::Number(literal)) => literal.parse().ok(),
+            _ => None,
+        }
+    }
+
+    fn flag(value: &Value, key: &str) -> bool {
+        matches!(value.get(key), Some(Value::Bool(true)))
+    }
+
+    /// One frame's topic and wire bytes. An empty body is a tombstone.
+    fn frame(frame: &Value, org: &str, project: &str, now: DateTime<Utc>) -> (String, Vec<u8>) {
+        let kind = frame.get("kind").and_then(Value::as_str).expect("kind");
+        let expires =
+            now + chrono::Duration::seconds(number(frame, "expires_in_seconds").unwrap_or(86_400));
+        let expires = expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let summary = frame
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        match kind {
+            "inbox" => {
+                let message_id = frame
+                    .get("message_id")
+                    .and_then(Value::as_str)
+                    .expect("message_id");
+                let topic = format!(
+                    "loam/v1/{org}/{project}/inbox/instance/{RECIPIENT_INSTANCE}/{SENDER_INSTANCE}/{message_id}"
+                );
+                let body = envelope_json(
+                    message_id,
+                    "io.loam.message",
+                    "urn:loam:schema:message:1",
+                    &time,
+                    &expires,
+                    &summary,
+                    project,
+                    org,
+                    Value::Array(vec![Value::Object(vec![
+                        ("kind".into(), Value::String("instance".into())),
+                        ("id".into(), Value::String(RECIPIENT_INSTANCE.into())),
+                    ])]),
+                    Value::Object(vec![("class".into(), Value::String("inbox".into()))]),
+                    Value::Object(vec![
+                        ("action".into(), Value::String("collaboration.note".into())),
+                        ("params".into(), Value::Object(vec![])),
+                        ("response_status".into(), Value::Null),
+                    ]),
+                );
+                (topic, body.into_bytes())
+            }
+            "state" => {
+                let key = frame
+                    .get("state_key")
+                    .and_then(Value::as_str)
+                    .expect("state_key");
+                let topic = format!("loam/v1/{org}/{project}/state/{SENDER_INSTANCE}/{key}");
+                if flag(frame, "tombstone") {
+                    // An empty MQTT payload is the tombstone: Slice B resolves it
+                    // and the store must drop the same logical item.
+                    return (topic, Vec::new());
+                }
+                let revision = frame
+                    .get("revision")
+                    .and_then(Value::as_str)
+                    .unwrap_or("1")
+                    .to_owned();
+                let body = envelope_json(
+                    "01K6Q6ESWMT48TPB",
+                    "io.loam.work.state",
+                    "urn:loam:schema:work-state:1",
+                    &time,
+                    &expires,
+                    &summary,
+                    project,
+                    org,
+                    Value::Array(vec![Value::Object(vec![
+                        ("kind".into(), Value::String("project".into())),
+                        ("id".into(), Value::String(project.to_owned())),
+                    ])]),
+                    Value::Object(vec![
+                        ("class".into(), Value::String("latest-state".into())),
+                        ("key".into(), Value::String(key.to_owned())),
+                        ("revision".into(), Value::Number(revision)),
+                    ]),
+                    Value::Object(vec![
+                        ("state".into(), Value::String("active".into())),
+                        ("acceptance".into(), Value::Object(vec![])),
+                        ("verification".into(), Value::Array(vec![])),
+                    ]),
+                );
+                (topic, body.into_bytes())
+            }
+            other => panic!("unknown frame kind `{other}`"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn envelope_json(
+        id: &str,
+        message_type: &str,
+        dataschema: &str,
+        time: &str,
+        expires: &str,
+        summary: &str,
+        project: &str,
+        org: &str,
+        to: Value,
+        delivery: Value,
+        payload: Value,
+    ) -> String {
+        Value::Object(vec![
+            ("specversion".into(), Value::String("1.0".into())),
+            ("id".into(), Value::String(id.to_owned())),
+            (
+                "source".into(),
+                Value::String(format!("urn:loam:instance:{SENDER_INSTANCE}")),
+            ),
+            ("type".into(), Value::String(message_type.to_owned())),
+            ("time".into(), Value::String(time.to_owned())),
+            (
+                "datacontenttype".into(),
+                Value::String("application/json".into()),
+            ),
+            ("dataschema".into(), Value::String(dataschema.to_owned())),
+            (
+                "data".into(),
+                Value::Object(vec![
+                    ("intent".into(), Value::String("inform".into())),
+                    (
+                        "from".into(),
+                        Value::Object(vec![
+                            (
+                                "principal_id".into(),
+                                Value::String(SENDER_PRINCIPAL.into()),
+                            ),
+                            ("agent_id".into(), Value::String("agent-72".into())),
+                            ("instance_id".into(), Value::String(SENDER_INSTANCE.into())),
+                        ]),
+                    ),
+                    ("to".into(), to),
+                    ("delivery".into(), delivery),
+                    (
+                        "thread".into(),
+                        Value::Object(vec![
+                            ("id".into(), Value::String("thread-01K6Q5".into())),
+                            ("correlation_id".into(), Value::String(id.to_owned())),
+                            ("causation_id".into(), Value::Null),
+                        ]),
+                    ),
+                    (
+                        "context".into(),
+                        Value::Object(vec![
+                            ("org_id".into(), Value::String(org.to_owned())),
+                            ("project_id".into(), Value::String(project.to_owned())),
+                            ("repository_id".into(), Value::String("repo-2F8".into())),
+                            (
+                                "git".into(),
+                                Value::Object(vec![
+                                    (
+                                        "base_oid".into(),
+                                        Value::String(
+                                            "84be000000000000000000000000000000000002".into(),
+                                        ),
+                                    ),
+                                    (
+                                        "plan_oid".into(),
+                                        Value::String(
+                                            "61af000000000000000000000000000000000001".into(),
+                                        ),
+                                    ),
+                                ]),
+                            ),
+                            ("artifacts".into(), Value::Array(vec![])),
+                        ]),
+                    ),
+                    ("expires_at".into(), Value::String(expires.to_owned())),
+                    ("summary".into(), Value::String(summary.to_owned())),
+                    ("payload".into(), payload),
+                ]),
+            ),
+        ])
+        .to_json()
+    }
+
+    fn keys(items: &[SnapshotItem]) -> Vec<String> {
+        items.iter().map(|item| item.key.clone()).collect()
+    }
+
+    #[test]
+    fn the_snapshot_store_honors_every_recorded_case() {
+        let cases = crate::json::parse(CASES).expect("fixture parses");
+        let org = cases.get("org_id").and_then(Value::as_str).unwrap();
+        let project = cases.get("project_id").and_then(Value::as_str).unwrap();
+        let other_project = cases
+            .get("other_project_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let now = base_time();
+
+        for case in cases.get("cases").and_then(Value::as_array).unwrap() {
+            let name = case.get("name").and_then(Value::as_str).unwrap();
+            let capacity = number(case, "capacity").unwrap() as usize;
+            let mut store = SnapshotStore::new(capacity).expect("capacity is non-zero");
+            // Generously sized so the store's own capacity, not the processor's
+            // tracking window, is what the overflow case exercises.
+            let mut processor =
+                DeliveryProcessor::new(ValidationConfig::default(), 64, 64, 64).expect("processor");
+            let claims = [SENDER_PRINCIPAL];
+            let origins = [SENDER_INSTANCE];
+            let identity = AuthenticatedTransportPrincipal::new(
+                AuthenticatedPrincipal::new(SENDER_PRINCIPAL, &claims),
+                &origins,
+            );
+
+            for value in case.get("frames").and_then(Value::as_array).unwrap() {
+                let scope = if flag(value, "other_project") {
+                    other_project
+                } else {
+                    project
+                };
+                let (topic, bytes) = frame(value, org, scope, now);
+                let outcome = processor
+                    .receive(&topic, &bytes, &identity, now)
+                    .unwrap_or_else(|error| panic!("{name}: frame rejected: {error:?}"));
+                store.admit(&topic, &outcome);
+            }
+
+            let read_at =
+                now + chrono::Duration::seconds(number(case, "read_after_seconds").unwrap_or(0));
+            let expected: Vec<String> = case
+                .get("expect")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_owned())
+                .collect();
+
+            // A read never consumes: an unresolved item must still be there on
+            // the next hook, so repeated reads must agree.
+            for round in 0..number(case, "reads").unwrap_or(1) {
+                let items = store.snapshot(project, read_at);
+                assert_eq!(
+                    keys(&items),
+                    expected,
+                    "{name}: snapshot mismatch on read {round}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_capacity_store_is_refused() {
+        assert!(SnapshotStore::new(0).is_err());
+    }
+
+    #[test]
+    fn a_restarted_connector_serves_an_empty_snapshot() {
+        // Retained state and the inbox re-deliver on reconnect, so the correct
+        // post-restart snapshot is empty rather than recovered from disk.
+        let mut before = SnapshotStore::new(4).expect("capacity");
+        let now = base_time();
+        let (topic, bytes) = frame(
+            &crate::json::parse(
+                r#"{"kind":"inbox","message_id":"01K6Q6ESWMT48TPD","summary":"Held."}"#,
+            )
+            .unwrap(),
+            "org-3A1",
+            "project-7M3",
+            now,
+        );
+        let claims = [SENDER_PRINCIPAL];
+        let origins = [SENDER_INSTANCE];
+        let identity = AuthenticatedTransportPrincipal::new(
+            AuthenticatedPrincipal::new(SENDER_PRINCIPAL, &claims),
+            &origins,
+        );
+        let mut processor =
+            DeliveryProcessor::new(ValidationConfig::default(), 8, 8, 8).expect("processor");
+        let outcome = processor.receive(&topic, &bytes, &identity, now).unwrap();
+        assert!(before.admit(&topic, &outcome));
+        assert_eq!(before.len("project-7M3"), 1);
+
+        drop(before);
+        let mut after = SnapshotStore::new(4).expect("capacity");
+        assert!(after.snapshot("project-7M3", now).is_empty());
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn an_unprovisioned_attach_opens_no_session_and_says_so() {
+        // Phase 1 ships no secret backend and no peer roster, so the honest
+        // answer is `credentials-unresolved` — never a fabricated live session.
+        let mut sessions = ProjectSessions::new(4);
+        let row = crate::enrollment::EnrolledRow {
+            identity_key: "unix:1:1".into(),
+            org_id: "org-3A1".into(),
+            project_id: "project-7M3".into(),
+            repository_id: "repo-2F8".into(),
+            descriptor_digest: "d".into(),
+            display_path: "/w".into(),
+            instance_id: RECIPIENT_INSTANCE.into(),
+            broker_profile: "p".into(),
+            commit: "84be000000000000000000000000000000000001".into(),
+            capabilities: crate::enrollment::CapabilityRecord {
+                authentication: true,
+                publish: true,
+                subscribe: true,
+                self_receive: true,
+                verified_at: "2026-07-24T14:20:00Z".into(),
+            },
+            remotes: Vec::new(),
+        };
+        assert_eq!(
+            sessions.attach(&row, provision_session(&row), base_time()),
+            SessionState::CredentialsUnresolved
+        );
+        assert!(!sessions.is_live(&row.project_id));
+        assert!(sessions.snapshot(&row.project_id, base_time()).is_empty());
+    }
+
+    #[test]
+    fn a_provisioned_but_rosterless_project_opens_no_session() {
+        // Credentials without a peer roster would open a session that can admit
+        // no colleague; refusing it beats a live session that hears nothing.
+        fn rosterless() -> Option<(MqttSession, PeerRoster)> {
+            let config = TransportConfig::new(
+                "localhost",
+                1883,
+                "loam-connector-test",
+                8,
+                400_000,
+                ValidationConfig::default(),
+            )
+            .expect("transport config");
+            Some((
+                MqttSession {
+                    config,
+                    username: "actor-a".into(),
+                    password: "unused".into(),
+                    ca_certificate: Vec::new(),
+                    client_authentication: None,
+                    claimed_identity: SessionIdentity {
+                        principal_id: SENDER_PRINCIPAL.into(),
+                        agent_id: "agent-72".into(),
+                        instance_id: RECIPIENT_INSTANCE.into(),
+                        allowed_claims: Vec::new(),
+                    },
+                },
+                PeerRoster::default(),
+            ))
+        }
+
+        let mut sessions = ProjectSessions::new(4);
+        let row = crate::enrollment::EnrolledRow {
+            identity_key: "unix:1:2".into(),
+            org_id: "org-3A1".into(),
+            project_id: "project-7M3".into(),
+            repository_id: "repo-2F8".into(),
+            descriptor_digest: "d".into(),
+            display_path: "/w".into(),
+            instance_id: RECIPIENT_INSTANCE.into(),
+            broker_profile: "p".into(),
+            commit: "84be000000000000000000000000000000000001".into(),
+            capabilities: crate::enrollment::CapabilityRecord {
+                authentication: true,
+                publish: true,
+                subscribe: true,
+                self_receive: true,
+                verified_at: "2026-07-24T14:20:00Z".into(),
+            },
+            remotes: Vec::new(),
+        };
+        assert_eq!(
+            sessions.attach(&row, rosterless(), base_time()),
+            SessionState::NoPeerRoster
+        );
+        assert!(!sessions.is_live(&row.project_id));
+    }
+
+    #[test]
+    fn a_live_session_subscribes_to_colleagues_not_only_itself() {
+        let identity = SessionIdentity {
+            principal_id: SENDER_PRINCIPAL.into(),
+            agent_id: "agent-72".into(),
+            instance_id: RECIPIENT_INSTANCE.into(),
+            allowed_claims: Vec::new(),
+        };
+        let filters = live_filters("org-3A1", "project-7M3", &identity);
+        assert!(filters.contains(&"loam/v1/org-3A1/project-7M3/event/+".to_string()));
+        assert!(filters.contains(&"loam/v1/org-3A1/project-7M3/state/+/+".to_string()));
+        assert!(filters
+            .iter()
+            .any(|filter| filter == "loam/v1/org-3A1/project-7M3/inbox/instance/instance-02/+/+"));
+        // Not a self-only event filter: that is the probe's shape, not a live
+        // collaboration session's.
+        assert!(!filters
+            .iter()
+            .any(|filter| filter.ends_with("/event/instance-02")));
+    }
+
+    #[test]
+    fn the_snapshot_projection_carries_no_envelope_bytes_or_credential() {
+        let item = SnapshotItem {
+            key: "inbox:01K6Q6ESWMT48TPD".into(),
+            source: format!("urn:loam:instance:{SENDER_INSTANCE}"),
+            item_type: "io.loam.message".into(),
+            summary: "Held.".into(),
+            to: vec![("instance".into(), RECIPIENT_INSTANCE.into())],
+            org_id: "org-3A1".into(),
+            project_id: "project-7M3".into(),
+            repository_id: "repo-2F8".into(),
+            from_principal_id: SENDER_PRINCIPAL.into(),
+            from_agent_id: "agent-72".into(),
+            from_instance_id: SENDER_INSTANCE.into(),
+            payload: crate::json::Value::Object(vec![]),
+            expires_at: base_time(),
+        };
+        let text = snapshot_json("project-7M3", std::slice::from_ref(&item)).to_json();
+        for field in [
+            "source", "type", "summary", "to", "context", "from", "payload",
+        ] {
+            assert!(text.contains(field), "the projection must carry `{field}`");
+        }
+        for forbidden in [
+            "specversion",
+            "dataschema",
+            "password",
+            "credential",
+            "mqtts://",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "the projection must not carry `{forbidden}`"
+            );
+        }
     }
 }

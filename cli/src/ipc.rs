@@ -70,6 +70,11 @@ pub enum Operation {
     /// The channel is held in a volatile in-memory registry; injection over it is
     /// Slice E. Never persisted.
     SessionRegisterInject,
+    /// Read the connector's bounded, normalized, already-deduped snapshot of a
+    /// project's current inbox items and work state (Slice D T1). A read: it
+    /// mutates nothing, persists nothing, and carries no envelope bytes,
+    /// credential, or raw remote URL back to the caller.
+    SnapshotGet,
 }
 
 impl Operation {
@@ -79,6 +84,7 @@ impl Operation {
             "project.attach" => Some(Operation::ProjectAttach),
             "project.detach" => Some(Operation::ProjectDetach),
             "session.register-inject" => Some(Operation::SessionRegisterInject),
+            "federation.snapshot" => Some(Operation::SnapshotGet),
             _ => None,
         }
     }
@@ -89,6 +95,7 @@ impl Operation {
             Operation::ProjectAttach => "project.attach",
             Operation::ProjectDetach => "project.detach",
             Operation::SessionRegisterInject => "session.register-inject",
+            Operation::SnapshotGet => "federation.snapshot",
         }
     }
 }
