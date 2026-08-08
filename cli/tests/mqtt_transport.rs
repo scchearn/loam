@@ -305,14 +305,18 @@ fn isolation() {
                 .expect("mTLS retained inbox cleanup should be acknowledged"),
         );
     }
+    // Retain a value from the origin under a bounded 1s message-expiry. Mosquitto
+    // does not clear an origin's retained messages when its credential is removed,
+    // so this value's later absence is driven by MQTT message expiry, not by
+    // revocation. That satisfies the "cleared or expired" AC via the expiry arm.
     let revoked_topic = format!("{project_a}/state/instance-01/revoked");
     assert_publish_accepted(
         actor_a
-            .publish(&revoked_topic, b"expires-on-revocation", true, Some(1))
-            .expect("revoked-origin expiry probe should publish before revocation"),
+            .publish(&revoked_topic, b"expires-by-message-expiry", true, Some(1))
+            .expect("bounded-expiry retained probe should publish before revocation"),
     );
     mtls.receive(&revoked_topic, Duration::from_secs(3))
-        .expect("revoked-origin retained value must exist before revocation");
+        .expect("bounded-expiry retained value must exist before it expires");
 
     // Baseline positive control while actor A is still connected: it writes to
     // its own origin and receives a live message an authorized peer publishes
@@ -364,7 +368,7 @@ fn isolation() {
     let severed = actor_a.publish(
         format!("{project_a}/state/instance-01/post-revoke-live"),
         b"denied-after-revocation",
-        true,
+        false,
         None,
     );
     assert!(
@@ -427,6 +431,8 @@ fn isolation() {
         publish.topic.as_ref() == post_revoke_control.as_bytes()
             && publish.payload.as_ref() == b"still-authorized"
     }));
+    // The revoked origin's retained value is gone — by MQTT message expiry
+    // (1s interval + the sleep above), not because revocation cleared it.
     assert!(post_revoke_values
         .iter()
         .all(|publish| publish.topic.as_ref() != revoked_topic.as_bytes()));

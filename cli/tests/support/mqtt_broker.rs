@@ -222,6 +222,9 @@ impl BrokerFixture {
             self.backend.reload(child)
         };
         signalled?;
+        // ponytail: matches the first "Reloading config" in the append-mode log;
+        // fine while reload() runs at most once per test. If a test ever reloads
+        // twice, capture the log length before signalling and search from there.
         self.wait_for_log("Reloading config")
     }
 
@@ -844,5 +847,14 @@ mod tests {
         assert_eq!(strip_acl_user(acl, "actor"), acl);
         // A missing user is a detectable no-op.
         assert_eq!(strip_acl_user(acl, "ghost"), acl);
+        // The last block without a trailing blank line is still fully removed.
+        let trailing = "user keep\ntopic read k/#\n\nuser drop\ntopic read d/#";
+        let stripped_trailing = strip_acl_user(trailing, "drop");
+        assert!(stripped_trailing.contains("user keep"));
+        assert!(!stripped_trailing.contains("user drop"));
+        assert!(!stripped_trailing.contains("read d/#"));
+        // A username appearing only inside a topic line must not trigger a strip.
+        let embedded = "user keep\ntopic read tenant/drop/#\n";
+        assert_eq!(strip_acl_user(embedded, "drop"), embedded);
     }
 }
