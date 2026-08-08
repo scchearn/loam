@@ -408,7 +408,9 @@ test('direct runtime invocation closes stdin', async () => {
     runtimePath: process.execPath,
     args: ['-e', "process.stdin.resume(); process.stdin.on('end', () => process.stdout.write('closed'))"],
     cwd: process.cwd(),
-    timeoutMs: 1000,
+    // Generous timeout: node startup under a loaded pre-commit run can exceed a
+    // tight bound and this test is about the closed-stdin contract, not latency.
+    timeoutMs: 15000,
   });
 
   assert.equal(result.code, 0, result.stderr);
