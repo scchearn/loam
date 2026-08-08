@@ -842,12 +842,52 @@ pub fn serve_one(
     channels: &mut ChannelRegistry,
 ) -> Result<(), ipc::IpcError> {
     let mut connection = endpoint.accept_verified()?;
-    let frame = ipc::read_frame(&mut connection, config)?;
+    serve_connection(&mut connection, db_path, config, channels)
+}
+
+/// One request/response exchange on an already owner-proven connection. Both
+/// platforms share it, so the codec, dispatch, and error shape cannot drift
+/// between them; the peer proof stays with each platform's accept.
+fn serve_connection<S: std::io::Read + std::io::Write>(
+    connection: &mut S,
+    db_path: &Path,
+    config: &IpcConfig,
+    channels: &mut ChannelRegistry,
+) -> Result<(), ipc::IpcError> {
+    let frame = ipc::read_frame(connection, config)?;
     let response = match ipc::parse_request(&frame, config) {
         Ok(request) => dispatch(&request, db_path, config, channels),
         Err(error) => ipc::error_response("", &error, config),
     };
-    ipc::write_frame(&mut connection, &response, config)
+    ipc::write_frame(connection, &response, config)
+}
+
+/// Run the connector on Windows. Same contract as the Unix path: the registry
+/// decides whether an endpoint exists at all, and the peer's SID is proven
+/// inside `accept_verified` before the codec sees a byte.
+#[cfg(windows)]
+pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
+    let db_path = global_root.join("loam.sqlite3");
+    if !registry_has_enrollments(&db_path)? {
+        return Ok(ServiceOutcome::Inert);
+    }
+    let endpoint = ipc::windows::bind(global_root).map_err(ServiceError::Ipc)?;
+    let mut channels = ChannelRegistry::new();
+    let config = IpcConfig::default();
+    // The named-pipe accept is bounded, so the loop wakes regularly instead of
+    // blocking forever; a timeout is simply "no client yet".
+    let accept_wait = config.lifecycle_deadline;
+    loop {
+        match endpoint.accept_verified(accept_wait) {
+            Ok(served) => {
+                let mut served = served.with_io_deadline(config.read_deadline);
+                let _ = serve_connection(&mut served, &db_path, &config, &mut channels);
+            }
+            // Neither an idle wait nor a rejected peer takes the connector down.
+            Err(ipc::IpcError::Timeout) | Err(ipc::IpcError::UnauthorizedPeer) => {}
+            Err(error) => return Err(ServiceError::Ipc(error)),
+        }
+    }
 }
 
 /// Resolve the request's workspace through the registry, enforce the project

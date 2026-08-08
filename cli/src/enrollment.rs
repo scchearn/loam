@@ -837,7 +837,7 @@ pub fn validate_enrollment(
 #[allow(unused_imports)]
 pub(crate) use registry::*;
 
-mod registry {
+pub mod registry {
     //! Consumed by the connect/disconnect/status orchestration in T10/T11, which
     //! retires this module allow once the registry is wired to the CLI surface.
     #![allow(dead_code)]

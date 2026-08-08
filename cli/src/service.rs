@@ -417,6 +417,11 @@ fn enable_start_commands(ctx: &ServiceContext) -> Vec<ManagerCommand> {
     vec![
         ManagerCommand::new("launchctl", &["bootstrap", &launchd::gui_domain(), &plist]),
         ManagerCommand::new("launchctl", &["enable", &launchd::gui_service()]),
+        // The plist is dormant (`RunAtLoad`/`KeepAlive` false), so bootstrapping
+        // it only *loads* the job. Activation after the first enrollment has to
+        // start it explicitly — systemd gets that from `enable --now` and
+        // schtasks from `/Run`.
+        ManagerCommand::new("launchctl", &["kickstart", "-k", &launchd::gui_service()]),
     ]
 }
 

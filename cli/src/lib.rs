@@ -3,7 +3,7 @@ mod checkpoint;
 mod codegraph;
 pub mod connector;
 mod datecheck;
-mod enrollment;
+pub mod enrollment;
 pub mod envelope;
 mod federation;
 mod hooks;

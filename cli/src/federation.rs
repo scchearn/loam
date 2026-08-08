@@ -325,17 +325,17 @@ fn service(mut args: impl Iterator<Item = String>) -> i32 {
 }
 
 fn service_run(root: &std::path::Path) -> i32 {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         match crate::connector::run_service(root) {
             Ok(_) => 0,
             Err(_) => 70,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = root;
-        eprintln!("federation service run: the Windows endpoint arrives in Slice C T7");
+        eprintln!("federation service run: unsupported platform");
         69
     }
 }

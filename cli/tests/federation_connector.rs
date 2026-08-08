@@ -19,7 +19,6 @@ fn binary() -> PathBuf {
     path.join(if cfg!(windows) { "loam.exe" } else { "loam" })
 }
 
-#[cfg(unix)]
 fn temp_root(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "loam-connector-{label}-{}",
@@ -33,7 +32,6 @@ fn temp_root(label: &str) -> PathBuf {
 }
 
 #[test]
-#[cfg(unix)]
 fn service_run_on_an_unenrolled_machine_is_inert() {
     let root = temp_root("inert");
     let output = Command::new(binary())
@@ -49,6 +47,7 @@ fn service_run_on_an_unenrolled_machine_is_inert() {
         String::from_utf8_lossy(&output.stderr)
     );
     // No endpoint was bound, and a read did not create the database.
+    #[cfg(unix)]
     assert!(
         !root.join("run").join("connector.sock").exists(),
         "no socket may exist on an unenrolled machine"
@@ -59,6 +58,137 @@ fn service_run_on_an_unenrolled_machine_is_inert() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// --- enrolled-start positive control (T8 fast-follow) ---
+//
+// Every inertness assertion here and in the hosted service smokes is an absence
+// check, and an absence check needs a run where the thing really does appear.
+// These seed one enrollment through the real registry API — no broker, no probe,
+// no credential — and prove the same binary that stays dormant on an empty
+// registry binds its endpoint and keeps serving once one exists.
+
+/// One enrollment for `root`, carrying only non-secret projections.
+fn smoke_enrollment(root: &std::path::Path) -> loam::enrollment::ValidatedEnrollment {
+    use loam::enrollment::{
+        PhysicalWorkspace, PlatformIdentity, ValidatedEnrollment, ValidatedRemote,
+    };
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(root).expect("global root exists");
+        PlatformIdentity::Unix {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    };
+    #[cfg(not(unix))]
+    let identity = PlatformIdentity::WindowsPath;
+
+    ValidatedEnrollment {
+        org_id: "org-smoke".into(),
+        project_id: "project-smoke".into(),
+        repository_id: "repository-smoke".into(),
+        broker_profile: "profile-smoke".into(),
+        broker_endpoint: "mqtts://broker.invalid:8883".into(),
+        tls_server_name: "broker.invalid".into(),
+        credential_ref: "keychain:loam-smoke".into(),
+        ca_ref: None,
+        commit: "0".repeat(40),
+        remotes: vec![ValidatedRemote {
+            name: "origin".into(),
+            url_digest: "0".repeat(64),
+            allowed_refs: vec!["refs/heads/main".into()],
+        }],
+        workspace: PhysicalWorkspace {
+            display_path: root.to_string_lossy().into_owned(),
+            identity,
+        },
+    }
+}
+
+fn seed_enrollment(root: &std::path::Path) {
+    use loam::enrollment::registry::{insert_enrollment, open_writable, CapabilityRecord};
+    let mut connection = open_writable(&root.join("loam.sqlite3")).expect("open the registry");
+    let capabilities = CapabilityRecord {
+        authentication: true,
+        publish: true,
+        subscribe: true,
+        self_receive: true,
+        verified_at: "2026-08-08T00:00:00Z".into(),
+    };
+    insert_enrollment(
+        &mut connection,
+        &smoke_enrollment(root),
+        &capabilities,
+        "2026-08-08T00:00:00Z",
+    )
+    .expect("seed one enrollment");
+}
+
+/// Seeds `LOAM_SMOKE_ROOT` for the hosted LaunchAgent/Task Scheduler smokes, so
+/// they can observe a real enrolled start under the real manager. Ignored by
+/// default; the smoke scripts run it by name.
+#[test]
+#[ignore]
+fn seed_one_enrollment_for_the_service_smoke() {
+    let root = PathBuf::from(
+        std::env::var("LOAM_SMOKE_ROOT").expect("LOAM_SMOKE_ROOT names the smoke's global root"),
+    );
+    std::fs::create_dir_all(&root).expect("global root");
+    seed_enrollment(&root);
+    assert!(root.join("loam.sqlite3").is_file(), "registry was written");
+}
+
+#[test]
+fn an_enrolled_machine_starts_and_serves_instead_of_exiting() {
+    let root = temp_root("enrolled-start");
+    seed_enrollment(&root);
+
+    let mut child = Command::new(binary())
+        .args(["federation", "service", "run", "--global-root"])
+        .arg(&root)
+        .spawn()
+        .expect("spawn service");
+
+    // The connector is inert only while the registry is empty; with one
+    // enrollment it must keep serving instead of exiting. On Unix the endpoint
+    // is an observable socket file; the Windows endpoint is a named pipe, so
+    // there the live process is the observation.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    #[cfg(unix)]
+    let served = {
+        let socket = root.join("run").join("connector.sock");
+        while !socket.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().expect("poll service").is_none(),
+                "an enrolled connector must not exit before binding its endpoint"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        socket.exists()
+    };
+    #[cfg(not(unix))]
+    let served = {
+        let live_for = std::time::Duration::from_secs(3);
+        let until = std::time::Instant::now() + live_for;
+        while std::time::Instant::now() < until {
+            assert!(
+                child.try_wait().expect("poll service").is_none(),
+                "an enrolled connector must not exit like an unenrolled one does"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = deadline;
+        true
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        served,
+        "an enrolled connector serves its owner-only endpoint"
+    );
 }
 
 #[test]
