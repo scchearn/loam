@@ -1614,6 +1614,466 @@ fn broker_contract() {
         .expect("broker fixture should stop and remove only its temporary directory");
 }
 
+#[test]
+#[ignore = "requires LOAM_MQTT_TEST=1, Git, and a real Mosquitto/OpenSSL installation"]
+fn failure_matrix() {
+    if std::env::var("LOAM_MQTT_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set LOAM_MQTT_TEST=1 to require the real broker tier");
+        return;
+    }
+
+    let cases = include_str!("fixtures/mqtt/failure-cases.json");
+    for name in [
+        "broker_restart",
+        "dropped_retained",
+        "duplicate_replay",
+        "invalid_retained",
+        "git_fetch_failure",
+        "revoked_credential",
+        "clock_skew",
+    ] {
+        assert!(cases.contains(name), "missing failure case {name}");
+    }
+
+    let mut broker = BrokerFixture::provision("failure-matrix")
+        .expect("the real broker fixture should provision");
+    let namespace = broker.namespace().to_owned();
+    let project = format!("{namespace}/project-a");
+    let now = test_time("2026-07-24T14:21:00Z");
+    // Every endpoint this tier touches is a localhost broker listener or a
+    // local file:// Git remote; no row widens that allowlist.
+
+    // ---- Row: broker_restart -> reconnect/reconcile ----------------------
+    // Retained state survives a broker restart from persistence; a non-retained
+    // event published beforehand is not replayed to a fresh subscriber.
+    let restart_topic = format!("{project}/state/instance-01/activity-01K6Q5");
+    let restart_event_topic = format!("{project}/event/instance-01");
+    let (_, restart_state) = scoped_work_state(
+        &broker,
+        "instance-01",
+        "employee-184",
+        1,
+        "active",
+        "SB-42",
+        now,
+    );
+    {
+        let mut publisher = TestClient::password(&broker, "failure-restart-pub")
+            .expect("restart publisher should authenticate");
+        publish_validated(&mut publisher, restart_state.clone(), now);
+        let pre_event =
+            scoped_event_with_id(&broker, &restart_event_topic, "01K6Q6ESWMT48TPA", now);
+        publish_validated(&mut publisher, pre_event, now);
+    }
+    broker
+        .restart()
+        .expect("broker restart injection should stop and restart the same instance");
+    let restored = {
+        let mut after = TestClient::password(&broker, "failure-restart-after")
+            .expect("post-restart client should authenticate");
+        after
+            .subscribe(format!("{project}/#"))
+            .expect("post-restart client should subscribe");
+        after.collect(Duration::from_secs(3))
+    };
+    let restored_state = restored
+        .iter()
+        .find(|publish| publish.topic.as_ref() == restart_topic.as_bytes() && publish.retain)
+        .expect("retained state must survive the broker restart (positive control)");
+    assert!(
+        restored
+            .iter()
+            .all(|publish| publish.topic.as_ref() != restart_event_topic.as_bytes()),
+        "a non-retained event was replayed after the broker restart"
+    );
+    let claims_01 = ["employee-184"];
+    let origins_01 = ["instance-01"];
+    let identity_01 = AuthenticatedTransportPrincipal::new(
+        AuthenticatedPrincipal::new("broker-user-7", &claims_01),
+        &origins_01,
+    );
+    let mut processor = DeliveryProcessor::new(ValidationConfig::default(), 8, 8, 8)
+        .expect("bounded failure processor should configure");
+    assert!(matches!(
+        processor.receive(&restart_topic, &restored_state.payload, &identity_01, now),
+        Ok(ReceiveOutcome::Accepted(_))
+    ));
+
+    // ---- Row: duplicate_replay -> one logical item -----------------------
+    // A duplicate QoS 1 event is deduped; a re-delivered state revision is not
+    // re-applied.
+    let mut dup_pub = TestClient::password(&broker, "failure-dup-pub")
+        .expect("duplicate publisher should authenticate");
+    let mut dup_obs = TestClient::password(&broker, "failure-dup-obs")
+        .expect("duplicate observer should authenticate");
+    dup_obs
+        .subscribe(&restart_event_topic)
+        .expect("duplicate observer should subscribe to the event origin");
+    let dup_event = scoped_event_with_id(&broker, &restart_event_topic, "01K6Q6ESWMT48TPF", now);
+    for _ in 0..2 {
+        publish_validated(&mut dup_pub, dup_event.clone(), now);
+    }
+    let first_event = dup_obs
+        .receive(&restart_event_topic, Duration::from_secs(3))
+        .expect("first event should traverse the broker");
+    let second_event = dup_obs
+        .receive(&restart_event_topic, Duration::from_secs(3))
+        .expect("duplicate event should traverse the broker");
+    assert!(matches!(
+        processor.receive(
+            &restart_event_topic,
+            &first_event.payload,
+            &identity_01,
+            now
+        ),
+        Ok(ReceiveOutcome::Accepted(_))
+    ));
+    assert_eq!(
+        processor.receive(
+            &restart_event_topic,
+            &second_event.payload,
+            &identity_01,
+            now
+        ),
+        Ok(ReceiveOutcome::DuplicateEvent)
+    );
+    assert_eq!(
+        processor.receive(&restart_topic, &restored_state.payload, &identity_01, now),
+        Ok(ReceiveOutcome::DuplicateState),
+        "a re-delivered state revision must not be re-applied"
+    );
+
+    // ---- Row: invalid_retained -> typed validation refusal ---------------
+    // A privileged fixture publisher writes a malformed retained payload; the
+    // receiver rejects it with a typed error. A valid retained payload on the
+    // same origin is the positive control.
+    let invalid_topic = format!("{project}/state/instance-01/activity-INVALID");
+    let mut invalid_obs = TestClient::password(&broker, "failure-invalid-obs")
+        .expect("invalid-retained observer should authenticate");
+    invalid_obs
+        .subscribe(format!("{project}/state/instance-01/#"))
+        .expect("invalid-retained observer should subscribe");
+    assert_publish_accepted(
+        dup_pub
+            .publish(
+                &invalid_topic,
+                b"{ not a valid envelope".to_vec(),
+                true,
+                None,
+            )
+            .expect("privileged fixture publisher should place the malformed retained payload"),
+    );
+    let malformed = invalid_obs
+        .receive(&invalid_topic, Duration::from_secs(3))
+        .expect("malformed retained payload should reach the validating receiver");
+    assert!(
+        matches!(
+            processor.receive(&invalid_topic, &malformed.payload, &identity_01, now),
+            Err(TransportError::Validation(_))
+        ),
+        "malformed retained payload must yield a typed validation refusal"
+    );
+
+    // ---- Row: clock_skew -> bounded expiry decision ----------------------
+    // A lease is honored within the skew tolerance and rejected one second past
+    // it, using the same envelope over the real broker.
+    let lifecycle = LifecycleConfig::new(
+        chrono::Duration::minutes(30),
+        chrono::Duration::minutes(10),
+        chrono::Duration::minutes(5),
+        chrono::Duration::hours(24),
+        chrono::Duration::seconds(30),
+    )
+    .expect("bounded lifecycle configuration should validate");
+    let (_, lease) = scoped_work_state(
+        &broker,
+        "instance-01",
+        "employee-184",
+        1,
+        "active",
+        "SKEW-1",
+        now,
+    );
+    transport::publish_with_lifecycle(&dup_pub.client, lease.clone(), now, &lifecycle)
+        .expect("lease should queue for publication");
+    assert_publish_accepted(
+        dup_pub
+            .wait_for_puback()
+            .expect("lease publication should be acknowledged"),
+    );
+    let lease_frame = invalid_obs
+        .receive(&restart_topic, Duration::from_secs(3))
+        .expect("lease should traverse the broker");
+    let mut within_skew =
+        DeliveryProcessor::with_lifecycle(ValidationConfig::default(), 8, 8, 8, lifecycle.clone())
+            .expect("within-skew processor should configure");
+    assert!(matches!(
+        within_skew.receive(
+            &restart_topic,
+            &lease_frame.payload,
+            &identity_01,
+            test_time("2026-07-24T14:50:29Z")
+        ),
+        Ok(ReceiveOutcome::Accepted(_))
+    ));
+    let mut beyond_skew =
+        DeliveryProcessor::with_lifecycle(ValidationConfig::default(), 8, 8, 8, lifecycle.clone())
+            .expect("beyond-skew processor should configure");
+    assert_eq!(
+        beyond_skew.receive(
+            &restart_topic,
+            &lease_frame.payload,
+            &identity_01,
+            test_time("2026-07-24T14:50:31Z")
+        ),
+        Err(TransportError::Validation(Violation::Expired))
+    );
+
+    // ---- Rows: dropped_retained + git_fetch_failure ----------------------
+    // Git is the durable oracle: a dropped ref-change hint still converges, and
+    // an unreachable configured remote is a typed degraded result. No ref,
+    // FETCH_HEAD, worktree, plan, or spec byte changes across either probe.
+    {
+        let mut git = GitOracleFixture::provision();
+        let before = git.snapshot();
+        let mut oracle = GitOracle::new(
+            git.peer(),
+            git.wiki(),
+            "origin",
+            git_scope(&broker),
+            ["refs/heads/main"],
+            ["instance-01"],
+            Duration::from_secs(30),
+        )
+        .expect("configured Git oracle should validate");
+        let hint = scoped_refs_changed(
+            &broker,
+            &restart_event_topic,
+            git.base_oid(),
+            git.allowed_oid(),
+            now,
+        );
+        let hinted = oracle
+            .reconcile_ref_change(&hint)
+            .expect("ref-change hint should fetch and recompute");
+        let without_hint = oracle
+            .reconcile()
+            .expect("a dropped hint should converge through ordinary reconciliation");
+        assert_eq!(hinted, without_hint);
+        assert_eq!(git.snapshot(), before);
+
+        let published = scoped_work_state_with_commit(
+            &broker,
+            "instance-01",
+            "employee-184",
+            2,
+            "published",
+            "SB-42",
+            Some(git.allowed_oid()),
+            now,
+        )
+        .1;
+        assert!(
+            matches!(
+                oracle.evaluate_work_state(&published),
+                Ok(PublicationStatus::Verified(_))
+            ),
+            "positive control: the allowed-ref publication verifies against the reachable remote"
+        );
+        let mut broken = GitOracle::new(
+            git.peer(),
+            git.wiki(),
+            "broken",
+            git_scope(&broker),
+            ["refs/heads/main"],
+            ["instance-01"],
+            Duration::from_secs(30),
+        )
+        .expect("configured but unreachable remote should validate locally");
+        assert_eq!(
+            broken.evaluate_work_state(&published),
+            Err(GitOracleError::GitFailure)
+        );
+        assert_eq!(git.snapshot(), before);
+        git.finish();
+    }
+
+    // ---- Row: revoked_credential -> authentication refusal ---------------
+    // A revoked credential loses its live session and cannot reconnect; an
+    // unrevoked peer keeps full access as the positive control.
+    let victim_topic = format!("{namespace}/project-b/state/instance-01/victim");
+    let mut victim = TestClient::credentials(
+        &broker,
+        "failure-revoke-victim",
+        "actor-b",
+        broker.foreign_password(),
+    )
+    .expect("revocation victim should authenticate before revocation");
+    assert_publish_accepted(
+        victim
+            .publish(&victim_topic, b"authorized-before-revocation", false, None)
+            .expect("victim should publish under its own project before revocation"),
+    );
+    broker
+        .revoke_live("actor-b")
+        .expect("victim credential should be revoked live");
+    let severed = victim.publish(&victim_topic, b"after-revocation", false, None);
+    assert!(
+        severed.is_err(),
+        "revoked live session unexpectedly kept publishing: {severed:?}"
+    );
+    let refused = match TestClient::credentials(
+        &broker,
+        "failure-revoke-reconnect",
+        "actor-b",
+        broker.foreign_password(),
+    ) {
+        Ok(_) => panic!("revoked credential reconnected"),
+        Err(error) => error,
+    };
+    assert!(
+        refused.contains("NotAuthorized") || refused.contains("not authorised"),
+        "unexpected revoked-credential refusal: {refused}"
+    );
+    drop(victim);
+    let mut survivor = TestClient::password(&broker, "failure-revoke-survivor")
+        .expect("unrevoked peer should survive the revocation");
+    let survivor_topic = format!("{project}/state/instance-01/survivor");
+    assert_publish_accepted(
+        survivor
+            .publish(&survivor_topic, b"still-authorized", false, None)
+            .expect("unrevoked peer should keep publish access"),
+    );
+
+    // ---- Teardown: clear every retained topic, then prove zero residue ----
+    publish_state_clear(&mut dup_pub, restart_state);
+    assert_publish_accepted(
+        dup_pub
+            .publish(&invalid_topic, Vec::new(), true, None)
+            .expect("malformed retained payload should be cleared"),
+    );
+    drop(dup_pub);
+    drop(dup_obs);
+    drop(invalid_obs);
+    drop(survivor);
+    let mut final_scan = TestClient::password(&broker, "failure-final-scan")
+        .expect("final retained scan should authenticate");
+    final_scan
+        .subscribe(format!("{project}/#"))
+        .expect("final retained scan should subscribe");
+    assert!(
+        final_scan.collect(Duration::from_secs(2)).is_empty(),
+        "failure matrix left retained values under its run namespace"
+    );
+    broker
+        .finish()
+        .expect("broker fixture should remove only its temporary directory");
+}
+
+#[test]
+#[ignore = "tier-10 public prototype: opt-in, synthetic-only, gates nothing and never runs in CI"]
+fn public_prototype() {
+    // Opt-in only. With the flag unset (normal and CI runs) this returns
+    // immediately, which is why tier-10 can gate nothing.
+    if std::env::var("LOAM_MQTT_PUBLIC_DEMO").as_deref() != Ok("1") {
+        eprintln!("skipped: set LOAM_MQTT_PUBLIC_DEMO=1 to opt into the tier-10 public prototype");
+        return;
+    }
+    // The public-demo flag REQUIRES an explicit synthetic-data marker.
+    assert_eq!(
+        std::env::var("LOAM_MQTT_SYNTHETIC").as_deref(),
+        Ok("1"),
+        "tier-10 refuses to run without LOAM_MQTT_SYNTHETIC=1; it accepts only labelled synthetic data"
+    );
+    eprintln!(
+        "WARNING: tier-10 public prototype is a synthetic-only demonstration; it is NOT suitable for \
+         production and must never carry a real credential, document, or fixture."
+    );
+
+    // Reject any ordinary (non-synthetic) fixture or credential.
+    assert!(reject_non_synthetic(SYNTHETIC_MARKER).is_ok());
+    for ordinary in [
+        include_str!("fixtures/mqtt/work-state.json"),
+        include_str!("fixtures/mqtt/message.json"),
+        include_str!("fixtures/mqtt/git-refs-changed.json"),
+    ] {
+        assert!(
+            reject_non_synthetic(ordinary).is_err(),
+            "tier-10 must refuse an ordinary fixture payload"
+        );
+    }
+
+    // A live public round-trip is optional and only runs when a public broker is
+    // named explicitly. It still carries only labelled synthetic data, and a
+    // missing endpoint is a reported skip, never a fabricated pass.
+    let Some(endpoint) = std::env::var("LOAM_MQTT_PUBLIC_BROKER")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        eprintln!(
+            "tier-10: set LOAM_MQTT_PUBLIC_BROKER=host:port to exercise a live public round-trip; \
+             skipping the network step"
+        );
+        return;
+    };
+    let (host, port) = endpoint
+        .split_once(':')
+        .expect("LOAM_MQTT_PUBLIC_BROKER must be host:port");
+    let port: u16 = port.parse().expect("public broker port must be a u16");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("demo clock should be after the Unix epoch")
+        .as_nanos();
+    let topic = format!("loam/v1/public-demo-{SYNTHETIC_MARKER}-{nonce:x}/state/synthetic");
+    let payload = format!(
+        "{{\"{SYNTHETIC_MARKER}\":true,\"note\":\"tier-10 synthetic demo, not production\"}}"
+    );
+    assert!(reject_non_synthetic(&payload).is_ok());
+
+    let mut options = MqttOptions::new(format!("loam-tier10-{nonce:x}"), host, port);
+    options.set_keep_alive(Duration::from_secs(5));
+    let (client, mut connection) = Client::new(options, 8);
+    client
+        .subscribe(&topic, QoS::AtLeastOnce)
+        .expect("tier-10 demo should subscribe to its synthetic topic");
+    client
+        .publish(&topic, QoS::AtLeastOnce, true, payload.clone().into_bytes())
+        .expect("tier-10 demo should publish its synthetic sentinel");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed = false;
+    while Instant::now() < deadline {
+        match connection.recv_timeout(Duration::from_secs(1)) {
+            Ok(Ok(Event::Incoming(Packet::Publish(publish))))
+                if publish.topic.as_ref() == topic.as_bytes() =>
+            {
+                assert_eq!(publish.payload.as_ref(), payload.as_bytes());
+                observed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    // Clear the retained sentinel so the public broker keeps no residue.
+    let _ = client.publish(&topic, QoS::AtLeastOnce, true, Vec::new());
+    let _ = connection.recv_timeout(Duration::from_secs(2));
+    assert!(
+        observed,
+        "tier-10 synthetic sentinel did not round-trip through the public broker"
+    );
+}
+
+const SYNTHETIC_MARKER: &str = "synthetic-demo-not-for-production";
+
+fn reject_non_synthetic(data: &str) -> Result<(), String> {
+    if data.contains(SYNTHETIC_MARKER) {
+        Ok(())
+    } else {
+        Err("tier-10 accepts only payloads labelled as synthetic demo data".to_owned())
+    }
+}
+
 struct TestClient {
     client: Client,
     connection: Connection,
