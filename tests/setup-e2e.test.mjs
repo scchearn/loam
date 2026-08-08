@@ -75,6 +75,14 @@ async function baseFixture() {
       cursor: { id: 'cursor', state: 'absent' },
     },
     smokeRunner: async () => ({ code: 0, stdout: '{"exists":false}', stderr: '' }),
+    // Delegated federation service lifecycle: status reports "not enabled" (a
+    // fresh machine is inert), every other verb succeeds. The real runtime is a
+    // dummy file in these fixtures, so we never actually spawn a manager.
+    federationRunner: async (request) => ({
+      code: request.args.includes('status') ? 1 : 0,
+      stdout: '',
+      stderr: '',
+    }),
   };
 }
 

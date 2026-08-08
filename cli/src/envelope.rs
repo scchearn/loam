@@ -2271,10 +2271,17 @@ mod tests {
             Err(Violation::UnknownContextField)
         );
 
+        // Union of the Slice B and Slice C process-capable admissions. Slice C:
+        // `enrollment.rs` + `service.rs` run git/manager subprocesses (the
+        // isolated commit-reachability fetch and the native service managers).
+        // Slice B: `transport.rs` runs the git-transport subprocess. Every other
+        // module stays barred; the guard is the security boundary for both slices.
         let process_files = [
             "checkpoint.rs",
             "codegraph.rs",
+            "enrollment.rs",
             "main.rs",
+            "service.rs",
             "state.rs",
             "transport.rs",
         ];
@@ -2283,12 +2290,20 @@ mod tests {
             "checkpoint.rs",
             "codegraph.rs",
             "datecheck.rs",
+            "enrollment.rs",
             "hooks.rs",
+            "ipc/unix.rs",
             "markdown.rs",
             "memory.rs",
+            "service.rs",
             "sha256.rs",
             "state.rs",
         ];
+        // The Slice C owner-authenticated IPC endpoint uses a local Unix domain
+        // socket (`UnixStream`/`UnixListener`) for same-host, same-user IPC — not
+        // network egress. It is admitted here alone; every other module stays
+        // barred, and no TCP/UDP/HTTP surface is ever allowed.
+        let unix_socket_ipc = "ipc/unix.rs";
         for (path, production) in crate_production_sources() {
             for forbidden in [
                 "std::net",
@@ -2300,12 +2315,21 @@ mod tests {
                 "hyper",
                 "curl ",
             ] {
+                if forbidden == "UnixStream" && path == unix_socket_ipc {
+                    continue;
+                }
                 assert!(
                     !production.contains(forbidden),
                     "network surface introduced in {path}: {forbidden}"
                 );
             }
-            if production.contains("std::process") || production.contains("Command::new") {
+            // `std::process::abort` is not a subprocess capability: it ends this
+            // process, it never starts another. The Windows IPC fail-safe uses it
+            // when a cancelled overlapped operation cannot be proven complete, so
+            // it is excluded by name — `ipc/windows.rs` stays barred from
+            // `Command::new` and from every other `std::process` reach.
+            let spawn_reach = production.replace("std::process::abort", "");
+            if spawn_reach.contains("std::process") || spawn_reach.contains("Command::new") {
                 assert!(
                     process_files.contains(&path.as_str()),
                     "new process-capable module: {path}"
