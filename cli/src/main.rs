@@ -7,6 +7,7 @@ mod enrollment;
 mod envelope;
 mod federation;
 mod hooks;
+mod ipc;
 mod json;
 mod lint;
 mod markdown;
