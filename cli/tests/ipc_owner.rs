@@ -178,6 +178,15 @@ mod windows_owner {
         let root = std::env::var("LOAM_IPC_SMOKE_ROOT").unwrap_or_else(|_| "C:\\loam-smoke".into());
         let endpoint = bind(&PathBuf::from(root)).expect("smoke endpoint should bind");
         println!("LOAM_PIPE_NAME={}", endpoint.pipe_name());
+        // The subject of the endpoint's only ACE, so the smoke's denial verdict
+        // can be read against the descriptor that produced it instead of an
+        // assumed one.
+        println!(
+            "LOAM_ENDPOINT_SDDL={}",
+            loam::ipc::windows::security_descriptor_sddl(
+                &loam::ipc::windows::endpoint_sid().expect("the process has a SID")
+            )
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
         // Serve every arriving client until the script is done; a denied client
         // never reaches this loop, because the DACL refuses it at open time.

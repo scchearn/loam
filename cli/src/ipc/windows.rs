@@ -437,8 +437,10 @@ fn logon_sid() -> Result<Option<String>, IpcError> {
 }
 
 /// The SID the endpoint's DACL grants: the logon session when there is one,
-/// otherwise the process user.
-fn endpoint_sid() -> Result<String, IpcError> {
+/// otherwise the process user. Public so a gate can name the subject of the
+/// ACE it is asserting about; it reveals only the calling process's own
+/// identity, which that process can read anyway.
+pub fn endpoint_sid() -> Result<String, IpcError> {
     match logon_sid()? {
         Some(sid) => Ok(sid),
         None => process_user_sid(),

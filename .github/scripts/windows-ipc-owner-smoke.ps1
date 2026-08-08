@@ -55,6 +55,8 @@ try {
     }
   }
   if (-not $pipeName) { Fail "the endpoint fixture never reported its pipe name" }
+  $sddl = Select-String -Path $Log -Pattern "LOAM_ENDPOINT_SDDL=(.+)$" | Select-Object -First 1
+  if ($sddl) { Write-Host ("endpoint dacl: " + $sddl.Matches[0].Groups[1].Value.Trim()) }
   if (-not $pipeName.StartsWith("\\.\pipe\")) { Fail "endpoint name is not local: $pipeName" }
   $short = $pipeName.Substring("\\.\pipe\".Length)
 
