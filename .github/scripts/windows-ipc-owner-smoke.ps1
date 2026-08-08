@@ -14,6 +14,7 @@ $User = "loamsmoke"
 $Password = "L0am-Smoke-" + [guid]::NewGuid().ToString("N").Substring(0, 12) + "!"
 $Root = Join-Path $env:TEMP ("loam-ipc-" + [guid]::NewGuid().ToString("N"))
 $Log = Join-Path $Root "server.log"
+$ErrLog = Join-Path $Root "server.err.log"
 $ChildScript = Join-Path $Root "deny.ps1"
 $ChildOut = Join-Path $Root "deny.out"
 $Server = $null
@@ -36,7 +37,7 @@ try {
   $env:LOAM_IPC_SMOKE_SECONDS = "60"
   $Server = Start-Process -FilePath $exe.FullName `
     -ArgumentList "--ignored", "--nocapture", "--exact", "windows_owner::windows_endpoint_serves_the_alternate_user_smoke" `
-    -RedirectStandardOutput $Log -PassThru -WindowStyle Hidden
+    -RedirectStandardOutput $Log -RedirectStandardError $ErrLog -PassThru -WindowStyle Hidden
 
   $pipeName = $null
   $deadline = (Get-Date).AddSeconds(60)
@@ -53,7 +54,18 @@ try {
 
   # 2. Positive control: the owning session round-trips one frame. Without this
   #    the denial below would prove nothing (a broken pipe also "denies").
-  $client = New-Object System.IO.Pipes.NamedPipeClientStream(".", $short, [System.IO.Pipes.PipeDirection]::InOut)
+  #    The control must open the pipe the way the real client does. .NET's
+  #    three-argument constructor defaults to TokenImpersonationLevel.None,
+  #    which omits SECURITY_SQOS_PRESENT from CreateFile; the server then
+  #    impersonates an anonymous token and the SID proof correctly rejects it.
+  #    `connect` in cli/src/ipc/windows.rs asks for SECURITY_IMPERSONATION, so
+  #    the control asks for the same level.
+  $client = [System.IO.Pipes.NamedPipeClientStream]::new(
+    ".",
+    $short,
+    [System.IO.Pipes.PipeDirection]::InOut,
+    [System.IO.Pipes.PipeOptions]::None,
+    [System.Security.Principal.TokenImpersonationLevel]::Impersonation)
   try {
     $client.Connect(10000)
     $body = [Text.Encoding]::ASCII.GetBytes("ping")
@@ -120,6 +132,12 @@ try {
   if (Test-Path $Log) {
     Write-Host "--- endpoint fixture output ---"
     Get-Content $Log | Write-Host
+  }
+  # Peer rejections are reported on stderr (`reject_peer` names the stage and
+  # the win32 code), so a red run says why the proof failed.
+  if (Test-Path $ErrLog) {
+    Write-Host "--- endpoint fixture stderr ---"
+    Get-Content $ErrLog | Write-Host
   }
   throw
 } finally {
