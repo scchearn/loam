@@ -10,6 +10,7 @@ import { detectHarnesses, installHarnesses } from './harnesses.mjs';
 import { installMarketplacePlugins } from './marketplace.mjs';
 import { migrateLegacyProject } from './migration.mjs';
 import { verifyInstallation } from './verify.mjs';
+import { stageFederationService } from './federation.mjs';
 
 // ponytail: trivial lockfile — no polling, no stale-PID detection.
 // Two concurrent setups on the same HOME is a near-zero event; the second
@@ -103,6 +104,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
     const metadataPath = join(discovery.globalRoot, 'install.json');
     let candidateIntegration;
     let harnessInstall;
+    let federationRollback;
     let activated = false;
     try {
       const skills = await ensureGlobalSkills({
@@ -240,6 +242,24 @@ export async function executeSetup(parsed, discovery, options = {}) {
         errorOutput.write('Final readiness verification failed.\n');
         return 1;
       }
+
+      // Stage the dormant native connector definition + stable identity through
+      // the just-verified private runtime, preserving prior active/inert desired
+      // state across a runtime-path update. Node delegates entirely to the
+      // runtime here — it never renders a definition or calls a manager. Runs
+      // after the runtime is committed and before metadata activation, so its
+      // rollback participates in the same transaction.
+      const federation = await stageFederationService({
+        runtimePath: runtime.path,
+        globalRoot: discovery.globalRoot,
+        runner: options.federationRunner,
+      });
+      if (!federation.ready) {
+        errorOutput.write(`Federation service staging failed: ${federation.detail || federation.category}\n`);
+        return 1;
+      }
+      federationRollback = federation.rollback;
+
       await options.beforeActivate?.({ install, metadataPath, integrationPath });
       await publishJson({ filePath: metadataPath, value: install });
       activated = true;
@@ -248,9 +268,13 @@ export async function executeSetup(parsed, discovery, options = {}) {
     } finally {
       if (!activated) {
         try {
-          await harnessInstall?.rollback?.();
+          await federationRollback?.();
         } finally {
-          if (candidateIntegration) await rm(candidateIntegration.root, { recursive: true, force: true });
+          try {
+            await harnessInstall?.rollback?.();
+          } finally {
+            if (candidateIntegration) await rm(candidateIntegration.root, { recursive: true, force: true });
+          }
         }
       }
     }

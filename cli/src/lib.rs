@@ -1,13 +1,18 @@
 mod check;
 mod checkpoint;
 mod codegraph;
+pub mod connector;
 mod datecheck;
+pub mod enrollment;
 pub mod envelope;
+mod federation;
 mod hooks;
-mod json;
+pub mod ipc;
+pub mod json;
 mod lint;
 mod markdown;
 mod memory;
+mod service;
 mod sha256;
 mod state;
 pub mod transport;
@@ -21,6 +26,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         Some("lint") => lint::run(args),
         Some("checkpoint") => checkpoint::run(args),
         Some("check") => check::run(args),
+        Some("federation") => federation::run(args),
         _ => {
             usage();
             1
