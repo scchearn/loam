@@ -76,6 +76,20 @@ try {
     [System.Security.Principal.TokenImpersonationLevel]::Impersonation)
   try {
     $client.Connect(10000)
+    # Read the descriptor while the connection is live: the server disconnects
+    # the instance as soon as it has answered, and a second open cannot read it
+    # because the single instance is busy. This is the only window there is.
+    try {
+      $live = [System.IO.Pipes.PipesAclExtensions]::GetAccessControl($client)
+      Write-Host ("live endpoint dacl: " + $live.GetSecurityDescriptorSddlForm("Access"))
+    } catch {
+      Write-Host "live endpoint dacl unavailable: $($_.Exception.Message)"
+    }
+    # Control for the probe itself: if this session's own groups show no
+    # S-1-5-5-* either, then the API hides logon SIDs and the child's missing
+    # one proves nothing about sessions.
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    Write-Host ("control groups: " + (($me.Groups | ForEach-Object { $_.Value }) -join ","))
     $body = [Text.Encoding]::ASCII.GetBytes("ping")
     $frame = New-Object byte[] (4 + $body.Length)
     [Array]::Copy([BitConverter]::GetBytes([int]$body.Length), 0, $frame, 0, 4)
@@ -92,16 +106,6 @@ try {
     if ($client.Read($payload, 0, $length) -ne $length) { Fail "same-user control read a short body" }
     $answer = [Text.Encoding]::ASCII.GetString($payload)
     if ($answer -ne "pong") { Fail "same-user control got '$answer', expected 'pong'" }
-    # The descriptor the LIVE pipe carries, read through this open handle. A
-    # second open cannot read it — the single instance is busy — and the string
-    # the server built is only what it intended to apply, not proof of what the
-    # object ended up with.
-    try {
-      $live = [System.IO.Pipes.PipesAclExtensions]::GetAccessControl($client)
-      Write-Host ("live endpoint dacl: " + $live.GetSecurityDescriptorSddlForm("Access"))
-    } catch {
-      Write-Host "live endpoint dacl unavailable: $($_.Exception.Message)"
-    }
   } finally {
     $client.Dispose()
   }
@@ -141,8 +145,12 @@ try {
 try {
   `$stream = New-Object System.IO.Pipes.NamedPipeClientStream('.', '$short', [System.IO.Pipes.PipeDirection]::InOut)
   `$stream.Connect(5000)
+  # Read the descriptor from the handle that should not exist. If this open is
+  # wrong, the object's own DACL is the evidence for why it succeeded.
+  `$sddl = 'unavailable'
+  try { `$sddl = `$stream.GetAccessControl().GetSecurityDescriptorSddlForm('Access') } catch { `$sddl = 'unavailable: ' + `$_.Exception.Message }
   `$stream.Dispose()
-  Set-Content -Path '$ChildOut' -Value "opened as `$who"
+  Set-Content -Path '$ChildOut' -Value "opened as `$who :: dacl `$sddl"
   exit 0
 } catch {
   `$denial = (`$_.Exception -is [System.UnauthorizedAccessException]) -or (`$_.Exception.Message -match 'Access is denied')
