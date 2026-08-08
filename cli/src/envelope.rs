@@ -2277,11 +2277,17 @@ mod tests {
             "datecheck.rs",
             "enrollment.rs",
             "hooks.rs",
+            "ipc/unix.rs",
             "markdown.rs",
             "memory.rs",
             "sha256.rs",
             "state.rs",
         ];
+        // The Slice C owner-authenticated IPC endpoint uses a local Unix domain
+        // socket (`UnixStream`/`UnixListener`) for same-host, same-user IPC — not
+        // network egress. It is admitted here alone; every other module stays
+        // barred, and no TCP/UDP/HTTP surface is ever allowed.
+        let unix_socket_ipc = "ipc/unix.rs";
         for (path, production) in crate_production_sources() {
             for forbidden in [
                 "std::net",
@@ -2293,6 +2299,9 @@ mod tests {
                 "hyper",
                 "curl ",
             ] {
+                if forbidden == "UnixStream" && path == unix_socket_ipc {
+                    continue;
+                }
                 assert!(
                     !production.contains(forbidden),
                     "network surface introduced in {path}: {forbidden}"

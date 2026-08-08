@@ -19,6 +19,10 @@ use std::time::Duration;
 
 use crate::json::Value;
 
+/// The owner-authenticated Unix domain-socket endpoint and peer-credential proof.
+#[cfg(unix)]
+pub mod unix;
+
 /// Protocol version this build speaks.
 pub const PROTOCOL_VERSION: i64 = 1;
 
