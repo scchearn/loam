@@ -21,7 +21,10 @@ test('dry-run package contains the scoped executable and legacy OpenCode entry',
   });
 
   assert.equal(result.status, 0, result.stderr);
-  const packageJson = JSON.parse(result.stdout)[0];
+  // npm <= 11 reports an array of packed packages; npm 12 reports a map keyed
+  // by package name. Accept both so the guard is not npm-version specific.
+  const packed = JSON.parse(result.stdout);
+  const packageJson = Array.isArray(packed) ? packed[0] : Object.values(packed)[0];
   const files = new Set(packageJson.files.map(({ path }) => path));
 
   assert.equal(packageJson.name, '@scchearn/loam');
