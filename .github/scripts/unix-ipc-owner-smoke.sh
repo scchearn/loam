@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Slice C T6/T15 Linux Unix-socket owner smoke.
+# Slice C T6/T15 Unix-socket owner smoke. Runs on Linux and macOS.
 #
 # Proves on a real host what no in-process test can, against the two barriers
 # the Unix endpoint actually has — the same two-barrier shape the Windows gate
@@ -7,9 +7,9 @@
 #
 #   1. The `0700` run directory and `0600` socket refuse a foreign UID at
 #      connect(2). No connection exists, so there is nothing to reject later.
-#   2. The SO_PEERCRED / getpeereid peer proof refuses a peer whose effective
-#      UID differs from the connector's, before the codec reads a byte — even
-#      one that reached the socket.
+#   2. The SO_PEERCRED (Linux) / getpeereid (macOS) peer proof refuses a peer
+#      whose effective UID differs from the connector's, before the codec reads
+#      a byte — even one that reached the socket.
 #
 # Barrier 2 is the one that matters and the one that is easy to leave
 # unproven: with barrier 1 in place a foreign peer never arrives, so the
@@ -19,13 +19,22 @@
 # check itself. That is deliberate and is exactly what the Windows gate does
 # when it reaches the endpoint from a logon session the DACL admits.
 #
+# Both platforms run this one script because the two `peer_euid`
+# implementations are different hand-declared FFI and only the comparison in
+# `verify_peer` is shared. A mis-declared `getpeereid` — wrong out-parameter,
+# wrong argument order, a value landing in the wrong pointer — can yield a
+# correct-looking euid for the owner AND a matching one for a foreigner; a
+# positive control cannot tell those apart, only a real mismatch can. So the
+# assertions must be identical on both, not merely analogous.
+#
 # Verdicts are evidence, never exit codes: each client reports the UID it
 # connected as, and the server reports the stage it rejected at and how many
 # frames it has served. A missing prerequisite is a BLOCKER, not a pass.
 set -euo pipefail
 
 USER_NAME="loamsmoke"
-NONCE="$$-$(date +%s%N)"
+PLATFORM="$(uname)"
+NONCE="$$-$(date +%s)"
 WORK="$(mktemp -d)"                 # owner-only: logs live here, not in the shared dir
 SHARED="/tmp/loam-ipc-shared-${NONCE}"
 ROOT="/tmp/loam-ipc-${NONCE}"
@@ -35,7 +44,48 @@ CLIENT="${SHARED}/client.py"
 SERVER_PID=""
 CREATED=0
 
-fail() { echo "linux ipc owner smoke: $*" >&2; exit 1; }
+fail() { echo "unix ipc owner smoke: $*" >&2; exit 1; }
+
+# The two platform-specific pieces. Everything else below is shared, so both
+# runners assert exactly the same things in exactly the same order.
+mode_of() {
+  if [ "$PLATFORM" = "Darwin" ]; then stat -f '%Lp' "$1"; else stat -c '%a' "$1"; fi
+}
+
+create_account() {
+  if [ "$PLATFORM" = "Darwin" ]; then
+    # No password is set: `sudo -u` does not need one, and not setting one keeps
+    # a credential out of the runner's process table.
+    local next
+    next=$(( $(dscl . -list /Users UniqueID | awk '{print $2}' | sort -n | tail -1) + 1 ))
+    sudo dscl . -create "/Users/${USER_NAME}"
+    sudo dscl . -create "/Users/${USER_NAME}" UserShell /usr/bin/false
+    sudo dscl . -create "/Users/${USER_NAME}" RealName "Loam Smoke"
+    sudo dscl . -create "/Users/${USER_NAME}" UniqueID "$next"
+    sudo dscl . -create "/Users/${USER_NAME}" PrimaryGroupID 20
+    # Directory Services can return before the account is resolvable. This poll
+    # is HARNESS-only — it waits for a usable account, never for a verdict. The
+    # security checks below are single-shot and fail closed.
+    sudo dscacheutil -flushcache 2>/dev/null || true
+    local ready=0 i
+    for i in $(seq 1 60); do
+      if id -u "$USER_NAME" >/dev/null 2>&1; then ready=1; break; fi
+      sleep 0.5
+    done
+    [ "$ready" -eq 1 ] || fail "the temporary account never became resolvable (Directory Services)"
+  else
+    sudo useradd -M -N -s /usr/sbin/nologin "$USER_NAME"
+    id -u "$USER_NAME" >/dev/null 2>&1 || fail "the temporary account was not created"
+  fi
+}
+
+delete_account() {
+  if [ "$PLATFORM" = "Darwin" ]; then
+    sudo dscl . -delete "/Users/${USER_NAME}" 2>/dev/null || true
+  else
+    sudo userdel "$USER_NAME" 2>/dev/null || true
+  fi
+}
 
 cleanup() {
   local status=$?
@@ -48,7 +98,7 @@ cleanup() {
     [ -f "$ERRLOG" ] && cat "$ERRLOG" || true
   fi
   [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
-  [ "$CREATED" -eq 1 ] && sudo userdel "$USER_NAME" 2>/dev/null || true
+  [ "$CREATED" -eq 1 ] && delete_account
   rm -rf "$WORK" "$SHARED" "$ROOT" 2>/dev/null || true
   return $status
 }
@@ -64,8 +114,11 @@ chmod 0777 "$SHARED"
 # 1. Build and launch the endpoint fixture, then learn its socket path.
 cargo +1.94.1 test --locked --test ipc_owner --no-run >/dev/null 2>&1 ||
   fail "building the ipc_owner test binary failed"
-EXE="$(find target/debug/deps -maxdepth 1 -name 'ipc_owner-*' -type f -perm -u+x -printf '%T@ %p\n' |
-  sort -rn | head -1 | cut -d' ' -f2-)"
+EXE=""
+for candidate in $(ls -t target/debug/deps/ipc_owner-* 2>/dev/null); do
+  case "$candidate" in *.d | *.dSYM) continue ;; esac
+  if [ -f "$candidate" ] && [ -x "$candidate" ]; then EXE="$candidate"; break; fi
+done
 [ -n "$EXE" ] || fail "no ipc_owner test binary was produced"
 
 LOAM_IPC_SMOKE_ROOT="$ROOT" LOAM_IPC_SMOKE_SECONDS=300 \
@@ -82,10 +135,11 @@ done
 [ -n "$SOCKET" ] || fail "the endpoint fixture never reported its socket path"
 OWNER_UID="$(sed -n 's/^LOAM_OWNER_UID=//p' "$LOG" | head -1)"
 [ -n "$OWNER_UID" ] || fail "the endpoint fixture never reported its owning uid"
+echo "platform: $PLATFORM"
 echo "endpoint socket: $SOCKET (owner uid $OWNER_UID)"
-echo "endpoint modes: $(stat -c '%a %U' "$ROOT") dir, $(stat -c '%a %U' "$SOCKET") socket"
-[ "$(stat -c '%a' "$ROOT")" = "700" ] || fail "the run directory is not 0700"
-[ "$(stat -c '%a' "$SOCKET")" = "600" ] || fail "the socket is not 0600"
+echo "endpoint modes: $(mode_of "$ROOT") dir, $(mode_of "$SOCKET") socket"
+[ "$(mode_of "$ROOT")" = "700" ] || fail "the run directory is not 0700"
+[ "$(mode_of "$SOCKET")" = "600" ] || fail "the socket is not 0600"
 
 served_frames() { sed -n 's/^LOAM_SERVED_FRAMES=//p' "$LOG" | tail -1; }
 
@@ -166,7 +220,7 @@ esac
 for _ in $(seq 1 50); do [ "$(served_frames)" = "1" ] && break; sleep 0.2; done
 [ "$(served_frames)" = "1" ] || fail "the endpoint did not record serving the owner's frame"
 
-sudo useradd -M -N -s /usr/sbin/nologin "$USER_NAME"
+create_account
 CREATED=1
 PEER_UID="$(id -u "$USER_NAME")"
 [ "$PEER_UID" != "$OWNER_UID" ] || fail "the temporary account shares the connector's uid"
@@ -190,7 +244,7 @@ esac
 #    the credential proof must stand on its own, without the filesystem's help.
 chmod 0711 "$ROOT"
 chmod 0666 "$SOCKET"
-echo "relaxed for barrier 2: $(stat -c '%a' "$ROOT") dir, $(stat -c '%a' "$SOCKET") socket"
+echo "relaxed for barrier 2: $(mode_of "$ROOT") dir, $(mode_of "$SOCKET") socket"
 before="$(served_frames)"
 sudo -u "$USER_NAME" python3 "$CLIENT" "$SOCKET" "${SHARED}/barrier2.out" || true
 verdict="$(read_verdict "${SHARED}/barrier2.out" 30)" || fail "the barrier-2 client left no verdict"
@@ -234,4 +288,4 @@ case "$verdict" in
   *) fail "the endpoint stopped serving its owner after a denial: $verdict" ;;
 esac
 
-echo "linux ipc owner smoke OK"
+echo "unix ipc owner smoke OK ($PLATFORM)"

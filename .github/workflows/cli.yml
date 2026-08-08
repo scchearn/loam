@@ -113,15 +113,25 @@ jobs:
   # path-safety rules; this job adds the one thing they cannot do — a real second
   # account being refused, first by the 0700 directory and then, once the owner
   # relaxes the path so the peer can actually reach the socket, by the
-  # SO_PEERCRED credential proof itself, before the parser runs.
-  linux-ipc-owner:
-    runs-on: ubuntu-22.04
+  # SO_PEERCRED/getpeereid credential proof itself, before the parser runs.
+  #
+  # Both platforms run because `peer_euid` is two different hand-declared FFI
+  # implementations and only the comparison is shared: a mis-declared
+  # `getpeereid` could return a false-matching euid that the macOS positive
+  # control cannot distinguish from a correct one. One script, so the two
+  # runners assert identically rather than merely analogously.
+  unix-ipc-owner:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         run: rustup toolchain install 1.94.1 --profile minimal
       - name: Unix socket owner smoke (cross-user denial)
-        run: bash .github/scripts/linux-ipc-owner-smoke.sh
+        run: bash .github/scripts/unix-ipc-owner-smoke.sh
 
   dist-plan:
     runs-on: ubuntu-22.04
