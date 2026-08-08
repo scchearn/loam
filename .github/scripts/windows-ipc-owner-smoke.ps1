@@ -238,12 +238,45 @@ try {
   # 4. Second logon session. A Task Scheduler batch logon carries its own logon
   #    SID, so the DACL must refuse it at open — no handle, no frame, nothing to
   #    reject later.
+  #
+  # A brand-new local account holds no SeBatchLogonRight, so schtasks registers
+  # the task and then it silently never runs. Grant the right first, through the
+  # in-box policy tool: export the current user-rights area, append this
+  # account's SID to SeBatchLogonRight, and apply. The account is deleted at the
+  # end of the run, and the runner is ephemeral, so the grant does not outlive
+  # the smoke.
+  $secCfg = Join-Path $Root "user-rights.inf"
+  $secDb = Join-Path $Root "user-rights.sdb"
+  & secedit /export /cfg $secCfg /areas USER_RIGHTS | Out-Null
+  if ($LASTEXITCODE -ne 0) { Fail "exporting the user-rights policy exited $LASTEXITCODE" }
+  $userSid = (New-Object System.Security.Principal.NTAccount($User)).Translate(
+    [System.Security.Principal.SecurityIdentifier]).Value
+  $granted = $false
+  $policy = @(foreach ($line in (Get-Content $secCfg)) {
+    if ($line -match '^SeBatchLogonRight\s*=') { $granted = $true; "$line,*$userSid" } else { $line }
+  })
+  if (-not $granted) {
+    $policy = @(foreach ($line in $policy) {
+      $line
+      if ($line -match '^\[Privilege Rights\]') { "SeBatchLogonRight = *$userSid" }
+    })
+  }
+  Set-Content -Path $secCfg -Value $policy -Encoding Unicode
+  & secedit /configure /db $secDb /cfg $secCfg /areas USER_RIGHTS | Out-Null
+  if ($LASTEXITCODE -ne 0) { Fail "granting $User SeBatchLogonRight exited $LASTEXITCODE" }
+
   # The arguments are baked into a wrapper rather than spelled out in /tr, which
   # schtasks caps at 261 characters.
   "& '$ChildScript' -PipeName '$short' -Out '$BatchOut'" | Set-Content -Path $TaskScript -Encoding ASCII
   $command = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $TaskScript"
-  & schtasks /create /tn $Task /tr $command /sc once /st 23:59 /ru $User /rp $Password /f | Out-Null
+  $created = & schtasks /create /tn $Task /tr $command /sc once /st 23:59 /ru $User /rp $Password /f 2>&1
   if ($LASTEXITCODE -ne 0) { Fail "registering the batch-logon task exited $LASTEXITCODE" }
+  # schtasks reports a missing batch-logon right as a warning on a zero exit and
+  # then the task never starts. Turn that into an immediate, precise failure
+  # instead of an unexplained missing verdict ninety seconds later.
+  if ($created -match "Batch logon privilege") {
+    Fail "the batch-logon right did not take: $($created -join ' ')"
+  }
   $Scheduled = $true
   & schtasks /run /tn $Task | Out-Null
   if ($LASTEXITCODE -ne 0) { Fail "starting the batch-logon task exited $LASTEXITCODE" }
