@@ -92,6 +92,16 @@ try {
     if ($client.Read($payload, 0, $length) -ne $length) { Fail "same-user control read a short body" }
     $answer = [Text.Encoding]::ASCII.GetString($payload)
     if ($answer -ne "pong") { Fail "same-user control got '$answer', expected 'pong'" }
+    # The descriptor the LIVE pipe carries, read through this open handle. A
+    # second open cannot read it — the single instance is busy — and the string
+    # the server built is only what it intended to apply, not proof of what the
+    # object ended up with.
+    try {
+      $live = [System.IO.Pipes.PipesAclExtensions]::GetAccessControl($client)
+      Write-Host ("live endpoint dacl: " + $live.GetSecurityDescriptorSddlForm("Access"))
+    } catch {
+      Write-Host "live endpoint dacl unavailable: $($_.Exception.Message)"
+    }
   } finally {
     $client.Dispose()
   }
@@ -126,8 +136,8 @@ try {
 # child actually landed in, so 'a second user opened it' can be told apart from
 # 'a second user in the same logon session opened it' — only the first is a
 # failure of the descriptor.
-`$logon = (`$id.Groups | Where-Object { `$_.Value -like 'S-1-5-5-*' } | Select-Object -First 1).Value
-`$who = `$id.Name + ' (' + `$id.User.Value + ', logon ' + `$logon + ')'
+`$groups = ((`$id.Groups | ForEach-Object { `$_.Value }) -join ',')
+`$who = `$id.Name + ' (' + `$id.User.Value + ', groups ' + `$groups + ')'
 try {
   `$stream = New-Object System.IO.Pipes.NamedPipeClientStream('.', '$short', [System.IO.Pipes.PipeDirection]::InOut)
   `$stream.Connect(5000)
