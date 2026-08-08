@@ -122,7 +122,12 @@ try {
   @"
 `$ErrorActionPreference = 'Stop'
 `$id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-`$who = `$id.Name + ' (' + `$id.User.Value + ')'
+# The endpoint's ACE names a logon SESSION, not a user. Report the session this
+# child actually landed in, so 'a second user opened it' can be told apart from
+# 'a second user in the same logon session opened it' — only the first is a
+# failure of the descriptor.
+`$logon = (`$id.Groups | Where-Object { `$_.Value -like 'S-1-5-5-*' } | Select-Object -First 1).Value
+`$who = `$id.Name + ' (' + `$id.User.Value + ', logon ' + `$logon + ')'
 try {
   `$stream = New-Object System.IO.Pipes.NamedPipeClientStream('.', '$short', [System.IO.Pipes.PipeDirection]::InOut)
   `$stream.Connect(5000)
