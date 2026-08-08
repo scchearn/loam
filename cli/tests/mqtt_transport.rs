@@ -314,18 +314,85 @@ fn isolation() {
     mtls.receive(&revoked_topic, Duration::from_secs(3))
         .expect("revoked-origin retained value must exist before revocation");
 
+    // Baseline positive control while actor A is still connected: it writes to
+    // its own origin and receives a live message an authorized peer publishes
+    // into its subscribed project scope.
+    let live_probe = format!("{project_a}/state/instance-02/live-access");
+    assert_publish_accepted(
+        actor_a
+            .publish(
+                format!("{project_a}/state/instance-01/pre-revoke-live"),
+                b"authorized-before-revocation",
+                false,
+                None,
+            )
+            .expect("actor A should still write to its own origin before revocation"),
+    );
+    assert_publish_accepted(
+        mtls.publish(&live_probe, b"pre-revoke-sentinel", false, None)
+            .expect("mTLS control should publish the pre-revocation live sentinel"),
+    );
+    assert_eq!(
+        actor_a
+            .receive(&live_probe, Duration::from_secs(3))
+            .expect("actor A should receive live project state before revocation")
+            .payload
+            .as_ref(),
+        b"pre-revoke-sentinel"
+    );
+
     let mut git = GitOracleFixture::provision();
     let git_before = git.snapshot();
-    drop(actor_a);
     drop(actor_b);
     drop(actor_c);
-    drop(mtls);
     drop(broker_oversize);
+
+    // Revoke actor A on its already-connected session without a broker restart:
+    // strip its ACL grants and delete its password, then apply the change in
+    // place with a SIGHUP reload. The reload severs actor A's live session but
+    // leaves every other connection up.
     broker
-        .revoke_password("actor-a")
-        .expect("broker credential should be revoked independently");
+        .revoke_live("actor-a")
+        .expect("broker credential should be revoked live without a restart");
     assert_eq!(git.snapshot(), git_before);
     assert!(git.peer_has_object(git.base_oid()));
+
+    // Live-session loss: an operation on the connection that was demonstrably
+    // working moments earlier now fails because the broker dropped the revoked
+    // session in place. The same publish succeeded before revocation, so the
+    // failure is genuine live loss rather than a never-authorized origin.
+    let severed = actor_a.publish(
+        format!("{project_a}/state/instance-01/post-revoke-live"),
+        b"denied-after-revocation",
+        true,
+        None,
+    );
+    assert!(
+        severed.is_err(),
+        "revoked live session unexpectedly kept publishing: {severed:?}"
+    );
+
+    // Positive control proving this was a live selective revocation and not a
+    // broker restart: the unrevoked mTLS session stays connected and keeps full
+    // publish/subscribe access on the same broker instance.
+    let survivor_probe = format!("{project_a}/state/instance-02/survivor");
+    assert_publish_accepted(
+        mtls.publish(&survivor_probe, b"survivor-sentinel", false, None)
+            .expect("unrevoked mTLS session must survive the live revocation"),
+    );
+    assert_eq!(
+        mtls.receive(&survivor_probe, Duration::from_secs(3))
+            .expect("surviving mTLS session must still receive live project state")
+            .payload
+            .as_ref(),
+        b"survivor-sentinel"
+    );
+
+    drop(actor_a);
+    drop(mtls);
+
+    // The now-deleted credential cannot open a fresh session, and anonymous
+    // access stays refused.
     let revoked = match TestClient::password(&broker, "isolation-revoked") {
         Ok(_) => panic!("revoked credential reconnected"),
         Err(error) => error,

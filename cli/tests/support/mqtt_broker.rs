@@ -211,7 +211,25 @@ impl BrokerFixture {
         self.start()
     }
 
-    pub fn revoke_password(&mut self, username: &str) -> Result<(), String> {
+    /// Reload the broker's password and ACL files in place via SIGHUP, without
+    /// restarting the process or tearing down any live connection.
+    pub fn reload(&mut self) -> Result<(), String> {
+        let signalled = {
+            let child = self
+                .child
+                .as_mut()
+                .ok_or_else(|| "broker process is not running".to_owned())?;
+            self.backend.reload(child)
+        };
+        signalled?;
+        self.wait_for_log("Reloading config")
+    }
+
+    /// Revoke a credential's authorization on an already-connected session
+    /// without a broker restart: strip the user's ACL grants, delete its
+    /// password entry, then SIGHUP-reload so the live session loses access in
+    /// place while every other connection stays up.
+    pub fn revoke_live(&mut self, username: &str) -> Result<(), String> {
         if username.is_empty()
             || username.starts_with('-')
             || !username
@@ -220,9 +238,20 @@ impl BrokerFixture {
         {
             return Err("credential username is invalid".to_owned());
         }
-        self.stop()?;
+        let acl_path = self.root.join("acl");
+        let current = fs::read_to_string(&acl_path)
+            .map_err(|error| format!("read broker ACL for revocation: {error}"))?;
+        let filtered = strip_acl_user(&current, username);
+        if filtered == current {
+            return Err(format!(
+                "ACL contained no `user {username}` block to revoke"
+            ));
+        }
+        fs::write(&acl_path, filtered)
+            .map_err(|error| format!("write revoked broker ACL: {error}"))?;
+        set_private_permissions(&acl_path, false)?;
         self.backend.delete_password_entry(&self.root, username)?;
-        self.start()
+        self.reload()
     }
 
     pub fn finish(mut self) -> Result<(), String> {
@@ -386,6 +415,27 @@ impl Backend {
         }
     }
 
+    fn reload(&self, child: &mut Child) -> Result<(), String> {
+        match self {
+            Self::Native { .. } => signal_native(child, "HUP"),
+            Self::Docker {
+                docker, container, ..
+            } => {
+                let output = Command::new(docker)
+                    .arg("kill")
+                    .arg("--signal=HUP")
+                    .arg(container)
+                    .output()
+                    .map_err(|error| format!("signal Mosquitto Docker container: {error}"))?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(format_output("signal Mosquitto Docker container", &output))
+                }
+            }
+        }
+    }
+
     fn spawn(&self, root: &Path, stdout: File, stderr: File) -> Result<Child, String> {
         let config = root.join("mosquitto.conf");
         let mut command = match self {
@@ -463,6 +513,30 @@ impl Backend {
             .map_err(|error| format!("wait for Mosquitto process: {error}"))?;
         Ok(())
     }
+}
+
+/// Remove the `user <username>` paragraph (its header and following topic
+/// lines up to the next blank line) from a Mosquitto ACL file, leaving every
+/// other user's grants intact. Returns the input unchanged if no such block
+/// exists so the caller can detect a no-op revocation.
+fn strip_acl_user(acl: &str, username: &str) -> String {
+    let header = format!("user {username}");
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in acl.lines() {
+        if !skipping && line.trim() == header {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            // A blank line ends this user's block; drop it and resume copying.
+            skipping = !line.trim().is_empty();
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 fn write_certificates(openssl: &Path, root: &Path) -> Result<(), String> {
@@ -693,6 +767,25 @@ fn set_private_permissions(_path: &Path, _directory: bool) -> Result<(), String>
 }
 
 #[cfg(unix)]
+fn signal_native(child: &Child, signal: &str) -> Result<(), String> {
+    let output = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(child.id().to_string())
+        .output()
+        .map_err(|error| format!("signal Mosquitto process: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format_output("signal Mosquitto process", &output))
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_native(_child: &Child, _signal: &str) -> Result<(), String> {
+    Err("SIGHUP reload of a native broker is only supported on Unix".to_owned())
+}
+
+#[cfg(unix)]
 fn terminate_native(child: &mut Child) -> Result<(), String> {
     let output = Command::new("kill")
         .arg("-TERM")
@@ -732,4 +825,24 @@ fn numeric_user() -> Option<String> {
 #[cfg(not(unix))]
 fn numeric_user() -> Option<String> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_acl_user;
+
+    #[test]
+    fn strip_acl_user_removes_only_the_named_block() {
+        let acl = "user actor-a\ntopic write a/#\ntopic read a/#\n\nuser mtls-actor\ntopic read a/#\n\nuser actor-b\ntopic read b/#\n";
+        let stripped = strip_acl_user(acl, "actor-a");
+        assert!(!stripped.contains("user actor-a"));
+        assert!(!stripped.contains("write a/#"));
+        assert!(stripped.contains("user mtls-actor"));
+        assert!(stripped.contains("user actor-b"));
+        assert!(stripped.contains("read b/#"));
+        // A username that is a prefix of another must not match.
+        assert_eq!(strip_acl_user(acl, "actor"), acl);
+        // A missing user is a detectable no-op.
+        assert_eq!(strip_acl_user(acl, "ghost"), acl);
+    }
 }
