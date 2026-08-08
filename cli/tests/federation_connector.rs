@@ -19,6 +19,7 @@ fn binary() -> PathBuf {
     path.join(if cfg!(windows) { "loam.exe" } else { "loam" })
 }
 
+#[cfg(unix)]
 fn temp_root(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "loam-connector-{label}-{}",

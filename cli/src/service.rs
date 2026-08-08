@@ -277,11 +277,10 @@ fn install_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
 }
 
 #[cfg(target_os = "macos")]
-fn uninstall_commands(ctx: &ServiceContext) -> Vec<ManagerCommand> {
-    let label = SERVICE_LABEL;
+fn uninstall_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
     vec![ManagerCommand::new(
         "launchctl",
-        &["bootout", &format!("gui/$(id -u)/{label}")],
+        &["bootout", &format!("gui/$(id -u)/{SERVICE_LABEL}")],
     )]
 }
 
