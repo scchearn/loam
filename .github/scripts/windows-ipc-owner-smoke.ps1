@@ -15,14 +15,20 @@ $Password = "L0am-Smoke-" + [guid]::NewGuid().ToString("N").Substring(0, 12) + "
 $Root = Join-Path $env:TEMP ("loam-ipc-" + [guid]::NewGuid().ToString("N"))
 $Log = Join-Path $Root "server.log"
 $ErrLog = Join-Path $Root "server.err.log"
-$ChildScript = Join-Path $Root "deny.ps1"
-$ChildOut = Join-Path $Root "deny.out"
+# The alternate user cannot reach our profile's TEMP — the path is not even
+# traversable for it — so everything the second logon session has to read or
+# write lives under the all-users public root instead, with an explicit grant
+# added once the account exists.
+$Shared = Join-Path $env:PUBLIC ("loam-ipc-" + [guid]::NewGuid().ToString("N"))
+$ChildScript = Join-Path $Shared "deny.ps1"
+$ChildOut = Join-Path $Shared "deny.out"
 $Server = $null
 $Created = $false
 
 function Fail([string]$message) { throw "windows ipc owner smoke: $message" }
 
 New-Item -ItemType Directory -Path $Root | Out-Null
+New-Item -ItemType Directory -Path $Shared | Out-Null
 try {
   # 1. Build and launch the endpoint fixture, then learn its pipe name.
   & cargo +1.94.1 test --locked --test ipc_owner --no-run 2>&1 | Out-Null
@@ -93,6 +99,10 @@ try {
   New-LocalUser -Name $User -Password (ConvertTo-SecureString $Password -AsPlainText -Force) `
     -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword | Out-Null
   $Created = $true
+  # The account only ever touches this one directory; the endpoint stays
+  # protected by its own DACL, which is the thing under test.
+  & icacls $Shared /grant "${User}:(OI)(CI)(F)" | Out-Null
+  if ($LASTEXITCODE -ne 0) { Fail "granting $User access to the shared directory exited $LASTEXITCODE" }
 
   @"
 `$ErrorActionPreference = 'Stop'
@@ -115,7 +125,7 @@ try {
     $User, (ConvertTo-SecureString $Password -AsPlainText -Force))
   $denied = Start-Process -FilePath "powershell.exe" -Credential $credential `
     -ArgumentList "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $ChildScript `
-    -WorkingDirectory $env:TEMP -PassThru -Wait
+    -WorkingDirectory $Shared -PassThru -Wait
   switch ($denied.ExitCode) {
     3 { Write-Host "alternate-user denial OK (access denied at pipe open)" }
     0 { Fail "another user opened the connector endpoint" }
@@ -144,4 +154,5 @@ try {
   if ($Server -and -not $Server.HasExited) { Stop-Process -Id $Server.Id -Force -ErrorAction SilentlyContinue }
   if ($Created) { Remove-LocalUser -Name $User -ErrorAction SilentlyContinue }
   Remove-Item -Recurse -Force $Root -ErrorAction SilentlyContinue
+  Remove-Item -Recurse -Force $Shared -ErrorAction SilentlyContinue
 }
