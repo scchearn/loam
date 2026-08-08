@@ -181,8 +181,10 @@ pub fn render_launchagent_plist(ctx: &ServiceContext) -> Result<String, ServiceE
     ))
 }
 
-/// The Windows Task Scheduler command set for a disabled current-user logon task
-/// running with least privilege. Rendered as argv for `schtasks.exe`.
+/// The Windows Task Scheduler create command for a current-user logon task
+/// running with least privilege. `schtasks /Create` has no disable flag, so the
+/// task is disabled by a separate `/Change` step (see
+/// [`task_scheduler_disable_command`]). Rendered as argv for `schtasks.exe`.
 pub fn task_scheduler_create_command(ctx: &ServiceContext) -> Result<ManagerCommand, ServiceError> {
     let runtime = absolute_utf8(&ctx.runtime_path)?;
     let root = absolute_utf8(&ctx.global_root)?;
@@ -201,10 +203,22 @@ pub fn task_scheduler_create_command(ctx: &ServiceContext) -> Result<ManagerComm
             "/RL".into(),
             "LIMITED".into(),
             "/F".into(),
-            // Created disabled; enabled only after first enrollment.
-            "/DISABLE".into(),
         ],
     })
+}
+
+/// Disable the created task so it stays dormant until first enrollment.
+/// `/Change /DISABLE` is the valid way — `/Create` has no disable flag.
+pub fn task_scheduler_disable_command(ctx: &ServiceContext) -> ManagerCommand {
+    ManagerCommand {
+        program: "schtasks".into(),
+        args: vec![
+            "/Change".into(),
+            "/TN".into(),
+            task_name(&ctx.instance_id),
+            "/DISABLE".into(),
+        ],
+    }
 }
 
 fn task_name(instance_id: &str) -> String {
@@ -294,9 +308,12 @@ fn status_command(_ctx: &ServiceContext) -> ManagerCommand {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn install_commands(ctx: &ServiceContext) -> Vec<ManagerCommand> {
-    // schtasks /Create /DISABLE — best-effort content unit-tested cross-platform.
-    vec![task_scheduler_create_command(ctx)
-        .unwrap_or_else(|_| ManagerCommand::new("schtasks", &["/Query"]))]
+    // Create the logon task, then disable it (schtasks /Create has no disable
+    // flag). Both commands are unit-tested cross-platform.
+    match task_scheduler_create_command(ctx) {
+        Ok(create) => vec![create, task_scheduler_disable_command(ctx)],
+        Err(_) => vec![ManagerCommand::new("schtasks", &["/Query"])],
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -460,12 +477,22 @@ mod tests {
     }
 
     #[test]
-    fn task_scheduler_create_is_disabled_least_privilege_logon() {
-        let command = task_scheduler_create_command(&ctx("schtasks")).unwrap();
-        assert_eq!(command.program, "schtasks");
-        assert!(command.args.contains(&"/DISABLE".to_owned()));
-        assert!(command.args.contains(&"LIMITED".to_owned()));
-        assert!(command.args.contains(&"ONLOGON".to_owned()));
+    fn task_scheduler_create_is_least_privilege_logon_without_invalid_disable_flag() {
+        let create = task_scheduler_create_command(&ctx("schtasks")).unwrap();
+        assert_eq!(create.program, "schtasks");
+        assert!(create.args.contains(&"/Create".to_owned()));
+        assert!(create.args.contains(&"LIMITED".to_owned()));
+        assert!(create.args.contains(&"ONLOGON".to_owned()));
+        // /Create has no /DISABLE flag — disabling is a separate /Change.
+        assert!(!create.args.contains(&"/DISABLE".to_owned()));
+    }
+
+    #[test]
+    fn task_scheduler_disable_uses_change() {
+        let disable = task_scheduler_disable_command(&ctx("schtasks"));
+        assert_eq!(disable.program, "schtasks");
+        assert!(disable.args.contains(&"/Change".to_owned()));
+        assert!(disable.args.contains(&"/DISABLE".to_owned()));
     }
 
     #[test]
