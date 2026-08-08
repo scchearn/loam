@@ -1,0 +1,53 @@
+{
+  "_comment": "Golden valid Slice C enrollment descriptor plus a rejection corpus. The valid object is the positive control; each rejection names the exact EnrollmentError variant the case must produce. Loaded by cli/src/enrollment.rs in-module tests. No secret material appears here: credential_ref/ca_ref are opaque references, never credentials.",
+  "valid": {
+    "schema": 1,
+    "org_id": "acme",
+    "project_id": "loam",
+    "repository_id": "loam-runtime",
+    "broker": {
+      "profile": "acme-prod",
+      "endpoint": "mqtts://broker.acme.example:8883",
+      "tls_server_name": "broker.acme.example",
+      "credential_ref": "vault://acme/loam/mqtt-client",
+      "ca_ref": "vault://acme/loam/org-ca"
+    },
+    "git": {
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "remotes": [
+        { "name": "origin", "refs": ["refs/heads/main", "refs/heads/federation"] }
+      ]
+    }
+  },
+  "valid_sha256_commit": {
+    "schema": 1,
+    "org_id": "acme",
+    "project_id": "loam",
+    "repository_id": "loam-runtime",
+    "broker": {
+      "profile": "acme-prod",
+      "endpoint": "mqtts://broker.acme.example:8883",
+      "tls_server_name": "broker.acme.example",
+      "credential_ref": "vault://acme/loam/mqtt-client"
+    },
+    "git": {
+      "commit": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "remotes": [{ "name": "origin", "refs": ["refs/heads/main"] }]
+    }
+  },
+  "rejections": {
+    "unknown_field": "an extra top-level key such as \"note\" is UnknownField",
+    "duplicate_field": "two \"org_id\" keys is DuplicateField",
+    "wrong_schema": "schema != 1 is UnsupportedSchema",
+    "secret_shaped_field": "any key matching password/token/secret/private_key/principal_id/source/agent_id/instance_id is ForbiddenField",
+    "plaintext_endpoint": "mqtt:// (not mqtts://) is InvalidEndpoint",
+    "endpoint_userinfo": "mqtts://user:pass@host is InvalidEndpoint",
+    "endpoint_query_fragment": "mqtts://host?x=1 or #frag is InvalidEndpoint",
+    "bad_commit": "commit not 40/64 lowercase hex is InvalidCommit",
+    "too_many_remotes": "more than 8 remotes is TooManyRemotes",
+    "too_many_refs": "more than 32 refs on a remote is TooManyRefs",
+    "non_full_ref": "a ref not starting with refs/ is InvalidRef",
+    "empty_id": "an empty or control-character org/project/repository id is InvalidField",
+    "credential_bearing_remote": "a resolved remote URL carrying userinfo is CredentialBearingRemote"
+  }
+}

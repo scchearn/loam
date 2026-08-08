@@ -2258,12 +2258,24 @@ mod tests {
         );
 
         assert_eq!(observer.attempts.get(), 0);
-        let process_files = ["checkpoint.rs", "codegraph.rs", "main.rs", "state.rs"];
+        // `enrollment.rs` is admitted to both capability allowlists for Slice C:
+        // the approved connector spec authorizes git subprocess use (the isolated
+        // commit-reachability fetch in a temporary bare repo) and filesystem use
+        // (canonicalizing the physical workspace and the temp repo). The guard
+        // stays live for every other module.
+        let process_files = [
+            "checkpoint.rs",
+            "codegraph.rs",
+            "enrollment.rs",
+            "main.rs",
+            "state.rs",
+        ];
         let filesystem_files = [
             "check.rs",
             "checkpoint.rs",
             "codegraph.rs",
             "datecheck.rs",
+            "enrollment.rs",
             "hooks.rs",
             "markdown.rs",
             "memory.rs",

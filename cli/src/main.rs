@@ -2,7 +2,9 @@ mod check;
 mod checkpoint;
 mod codegraph;
 mod datecheck;
+mod enrollment;
 mod envelope;
+mod federation;
 mod hooks;
 mod json;
 mod lint;
@@ -27,6 +29,7 @@ fn run(mut args: impl Iterator<Item = String>) -> i32 {
         Some("lint") => lint::run(args),
         Some("checkpoint") => checkpoint::run(args),
         Some("check") => check::run(args),
+        Some("federation") => federation::run(args),
         _ => {
             usage();
             1
