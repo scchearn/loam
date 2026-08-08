@@ -1,0 +1,11 @@
+[
+  {"name": "active_lease_current", "expected": "current"},
+  {"name": "renewal_interval_elapsed", "expected": "renewal_due"},
+  {"name": "expired_within_skew", "expected": "current"},
+  {"name": "expired_beyond_skew", "expected": "stale_interrupted"},
+  {"name": "origin_tombstone", "expected": "removed"},
+  {"name": "cross_origin_tombstone", "expected": "origin_not_authorized"},
+  {"name": "clean_restart", "expected": "clean"},
+  {"name": "dirty_restart", "expected": "dirty"},
+  {"name": "degraded_restart", "expected": "degraded"}
+]
