@@ -1,9 +1,20 @@
 # Slice C T7 Windows named-pipe owner smoke.
 #
-# Proves on a real Windows host what no in-process test can: a second local
-# user, in its own logon session, cannot open the connector's endpoint, while
-# the owning session round-trips a frame through it. The denial comes from the
-# pipe's protected DACL, so it happens at open time — before any frame byte.
+# Proves on a real Windows host what no in-process test can, against the two
+# barriers the endpoint actually has:
+#
+#   1. The pipe's protected DACL grants one logon SESSION. A peer in a different
+#      logon session is refused at open time, before a handle exists.
+#   2. The client-token SID proof grants one USER. A peer that shares the logon
+#      session opens the handle and is then refused before the codec reads a
+#      byte, so it is never served.
+#
+# Both are exercised with the same second local account, because the difference
+# between them is the logon session, not the user: `Start-Process -Credential`
+# copies the caller's logon SID into the new token (that is how a runas'd
+# process reaches the caller's desktop), while a Task Scheduler batch logon
+# carries its own. Asserting "another user is denied at open" would be asserting
+# something the descriptor does not say.
 #
 # Requires administrator rights to create and remove the temporary local user
 # (the hosted windows runner has them). A missing prerequisite is a BLOCKER, not
@@ -20,12 +31,27 @@ $ErrLog = Join-Path $Root "server.err.log"
 # write lives under the all-users public root instead, with an explicit grant
 # added once the account exists.
 $Shared = Join-Path $env:PUBLIC ("loam-ipc-" + [guid]::NewGuid().ToString("N"))
-$ChildScript = Join-Path $Shared "deny.ps1"
-$ChildOut = Join-Path $Shared "deny.out"
+$ChildScript = Join-Path $Shared "client.ps1"
+$SessionOut = Join-Path $Shared "same-session.out"
+$BatchOut = Join-Path $Shared "batch-session.out"
+$Task = "loam-ipc-owner-smoke"
 $Server = $null
 $Created = $false
+$Scheduled = $false
 
 function Fail([string]$message) { throw "windows ipc owner smoke: $message" }
+
+function Read-Verdict([string]$path, [int]$seconds) {
+  $deadline = (Get-Date).AddSeconds($seconds)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-Path $path) {
+      $text = (Get-Content $path -Raw).Trim()
+      if ($text) { return $text }
+    }
+    Start-Sleep -Milliseconds 250
+  }
+  return ""
+}
 
 New-Item -ItemType Directory -Path $Root | Out-Null
 New-Item -ItemType Directory -Path $Shared | Out-Null
@@ -40,7 +66,7 @@ try {
   if (-not $exe) { Fail "no ipc_owner test binary was produced" }
 
   $env:LOAM_IPC_SMOKE_ROOT = $Root
-  $env:LOAM_IPC_SMOKE_SECONDS = "60"
+  $env:LOAM_IPC_SMOKE_SECONDS = "300"
   $Server = Start-Process -FilePath $exe.FullName `
     -ArgumentList "--ignored", "--nocapture", "--exact", "windows_owner::windows_endpoint_serves_the_alternate_user_smoke" `
     -RedirectStandardOutput $Log -RedirectStandardError $ErrLog -PassThru -WindowStyle Hidden
@@ -55,13 +81,13 @@ try {
     }
   }
   if (-not $pipeName) { Fail "the endpoint fixture never reported its pipe name" }
-  $sddl = Select-String -Path $Log -Pattern "LOAM_ENDPOINT_SDDL=(.+)$" | Select-Object -First 1
-  if ($sddl) { Write-Host ("endpoint dacl: " + $sddl.Matches[0].Groups[1].Value.Trim()) }
   if (-not $pipeName.StartsWith("\\.\pipe\")) { Fail "endpoint name is not local: $pipeName" }
   $short = $pipeName.Substring("\\.\pipe\".Length)
+  $sddl = Select-String -Path $Log -Pattern "LOAM_ENDPOINT_SDDL=(.+)$" | Select-Object -First 1
+  if ($sddl) { Write-Host ("endpoint dacl: " + $sddl.Matches[0].Groups[1].Value.Trim()) }
 
   # 2. Positive control: the owning session round-trips one frame. Without this
-  #    the denial below would prove nothing (a broken pipe also "denies").
+  #    every denial below would prove nothing (a broken pipe also "denies").
   #    The control must open the pipe the way the real client does. .NET's
   #    three-argument constructor defaults to TokenImpersonationLevel.None,
   #    which omits SECURITY_SQOS_PRESENT from CreateFile; the server then
@@ -85,11 +111,6 @@ try {
     } catch {
       Write-Host "live endpoint dacl unavailable: $($_.Exception.Message)"
     }
-    # Control for the probe itself: if this session's own groups show no
-    # S-1-5-5-* either, then the API hides logon SIDs and the child's missing
-    # one proves nothing about sessions.
-    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    Write-Host ("control groups: " + (($me.Groups | ForEach-Object { $_.Value }) -join ","))
     $body = [Text.Encoding]::ASCII.GetBytes("ping")
     $frame = New-Object byte[] (4 + $body.Length)
     [Array]::Copy([BitConverter]::GetBytes([int]$body.Length), 0, $frame, 0, 4)
@@ -109,16 +130,58 @@ try {
   } finally {
     $client.Dispose()
   }
-  Write-Host "same-user positive control OK"
-  # Diagnostic only: the descriptor the endpoint actually carries, so the
-  # denial verdict below can be read against it instead of assumed.
-  try {
-    Write-Host ("endpoint sddl: " + (Get-Acl -Path "\\.\pipe\$short" -ErrorAction Stop).Sddl)
-  } catch {
-    Write-Host "endpoint sddl unavailable: $($_.Exception.Message)"
-  }
+  Write-Host ("same-user positive control OK (logon " + ((whoami /logonid) | Select-Object -Last 1).Trim() + ")")
 
-  # 3. Alternate user, alternate logon session: opening the pipe must be denied.
+  # The one client both cases run. It reports what it observed — refused at
+  # open, opened but never served, or opened and served — and the identity and
+  # logon session it observed it from. `whoami /logonid` is used deliberately:
+  # WindowsIdentity.Groups does not surface the logon SID, so the .NET view
+  # cannot tell these two cases apart.
+  @'
+param([string]$PipeName, [string]$Out)
+$ErrorActionPreference = 'Stop'
+$id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$who = $id.Name + ' (' + $id.User.Value + ') logon ' + ((whoami /logonid) | Select-Object -Last 1).Trim()
+function Say([string]$outcome, [string]$detail) {
+  Set-Content -Path $Out -Value "$outcome as $who :: $detail"
+}
+try {
+  $stream = New-Object System.IO.Pipes.NamedPipeClientStream('.', $PipeName, [System.IO.Pipes.PipeDirection]::InOut)
+  $stream.Connect(5000)
+} catch {
+  if (($_.Exception -is [System.UnauthorizedAccessException]) -or ($_.Exception.Message -match 'Access is denied')) {
+    Say 'denied-at-open' $_.Exception.GetType().FullName
+    exit 3
+  }
+  Say 'error' ($_.Exception.GetType().FullName + ' :: ' + $_.Exception.Message)
+  exit 4
+}
+# The handle exists, so the DACL admitted this logon session. Everything from
+# here tests the second barrier: whether the connector will SERVE this user.
+$sddl = 'unavailable'
+try { $sddl = $stream.GetAccessControl().GetSecurityDescriptorSddlForm('Access') } catch { }
+try {
+  $body = [Text.Encoding]::ASCII.GetBytes('ping')
+  $frame = New-Object byte[] (4 + $body.Length)
+  [Array]::Copy([BitConverter]::GetBytes([int]$body.Length), 0, $frame, 0, 4)
+  if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($frame, 0, 4) }
+  [Array]::Copy($body, 0, $frame, 4, $body.Length)
+  $stream.Write($frame, 0, $frame.Length)
+  $stream.Flush()
+  $buffer = New-Object byte[] 8
+  $read = $stream.ReadAsync($buffer, 0, 8)
+  if (-not $read.Wait(15000)) { Say 'unserved' "no response before the deadline; dacl $sddl"; exit 0 }
+  if ($read.Result -eq 0) { Say 'unserved' "server closed without answering; dacl $sddl"; exit 0 }
+  Say 'served' "server answered $($read.Result) bytes; dacl $sddl"
+  exit 5
+} catch {
+  Say 'unserved' ('connection failed after open: ' + $_.Exception.GetType().FullName + '; dacl ' + $sddl)
+  exit 0
+} finally {
+  $stream.Dispose()
+}
+'@ | Set-Content -Path $ChildScript -Encoding ASCII
+
   New-LocalUser -Name $User -Password (ConvertTo-SecureString $Password -AsPlainText -Force) `
     -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword | Out-Null
   $Created = $true
@@ -127,52 +190,35 @@ try {
   & icacls $Shared /grant "${User}:(OI)(CI)(F)" | Out-Null
   if ($LASTEXITCODE -ne 0) { Fail "granting $User access to the shared directory exited $LASTEXITCODE" }
 
-  # The child writes its own verdict, including the identity it actually ran
-  # under. A cross-session exit code is not evidence — `Start-Process
-  # -Credential` reports one the parent cannot always read back — and this gate
-  # decides a security question, so it decides it on what the child observed,
-  # not on a number that defaults to zero. Only an access denial passes; every
-  # other exception is an inconclusive run, not a denial.
-  @"
-`$ErrorActionPreference = 'Stop'
-`$id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-# The endpoint's ACE names a logon SESSION, not a user. Report the session this
-# child actually landed in, so 'a second user opened it' can be told apart from
-# 'a second user in the same logon session opened it' — only the first is a
-# failure of the descriptor.
-`$groups = ((`$id.Groups | ForEach-Object { `$_.Value }) -join ',')
-`$who = `$id.Name + ' (' + `$id.User.Value + ', groups ' + `$groups + ')'
-try {
-  `$stream = New-Object System.IO.Pipes.NamedPipeClientStream('.', '$short', [System.IO.Pipes.PipeDirection]::InOut)
-  `$stream.Connect(5000)
-  # Read the descriptor from the handle that should not exist. If this open is
-  # wrong, the object's own DACL is the evidence for why it succeeded.
-  `$sddl = 'unavailable'
-  try { `$sddl = `$stream.GetAccessControl().GetSecurityDescriptorSddlForm('Access') } catch { `$sddl = 'unavailable: ' + `$_.Exception.Message }
-  `$stream.Dispose()
-  Set-Content -Path '$ChildOut' -Value "opened as `$who :: dacl `$sddl"
-  exit 0
-} catch {
-  `$denial = (`$_.Exception -is [System.UnauthorizedAccessException]) -or (`$_.Exception.Message -match 'Access is denied')
-  `$kind = if (`$denial) { 'denied' } else { 'error' }
-  Set-Content -Path '$ChildOut' -Value "`$kind as `$who :: `$(`$_.Exception.GetType().FullName) :: `$(`$_.Exception.Message)"
-  if (`$denial) { exit 3 } else { exit 4 }
-}
-"@ | Set-Content -Path $ChildScript -Encoding ASCII
-
+  # 3. Second USER, same logon session. The DACL admits it; the SID proof must
+  #    refuse to serve it, before the codec reads a byte.
   $credential = New-Object System.Management.Automation.PSCredential(
     $User, (ConvertTo-SecureString $Password -AsPlainText -Force))
-  $denied = Start-Process -FilePath "powershell.exe" -Credential $credential `
-    -ArgumentList "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $ChildScript `
-    -WorkingDirectory $Shared -PassThru -Wait
-  $verdict = if (Test-Path $ChildOut) { (Get-Content $ChildOut -Raw).Trim() } else { "" }
-  if (-not $verdict) { Fail "the alternate-user child left no verdict (exit $($denied.ExitCode))" }
-  if ($verdict.StartsWith("denied")) {
-    Write-Host "alternate-user denial OK (access denied at pipe open): $verdict"
-  } elseif ($verdict.StartsWith("opened")) {
-    Fail "another user opened the connector endpoint: $verdict"
-  } else {
-    Fail "alternate-user attempt was inconclusive (exit $($denied.ExitCode)): $verdict"
+  Start-Process -FilePath "powershell.exe" -Credential $credential `
+    -ArgumentList "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $ChildScript, "-PipeName", $short, "-Out", $SessionOut `
+    -WorkingDirectory $Shared -PassThru -Wait | Out-Null
+  $verdict = Read-Verdict $SessionOut 30
+  if (-not $verdict) { Fail "the same-session client left no verdict" }
+  Write-Host "same-session second user: $verdict"
+  if ($verdict.StartsWith("served")) { Fail "the connector served a second user: $verdict" }
+  if (-not ($verdict.StartsWith("unserved") -or $verdict.StartsWith("denied-at-open"))) {
+    Fail "the same-session attempt was inconclusive: $verdict"
+  }
+
+  # 4. Second logon session. A Task Scheduler batch logon carries its own logon
+  #    SID, so the DACL must refuse it at open — no handle, no frame, nothing to
+  #    reject later.
+  $command = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $ChildScript -PipeName $short -Out $BatchOut"
+  & schtasks /create /tn $Task /tr $command /sc once /st 23:59 /ru $User /rp $Password /f | Out-Null
+  if ($LASTEXITCODE -ne 0) { Fail "registering the batch-logon task exited $LASTEXITCODE" }
+  $Scheduled = $true
+  & schtasks /run /tn $Task | Out-Null
+  if ($LASTEXITCODE -ne 0) { Fail "starting the batch-logon task exited $LASTEXITCODE" }
+  $verdict = Read-Verdict $BatchOut 90
+  if (-not $verdict) { Fail "the batch-logon client left no verdict (it may never have run)" }
+  Write-Host "second logon session: $verdict"
+  if (-not $verdict.StartsWith("denied-at-open")) {
+    Fail "a different logon session was not refused at open: $verdict"
   }
 
   Write-Host "windows ipc owner smoke OK"
@@ -192,6 +238,7 @@ try {
   throw
 } finally {
   if ($Server -and -not $Server.HasExited) { Stop-Process -Id $Server.Id -Force -ErrorAction SilentlyContinue }
+  if ($Scheduled) { & schtasks /delete /tn $Task /f 2>&1 | Out-Null }
   if ($Created) { Remove-LocalUser -Name $User -ErrorAction SilentlyContinue }
   Remove-Item -Recurse -Force $Root -ErrorAction SilentlyContinue
   Remove-Item -Recurse -Force $Shared -ErrorAction SilentlyContinue

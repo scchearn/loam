@@ -429,7 +429,11 @@ fn logon_sid() -> Result<Option<String>, IpcError> {
     let count = groups.group_count as usize;
     let entries = unsafe { std::slice::from_raw_parts(groups.groups.as_ptr(), count) };
     for entry in entries {
-        if entry.attributes & SE_GROUP_LOGON_ID != 0 {
+        // `SE_GROUP_LOGON_ID` is two bits, so a test for "either bit" would
+        // accept a group that carries only one of them and hand the endpoint's
+        // ACE to the wrong subject. Masked equality asks for both, while
+        // ignoring the enabled/mandatory attributes the real entry also sets.
+        if (entry.attributes & SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID {
             return Ok(Some(sid_string(entry.sid)?));
         }
     }
