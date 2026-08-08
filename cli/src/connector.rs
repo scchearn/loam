@@ -925,6 +925,241 @@ fn ack_json(row: &crate::enrollment::EnrolledRow, action: &str) -> crate::json::
     ])
 }
 
+// ---------------------------------------------------------------------------
+// Disconnect, observational status, and lifecycle convergence (T11)
+// ---------------------------------------------------------------------------
+//
+// Local removal is authoritative: a disconnect deletes only the named
+// enrollment, preserves every other project, and — when the registry becomes
+// empty — stops/disables the one service. Broker cleanup (the best-effort
+// project tombstone) is a separate, failure-tolerant channel that never blocks
+// local removal; the real ordered tombstone via the adapter is T13, so here its
+// outcome is injected so both the success and the broker-down paths are tested.
+// Manager stop/disable failure is a precise degraded result, never hidden
+// success. Status is strictly read-only: it never creates the database, starts
+// a process, or claims an aggregate `connected`/`ready`.
+
+/// Whether the named enrollment was actually removed by this disconnect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalOutcome {
+    /// The row existed and was deleted — local removal is authoritative.
+    Removed,
+    /// Nothing was enrolled for this workspace (already gone / never enrolled).
+    AlreadyAbsent,
+}
+
+/// The best-effort broker-side cleanup outcome, reported separately from local
+/// removal so a broker-down tombstone failure is visible without blocking it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupOutcome {
+    Ok,
+    Failed(String),
+}
+
+impl From<Result<(), String>> for CleanupOutcome {
+    fn from(result: Result<(), String>) -> Self {
+        match result {
+            Ok(()) => CleanupOutcome::Ok,
+            Err(reason) => CleanupOutcome::Failed(reason),
+        }
+    }
+}
+
+/// The service lifecycle result after reconciling against registry truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleOutcome {
+    /// Other projects remain; the service stays up.
+    Preserved { remaining: usize },
+    /// The registry is now empty; the service was stopped and disabled.
+    StoppedDisabled,
+    /// The registry is empty but the manager stop/disable failed — a precise
+    /// degraded result, not hidden success.
+    ManagerDegraded(String),
+    /// The machine was already fully dormant (no store); nothing to reconcile.
+    Untouched,
+}
+
+/// The three separate lifecycle facts a disconnect reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisconnectReport {
+    pub local: LocalOutcome,
+    pub broker_cleanup: CleanupOutcome,
+    pub lifecycle: LifecycleOutcome,
+}
+
+#[derive(Debug)]
+pub enum DisconnectError {
+    Registry(crate::enrollment::RegistryError),
+}
+
+/// Disconnect a single physical workspace by its identity key. Best-effort
+/// broker cleanup (injected) is reported separately; local deletion is
+/// authoritative; the service is reconciled from registry truth afterward.
+///
+/// A missing database means a fully dormant machine: there is nothing to remove
+/// and no manager state to repair, so this never creates the store on a read.
+pub fn disconnect_by_key<R: service::CommandRunner>(
+    db_path: &std::path::Path,
+    key: &str,
+    broker_cleanup: Result<(), String>,
+    service_runner: &R,
+    service_ctx: &service::ServiceContext,
+) -> Result<DisconnectReport, DisconnectError> {
+    let cleanup = CleanupOutcome::from(broker_cleanup);
+
+    // Dormant machine: no store, so nothing to delete and nothing to reconcile.
+    let existed =
+        match crate::enrollment::open_readonly(db_path).map_err(DisconnectError::Registry)? {
+            None => {
+                return Ok(DisconnectReport {
+                    local: LocalOutcome::AlreadyAbsent,
+                    broker_cleanup: cleanup,
+                    lifecycle: LifecycleOutcome::Untouched,
+                });
+            }
+            Some(connection) => crate::enrollment::lookup(&connection, key)
+                .map_err(DisconnectError::Registry)?
+                .is_some(),
+        };
+
+    // The store exists, so we may open it writable to delete and to reconcile the
+    // manager lifecycle from registry truth (also the repeated-disconnect repair).
+    let mut connection =
+        crate::enrollment::open_writable(db_path).map_err(DisconnectError::Registry)?;
+    let removed = existed
+        && crate::enrollment::delete_enrollment(&mut connection, key)
+            .map_err(DisconnectError::Registry)?;
+    let remaining = crate::enrollment::list_enrollments(&connection)
+        .map_err(DisconnectError::Registry)?
+        .len();
+    drop(connection);
+
+    let lifecycle = if remaining == 0 {
+        // Final removal, or a repeated disconnect repairing residual drift:
+        // reconcile the one service to the empty desired state. Idempotent.
+        match service::disable_stop(service_runner, service_ctx) {
+            Ok(()) => LifecycleOutcome::StoppedDisabled,
+            Err(error) => LifecycleOutcome::ManagerDegraded(error.to_string()),
+        }
+    } else {
+        LifecycleOutcome::Preserved { remaining }
+    };
+
+    Ok(DisconnectReport {
+        local: if removed {
+            LocalOutcome::Removed
+        } else {
+            LocalOutcome::AlreadyAbsent
+        },
+        broker_cleanup: cleanup,
+        lifecycle,
+    })
+}
+
+/// A read-only, aggregate-free status projection for the whole machine (or one
+/// workspace when `key` is given). Never creates the database and never starts a
+/// process: enrollment comes from a read-only registry open, the definition from
+/// a filesystem presence check, and the process/enabled state from a read-only
+/// manager query. Historical verified capabilities, the (not-observed) live
+/// broker session, and per-project health are separate fields — there is no
+/// `connected`/`ready` boolean.
+pub fn status_report<R: service::CommandRunner>(
+    db_path: &std::path::Path,
+    service_runner: &R,
+    service_ctx: &service::ServiceContext,
+    key: Option<&str>,
+) -> crate::json::Value {
+    use crate::json::Value;
+
+    // Read-only registry open: a missing store yields no enrollments and is never
+    // created here.
+    let enrollments: Vec<crate::enrollment::EnrolledRow> =
+        match crate::enrollment::open_readonly(db_path) {
+            Ok(Some(connection)) => match key {
+                Some(key) => crate::enrollment::lookup(&connection, key)
+                    .ok()
+                    .flatten()
+                    .into_iter()
+                    .collect(),
+                None => crate::enrollment::list_enrollments(&connection).unwrap_or_default(),
+            },
+            _ => Vec::new(),
+        };
+
+    let enrollment_values = enrollments
+        .iter()
+        .map(|row| {
+            Value::Object(vec![
+                ("org_id".into(), Value::String(row.org_id.clone())),
+                ("project_id".into(), Value::String(row.project_id.clone())),
+                (
+                    "repository_id".into(),
+                    Value::String(row.repository_id.clone()),
+                ),
+                (
+                    "display_path".into(),
+                    Value::String(row.display_path.clone()),
+                ),
+                // Per-project historical verification, kept beside the enrollment
+                // and never collapsed into a readiness claim.
+                (
+                    "verification".into(),
+                    Value::Object(vec![
+                        (
+                            "capabilities".into(),
+                            Value::Array(capability_names(&row.capabilities)),
+                        ),
+                        (
+                            "verified_at".into(),
+                            Value::String(row.capabilities.verified_at.clone()),
+                        ),
+                    ]),
+                ),
+                // Per-project health is the enrollment's own state, separate from
+                // any live-session claim.
+                ("health".into(), Value::String("enrolled".into())),
+            ])
+        })
+        .collect();
+
+    // Definition presence is a filesystem fact; the process/enabled state is a
+    // read-only manager query. Neither starts anything.
+    let definition_present = service::definition_path(service_ctx).exists();
+    let manager_state = match service::status(service_runner, service_ctx) {
+        Ok(0) => "enabled",
+        Ok(_) => "disabled",
+        Err(_) => "unknown",
+    };
+
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        ("enrollments".into(), Value::Array(enrollment_values)),
+        (
+            "definition".into(),
+            Value::Object(vec![("present".into(), Value::Bool(definition_present))]),
+        ),
+        (
+            "process".into(),
+            Value::Object(vec![(
+                "manager_state".into(),
+                Value::String(manager_state.into()),
+            )]),
+        ),
+        (
+            "broker".into(),
+            // Read-only status does not observe a live broker session; the live
+            // session belongs to the running connector/adapter (T13).
+            Value::Object(vec![
+                ("session_observed".into(), Value::Bool(false)),
+                (
+                    "session_state".into(),
+                    Value::String("not-observed-in-read-only-status".into()),
+                ),
+            ]),
+        ),
+    ])
+}
+
 #[cfg(test)]
 mod probe_tests {
     use super::*;
@@ -1606,5 +1841,298 @@ mod connect_tests {
             now(),
         );
         assert!(matches!(outcome, Err(ConnectError::EnrollmentConflict)));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::enrollment::{
+        CapabilityRecord, PhysicalWorkspace, PlatformIdentity, ValidatedEnrollment, ValidatedRemote,
+    };
+    use crate::service::{CommandRunner, ManagerCommand, ServiceContext, ServiceError};
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    /// A recording service runner. `failing_all` makes every manager command fail
+    /// (fail substring `""` matches any line), so the degraded-lifecycle path is
+    /// exercised without depending on a platform-specific command string.
+    struct FakeService {
+        fail_all: bool,
+        recorded: RefCell<Vec<String>>,
+    }
+    impl FakeService {
+        fn ok() -> Self {
+            FakeService {
+                fail_all: false,
+                recorded: RefCell::new(Vec::new()),
+            }
+        }
+        fn failing_all() -> Self {
+            FakeService {
+                fail_all: true,
+                recorded: RefCell::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.recorded.borrow().clone()
+        }
+    }
+    impl CommandRunner for FakeService {
+        fn run(&self, command: &ManagerCommand) -> Result<i32, ServiceError> {
+            self.recorded.borrow_mut().push(format!(
+                "{} {}",
+                command.program,
+                command.args.join(" ")
+            ));
+            if self.fail_all {
+                return Err(ServiceError::ManagerFailed { code: 1 });
+            }
+            Ok(0)
+        }
+    }
+
+    fn caps() -> CapabilityRecord {
+        CapabilityRecord {
+            authentication: true,
+            publish: true,
+            subscribe: true,
+            self_receive: true,
+            verified_at: "2026-08-08T10:00:00Z".into(),
+        }
+    }
+
+    fn synthetic(project: &str, device: u64, inode: u64) -> ValidatedEnrollment {
+        ValidatedEnrollment {
+            org_id: "acme".into(),
+            project_id: project.into(),
+            repository_id: "repo".into(),
+            broker_profile: "acme-prod".into(),
+            broker_endpoint: "mqtts://h:8883".into(),
+            tls_server_name: "h".into(),
+            credential_ref: "vault://c".into(),
+            ca_ref: None,
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            remotes: vec![ValidatedRemote {
+                name: "origin".into(),
+                url_digest: "a".repeat(64),
+                allowed_refs: vec!["refs/heads/main".into()],
+            }],
+            workspace: PhysicalWorkspace {
+                display_path: format!("/w/{project}"),
+                identity: PlatformIdentity::Unix { device, inode },
+            },
+        }
+    }
+
+    fn setup(label: &str) -> (PathBuf, ServiceContext) {
+        let root = std::env::temp_dir().join(format!(
+            "loam-lifecycle-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let instance_id = crate::service::ensure_instance_id(&root).unwrap();
+        let ctx = ServiceContext {
+            global_root: root.clone(),
+            instance_id,
+            runtime_path: std::env::temp_dir().join("loam-rt").join("loam"),
+        };
+        (root.join("loam.sqlite3"), ctx)
+    }
+
+    fn insert(db: &Path, enrollment: &ValidatedEnrollment) {
+        let mut connection = crate::enrollment::open_writable(db).unwrap();
+        crate::enrollment::insert_enrollment(&mut connection, enrollment, &caps(), "t").unwrap();
+    }
+
+    fn key_of(enrollment: &ValidatedEnrollment) -> String {
+        crate::enrollment::identity_key(&enrollment.workspace)
+    }
+
+    #[test]
+    fn intermediate_disconnect_removes_one_and_preserves_the_others() {
+        let (db, ctx) = setup("intermediate");
+        let a = synthetic("proj-a", 1, 10);
+        let b = synthetic("proj-b", 1, 11);
+        let c = synthetic("proj-c", 1, 12);
+        insert(&db, &a);
+        insert(&db, &b);
+        insert(&db, &c);
+
+        let service = FakeService::ok();
+        let report =
+            disconnect_by_key(&db, &key_of(&b), Ok(()), &service, &ctx).expect("disconnect");
+
+        assert_eq!(report.local, LocalOutcome::Removed);
+        assert_eq!(
+            report.lifecycle,
+            LifecycleOutcome::Preserved { remaining: 2 }
+        );
+        // Preserving the service means no stop/disable was issued.
+        assert!(
+            service.calls().is_empty(),
+            "an intermediate disconnect must not touch the manager: {:?}",
+            service.calls()
+        );
+        // The other two projects survive.
+        let read = crate::enrollment::open_readonly(&db).unwrap().unwrap();
+        assert!(crate::enrollment::lookup(&read, &key_of(&a))
+            .unwrap()
+            .is_some());
+        assert!(crate::enrollment::lookup(&read, &key_of(&c))
+            .unwrap()
+            .is_some());
+        assert!(crate::enrollment::lookup(&read, &key_of(&b))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn final_disconnect_removes_and_stops_the_service() {
+        let (db, ctx) = setup("final");
+        let only = synthetic("proj-only", 2, 20);
+        insert(&db, &only);
+
+        let service = FakeService::ok();
+        let report =
+            disconnect_by_key(&db, &key_of(&only), Ok(()), &service, &ctx).expect("disconnect");
+
+        assert_eq!(report.local, LocalOutcome::Removed);
+        assert_eq!(report.lifecycle, LifecycleOutcome::StoppedDisabled);
+        // The registry is empty and the manager stop/disable was attempted.
+        assert!(
+            !service.calls().is_empty(),
+            "final disconnect stops the service"
+        );
+        let read = crate::enrollment::open_readonly(&db).unwrap().unwrap();
+        assert!(crate::enrollment::list_enrollments(&read)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn final_disconnect_stops_even_when_broker_cleanup_fails() {
+        let (db, ctx) = setup("broker-down");
+        let only = synthetic("proj-only", 3, 30);
+        insert(&db, &only);
+
+        let service = FakeService::ok();
+        // Broker tombstone failed (broker down / credential revoked) — local
+        // removal and service stop proceed regardless, and the failure is
+        // reported separately.
+        let report = disconnect_by_key(
+            &db,
+            &key_of(&only),
+            Err("broker unreachable".into()),
+            &service,
+            &ctx,
+        )
+        .expect("disconnect");
+
+        assert_eq!(report.local, LocalOutcome::Removed);
+        assert_eq!(report.lifecycle, LifecycleOutcome::StoppedDisabled);
+        assert_eq!(
+            report.broker_cleanup,
+            CleanupOutcome::Failed("broker unreachable".into())
+        );
+    }
+
+    #[test]
+    fn manager_failure_on_final_disconnect_is_a_degraded_result_not_hidden_success() {
+        let (db, ctx) = setup("degraded");
+        let only = synthetic("proj-only", 4, 40);
+        insert(&db, &only);
+
+        let service = FakeService::failing_all();
+        let report =
+            disconnect_by_key(&db, &key_of(&only), Ok(()), &service, &ctx).expect("disconnect");
+
+        // Local removal still succeeded; the manager failure is surfaced.
+        assert_eq!(report.local, LocalOutcome::Removed);
+        assert!(matches!(
+            report.lifecycle,
+            LifecycleOutcome::ManagerDegraded(_)
+        ));
+        let read = crate::enrollment::open_readonly(&db).unwrap().unwrap();
+        assert!(crate::enrollment::list_enrollments(&read)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn repeated_disconnect_repairs_residual_manager_state() {
+        let (db, ctx) = setup("repair");
+        let only = synthetic("proj-only", 5, 50);
+        insert(&db, &only);
+        // First disconnect empties the registry.
+        disconnect_by_key(&db, &key_of(&only), Ok(()), &FakeService::ok(), &ctx)
+            .expect("first disconnect");
+
+        // A repeated disconnect of the same (now-absent) workspace: nothing to
+        // remove, but the empty registry is reconciled — the manager is
+        // stopped/disabled again to repair any residual drift, without recreating
+        // an enrollment or contacting the broker.
+        let service = FakeService::ok();
+        let report =
+            disconnect_by_key(&db, &key_of(&only), Ok(()), &service, &ctx).expect("repeat");
+        assert_eq!(report.local, LocalOutcome::AlreadyAbsent);
+        assert_eq!(report.lifecycle, LifecycleOutcome::StoppedDisabled);
+        assert!(!service.calls().is_empty(), "repair reconciles the manager");
+    }
+
+    #[test]
+    fn disconnect_on_a_dormant_machine_creates_no_database_and_touches_no_manager() {
+        let (db, ctx) = setup("dormant");
+        // No enrollment ever existed: the store is absent.
+        assert!(!db.exists());
+        let service = FakeService::ok();
+        let report =
+            disconnect_by_key(&db, "unix:9:9", Ok(()), &service, &ctx).expect("disconnect");
+        assert_eq!(report.local, LocalOutcome::AlreadyAbsent);
+        assert_eq!(report.lifecycle, LifecycleOutcome::Untouched);
+        assert!(service.calls().is_empty(), "a dormant disconnect is inert");
+        // A disconnect read never creates the database.
+        assert!(!db.exists(), "disconnect must not create the store");
+    }
+
+    #[test]
+    fn status_on_a_missing_registry_is_empty_and_creates_no_database() {
+        let (db, ctx) = setup("status-missing");
+        assert!(!db.exists());
+        let service = FakeService::ok();
+        let report = status_report(&db, &service, &ctx, None);
+        let text = report.to_json();
+        assert!(text.contains("\"enrollments\":[]"));
+        // No aggregate readiness claim, and the read created no database.
+        assert!(!text.contains("\"connected\"") && !text.contains("\"ready\""));
+        assert!(!db.exists(), "status must not create the store");
+    }
+
+    #[test]
+    fn status_reports_separate_enrollment_and_verification_fields() {
+        let (db, ctx) = setup("status-enrolled");
+        let a = synthetic("proj-a", 6, 60);
+        let b = synthetic("proj-b", 6, 61);
+        insert(&db, &a);
+        insert(&db, &b);
+
+        let service = FakeService::ok();
+        let report = status_report(&db, &service, &ctx, None);
+        let text = report.to_json();
+        // Two enrollments, each with its own historical verification, plus the
+        // separate definition/process/broker fields — no aggregate boolean.
+        assert!(text.contains("proj-a") && text.contains("proj-b"));
+        assert!(text.contains("\"verification\""));
+        assert!(text.contains("\"definition\""));
+        assert!(text.contains("\"process\""));
+        assert!(text.contains("\"session_observed\":false"));
+        assert!(!text.contains("\"connected\"") && !text.contains("\"ready\""));
+
+        // A workspace filter narrows to one enrollment.
+        let one = status_report(&db, &service, &ctx, Some(&key_of(&a)));
+        let one_text = one.to_json();
+        assert!(one_text.contains("proj-a") && !one_text.contains("proj-b"));
     }
 }

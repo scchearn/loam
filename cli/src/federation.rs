@@ -18,17 +18,261 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     match args.next().as_deref() {
         Some("connect") => connect(args),
         Some("service") => service(args),
-        Some("disconnect") | Some("status") => {
-            eprintln!("federation: disconnect and status arrive in Slice C T11");
-            69
-        }
+        Some("disconnect") => disconnect(args),
+        Some("status") => status(args),
         _ => {
             eprintln!(
-                "Usage:\n  loam federation connect [<workspace>] --json   (reads one descriptor on stdin)"
+                "Usage:\n  \
+                 loam federation connect [<workspace>] --json   (reads one descriptor on stdin)\n  \
+                 loam federation disconnect <workspace> --global-root <path> [--json]\n  \
+                 loam federation status [<workspace>] --global-root <path> [--json]"
             );
             64
         }
     }
+}
+
+/// Build the connector's service context (stable identity + absolute runtime) so
+/// disconnect/status can drive the real per-user manager. Shared by both.
+fn service_context(root: &std::path::Path) -> Result<crate::service::ServiceContext, i32> {
+    let instance_id = crate::service::ensure_instance_id(root).map_err(|error| {
+        eprintln!("federation: {error}");
+        70
+    })?;
+    let runtime_path = std::env::current_exe().map_err(|_| {
+        eprintln!("federation: cannot resolve the current runtime path");
+        70
+    })?;
+    Ok(crate::service::ServiceContext {
+        global_root: root.to_path_buf(),
+        instance_id,
+        runtime_path,
+    })
+}
+
+/// Resolve a workspace path to its physical-identity key, exactly as enrollment
+/// did, so path aliases map to the same enrollment.
+fn workspace_key(workspace: &std::path::Path) -> Result<String, i32> {
+    match enrollment::PhysicalWorkspace::resolve(workspace) {
+        Ok(physical) => Ok(enrollment::identity_key(&physical)),
+        Err(error) => {
+            eprintln!("federation: {error}");
+            Err(error.sysexit())
+        }
+    }
+}
+
+/// `loam federation disconnect <workspace> --global-root <path> [--json]`.
+/// Local removal is authoritative; the service is reconciled from registry
+/// truth. Broker cleanup is deferred to the real adapter (T13).
+fn disconnect(mut args: impl Iterator<Item = String>) -> i32 {
+    let mut workspace: Option<PathBuf> = None;
+    let mut global_root: Option<PathBuf> = None;
+    let mut json_output = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => json_output = true,
+            "--global-root" => match args.next() {
+                Some(value) => global_root = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("federation disconnect: --global-root needs a value");
+                    return 64;
+                }
+            },
+            other if other.starts_with("--") => {
+                eprintln!("federation disconnect: unknown flag `{other}`");
+                return 64;
+            }
+            other => {
+                if workspace.is_some() {
+                    eprintln!("federation disconnect: workspace given twice");
+                    return 64;
+                }
+                workspace = Some(PathBuf::from(other));
+            }
+        }
+    }
+    let (Some(workspace), Some(root)) = (workspace, global_root) else {
+        eprintln!("federation disconnect: <workspace> and --global-root are required");
+        return 64;
+    };
+
+    let key = match workspace_key(&workspace) {
+        Ok(key) => key,
+        Err(code) => return code,
+    };
+    let context = match service_context(&root) {
+        Ok(context) => context,
+        Err(code) => return code,
+    };
+    let db_path = root.join("loam.sqlite3");
+    let runner = crate::service::RealRunner;
+
+    // The bounded broker tombstone is the real adapter's job (T13). Until then it
+    // is a no-op success; local removal proceeds regardless of its outcome.
+    match crate::connector::disconnect_by_key(&db_path, &key, Ok(()), &runner, &context) {
+        Ok(report) => {
+            let degraded = matches!(
+                report.lifecycle,
+                crate::connector::LifecycleOutcome::ManagerDegraded(_)
+            );
+            if json_output {
+                println!("{}", disconnect_json(&report).to_json());
+            } else {
+                println!("disconnect: {}", disconnect_summary(&report));
+            }
+            // Local removal succeeds independently of the manager; a manager
+            // stop/disable failure is surfaced as a degraded (non-zero) result.
+            if degraded {
+                70
+            } else {
+                0
+            }
+        }
+        Err(crate::connector::DisconnectError::Registry(error)) => {
+            eprintln!("federation disconnect: {error}");
+            73
+        }
+    }
+}
+
+/// `loam federation status [<workspace>] --global-root <path> [--json]`.
+/// Strictly read-only and egress-free: never creates the database or starts a
+/// process.
+fn status(mut args: impl Iterator<Item = String>) -> i32 {
+    let mut workspace: Option<PathBuf> = None;
+    let mut global_root: Option<PathBuf> = None;
+    let mut json_output = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => json_output = true,
+            "--global-root" => match args.next() {
+                Some(value) => global_root = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("federation status: --global-root needs a value");
+                    return 64;
+                }
+            },
+            other if other.starts_with("--") => {
+                eprintln!("federation status: unknown flag `{other}`");
+                return 64;
+            }
+            other => {
+                if workspace.is_some() {
+                    eprintln!("federation status: workspace given twice");
+                    return 64;
+                }
+                workspace = Some(PathBuf::from(other));
+            }
+        }
+    }
+    let Some(root) = global_root else {
+        eprintln!("federation status: --global-root is required");
+        return 64;
+    };
+
+    let key = match workspace.as_deref() {
+        Some(path) => match workspace_key(path) {
+            Ok(key) => Some(key),
+            Err(code) => return code,
+        },
+        None => None,
+    };
+    let context = match service_context(&root) {
+        Ok(context) => context,
+        Err(code) => return code,
+    };
+    let db_path = root.join("loam.sqlite3");
+    let runner = crate::service::RealRunner;
+
+    let report = crate::connector::status_report(&db_path, &runner, &context, key.as_deref());
+    if json_output {
+        println!("{}", report.to_json());
+    } else {
+        println!("{}", status_summary(&report));
+    }
+    0
+}
+
+/// A terse, read-only human summary of the status projection: enrollment count,
+/// definition presence, and manager state — never an aggregate readiness claim.
+fn status_summary(report: &Value) -> String {
+    let count = report
+        .get("enrollments")
+        .and_then(Value::as_array)
+        .map(|rows| rows.len())
+        .unwrap_or(0);
+    let definition = report
+        .get("definition")
+        .and_then(|d| d.get("present"))
+        .map(|v| matches!(v, Value::Bool(true)))
+        .unwrap_or(false);
+    let manager = report
+        .get("process")
+        .and_then(|p| p.get("manager_state"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    format!(
+        "status: {count} enrolled project(s); definition {}; manager {manager}; live broker session not observed",
+        if definition { "present" } else { "absent" }
+    )
+}
+
+fn disconnect_summary(report: &crate::connector::DisconnectReport) -> String {
+    use crate::connector::{CleanupOutcome, LifecycleOutcome, LocalOutcome};
+    let local = match report.local {
+        LocalOutcome::Removed => "removed",
+        LocalOutcome::AlreadyAbsent => "not-enrolled",
+    };
+    let lifecycle = match &report.lifecycle {
+        LifecycleOutcome::Preserved { remaining } => {
+            format!("service preserved ({remaining} left)")
+        }
+        LifecycleOutcome::StoppedDisabled => "service stopped/disabled".into(),
+        LifecycleOutcome::ManagerDegraded(reason) => format!("manager degraded: {reason}"),
+        LifecycleOutcome::Untouched => "machine dormant".into(),
+    };
+    let cleanup = match &report.broker_cleanup {
+        CleanupOutcome::Ok => "broker cleanup ok".to_string(),
+        CleanupOutcome::Failed(reason) => format!("broker cleanup failed: {reason}"),
+    };
+    format!("{local}; {lifecycle}; {cleanup}")
+}
+
+fn disconnect_json(report: &crate::connector::DisconnectReport) -> Value {
+    use crate::connector::{CleanupOutcome, LifecycleOutcome, LocalOutcome};
+    let local = match report.local {
+        LocalOutcome::Removed => "removed",
+        LocalOutcome::AlreadyAbsent => "not-enrolled",
+    };
+    let (lifecycle, remaining, reason) = match &report.lifecycle {
+        LifecycleOutcome::Preserved { remaining } => ("preserved", Some(*remaining), None),
+        LifecycleOutcome::StoppedDisabled => ("stopped-disabled", None, None),
+        LifecycleOutcome::ManagerDegraded(reason) => {
+            ("manager-degraded", None, Some(reason.clone()))
+        }
+        LifecycleOutcome::Untouched => ("untouched", None, None),
+    };
+    let mut lifecycle_fields = vec![("state".into(), Value::String(lifecycle.into()))];
+    if let Some(remaining) = remaining {
+        lifecycle_fields.push(("remaining".into(), Value::Number(remaining.to_string())));
+    }
+    if let Some(reason) = reason {
+        lifecycle_fields.push(("reason".into(), Value::String(reason)));
+    }
+    let broker = match &report.broker_cleanup {
+        CleanupOutcome::Ok => Value::Object(vec![("cleanup".into(), Value::String("ok".into()))]),
+        CleanupOutcome::Failed(reason) => Value::Object(vec![
+            ("cleanup".into(), Value::String("failed".into())),
+            ("reason".into(), Value::String(reason.clone())),
+        ]),
+    };
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        ("local".into(), Value::String(local.into())),
+        ("lifecycle".into(), Value::Object(lifecycle_fields)),
+        ("broker_cleanup".into(), broker),
+    ])
 }
 
 /// Hidden internal service entrypoint: `loam federation service
