@@ -334,6 +334,11 @@ test('Codex SubagentStart injects resolved preparation-first context and Subagen
   assert.ok(context.indexOf('--native-prepare') < context.indexOf('loam::ingesting-codebase'));
   assert.match(context, /action.*skip.*stop immediately/iu);
   assert.deepEqual(calls.map(([kind]) => kind), ['bind', 'worker-start']);
+  assert.equal(calls[1][1].origin, 'external');
+  assert.equal(calls[1][1].sessionId, 'agent-17');
+  assert.deepEqual(calls[1][1].events, [
+    { event: 'subagent', phase: 'start', outcome: 'observed', agent_type: 'loam_ingestor', session_id: 'agent-17' },
+  ]);
 
   calls.length = 0;
   assert.deepEqual(await stop.handleSubagentStop(payload, env, { loadHooks, loadIngest }), {});
@@ -342,6 +347,11 @@ test('Codex SubagentStart injects resolved preparation-first context and Subagen
   assert.equal(JSON.stringify(calls[0][1]).includes('definitely succeeded'), false, 'assistant text is not completion evidence');
   assert.equal(calls[1][1].reason, 'ok');
   assert.equal(calls[1][1].run.id, 17);
+  assert.equal(calls[1][1].origin, 'external');
+  assert.equal(calls[1][1].sessionId, 'agent-17');
+  assert.deepEqual(calls[1][1].events, [
+    { event: 'subagent', phase: 'stop', outcome: 'succeeded', agent_type: 'loam_ingestor', session_id: 'agent-17' },
+  ]);
 });
 
 test('loam_ingestor native preparation command routes through the installed worker without launching a model', async () => {
@@ -470,7 +480,12 @@ test('Codex native Stop returns one spawn_agent continuation with identical dire
   assert.equal((directResponse.reason.match(/spawn_agent/gu) || []).length, 1);
   assert.match(directResponse.reason, /loam_ingestor/u);
   assert.match(directResponse.reason, /finish (?:this )?continuation immediately/iu);
-  assert.deepEqual(finishCalls, [{ run, status: 'succeeded', action: 'spawn_worker' }]);
+  assert.deepEqual(finishCalls, [{
+    run,
+    status: 'continued',
+    action: 'request_worker',
+    events: [{ event: 'codex_native', phase: 'continuation', outcome: 'returned', visibility: 'native' }],
+  }]);
 
   finishCalls.length = 0;
   const fallbackLoad = async () => ({
@@ -543,4 +558,62 @@ test('Claude marketplace Stop forwards agent_type without making a background-se
   assert.deepEqual(response, {});
   assert.equal('systemMessage' in response, false);
   assert.equal(forwarded.payload.agent_type, 'loam:ingestor');
+});
+
+test('Claude marketplace Stop records claude_recursion_guard when a loam:ingestor session is refused', async () => {
+  const stop = await import(`${pathToFileURL(marketplaceStopPath).href}?claude-recursion=${Date.now()}`);
+  const run = { id: 77 };
+  const finishCalls = [];
+  const response = await stop.handleStop(
+    { cwd: '/workspace', session_id: 'claude-session', agent_type: 'loam:ingestor' },
+    { CLAUDE_PLUGIN_ROOT: marketplaceRoot },
+    {
+      loadHooks: async () => ({
+        resolveGlobalRoot: () => '/global',
+        beginHookRun: async () => run,
+        finishHookRun: async (call) => finishCalls.push(call),
+      }),
+      loadIngest: async () => ({
+        resolveGlobalRoot: () => '/global',
+        resolveSkillsRoot: () => '/skills',
+        dispatchBoundary: async () => ({ action: 'skip', reason: 'disabled', recursion: true, workspace: '/workspace' }),
+      }),
+    },
+  );
+
+  assert.deepEqual(response, {});
+  assert.deepEqual(finishCalls, [{
+    run,
+    status: 'succeeded',
+    action: 'skip',
+    reason: 'disabled',
+    events: [{ event: 'claude_recursion_guard', outcome: 'refused', agent_type: 'loam:ingestor' }],
+  }]);
+});
+
+test('marketplace Stop spawns the detached worker only after hook-finish returns', async () => {
+  const stop = await import(`${pathToFileURL(marketplaceStopPath).href}?defer-spawn=${Date.now()}`);
+  const order = [];
+  const run = { id: 55 };
+  await stop.handleStop(
+    { cwd: '/workspace', session_id: 's' },
+    { CLAUDE_PLUGIN_ROOT: marketplaceRoot },
+    {
+      loadHooks: async () => ({
+        resolveGlobalRoot: () => '/global',
+        beginHookRun: async () => run,
+        finishHookRun: async () => { order.push('finish'); },
+      }),
+      loadIngest: async () => ({
+        resolveGlobalRoot: () => '/global',
+        resolveSkillsRoot: () => '/skills',
+        dispatchBoundary: async (input) => {
+          assert.equal(input.deferSpawn, true);
+          return { action: 'spawn_worker', workspace: '/workspace', spawn: async () => { order.push('spawn'); } };
+        },
+      }),
+    },
+  );
+
+  assert.deepEqual(order, ['finish', 'spawn']);
 });

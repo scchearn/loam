@@ -201,6 +201,7 @@ export function createOpenCodeAdapter({
                     run: hookRun,
                     reason: result?.reason,
                     ...(result?.detail !== undefined ? { detail: result.detail } : {}),
+                    ...(result?.events?.length ? { events: result.events } : {}),
                   });
                 } catch {}
               }

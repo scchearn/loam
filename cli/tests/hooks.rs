@@ -1970,3 +1970,618 @@ fn a_new_store_is_private() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+// --- T1: --events-stdin batch ingest on the lifecycle commands ---
+
+fn loam_stdin(args: &[&str], input: &str) -> Output {
+    use std::io::Write as _;
+    let mut child =
+        Command::new(std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide loam"))
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("loam should spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(input.as_bytes())
+        .expect("stdin write should succeed");
+    child.wait_with_output().expect("loam should finish")
+}
+
+fn store(root: &Path) -> Connection {
+    Connection::open(root.join("loam.sqlite3")).unwrap()
+}
+
+fn event_count(root: &Path) -> i64 {
+    store(root)
+        .query_row("SELECT count(*) FROM hook_event", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn worker_status(root: &Path, id: i64) -> Option<String> {
+    store(root)
+        .query_row(
+            "SELECT worker_status FROM hook_run WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn ok(output: &Output) {
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn finished_spawn_worker(root: &Path, harness: &str) -> i64 {
+    let workspace = temporary_root("workspace");
+    let id = begin_id(root, harness, "stop", &workspace);
+    ok(&finish_result(
+        root,
+        id,
+        "succeeded",
+        Some("spawn_worker"),
+        None,
+        None,
+    ));
+    id
+}
+
+fn continued_request_worker(root: &Path) -> i64 {
+    let workspace = temporary_root("workspace");
+    let id = begin_id(root, "codex", "stop", &workspace);
+    ok(&finish_result(
+        root,
+        id,
+        "continued",
+        Some("request_worker"),
+        None,
+        None,
+    ));
+    id
+}
+
+#[test]
+fn finish_batch_records_launch_events_after_the_transition() {
+    let root = temporary_root("finish-batch-ok");
+    let workspace = temporary_root("workspace");
+    let id = begin_id(&root, "claude", "stop", &workspace);
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"native","launch_mode":"claude_bg"}]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--action",
+            "spawn_worker",
+            "--events-stdin",
+        ],
+        batch,
+    );
+    ok(&output);
+    assert_eq!(event_count(&root), 1);
+    let (event, phase, launch) = store(&root)
+        .query_row(
+            "SELECT event, phase, launch_mode FROM hook_event WHERE hook_run_id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (event.as_str(), phase.as_str(), launch.as_str()),
+        ("ingest_visibility", "launch", "claude_bg")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn finish_stays_ok_and_inserts_nothing_when_the_batch_is_rejected() {
+    // One invalid member (recursion guard has no spawn_worker parent) rejects the
+    // whole batch, and the batch failure is fail-open: finish still succeeds.
+    let root = temporary_root("finish-batch-atomic");
+    let workspace = temporary_root("workspace");
+    let id = begin_id(&root, "claude", "stop", &workspace);
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"native","launch_mode":"claude_bg"},{"event":"claude_recursion_guard","outcome":"refused","agent_type":"loam:ingestor"}]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--action",
+            "spawn_worker",
+            "--events-stdin",
+        ],
+        batch,
+    );
+    ok(&output);
+    assert_eq!(event_count(&root), 0);
+    assert_eq!(
+        store(&root)
+            .query_row(
+                "SELECT status FROM hook_run WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "succeeded"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn finish_ignores_a_malformed_or_oversized_or_wrong_schema_batch() {
+    for batch in [
+        // unknown envelope key
+        r#"{"schema":1,"events":[{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"native","launch_mode":"x"}],"extra":1}"#.to_owned(),
+        // unknown event field
+        r#"{"schema":1,"events":[{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"native","launch_mode":"x","bogus":"y"}]}"#.to_owned(),
+        // wrong schema
+        r#"{"schema":2,"events":[{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"native","launch_mode":"x"}]}"#.to_owned(),
+        // empty events array
+        r#"{"schema":1,"events":[]}"#.to_owned(),
+        // empty stdin
+        String::new(),
+        // seventeen events (over the 16 cap)
+        format!(
+            "{{\"schema\":1,\"events\":[{}]}}",
+            vec![r#"{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"native","launch_mode":"x"}"#; 17].join(",")
+        ),
+    ] {
+        let root = temporary_root("finish-batch-malformed");
+        let workspace = temporary_root("workspace");
+        let id = begin_id(&root, "claude", "stop", &workspace);
+        let id_str = id.to_string();
+        let output = loam_stdin(
+            &[
+                "hooks", "finish", root.to_str().unwrap(), "--id", &id_str,
+                "--status", "succeeded", "--action", "spawn_worker", "--events-stdin",
+            ],
+            &batch,
+        );
+        ok(&output);
+        assert_eq!(event_count(&root), 0, "batch should have been rejected: {batch}");
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn external_worker_start_persists_proof_and_transition_atomically() {
+    let root = temporary_root("worker-start-external");
+    let id = continued_request_worker(&root);
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[{"event":"subagent","phase":"start","outcome":"observed","agent_type":"loam_ingestor","session_id":"child-1"}]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "worker-start",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--origin",
+            "external",
+            "--session-id",
+            "child-1",
+            "--events-stdin",
+        ],
+        batch,
+    );
+    ok(&output);
+    assert_eq!(worker_status(&root, id).as_deref(), Some("running"));
+    assert_eq!(event_count(&root), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn external_worker_start_rolls_back_proof_when_the_transition_fails() {
+    // Proof session id and the transition session id disagree, so the external
+    // guard fails; neither the proof event nor the transition may persist.
+    let root = temporary_root("worker-start-atomic");
+    let id = continued_request_worker(&root);
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[{"event":"subagent","phase":"start","outcome":"observed","agent_type":"loam_ingestor","session_id":"child-1"}]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "worker-start",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--origin",
+            "external",
+            "--session-id",
+            "child-2",
+            "--events-stdin",
+        ],
+        batch,
+    );
+    assert_ne!(output.status.code(), Some(0));
+    assert_eq!(worker_status(&root, id).as_deref(), Some("requested"));
+    assert_eq!(event_count(&root), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_finish_flushes_its_batch_then_always_finishes() {
+    let root = temporary_root("worker-finish-batch");
+    let id = continued_request_worker(&root);
+    let id_str = id.to_string();
+    // Bind the external worker with its start proof.
+    ok(&loam_stdin(
+        &[
+            "hooks",
+            "worker-start",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--origin",
+            "external",
+            "--session-id",
+            "child-1",
+            "--events-stdin",
+        ],
+        r#"{"schema":1,"events":[{"event":"subagent","phase":"start","outcome":"observed","agent_type":"loam_ingestor","session_id":"child-1"}]}"#,
+    ));
+    // Worker-finish flushes a subagent/stop while still running, then finishes.
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--origin",
+            "external",
+            "--session-id",
+            "child-1",
+            "--events-stdin",
+        ],
+        r#"{"schema":1,"events":[{"event":"subagent","phase":"stop","outcome":"succeeded","agent_type":"loam_ingestor","session_id":"child-1"}]}"#,
+    );
+    ok(&output);
+    assert_eq!(worker_status(&root, id).as_deref(), Some("succeeded"));
+    assert_eq!(event_count(&root), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_finish_terminal_survives_a_rejected_batch() {
+    let root = temporary_root("worker-finish-failopen");
+    let id = continued_request_worker(&root);
+    let id_str = id.to_string();
+    ok(&loam_stdin(
+        &[
+            "hooks",
+            "worker-start",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--origin",
+            "external",
+            "--session-id",
+            "child-1",
+            "--events-stdin",
+        ],
+        r#"{"schema":1,"events":[{"event":"subagent","phase":"start","outcome":"observed","agent_type":"loam_ingestor","session_id":"child-1"}]}"#,
+    ));
+    // A malformed batch is dropped, but the terminal transition still applies.
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--origin",
+            "external",
+            "--session-id",
+            "child-1",
+            "--events-stdin",
+        ],
+        r#"{"schema":1,"events":[{"event":"subagent","phase":"stop","outcome":"succeeded","bogus":"x"}]}"#,
+    );
+    ok(&output);
+    assert_eq!(worker_status(&root, id).as_deref(), Some("succeeded"));
+    assert_eq!(event_count(&root), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_finish_batch_records_preparation_and_finalization() {
+    // Proves the exact DTO shapes the T5 worker producer emits satisfy the
+    // native preparation/finalization guards, including pre_digest == the
+    // preparation's actionable_digest.
+    let root = temporary_root("worker-prep-fin");
+    let id = finished_spawn_worker(&root, "codex");
+    ok(&worker_start(&root, id, None));
+    let id_str = id.to_string();
+    let digest = "a".repeat(64);
+    let batch = format!(
+        "{{\"schema\":1,\"events\":[\
+            {{\"event\":\"ingest_preparation\",\"outcome\":\"admitted\",\"launch_mode\":\"codex_detached\",\"lease_id\":\"lease-1\",\"actionable_digest\":\"{d}\",\"actionable_count\":3,\"deadline_ms\":1893456000000}},\
+            {{\"event\":\"ingest_finalization\",\"outcome\":\"ok\",\"lease_id\":\"lease-1\",\"pre_digest\":\"{d}\",\"post_digest\":\"{d}\",\"actionable_count\":3,\"failure_count\":0}}\
+        ]}}",
+        d = digest
+    );
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--events-stdin",
+        ],
+        &batch,
+    );
+    ok(&output);
+    assert_eq!(worker_status(&root, id).as_deref(), Some("succeeded"));
+    assert_eq!(event_count(&root), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn finish_batch_records_codex_native_continuation() {
+    // Guards the exact continuation DTO the adapter emits, including visibility.
+    let root = temporary_root("codex-continuation");
+    let workspace = temporary_root("workspace");
+    let id = begin_id(&root, "codex", "stop", &workspace);
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[{"event":"codex_native","phase":"continuation","outcome":"returned","visibility":"native"}]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "continued",
+            "--action",
+            "request_worker",
+            "--events-stdin",
+        ],
+        batch,
+    );
+    ok(&output);
+    assert_eq!(event_count(&root), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_finish_batch_records_visibility_and_delivery() {
+    // Proves the T5 visibility DTO shapes and their ordering satisfy the guards:
+    // launch before terminal, each visibility event before its delivery.
+    let root = temporary_root("worker-visibility");
+    let id = finished_spawn_worker(&root, "opencode");
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[
+        {"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"toast","launch_mode":"opencode_child"},
+        {"event":"ingest_visibility","phase":"terminal","outcome":"ok","visibility":"toast","launch_mode":"opencode_child"},
+        {"event":"visibility_delivery","phase":"launch","outcome":"aborted","visibility":"toast","launch_mode":"opencode_child"},
+        {"event":"visibility_delivery","phase":"terminal","outcome":"emitted","visibility":"toast","launch_mode":"opencode_child"}
+    ]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--events-stdin",
+        ],
+        batch,
+    );
+    ok(&output);
+    assert_eq!(event_count(&root), 4);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_finish_batch_records_claude_agent_events() {
+    // Guards the exact claude_agent_profile and claude_agent_view DTO shapes.
+    let root = temporary_root("claude-agent-events");
+    let id = finished_spawn_worker(&root, "claude");
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[
+        {"event":"claude_agent_profile","outcome":"selected","launch_mode":"claude_bg","agent_type":"loam:ingestor","manager_name":"mgr","manager_id":"mid-1","lease_id":"lease-1"},
+        {"event":"claude_agent_view","outcome":"fallback","reason":"agent_view_disabled","launch_mode":"claude_bg","fallback_launch_mode":"claude_print","visibility":"native","lease_id":"lease-1","require_visible_worker":false}
+    ]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--events-stdin",
+        ],
+        batch,
+    );
+    ok(&output);
+    assert_eq!(event_count(&root), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fallback_worker_lane_records_taken_and_finishes() {
+    // The fallback worker carries codex_native/fallback/taken in its worker-start
+    // batch; it inserts (worker_origin NULL) then the fallback transition sees it.
+    let root = temporary_root("fallback-lane");
+    let id = continued_request_worker(&root);
+    let id_str = id.to_string();
+    ok(&loam_stdin(
+        &[
+            "hooks",
+            "worker-start",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--origin",
+            "fallback",
+            "--events-stdin",
+        ],
+        r#"{"schema":1,"events":[{"event":"codex_native","phase":"fallback","outcome":"taken","visibility":"native"}]}"#,
+    ));
+    assert_eq!(worker_status(&root, id).as_deref(), Some("running"));
+    ok(&worker_finish_with_origin(
+        &root,
+        id,
+        "succeeded",
+        "ok",
+        Some("fallback"),
+        None,
+        None,
+    ));
+    assert_eq!(worker_status(&root, id).as_deref(), Some("succeeded"));
+    assert_eq!(event_count(&root), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn external_worker_finish_flushes_native_preparation_finalization_and_stop() {
+    // The native subagent SubagentStop batch: preparation and finalization
+    // (buffered across the prepare/stop boundary) flush before subagent/stop.
+    let root = temporary_root("native-subagent-finalize");
+    let id = continued_request_worker(&root);
+    let id_str = id.to_string();
+    ok(&loam_stdin(
+        &[
+            "hooks",
+            "worker-start",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--origin",
+            "external",
+            "--session-id",
+            "agent-9",
+            "--events-stdin",
+        ],
+        r#"{"schema":1,"events":[{"event":"subagent","phase":"start","outcome":"observed","agent_type":"loam_ingestor","session_id":"agent-9"}]}"#,
+    ));
+    let digest = "b".repeat(64);
+    let batch = format!(
+        "{{\"schema\":1,\"events\":[\
+            {{\"event\":\"ingest_preparation\",\"outcome\":\"admitted\",\"launch_mode\":\"codex_native\",\"lease_id\":\"l9\",\"actionable_digest\":\"{d}\",\"actionable_count\":2,\"deadline_ms\":1893456000000}},\
+            {{\"event\":\"ingest_finalization\",\"outcome\":\"ok\",\"lease_id\":\"l9\",\"pre_digest\":\"{d}\",\"post_digest\":\"{d}\",\"actionable_count\":2,\"failure_count\":0}},\
+            {{\"event\":\"subagent\",\"phase\":\"stop\",\"outcome\":\"succeeded\",\"agent_type\":\"loam_ingestor\",\"session_id\":\"agent-9\"}}\
+        ]}}",
+        d = digest
+    );
+    ok(&loam_stdin(
+        &[
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--origin",
+            "external",
+            "--session-id",
+            "agent-9",
+            "--events-stdin",
+        ],
+        &batch,
+    ));
+    assert_eq!(worker_status(&root, id).as_deref(), Some("succeeded"));
+    assert_eq!(event_count(&root), 4);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_finish_batch_on_a_pruned_parent_inserts_nothing_and_does_not_crash() {
+    // S9: retention pruned the parent before a long worker flushed. The batch is
+    // dropped fail-open and the terminal transition reports failure — no crash,
+    // no partial insert.
+    let root = temporary_root("pruned-parent");
+    let id = finished_spawn_worker(&root, "codex");
+    store(&root)
+        .execute("DELETE FROM hook_run WHERE id = ?1", params![id])
+        .unwrap();
+    let id_str = id.to_string();
+    let batch = r#"{"schema":1,"events":[{"event":"ingest_visibility","phase":"launch","outcome":"started","visibility":"toast","launch_mode":"opencode_child"}]}"#;
+    let output = loam_stdin(
+        &[
+            "hooks",
+            "worker-finish",
+            root.to_str().unwrap(),
+            "--id",
+            &id_str,
+            "--status",
+            "succeeded",
+            "--reason",
+            "ok",
+            "--events-stdin",
+        ],
+        batch,
+    );
+    assert_ne!(output.status.code(), Some(0));
+    assert_eq!(event_count(&root), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lifecycle_without_events_stdin_is_unchanged() {
+    let root = temporary_root("no-events-flag");
+    let id = finished_spawn_worker(&root, "claude");
+    assert_eq!(event_count(&root), 0);
+    assert_eq!(
+        store(&root)
+            .query_row(
+                "SELECT action FROM hook_run WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "spawn_worker"
+    );
+    fs::remove_dir_all(root).unwrap();
+}

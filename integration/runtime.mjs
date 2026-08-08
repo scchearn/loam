@@ -59,13 +59,15 @@ function withTimeout(task, timeoutMs) {
   });
 }
 
-function spawnRuntime({ runtimePath, args, cwd, timeoutMs }) {
+function spawnRuntime({ runtimePath, args, cwd, timeoutMs, input }) {
   return new Promise((resolvePromise) => {
     const child = spawn(runtimePath, args, {
       cwd,
       shell: false,
       windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      // Open stdin only when there is a bounded payload to write; the no-input
+      // path keeps stdin closed exactly as before.
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
     let stderr = '';
@@ -98,12 +100,20 @@ function spawnRuntime({ runtimePath, args, cwd, timeoutMs }) {
       finish({ code: null, signal: null, category: 'runtime_error' });
     });
     child.once('close', (code, signal) => finish({ code, signal }));
+    if (input !== undefined) {
+      // Fail-open: a child that exits before reading its stdin raises EPIPE on
+      // the write; swallow it so the bounded result still resolves normally.
+      child.stdin?.on('error', () => {});
+      child.stdin?.end(String(input));
+    }
   });
 }
 
-export function invokeRuntime({ runtimePath: executable, args = [], cwd, timeoutMs = 5000, runner } = {}) {
+export function invokeRuntime({ runtimePath: executable, args = [], cwd, timeoutMs = 5000, input, runner } = {}) {
   return withTimeout(
-    () => (runner ? runner({ runtimePath: executable, args, cwd, timeoutMs }) : spawnRuntime({ runtimePath: executable, args, cwd, timeoutMs })),
+    () => (runner
+      ? runner({ runtimePath: executable, args, cwd, timeoutMs, input })
+      : spawnRuntime({ runtimePath: executable, args, cwd, timeoutMs, input })),
     timeoutMs,
   );
 }

@@ -42,19 +42,24 @@ async function writeAtomicFile(path, contents) {
 function numeric(value, fallback) { const parsed = Number(value); return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback; }
 function visibility(value) { return ['silent', 'toast', 'native'].includes(value) ? value : DEFAULTS.visibility; }
 
+// Returns the delivery outcome so callers can emit a matching visibility_delivery
+// event: 'emitted' (fulfilled), 'failed' (threw/rejected), 'aborted' (250 ms
+// deadline won), or null when no attempt was made (silent, or no notifier).
 async function sendNotification(notify, configuredVisibility, event) {
-  if (configuredVisibility === 'silent' || typeof notify !== 'function') return;
+  if (configuredVisibility === 'silent' || typeof notify !== 'function') return null;
   // Contract: notifiers must pass this signal to every resource they open; the seam cannot cancel resources that ignore it.
   const controller = new AbortController();
   let timer;
   try {
-    await Promise.race([
-      Promise.resolve().then(() => notify({ ...event, visibility: configuredVisibility, signal: controller.signal })),
+    return await Promise.race([
+      Promise.resolve()
+        .then(() => notify({ ...event, visibility: configuredVisibility, signal: controller.signal }))
+        .then(() => 'emitted', () => 'failed'),
       new Promise((resolvePromise) => {
-        timer = setTimeout(() => { controller.abort(); resolvePromise(); }, NOTIFICATION_TIMEOUT_MS);
+        timer = setTimeout(() => { controller.abort(); resolvePromise('aborted'); }, NOTIFICATION_TIMEOUT_MS);
       }),
     ]);
-  } catch {}
+  } catch { return 'failed'; }
   finally { clearTimeout(timer); }
 }
 
@@ -97,7 +102,9 @@ function recursion(payload, env) {
 export async function gate({ harness, payload = {}, globalRoot, env = process.env, now = Date.now() } = {}) {
   const config = await readIngestConfig(globalRoot, env);
   if (!config.enabled) return { action: 'skip', reason: 'disabled' };
-  if (recursion(payload, env)) return { action: 'skip', reason: 'disabled' };
+  // Mark the recursion refusal distinctly from a config-disabled skip so the
+  // hook-finish producer can emit claude_recursion_guard only for the former.
+  if (recursion(payload, env)) return { action: 'skip', reason: 'disabled', recursion: true };
   const workspace = await canonicalWorkspace(payloadWorkspace(payload));
   const root = runRoot(globalRoot, workspace);
   await ensureRoot(root);
@@ -113,7 +120,7 @@ export async function gate({ harness, payload = {}, globalRoot, env = process.en
 }
 
 export function startWorker({
-  harness, workspace, globalRoot, skillsRoot, workerPath, hookRunId,
+  harness, workspace, globalRoot, skillsRoot, workerPath, hookRunId, workerOrigin,
   env = process.env, spawn = spawnDetached,
 } = {}) {
   if (!workerPath) throw new Error('installed ingestion worker is unavailable');
@@ -122,6 +129,7 @@ export function startWorker({
     args: [
       workerPath, '--harness', harness, '--workspace', resolve(workspace),
       ...(Number.isSafeInteger(hookRunId) && hookRunId > 0 ? ['--hook-run-id', String(hookRunId)] : []),
+      ...(workerOrigin === 'fallback' ? ['--worker-origin', 'fallback'] : []),
     ],
     cwd: resolve(workspace),
     env: { ...env, LOAM_INGEST_WORKER: '1', LOAM_INGEST_GLOBAL_ROOT: resolve(globalRoot), ...(skillsRoot ? { LOAM_INGEST_SKILLS_ROOT: resolve(skillsRoot) } : {}) },
@@ -324,11 +332,14 @@ export async function bindNativeAgent({ globalRoot, workspace, agentId, now = Da
 function persistedPreparation(prepared) {
   const {
     action, harness, workspace, globalRoot, skillsRoot, platform, root,
-    config, lease, readiness, exclusionsPath, fingerprint,
+    config, lease, readiness, exclusionsPath, fingerprint, events,
   } = prepared;
   return {
     action, harness, workspace, globalRoot, skillsRoot, platform, root,
     config, lease, readiness, exclusionsPath, fingerprint,
+    // Carry the buffered preparation event across the native prepare/stop
+    // process boundary so finalization can find its causal parent.
+    events: Array.isArray(events) ? events : [],
   };
 }
 
@@ -450,13 +461,25 @@ export async function finalizeNativeAgentRun({
     outcome = { reason: 'unavailable' };
   }
   await finishNativeRecord(paths, record, { state: 'finished', prepared: null, result: outcome });
-  return { reason: outcome.reason || 'unavailable', ...resultBase };
+  return { reason: outcome.reason || 'unavailable', events: prepared.events, ...resultBase };
 }
 
 async function startBoundaryWorker(options, result, { nativeFallback = false, intentId } = {}) {
   try {
-    startWorker({ ...options, workerPath: await installedWorkerPath(options.globalRoot), workspace: result.workspace });
-    return nativeFallback ? { ...result, native_fallback: true } : result;
+    const workerPath = await installedWorkerPath(options.globalRoot);
+    const launch = () => startWorker({
+      ...options, workerPath, workspace: result.workspace,
+      ...(nativeFallback ? { workerOrigin: 'fallback' } : {}),
+    });
+    const outcome = nativeFallback ? { ...result, native_fallback: true } : result;
+    if (options.deferSpawn) {
+      // S1: hand the physical spawn back so the caller runs it only after
+      // hook-finish returns, letting the worker's worker-start reliably see the
+      // finished parent. The spawn stays best-effort and fail-open.
+      return { ...outcome, spawn: async () => { try { launch(); } catch {} } };
+    }
+    launch();
+    return outcome;
   } catch (error) {
     if (intentId) await clearNativeFallback(options.globalRoot, result.workspace, intentId).catch(() => {});
     return { action: 'skip', reason: 'unavailable', detail: error.message };
@@ -954,7 +977,7 @@ async function recordProgress(root, pre, post, count, lease) {
       failure_count: failureCount, backoff_until: backoff,
       ...(lease.downgrade_reason ? { downgrade_reason: lease.downgrade_reason } : {}),
     });
-    return { recorded: true, status };
+    return { recorded: true, status, failureCount, backoff };
   } catch {
     return { recorded: false, status: 'failed' };
   }
@@ -973,6 +996,9 @@ export async function prepareWorkerRun({
   if (leaseResult.status !== 'acquired') return { action: 'skip', result: { reason: 'unavailable' } };
   const lease = leaseResult.lease;
   let leaseHandled = false;
+  // Typed events buffered here and flushed at worker-finish (T5). Only the
+  // reusable preparation/finalization telemetry is projected at its point.
+  const events = [];
   const skip = async (reason, fields = {}) => {
     await writeSkip(root, reason, {
       ...(lease.downgrade_reason ? { downgrade_reason: lease.downgrade_reason } : {}),
@@ -980,7 +1006,8 @@ export async function prepareWorkerRun({
     }, lease.lease_id);
     await releaseLease(root, lease.lease_id);
     leaseHandled = true;
-    return { action: 'skip', result: { reason: publicReason(reason) } };
+    events.push({ event: 'ingest_preparation', outcome: 'skipped', reason: publicReason(reason) });
+    return { action: 'skip', result: { reason: publicReason(reason), events } };
   };
   try {
     if (!config.enabled) return await skip('disabled');
@@ -1020,6 +1047,7 @@ export async function prepareWorkerRun({
             launch_at: new Date().toISOString(),
             owner_identity: { pid: lease.owner_pid, boot_id: lease.boot_id, process_start: lease.process_start },
           };
+    const hardDeadlineMs = Date.now() + config.timeout_seconds * 1000;
     if (!(await updateLease(root, lease, {
       actionable_fingerprint: fingerprint.fingerprint,
       actionable_count: fingerprint.count,
@@ -1028,14 +1056,32 @@ export async function prepareWorkerRun({
       planned_identity: plannedIdentity,
       child_identity: selectedLaunchMode === 'codex_native' ? { agent_id: nativeAgentId } : null,
       downgrade_reason: selectedLaunch.downgradeReason || null,
-      hard_deadline: new Date(Date.now() + config.timeout_seconds * 1000).toISOString(),
+      hard_deadline: new Date(hardDeadlineMs).toISOString(),
     }))) return await skip('orphan_unknown');
+    if (harness === 'claude' && selectedLaunch.downgradeReason) {
+      // Agent View downgraded to the invisible claude_print path: record whether
+      // the fallback was taken or refused by policy (S: claude_agent_view).
+      events.push({
+        event: 'claude_agent_view',
+        outcome: config.require_visible_worker ? 'refused' : 'fallback',
+        reason: selectedLaunch.downgradeReason,
+        launch_mode: 'claude_bg', fallback_launch_mode: 'claude_print',
+        visibility: config.visibility, lease_id: lease.lease_id,
+        require_visible_worker: config.require_visible_worker,
+      });
+    }
     if (selectedLaunch.downgradeReason && config.require_visible_worker) return await skip(selectedLaunch.downgradeReason);
     leaseHandled = true;
+    events.push({
+      event: 'ingest_preparation', outcome: 'admitted',
+      launch_mode: selectedLaunchMode, lease_id: lease.lease_id,
+      actionable_digest: fingerprint.fingerprint, actionable_count: fingerprint.count,
+      deadline_ms: hardDeadlineMs,
+    });
     return {
       action: 'run', harness, workspace: canonical, globalRoot, skillsRoot, env, platform,
       runtimeRunner, openCodeSession, notify, root, config, lease, readiness: ready,
-      exclusionsPath, fingerprint,
+      exclusionsPath, fingerprint, events,
       intent: {
         schema: 1, lease_id: lease.lease_id, workspace: canonical, harness,
         actionable_fingerprint: fingerprint.fingerprint, actionable_count: fingerprint.count,
@@ -1107,12 +1153,54 @@ export async function finalizeWorkerRun(prepared, {
     } catch {}
     if (result.category || (typeof result.code === 'number' && result.code !== 0)) post.complete = false;
     const recorded = await recordProgress(root, fingerprint, post, fingerprint.count, lease);
+    // Finalization telemetry: omit the event entirely when either digest is
+    // unavailable rather than storing a sentinel or invalid digest (S6).
+    if (recorded.recorded && /^[a-f0-9]{64}$/i.test(fingerprint.fingerprint) && /^[a-f0-9]{64}$/i.test(post.fingerprint)) {
+      (prepared.events ||= []).push({
+        event: 'ingest_finalization', outcome: recorded.status,
+        lease_id: lease.lease_id, pre_digest: fingerprint.fingerprint, post_digest: post.fingerprint,
+        actionable_count: fingerprint.count, failure_count: recorded.failureCount,
+        ...(recorded.backoff ? { backoff_until_ms: recorded.backoff } : {}),
+      });
+    }
+    if (harness === 'claude' && lease.launch_mode === 'claude_bg') {
+      // Agent View registered: record the selected profile and its manager
+      // identity from the freshly persisted lease (S: claude_agent_profile).
+      const finalLease = await json(join(root, 'lease.json'));
+      const managerId = finalLease?.child_identity?.manager_id;
+      const managerName = finalLease?.child_identity?.manager_name;
+      if (managerId && managerName) {
+        (prepared.events ||= []).push({
+          event: 'claude_agent_profile', outcome: 'selected',
+          launch_mode: 'claude_bg', agent_type: 'loam:ingestor',
+          manager_name: managerName, manager_id: managerId, lease_id: lease.lease_id,
+        });
+      }
+    }
     if (lease.launch_mode === 'claude_bg') await pruneClaudeSessions(workspace, lease, env);
-    await launchNotification;
-    await sendNotification(notify, config.visibility, {
+    const launchDelivery = await launchNotification;
+    const terminalDelivery = await sendNotification(notify, config.visibility, {
       phase: 'terminal', harness, workspace, launchMode: lease.launch_mode,
       status: recorded.status,
     });
+    if (config.visibility !== 'silent' && typeof notify === 'function') {
+      (prepared.events ||= []).push({
+        event: 'ingest_visibility', phase: 'terminal', outcome: recorded.status,
+        visibility: config.visibility, launch_mode: lease.launch_mode,
+      });
+      if (launchDelivery) {
+        prepared.events.push({
+          event: 'visibility_delivery', phase: 'launch', outcome: launchDelivery,
+          visibility: config.visibility, launch_mode: lease.launch_mode,
+        });
+      }
+      if (terminalDelivery) {
+        prepared.events.push({
+          event: 'visibility_delivery', phase: 'terminal', outcome: terminalDelivery,
+          visibility: config.visibility, launch_mode: lease.launch_mode,
+        });
+      }
+    }
     return { reason: result?.category === 'timeout' ? 'unavailable' : 'ok' };
   } finally {
     if (!retainLease && await liveOwnedChild(root, workspace, openCodeSession, lease.lease_id, env)) retainLease = true;
@@ -1124,6 +1212,9 @@ export async function runWorker(options = {}) {
   const prepared = await prepareWorkerRun(options);
   if (prepared.action !== 'run') return prepared.result || prepared;
   const { harness, workspace, globalRoot, env, root, config, lease, openCodeSession, notify } = prepared;
+  // Attach the worker's buffered event batch to every terminal result so the
+  // detached worker can flush it at worker-finish.
+  const withEvents = (result) => ({ ...result, events: prepared.events });
   try {
     const launch = options.modelRunner
       ? await options.modelRunner({ harness, workspace, lease, root })
@@ -1134,9 +1225,15 @@ export async function runWorker(options = {}) {
           requireVisibleWorker: config.require_visible_worker,
         });
     if (launch.category) {
-      return finalizeWorkerRun(prepared, {
+      return withEvents(await finalizeWorkerRun(prepared, {
         skipReason: launch.category,
         retainLease: ['orphan_live', 'orphan_unknown'].includes(launch.category),
+      }));
+    }
+    if (config.visibility !== 'silent' && typeof notify === 'function') {
+      prepared.events.push({
+        event: 'ingest_visibility', phase: 'launch', outcome: 'started',
+        visibility: config.visibility, launch_mode: lease.launch_mode,
       });
     }
     const launchNotification = sendNotification(notify, config.visibility, {
@@ -1144,13 +1241,13 @@ export async function runWorker(options = {}) {
       identity: lease.child_identity || lease.planned_identity,
     });
     const result = await (launch.completion || Promise.resolve({ code: 0 }));
-    return finalizeWorkerRun(prepared, { launch, result, launchNotification });
+    return withEvents(await finalizeWorkerRun(prepared, { launch, result, launchNotification }));
   } catch (error) {
-    return finalizeWorkerRun(prepared, {
+    return withEvents(await finalizeWorkerRun(prepared, {
       skipReason: 'runtime_unavailable',
       skipFields: { detail: error instanceof Error ? error.message.slice(0, 256) : String(error).slice(0, 256) },
       retainLease: Boolean(lease.child_identity),
-    });
+    }));
   }
 }
 

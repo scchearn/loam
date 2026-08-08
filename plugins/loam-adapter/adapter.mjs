@@ -153,6 +153,9 @@ export async function handleMarketplaceStop(payload = {}, {
       skillsRoot: env.LOAM_INGEST_SKILLS_ROOT || resolveSkillsRoot({ env }),
       hookRunId: hookRun?.id,
       env,
+      // S1: defer the physical worker spawn so it runs after finishHookRun, so
+      // the worker's worker-start sees the finished, action-set parent.
+      deferSpawn: true,
     });
     const harvest = await loadHarvest();
     if (harvest?.harvestTick) {
@@ -172,21 +175,36 @@ export async function handleMarketplaceStop(payload = {}, {
 
   if (hookRun && finishHookRun) {
     try {
-      const recorded = harvestOutcome?.action === 'spawn_worker'
-        ? { action: harvestOutcome.action, reason: 'harvest_dispatched' }
-        : null;
-      await finishHookRun({
-        run: hookRun,
-        status: failure ? 'failed' : 'succeeded',
-        ...(failure
-          ? { detail: failure instanceof Error ? failure.message : String(failure) }
-          : recorded || {
-              action: outcome?.action,
-              ...(outcome?.reason !== undefined ? { reason: outcome.reason } : {}),
-              ...(outcome?.detail !== undefined ? { detail: outcome.detail } : {}),
-            }),
-      });
+      let finishArgs;
+      if (failure) {
+        finishArgs = { status: 'failed', detail: failure instanceof Error ? failure.message : String(failure) };
+      } else if (harness === 'codex' && outcome?.native_continuation) {
+        // The Codex native path requested a parent-model spawn without spawning
+        // one itself: record the distinct continued lane and its typed event.
+        finishArgs = {
+          status: 'continued',
+          action: 'request_worker',
+          events: [{ event: 'codex_native', phase: 'continuation', outcome: 'returned', visibility: 'native' }],
+        };
+      } else if (harvestOutcome?.action === 'spawn_worker') {
+        finishArgs = { status: 'succeeded', action: 'spawn_worker', reason: 'harvest_dispatched' };
+      } else {
+        finishArgs = {
+          status: 'succeeded',
+          action: outcome?.action,
+          ...(outcome?.reason !== undefined ? { reason: outcome.reason } : {}),
+          ...(outcome?.detail !== undefined ? { detail: outcome.detail } : {}),
+          ...(harness === 'claude' && outcome?.recursion
+            ? { events: [{ event: 'claude_recursion_guard', outcome: 'refused', agent_type: 'loam:ingestor' }] }
+            : {}),
+        };
+      }
+      await finishHookRun({ run: hookRun, ...finishArgs });
     } catch {}
+  }
+  // Spawn the detached worker only now that hook-finish has returned (S1).
+  if (typeof outcome?.spawn === 'function') {
+    try { await outcome.spawn(); } catch {}
   }
   return stopResponse({ harness, visibility, outcome, failure });
 }
@@ -246,7 +264,16 @@ export async function handleMarketplaceSubagentStart(payload = {}, {
     if (bound?.status !== 'bound' && bound?.status !== 'late') return {};
     const run = bound.owns_claim ? nativeHookRun(bound, globalRoot) : null;
     if (run) {
-      try { await (await loadHooks()).startHookWorker?.({ run, sessionId: bound.agent_id }); } catch {}
+      // The observed native subagent is the external worker-start proof; the
+      // native command inserts it and the transition together, all-or-nothing.
+      try {
+        await (await loadHooks()).startHookWorker?.({
+          run,
+          sessionId: bound.agent_id,
+          origin: 'external',
+          events: [{ event: 'subagent', phase: 'start', outcome: 'observed', agent_type: 'loam_ingestor', session_id: bound.agent_id }],
+        });
+      } catch {}
     }
     return {
       hookSpecificOutput: {
@@ -277,7 +304,22 @@ export async function handleMarketplaceSubagentStop(payload = {}, {
     });
     const run = result?.owns_claim ? nativeHookRun(result, globalRoot) : null;
     if (run) {
-      try { await (await loadHooks()).finishHookWorker?.({ run, reason: result.reason }); } catch {}
+      const stopOutcome = result.reason === 'ok' ? 'succeeded'
+        : result.reason === 'unavailable' ? 'failed' : 'skipped';
+      try {
+        await (await loadHooks()).finishHookWorker?.({
+          run,
+          reason: result.reason,
+          origin: 'external',
+          sessionId: payload.agent_id,
+          // The native run's preparation/finalization (buffered across the
+          // prepare/stop boundary) flush before the subagent/stop proof.
+          events: [
+            ...(Array.isArray(result.events) ? result.events : []),
+            { event: 'subagent', phase: 'stop', outcome: stopOutcome, agent_type: 'loam_ingestor', session_id: payload.agent_id },
+          ],
+        });
+      } catch {}
     }
   } catch {}
   return {};

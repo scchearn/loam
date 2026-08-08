@@ -131,8 +131,8 @@ test('boundary gate honors config and environment precedence and blocks worker r
 
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { enabled: true } }));
   assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
-  assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_WORKER: '1' } }), { action: 'skip', reason: 'disabled' });
-  assert.deepEqual(await gate({ ...options, payload: { cwd: workspace, agent_type: 'loam:ingestor' }, env: {} }), { action: 'skip', reason: 'disabled' });
+  assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_WORKER: '1' } }), { action: 'skip', reason: 'disabled', recursion: true });
+  assert.deepEqual(await gate({ ...options, payload: { cwd: workspace, agent_type: 'loam:ingestor' }, env: {} }), { action: 'skip', reason: 'disabled', recursion: true });
   assert.equal((await gate({ ...options, payload: { cwd: workspace, agent_type: 'other-agent' }, env: {} })).action, 'spawn_worker');
 });
 
@@ -226,6 +226,20 @@ test('notification launch is non-blocking and terminal status follows persisted 
   assert.equal(launchNotificationSettled, true, 'deadline must settle an abort-aware notification resource');
   assert.equal(calls[1].signal.aborted, false);
   assert.equal(calls[1].status, stored.status);
+  // T5: the worker buffered visibility launch/terminal + delivery events in order.
+  assert.deepEqual(result.events.map((e) => `${e.event}/${e.phase ?? 'none'}`), [
+    'ingest_preparation/none',
+    'ingest_visibility/launch',
+    'ingest_finalization/none',
+    'ingest_visibility/terminal',
+    'visibility_delivery/launch',
+    'visibility_delivery/terminal',
+  ]);
+  assert.equal(result.events[1].visibility, 'toast');
+  assert.equal(result.events[1].launch_mode, result.events[3].launch_mode);
+  assert.equal(result.events[3].outcome, stored.status);
+  assert.ok(['emitted', 'failed', 'aborted'].includes(result.events[4].outcome));
+  assert.ok(['emitted', 'failed', 'aborted'].includes(result.events[5].outcome));
 });
 
 test('silent and failing notifications cannot change ingestion state or exceed two calls', async () => {
@@ -655,6 +669,20 @@ test('worker preparation and finalization expose one reusable safety lifecycle',
     result: { code: 0 },
   });
   assert.equal(result.reason, 'ok');
+  // T5: the worker buffered a typed preparation-admitted then finalization event.
+  assert.equal(prepared.events.length, 2);
+  assert.deepEqual(prepared.events[0], {
+    event: 'ingest_preparation', outcome: 'admitted',
+    launch_mode: prepared.lease.launch_mode, lease_id: prepared.lease.lease_id,
+    actionable_digest: prepared.fingerprint.fingerprint, actionable_count: 1,
+    deadline_ms: prepared.events[0].deadline_ms,
+  });
+  assert.ok(Number.isInteger(prepared.events[0].deadline_ms) && prepared.events[0].deadline_ms > 0);
+  assert.equal(prepared.events[1].event, 'ingest_finalization');
+  assert.equal(prepared.events[1].outcome, 'ok');
+  assert.equal(prepared.events[1].pre_digest, prepared.fingerprint.fingerprint);
+  assert.equal(prepared.events[1].post_digest.length, 64);
+  assert.equal(prepared.events[1].actionable_count, 1);
   assert.equal(JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8')).status, 'ok');
   await assert.rejects(() => readFile(join(runRoot(root, workspace), 'lease.json')), (error) => error.code === 'ENOENT');
 
@@ -665,7 +693,13 @@ test('worker preparation and finalization expose one reusable safety lifecycle',
     runtimeRunner: async () => ({ code: 0, stdout: JSON.stringify({ wiki_root: '', hints: [] }), stderr: '' }),
     env: { LOAM_INGEST_BACKGROUND: '1' },
   });
-  assert.deepEqual(skipped, { action: 'skip', result: { reason: 'nothing_to_do' } });
+  assert.deepEqual(skipped, {
+    action: 'skip',
+    result: {
+      reason: 'nothing_to_do',
+      events: [{ event: 'ingest_preparation', outcome: 'skipped', reason: 'nothing_to_do' }],
+    },
+  });
   await assert.rejects(() => readFile(join(runRoot(skippedRoot, workspace), 'lease.json')), (error) => error.code === 'ENOENT');
 });
 
@@ -720,7 +754,13 @@ test('worker preparation preserves skip classifications and never strands its le
       readiness: item.readiness || { ready: true, runtimePath: '/private/loam' },
       runtimeRunner, env: item.env || { LOAM_INGEST_BACKGROUND: '1' },
     });
-    assert.deepEqual(skipped, { action: 'skip', result: { reason: item.expected } }, item.name);
+    assert.deepEqual(skipped, {
+      action: 'skip',
+      result: {
+        reason: item.expected,
+        events: [{ event: 'ingest_preparation', outcome: 'skipped', reason: item.expected }],
+      },
+    }, item.name);
     const stored = JSON.parse(await readFile(join(runRoot(globalRoot, workspace), 'last-run.json'), 'utf8'));
     assert.equal(stored.status, 'skipped', item.name);
     assert.equal(stored.detail, item.detail, item.name);

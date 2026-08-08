@@ -1041,6 +1041,10 @@ test('harvest_run: the detached worker parses its argv and reports through hook 
   const result = await main({
     harness: 'claude', workspace: '/workspace', sessionId: 'sess-w', hookRunId: 7,
     globalRoot: '/global',
+    // Inject skillsRoot so the assertion is hermetic: without it the worker falls
+    // back to the module-level resolveSkillsRoot, which is undefined only where the
+    // integration is not installed (CI) and leaks the real ~/.agents/skills locally.
+    skillsRoot: '/sandbox/skills',
     runHarvest: async (input) => {
       calls.push(input);
       return { reason: 'wiki_missing' };
@@ -1053,7 +1057,7 @@ test('harvest_run: the detached worker parses its argv and reports through hook 
     ['start', { run: { id: 7, globalRoot: '/global', workspace: '/workspace' } }],
     {
       harness: 'claude', workspace: '/workspace', sessionId: 'sess-w', globalRoot: '/global',
-      skillsRoot: undefined, env: process.env,
+      skillsRoot: '/sandbox/skills', env: process.env,
     },
     ['finish', { run: { id: 7, globalRoot: '/global', workspace: '/workspace' }, reason: 'wiki_missing' }],
   ]);

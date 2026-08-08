@@ -1,10 +1,16 @@
+use crate::json::{self, Value};
 use chrono::{SecondsFormat, TimeZone, Utc};
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DATABASE_NAME: &str = "loam.sqlite3";
+// A lifecycle batch rides one bounded stdin frame; producers project each event
+// at its observation point so this stays diagnostic metadata, never a payload.
+const EVENT_BATCH_MAX_BYTES: usize = 16 * 1024;
+const EVENT_BATCH_MAX_EVENTS: usize = 16;
 // This is a wait ceiling under contention, not a delay on uncontended operations.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const SCHEMA_VERSION: i64 = 2;
@@ -170,6 +176,7 @@ struct FinishArgs {
     action: Option<FinishAction>,
     reason: Option<String>,
     detail: Option<String>,
+    events_stdin: bool,
 }
 
 fn parse_finish(args: Vec<String>) -> Result<FinishArgs, String> {
@@ -180,6 +187,7 @@ fn parse_finish(args: Vec<String>) -> Result<FinishArgs, String> {
     let mut action = None;
     let mut reason = None;
     let mut detail = None;
+    let mut events_stdin = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--id" => take_value(&mut id, &flag, &mut args)?,
@@ -187,6 +195,7 @@ fn parse_finish(args: Vec<String>) -> Result<FinishArgs, String> {
             "--action" => take_value(&mut action, &flag, &mut args)?,
             "--reason" => take_value(&mut reason, &flag, &mut args)?,
             "--detail" => take_value(&mut detail, &flag, &mut args)?,
+            "--events-stdin" => events_stdin = true,
             _ => return Err(format!("unknown option {flag}")),
         }
     }
@@ -232,6 +241,7 @@ fn parse_finish(args: Vec<String>) -> Result<FinishArgs, String> {
         action,
         reason,
         detail,
+        events_stdin,
     })
 }
 
@@ -240,6 +250,7 @@ struct WorkerStartArgs {
     id: i64,
     origin: WorkerOrigin,
     session_id: Option<String>,
+    events_stdin: bool,
 }
 
 fn parse_worker_start(args: Vec<String>) -> Result<WorkerStartArgs, String> {
@@ -248,11 +259,13 @@ fn parse_worker_start(args: Vec<String>) -> Result<WorkerStartArgs, String> {
     let mut id = None;
     let mut origin = None;
     let mut session_id = None;
+    let mut events_stdin = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--id" => take_value(&mut id, &flag, &mut args)?,
             "--origin" => take_value(&mut origin, &flag, &mut args)?,
             "--session-id" => take_value(&mut session_id, &flag, &mut args)?,
+            "--events-stdin" => events_stdin = true,
             _ => return Err(format!("unknown option {flag}")),
         }
     }
@@ -271,6 +284,7 @@ fn parse_worker_start(args: Vec<String>) -> Result<WorkerStartArgs, String> {
         id: positive_id(id)?,
         origin,
         session_id,
+        events_stdin,
     })
 }
 
@@ -282,6 +296,7 @@ struct WorkerFinishArgs {
     origin: WorkerOrigin,
     session_id: Option<String>,
     detail: Option<String>,
+    events_stdin: bool,
 }
 
 fn parse_worker_finish(args: Vec<String>) -> Result<WorkerFinishArgs, String> {
@@ -293,6 +308,7 @@ fn parse_worker_finish(args: Vec<String>) -> Result<WorkerFinishArgs, String> {
     let mut origin = None;
     let mut session_id = None;
     let mut detail = None;
+    let mut events_stdin = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--id" => take_value(&mut id, &flag, &mut args)?,
@@ -301,6 +317,7 @@ fn parse_worker_finish(args: Vec<String>) -> Result<WorkerFinishArgs, String> {
             "--origin" => take_value(&mut origin, &flag, &mut args)?,
             "--session-id" => take_value(&mut session_id, &flag, &mut args)?,
             "--detail" => take_value(&mut detail, &flag, &mut args)?,
+            "--events-stdin" => events_stdin = true,
             _ => return Err(format!("unknown option {flag}")),
         }
     }
@@ -339,6 +356,7 @@ fn parse_worker_finish(args: Vec<String>) -> Result<WorkerFinishArgs, String> {
         origin,
         session_id,
         detail,
+        events_stdin,
     })
 }
 
@@ -656,37 +674,99 @@ fn parse_event(args: Vec<String>) -> Result<EventArgs, String> {
             _ => return Err(format!("unknown option {flag}")),
         }
     }
+    let id = positive_id(id)?;
+    let fields = EventFields {
+        event,
+        phase,
+        outcome,
+        reason,
+        visibility,
+        launch_mode,
+        fallback_launch_mode,
+        agent_type,
+        session_id,
+        parent_session_id,
+        manager_name,
+        manager_id,
+        lease_id,
+        require_visible_worker,
+        detail,
+        actionable_digest,
+        pre_digest,
+        post_digest,
+        actionable_count,
+        failure_count,
+        deadline_ms,
+        backoff_until_ms,
+    };
+    build_event(root, id, fields)
+}
+
+/// The raw string form of one event's fields, before typed parsing. The argv
+/// `event` command and the `--events-stdin` batch both fill this, so a single
+/// `build_event` owns the typed matrix and neither entry path validates twice.
+#[derive(Default)]
+struct EventFields {
+    event: Option<String>,
+    phase: Option<String>,
+    outcome: Option<String>,
+    reason: Option<String>,
+    visibility: Option<String>,
+    launch_mode: Option<String>,
+    fallback_launch_mode: Option<String>,
+    agent_type: Option<String>,
+    session_id: Option<String>,
+    parent_session_id: Option<String>,
+    manager_name: Option<String>,
+    manager_id: Option<String>,
+    lease_id: Option<String>,
+    require_visible_worker: Option<String>,
+    detail: Option<String>,
+    actionable_digest: Option<String>,
+    pre_digest: Option<String>,
+    post_digest: Option<String>,
+    actionable_count: Option<String>,
+    failure_count: Option<String>,
+    deadline_ms: Option<String>,
+    backoff_until_ms: Option<String>,
+}
+
+fn build_event(root: PathBuf, id: i64, fields: EventFields) -> Result<EventArgs, String> {
     let mut parsed = EventArgs {
         root,
-        id: positive_id(id)?,
-        event: EventKind::parse(event)?,
-        phase: EventPhase::parse(phase)?,
-        outcome: EventOutcome::parse(outcome)?,
-        reason: optional_identifier(reason, "reason")?,
-        visibility: Visibility::parse(visibility)?,
-        launch_mode: optional_identifier(launch_mode, "launch-mode")?,
-        fallback_launch_mode: optional_identifier(fallback_launch_mode, "fallback-launch-mode")?,
-        agent_type,
-        session_id: optional_event_identity(session_id, "session id")?,
-        parent_session_id: optional_event_identity(parent_session_id, "parent session id")?,
-        manager_name: optional_event_identity(manager_name, "manager name")?,
-        manager_id: optional_event_identity(manager_id, "manager id")?,
-        lease_id: optional_event_identity(lease_id, "lease id")?,
-        require_visible_worker: require_visible_worker
+        id,
+        event: EventKind::parse(fields.event)?,
+        phase: EventPhase::parse(fields.phase)?,
+        outcome: EventOutcome::parse(fields.outcome)?,
+        reason: optional_identifier(fields.reason, "reason")?,
+        visibility: Visibility::parse(fields.visibility)?,
+        launch_mode: optional_identifier(fields.launch_mode, "launch-mode")?,
+        fallback_launch_mode: optional_identifier(
+            fields.fallback_launch_mode,
+            "fallback-launch-mode",
+        )?,
+        agent_type: fields.agent_type,
+        session_id: optional_event_identity(fields.session_id, "session id")?,
+        parent_session_id: optional_event_identity(fields.parent_session_id, "parent session id")?,
+        manager_name: optional_event_identity(fields.manager_name, "manager name")?,
+        manager_id: optional_event_identity(fields.manager_id, "manager id")?,
+        lease_id: optional_event_identity(fields.lease_id, "lease id")?,
+        require_visible_worker: fields
+            .require_visible_worker
             .map(|value| match value.as_str() {
                 "true" => Ok(true),
                 "false" => Ok(false),
                 _ => Err("require-visible-worker must be true or false".to_owned()),
             })
             .transpose()?,
-        detail,
-        actionable_digest: optional_digest(actionable_digest, "actionable digest")?,
-        pre_digest: optional_digest(pre_digest, "pre digest")?,
-        post_digest: optional_digest(post_digest, "post digest")?,
-        actionable_count: optional_non_negative_i64(actionable_count, "actionable count")?,
-        failure_count: optional_non_negative_i64(failure_count, "failure count")?,
-        deadline_ms: optional_positive_i64(deadline_ms, "deadline")?,
-        backoff_until_ms: optional_positive_i64(backoff_until_ms, "backoff deadline")?,
+        detail: fields.detail,
+        actionable_digest: optional_digest(fields.actionable_digest, "actionable digest")?,
+        pre_digest: optional_digest(fields.pre_digest, "pre digest")?,
+        post_digest: optional_digest(fields.post_digest, "post digest")?,
+        actionable_count: optional_non_negative_i64(fields.actionable_count, "actionable count")?,
+        failure_count: optional_non_negative_i64(fields.failure_count, "failure count")?,
+        deadline_ms: optional_positive_i64(fields.deadline_ms, "deadline")?,
+        backoff_until_ms: optional_positive_i64(fields.backoff_until_ms, "backoff deadline")?,
     };
     if parsed
         .detail
@@ -704,6 +784,118 @@ fn parse_event(args: Vec<String>) -> Result<EventArgs, String> {
         .transpose()?;
     validate_event(&parsed)?;
     Ok(parsed)
+}
+
+/// Builds one event from a batch JSON object, enforcing the closed key set and
+/// each field's scalar type before the shared `build_event` matrix runs. String
+/// fields must be JSON strings, counts/deadlines JSON numbers, and the policy
+/// flag a JSON boolean, so an array, object, or null can never slip through.
+fn event_from_json(root: PathBuf, id: i64, value: &Value) -> Result<EventArgs, String> {
+    let Value::Object(entries) = value else {
+        return Err("batch event must be a JSON object".to_owned());
+    };
+    let mut fields = EventFields::default();
+    for (key, item) in entries {
+        let slot = match key.as_str() {
+            "event" => &mut fields.event,
+            "phase" => &mut fields.phase,
+            "outcome" => &mut fields.outcome,
+            "reason" => &mut fields.reason,
+            "visibility" => &mut fields.visibility,
+            "launch_mode" => &mut fields.launch_mode,
+            "fallback_launch_mode" => &mut fields.fallback_launch_mode,
+            "agent_type" => &mut fields.agent_type,
+            "session_id" => &mut fields.session_id,
+            "parent_session_id" => &mut fields.parent_session_id,
+            "manager_name" => &mut fields.manager_name,
+            "manager_id" => &mut fields.manager_id,
+            "lease_id" => &mut fields.lease_id,
+            "require_visible_worker" => &mut fields.require_visible_worker,
+            "detail" => &mut fields.detail,
+            "actionable_digest" => &mut fields.actionable_digest,
+            "pre_digest" => &mut fields.pre_digest,
+            "post_digest" => &mut fields.post_digest,
+            "actionable_count" => &mut fields.actionable_count,
+            "failure_count" => &mut fields.failure_count,
+            "deadline_ms" => &mut fields.deadline_ms,
+            "backoff_until_ms" => &mut fields.backoff_until_ms,
+            _ => return Err(format!("batch event has unknown field {key}")),
+        };
+        if slot.is_some() {
+            return Err(format!("batch event repeats field {key}"));
+        }
+        *slot = Some(json_event_field(key, item)?);
+    }
+    build_event(root, id, fields)
+}
+
+fn json_event_field(key: &str, item: &Value) -> Result<String, String> {
+    match key {
+        "actionable_count" | "failure_count" | "deadline_ms" | "backoff_until_ms" => match item {
+            Value::Number(literal) => Ok(literal.clone()),
+            _ => Err(format!("batch event field {key} must be a number")),
+        },
+        "require_visible_worker" => match item {
+            Value::Bool(flag) => Ok(if *flag { "true" } else { "false" }.to_owned()),
+            _ => Err(format!("batch event field {key} must be a boolean")),
+        },
+        _ => match item {
+            Value::String(text) => Ok(text.clone()),
+            _ => Err(format!("batch event field {key} must be a string")),
+        },
+    }
+}
+
+/// Reads the bounded `{"schema":1,"events":[...]}` frame from stdin and builds
+/// every event up front, so a single malformed member rejects the whole batch
+/// before any insert. Byte and count bounds are enforced before parsing.
+fn read_events_batch(root: &Path, id: i64) -> Result<Vec<EventArgs>, String> {
+    let mut input = String::new();
+    std::io::stdin()
+        .take((EVENT_BATCH_MAX_BYTES + 1) as u64)
+        .read_to_string(&mut input)
+        .map_err(|error| format!("cannot read event batch: {error}"))?;
+    if input.len() > EVENT_BATCH_MAX_BYTES {
+        return Err("event batch exceeds 16 KiB".to_owned());
+    }
+    let document = json::parse(&input)?;
+    let Value::Object(entries) = &document else {
+        return Err("event batch must be a JSON object".to_owned());
+    };
+    for (key, _) in entries {
+        if key != "schema" && key != "events" {
+            return Err(format!("event batch has unknown field {key}"));
+        }
+    }
+    match document.get("schema") {
+        Some(Value::Number(literal)) if literal == "1" => {}
+        _ => return Err("event batch schema must be 1".to_owned()),
+    }
+    let events = document
+        .get("events")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "event batch events must be an array".to_owned())?;
+    if events.is_empty() || events.len() > EVENT_BATCH_MAX_EVENTS {
+        return Err("event batch must carry 1..16 events".to_owned());
+    }
+    events
+        .iter()
+        .map(|event| event_from_json(root.to_path_buf(), id, event))
+        .collect()
+}
+
+/// Applies a pre-built batch in its own immediate transaction, all-or-nothing.
+/// A single insert failure drops every event in the batch.
+fn apply_event_batch(root: &Path, events: &[EventArgs]) -> Result<(), String> {
+    let mut connection = writable_store(root)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    ensure_write_schema(&transaction)?;
+    for event in events {
+        insert_event_tx(&transaction, event)?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 /// The matrix prevents diagnostic metadata from becoming an unbounded payload channel.
@@ -1214,7 +1406,17 @@ fn finish(args: FinishArgs) -> Result<(), String> {
     if changed != 1 {
         return Err("hook run is missing or already finished".to_owned());
     }
-    transaction.commit().map_err(|error| error.to_string())
+    transaction.commit().map_err(|error| error.to_string())?;
+    // Commit the parent finish first, then attach the ordered batch. A batch
+    // failure is fail-open: it never rolls back or fails the completed finish.
+    if args.events_stdin {
+        if let Err(error) = read_events_batch(&args.root, args.id)
+            .and_then(|events| apply_event_batch(&args.root, &events))
+        {
+            eprintln!("loam hooks: finish event batch dropped: {error}");
+        }
+    }
+    Ok(())
 }
 
 /// Events use guarded inserts so a valid enum cannot be attached to an incompatible parent.
@@ -1224,6 +1426,14 @@ fn record_event(args: EventArgs) -> Result<(), String> {
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
     ensure_write_schema(&transaction)?;
+    insert_event_tx(&transaction, &args)?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+/// Inserts one validated event under its causal-parent guard inside an existing
+/// transaction. Shared by the standalone `event` command and the `--events-stdin`
+/// batch so one guard matrix serves both; a missing/incompatible parent errors.
+fn insert_event_tx(transaction: &Connection, args: &EventArgs) -> Result<(), String> {
     let guard = match (args.event, args.phase, args.agent_type.as_deref()) {
         (EventKind::IngestVisibility, Some(EventPhase::Launch), _) => {
             "status = 'succeeded' AND action = 'spawn_worker'"
@@ -1358,15 +1568,27 @@ fn record_event(args: EventArgs) -> Result<(), String> {
     if changed != 1 {
         return Err("hook event parent is missing or incompatible".to_owned());
     }
-    transaction.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 fn worker_start(args: WorkerStartArgs) -> Result<(), String> {
+    // Build and validate the batch before opening the transaction so a malformed
+    // frame aborts with nothing persisted. The external-origin proof
+    // (subagent/start/observed) and the transition then commit together in one
+    // transaction: if either fails, neither persists.
+    let events = if args.events_stdin {
+        read_events_batch(&args.root, args.id)?
+    } else {
+        Vec::new()
+    };
     let mut connection = writable_store(&args.root)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
     ensure_write_schema(&transaction)?;
+    for event in &events {
+        insert_event_tx(&transaction, event)?;
+    }
     let guard = match args.origin {
         WorkerOrigin::Direct => {
             "status = 'succeeded' AND action = 'spawn_worker' AND worker_origin = 'direct'"
@@ -1412,6 +1634,16 @@ fn worker_start(args: WorkerStartArgs) -> Result<(), String> {
 }
 
 fn worker_finish(args: WorkerFinishArgs) -> Result<(), String> {
+    // Attempt the ordered batch first, while the worker is still requested or
+    // running, then always attempt the terminal transition below. A batch
+    // failure is fail-open and cannot block the terminal transition.
+    if args.events_stdin {
+        if let Err(error) = read_events_batch(&args.root, args.id)
+            .and_then(|events| apply_event_batch(&args.root, &events))
+        {
+            eprintln!("loam hooks: worker-finish event batch dropped: {error}");
+        }
+    }
     let mut connection = writable_store(&args.root)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)

@@ -13,6 +13,7 @@ function args(argv) {
     else if (argv[index] === '--hook-run-id') result.hookRunId = argv[++index];
     else if (argv[index] === '--global-root') result.globalRoot = argv[++index];
     else if (argv[index] === '--agent-id') result.agentId = argv[++index];
+    else if (argv[index] === '--worker-origin') result.workerOrigin = argv[++index];
     else if (argv[index] === '--native-prepare') result.nativePrepare = true;
   }
   return result;
@@ -42,8 +43,19 @@ export async function main(options = {}) {
   const hookRun = Number.isSafeInteger(hookRunId) && hookRunId > 0
     ? { id: hookRunId, globalRoot, workspace: parsed.workspace }
     : null;
+  const fallback = parsed.workerOrigin === 'fallback';
   if (hookRun && workerStart) {
-    try { await workerStart({ run: hookRun }); } catch {}
+    // A detached fallback worker carries the codex_native/fallback/taken proof
+    // in its own worker-start batch so the native fallback guard is satisfied.
+    try {
+      await workerStart({
+        run: hookRun,
+        ...(fallback ? {
+          origin: 'fallback',
+          events: [{ event: 'codex_native', phase: 'fallback', outcome: 'taken', visibility: 'native' }],
+        } : {}),
+      });
+    } catch {}
   }
   try {
     if (!worker) throw new Error('loam ingestion integration is unavailable');
@@ -55,7 +67,15 @@ export async function main(options = {}) {
       env,
     });
     if (hookRun && workerFinish) {
-      try { await workerFinish({ run: hookRun, reason: result?.reason, detail: result?.detail }); } catch {}
+      try {
+        await workerFinish({
+          run: hookRun,
+          reason: result?.reason,
+          detail: result?.detail,
+          ...(fallback ? { origin: 'fallback' } : {}),
+          ...(result?.events?.length ? { events: result.events } : {}),
+        });
+      } catch {}
     }
     return result;
   } catch (error) {
@@ -64,6 +84,7 @@ export async function main(options = {}) {
         await workerFinish({
           run: hookRun,
           reason: 'unavailable',
+          ...(fallback ? { origin: 'fallback' } : {}),
           detail: error instanceof Error ? error.message : String(error),
         });
       } catch {}
