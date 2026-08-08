@@ -19,7 +19,9 @@
 //!    explicit deadlines. On timeout the operation is cancelled with
 //!    `CancelIoEx` and then *awaited to terminal completion*, so the
 //!    `OVERLAPPED` and its buffer are never freed while the kernel may still
-//!    write to them.
+//!    write to them. If that drain does not itself reach terminal completion,
+//!    the process aborts rather than freeing memory the kernel still owns —
+//!    the rule is absolute, not bounded by a second timeout.
 //!
 //! Raw FFI (approved Route A, T1). Each declaration carries the Win32 signature
 //! it was matched against; a mis-declared signature or constant is the one risk
@@ -644,8 +646,25 @@ fn finish(
     unsafe { CancelIoEx(handle, overlapped) };
     let mut drained: u32 = 0;
     // Safe: same live handle and OVERLAPPED.
-    unsafe { GetOverlappedResultEx(handle, overlapped, &mut drained, CANCEL_DRAIN_MS, 0) };
+    let returned =
+        unsafe { GetOverlappedResultEx(handle, overlapped, &mut drained, CANCEL_DRAIN_MS, 0) };
+    if !drain_reached_terminal_completion(returned, last_error()) {
+        // The kernel may still write into this OVERLAPPED and into the caller's
+        // buffer, and returning would free both. There is no bounded amount of
+        // further waiting that makes that safe, so end the process instead:
+        // "never free while I/O is in flight" stays absolute, not best-effort.
+        std::process::abort();
+    }
     Err(IpcError::Timeout)
+}
+
+/// Whether a post-`CancelIoEx` `GetOverlappedResultEx` proves the operation is
+/// terminally complete. Success is terminal; so is any failure other than
+/// `WAIT_TIMEOUT` (a cancelled operation reports `ERROR_OPERATION_ABORTED`).
+/// `WAIT_TIMEOUT` alone means the request is still pending in the kernel.
+/// `WAIT_IO_COMPLETION` cannot occur: every wait here is non-alertable.
+fn drain_reached_terminal_completion(returned: i32, error: u32) -> bool {
+    returned != 0 || error != WAIT_TIMEOUT
 }
 
 /// Impersonate the connected client, read its token user SID, revert, and
@@ -858,6 +877,21 @@ mod tests {
                 "{forbidden} granted"
             );
         }
+    }
+
+    #[test]
+    fn only_a_still_pending_drain_is_non_terminal() {
+        const ERROR_OPERATION_ABORTED: u32 = 995;
+        // Completed after cancellation, and the cancelled-op result, are both
+        // terminal — the buffers are reclaimable.
+        assert!(drain_reached_terminal_completion(1, 0));
+        assert!(drain_reached_terminal_completion(
+            0,
+            ERROR_OPERATION_ABORTED
+        ));
+        assert!(drain_reached_terminal_completion(0, ERROR_INVALID_HANDLE));
+        // Still pending: the caller must not free, so `finish` aborts.
+        assert!(!drain_reached_terminal_completion(0, WAIT_TIMEOUT));
     }
 
     #[test]

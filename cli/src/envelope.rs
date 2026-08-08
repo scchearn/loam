@@ -2323,7 +2323,13 @@ mod tests {
                     "network surface introduced in {path}: {forbidden}"
                 );
             }
-            if production.contains("std::process") || production.contains("Command::new") {
+            // `std::process::abort` is not a subprocess capability: it ends this
+            // process, it never starts another. The Windows IPC fail-safe uses it
+            // when a cancelled overlapped operation cannot be proven complete, so
+            // it is excluded by name — `ipc/windows.rs` stays barred from
+            // `Command::new` and from every other `std::process` reach.
+            let spawn_reach = production.replace("std::process::abort", "");
+            if spawn_reach.contains("std::process") || spawn_reach.contains("Command::new") {
                 assert!(
                     process_files.contains(&path.as_str()),
                     "new process-capable module: {path}"
