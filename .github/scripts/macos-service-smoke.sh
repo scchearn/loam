@@ -58,7 +58,22 @@ if [ -z "$PID" ]; then
   exit 1
 fi
 echo "enrolled start observed under launchd (pid $PID)"
-test -S "$ROOT/run/connector.sock" || { echo "FAIL: enrolled connector bound no endpoint"; exit 1; }
+# launchd reports the pid the moment it spawns the job; the connector still has
+# to open the registry and bind. Poll rather than race it — but keep the check,
+# because an observed process that never binds is exactly the failure the
+# positive control exists to catch.
+for _ in $(seq 1 30); do
+  [ -S "$ROOT/run/connector.sock" ] && break
+  sleep 1
+done
+if [ ! -S "$ROOT/run/connector.sock" ]; then
+  echo "FAIL: enrolled connector bound no endpoint"
+  # Distinguish a connector that died from one that is alive and never bound.
+  if ps -p "$PID" >/dev/null 2>&1; then echo "pid $PID is still alive"; else echo "pid $PID has exited"; fi
+  ls -la "$ROOT/run" 2>&1 | head -10 || true
+  launchctl print "$DOMAIN/$LABEL" 2>&1 | head -40 || true
+  exit 1
+fi
 
 # Final disconnect equivalent: disable stops the agent and leaves nothing behind.
 "$BIN" federation service disable --global-root "$ROOT"
