@@ -8,6 +8,7 @@ import { resolveExclusions } from '../integration/ingest.mjs';
 import { checkReadiness, probeState } from '../integration/runtime.mjs';
 import { verifyGlobalSkills } from './skills.mjs';
 import { isOwnedCommand } from './harnesses.mjs';
+import { verifyFederationService } from './federation.mjs';
 
 async function fileExists(path) {
   try {
@@ -146,6 +147,7 @@ export async function verifyInstallation({
   install: suppliedInstall,
   runtimeRunner,
   runtimeTimeoutMs,
+  federationRunner,
 } = {}) {
   let install = suppliedInstall;
   if (!install) {
@@ -190,14 +192,33 @@ export async function verifyInstallation({
   const harnessReady = Object.values(harnesses).every((harness) => harness.ready);
   const pluginVersionReady = install?.plugin_version === discovery.packageVersion;
   const ingestExclusions = await verifyIngestExclusions(discovery.skillsRoot);
+  // Opt-in native connector lifecycle check: only runs when a runner is supplied
+  // (default callers stay unchanged). Read-only status through the runtime proves
+  // the definition is present/inspectable and references the trusted runtime
+  // without starting the connector or contacting a broker.
+  let federation = { ready: true, checked: false };
+  if (federationRunner !== undefined && install?.runtime_path) {
+    federation = {
+      ...(await verifyFederationService({
+        runtimePath: install.runtime_path,
+        globalRoot: discovery.globalRoot,
+        runner: federationRunner,
+      })),
+      checked: true,
+    };
+  }
   return {
-    ready: Boolean(pluginVersionReady && skills.ready && runtime.ready && harnessReady && migration.ready && ingestExclusions.ready),
+    ready: Boolean(
+      pluginVersionReady && skills.ready && runtime.ready && harnessReady
+      && migration.ready && ingestExclusions.ready && federation.ready,
+    ),
     install,
     skills,
     runtime,
     harnesses,
     ingestExclusions,
     migration,
-    native: { ready: runtime.ready },
+    federation,
+    native: { ready: runtime.ready, federation: federation.ready },
   };
 }

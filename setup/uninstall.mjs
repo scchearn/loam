@@ -12,6 +12,7 @@ import { listSkills, skillEntryAliases, skillEntrySource } from './skills.mjs';
 import { runSkills } from './process.mjs';
 import { announce, confirmUninstall, finish } from './wizard.mjs';
 import { removeMarketplacePlugins } from './marketplace.mjs';
+import { removeFederationService } from './federation.mjs';
 
 // Harness configs are cleaned in-place (remove only Loam-owned hook entries,
 // preserve unrelated config) rather than blind-restoring backups, because a
@@ -216,6 +217,7 @@ export async function uninstall({
   globalRoot,
   packageRoot = PACKAGE_ROOT,
   runner,
+  federationRunner,
   yes = false,
   confirm,
   input = process.stdin,
@@ -268,7 +270,7 @@ export async function uninstall({
     return 1;
   }
 
-  const results = { configs: [], opencode: null, globalRoot: null, backups: [], skills: null, marketplace: null };
+  const results = { configs: [], opencode: null, globalRoot: null, backups: [], skills: null, marketplace: null, federation: null };
 
   results.marketplace = await removeMarketplacePlugins({
     harnesses: detectedHarnesses,
@@ -312,6 +314,18 @@ export async function uninstall({
       await rm(opencodePath, { force: true });
       results.opencode = { path: opencodePath, action: 'removed' };
     }
+  }
+
+  // Stop/disable and remove the Loam-owned native connector definition through
+  // the runtime before deleting the global root. Best-effort and delegated: Node
+  // never calls a manager directly, resolves a credential, or contacts a broker.
+  // A missing/invalid runtime path just means there is nothing to reconcile.
+  if (typeof install?.runtime_path === 'string' && install.runtime_path) {
+    results.federation = await removeFederationService({
+      runtimePath: install.runtime_path,
+      globalRoot: root,
+      runner: federationRunner,
+    });
   }
 
   // Remove global root

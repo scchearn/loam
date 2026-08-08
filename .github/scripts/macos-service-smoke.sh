@@ -21,10 +21,17 @@ test -f "$PLIST" || { echo "FAIL: plist not written"; exit 1; }
 plutil -lint "$PLIST" || { echo "FAIL: plist invalid"; exit 1; }
 grep -q "<key>RunAtLoad</key><false/>" "$PLIST" || { echo "FAIL: plist not dormant"; exit 1; }
 test ! -f "$ROOT/loam.sqlite3" || { echo "FAIL: database created by install"; exit 1; }
-# Exercise the real manager with our plist.
-launchctl bootstrap "$DOMAIN" "$PLIST"
-launchctl print "$DOMAIN/$LABEL" >/dev/null || { echo "FAIL: agent not loaded"; exit 1; }
-launchctl bootout "$DOMAIN/$LABEL"
+# Read-only status (the verb packaged setup delegates to for verification) must
+# not create a database or start anything; a dormant definition reports disabled.
+"$BIN" federation service status --global-root "$ROOT" >/dev/null 2>&1 || true
+test ! -f "$ROOT/loam.sqlite3" || { echo "FAIL: database created by status"; exit 1; }
+# Exercise the real manager through the delegated lifecycle verbs (enable/disable
+# are what setup uses to preserve active desired state across a runtime update).
+# The empty registry keeps the connector inert, so enable never leaves a daemon.
+"$BIN" federation service enable --global-root "$ROOT"
+launchctl print "$DOMAIN/$LABEL" >/dev/null || { echo "FAIL: agent not loaded after enable"; exit 1; }
+test ! -f "$ROOT/loam.sqlite3" || { echo "FAIL: database created by enable (inert violated)"; exit 1; }
+"$BIN" federation service disable --global-root "$ROOT"
 "$BIN" federation service uninstall --global-root "$ROOT"
 test ! -f "$PLIST" || { echo "FAIL: plist not removed"; exit 1; }
 echo "macos service smoke OK"

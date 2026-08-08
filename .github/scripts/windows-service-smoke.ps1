@@ -18,6 +18,20 @@ try {
   # Confirm it is disabled (not Ready/Running).
   $info = schtasks /Query /TN $Task /FO LIST /V | Out-String
   if ($info -notmatch "Disabled") { throw "task is not disabled: $info" }
+  # Read-only status (the verb packaged setup delegates to) must not create a DB.
+  & $Bin federation service status --global-root $Root | Out-Null
+  if (Test-Path (Join-Path $Root "loam.sqlite3")) { throw "database created by status" }
+  # enable/disable are what setup uses to preserve active desired state across a
+  # runtime update; exercise them against real schtasks. The empty registry keeps
+  # the connector inert (the Windows endpoint itself lands in T7), so no daemon
+  # and no database result.
+  & $Bin federation service enable --global-root $Root
+  if ($LASTEXITCODE -ne 0) { throw "enable exited $LASTEXITCODE" }
+  $enabled = schtasks /Query /TN $Task /FO LIST /V | Out-String
+  if ($enabled -match "Scheduled Task State:\s+Disabled") { throw "task still disabled after enable: $enabled" }
+  if (Test-Path (Join-Path $Root "loam.sqlite3")) { throw "database created by enable (inert violated)" }
+  & $Bin federation service disable --global-root $Root
+  if ($LASTEXITCODE -ne 0) { throw "disable exited $LASTEXITCODE" }
   & $Bin federation service uninstall --global-root $Root
   if ($LASTEXITCODE -ne 0) { throw "uninstall exited $LASTEXITCODE" }
   schtasks /Query /TN $Task 2>$null | Out-Null

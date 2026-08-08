@@ -282,7 +282,7 @@ fn service(mut args: impl Iterator<Item = String>) -> i32 {
     let subcommand = match args.next() {
         Some(value) => value,
         None => {
-            eprintln!("federation service: expected install|uninstall|status|run");
+            eprintln!("federation service: expected install|uninstall|status|enable|disable|run");
             return 64;
         }
     };
@@ -312,6 +312,11 @@ fn service(mut args: impl Iterator<Item = String>) -> i32 {
         "install" => service_lifecycle(&root, ServiceAction::Install),
         "uninstall" => service_lifecycle(&root, ServiceAction::Uninstall),
         "status" => service_lifecycle(&root, ServiceAction::Status),
+        // enable/disable let packaged setup preserve active/inert desired state
+        // across a runtime-path update (T12): they reuse the same T8 manager
+        // functions connect/disconnect use, so no definition logic lives in Node.
+        "enable" => service_lifecycle(&root, ServiceAction::Enable),
+        "disable" => service_lifecycle(&root, ServiceAction::Disable),
         other => {
             eprintln!("federation service: unknown subcommand `{other}`");
             64
@@ -339,11 +344,15 @@ enum ServiceAction {
     Install,
     Uninstall,
     Status,
+    Enable,
+    Disable,
 }
 
-/// Install/uninstall/status the dormant native definition. Builds the service
-/// context (stable instance identity + the absolute current runtime) and drives
-/// the real per-user manager. Never starts the connector or contacts a broker.
+/// Install/uninstall/status/enable/disable the native definition. Builds the
+/// service context (stable instance identity + the absolute current runtime) and
+/// drives the real per-user manager. `install`/`status`/`disable` never start the
+/// connector or contact a broker; `enable` re-asserts active desired state on the
+/// current runtime after a runtime-path update (setup delegates this, T12).
 fn service_lifecycle(root: &std::path::Path, action: ServiceAction) -> i32 {
     let instance_id = match crate::service::ensure_instance_id(root) {
         Ok(id) => id,
@@ -369,6 +378,8 @@ fn service_lifecycle(root: &std::path::Path, action: ServiceAction) -> i32 {
         ServiceAction::Install => crate::service::install(&runner, &context).map(|()| 0),
         ServiceAction::Uninstall => crate::service::uninstall(&runner, &context).map(|()| 0),
         ServiceAction::Status => crate::service::status(&runner, &context),
+        ServiceAction::Enable => crate::service::enable_start(&runner, &context).map(|()| 0),
+        ServiceAction::Disable => crate::service::disable_stop(&runner, &context).map(|()| 0),
     };
     match result {
         Ok(code) => code,

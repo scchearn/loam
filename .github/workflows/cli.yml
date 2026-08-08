@@ -9,6 +9,9 @@ on:
       - dist-workspace.toml
       - .github/workflows/cli.yml
       - .github/scripts/**
+      # Native connector lifecycle delegation lives in packaged setup; a change
+      # here must dispatch the real per-platform service smokes (T12).
+      - setup/**
   push:
     branches: [main]
     paths:
@@ -18,6 +21,7 @@ on:
       - dist-workspace.toml
       - .github/workflows/cli.yml
       - .github/scripts/**
+      - setup/**
   workflow_dispatch:
 
 permissions:
