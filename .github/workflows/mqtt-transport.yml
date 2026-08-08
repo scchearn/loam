@@ -1,0 +1,35 @@
+name: mqtt-transport
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - cli/**
+      - .github/workflows/mqtt-transport.yml
+  push:
+    branches: [federation]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - cli/**
+      - .github/workflows/mqtt-transport.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-broker:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Mosquitto and OpenSSL
+        run: sudo apt-get update && sudo apt-get install -y mosquitto openssl
+      - name: Install Rust
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - name: Run the isolated MQTT 5 broker contract
+        env:
+          LOAM_MQTT_TEST: "1"
+        run: cargo +1.94.1 test --locked --test mqtt_transport -- --ignored --test-threads=1 broker_contract

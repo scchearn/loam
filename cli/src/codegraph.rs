@@ -464,7 +464,26 @@ fn index_json(entries: &[IndexEntry]) -> String {
 }
 
 pub fn pending_count(codebase: &Path, wiki_root: &Path) -> Option<usize> {
-    let walk = collect(codebase, &Options::default()).ok()?;
+    pending_count_with(codebase, wiki_root, Options::default())
+}
+
+pub(crate) fn pending_count_at_ref(
+    codebase: &Path,
+    wiki_root: &Path,
+    source_ref: &str,
+) -> Option<usize> {
+    pending_count_with(
+        codebase,
+        wiki_root,
+        Options {
+            source_ref: Some(source_ref.to_owned()),
+            ..Options::default()
+        },
+    )
+}
+
+fn pending_count_with(codebase: &Path, wiki_root: &Path, options: Options) -> Option<usize> {
+    let walk = collect(codebase, &options).ok()?;
     let index = index_records(wiki_root, Some(codebase));
     let by_source: HashMap<&str, &IndexEntry> = index
         .iter()
