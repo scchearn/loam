@@ -3,8 +3,9 @@
 //!
 //! The transport seam is a trait consumed by **generics** (static dispatch) —
 //! never a trait object — so the crate's no-dispatch tripwire stays green and no
-//! callable capability is introduced. Slice B later supplies a real adapter
-//! against the same seam (T13); this module never reaches into Slice B.
+//! callable capability is introduced. [`StubTransport`] keeps the probe testable
+//! without a broker; [`MqttTransport`] (T13) implements the same seam over Slice
+//! B's public `transport` surface and is the only code here that touches it.
 //!
 //! `AuthenticatedPrincipal` is constructed only inside a transport adapter,
 //! after the transport reports an authenticated session. The probe derives every
@@ -427,6 +428,292 @@ fn corrupt_id(bytes: &[u8]) -> Vec<u8> {
         return text.replacen(&value, &replaced, 1).into_bytes();
     }
     bytes.to_vec()
+}
+
+// ---------------------------------------------------------------------------
+// Real MQTT adapter over the Slice B transport (T13)
+// ---------------------------------------------------------------------------
+//
+// The only place an accepted broker session becomes an `AuthenticatedPrincipal`:
+// no authority exists before the CONNACK, and the caller can never supply one.
+// Wire encoding is delegated to Slice B's `transport::publish` (the single
+// encoder) and every received frame is admitted by Slice B's `DeliveryProcessor`
+// (the single validator/deduplicator). This adapter adds no second encoder and
+// no capability of its own: certificate bytes arrive from the caller, so the
+// module stays filesystem-free, and rumqttc owns the socket.
+
+use std::time::Instant;
+
+use rumqttc::v5::mqttbytes::v5::{
+    ConnectReturnCode, Filter, Packet, PubAckReason, Publish, SubscribeReasonCode,
+};
+use rumqttc::v5::mqttbytes::QoS;
+use rumqttc::v5::{Client, Connection, Event, RecvTimeoutError};
+
+use crate::transport::{AuthenticatedTransportPrincipal, DeliveryProcessor, TransportConfig};
+
+/// How long the adapter waits for one broker acknowledgement (CONNACK, SUBACK,
+/// PUBACK). The probe's own receive deadline is passed in separately.
+const ACK_TIMEOUT: Duration = Duration::from_secs(10);
+const KEEP_ALIVE: Duration = Duration::from_secs(5);
+const REQUEST_CAPACITY: usize = 8;
+/// Bounded per-class delivery tracking for one probe session.
+const TRACKING_CAPACITY: usize = 32;
+
+/// One authenticated broker session's inputs. Secrets live only here, never in
+/// an envelope, a registry row, or a report.
+pub struct MqttSession {
+    /// Slice B's validated broker configuration (endpoint, client id, bounds).
+    pub config: TransportConfig,
+    pub username: String,
+    pub password: String,
+    /// PEM bytes supplied by the caller: this module reads no files.
+    pub ca_certificate: Vec<u8>,
+    pub client_authentication: Option<(Vec<u8>, Vec<u8>)>,
+    /// The identity these credentials assert. It becomes authority only after
+    /// the broker accepts the connection.
+    pub claimed_identity: SessionIdentity,
+}
+
+/// The real transport: a connected rumqttc client plus Slice B's delivery
+/// processor, exposed through the same seam the stub implements.
+pub struct MqttTransport {
+    session: MqttSession,
+    client: Option<Client>,
+    connection: Option<Connection>,
+    /// Set only after an accepted CONNACK.
+    identity: Option<SessionIdentity>,
+    processor: DeliveryProcessor,
+    /// Inbound publishes parked while waiting for a control packet.
+    pending: Vec<Publish>,
+    now: DateTime<Utc>,
+}
+
+impl MqttTransport {
+    pub fn new(
+        session: MqttSession,
+        validation: ValidationConfig,
+        now: DateTime<Utc>,
+    ) -> Result<Self, ProbeError> {
+        let processor = DeliveryProcessor::new(
+            validation,
+            TRACKING_CAPACITY,
+            TRACKING_CAPACITY,
+            TRACKING_CAPACITY,
+        )
+        .map_err(|error| ProbeError::InvalidProbe(format!("{error}")))?;
+        Ok(Self {
+            session,
+            client: None,
+            connection: None,
+            identity: None,
+            processor,
+            pending: Vec::new(),
+            now,
+        })
+    }
+
+    /// Disconnect the session. Best-effort: the probe's evidence is already
+    /// recorded, and a broker that drops us first is not a probe failure.
+    pub fn disconnect(&mut self) {
+        if let Some(client) = self.client.take() {
+            let _ = client.disconnect();
+        }
+        if let Some(mut connection) = self.connection.take() {
+            let _ = poll_incoming(&mut connection, Instant::now() + Duration::from_secs(1));
+        }
+        self.identity = None;
+    }
+}
+
+impl Transport for MqttTransport {
+    fn authenticate(&mut self) -> Result<SessionIdentity, ProbeError> {
+        if let Some(identity) = &self.identity {
+            return Ok(identity.clone());
+        }
+        let mut options = self.session.config.mqtt_options();
+        options
+            .set_credentials(&self.session.username, &self.session.password)
+            .set_transport(rumqttc::Transport::tls(
+                self.session.ca_certificate.clone(),
+                self.session.client_authentication.clone(),
+                None,
+            ))
+            .set_keep_alive(KEEP_ALIVE)
+            .set_clean_start(true);
+        let (client, mut connection) = Client::new(options, REQUEST_CAPACITY);
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        let accepted = loop {
+            match await_control(&mut connection, &mut self.pending, deadline) {
+                Some(Packet::ConnAck(ack)) => break ack.code == ConnectReturnCode::Success,
+                Some(_) => {}
+                None => break false,
+            }
+        };
+        if !accepted {
+            return Err(ProbeError::AuthenticationFailed);
+        }
+        // Authority starts here and nowhere else.
+        self.client = Some(client);
+        self.connection = Some(connection);
+        self.identity = Some(self.session.claimed_identity.clone());
+        Ok(self.session.claimed_identity.clone())
+    }
+
+    fn subscribe(&mut self, filter: &str, no_local: bool) -> Result<(), ProbeError> {
+        let denied = || ProbeError::SubscribeDenied {
+            filter: filter.to_owned(),
+        };
+        let (Some(client), Some(connection)) = (self.client.clone(), self.connection.as_mut())
+        else {
+            return Err(denied());
+        };
+        client
+            .subscribe_many([Filter {
+                nolocal: no_local,
+                ..Filter::new(filter, QoS::AtLeastOnce)
+            }])
+            .map_err(|_| denied())?;
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        loop {
+            match await_control(connection, &mut self.pending, deadline) {
+                Some(Packet::SubAck(ack)) => {
+                    return match ack.return_codes.first() {
+                        Some(SubscribeReasonCode::Success(_)) => Ok(()),
+                        _ => Err(denied()),
+                    };
+                }
+                Some(_) => {}
+                None => return Err(denied()),
+            }
+        }
+    }
+
+    fn publish(
+        &mut self,
+        _topic: &str,
+        envelope: &ValidatedEnvelope,
+        retain: bool,
+    ) -> Result<(), ProbeError> {
+        // The probe is never retained, and Slice B derives both the topic and
+        // the retain flag from the validated envelope itself — a probe that
+        // asked to be retained would mean the class is no longer `event`.
+        if retain {
+            return Err(ProbeError::RetainedProbe);
+        }
+        let (Some(client), Some(connection)) = (self.client.clone(), self.connection.as_mut())
+        else {
+            return Err(ProbeError::PublishDenied);
+        };
+        crate::transport::publish(&client, envelope.clone(), self.now)
+            .map_err(|_| ProbeError::PublishDenied)?;
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        loop {
+            match await_control(connection, &mut self.pending, deadline) {
+                Some(Packet::PubAck(ack)) => {
+                    return match ack.reason {
+                        PubAckReason::Success | PubAckReason::NoMatchingSubscribers => Ok(()),
+                        _ => Err(ProbeError::PublishDenied),
+                    };
+                }
+                Some(_) => {}
+                None => return Err(ProbeError::PublishDenied),
+            }
+        }
+    }
+
+    fn receive(&mut self, deadline: Duration) -> Result<Option<ReceivedFrame>, ProbeError> {
+        let identity = self
+            .identity
+            .clone()
+            .ok_or(ProbeError::AuthenticationFailed)?;
+        let claims: Vec<&str> = identity.allowed_claims.iter().map(String::as_str).collect();
+        // The adapter is the only constructor of envelope authority, and the
+        // only origin this session may speak or hear for is its own instance.
+        let origins = [identity.instance_id.as_str()];
+        let authenticated = AuthenticatedTransportPrincipal::new(
+            AuthenticatedPrincipal::new(&identity.principal_id, &claims),
+            &origins,
+        );
+        let deadline = Instant::now() + deadline;
+        loop {
+            let publish = match self.take_publish(deadline) {
+                Some(publish) => publish,
+                None => return Ok(None),
+            };
+            // A retained frame means a probe outlived its session on the broker.
+            if publish.retain {
+                return Err(ProbeError::RetainedProbe);
+            }
+            let Ok(topic) = String::from_utf8(publish.topic.to_vec()) else {
+                return Err(ProbeError::WrongSelfReceive);
+            };
+            match self
+                .processor
+                .receive(&topic, &publish.payload, &authenticated, self.now)
+            {
+                Ok(crate::transport::ReceiveOutcome::Accepted(_)) => {
+                    return Ok(Some(ReceivedFrame {
+                        topic,
+                        bytes: publish.payload.to_vec(),
+                    }));
+                }
+                // Duplicates and tombstones are not the probe's echo; keep
+                // waiting until the deadline rather than failing the probe.
+                Ok(_) => {}
+                Err(_) => return Err(ProbeError::WrongSelfReceive),
+            }
+        }
+    }
+}
+
+impl MqttTransport {
+    /// The next inbound publish: parked frames first, then the wire.
+    fn take_publish(&mut self, deadline: Instant) -> Option<Publish> {
+        if !self.pending.is_empty() {
+            return Some(self.pending.remove(0));
+        }
+        let connection = self.connection.as_mut()?;
+        loop {
+            match poll_incoming(connection, deadline)? {
+                Packet::Publish(publish) => return Some(publish),
+                _ => continue,
+            }
+        }
+    }
+}
+
+/// The next incoming packet before `deadline`; `None` on timeout or a closed
+/// connection. Outgoing events carry no broker decision, so they are skipped.
+fn poll_incoming(connection: &mut Connection, deadline: Instant) -> Option<Packet> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match connection.recv_timeout(remaining) {
+            Ok(Ok(Event::Incoming(packet))) => return Some(packet),
+            Ok(Ok(Event::Outgoing(_))) => {}
+            Ok(Err(_)) | Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                return None;
+            }
+        }
+    }
+}
+
+/// The next control packet, parking inbound publishes for `receive` so an echo
+/// that races an acknowledgement is never dropped.
+fn await_control(
+    connection: &mut Connection,
+    pending: &mut Vec<Publish>,
+    deadline: Instant,
+) -> Option<Packet> {
+    loop {
+        match poll_incoming(connection, deadline)? {
+            Packet::Publish(publish) => pending.push(publish),
+            packet => return Some(packet),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
