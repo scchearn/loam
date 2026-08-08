@@ -17,6 +17,7 @@ use crate::json::Value;
 pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     match args.next().as_deref() {
         Some("connect") => connect(args),
+        Some("service") => service(args),
         Some("disconnect") | Some("status") => {
             eprintln!("federation: disconnect and status arrive in Slice C T11");
             69
@@ -27,6 +28,51 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
             );
             64
         }
+    }
+}
+
+/// Hidden internal service entrypoint: `loam federation service run
+/// --global-root <path>`. Reconciles the registry before any endpoint; an empty
+/// registry exits inert. Not a user-facing command.
+fn service(mut args: impl Iterator<Item = String>) -> i32 {
+    if args.next().as_deref() != Some("run") {
+        eprintln!("federation service: only `run` is supported");
+        return 64;
+    }
+    let mut global_root: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--global-root" => match args.next() {
+                Some(value) => global_root = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("federation service run: --global-root needs a value");
+                    return 64;
+                }
+            },
+            other => {
+                eprintln!("federation service run: unexpected argument `{other}`");
+                return 64;
+            }
+        }
+    }
+    let Some(root) = global_root else {
+        eprintln!("federation service run: --global-root is required");
+        return 64;
+    };
+
+    #[cfg(unix)]
+    {
+        match crate::connector::run_service(&root) {
+            Ok(crate::connector::ServiceOutcome::Inert) => 0,
+            Ok(crate::connector::ServiceOutcome::Served) => 0,
+            Err(_) => 70,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        eprintln!("federation service run: the Windows endpoint arrives in Slice C T7");
+        69
     }
 }
 

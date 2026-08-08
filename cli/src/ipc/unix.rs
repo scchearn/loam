@@ -143,6 +143,39 @@ impl OwnedEndpoint {
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
+
+    /// Accept one connection and prove its peer before handing back a byte
+    /// stream. The kernel peer-credential check runs here, so a caller that only
+    /// ever touches a [`VerifiedConn`] cannot read a frame from an unverified
+    /// peer. Keeps all `UnixStream` handling inside this module.
+    pub fn accept_verified(&self) -> Result<VerifiedConn, IpcError> {
+        let (stream, _addr) = self.listener.accept().map_err(|_| IpcError::Internal)?;
+        verify_peer(&stream)?;
+        Ok(VerifiedConn { stream })
+    }
+}
+
+/// A connection whose peer has already been proven to share the connector's
+/// effective UID. Exposes only `Read`/`Write`, never the underlying socket type,
+/// so higher layers never name a `UnixStream`.
+pub struct VerifiedConn {
+    stream: UnixStream,
+}
+
+impl std::io::Read for VerifiedConn {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.read(buffer)
+    }
+}
+
+impl std::io::Write for VerifiedConn {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 impl Drop for OwnedEndpoint {

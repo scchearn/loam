@@ -429,6 +429,222 @@ fn corrupt_id(bytes: &[u8]) -> Vec<u8> {
     bytes.to_vec()
 }
 
+// ---------------------------------------------------------------------------
+// Inert-by-default connector service loop (T9)
+// ---------------------------------------------------------------------------
+//
+// One per-user connector hosts every enrolled project. The empty registry is the
+// desired-state switch: reconciliation runs *before* any endpoint or transport,
+// so a missing or empty registry means no socket, no process footprint, and no
+// network. Each request crosses two boundaries in order — the kernel peer check
+// (owner-only), then a registry workspace/project-binding resolution — before a
+// closed operation is dispatched. There is no generic dispatch.
+
+use std::path::Path;
+
+use crate::ipc::{self, IpcConfig, Operation, Request};
+
+/// Whether the service found work to host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceOutcome {
+    /// No enrollment exists: no endpoint was created and no network occurred.
+    Inert,
+    /// The endpoint was bound and the accept loop ran.
+    Served,
+}
+
+#[derive(Debug)]
+pub enum ServiceError {
+    Registry(crate::enrollment::RegistryError),
+    Ipc(ipc::IpcError),
+}
+
+/// Run the connector. Reconciles the registry before touching an endpoint: a
+/// missing database or an empty registry returns [`ServiceOutcome::Inert`]
+/// without binding a socket. Only a non-empty registry binds the owner-only
+/// endpoint and serves.
+#[cfg(unix)]
+pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
+    let db_path = global_root.join("loam.sqlite3");
+    if !registry_has_enrollments(&db_path)? {
+        return Ok(ServiceOutcome::Inert);
+    }
+    let run_dir = global_root.join("run");
+    let endpoint = ipc::unix::bind(&run_dir).map_err(ServiceError::Ipc)?;
+    accept_loop(&endpoint, &db_path);
+    Ok(ServiceOutcome::Served)
+}
+
+fn registry_has_enrollments(db_path: &Path) -> Result<bool, ServiceError> {
+    match crate::enrollment::open_readonly(db_path).map_err(ServiceError::Registry)? {
+        None => Ok(false),
+        Some(connection) => Ok(!crate::enrollment::list_enrollments(&connection)
+            .map_err(ServiceError::Registry)?
+            .is_empty()),
+    }
+}
+
+#[cfg(unix)]
+fn accept_loop(endpoint: &ipc::unix::OwnedEndpoint, db_path: &Path) {
+    let config = IpcConfig::default();
+    loop {
+        // One failed connection never takes the connector down; keep serving.
+        let _ = serve_one(endpoint, db_path, &config);
+    }
+}
+
+/// Serve exactly one connection: prove the peer (inside `accept_verified`),
+/// read one bounded frame, dispatch through the registry, and write one
+/// response. Exposed for tests.
+#[cfg(unix)]
+pub fn serve_one(
+    endpoint: &ipc::unix::OwnedEndpoint,
+    db_path: &Path,
+    config: &IpcConfig,
+) -> Result<(), ipc::IpcError> {
+    let mut connection = endpoint.accept_verified()?;
+    let frame = ipc::read_frame(&mut connection, config)?;
+    let response = match ipc::parse_request(&frame, config) {
+        Ok(request) => dispatch(&request, db_path, config),
+        Err(error) => ipc::error_response("", &error, config),
+    };
+    ipc::write_frame(&mut connection, &response, config)
+}
+
+/// Resolve the request's workspace through the registry, enforce the project
+/// binding, and run the closed operation. Returns an encoded response body.
+fn dispatch(request: &Request, db_path: &Path, config: &IpcConfig) -> Vec<u8> {
+    match resolve_and_run(request, db_path) {
+        Ok(result) => ipc::ok_response(&request.request_id, result),
+        Err(error) => ipc::error_response(&request.request_id, &error, config),
+    }
+}
+
+fn resolve_and_run(request: &Request, db_path: &Path) -> Result<crate::json::Value, ipc::IpcError> {
+    // Resolve the workspace to its physical identity exactly as enrollment did,
+    // so a path alias resolves to the same enrollment and a non-workspace path is
+    // treated as unenrolled.
+    let workspace = crate::enrollment::PhysicalWorkspace::resolve(Path::new(&request.workspace))
+        .map_err(|_| ipc::IpcError::WorkspaceUnenrolled)?;
+    let key = crate::enrollment::identity_key(&workspace);
+    dispatch_for_key(request, &key, db_path)
+}
+
+/// Dispatch a request that has already been resolved to a physical identity key.
+/// Separated from workspace resolution so the registry-binding and operation
+/// logic is testable without a Git workspace.
+fn dispatch_for_key(
+    request: &Request,
+    key: &str,
+    db_path: &Path,
+) -> Result<crate::json::Value, ipc::IpcError> {
+    let read = crate::enrollment::open_readonly(db_path)
+        .map_err(|_| ipc::IpcError::Internal)?
+        .ok_or(ipc::IpcError::WorkspaceUnenrolled)?;
+    let row = crate::enrollment::lookup(&read, key)
+        .map_err(|_| ipc::IpcError::Internal)?
+        .ok_or(ipc::IpcError::WorkspaceUnenrolled)?;
+
+    // Project binding: if the caller names a project, it must match the
+    // enrollment's, or the request is rejected before any operation runs.
+    if let Some(claimed) = request.payload.get("project_id").and_then(|v| v.as_str()) {
+        if claimed != row.project_id {
+            return Err(ipc::IpcError::ProjectBindingMismatch);
+        }
+    }
+    drop(read);
+
+    match request.operation {
+        Operation::StatusGet => Ok(status_json(&row)),
+        Operation::ProjectAttach => {
+            // The enrollment already exists (looked up above); the broker session
+            // wiring is stubbed until the real adapter (T13). Acknowledge attach.
+            Ok(ack_json(&row, "attached"))
+        }
+        Operation::ProjectDetach => {
+            let mut write =
+                crate::enrollment::open_writable(db_path).map_err(|_| ipc::IpcError::Internal)?;
+            let removed = crate::enrollment::delete_enrollment(&mut write, key)
+                .map_err(|_| ipc::IpcError::Internal)?;
+            if removed {
+                Ok(ack_json(&row, "detached"))
+            } else {
+                Err(ipc::IpcError::WorkspaceUnenrolled)
+            }
+        }
+    }
+}
+
+/// A precise, aggregate-free status projection: enrollment, historical verified
+/// capabilities, and a broker-session field that is explicitly not-live here (a
+/// real session is the adapter's, T13). No `connected`/`ready` boolean.
+fn status_json(row: &crate::enrollment::EnrolledRow) -> crate::json::Value {
+    use crate::json::Value;
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        (
+            "enrollment".into(),
+            Value::Object(vec![
+                ("state".into(), Value::String("enrolled".into())),
+                ("org_id".into(), Value::String(row.org_id.clone())),
+                ("project_id".into(), Value::String(row.project_id.clone())),
+                (
+                    "repository_id".into(),
+                    Value::String(row.repository_id.clone()),
+                ),
+                (
+                    "display_path".into(),
+                    Value::String(row.display_path.clone()),
+                ),
+            ]),
+        ),
+        (
+            "verification".into(),
+            Value::Object(vec![
+                (
+                    "capabilities".into(),
+                    Value::Array(capability_names(&row.capabilities)),
+                ),
+                (
+                    "verified_at".into(),
+                    Value::String(row.capabilities.verified_at.clone()),
+                ),
+            ]),
+        ),
+        (
+            "broker".into(),
+            Value::Object(vec![(
+                "session_state".into(),
+                Value::String("not-live-in-connector".into()),
+            )]),
+        ),
+    ])
+}
+
+fn capability_names(record: &crate::enrollment::CapabilityRecord) -> Vec<crate::json::Value> {
+    let mut names = Vec::new();
+    for (present, name) in [
+        (record.authentication, "authentication"),
+        (record.publish, "publish"),
+        (record.subscribe, "subscribe"),
+        (record.self_receive, "self_receive"),
+    ] {
+        if present {
+            names.push(crate::json::Value::String(name.to_owned()));
+        }
+    }
+    names
+}
+
+fn ack_json(row: &crate::enrollment::EnrolledRow, action: &str) -> crate::json::Value {
+    use crate::json::Value;
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        ("action".into(), Value::String(action.to_owned())),
+        ("project_id".into(), Value::String(row.project_id.clone())),
+    ])
+}
+
 #[cfg(test)]
 mod probe_tests {
     use super::*;
@@ -609,5 +825,149 @@ mod probe_tests {
         )
         .expect("probe envelope validates");
         assert_eq!(validated.as_envelope().id, id);
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+    use crate::enrollment::{
+        CapabilityRecord, PhysicalWorkspace, PlatformIdentity, ValidatedEnrollment, ValidatedRemote,
+    };
+
+    fn temp_db(label: &str) -> std::path::PathBuf {
+        // Leaked on purpose: connector.rs is not on the filesystem capability
+        // allowlist, so these tests never perform any filesystem cleanup here.
+        std::env::temp_dir().join(format!(
+            "loam-svc-{label}-{}.sqlite3",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn synthetic(device: u64, inode: u64) -> ValidatedEnrollment {
+        ValidatedEnrollment {
+            org_id: "acme".into(),
+            project_id: "loam".into(),
+            repository_id: "repo".into(),
+            broker_profile: "acme-prod".into(),
+            broker_endpoint: "mqtts://h:8883".into(),
+            tls_server_name: "h".into(),
+            credential_ref: "vault://c".into(),
+            ca_ref: None,
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            remotes: vec![ValidatedRemote {
+                name: "origin".into(),
+                url_digest: "a".repeat(64),
+                allowed_refs: vec!["refs/heads/main".into()],
+            }],
+            workspace: PhysicalWorkspace {
+                display_path: "/w/proj".into(),
+                identity: PlatformIdentity::Unix { device, inode },
+            },
+        }
+    }
+
+    fn caps() -> CapabilityRecord {
+        CapabilityRecord {
+            authentication: true,
+            publish: true,
+            subscribe: true,
+            self_receive: true,
+            verified_at: "2026-08-08T10:00:00Z".into(),
+        }
+    }
+
+    fn enrolled_db(label: &str, device: u64, inode: u64) -> (std::path::PathBuf, String) {
+        let path = temp_db(label);
+        let mut connection = crate::enrollment::open_writable(&path).unwrap();
+        let enrollment = synthetic(device, inode);
+        crate::enrollment::insert_enrollment(&mut connection, &enrollment, &caps(), "t").unwrap();
+        let key = crate::enrollment::identity_key(&enrollment.workspace);
+        (path, key)
+    }
+
+    fn request(operation: Operation, payload: crate::json::Value) -> Request {
+        Request {
+            request_id: "r-1".into(),
+            workspace: "/w/proj".into(),
+            operation,
+            payload,
+        }
+    }
+
+    #[test]
+    fn empty_and_missing_registries_are_inert() {
+        // A path with no database: reconciliation finds nothing, no endpoint.
+        let missing = temp_db("inert-missing");
+        assert!(!registry_has_enrollments(&missing).unwrap());
+
+        // An existing database with zero enrollments is equally inert.
+        let empty = temp_db("inert-empty");
+        drop(crate::enrollment::open_writable(&empty).unwrap());
+        assert!(!registry_has_enrollments(&empty).unwrap());
+    }
+
+    #[test]
+    fn a_populated_registry_reports_work_to_host() {
+        let (path, _key) = enrolled_db("populated", 1, 10);
+        assert!(registry_has_enrollments(&path).unwrap());
+    }
+
+    #[test]
+    fn status_get_returns_an_aggregate_free_projection() {
+        let (path, key) = enrolled_db("status", 2, 20);
+        let result = dispatch_for_key(
+            &request(Operation::StatusGet, crate::json::Value::Object(vec![])),
+            &key,
+            &path,
+        )
+        .expect("status");
+        let text = result.to_json();
+        assert!(text.contains("\"enrollment\""));
+        assert!(text.contains("\"capabilities\""));
+        assert!(text.contains("not-live-in-connector"));
+        assert!(!text.contains("\"connected\"") && !text.contains("\"ready\""));
+    }
+
+    #[test]
+    fn an_unenrolled_workspace_is_rejected() {
+        let (path, _key) = enrolled_db("unenrolled", 3, 30);
+        let outcome = dispatch_for_key(
+            &request(Operation::StatusGet, crate::json::Value::Object(vec![])),
+            "unix:999:999",
+            &path,
+        );
+        assert_eq!(outcome.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
+    }
+
+    #[test]
+    fn a_cross_project_binding_is_rejected() {
+        let (path, key) = enrolled_db("binding", 4, 40);
+        let payload = crate::json::Value::Object(vec![(
+            "project_id".into(),
+            crate::json::Value::String("some-other-project".into()),
+        )]);
+        let outcome = dispatch_for_key(&request(Operation::StatusGet, payload), &key, &path);
+        assert_eq!(outcome.err(), Some(ipc::IpcError::ProjectBindingMismatch));
+    }
+
+    #[test]
+    fn detach_removes_then_status_is_unenrolled() {
+        let (path, key) = enrolled_db("detach", 5, 50);
+        dispatch_for_key(
+            &request(Operation::ProjectDetach, crate::json::Value::Object(vec![])),
+            &key,
+            &path,
+        )
+        .expect("detach");
+        let after = dispatch_for_key(
+            &request(Operation::StatusGet, crate::json::Value::Object(vec![])),
+            &key,
+            &path,
+        );
+        assert_eq!(after.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
     }
 }
