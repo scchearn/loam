@@ -442,8 +442,14 @@ mod tests {
         ServiceContext {
             global_root: root,
             instance_id: "0123456789abcdef0123456789abcdef".into(),
-            runtime_path: PathBuf::from("/opt/loam/bin/loam"),
+            // Absolute on every platform (temp_dir is absolute on Windows too),
+            // so `absolute_utf8` accepts it in the render tests.
+            runtime_path: std::env::temp_dir().join("loam-runtime").join("loam"),
         }
+    }
+
+    fn runtime_string(context: &ServiceContext) -> String {
+        context.runtime_path.to_str().unwrap().to_owned()
     }
 
     #[test]
@@ -460,8 +466,12 @@ mod tests {
 
     #[test]
     fn systemd_unit_is_dormant_and_references_the_absolute_runtime() {
-        let unit = render_systemd_unit(&ctx("systemd")).unwrap();
-        assert!(unit.contains("ExecStart=/opt/loam/bin/loam federation service run --global-root"));
+        let context = ctx("systemd");
+        let runtime = runtime_string(&context);
+        let unit = render_systemd_unit(&context).unwrap();
+        assert!(unit.contains(&format!(
+            "ExecStart={runtime} federation service run --global-root"
+        )));
         assert!(unit.contains("Restart=on-failure"));
         // No socket activation, no auto-start beyond an explicit enable.
         assert!(!unit.contains("RunAtLoad"));
@@ -469,10 +479,12 @@ mod tests {
 
     #[test]
     fn launchagent_plist_is_dormant() {
-        let plist = render_launchagent_plist(&ctx("launchd")).unwrap();
+        let context = ctx("launchd");
+        let runtime = runtime_string(&context);
+        let plist = render_launchagent_plist(&context).unwrap();
         assert!(plist.contains("<key>RunAtLoad</key><false/>"));
         assert!(plist.contains("<key>KeepAlive</key><false/>"));
-        assert!(plist.contains("<string>/opt/loam/bin/loam</string>"));
+        assert!(plist.contains(&format!("<string>{runtime}</string>")));
         assert!(plist.contains(SERVICE_LABEL));
     }
 
