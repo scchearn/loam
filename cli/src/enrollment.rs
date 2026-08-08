@@ -250,6 +250,7 @@ pub struct PhysicalWorkspace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlatformIdentity {
     /// Unix device + inode: robust against symlink, case, and bind-mount aliases.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Unix { device: u64, inode: u64 },
     /// Windows carries only the canonical final path in Slice C T2; the
     /// volume-serial/file-index refinement lands in T7 alongside the other
