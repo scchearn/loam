@@ -23,6 +23,10 @@ use crate::json::Value;
 #[cfg(unix)]
 pub mod unix;
 
+/// The owner-authenticated Windows named-pipe endpoint and client-SID proof.
+#[cfg(windows)]
+pub mod windows;
+
 /// Protocol version this build speaks.
 pub const PROTOCOL_VERSION: i64 = 1;
 

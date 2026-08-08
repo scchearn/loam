@@ -95,6 +95,19 @@ jobs:
       - name: Dormant service lifecycle smoke
         run: ${{ matrix.run }}
 
+  # Slice C T7: the Windows named-pipe endpoint's owner proof. The in-process
+  # tests (`--test ipc_owner`) run inside `build` on windows-2022; this job adds
+  # the one thing they cannot do — a second local user, in its own logon session,
+  # being denied at pipe open while the owning session round-trips a frame.
+  windows-ipc-owner:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - name: Named-pipe owner smoke (alternate-user denial)
+        run: pwsh .github/scripts/windows-ipc-owner-smoke.ps1
+
   dist-plan:
     runs-on: ubuntu-22.04
     steps:
