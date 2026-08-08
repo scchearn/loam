@@ -168,11 +168,18 @@ try {
     [System.Security.Principal.TokenImpersonationLevel]::Impersonation)
   $stream.Connect(5000)
 } catch {
-  if (($_.Exception -is [System.UnauthorizedAccessException]) -or ($_.Exception.Message -match 'Access is denied')) {
-    Say 'denied-at-open' $_.Exception.GetType().FullName
+  # A .NET method that throws inside PowerShell arrives wrapped in a
+  # MethodInvocationException, so the real exception is at the end of the
+  # InnerException chain. Match the type there, and keep a message fallback
+  # because the framework's own wording varies ("Access to the path is
+  # denied." from the pipe client, "Access is denied" from a raw Win32 path).
+  $inner = $_.Exception
+  while ($inner.InnerException) { $inner = $inner.InnerException }
+  if (($inner -is [System.UnauthorizedAccessException]) -or ($inner.Message -match '[Aa]ccess.*denied')) {
+    Say 'denied-at-open' ($inner.GetType().FullName + ' :: ' + $inner.Message)
     exit 3
   }
-  Say 'error' ($_.Exception.GetType().FullName + ' :: ' + $_.Exception.Message)
+  Say 'error' ($inner.GetType().FullName + ' :: ' + $inner.Message)
   exit 4
 }
 # The handle exists, so the DACL admitted this logon session. Everything from
