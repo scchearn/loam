@@ -114,6 +114,14 @@ try {
   }
 
   Write-Host "windows ipc owner smoke OK"
+} catch {
+  # The endpoint fixture's own output is the only view of the server side, so a
+  # red run is diagnosable instead of just "pipe is broken".
+  if (Test-Path $Log) {
+    Write-Host "--- endpoint fixture output ---"
+    Get-Content $Log | Write-Host
+  }
+  throw
 } finally {
   if ($Server -and -not $Server.HasExited) { Stop-Process -Id $Server.Id -Force -ErrorAction SilentlyContinue }
   if ($Created) { Remove-LocalUser -Name $User -ErrorAction SilentlyContinue }

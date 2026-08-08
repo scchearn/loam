@@ -51,6 +51,37 @@ mod windows_owner {
         assert_eq!(client.join().expect("client thread should finish"), b"pong");
     }
 
+    /// A client that connects and only writes later must still be proven and
+    /// served: on a byte-mode pipe the client's identity is not available until
+    /// its first bytes arrive, and dropping it there would reject honest peers.
+    #[test]
+    fn windows_a_client_that_writes_late_is_still_proven_and_served() {
+        let endpoint = bind(&run_dir("late-write")).expect("first instance should bind");
+        let name = endpoint.pipe_name().to_owned();
+
+        let client = std::thread::spawn(move || {
+            let mut connection = connect(&name).expect("same-user client should open the pipe");
+            std::thread::sleep(Duration::from_millis(300));
+            let config = IpcConfig::default();
+            write_frame(&mut connection, b"ping", &config).expect("client should frame a request");
+            connection.flush().ok();
+            read_frame(&mut connection, &config).expect("client should read the response")
+        });
+
+        let mut served = endpoint
+            .accept_verified(Duration::from_secs(10))
+            .expect("a late-writing same-user client is still an owner-proven peer");
+        let config = IpcConfig::default();
+        assert_eq!(
+            read_frame(&mut served, &config).expect("server should read one frame"),
+            b"ping"
+        );
+        write_frame(&mut served, b"pong", &config).expect("server should answer");
+        served.flush().ok();
+
+        assert_eq!(client.join().expect("client thread should finish"), b"pong");
+    }
+
     #[test]
     fn windows_endpoint_is_a_first_instance_singleton() {
         let root = run_dir("singleton");
@@ -160,6 +191,8 @@ mod windows_owner {
                     }
                 }
                 Err(IpcError::Timeout) => {}
+                // A rejected peer must not take the endpoint down with it.
+                Err(IpcError::UnauthorizedPeer) => {}
                 Err(_) => break,
             }
         }

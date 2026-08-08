@@ -1941,12 +1941,38 @@ mod connect_tests {
         }
     }
 
+    impl FakeService {
+        /// Case-insensitive, because the three managers do not agree on case:
+        /// `systemctl --user enable --now` and `launchctl enable` are lowercase,
+        /// `schtasks /Change /ENABLE` is not.
+        fn recorded_any(&self, mark: &str) -> bool {
+            let mark = mark.to_ascii_lowercase();
+            self.recorded
+                .borrow()
+                .iter()
+                .any(|line| line.to_ascii_lowercase().contains(&mark))
+        }
+    }
+
+    /// Activation and deactivation are spelled differently per manager, so the
+    /// tests match the word the *current* platform's commands actually use:
+    /// systemd `enable --now`/`disable --now`, launchctl `bootstrap`+`enable`/
+    /// `bootout`, Task Scheduler `/Change /ENABLE`/`/Change /DISABLE`.
+    const ENABLE_MARK: &str = "enable";
+    #[cfg(target_os = "macos")]
+    const DISABLE_MARK: &str = "bootout";
+    #[cfg(not(target_os = "macos"))]
+    const DISABLE_MARK: &str = "disable";
+
     impl CommandRunner for FakeService {
         fn run(&self, command: &ManagerCommand) -> Result<i32, ServiceError> {
             let line = format!("{} {}", command.program, command.args.join(" "));
             self.recorded.borrow_mut().push(line.clone());
             if let Some(fail) = &self.fail_on {
-                if line.contains(fail) {
+                if line
+                    .to_ascii_lowercase()
+                    .contains(&fail.to_ascii_lowercase())
+                {
                     return Err(ServiceError::ManagerFailed { code: 1 });
                 }
             }
@@ -2043,11 +2069,7 @@ mod connect_tests {
             1
         );
         // The service was enabled/started.
-        assert!(service
-            .recorded
-            .borrow()
-            .iter()
-            .any(|c| c.contains("enable")));
+        assert!(service.recorded_any(ENABLE_MARK));
     }
 
     #[test]
@@ -2078,7 +2100,7 @@ mod connect_tests {
     fn activation_failure_rolls_the_enrollment_back() {
         let (db, ctx) = setup("activate-fail");
         let mut transport = StubTransport::healthy(identity());
-        let service = FakeService::failing("enable"); // enable_start fails
+        let service = FakeService::failing(ENABLE_MARK); // enable_start fails
         let outcome = orchestrate_from_validated(
             &enrolled(3, 30, COMMIT_A),
             &mut transport,
@@ -2095,11 +2117,7 @@ mod connect_tests {
         assert!(crate::enrollment::list_enrollments(&connection)
             .unwrap()
             .is_empty());
-        assert!(service
-            .recorded
-            .borrow()
-            .iter()
-            .any(|c| c.contains("disable")));
+        assert!(service.recorded_any(DISABLE_MARK));
     }
 
     #[test]

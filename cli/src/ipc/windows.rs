@@ -83,6 +83,12 @@ const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
 /// prompt in practice; this bound exists so no path can block forever.
 const CANCEL_DRAIN_MS: u32 = 5_000;
 
+const ERROR_CANNOT_IMPERSONATE: u32 = 1368;
+/// How long the accept path waits for a connected client to become
+/// impersonatable (see [`impersonate_client`]), and how often it retries.
+const IMPERSONATE_WAIT_MS: u64 = 2_000;
+const IMPERSONATE_POLL: Duration = Duration::from_millis(10);
+
 // --- Win32 structures, matched to the SDK headers ---------------------------
 
 // typedef struct _SECURITY_ATTRIBUTES { DWORD nLength;
@@ -648,6 +654,13 @@ fn finish(
     // Safe: same live handle and OVERLAPPED.
     let returned =
         unsafe { GetOverlappedResultEx(handle, overlapped, &mut drained, CANCEL_DRAIN_MS, 0) };
+    if returned != 0 {
+        // The operation completed before the cancellation reached it — a client
+        // connected, or bytes moved, in that window. That is a real completion,
+        // not a timeout: dropping it would disconnect a peer that is already
+        // attached.
+        return Ok(drained);
+    }
     if !drain_reached_terminal_completion(returned, last_error()) {
         // The kernel may still write into this OVERLAPPED and into the caller's
         // buffer, and returning would free both. There is no bounded amount of
@@ -667,14 +680,32 @@ fn drain_reached_terminal_completion(returned: i32, error: u32) -> bool {
     returned != 0 || error != WAIT_TIMEOUT
 }
 
+/// Impersonate the connected client, waiting for the moment impersonation
+/// becomes possible. On a byte-mode pipe the client's identity is not available
+/// until it has written its first bytes, so a client that connects and *then*
+/// writes loses a race the server has to absorb: `ImpersonateNamedPipeClient`
+/// fails with `ERROR_CANNOT_IMPERSONATE` until then. The wait is bounded and
+/// reads nothing — a peer that never writes is rejected, and the codec still
+/// cannot run before the SID proof.
+fn impersonate_client(pipe: Handle) -> Result<(), IpcError> {
+    let give_up = std::time::Instant::now() + Duration::from_millis(IMPERSONATE_WAIT_MS);
+    loop {
+        // Safe: the pipe has a connected client.
+        if unsafe { ImpersonateNamedPipeClient(pipe) } != 0 {
+            return Ok(());
+        }
+        if last_error() != ERROR_CANNOT_IMPERSONATE || std::time::Instant::now() >= give_up {
+            return Err(IpcError::UnauthorizedPeer);
+        }
+        std::thread::sleep(IMPERSONATE_POLL);
+    }
+}
+
 /// Impersonate the connected client, read its token user SID, revert, and
 /// require SID equality with the connector process. Every failure is a
 /// rejection: the server never continues under its own token.
 fn verify_peer(pipe: Handle) -> Result<(), IpcError> {
-    // Safe: the pipe has a connected client.
-    if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
-        return Err(IpcError::UnauthorizedPeer);
-    }
+    impersonate_client(pipe)?;
     // From here every exit reverts, including the error paths below.
     let _revert = Impersonation;
 

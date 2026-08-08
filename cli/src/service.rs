@@ -181,6 +181,29 @@ pub fn render_launchagent_plist(ctx: &ServiceContext) -> Result<String, ServiceE
     ))
 }
 
+/// launchd domain naming. Manager commands are argv vectors run without a
+/// shell (deliberately — no shell command construction), so a literal
+/// `gui/$(id -u)` reaches `launchctl` unexpanded and is rejected as a bad
+/// request. The real effective uid is rendered in instead.
+#[cfg(target_os = "macos")]
+mod launchd {
+    // `uid_t geteuid(void);` — uid_t is `unsigned int` (u32) on macOS.
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+
+    /// `gui/<uid>` — the per-user GUI domain `launchctl bootstrap` targets.
+    pub fn gui_domain() -> String {
+        // Safe: geteuid takes no arguments and cannot fail.
+        format!("gui/{}", unsafe { geteuid() })
+    }
+
+    /// `gui/<uid>/<label>` — one service inside that domain.
+    pub fn gui_service() -> String {
+        format!("{}/{}", gui_domain(), super::SERVICE_LABEL)
+    }
+}
+
 /// The Windows Task Scheduler create command for a current-user logon task
 /// running with least privilege. `schtasks /Create` has no disable flag, so the
 /// task is disabled by a separate `/Change` step (see
@@ -294,16 +317,13 @@ fn install_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
 fn uninstall_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
     vec![ManagerCommand::new(
         "launchctl",
-        &["bootout", &format!("gui/$(id -u)/{SERVICE_LABEL}")],
+        &["bootout", &launchd::gui_service()],
     )]
 }
 
 #[cfg(target_os = "macos")]
 fn status_command(_ctx: &ServiceContext) -> ManagerCommand {
-    ManagerCommand::new(
-        "launchctl",
-        &["print", &format!("gui/$(id -u)/{SERVICE_LABEL}")],
-    )
+    ManagerCommand::new("launchctl", &["print", &launchd::gui_service()])
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -395,11 +415,8 @@ fn disable_stop_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
 fn enable_start_commands(ctx: &ServiceContext) -> Vec<ManagerCommand> {
     let plist = definition_path(ctx).to_string_lossy().into_owned();
     vec![
-        ManagerCommand::new("launchctl", &["bootstrap", "gui/$(id -u)", &plist]),
-        ManagerCommand::new(
-            "launchctl",
-            &["enable", &format!("gui/$(id -u)/{SERVICE_LABEL}")],
-        ),
+        ManagerCommand::new("launchctl", &["bootstrap", &launchd::gui_domain(), &plist]),
+        ManagerCommand::new("launchctl", &["enable", &launchd::gui_service()]),
     ]
 }
 
@@ -407,7 +424,7 @@ fn enable_start_commands(ctx: &ServiceContext) -> Vec<ManagerCommand> {
 fn disable_stop_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
     vec![ManagerCommand::new(
         "launchctl",
-        &["bootout", &format!("gui/$(id -u)/{SERVICE_LABEL}")],
+        &["bootout", &launchd::gui_service()],
     )]
 }
 
@@ -533,6 +550,22 @@ mod tests {
         assert_eq!(first, second, "id must be stable across calls");
         // A read-only reconcile of identity never creates the SQLite store.
         assert!(!context.global_root.join("loam.sqlite3").exists());
+    }
+
+    /// launchctl receives argv, never a shell line, so an unexpanded
+    /// `gui/$(id -u)` is a "Bad request" — the domain must carry a real uid.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_launchd_domain_carries_a_real_uid_not_a_shell_substitution() {
+        let domain = launchd::gui_domain();
+        let uid = domain.strip_prefix("gui/").expect("gui/<uid> domain");
+        assert!(!uid.is_empty() && uid.chars().all(|c| c.is_ascii_digit()));
+        assert!(!domain.contains('$') && !domain.contains('('));
+        assert_eq!(launchd::gui_service(), format!("{domain}/{SERVICE_LABEL}"));
+        // The commands the real manager runs carry the same expanded domain.
+        for command in enable_start_commands(&ctx("launchd-domain")) {
+            assert!(command.args.iter().all(|a| !a.contains('$')));
+        }
     }
 
     #[test]
