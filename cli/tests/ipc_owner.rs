@@ -208,6 +208,84 @@ mod windows_owner {
     }
 }
 
+#[cfg(unix)]
+mod unix_owner {
+    use loam::ipc::unix::bind;
+    use loam::ipc::{read_frame, write_frame, IpcConfig, IpcError};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    /// Support for `.github/scripts/linux-ipc-owner-smoke.sh`: hold a live
+    /// endpoint open so the script can drive a same-user positive control and a
+    /// real foreign-UID denial against it. Ignored by default — it is a
+    /// fixture, not an assertion.
+    ///
+    /// Everything the script needs to reach a verdict is printed, not inferred:
+    /// the socket path, the owning UID, and — after every accept — the number of
+    /// frames that have been served. That counter is the pre-parse sentinel. The
+    /// codec is only reachable through a `VerifiedConn`, so a peer the kernel
+    /// check rejects cannot advance it; the script asserts it does not move
+    /// across the foreign attempt, which is what "rejected before the parser"
+    /// means operationally.
+    #[test]
+    #[ignore = "fixture for the cross-user shell smoke"]
+    fn unix_endpoint_serves_the_alternate_user_smoke() {
+        let seconds: u64 = std::env::var("LOAM_IPC_SMOKE_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(120);
+        let root = std::env::var("LOAM_IPC_SMOKE_ROOT")
+            .expect("the smoke must supply LOAM_IPC_SMOKE_ROOT");
+        let endpoint = bind(&PathBuf::from(root)).expect("smoke endpoint should bind");
+
+        // `accept_verified` blocks, which is correct for the connector but would
+        // hang a runner if a client never arrives. Bound the whole fixture
+        // instead of weakening the accept path under test.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(seconds));
+            eprintln!("loam ipc: smoke fixture deadline reached");
+            std::process::exit(0);
+        });
+
+        println!("LOAM_SOCKET_PATH={}", endpoint.socket_path().display());
+        println!("LOAM_OWNER_UID={}", unsafe { libc_geteuid() });
+        println!("LOAM_SERVED_FRAMES=0");
+
+        let mut served_frames = 0u32;
+        loop {
+            match endpoint.accept_verified() {
+                Ok(mut served) => {
+                    let config = IpcConfig::default();
+                    if read_frame(&mut served, &config).is_ok() {
+                        served_frames += 1;
+                        let _ = write_frame(&mut served, b"pong", &config);
+                        let _ = served.flush();
+                    }
+                }
+                // A rejected peer must not take the endpoint down with it, and
+                // the stage is named so the script can assert which barrier
+                // produced the refusal rather than trusting a bare silence.
+                Err(IpcError::UnauthorizedPeer) => {
+                    eprintln!("loam ipc: peer rejected at unauthorized-peer");
+                }
+                Err(other) => {
+                    eprintln!("loam ipc: accept failed with {}", other.code());
+                    break;
+                }
+            }
+            println!("LOAM_SERVED_FRAMES={served_frames}");
+        }
+    }
+
+    // The fixture reports the UID it is proving against, so the script compares
+    // two observed identities instead of assuming the runner's.
+    extern "C" {
+        #[link_name = "geteuid"]
+        fn libc_geteuid() -> u32;
+    }
+}
+
 #[cfg(not(windows))]
 #[test]
 fn windows_ipc_owner_proof_is_verified_on_the_hosted_windows_runner() {

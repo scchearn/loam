@@ -108,6 +108,21 @@ jobs:
       - name: Named-pipe owner smoke (alternate-user denial)
         run: pwsh .github/scripts/windows-ipc-owner-smoke.ps1
 
+  # Slice C T6: the Unix domain-socket endpoint's owner proof, and the mirror of
+  # the Windows job above. The in-process tests cover the positive path and the
+  # path-safety rules; this job adds the one thing they cannot do — a real second
+  # account being refused, first by the 0700 directory and then, once the owner
+  # relaxes the path so the peer can actually reach the socket, by the
+  # SO_PEERCRED credential proof itself, before the parser runs.
+  linux-ipc-owner:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - name: Unix socket owner smoke (cross-user denial)
+        run: bash .github/scripts/linux-ipc-owner-smoke.sh
+
   dist-plan:
     runs-on: ubuntu-22.04
     steps:
