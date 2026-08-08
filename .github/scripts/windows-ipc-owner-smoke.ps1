@@ -94,6 +94,13 @@ try {
     $client.Dispose()
   }
   Write-Host "same-user positive control OK"
+  # Diagnostic only: the descriptor the endpoint actually carries, so the
+  # denial verdict below can be read against it instead of assumed.
+  try {
+    Write-Host ("endpoint sddl: " + (Get-Acl -Path "\\.\pipe\$short" -ErrorAction Stop).Sddl)
+  } catch {
+    Write-Host "endpoint sddl unavailable: $($_.Exception.Message)"
+  }
 
   # 3. Alternate user, alternate logon session: opening the pipe must be denied.
   New-LocalUser -Name $User -Password (ConvertTo-SecureString $Password -AsPlainText -Force) `
@@ -104,20 +111,27 @@ try {
   & icacls $Shared /grant "${User}:(OI)(CI)(F)" | Out-Null
   if ($LASTEXITCODE -ne 0) { Fail "granting $User access to the shared directory exited $LASTEXITCODE" }
 
+  # The child writes its own verdict, including the identity it actually ran
+  # under. A cross-session exit code is not evidence — `Start-Process
+  # -Credential` reports one the parent cannot always read back — and this gate
+  # decides a security question, so it decides it on what the child observed,
+  # not on a number that defaults to zero. Only an access denial passes; every
+  # other exception is an inconclusive run, not a denial.
   @"
 `$ErrorActionPreference = 'Stop'
+`$id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+`$who = `$id.Name + ' (' + `$id.User.Value + ')'
 try {
   `$stream = New-Object System.IO.Pipes.NamedPipeClientStream('.', '$short', [System.IO.Pipes.PipeDirection]::InOut)
   `$stream.Connect(5000)
   `$stream.Dispose()
+  Set-Content -Path '$ChildOut' -Value "opened as `$who"
   exit 0
-} catch [System.UnauthorizedAccessException] {
-  exit 3
 } catch {
-  if (`$_.Exception.Message -match 'Access is denied') { exit 3 }
-  Set-Content -Path '$ChildOut' -Value `$_.Exception.GetType().FullName
-  Add-Content -Path '$ChildOut' -Value `$_.Exception.Message
-  exit 4
+  `$denial = (`$_.Exception -is [System.UnauthorizedAccessException]) -or (`$_.Exception.Message -match 'Access is denied')
+  `$kind = if (`$denial) { 'denied' } else { 'error' }
+  Set-Content -Path '$ChildOut' -Value "`$kind as `$who :: `$(`$_.Exception.GetType().FullName) :: `$(`$_.Exception.Message)"
+  if (`$denial) { exit 3 } else { exit 4 }
 }
 "@ | Set-Content -Path $ChildScript -Encoding ASCII
 
@@ -126,13 +140,14 @@ try {
   $denied = Start-Process -FilePath "powershell.exe" -Credential $credential `
     -ArgumentList "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $ChildScript `
     -WorkingDirectory $Shared -PassThru -Wait
-  switch ($denied.ExitCode) {
-    3 { Write-Host "alternate-user denial OK (access denied at pipe open)" }
-    0 { Fail "another user opened the connector endpoint" }
-    default {
-      $detail = if (Test-Path $ChildOut) { Get-Content $ChildOut -Raw } else { "no detail" }
-      Fail "alternate-user attempt was inconclusive (exit $($denied.ExitCode)): $detail"
-    }
+  $verdict = if (Test-Path $ChildOut) { (Get-Content $ChildOut -Raw).Trim() } else { "" }
+  if (-not $verdict) { Fail "the alternate-user child left no verdict (exit $($denied.ExitCode))" }
+  if ($verdict.StartsWith("denied")) {
+    Write-Host "alternate-user denial OK (access denied at pipe open): $verdict"
+  } elseif ($verdict.StartsWith("opened")) {
+    Fail "another user opened the connector endpoint: $verdict"
+  } else {
+    Fail "alternate-user attempt was inconclusive (exit $($denied.ExitCode)): $verdict"
   }
 
   Write-Host "windows ipc owner smoke OK"
