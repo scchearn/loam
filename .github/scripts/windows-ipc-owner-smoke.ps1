@@ -30,10 +30,13 @@ $ErrLog = Join-Path $Root "server.err.log"
 # traversable for it — so everything the second logon session has to read or
 # write lives under the all-users public root instead, with an explicit grant
 # added once the account exists.
-$Shared = Join-Path $env:PUBLIC ("loam-ipc-" + [guid]::NewGuid().ToString("N"))
+# Short names on purpose: schtasks caps /tr at 261 characters, and these paths
+# are spelled out inside it.
+$Shared = Join-Path $env:PUBLIC ("loam-ipc-" + [guid]::NewGuid().ToString("N").Substring(0, 12))
 $ChildScript = Join-Path $Shared "client.ps1"
-$SessionOut = Join-Path $Shared "same-session.out"
-$BatchOut = Join-Path $Shared "batch-session.out"
+$TaskScript = Join-Path $Shared "task.ps1"
+$SessionOut = Join-Path $Shared "session.out"
+$BatchOut = Join-Path $Shared "batch.out"
 $Task = "loam-ipc-owner-smoke"
 $Server = $null
 $Created = $false
@@ -208,7 +211,10 @@ try {
   # 4. Second logon session. A Task Scheduler batch logon carries its own logon
   #    SID, so the DACL must refuse it at open — no handle, no frame, nothing to
   #    reject later.
-  $command = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $ChildScript -PipeName $short -Out $BatchOut"
+  # The arguments are baked into a wrapper rather than spelled out in /tr, which
+  # schtasks caps at 261 characters.
+  "& '$ChildScript' -PipeName '$short' -Out '$BatchOut'" | Set-Content -Path $TaskScript -Encoding ASCII
+  $command = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $TaskScript"
   & schtasks /create /tn $Task /tr $command /sc once /st 23:59 /ru $User /rp $Password /f | Out-Null
   if ($LASTEXITCODE -ne 0) { Fail "registering the batch-logon task exited $LASTEXITCODE" }
   $Scheduled = $true
