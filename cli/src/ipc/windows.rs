@@ -84,6 +84,10 @@ const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
 const CANCEL_DRAIN_MS: u32 = 5_000;
 
 const ERROR_CANNOT_IMPERSONATE: u32 = 1368;
+/// `CreateFileW` security-quality-of-service flags: the client states its
+/// impersonation level instead of inheriting a default.
+const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
+const SECURITY_IMPERSONATION: u32 = 0x0002_0000;
 /// How long the accept path waits for a connected client to become
 /// impersonatable (see [`impersonate_client`]), and how often it retries.
 const IMPERSONATE_WAIT_MS: u64 = 2_000;
@@ -346,11 +350,11 @@ fn token_information(token: Handle, class: i32) -> Result<Vec<u64>, IpcError> {
     // Safe: a null buffer with zero length is the documented size query.
     unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut needed) };
     if needed == 0 {
-        return Err(IpcError::UnauthorizedPeer);
+        return Err(reject_peer("token-size"));
     }
     let error = last_error();
     if error != ERROR_INSUFFICIENT_BUFFER {
-        return Err(IpcError::UnauthorizedPeer);
+        return Err(reject_peer("token-size"));
     }
     let words = (needed as usize).div_ceil(8);
     let mut buffer = vec![0u64; words];
@@ -366,7 +370,7 @@ fn token_information(token: Handle, class: i32) -> Result<Vec<u64>, IpcError> {
         )
     };
     if ok == 0 {
-        return Err(IpcError::UnauthorizedPeer);
+        return Err(reject_peer("token-read"));
     }
     Ok(buffer)
 }
@@ -680,6 +684,17 @@ fn drain_reached_terminal_completion(returned: i32, error: u32) -> bool {
     returned != 0 || error != WAIT_TIMEOUT
 }
 
+/// A rejected peer is a security event, so each rejection names the stage that
+/// produced it and the Win32 error behind it. Bounded and value-free: no
+/// payload, path, or SID is ever printed.
+fn reject_peer(stage: &str) -> IpcError {
+    eprintln!(
+        "loam ipc: peer rejected at {stage} (win32 {})",
+        last_error()
+    );
+    IpcError::UnauthorizedPeer
+}
+
 /// Impersonate the connected client, waiting for the moment impersonation
 /// becomes possible. On a byte-mode pipe the client's identity is not available
 /// until it has written its first bytes, so a client that connects and *then*
@@ -695,7 +710,7 @@ fn impersonate_client(pipe: Handle) -> Result<(), IpcError> {
             return Ok(());
         }
         if last_error() != ERROR_CANNOT_IMPERSONATE || std::time::Instant::now() >= give_up {
-            return Err(IpcError::UnauthorizedPeer);
+            return Err(reject_peer("impersonate"));
         }
         std::thread::sleep(IMPERSONATE_POLL);
     }
@@ -715,7 +730,7 @@ fn verify_peer(pipe: Handle) -> Result<(), IpcError> {
     // impersonating.
     let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
     if opened == 0 {
-        return Err(IpcError::UnauthorizedPeer);
+        return Err(reject_peer("open-thread-token"));
     }
     let token = OwnedHandle(token);
     let client = token_information(token.raw(), TOKEN_USER_CLASS)?;
@@ -726,7 +741,7 @@ fn verify_peer(pipe: Handle) -> Result<(), IpcError> {
     // Safe: pseudo-handle, query access only, local out-pointer.
     let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut process_token) };
     if ok == 0 {
-        return Err(IpcError::UnauthorizedPeer);
+        return Err(reject_peer("open-process-token"));
     }
     let process_token = OwnedHandle(process_token);
     let server = token_information(process_token.raw(), TOKEN_USER_CLASS)?;
@@ -735,7 +750,7 @@ fn verify_peer(pipe: Handle) -> Result<(), IpcError> {
 
     // Safe: both SIDs point into live, correctly aligned token buffers.
     if unsafe { EqualSid(client_sid, server_sid) } == 0 {
-        return Err(IpcError::UnauthorizedPeer);
+        return Err(reject_peer("sid-mismatch"));
     }
     Ok(())
 }
@@ -813,7 +828,11 @@ pub fn connect(pipe_name: &str) -> Result<ClientConn, IpcError> {
             0,
             std::ptr::null(),
             OPEN_EXISTING,
-            0,
+            // Ask explicitly for an impersonation-capable connection. Without
+            // SECURITY_SQOS_PRESENT the level is whatever the system defaults
+            // to, and an identification- or anonymous-level client cannot be
+            // proven by the server's SID check.
+            SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION,
             std::ptr::null_mut(),
         )
     };
