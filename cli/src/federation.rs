@@ -31,40 +31,55 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     }
 }
 
-/// Hidden internal service entrypoint: `loam federation service run
-/// --global-root <path>`. Reconciles the registry before any endpoint; an empty
-/// registry exits inert. Not a user-facing command.
+/// Hidden internal service entrypoint: `loam federation service
+/// <install|uninstall|status|run> --global-root <path>`. Manages the dormant
+/// per-user definition and runs the inert-by-default connector. Not user-facing.
 fn service(mut args: impl Iterator<Item = String>) -> i32 {
-    if args.next().as_deref() != Some("run") {
-        eprintln!("federation service: only `run` is supported");
-        return 64;
-    }
+    let subcommand = match args.next() {
+        Some(value) => value,
+        None => {
+            eprintln!("federation service: expected install|uninstall|status|run");
+            return 64;
+        }
+    };
     let mut global_root: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--global-root" => match args.next() {
                 Some(value) => global_root = Some(PathBuf::from(value)),
                 None => {
-                    eprintln!("federation service run: --global-root needs a value");
+                    eprintln!("federation service: --global-root needs a value");
                     return 64;
                 }
             },
             other => {
-                eprintln!("federation service run: unexpected argument `{other}`");
+                eprintln!("federation service: unexpected argument `{other}`");
                 return 64;
             }
         }
     }
     let Some(root) = global_root else {
-        eprintln!("federation service run: --global-root is required");
+        eprintln!("federation service: --global-root is required");
         return 64;
     };
 
+    match subcommand.as_str() {
+        "run" => service_run(&root),
+        "install" => service_lifecycle(&root, ServiceAction::Install),
+        "uninstall" => service_lifecycle(&root, ServiceAction::Uninstall),
+        "status" => service_lifecycle(&root, ServiceAction::Status),
+        other => {
+            eprintln!("federation service: unknown subcommand `{other}`");
+            64
+        }
+    }
+}
+
+fn service_run(root: &std::path::Path) -> i32 {
     #[cfg(unix)]
     {
-        match crate::connector::run_service(&root) {
-            Ok(crate::connector::ServiceOutcome::Inert) => 0,
-            Ok(crate::connector::ServiceOutcome::Served) => 0,
+        match crate::connector::run_service(root) {
+            Ok(_) => 0,
             Err(_) => 70,
         }
     }
@@ -73,6 +88,50 @@ fn service(mut args: impl Iterator<Item = String>) -> i32 {
         let _ = root;
         eprintln!("federation service run: the Windows endpoint arrives in Slice C T7");
         69
+    }
+}
+
+enum ServiceAction {
+    Install,
+    Uninstall,
+    Status,
+}
+
+/// Install/uninstall/status the dormant native definition. Builds the service
+/// context (stable instance identity + the absolute current runtime) and drives
+/// the real per-user manager. Never starts the connector or contacts a broker.
+fn service_lifecycle(root: &std::path::Path, action: ServiceAction) -> i32 {
+    let instance_id = match crate::service::ensure_instance_id(root) {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("federation service: {error}");
+            return 70;
+        }
+    };
+    let runtime_path = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => {
+            eprintln!("federation service: cannot resolve the current runtime path");
+            return 70;
+        }
+    };
+    let context = crate::service::ServiceContext {
+        global_root: root.to_path_buf(),
+        instance_id,
+        runtime_path,
+    };
+    let runner = crate::service::RealRunner;
+    let result = match action {
+        ServiceAction::Install => crate::service::install(&runner, &context).map(|()| 0),
+        ServiceAction::Uninstall => crate::service::uninstall(&runner, &context).map(|()| 0),
+        ServiceAction::Status => crate::service::status(&runner, &context),
+    };
+    match result {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("federation service: {error}");
+            70
+        }
     }
 }
 

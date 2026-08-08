@@ -8,6 +8,7 @@ on:
       - cli/**
       - dist-workspace.toml
       - .github/workflows/cli.yml
+      - .github/scripts/**
   push:
     branches: [main]
     paths:
@@ -16,6 +17,7 @@ on:
       - cli/**
       - dist-workspace.toml
       - .github/workflows/cli.yml
+      - .github/scripts/**
   workflow_dispatch:
 
 permissions:
@@ -60,6 +62,34 @@ jobs:
           path: ${{ matrix.binary }}
           if-no-files-found: error
           retention-days: 7
+
+  # Slice C T8: prove the dormant per-user service definition installs, is
+  # observable, and uninstalls on the real native managers (systemd --user,
+  # macOS LaunchAgent via launchctl, Windows Task Scheduler via schtasks). No
+  # `if:` draft guard, so this dispatches on draft PRs too. The enrolled-start
+  # smoke (observed running process) is a fast follow once this is green.
+  service-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            binary: target/release/loam
+            run: bash .github/scripts/linux-service-smoke.sh target/release/loam
+          - os: macos-14
+            binary: target/release/loam
+            run: bash .github/scripts/macos-service-smoke.sh target/release/loam
+          - os: windows-2022
+            binary: target/release/loam.exe
+            run: pwsh .github/scripts/windows-service-smoke.ps1 target/release/loam.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - run: cargo +1.94.1 build --release --locked --package loam
+      - name: Dormant service lifecycle smoke
+        run: ${{ matrix.run }}
 
   dist-plan:
     runs-on: ubuntu-22.04

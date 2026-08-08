@@ -2268,6 +2268,7 @@ mod tests {
             "codegraph.rs",
             "enrollment.rs",
             "main.rs",
+            "service.rs",
             "state.rs",
         ];
         let filesystem_files = [
@@ -2280,6 +2281,7 @@ mod tests {
             "ipc/unix.rs",
             "markdown.rs",
             "memory.rs",
+            "service.rs",
             "sha256.rs",
             "state.rs",
         ];

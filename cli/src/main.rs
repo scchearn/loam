@@ -12,6 +12,7 @@ mod json;
 mod lint;
 mod markdown;
 mod memory;
+mod service;
 mod sha256;
 mod state;
 
