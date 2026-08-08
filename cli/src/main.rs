@@ -1,6 +1,7 @@
 mod check;
 mod checkpoint;
 mod codegraph;
+mod connector;
 mod datecheck;
 mod enrollment;
 mod envelope;
