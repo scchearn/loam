@@ -819,6 +819,476 @@ pub fn validate_enrollment(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Transactional federation registry
+// ---------------------------------------------------------------------------
+//
+// Federation enrollments live in federation-owned tables inside the existing
+// `<global-root>/loam.sqlite3`, alongside the hook tables. The registry keeps
+// its own `federation_schema(version)` marker and never reads or writes the
+// hook-owned `PRAGMA user_version`. Reads open read-only and return empty when
+// the database does not exist — a read never creates the store. Writes use a
+// 5-second busy ceiling and `BEGIN IMMEDIATE`. Physical-workspace identity is the
+// uniqueness key, so symlink/case/bind aliases cannot enroll twice.
+
+// Re-exported for the connect/disconnect/status orchestration (T10/T11); unused
+// in the binary until then.
+#[allow(unused_imports)]
+pub(crate) use registry::*;
+
+mod registry {
+    //! Consumed by the connect/disconnect/status orchestration in T10/T11, which
+    //! retires this module allow once the registry is wired to the CLI surface.
+    #![allow(dead_code)]
+
+    use std::path::Path;
+
+    use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+
+    use crate::enrollment::{
+        PhysicalWorkspace, PlatformIdentity, ValidatedEnrollment, ValidatedRemote,
+    };
+    use crate::sha256::Sha256;
+
+    const FEDERATION_SCHEMA_VERSION: i64 = 1;
+    const REGISTRY_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5_000);
+
+    const CREATE_FEDERATION_TABLES: &str = "\
+    CREATE TABLE IF NOT EXISTS federation_schema (version INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS federation_enrollment (
+        id INTEGER PRIMARY KEY,
+        identity_key TEXT NOT NULL UNIQUE,
+        org_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        repository_id TEXT NOT NULL,
+        descriptor_digest TEXT NOT NULL,
+        display_path TEXT NOT NULL,
+        instance_id TEXT NOT NULL,
+        broker_profile TEXT NOT NULL,
+        broker_endpoint TEXT NOT NULL,
+        tls_server_name TEXT NOT NULL,
+        credential_ref TEXT NOT NULL,
+        ca_ref TEXT,
+        commit_oid TEXT NOT NULL,
+        cap_authentication INTEGER NOT NULL,
+        cap_publish INTEGER NOT NULL,
+        cap_subscribe INTEGER NOT NULL,
+        cap_self_receive INTEGER NOT NULL,
+        verified_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS federation_remote (
+        enrollment_id INTEGER NOT NULL REFERENCES federation_enrollment(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        url_digest TEXT NOT NULL,
+        allowed_refs TEXT NOT NULL
+    );";
+
+    /// A backend or schema failure. Distinct from the descriptor rejections above so
+    /// callers map it to a persistence sysexit rather than a usage error.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum RegistryError {
+        Backend(String),
+        SchemaUnsupported { version: i64 },
+    }
+
+    impl std::fmt::Display for RegistryError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                RegistryError::Backend(why) => {
+                    write!(f, "federation registry backend error: {why}")
+                }
+                RegistryError::SchemaUnsupported { version } => {
+                    write!(f, "unsupported federation schema version {version}")
+                }
+            }
+        }
+    }
+
+    impl RegistryError {
+        fn backend<E: std::fmt::Display>(error: E) -> RegistryError {
+            RegistryError::Backend(error.to_string())
+        }
+    }
+
+    /// The result of an idempotent enrollment insert.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum InsertOutcome {
+        /// A new enrollment was committed.
+        Inserted,
+        /// The same physical workspace with the same descriptor digest already
+        /// exists; nothing changed (and no healthy probe is republished).
+        AlreadyEnrolled,
+        /// The same physical workspace exists with a different descriptor/binding;
+        /// neither row changed. The caller must disconnect first.
+        Conflict,
+    }
+
+    /// One stored enrollment, read back for status and lifecycle. Carries no secret,
+    /// no raw remote URL, and no message content.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct EnrolledRow {
+        pub identity_key: String,
+        pub org_id: String,
+        pub project_id: String,
+        pub repository_id: String,
+        pub descriptor_digest: String,
+        pub display_path: String,
+        pub instance_id: String,
+        pub broker_profile: String,
+        pub commit: String,
+        pub capabilities: CapabilityRecord,
+        pub remotes: Vec<ValidatedRemote>,
+    }
+
+    /// The historical capability evidence a successful probe recorded.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CapabilityRecord {
+        pub authentication: bool,
+        pub publish: bool,
+        pub subscribe: bool,
+        pub self_receive: bool,
+        pub verified_at: String,
+    }
+
+    /// The uniqueness key for a physical workspace. Two aliases of one directory
+    /// resolve to the same key and therefore cannot enroll twice.
+    pub fn identity_key(workspace: &PhysicalWorkspace) -> String {
+        match &workspace.identity {
+            PlatformIdentity::Unix { device, inode } => format!("unix:{device}:{inode}"),
+            PlatformIdentity::WindowsPath => format!("path:{}", workspace.display_path),
+        }
+    }
+
+    /// A stable digest of the validated enrollment's binding, used to decide whether
+    /// a repeated connect is idempotent or a conflict. Covers org/project/repository,
+    /// broker, commit, and each remote's name/digest/refs — never a secret.
+    pub fn descriptor_digest(enrolled: &ValidatedEnrollment) -> String {
+        let mut hasher = Sha256::default();
+        for part in [
+            &enrolled.org_id,
+            &enrolled.project_id,
+            &enrolled.repository_id,
+            &enrolled.broker_profile,
+            &enrolled.broker_endpoint,
+            &enrolled.tls_server_name,
+            &enrolled.credential_ref,
+            &enrolled.commit,
+        ] {
+            hasher.update(part.as_bytes());
+            hasher.update(b"\x1f");
+        }
+        for remote in &enrolled.remotes {
+            hasher.update(remote.name.as_bytes());
+            hasher.update(b"\x1f");
+            hasher.update(remote.url_digest.as_bytes());
+            hasher.update(b"\x1f");
+            for allowed in &remote.allowed_refs {
+                hasher.update(allowed.as_bytes());
+                hasher.update(b"\x1e");
+            }
+            hasher.update(b"\x1d");
+        }
+        hasher.finish()
+    }
+
+    /// Open the registry for writing, creating the database and the federation
+    /// tables if absent. Never touches the hook-owned `PRAGMA user_version`.
+    pub fn open_writable(db_path: &Path) -> Result<Connection, RegistryError> {
+        let connection = Connection::open(db_path).map_err(RegistryError::backend)?;
+        connection
+            .busy_timeout(REGISTRY_BUSY_TIMEOUT)
+            .map_err(RegistryError::backend)?;
+        connection
+            .execute_batch(CREATE_FEDERATION_TABLES)
+            .map_err(RegistryError::backend)?;
+        ensure_schema_marker(&connection)?;
+        Ok(connection)
+    }
+
+    /// Open the registry read-only. Returns `None` when the database does not exist,
+    /// so a read never creates the store.
+    pub fn open_readonly(db_path: &Path) -> Result<Option<Connection>, RegistryError> {
+        if !db_path.is_file() {
+            return Ok(None);
+        }
+        let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(RegistryError::backend)?;
+        connection
+            .busy_timeout(REGISTRY_BUSY_TIMEOUT)
+            .map_err(RegistryError::backend)?;
+        // A database that predates federation has no marker yet; treat absent as
+        // "no enrollments" rather than an error.
+        if federation_tables_present(&connection)? {
+            let version = schema_marker(&connection)?;
+            if version != FEDERATION_SCHEMA_VERSION {
+                return Err(RegistryError::SchemaUnsupported { version });
+            }
+        }
+        Ok(Some(connection))
+    }
+
+    fn ensure_schema_marker(connection: &Connection) -> Result<(), RegistryError> {
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM federation_schema", [], |row| {
+                row.get(0)
+            })
+            .map_err(RegistryError::backend)?;
+        if count == 0 {
+            connection
+                .execute(
+                    "INSERT INTO federation_schema (version) VALUES (?1)",
+                    [FEDERATION_SCHEMA_VERSION],
+                )
+                .map_err(RegistryError::backend)?;
+        } else {
+            let version = schema_marker(connection)?;
+            if version != FEDERATION_SCHEMA_VERSION {
+                return Err(RegistryError::SchemaUnsupported { version });
+            }
+        }
+        Ok(())
+    }
+
+    fn schema_marker(connection: &Connection) -> Result<i64, RegistryError> {
+        connection
+            .query_row("SELECT version FROM federation_schema LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .map_err(RegistryError::backend)
+    }
+
+    fn federation_tables_present(connection: &Connection) -> Result<bool, RegistryError> {
+        let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='federation_schema'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(RegistryError::backend)?;
+        Ok(count == 1)
+    }
+
+    /// Insert an enrollment idempotently. Existing identical bindings are
+    /// `AlreadyEnrolled`; a changed binding for the same physical workspace is a
+    /// `Conflict`; neither mutates an existing row.
+    pub fn insert_enrollment(
+        connection: &mut Connection,
+        enrolled: &ValidatedEnrollment,
+        capabilities: &CapabilityRecord,
+        now_rfc3339: &str,
+    ) -> Result<InsertOutcome, RegistryError> {
+        let key = identity_key(&enrolled.workspace);
+        let digest = descriptor_digest(enrolled);
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(RegistryError::backend)?;
+
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT descriptor_digest FROM federation_enrollment WHERE identity_key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(existing_digest) = existing {
+            let outcome = if existing_digest == digest {
+                InsertOutcome::AlreadyEnrolled
+            } else {
+                InsertOutcome::Conflict
+            };
+            transaction.rollback().map_err(RegistryError::backend)?;
+            return Ok(outcome);
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO federation_enrollment (
+                identity_key, org_id, project_id, repository_id, descriptor_digest,
+                display_path, instance_id, broker_profile, broker_endpoint,
+                tls_server_name, credential_ref, ca_ref, commit_oid,
+                cap_authentication, cap_publish, cap_subscribe, cap_self_receive,
+                verified_at, created_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19
+            )",
+                rusqlite::params![
+                    key,
+                    enrolled.org_id,
+                    enrolled.project_id,
+                    enrolled.repository_id,
+                    digest,
+                    enrolled.workspace.display_path,
+                    instance_id_for(enrolled),
+                    enrolled.broker_profile,
+                    enrolled.broker_endpoint,
+                    enrolled.tls_server_name,
+                    enrolled.credential_ref,
+                    enrolled.ca_ref,
+                    enrolled.commit,
+                    capabilities.authentication as i64,
+                    capabilities.publish as i64,
+                    capabilities.subscribe as i64,
+                    capabilities.self_receive as i64,
+                    capabilities.verified_at,
+                    now_rfc3339,
+                ],
+            )
+            .map_err(RegistryError::backend)?;
+        let enrollment_id = transaction.last_insert_rowid();
+        for remote in &enrolled.remotes {
+            transaction
+                .execute(
+                    "INSERT INTO federation_remote (enrollment_id, name, url_digest, allowed_refs)
+                 VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        enrollment_id,
+                        remote.name,
+                        remote.url_digest,
+                        remote.allowed_refs.join("\n"),
+                    ],
+                )
+                .map_err(RegistryError::backend)?;
+        }
+        transaction.commit().map_err(RegistryError::backend)?;
+        Ok(InsertOutcome::Inserted)
+    }
+
+    /// Look up an enrollment by physical-workspace identity key.
+    pub fn lookup(
+        connection: &Connection,
+        key: &str,
+    ) -> Result<Option<EnrolledRow>, RegistryError> {
+        let row = connection
+            .query_row(
+                "SELECT id, identity_key, org_id, project_id, repository_id, descriptor_digest,
+                    display_path, instance_id, broker_profile, commit_oid,
+                    cap_authentication, cap_publish, cap_subscribe, cap_self_receive, verified_at
+             FROM federation_enrollment WHERE identity_key = ?1",
+                [key],
+                row_to_enrolled,
+            )
+            .ok();
+        match row {
+            Some((id, mut enrolled)) => {
+                enrolled.remotes = remotes_for(connection, id)?;
+                Ok(Some(enrolled))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List every enrollment, each with its remotes.
+    pub fn list_enrollments(connection: &Connection) -> Result<Vec<EnrolledRow>, RegistryError> {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, identity_key, org_id, project_id, repository_id, descriptor_digest,
+                    display_path, instance_id, broker_profile, commit_oid,
+                    cap_authentication, cap_publish, cap_subscribe, cap_self_receive, verified_at
+             FROM federation_enrollment ORDER BY id",
+            )
+            .map_err(RegistryError::backend)?;
+        let rows = statement
+            .query_map([], row_to_enrolled)
+            .map_err(RegistryError::backend)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, mut enrolled) = row.map_err(RegistryError::backend)?;
+            enrolled.remotes = remotes_for(connection, id)?;
+            out.push(enrolled);
+        }
+        Ok(out)
+    }
+
+    /// Remove an enrollment by identity key. Returns whether a row was removed.
+    pub fn delete_enrollment(
+        connection: &mut Connection,
+        key: &str,
+    ) -> Result<bool, RegistryError> {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(RegistryError::backend)?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM federation_enrollment WHERE identity_key = ?1",
+                [key],
+            )
+            .map_err(RegistryError::backend)?;
+        // Remotes cascade via the foreign key only when enforcement is on; delete
+        // explicitly so the projection is clean regardless of the pragma.
+        transaction
+            .execute(
+                "DELETE FROM federation_remote WHERE enrollment_id NOT IN
+                (SELECT id FROM federation_enrollment)",
+                [],
+            )
+            .map_err(RegistryError::backend)?;
+        transaction.commit().map_err(RegistryError::backend)?;
+        Ok(removed > 0)
+    }
+
+    fn row_to_enrolled(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, EnrolledRow)> {
+        let id: i64 = row.get(0)?;
+        Ok((
+            id,
+            EnrolledRow {
+                identity_key: row.get(1)?,
+                org_id: row.get(2)?,
+                project_id: row.get(3)?,
+                repository_id: row.get(4)?,
+                descriptor_digest: row.get(5)?,
+                display_path: row.get(6)?,
+                instance_id: row.get(7)?,
+                broker_profile: row.get(8)?,
+                commit: row.get(9)?,
+                capabilities: CapabilityRecord {
+                    authentication: row.get::<_, i64>(10)? != 0,
+                    publish: row.get::<_, i64>(11)? != 0,
+                    subscribe: row.get::<_, i64>(12)? != 0,
+                    self_receive: row.get::<_, i64>(13)? != 0,
+                    verified_at: row.get(14)?,
+                },
+                remotes: Vec::new(),
+            },
+        ))
+    }
+
+    fn remotes_for(
+        connection: &Connection,
+        enrollment_id: i64,
+    ) -> Result<Vec<ValidatedRemote>, RegistryError> {
+        let mut statement = connection
+        .prepare("SELECT name, url_digest, allowed_refs FROM federation_remote WHERE enrollment_id = ?1 ORDER BY name")
+        .map_err(RegistryError::backend)?;
+        let rows = statement
+            .query_map([enrollment_id], |row| {
+                let name: String = row.get(0)?;
+                let url_digest: String = row.get(1)?;
+                let allowed: String = row.get(2)?;
+                Ok(ValidatedRemote {
+                    name,
+                    url_digest,
+                    allowed_refs: allowed.split('\n').map(str::to_owned).collect(),
+                })
+            })
+            .map_err(RegistryError::backend)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(RegistryError::backend)?);
+        }
+        Ok(out)
+    }
+
+    /// The derived instance identity for an enrollment. Slice C T8 owns the stable
+    /// per-install `instance_id`; until it is wired, a stable value derived from the
+    /// physical identity populates the registry column.
+    fn instance_id_for(enrolled: &ValidatedEnrollment) -> String {
+        identity_key(&enrolled.workspace)
+    }
+} // mod registry
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1043,5 +1513,183 @@ mod tests {
         // valid descriptor.
         let valid = golden_valid();
         format!("{{{extra_pair},{}", &valid[1..])
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use rusqlite::{Connection, TransactionBehavior};
+
+    fn temp_db(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "loam-registry-{label}-{}.sqlite3",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn sample(device: u64, inode: u64, commit: &str) -> ValidatedEnrollment {
+        ValidatedEnrollment {
+            org_id: "acme".into(),
+            project_id: "loam".into(),
+            repository_id: "repo".into(),
+            broker_profile: "acme-prod".into(),
+            broker_endpoint: "mqtts://broker.acme.example:8883".into(),
+            tls_server_name: "broker.acme.example".into(),
+            credential_ref: "vault://acme/loam/mqtt".into(),
+            ca_ref: None,
+            commit: commit.into(),
+            remotes: vec![ValidatedRemote {
+                name: "origin".into(),
+                url_digest: "a".repeat(64),
+                allowed_refs: vec!["refs/heads/main".into()],
+            }],
+            workspace: PhysicalWorkspace {
+                display_path: "/w/proj".into(),
+                identity: PlatformIdentity::Unix { device, inode },
+            },
+        }
+    }
+
+    fn caps() -> CapabilityRecord {
+        CapabilityRecord {
+            authentication: true,
+            publish: true,
+            subscribe: true,
+            self_receive: true,
+            verified_at: "2026-08-08T10:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn a_read_never_creates_the_store() {
+        let path = temp_db("no-create");
+        assert!(open_readonly(&path).unwrap().is_none());
+        assert!(!path.is_file(), "read must not create the database");
+    }
+
+    #[test]
+    fn insert_lookup_and_list_round_trip() {
+        let path = temp_db("round-trip");
+        let mut connection = open_writable(&path).unwrap();
+        let enrolled = sample(1, 10, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(
+            insert_enrollment(&mut connection, &enrolled, &caps(), "2026-08-08T10:00:00Z").unwrap(),
+            InsertOutcome::Inserted
+        );
+        let key = identity_key(&enrolled.workspace);
+        let row = lookup(&connection, &key).unwrap().expect("present");
+        assert_eq!(row.org_id, "acme");
+        assert_eq!(row.commit, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(row.remotes.len(), 1);
+        assert_eq!(row.remotes[0].url_digest, "a".repeat(64));
+        assert!(row.capabilities.self_receive);
+        assert_eq!(list_enrollments(&connection).unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn same_physical_workspace_is_idempotent_and_conflict_aware() {
+        let path = temp_db("idempotent");
+        let mut connection = open_writable(&path).unwrap();
+        let enrolled = sample(2, 20, "0123456789abcdef0123456789abcdef01234567");
+        insert_enrollment(&mut connection, &enrolled, &caps(), "t").unwrap();
+
+        // Same identity, same digest -> AlreadyEnrolled, no duplicate row.
+        assert_eq!(
+            insert_enrollment(&mut connection, &enrolled, &caps(), "t").unwrap(),
+            InsertOutcome::AlreadyEnrolled
+        );
+        assert_eq!(list_enrollments(&connection).unwrap().len(), 1);
+
+        // Same identity, different binding (commit) -> Conflict, still one row.
+        let changed = sample(2, 20, "ffffffffffffffffffffffffffffffffffffffff");
+        assert_eq!(
+            insert_enrollment(&mut connection, &changed, &caps(), "t").unwrap(),
+            InsertOutcome::Conflict
+        );
+        let row = lookup(&connection, &identity_key(&enrolled.workspace))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.commit, "0123456789abcdef0123456789abcdef01234567",
+            "conflict must not overwrite"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delete_removes_then_reports_absent() {
+        let path = temp_db("delete");
+        let mut connection = open_writable(&path).unwrap();
+        let enrolled = sample(3, 30, "0123456789abcdef0123456789abcdef01234567");
+        insert_enrollment(&mut connection, &enrolled, &caps(), "t").unwrap();
+        let key = identity_key(&enrolled.workspace);
+        assert!(delete_enrollment(&mut connection, &key).unwrap());
+        assert!(!delete_enrollment(&mut connection, &key).unwrap());
+        assert!(lookup(&connection, &key).unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn federation_never_touches_hook_user_version() {
+        let path = temp_db("user-version");
+        let connection = open_writable(&path).unwrap();
+        // A fresh federation-only database leaves user_version at its default 0.
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 0);
+        // Simulate the hook store claiming version 2, then run a federation write.
+        connection
+            .execute_batch("PRAGMA user_version = 2;")
+            .unwrap();
+        drop(connection);
+        let mut connection = open_writable(&path).unwrap();
+        insert_enrollment(
+            &mut connection,
+            &sample(4, 40, "0123456789abcdef0123456789abcdef01234567"),
+            &caps(),
+            "t",
+        )
+        .unwrap();
+        let after: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            after, 2,
+            "federation must not alter hook-owned user_version"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_busy_writer_times_out_rather_than_corrupting() {
+        // A second immediate transaction against a write-locked database must
+        // fail (busy) within its short timeout rather than block forever or
+        // corrupt state — proving `BEGIN IMMEDIATE` + busy ceiling behave.
+        let path = temp_db("busy");
+        let mut holder = open_writable(&path).unwrap();
+        let held = holder
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        held.execute_batch("CREATE TABLE IF NOT EXISTS lock_marker(a)")
+            .unwrap(); // acquire the write lock
+
+        let second = Connection::open(&path).unwrap();
+        second
+            .busy_timeout(std::time::Duration::from_millis(20))
+            .unwrap();
+        let result = second.execute_batch("BEGIN IMMEDIATE; CREATE TABLE x(a); COMMIT;");
+        assert!(
+            result.is_err(),
+            "a write-locked database must refuse the second immediate writer"
+        );
+
+        drop(held);
+        let _ = std::fs::remove_file(&path);
     }
 }
