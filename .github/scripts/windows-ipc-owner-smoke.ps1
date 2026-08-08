@@ -240,6 +240,29 @@ try {
     Write-Warning ("case 3 did not open a handle, so only the logon-SESSION barrier was exercised; " +
       "the per-USER SID proof is UNTESTED by this run. Find another way to reach the endpoint " +
       "from the caller's logon session as a different user.")
+  } else {
+    # The verdict alone says the client was not served; it does not say why.
+    # Require the server to name the stage, because only `sid-mismatch` is the
+    # per-USER barrier. `impersonate` would mean the client arrived without
+    # SECURITY_SQOS_PRESENT and was refused for having no readable SID at all —
+    # a real rejection, but not the one this case exists to prove. Neither the
+    # positive control nor the batch-logon case reaches this code, so any
+    # rejection line here belongs to case 3.
+    $stage = ""
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline -and -not $stage) {
+      if (Test-Path $ErrLog) {
+        $hit = Select-String -Path $ErrLog -Pattern "peer rejected at (\S+)" | Select-Object -Last 1
+        if ($hit) { $stage = $hit.Matches[0].Groups[1].Value }
+      }
+      if (-not $stage) { Start-Sleep -Milliseconds 250 }
+    }
+    if (-not $stage) { Fail "the endpoint never reported rejecting the same-session peer" }
+    Write-Host "same-session second user was rejected at: $stage"
+    if ($stage -ne "sid-mismatch") {
+      Fail ("the same-session peer was rejected at '$stage', not by the SID proof; " +
+        "the per-USER barrier is not what this run demonstrated")
+    }
   }
 
   # 4. Second logon session. A Task Scheduler batch logon carries its own logon
