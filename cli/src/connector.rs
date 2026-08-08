@@ -459,6 +459,51 @@ pub enum ServiceError {
     Ipc(ipc::IpcError),
 }
 
+/// A volatile, in-memory per-session inject-channel registry (2026-08-08
+/// amendment, T18). Held only for the life of one connector process: a restart
+/// drops every channel, and nothing here is ever written to the SQLite registry.
+/// Injection over a channel is Slice E; Slice C only admits, holds, hands back,
+/// and drops it.
+#[derive(Debug, Default)]
+pub struct ChannelRegistry {
+    sessions: std::collections::HashMap<String, InjectChannel>,
+}
+
+/// One registered inject channel. `channel_ref` is opaque: the plugin hands it
+/// over and the connector holds it without interpreting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectChannel {
+    pub session_id: String,
+    pub project_id: String,
+    pub channel_ref: String,
+}
+
+impl ChannelRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, channel: InjectChannel) {
+        self.sessions.insert(channel.session_id.clone(), channel);
+    }
+
+    pub fn drop_session(&mut self, session_id: &str) -> bool {
+        self.sessions.remove(session_id).is_some()
+    }
+
+    pub fn contains(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+}
+
 /// Run the connector. Reconciles the registry before touching an endpoint: a
 /// missing database or an empty registry returns [`ServiceOutcome::Inert`]
 /// without binding a socket. Only a non-empty registry binds the owner-only
@@ -471,7 +516,9 @@ pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
     }
     let run_dir = global_root.join("run");
     let endpoint = ipc::unix::bind(&run_dir).map_err(ServiceError::Ipc)?;
-    accept_loop(&endpoint, &db_path);
+    // The channel registry lives only for this process; a restart starts empty.
+    let mut channels = ChannelRegistry::new();
+    accept_loop(&endpoint, &db_path, &mut channels);
     Ok(ServiceOutcome::Served)
 }
 
@@ -485,11 +532,15 @@ fn registry_has_enrollments(db_path: &Path) -> Result<bool, ServiceError> {
 }
 
 #[cfg(unix)]
-fn accept_loop(endpoint: &ipc::unix::OwnedEndpoint, db_path: &Path) {
+fn accept_loop(
+    endpoint: &ipc::unix::OwnedEndpoint,
+    db_path: &Path,
+    channels: &mut ChannelRegistry,
+) {
     let config = IpcConfig::default();
     loop {
         // One failed connection never takes the connector down; keep serving.
-        let _ = serve_one(endpoint, db_path, &config);
+        let _ = serve_one(endpoint, db_path, &config, channels);
     }
 }
 
@@ -501,11 +552,12 @@ pub fn serve_one(
     endpoint: &ipc::unix::OwnedEndpoint,
     db_path: &Path,
     config: &IpcConfig,
+    channels: &mut ChannelRegistry,
 ) -> Result<(), ipc::IpcError> {
     let mut connection = endpoint.accept_verified()?;
     let frame = ipc::read_frame(&mut connection, config)?;
     let response = match ipc::parse_request(&frame, config) {
-        Ok(request) => dispatch(&request, db_path, config),
+        Ok(request) => dispatch(&request, db_path, config, channels),
         Err(error) => ipc::error_response("", &error, config),
     };
     ipc::write_frame(&mut connection, &response, config)
@@ -513,21 +565,30 @@ pub fn serve_one(
 
 /// Resolve the request's workspace through the registry, enforce the project
 /// binding, and run the closed operation. Returns an encoded response body.
-fn dispatch(request: &Request, db_path: &Path, config: &IpcConfig) -> Vec<u8> {
-    match resolve_and_run(request, db_path) {
+fn dispatch(
+    request: &Request,
+    db_path: &Path,
+    config: &IpcConfig,
+    channels: &mut ChannelRegistry,
+) -> Vec<u8> {
+    match resolve_and_run(request, db_path, channels) {
         Ok(result) => ipc::ok_response(&request.request_id, result),
         Err(error) => ipc::error_response(&request.request_id, &error, config),
     }
 }
 
-fn resolve_and_run(request: &Request, db_path: &Path) -> Result<crate::json::Value, ipc::IpcError> {
+fn resolve_and_run(
+    request: &Request,
+    db_path: &Path,
+    channels: &mut ChannelRegistry,
+) -> Result<crate::json::Value, ipc::IpcError> {
     // Resolve the workspace to its physical identity exactly as enrollment did,
     // so a path alias resolves to the same enrollment and a non-workspace path is
     // treated as unenrolled.
     let workspace = crate::enrollment::PhysicalWorkspace::resolve(Path::new(&request.workspace))
         .map_err(|_| ipc::IpcError::WorkspaceUnenrolled)?;
     let key = crate::enrollment::identity_key(&workspace);
-    dispatch_for_key(request, &key, db_path)
+    dispatch_for_key(request, &key, db_path, channels)
 }
 
 /// Dispatch a request that has already been resolved to a physical identity key.
@@ -537,6 +598,7 @@ fn dispatch_for_key(
     request: &Request,
     key: &str,
     db_path: &Path,
+    channels: &mut ChannelRegistry,
 ) -> Result<crate::json::Value, ipc::IpcError> {
     let read = crate::enrollment::open_readonly(db_path)
         .map_err(|_| ipc::IpcError::Internal)?
@@ -567,12 +629,49 @@ fn dispatch_for_key(
             let removed = crate::enrollment::delete_enrollment(&mut write, key)
                 .map_err(|_| ipc::IpcError::Internal)?;
             if removed {
+                // Any live inject channels for this project become moot; the real
+                // per-session drop is driven by Slice E's session end.
                 Ok(ack_json(&row, "detached"))
             } else {
                 Err(ipc::IpcError::WorkspaceUnenrolled)
             }
         }
+        Operation::SessionRegisterInject => {
+            // Admit the session's inject channel to the volatile in-memory
+            // registry (2026-08-08 amendment). The enrollment + project binding
+            // were already proven above. Nothing is written to SQLite; injection
+            // over the channel is Slice E.
+            let session_id = request
+                .payload
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .ok_or(ipc::IpcError::InvalidRequest)?;
+            let channel_ref = request
+                .payload
+                .get("channel_ref")
+                .and_then(|v| v.as_str())
+                .ok_or(ipc::IpcError::InvalidRequest)?;
+            channels.register(InjectChannel {
+                session_id: session_id.to_owned(),
+                project_id: row.project_id.clone(),
+                channel_ref: channel_ref.to_owned(),
+            });
+            Ok(register_ack_json(session_id, &row.project_id))
+        }
     }
+}
+
+fn register_ack_json(session_id: &str, project_id: &str) -> crate::json::Value {
+    use crate::json::Value;
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        (
+            "action".into(),
+            Value::String("inject-channel-registered".into()),
+        ),
+        ("session_id".into(), Value::String(session_id.to_owned())),
+        ("project_id".into(), Value::String(project_id.to_owned())),
+    ])
 }
 
 /// A precise, aggregate-free status projection: enrollment, historical verified
@@ -923,6 +1022,7 @@ mod service_tests {
             &request(Operation::StatusGet, crate::json::Value::Object(vec![])),
             &key,
             &path,
+            &mut ChannelRegistry::new(),
         )
         .expect("status");
         let text = result.to_json();
@@ -939,6 +1039,7 @@ mod service_tests {
             &request(Operation::StatusGet, crate::json::Value::Object(vec![])),
             "unix:999:999",
             &path,
+            &mut ChannelRegistry::new(),
         );
         assert_eq!(outcome.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
     }
@@ -950,7 +1051,12 @@ mod service_tests {
             "project_id".into(),
             crate::json::Value::String("some-other-project".into()),
         )]);
-        let outcome = dispatch_for_key(&request(Operation::StatusGet, payload), &key, &path);
+        let outcome = dispatch_for_key(
+            &request(Operation::StatusGet, payload),
+            &key,
+            &path,
+            &mut ChannelRegistry::new(),
+        );
         assert_eq!(outcome.err(), Some(ipc::IpcError::ProjectBindingMismatch));
     }
 
@@ -961,13 +1067,102 @@ mod service_tests {
             &request(Operation::ProjectDetach, crate::json::Value::Object(vec![])),
             &key,
             &path,
+            &mut ChannelRegistry::new(),
         )
         .expect("detach");
         let after = dispatch_for_key(
             &request(Operation::StatusGet, crate::json::Value::Object(vec![])),
             &key,
             &path,
+            &mut ChannelRegistry::new(),
         );
         assert_eq!(after.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
+    }
+
+    // --- T18 register-inject + volatile channel registry ---
+
+    fn register_request(session_id: &str, channel_ref: &str) -> Request {
+        Request {
+            request_id: "r-1".into(),
+            workspace: "/w/proj".into(),
+            operation: Operation::SessionRegisterInject,
+            payload: crate::json::Value::Object(vec![
+                (
+                    "session_id".into(),
+                    crate::json::Value::String(session_id.into()),
+                ),
+                (
+                    "channel_ref".into(),
+                    crate::json::Value::String(channel_ref.into()),
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn register_inject_admits_a_channel_without_persisting() {
+        let (path, key) = enrolled_db("register", 6, 60);
+        let mut channels = ChannelRegistry::new();
+        let result = dispatch_for_key(
+            &register_request("sess-1", "chan-token-1"),
+            &key,
+            &path,
+            &mut channels,
+        )
+        .expect("register");
+        assert!(result.to_json().contains("inject-channel-registered"));
+        assert!(channels.contains("sess-1"));
+        assert_eq!(channels.len(), 1);
+
+        // Nothing about the channel is written to SQLite: no table holds it, and
+        // the enrollment row count is unchanged.
+        let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+        let channel_tables: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE '%channel%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(channel_tables, 0, "no channel table may exist in SQLite");
+        assert_eq!(
+            crate::enrollment::list_enrollments(&connection)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn register_inject_requires_an_enrolled_workspace() {
+        let (path, _key) = enrolled_db("register-unenrolled", 7, 70);
+        let outcome = dispatch_for_key(
+            &register_request("sess-x", "chan"),
+            "unix:404:404",
+            &path,
+            &mut ChannelRegistry::new(),
+        );
+        assert_eq!(outcome.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
+    }
+
+    #[test]
+    fn a_channel_is_dropped_on_session_end() {
+        let mut channels = ChannelRegistry::new();
+        channels.register(InjectChannel {
+            session_id: "sess-2".into(),
+            project_id: "loam".into(),
+            channel_ref: "c".into(),
+        });
+        assert!(channels.contains("sess-2"));
+        assert!(channels.drop_session("sess-2"));
+        assert!(!channels.contains("sess-2"));
+        assert!(!channels.drop_session("sess-2")); // idempotent
+    }
+
+    #[test]
+    fn a_restart_starts_with_an_empty_registry() {
+        // A fresh registry (a new process) holds nothing — channels never persist.
+        let channels = ChannelRegistry::new();
+        assert!(channels.is_empty());
     }
 }

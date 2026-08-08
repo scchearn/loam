@@ -52,14 +52,20 @@ impl Default for IpcConfig {
     }
 }
 
-/// The closed Slice C operation enum. Unknown or Slice-D/E-future operations
-/// return [`IpcError::UnknownOperation`]; there is no string-to-handler registry
-/// and no generic payload dispatch. T18 extends this enum by a named variant.
+/// The closed Slice C operation enum. Unknown operations return
+/// [`IpcError::UnknownOperation`]; there is no string-to-handler registry and no
+/// generic payload dispatch. Named variants extend it — Slice E's live delivery
+/// registers an inject channel via `session.register-inject` (T18), which is a
+/// named variant here, not a generic dispatch surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
     StatusGet,
     ProjectAttach,
     ProjectDetach,
+    /// A session hands the connector an inject channel (2026-08-08 amendment).
+    /// The channel is held in a volatile in-memory registry; injection over it is
+    /// Slice E. Never persisted.
+    SessionRegisterInject,
 }
 
 impl Operation {
@@ -68,6 +74,7 @@ impl Operation {
             "status.get" => Some(Operation::StatusGet),
             "project.attach" => Some(Operation::ProjectAttach),
             "project.detach" => Some(Operation::ProjectDetach),
+            "session.register-inject" => Some(Operation::SessionRegisterInject),
             _ => None,
         }
     }
@@ -77,6 +84,7 @@ impl Operation {
             Operation::StatusGet => "status.get",
             Operation::ProjectAttach => "project.attach",
             Operation::ProjectDetach => "project.detach",
+            Operation::SessionRegisterInject => "session.register-inject",
         }
     }
 }
@@ -398,10 +406,16 @@ mod tests {
             parse_request(v2, &config),
             Err(IpcError::UnsupportedVersion)
         );
-        let unknown_op = br#"{"version":1,"request_id":"r","workspace":"w","operation":"session.register-inject","payload":{}}"#;
+        let unknown_op = br#"{"version":1,"request_id":"r","workspace":"w","operation":"session.teleport","payload":{}}"#;
         assert_eq!(
             parse_request(unknown_op, &config),
             Err(IpcError::UnknownOperation)
+        );
+        // The T18 named variant is now recognized, not a generic dispatch.
+        let register = br#"{"version":1,"request_id":"r","workspace":"w","operation":"session.register-inject","payload":{}}"#;
+        assert_eq!(
+            parse_request(register, &config).unwrap().operation,
+            Operation::SessionRegisterInject
         );
     }
 
