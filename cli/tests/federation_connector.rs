@@ -19,8 +19,15 @@ fn binary() -> PathBuf {
     path.join(if cfg!(windows) { "loam.exe" } else { "loam" })
 }
 
+/// A short-pathed temporary global root. The endpoint is a Unix socket, and
+/// `sun_path` is 104 bytes on macOS — `std::env::temp_dir()` there is a long
+/// `/var/folders/...` path that alone can exceed it.
 fn temp_root(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    #[cfg(unix)]
+    let base = PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let base = std::env::temp_dir();
+    let dir = base.join(format!(
         "loam-connector-{label}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -162,7 +169,9 @@ fn an_enrolled_machine_starts_and_serves_instead_of_exiting() {
         while !socket.exists() && std::time::Instant::now() < deadline {
             assert!(
                 child.try_wait().expect("poll service").is_none(),
-                "an enrolled connector must not exit before binding its endpoint"
+                "an enrolled connector must not exit before binding its endpoint \
+                 (exit status {:?})",
+                child.try_wait().expect("poll service")
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }

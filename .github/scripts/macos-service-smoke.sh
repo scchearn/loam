@@ -5,7 +5,10 @@
 # uninstall remove it. RunAtLoad=false, so bootstrapping never starts it.
 set -euo pipefail
 BIN="${1:?path to loam binary required}"
-ROOT="$(mktemp -d)"
+# Short root on purpose: the connector endpoint is a Unix socket and macOS
+# caps sun_path at 104 bytes, which the default /var/folders/... temp path can
+# exceed on its own.
+ROOT="$(mktemp -d /tmp/loam-svc-XXXXXX)"
 LABEL="io.loam.connector"
 DOMAIN="gui/$(id -u)"
 PLIST="$ROOT/launchagents/$LABEL.plist"
