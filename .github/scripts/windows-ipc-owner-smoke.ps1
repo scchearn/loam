@@ -140,6 +140,17 @@ try {
   # logon session it observed it from. `whoami /logonid` is used deliberately:
   # WindowsIdentity.Groups does not surface the logon SID, so the .NET view
   # cannot tell these two cases apart.
+  #
+  # It opens with the five-argument constructor and TokenImpersonationLevel
+  # Impersonation, exactly like the positive control above and like `connect`
+  # in cli/src/ipc/windows.rs. This matters for case 3: the three-argument
+  # constructor defaults to TokenImpersonationLevel.None, which omits
+  # SECURITY_SQOS_PRESENT, so the server impersonates an anonymous token and
+  # rejects it for having no readable SID at all. That "unserved" verdict would
+  # be attributable to anonymous impersonation, not to the SID mismatch — and
+  # case 3 is the only evidence for the per-USER barrier. Asking for
+  # Impersonation gives the server a genuinely different, readable client SID,
+  # so the rejection can only come from EqualSid.
   @'
 param([string]$PipeName, [string]$Out)
 $ErrorActionPreference = 'Stop'
@@ -149,7 +160,12 @@ function Say([string]$outcome, [string]$detail) {
   Set-Content -Path $Out -Value "$outcome as $who :: $detail"
 }
 try {
-  $stream = New-Object System.IO.Pipes.NamedPipeClientStream('.', $PipeName, [System.IO.Pipes.PipeDirection]::InOut)
+  $stream = [System.IO.Pipes.NamedPipeClientStream]::new(
+    '.',
+    $PipeName,
+    [System.IO.Pipes.PipeDirection]::InOut,
+    [System.IO.Pipes.PipeOptions]::None,
+    [System.Security.Principal.TokenImpersonationLevel]::Impersonation)
   $stream.Connect(5000)
 } catch {
   if (($_.Exception -is [System.UnauthorizedAccessException]) -or ($_.Exception.Message -match 'Access is denied')) {
@@ -206,6 +222,17 @@ try {
   if ($verdict.StartsWith("served")) { Fail "the connector served a second user: $verdict" }
   if (-not ($verdict.StartsWith("unserved") -or $verdict.StartsWith("denied-at-open"))) {
     Fail "the same-session attempt was inconclusive: $verdict"
+  }
+  # `unserved` is the verdict this case exists to produce: the handle opened, so
+  # the DACL admitted the logon session, and the refusal came from the SID
+  # proof. `denied-at-open` is still a safe outcome, but it means seclogon no
+  # longer copies the caller's logon SID, so case 3 has silently degraded into a
+  # duplicate of case 4 and the per-USER barrier is no longer under test. Say so
+  # loudly rather than letting the gate go green on half its evidence.
+  if ($verdict.StartsWith("denied-at-open")) {
+    Write-Warning ("case 3 did not open a handle, so only the logon-SESSION barrier was exercised; " +
+      "the per-USER SID proof is UNTESTED by this run. Find another way to reach the endpoint " +
+      "from the caller's logon session as a different user.")
   }
 
   # 4. Second logon session. A Task Scheduler batch logon carries its own logon
