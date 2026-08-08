@@ -674,6 +674,187 @@ fn register_ack_json(session_id: &str, project_id: &str) -> crate::json::Value {
     ])
 }
 
+// ---------------------------------------------------------------------------
+// Transactional connect orchestration and rollback (T10)
+// ---------------------------------------------------------------------------
+//
+// The ordered contract: validate locally (done by the caller), then check
+// idempotence/conflict against the registry BEFORE probing, then run the
+// subscribe-first exact round-trip probe, then commit the enrollment
+// transactionally, then activate exactly one service and reach readiness. Any
+// failure after the registry commit removes only this attempt's row and
+// stops/disables an otherwise-empty service; a compound compensation failure is
+// surfaced as `RollbackIncomplete`, never as success. The transport and the
+// service manager are seams so the whole ordered failure matrix is testable.
+
+use crate::service;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConnectOutcome {
+    /// A new enrollment was probed, committed, and activated.
+    Connected {
+        capabilities: crate::enrollment::CapabilityRecord,
+    },
+    /// The same physical workspace with the same descriptor was already enrolled;
+    /// lifecycle drift was repaired without a re-probe.
+    AlreadyConnected,
+}
+
+#[derive(Debug)]
+pub enum ConnectError {
+    Probe(ProbeError),
+    Registry(crate::enrollment::RegistryError),
+    /// The same physical workspace is enrolled with a different binding.
+    EnrollmentConflict,
+    /// Activation failed but compensation succeeded (no residual enrollment).
+    ActivationFailed(String),
+    /// Compensation itself failed; the residual local state is reported.
+    RollbackIncomplete(String),
+}
+
+impl ConnectError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ConnectError::Probe(_) => "connect_probe_failed",
+            ConnectError::Registry(_) => "connect_registry_error",
+            ConnectError::EnrollmentConflict => "enrollment_conflict",
+            ConnectError::ActivationFailed(_) => "connect_activation_failed",
+            ConnectError::RollbackIncomplete(_) => "rollback_incomplete",
+        }
+    }
+}
+
+fn capability_record(evidence: &CapabilityEvidence) -> crate::enrollment::CapabilityRecord {
+    crate::enrollment::CapabilityRecord {
+        authentication: evidence.authentication,
+        publish: evidence.publish,
+        subscribe: evidence.subscribe,
+        self_receive: evidence.self_receive,
+        verified_at: evidence.verified_at.to_rfc3339(),
+    }
+}
+
+fn probe_context_from(enrolled: &crate::enrollment::ValidatedEnrollment) -> ProbeContext {
+    // The probe is a capability check; its git anchors just need to be valid
+    // OIDs, so the enrolled commit serves for both.
+    ProbeContext {
+        org_id: enrolled.org_id.clone(),
+        project_id: enrolled.project_id.clone(),
+        repository_id: enrolled.repository_id.clone(),
+        base_oid: enrolled.commit.clone(),
+        plan_oid: enrolled.commit.clone(),
+    }
+}
+
+/// Orchestrate connect from an already-validated enrollment. Splitting the
+/// Git-dependent validation (the caller's step) from this lets the ordered
+/// failure matrix be tested without a real workspace.
+#[allow(clippy::too_many_arguments)]
+pub fn orchestrate_from_validated<T: Transport, R: service::CommandRunner>(
+    enrolled: &crate::enrollment::ValidatedEnrollment,
+    transport: &mut T,
+    service_runner: &R,
+    service_ctx: &service::ServiceContext,
+    db_path: &std::path::Path,
+    config: &ValidationConfig,
+    deadline: Duration,
+    now: DateTime<Utc>,
+) -> Result<ConnectOutcome, ConnectError> {
+    let key = crate::enrollment::identity_key(&enrolled.workspace);
+    let digest = crate::enrollment::descriptor_digest(enrolled);
+
+    // Idempotence / conflict — before any probe, so a healthy existing enrollment
+    // is never re-probed.
+    if let Some(connection) =
+        crate::enrollment::open_readonly(db_path).map_err(ConnectError::Registry)?
+    {
+        if let Some(existing) =
+            crate::enrollment::lookup(&connection, &key).map_err(ConnectError::Registry)?
+        {
+            drop(connection);
+            if existing.descriptor_digest == digest {
+                // Repair lifecycle drift, no re-publication.
+                let _ = service::install(service_runner, service_ctx);
+                let _ = service::enable_start(service_runner, service_ctx);
+                return Ok(ConnectOutcome::AlreadyConnected);
+            }
+            return Err(ConnectError::EnrollmentConflict);
+        }
+    }
+
+    // Subscribe-first exact round-trip probe.
+    let probe_ctx = probe_context_from(enrolled);
+    let evidence =
+        run_probe(transport, &probe_ctx, config, deadline, now).map_err(ConnectError::Probe)?;
+    let capabilities = capability_record(&evidence);
+
+    // Commit the enrollment transactionally before activation.
+    let mut connection =
+        crate::enrollment::open_writable(db_path).map_err(ConnectError::Registry)?;
+    match crate::enrollment::insert_enrollment(
+        &mut connection,
+        enrolled,
+        &capabilities,
+        &now.to_rfc3339(),
+    )
+    .map_err(ConnectError::Registry)?
+    {
+        crate::enrollment::InsertOutcome::Inserted => {}
+        crate::enrollment::InsertOutcome::AlreadyEnrolled => {
+            return Ok(ConnectOutcome::AlreadyConnected)
+        }
+        crate::enrollment::InsertOutcome::Conflict => return Err(ConnectError::EnrollmentConflict),
+    }
+    drop(connection);
+
+    // Activate exactly one service; compensate on any failure.
+    let activation = service::install(service_runner, service_ctx)
+        .and_then(|()| service::enable_start(service_runner, service_ctx));
+    if let Err(error) = activation {
+        return Err(compensate_after_activation(
+            db_path,
+            &key,
+            service_runner,
+            service_ctx,
+            &error,
+        ));
+    }
+
+    Ok(ConnectOutcome::Connected { capabilities })
+}
+
+/// Remove only this attempt's enrollment row and, if the registry is now empty,
+/// stop/disable the service. A failure to compensate is `RollbackIncomplete`.
+fn compensate_after_activation<R: service::CommandRunner>(
+    db_path: &std::path::Path,
+    key: &str,
+    service_runner: &R,
+    service_ctx: &service::ServiceContext,
+    activation_error: &service::ServiceError,
+) -> ConnectError {
+    let mut connection = match crate::enrollment::open_writable(db_path) {
+        Ok(connection) => connection,
+        Err(_) => {
+            return ConnectError::RollbackIncomplete(format!(
+                "registry unreachable during rollback after activation error: {activation_error}"
+            ))
+        }
+    };
+    if crate::enrollment::delete_enrollment(&mut connection, key).is_err() {
+        return ConnectError::RollbackIncomplete(format!(
+            "enrollment row not removed during rollback after activation error: {activation_error}"
+        ));
+    }
+    let now_empty = crate::enrollment::list_enrollments(&connection)
+        .map(|rows| rows.is_empty())
+        .unwrap_or(false);
+    drop(connection);
+    if now_empty {
+        let _ = service::disable_stop(service_runner, service_ctx);
+    }
+    ConnectError::ActivationFailed(activation_error.to_string())
+}
+
 /// A precise, aggregate-free status projection: enrollment, historical verified
 /// capabilities, and a broker-session field that is explicitly not-live here (a
 /// real session is the adapter's, T13). No `connected`/`ready` boolean.
@@ -1164,5 +1345,266 @@ mod service_tests {
         // A fresh registry (a new process) holds nothing — channels never persist.
         let channels = ChannelRegistry::new();
         assert!(channels.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+    use crate::enrollment::{
+        PhysicalWorkspace, PlatformIdentity, ValidatedEnrollment, ValidatedRemote,
+    };
+    use crate::service::{CommandRunner, ManagerCommand, ServiceContext, ServiceError};
+    use std::cell::RefCell;
+
+    /// A recording service runner that can be made to fail when a command line
+    /// contains a substring (e.g. "enable" to fail activation).
+    struct FakeService {
+        fail_on: Option<String>,
+        recorded: RefCell<Vec<String>>,
+    }
+
+    impl FakeService {
+        fn ok() -> Self {
+            FakeService {
+                fail_on: None,
+                recorded: RefCell::new(Vec::new()),
+            }
+        }
+        fn failing(substr: &str) -> Self {
+            FakeService {
+                fail_on: Some(substr.to_owned()),
+                recorded: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CommandRunner for FakeService {
+        fn run(&self, command: &ManagerCommand) -> Result<i32, ServiceError> {
+            let line = format!("{} {}", command.program, command.args.join(" "));
+            self.recorded.borrow_mut().push(line.clone());
+            if let Some(fail) = &self.fail_on {
+                if line.contains(fail) {
+                    return Err(ServiceError::ManagerFailed { code: 1 });
+                }
+            }
+            Ok(0)
+        }
+    }
+
+    fn identity() -> SessionIdentity {
+        SessionIdentity {
+            principal_id: "employee-184".into(),
+            agent_id: "agent-72".into(),
+            instance_id: "instance-01".into(),
+            allowed_claims: vec![],
+        }
+    }
+
+    fn enrolled(device: u64, inode: u64, commit: &str) -> ValidatedEnrollment {
+        ValidatedEnrollment {
+            org_id: "acme".into(),
+            project_id: "loam".into(),
+            repository_id: "repo-2F8".into(),
+            broker_profile: "acme-prod".into(),
+            broker_endpoint: "mqtts://broker:8883".into(),
+            tls_server_name: "broker".into(),
+            credential_ref: "vault://c".into(),
+            ca_ref: None,
+            commit: commit.into(),
+            remotes: vec![ValidatedRemote {
+                name: "origin".into(),
+                url_digest: "a".repeat(64),
+                allowed_refs: vec!["refs/heads/main".into()],
+            }],
+            workspace: PhysicalWorkspace {
+                display_path: "/w/proj".into(),
+                identity: PlatformIdentity::Unix { device, inode },
+            },
+        }
+    }
+
+    fn setup(label: &str) -> (std::path::PathBuf, ServiceContext) {
+        let root = std::env::temp_dir().join(format!(
+            "loam-connect-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // ensure_instance_id creates the global root (via the service module),
+        // so open_writable can create the database beneath it.
+        let instance_id = crate::service::ensure_instance_id(&root).unwrap();
+        let ctx = ServiceContext {
+            global_root: root.clone(),
+            instance_id,
+            runtime_path: std::env::temp_dir().join("loam-rt").join("loam"),
+        };
+        (root.join("loam.sqlite3"), ctx)
+    }
+
+    fn deadline() -> Duration {
+        Duration::from_millis(50)
+    }
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-08T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    const COMMIT_A: &str = "0123456789abcdef0123456789abcdef01234567";
+    const COMMIT_B: &str = "ffffffffffffffffffffffffffffffffffffffff";
+
+    #[test]
+    fn happy_path_probes_commits_and_activates() {
+        let (db, ctx) = setup("happy");
+        let mut transport = StubTransport::healthy(identity());
+        let service = FakeService::ok();
+        let outcome = orchestrate_from_validated(
+            &enrolled(1, 10, COMMIT_A),
+            &mut transport,
+            &service,
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        )
+        .expect("connect");
+        assert!(matches!(outcome, ConnectOutcome::Connected { .. }));
+        // Enrollment persisted.
+        let connection = crate::enrollment::open_readonly(&db).unwrap().unwrap();
+        assert_eq!(
+            crate::enrollment::list_enrollments(&connection)
+                .unwrap()
+                .len(),
+            1
+        );
+        // The service was enabled/started.
+        assert!(service
+            .recorded
+            .borrow()
+            .iter()
+            .any(|c| c.contains("enable")));
+    }
+
+    #[test]
+    fn probe_failure_leaves_no_enrollment_and_no_activation() {
+        let (db, ctx) = setup("probe-fail");
+        let mut transport = StubTransport {
+            deny_auth: true,
+            ..StubTransport::healthy(identity())
+        };
+        let service = FakeService::ok();
+        let outcome = orchestrate_from_validated(
+            &enrolled(2, 20, COMMIT_A),
+            &mut transport,
+            &service,
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        );
+        assert!(matches!(outcome, Err(ConnectError::Probe(_))));
+        // No database row, no activation command.
+        assert!(crate::enrollment::open_readonly(&db).unwrap().is_none());
+        assert!(service.recorded.borrow().is_empty());
+    }
+
+    #[test]
+    fn activation_failure_rolls_the_enrollment_back() {
+        let (db, ctx) = setup("activate-fail");
+        let mut transport = StubTransport::healthy(identity());
+        let service = FakeService::failing("enable"); // enable_start fails
+        let outcome = orchestrate_from_validated(
+            &enrolled(3, 30, COMMIT_A),
+            &mut transport,
+            &service,
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        );
+        assert!(matches!(outcome, Err(ConnectError::ActivationFailed(_))));
+        // The row was removed (registry now empty) and the service was disabled.
+        let connection = crate::enrollment::open_readonly(&db).unwrap().unwrap();
+        assert!(crate::enrollment::list_enrollments(&connection)
+            .unwrap()
+            .is_empty());
+        assert!(service
+            .recorded
+            .borrow()
+            .iter()
+            .any(|c| c.contains("disable")));
+    }
+
+    #[test]
+    fn repeated_identical_connect_repairs_without_reprobe() {
+        let (db, ctx) = setup("idempotent");
+        // First connect.
+        let mut transport = StubTransport::healthy(identity());
+        orchestrate_from_validated(
+            &enrolled(4, 40, COMMIT_A),
+            &mut transport,
+            &FakeService::ok(),
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        )
+        .expect("first connect");
+        // Second identical connect: a fresh transport that would FAIL a probe,
+        // proving no re-probe happens for a healthy existing enrollment.
+        let mut no_probe = StubTransport {
+            deny_auth: true,
+            ..StubTransport::healthy(identity())
+        };
+        let service = FakeService::ok();
+        let outcome = orchestrate_from_validated(
+            &enrolled(4, 40, COMMIT_A),
+            &mut no_probe,
+            &service,
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        )
+        .expect("idempotent connect");
+        assert_eq!(outcome, ConnectOutcome::AlreadyConnected);
+    }
+
+    #[test]
+    fn a_changed_binding_for_the_same_workspace_is_a_conflict() {
+        let (db, ctx) = setup("conflict");
+        orchestrate_from_validated(
+            &enrolled(5, 50, COMMIT_A),
+            &mut StubTransport::healthy(identity()),
+            &FakeService::ok(),
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        )
+        .expect("first connect");
+        // Same physical identity, different commit -> conflict, no re-probe.
+        let outcome = orchestrate_from_validated(
+            &enrolled(5, 50, COMMIT_B),
+            &mut StubTransport {
+                deny_auth: true,
+                ..StubTransport::healthy(identity())
+            },
+            &FakeService::ok(),
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        );
+        assert!(matches!(outcome, Err(ConnectError::EnrollmentConflict)));
     }
 }

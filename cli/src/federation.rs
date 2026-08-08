@@ -135,12 +135,20 @@ fn service_lifecycle(root: &std::path::Path, action: ServiceAction) -> i32 {
     }
 }
 
-fn connect(args: impl Iterator<Item = String>) -> i32 {
+fn connect(mut args: impl Iterator<Item = String>) -> i32 {
     let mut workspace: Option<PathBuf> = None;
+    let mut global_root: Option<PathBuf> = None;
     let mut json_output = false;
-    for arg in args {
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" => json_output = true,
+            "--global-root" => match args.next() {
+                Some(value) => global_root = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("federation connect: --global-root needs a value");
+                    return 64;
+                }
+            },
             other if other.starts_with("--") => {
                 eprintln!("federation connect: unknown flag `{other}`");
                 return 64;
@@ -160,8 +168,21 @@ fn connect(args: impl Iterator<Item = String>) -> i32 {
         Err(code) => return code,
     };
 
-    match validate(&descriptor_bytes, workspace.as_deref()) {
-        Ok(enrolled) => {
+    let enrolled = match validate(&descriptor_bytes, workspace.as_deref()) {
+        Ok(enrolled) => enrolled,
+        Err(error) => {
+            if json_output {
+                println!("{}", error_json(&error).to_json());
+            } else {
+                eprintln!("federation connect: {error}");
+            }
+            return error.sysexit();
+        }
+    };
+
+    match global_root {
+        // No global root: validation-only (the descriptor + workspace proof).
+        None => {
             if json_output {
                 println!("{}", success_json(&enrolled).to_json());
             } else {
@@ -172,14 +193,119 @@ fn connect(args: impl Iterator<Item = String>) -> i32 {
             }
             0
         }
+        // With a global root: the full transactional connect (T10). The transport
+        // is the deterministic stub until the real broker adapter lands (T13).
+        Some(root) => orchestrate_cli(&enrolled, &root, json_output),
+    }
+}
+
+/// Drive the T10 transactional connect from the CLI: derive the connector's
+/// service context and identity, run the probe/commit/activate orchestration
+/// against the stub transport, and report the outcome.
+fn orchestrate_cli(
+    enrolled: &enrollment::ValidatedEnrollment,
+    root: &std::path::Path,
+    json_output: bool,
+) -> i32 {
+    let instance_id = match crate::service::ensure_instance_id(root) {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("federation connect: {error}");
+            return 70;
+        }
+    };
+    let runtime_path = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => {
+            eprintln!("federation connect: cannot resolve the current runtime path");
+            return 70;
+        }
+    };
+    let context = crate::service::ServiceContext {
+        global_root: root.to_path_buf(),
+        instance_id: instance_id.clone(),
+        runtime_path,
+    };
+    // The connector's own authenticated identity is supplied by the transport in
+    // production (T13). The stub reports this derived identity.
+    let identity = crate::connector::SessionIdentity {
+        principal_id: format!("connector-{instance_id}"),
+        agent_id: format!("agent-{instance_id}"),
+        instance_id,
+        allowed_claims: vec![],
+    };
+    let mut transport = crate::connector::StubTransport::healthy(identity);
+    let runner = crate::service::RealRunner;
+    let db_path = root.join("loam.sqlite3");
+    let now = chrono::Utc::now();
+
+    match crate::connector::orchestrate_from_validated(
+        enrolled,
+        &mut transport,
+        &runner,
+        &context,
+        &db_path,
+        &crate::envelope::ValidationConfig::default(),
+        std::time::Duration::from_secs(5),
+        now,
+    ) {
+        Ok(outcome) => {
+            let state = match outcome {
+                crate::connector::ConnectOutcome::Connected { .. } => "connected",
+                crate::connector::ConnectOutcome::AlreadyConnected => "already-connected",
+            };
+            if json_output {
+                println!(
+                    "{}",
+                    Value::Object(vec![
+                        ("schema".into(), Value::Number("1".into())),
+                        ("status".into(), Value::String(state.into())),
+                        ("org_id".into(), Value::String(enrolled.org_id.clone())),
+                        (
+                            "project_id".into(),
+                            Value::String(enrolled.project_id.clone())
+                        ),
+                    ])
+                    .to_json()
+                );
+            } else {
+                println!("{state}: {}/{}", enrolled.org_id, enrolled.project_id);
+            }
+            0
+        }
         Err(error) => {
             if json_output {
-                println!("{}", error_json(&error).to_json());
+                println!(
+                    "{}",
+                    Value::Object(vec![
+                        ("schema".into(), Value::Number("1".into())),
+                        ("status".into(), Value::String("error".into())),
+                        (
+                            "error".into(),
+                            Value::Object(vec![(
+                                "code".into(),
+                                Value::String(error.code().into())
+                            )]),
+                        ),
+                    ])
+                    .to_json()
+                );
             } else {
-                eprintln!("federation connect: {error}");
+                eprintln!("federation connect: {}", error.code());
             }
-            error.sysexit()
+            connect_sysexit(&error)
         }
+    }
+}
+
+fn connect_sysexit(error: &crate::connector::ConnectError) -> i32 {
+    use crate::connector::ConnectError;
+    match error {
+        ConnectError::EnrollmentConflict => 65,
+        ConnectError::Probe(_) => 69,
+        ConnectError::Registry(_) => 73,
+        ConnectError::ActivationFailed(_) => 75,
+        ConnectError::RollbackIncomplete(_) => 70,
     }
 }
 

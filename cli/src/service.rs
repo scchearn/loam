@@ -358,6 +358,77 @@ pub fn status<R: CommandRunner>(runner: &R, ctx: &ServiceContext) -> Result<i32,
     runner.run(&status_command(ctx))
 }
 
+/// Enable and start the connector after the first enrollment (T10 activation).
+/// Idempotent — safe to call when already active.
+pub fn enable_start<R: CommandRunner>(
+    runner: &R,
+    ctx: &ServiceContext,
+) -> Result<(), ServiceError> {
+    run_all(runner, &enable_start_commands(ctx))
+}
+
+/// Disable and stop the connector after the final disconnect (T11). Idempotent.
+pub fn disable_stop<R: CommandRunner>(
+    runner: &R,
+    ctx: &ServiceContext,
+) -> Result<(), ServiceError> {
+    run_all(runner, &disable_stop_commands(ctx))
+}
+
+#[cfg(target_os = "linux")]
+fn enable_start_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
+    vec![ManagerCommand::new(
+        "systemctl",
+        &["--user", "enable", "--now", "loam-connector.service"],
+    )]
+}
+
+#[cfg(target_os = "linux")]
+fn disable_stop_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
+    vec![ManagerCommand::new(
+        "systemctl",
+        &["--user", "disable", "--now", "loam-connector.service"],
+    )]
+}
+
+#[cfg(target_os = "macos")]
+fn enable_start_commands(ctx: &ServiceContext) -> Vec<ManagerCommand> {
+    let plist = definition_path(ctx).to_string_lossy().into_owned();
+    vec![
+        ManagerCommand::new("launchctl", &["bootstrap", "gui/$(id -u)", &plist]),
+        ManagerCommand::new(
+            "launchctl",
+            &["enable", &format!("gui/$(id -u)/{SERVICE_LABEL}")],
+        ),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn disable_stop_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
+    vec![ManagerCommand::new(
+        "launchctl",
+        &["bootout", &format!("gui/$(id -u)/{SERVICE_LABEL}")],
+    )]
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn enable_start_commands(ctx: &ServiceContext) -> Vec<ManagerCommand> {
+    let name = task_name(&ctx.instance_id);
+    vec![
+        ManagerCommand::new("schtasks", &["/Change", "/TN", &name, "/ENABLE"]),
+        ManagerCommand::new("schtasks", &["/Run", "/TN", &name]),
+    ]
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn disable_stop_commands(ctx: &ServiceContext) -> Vec<ManagerCommand> {
+    let name = task_name(&ctx.instance_id);
+    vec![
+        ManagerCommand::new("schtasks", &["/End", "/TN", &name]),
+        ManagerCommand::new("schtasks", &["/Change", "/TN", &name, "/DISABLE"]),
+    ]
+}
+
 fn write_definition(ctx: &ServiceContext) -> Result<(), ServiceError> {
     let content = current_definition(ctx)?;
     if let Some(content) = content {
