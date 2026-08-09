@@ -837,6 +837,24 @@ pub fn validate_enrollment(
 #[allow(unused_imports)]
 pub(crate) use registry::*;
 
+/// A unique existing directory for a test that needs a global root. It lives
+/// here because this module is the crate's admitted filesystem surface — a
+/// caller such as `federation.rs` is deliberately barred from `std::fs`, so it
+/// cannot make one itself. Leaked on purpose, like every other temp path in
+/// these tests.
+#[cfg(test)]
+pub fn temp_global_root(label: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "loam-root-{label}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&path).expect("temp global root");
+    path
+}
+
 pub mod registry {
     //! Consumed by the connect/disconnect/status orchestration in T10/T11, which
     //! retires this module allow once the registry is wired to the CLI surface.
@@ -1351,6 +1369,27 @@ pub mod registry {
         transaction.commit().map_err(RegistryError::backend)?;
         Ok(DedupOutcome::Recorded)
     }
+
+    /// Release a slot taken by [`record_response`] when the forward it was taken
+    /// for provably queued nothing. Without this a transient connector outage
+    /// makes a response permanently un-emittable: the slot is held forever for a
+    /// message that never shipped. The caller must only reach here on an outcome
+    /// that proves nothing was queued — an ambiguous result keeps the slot, so
+    /// at-most-once survives.
+    pub fn clear_response(
+        connection: &mut Connection,
+        causation_id: &str,
+        responder_principal_id: &str,
+    ) -> Result<(), RegistryError> {
+        connection
+            .execute(
+                "DELETE FROM response_dedup
+                 WHERE causation_id = ?1 AND responder_principal_id = ?2",
+                rusqlite::params![causation_id, responder_principal_id],
+            )
+            .map_err(RegistryError::backend)?;
+        Ok(())
+    }
 } // mod registry
 
 #[cfg(test)]
@@ -1771,6 +1810,36 @@ mod registry_tests {
             record_response(&mut connection, "cause-1", "employee-184", "t2").unwrap(),
             DedupOutcome::AlreadyResponded
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_cleared_slot_can_be_taken_again_but_an_uncleared_one_cannot() {
+        // Slice D T5 fixup: the slot is taken before the forward, so a forward
+        // that provably queued nothing must give it back — otherwise one
+        // transient outage makes that response permanently un-emittable.
+        let path = temp_db("dedup-clear");
+        let mut connection = open_writable(&path).unwrap();
+        assert_eq!(
+            record_response(&mut connection, "cause-9", "instance-01", "t1").unwrap(),
+            DedupOutcome::Recorded
+        );
+        clear_response(&mut connection, "cause-9", "instance-01").unwrap();
+        assert_eq!(
+            record_response(&mut connection, "cause-9", "instance-01", "t2").unwrap(),
+            DedupOutcome::Recorded,
+            "a released slot must be takeable again"
+        );
+
+        // Positive control: without the release the slot stays held, so the
+        // clear above is what changed the outcome — not a ledger that never
+        // held anything.
+        assert_eq!(
+            record_response(&mut connection, "cause-9", "instance-01", "t3").unwrap(),
+            DedupOutcome::AlreadyResponded
+        );
+        // Clearing a slot that was never taken is a no-op, not an error.
+        clear_response(&mut connection, "cause-absent", "instance-01").unwrap();
         let _ = std::fs::remove_file(&path);
     }
 

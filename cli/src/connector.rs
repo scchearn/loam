@@ -4038,3 +4038,120 @@ mod snapshot_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod outbound_tests {
+    //! T5 fixup: the CLI derives an *operation*; this module builds the
+    //! envelope from it. Nothing tested that seam, and `work.report` was broken
+    //! across it — `revision` was derived as a JSON number and read back with
+    //! `as_str`, so `outbound_envelope` returned `None` and every work report
+    //! surfaced as `connector_refused`.
+
+    use super::*;
+    use crate::json::Value;
+
+    fn row() -> crate::enrollment::EnrolledRow {
+        crate::enrollment::EnrolledRow {
+            identity_key: "unix:1:1".into(),
+            org_id: "acme".into(),
+            project_id: "loam".into(),
+            repository_id: "repo".into(),
+            descriptor_digest: "d".into(),
+            display_path: "/w".into(),
+            instance_id: "instance-01".into(),
+            broker_profile: "p".into(),
+            commit: "84be000000000000000000000000000000000001".into(),
+            capabilities: crate::enrollment::CapabilityRecord {
+                authentication: true,
+                publish: true,
+                subscribe: true,
+                self_receive: true,
+                verified_at: "2026-07-24T14:20:00Z".into(),
+            },
+            remotes: Vec::new(),
+        }
+    }
+
+    fn identity() -> SessionIdentity {
+        SessionIdentity {
+            principal_id: "employee-42".into(),
+            agent_id: "agent-7".into(),
+            instance_id: "instance-01".into(),
+            allowed_claims: vec!["employee-42".into()],
+        }
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-24T14:20:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// Derive through the real CLI path, then build through the real connector
+    /// path — the round trip neither half tested on its own.
+    fn round_trip(operation: &str) -> Option<(String, String)> {
+        let parsed = crate::json::parse(operation).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+        outbound_envelope(&derived.operation, &row(), &identity())
+    }
+
+    #[test]
+    fn a_derived_work_report_builds_an_envelope_and_its_revision_survives() {
+        let (document, topic) = round_trip(
+            r#"{"type":"work.report","state_key":"task-7","revision":"12","summary":"ready","payload":{"state":"ready"}}"#,
+        )
+        .expect("the connector builds an envelope from the CLI's derived work report");
+        assert_eq!(topic, "loam/v1/acme/loam/state/instance-01/task-7");
+        let parsed = crate::json::parse(&document).expect("envelope parses");
+        let delivery = parsed
+            .get("data")
+            .and_then(|data| data.get("delivery"))
+            .expect("delivery");
+        assert_eq!(
+            delivery.get("class").and_then(Value::as_str),
+            Some("latest-state")
+        );
+        assert_eq!(delivery.get("key").and_then(Value::as_str), Some("task-7"));
+        // The caller's revision, not the derived default.
+        assert_eq!(
+            delivery.get("revision"),
+            Some(&Value::Number("12".into())),
+            "revision must survive the CLI→connector round trip: {document}"
+        );
+    }
+
+    #[test]
+    fn a_numeric_revision_is_read_as_the_same_revision_not_silently_defaulted() {
+        // A JSON-numeric `revision` is the natural spelling; reading it only as
+        // a string would coerce every such report to revision 1.
+        let (document, _topic) = round_trip(
+            r#"{"type":"work.report","state_key":"task-7","revision":12,"summary":"ready","payload":{"state":"ready"}}"#,
+        )
+        .expect("envelope");
+        let parsed = crate::json::parse(&document).expect("envelope parses");
+        assert_eq!(
+            parsed
+                .get("data")
+                .and_then(|data| data.get("delivery"))
+                .and_then(|delivery| delivery.get("revision")),
+            Some(&Value::Number("12".into())),
+            "{document}"
+        );
+    }
+
+    #[test]
+    fn the_reply_path_still_builds_its_inbox_envelope() {
+        // The positive control that this round trip is not work.report-shaped by
+        // accident: the untouched vocabulary types still build.
+        let (document, topic) = round_trip(
+            r#"{"type":"message.reply","causation_id":"c-1","summary":"On it.","to":[{"kind":"instance","id":"instance-02"}],"payload":{}}"#,
+        )
+        .expect("envelope");
+        assert!(
+            topic.starts_with("loam/v1/acme/loam/inbox/instance/instance-02/instance-01/"),
+            "{topic}"
+        );
+        assert!(document.contains("\"intent\":\"response\""), "{document}");
+    }
+}

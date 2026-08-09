@@ -795,6 +795,20 @@ fn derive_event_id(now: DateTime<Utc>, salt: &str) -> String {
         .collect()
 }
 
+/// A caller may spell `revision` as a JSON string or a JSON number; both mean
+/// the same revision, and reading only one of them silently defaults the other
+/// to `1`. The derived operation carries the *string* form: the connector reads
+/// it back with `as_str` before re-emitting the numeric literal into the
+/// envelope's delivery block.
+fn revision_literal(value: &Value) -> Option<String> {
+    match value {
+        Value::String(literal) | Value::Number(literal) if !literal.is_empty() => {
+            Some(literal.clone())
+        }
+        _ => None,
+    }
+}
+
 /// Derive every authority-bearing field from trusted state and refuse the rest.
 /// Pure: no registry, no socket, no clock of its own.
 pub fn derive_emit(
@@ -900,12 +914,11 @@ pub fn derive_emit(
         derived.push(("state_key".into(), Value::String(key.to_owned())));
         derived.push((
             "revision".into(),
-            Value::Number(
+            Value::String(
                 operation
                     .get("revision")
-                    .and_then(Value::as_str)
-                    .unwrap_or("1")
-                    .to_owned(),
+                    .and_then(revision_literal)
+                    .unwrap_or_else(|| "1".to_owned()),
             ),
         ));
         derived.push((
@@ -1081,7 +1094,23 @@ fn run_emit(
         }
     }
 
-    let response = forward_emit(global_root, &physical.display_path, &derived.operation)?;
+    let forwarded = forward_emit(global_root, &physical.display_path, &derived.operation);
+
+    // The slot was taken before the forward and stays taken for anything that
+    // might have shipped. Only an outcome that *proves* nothing was queued gives
+    // it back, so a transient outage does not make this response permanently
+    // un-emittable. Safe under concurrency: the losing terminal short-circuits at
+    // `record_response` and never reaches the forward, so on a not-queued result
+    // nothing shipped anywhere and a later retry heals.
+    if let Some(causation_id) = &derived.causation_id {
+        if forward_queued_nothing(&forwarded) {
+            if let Ok(mut write) = enrollment::open_writable(&db_path) {
+                let _ = enrollment::clear_response(&mut write, causation_id, &row.instance_id);
+            }
+        }
+    }
+
+    let response = forwarded?;
     let refused = derived
         .refused
         .iter()
@@ -1105,6 +1134,23 @@ fn run_emit(
         // Every override the caller attempted, reported rather than merged.
         ("refused_overrides".into(), Value::Array(refused)),
     ]))
+}
+
+/// Did the forward prove that nothing was queued? Exactly three outcomes do:
+/// the connector answering `not-shipped / no-live-session`, an unreachable
+/// connector, and a refused connector — in all three the operation never
+/// entered an outbound queue. Everything else, including a queued result and an
+/// IPC response lost after the send, is ambiguous and keeps the dedup slot so
+/// the at-most-once guarantee survives.
+fn forward_queued_nothing(forwarded: &Result<Value, EmitError>) -> bool {
+    match forwarded {
+        Err(EmitError::ConnectorUnreachable | EmitError::ConnectorRefused) => true,
+        Ok(response) => {
+            response.get("status").and_then(Value::as_str) == Some("not-shipped")
+                && response.get("reason").and_then(Value::as_str) == Some("no-live-session")
+        }
+        Err(_) => false,
+    }
 }
 
 /// Hand the derived operation to the connector. The CLI never opens a broker
@@ -1412,6 +1458,123 @@ mod emit_tests {
         .expect_err("unenrolled is refused");
         assert_eq!(error, EmitError::Unenrolled);
         assert_eq!(error.code(), "workspace_unenrolled");
+    }
+
+    /// An enrolled global root bound to a real workspace path, so `run_emit`
+    /// gets past workspace resolution and actually reaches the ledger and the
+    /// forward. The workspace is this crate's own directory: real, existing, and
+    /// never written to.
+    fn enrolled_root(label: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let physical =
+            enrollment::PhysicalWorkspace::resolve(&workspace).expect("workspace resolves");
+        let root = enrollment::temp_global_root(label);
+        let mut connection =
+            enrollment::open_writable(&root.join("loam.sqlite3")).expect("registry opens");
+        let enrolled = enrollment::ValidatedEnrollment {
+            org_id: "acme".into(),
+            project_id: "loam".into(),
+            repository_id: "repo".into(),
+            broker_profile: "acme-prod".into(),
+            broker_endpoint: "mqtts://h:8883".into(),
+            tls_server_name: "h".into(),
+            credential_ref: "vault://c".into(),
+            ca_ref: None,
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            remotes: Vec::new(),
+            workspace: physical,
+        };
+        enrollment::insert_enrollment(
+            &mut connection,
+            &enrolled,
+            &enrollment::CapabilityRecord {
+                authentication: true,
+                publish: true,
+                subscribe: true,
+                self_receive: true,
+                verified_at: "2026-07-24T14:20:00Z".into(),
+            },
+            "2026-07-24T14:20:00Z",
+        )
+        .expect("enrollment inserts");
+        let instance_id =
+            enrollment::lookup(&connection, &enrollment::identity_key(&enrolled.workspace))
+                .expect("lookup")
+                .expect("enrolled row")
+                .instance_id;
+        (root, workspace, instance_id)
+    }
+
+    #[test]
+    fn a_forward_that_never_reached_the_connector_does_not_burn_the_response() {
+        // The defect this closes: the slot was taken before the forward and kept
+        // even when the forward provably queued nothing, so one transient outage
+        // made a reply permanently un-emittable.
+        let (root, workspace, instance_id) = enrolled_root("emit-rollback");
+        let operation = br#"{"type":"message.ack","causation_id":"cause-77","summary":"Received.","to":[{"kind":"instance","id":"instance-02"}],"payload":{}}"#;
+
+        // No endpoint under `root/run`: the forward cannot have queued anything.
+        let first = run_emit(operation, &workspace, &root, now()).expect_err("no connector");
+        assert_eq!(first, EmitError::ConnectorUnreachable);
+
+        // The retry must still reach the forward. Before the fix this was
+        // `AlreadyResponded` forever, for a message that never shipped.
+        let second = run_emit(operation, &workspace, &root, now()).expect_err("no connector");
+        assert_eq!(
+            second,
+            EmitError::ConnectorUnreachable,
+            "a response that never shipped must stay emittable"
+        );
+
+        // Positive control: the ledger is not inert. A slot that *is* held stops
+        // the very next attempt at the same causation, so the retry above got
+        // through because the slot was released — not because dedup does nothing.
+        let mut connection =
+            enrollment::open_writable(&root.join("loam.sqlite3")).expect("registry opens");
+        assert_eq!(
+            enrollment::record_response(&mut connection, "cause-88", &instance_id, "t").unwrap(),
+            enrollment::DedupOutcome::Recorded
+        );
+        let held = run_emit(
+            br#"{"type":"message.ack","causation_id":"cause-88","summary":"Received.","to":[{"kind":"instance","id":"instance-02"}],"payload":{}}"#,
+            &workspace,
+            &root,
+            now(),
+        )
+        .expect_err("held slot");
+        assert_eq!(held, EmitError::AlreadyResponded);
+    }
+
+    #[test]
+    fn only_a_forward_that_queued_nothing_releases_the_dedup_slot() {
+        let response = |json: &str| Ok(crate::json::parse(json).expect("response parses"));
+
+        // The three outcomes that prove nothing entered an outbound queue.
+        assert!(forward_queued_nothing(&Err(
+            EmitError::ConnectorUnreachable
+        )));
+        assert!(forward_queued_nothing(&Err(EmitError::ConnectorRefused)));
+        assert!(forward_queued_nothing(&response(
+            r#"{"status":"not-shipped","reason":"no-live-session"}"#
+        )));
+
+        // The positive control for the release: a forward that *did* queue keeps
+        // the slot, which is the whole at-most-once guarantee. If this returned
+        // true the rollback would re-open the double-ship the ledger prevents.
+        assert!(!forward_queued_nothing(&response(
+            r#"{"status":"queued","reason":null}"#
+        )));
+        assert!(!forward_queued_nothing(&response(
+            r#"{"status":"ok","reason":null}"#
+        )));
+        // An unrecognized not-shipped reason is ambiguous, not proof.
+        assert!(!forward_queued_nothing(&response(
+            r#"{"status":"not-shipped","reason":"something-new"}"#
+        )));
+        // And a refusal that never reached the connector at all cannot have
+        // taken a slot in the first place.
+        assert!(!forward_queued_nothing(&Err(EmitError::AlreadyResponded)));
+        assert!(!forward_queued_nothing(&Err(EmitError::Unenrolled)));
     }
 
     #[test]
