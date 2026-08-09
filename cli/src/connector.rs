@@ -1177,6 +1177,10 @@ pub mod reason {
     pub const ENDPOINT_MALFORMED: &str = "endpoint-malformed";
     pub const CREDENTIAL_REF_UNRESOLVED: &str = "credential-ref-unresolved";
     pub const CA_UNRESOLVED: &str = "ca-unresolved";
+    /// The local Git email and the authenticated certificate's common name
+    /// disagree. The certificate is authoritative and the disagreement is
+    /// surfaced rather than resolved in either direction.
+    pub const IDENTITY_MISMATCH: &str = "identity-mismatch";
     pub const ROSTER_ABSENT: &str = "roster-absent";
     pub const ROSTER_EMPTY: &str = "roster-empty";
     /// Principals but no origins: not empty by `PeerRoster::is_empty`, yet it

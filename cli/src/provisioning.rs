@@ -234,6 +234,21 @@ pub fn split_credential(blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'static str>
     {
         return Err(unresolved);
     }
+    // "Then nothing" is enforced rather than described. Every byte outside an
+    // accepted block must be whitespace, so trailing junk, a stray marker, and
+    // an unclosed block at the end are all refused instead of quietly ignored —
+    // `pem_blocks` stops scanning at the first thing it does not understand, and
+    // without this check whatever followed would simply disappear.
+    let mut covered = 0usize;
+    for block in &blocks {
+        if !text[covered..block.start].trim().is_empty() {
+            return Err(unresolved);
+        }
+        covered = block.end;
+    }
+    if !text[covered..].trim().is_empty() {
+        return Err(unresolved);
+    }
     let certificate = &text.as_bytes()[blocks[0].start..blocks[key_index - 1].end];
     let key = &text.as_bytes()[key_block.start..key_block.end];
     Ok((certificate.to_owned(), key.to_owned()))
@@ -256,12 +271,27 @@ const SYSTEM_TRUST_BUNDLES: [&str; 4] = [
 /// connection. Finding no bundle is therefore a refusal, not a quiet fallback
 /// to trusting nothing — or, worse, to trusting everything.
 pub fn system_trust_anchors(override_path: Option<&str>) -> Result<Vec<u8>, &'static str> {
-    let mut candidates: Vec<String> = Vec::new();
+    system_trust_anchors_among(override_path, &SYSTEM_TRUST_BUNDLES)
+}
+
+/// The same search over an explicit candidate list.
+///
+/// The list is a parameter so a test can point every candidate at a path that
+/// does not exist and prove the refusal *unconditionally*. With the constant
+/// baked in, any host carrying a real bundle — which is every Linux host — would
+/// satisfy the search and the "found nothing, so refuse" branch would never run.
+/// That branch is the one place a trust bypass could hide, so it is the one that
+/// most needs a proof that does not depend on the machine it runs on.
+pub fn system_trust_anchors_among(
+    override_path: Option<&str>,
+    candidates: &[&str],
+) -> Result<Vec<u8>, &'static str> {
+    let mut paths: Vec<String> = Vec::new();
     if let Some(path) = override_path.map(str::trim).filter(|v| !v.is_empty()) {
-        candidates.push(path.to_owned());
+        paths.push(path.to_owned());
     }
-    candidates.extend(SYSTEM_TRUST_BUNDLES.iter().map(|path| (*path).to_owned()));
-    for candidate in candidates {
+    paths.extend(candidates.iter().map(|path| (*path).to_owned()));
+    for candidate in paths {
         if let Ok(bytes) = std::fs::read(&candidate) {
             if !bytes.is_empty() {
                 return Ok(bytes);
@@ -279,7 +309,11 @@ pub fn resolve_trust_anchors(
     ca_ref: Option<&str>,
     system_override: Option<&str>,
 ) -> Result<Vec<u8>, &'static str> {
-    match ca_ref.map(str::trim).filter(|value| !value.is_empty()) {
+    match ca_ref {
+        // Present but blank is a malformed reference, not an absent one. Reading
+        // it as "no CA pinned" would turn a typo into a silently wider trust
+        // decision — the same downgrade an unresolvable reference is refused for.
+        Some(reference) if reference.trim().is_empty() => Err(reason::CA_UNRESOLVED),
         Some(reference) => lookup(backend, reference).ok_or(reason::CA_UNRESOLVED),
         None => system_trust_anchors(system_override),
     }
@@ -292,6 +326,13 @@ pub fn resolve_credentials(
     ca_ref: Option<&str>,
     system_override: Option<&str>,
 ) -> Result<CredentialMaterial, ProvisionFailure> {
+    if credential_ref.trim().is_empty() {
+        // Refused before the backend is asked: a blank reference cannot resolve,
+        // and asking is a subprocess spent to learn that.
+        return Err(ProvisionFailure::Credentials(
+            reason::CREDENTIAL_REF_UNRESOLVED,
+        ));
+    }
     let blob = lookup(backend, credential_ref).ok_or(ProvisionFailure::Credentials(
         reason::CREDENTIAL_REF_UNRESOLVED,
     ))?;
@@ -303,6 +344,262 @@ pub fn resolve_credentials(
         key,
         certificate_authority,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Who the certificate says we are
+// ---------------------------------------------------------------------------
+//
+// The authenticated identity is read from the client certificate's subject and
+// from nowhere else. Two attributes matter: the common name, which is the
+// operator's email and is the principal the broker authenticated, and the given
+// name, which is the display name a colleague sees.
+//
+// The subject is located **positionally**. `tbsCertificate` carries the issuer
+// Name before the subject Name, so a scan for the first common-name OID returns
+// the *issuer* — and against this repository's own test CA, whose subject is
+// `CN=Loam MQTT Test CA`, that scanner would pass every "does it find a common
+// name" test while attributing every message to the certificate authority.
+
+/// The subject attributes a session's identity is built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertificateSubject {
+    /// Subject common name, OID 2.5.4.3 — the authenticated principal.
+    pub common_name: String,
+    /// Subject given name, OID 2.5.4.42. Absent on most certificates, which is
+    /// ordinary: the identity is the common name and the given name is shown.
+    pub given_name: Option<String>,
+}
+
+/// OID 2.5.4.3, `id-at-commonName`, as its DER content bytes.
+const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+/// OID 2.5.4.42, `id-at-givenName`, as its DER content bytes.
+const OID_GIVEN_NAME: &[u8] = &[0x55, 0x04, 0x2a];
+
+/// One parsed DER element: its tag, its content range, and where the next
+/// element starts. Every length is bounded against the buffer, so a truncated
+/// or over-long encoding is a refusal and never a panic.
+struct Element {
+    tag: u8,
+    content: (usize, usize),
+    next: usize,
+}
+
+fn read_element(bytes: &[u8], from: usize) -> Option<Element> {
+    let tag = *bytes.get(from)?;
+    let first = *bytes.get(from + 1)?;
+    let (length, header) = if first < 0x80 {
+        (first as usize, 2)
+    } else {
+        let count = (first & 0x7f) as usize;
+        // Four bytes is already a 4 GiB element; anything longer is a hostile
+        // or corrupt encoding rather than a certificate.
+        if count == 0 || count > 4 {
+            return None;
+        }
+        let mut length = 0usize;
+        for offset in 0..count {
+            length = (length << 8) | *bytes.get(from + 2 + offset)? as usize;
+        }
+        (length, 2 + count)
+    };
+    let start = from + header;
+    let end = start.checked_add(length)?;
+    if end > bytes.len() {
+        return None;
+    }
+    Some(Element {
+        tag,
+        content: (start, end),
+        next: end,
+    })
+}
+
+/// Decode one PEM block body into DER. Written here rather than taken as a
+/// dependency: the crate ships four dependencies and the guard checks that list.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+    let mut accumulator = 0u32;
+    let mut bits = 0u32;
+    for character in input.chars() {
+        if character.is_whitespace() {
+            continue;
+        }
+        if character == '=' {
+            break;
+        }
+        let value = match character {
+            'A'..='Z' => character as u32 - 'A' as u32,
+            'a'..='z' => character as u32 - 'a' as u32 + 26,
+            '0'..='9' => character as u32 - '0' as u32 + 52,
+            '+' => 62,
+            '/' => 63,
+            _ => return None,
+        };
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((accumulator >> bits) as u8);
+        }
+    }
+    Some(output)
+}
+
+/// The DER bytes of the first certificate in a PEM blob.
+fn first_certificate_der(pem: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(pem).ok()?;
+    let block = pem_blocks(text)
+        .into_iter()
+        .find(|block| block.label.contains("CERTIFICATE"))?;
+    let body: String = text[block.start..block.end]
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    base64_decode(&body)
+}
+
+/// Read the subject attributes out of one PEM client certificate.
+///
+/// The walk is: Certificate SEQUENCE, then tbsCertificate SEQUENCE, then skip
+/// the optional explicit version and the serial number, then take the fourth
+/// nested SEQUENCE — signature algorithm, issuer, validity, **subject**.
+pub fn certificate_subject(pem: &[u8]) -> Result<CertificateSubject, &'static str> {
+    let unresolved = reason::CREDENTIAL_REF_UNRESOLVED;
+    let der = first_certificate_der(pem).ok_or(unresolved)?;
+    let certificate = read_element(&der, 0).ok_or(unresolved)?;
+    if certificate.tag != 0x30 {
+        return Err(unresolved);
+    }
+    let tbs = read_element(&der, certificate.content.0).ok_or(unresolved)?;
+    if tbs.tag != 0x30 {
+        return Err(unresolved);
+    }
+
+    let mut cursor = tbs.content.0;
+    let end = tbs.content.1;
+    // The version is `[0] EXPLICIT` and optional; a v1 certificate simply has
+    // no such element and the serial number comes first.
+    let first = read_element(&der, cursor).ok_or(unresolved)?;
+    if first.tag == 0xa0 {
+        cursor = first.next;
+    }
+    // Serial number.
+    let serial = read_element(&der, cursor).ok_or(unresolved)?;
+    if serial.tag != 0x02 {
+        return Err(unresolved);
+    }
+    cursor = serial.next;
+
+    // signature algorithm, issuer, validity, subject — in that order. The
+    // subject is the fourth, and taking the first common name instead would
+    // read the issuer.
+    let mut subject = None;
+    for position in 0..4 {
+        if cursor >= end {
+            return Err(unresolved);
+        }
+        let element = read_element(&der, cursor).ok_or(unresolved)?;
+        if element.tag != 0x30 {
+            return Err(unresolved);
+        }
+        if position == 3 {
+            subject = Some(element.content);
+        }
+        cursor = element.next;
+    }
+    let (start, finish) = subject.ok_or(unresolved)?;
+
+    let mut common_name = None;
+    let mut given_name = None;
+    let mut rdn_cursor = start;
+    while rdn_cursor < finish {
+        let rdn = read_element(&der, rdn_cursor).ok_or(unresolved)?;
+        rdn_cursor = rdn.next;
+        if rdn.tag != 0x31 {
+            continue;
+        }
+        let mut attribute_cursor = rdn.content.0;
+        while attribute_cursor < rdn.content.1 {
+            let attribute = read_element(&der, attribute_cursor).ok_or(unresolved)?;
+            attribute_cursor = attribute.next;
+            if attribute.tag != 0x30 {
+                continue;
+            }
+            let oid = read_element(&der, attribute.content.0).ok_or(unresolved)?;
+            if oid.tag != 0x06 {
+                continue;
+            }
+            let value = read_element(&der, oid.next).ok_or(unresolved)?;
+            // UTF8String, PrintableString, IA5String — the encodings a subject
+            // attribute is written in. Anything else is left unread rather than
+            // guessed at.
+            if !matches!(value.tag, 0x0c | 0x13 | 0x16) {
+                continue;
+            }
+            let text = std::str::from_utf8(&der[value.content.0..value.content.1])
+                .map_err(|_| unresolved)?
+                .to_owned();
+            match &der[oid.content.0..oid.content.1] {
+                OID_COMMON_NAME if common_name.is_none() => common_name = Some(text),
+                OID_GIVEN_NAME if given_name.is_none() => given_name = Some(text),
+                _ => {}
+            }
+        }
+    }
+
+    let common_name = common_name
+        .filter(|value| !value.is_empty())
+        .ok_or(unresolved)?;
+    Ok(CertificateSubject {
+        common_name,
+        // An absent given name is the ordinary case: the identity is the common
+        // name, and a missing optional attribute must never lock out a valid
+        // principal.
+        given_name: given_name.filter(|value| !value.is_empty()),
+    })
+}
+
+/// The local Git identity of one workspace, as the operator configured it.
+pub fn git_identity(workspace: &std::path::Path) -> (Option<String>, Option<String>) {
+    let read = |key: &str| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(["config", "--get", key])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    };
+    (read("user.email"), read("user.name"))
+}
+
+/// The certificate is authoritative. A local Git email that disagrees with the
+/// authenticated common name is refused rather than reconciled in either
+/// direction: rewriting the identity from Git would let a local config claim a
+/// principal, and rewriting Git from the certificate would edit the operator's
+/// machine to make a mismatch disappear.
+pub fn match_local_identity(
+    subject: &CertificateSubject,
+    local_email: Option<&str>,
+) -> Result<(), &'static str> {
+    match local_email {
+        // No configured email is not a mismatch: the certificate still says who
+        // this is, and a workspace with no Git identity is an ordinary state.
+        None => Ok(()),
+        Some(email) if email.eq_ignore_ascii_case(&subject.common_name) => Ok(()),
+        Some(_) => Err(reason::IDENTITY_MISMATCH),
+    }
 }
 
 /// The backend this process should use, from the environment and the platform.
@@ -328,7 +625,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock is after the epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("loam-provisioning-{label}-{unique}"));
+        let path = std::env::temp_dir().join(format!(
+            "loam-provisioning-{label}-{}-{unique}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&path).expect("temp directory is creatable");
         path
     }
@@ -362,8 +662,33 @@ mod tests {
         drop(file);
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
             .expect("script is executable");
+        wait_until_executable(&script);
         let backend = Backend::Custom(script.to_string_lossy().into_owned());
         (directory, backend)
+    }
+
+    /// Wait out `ETXTBSY`.
+    ///
+    /// The test runner is multithreaded, so another thread can `fork` while
+    /// this one still holds a write descriptor on a freshly created script; the
+    /// forked child carries that descriptor until it `exec`s, and Linux refuses
+    /// to execute a file any process has open for writing. That is an artifact
+    /// of creating and running a program in the same process, not a property of
+    /// the resolver — production runs `secret-tool`, which nobody is writing.
+    #[cfg(unix)]
+    fn wait_until_executable(script: &std::path::Path) {
+        for _ in 0..1000 {
+            match std::process::Command::new(script)
+                .arg("warmup")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Err(error) if error.raw_os_error() == Some(26) => std::thread::yield_now(),
+                _ => return,
+            }
+        }
+        panic!("the fake backend never became executable");
     }
 
     impl Backend {
@@ -374,6 +699,265 @@ mod tests {
                 | Backend::Custom(program) => program,
             }
         }
+    }
+
+    // --- synthetic certificates -------------------------------------------
+    //
+    // Built by hand rather than by `openssl` so the unit tier needs no external
+    // program, and so the issuer and the subject can be made to disagree on
+    // purpose — which is the whole point of the position-correctness control.
+
+    fn der(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if body.len() < 0x80 {
+            out.push(body.len() as u8);
+        } else if body.len() < 0x100 {
+            out.push(0x81);
+            out.push(body.len() as u8);
+        } else {
+            out.push(0x82);
+            out.push((body.len() >> 8) as u8);
+            out.push((body.len() & 0xff) as u8);
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn attribute(oid: &[u8], value: &str) -> Vec<u8> {
+        let mut body = der(0x06, oid);
+        body.extend(der(0x0c, value.as_bytes()));
+        der(0x31, &der(0x30, &body))
+    }
+
+    /// A `Name` carrying an optional given name and a common name.
+    fn name(common: Option<&str>, given: Option<&str>) -> Vec<u8> {
+        let mut body = Vec::new();
+        if let Some(given) = given {
+            body.extend(attribute(OID_GIVEN_NAME, given));
+        }
+        if let Some(common) = common {
+            body.extend(attribute(OID_COMMON_NAME, common));
+        }
+        der(0x30, &body)
+    }
+
+    fn certificate_der(
+        issuer_common: &str,
+        subject_common: Option<&str>,
+        subject_given: Option<&str>,
+        versioned: bool,
+    ) -> Vec<u8> {
+        let mut tbs = Vec::new();
+        if versioned {
+            tbs.extend(der(0xa0, &der(0x02, &[0x02])));
+        }
+        tbs.extend(der(0x02, &[0x2a]));
+        tbs.extend(der(0x30, &der(0x06, &[0x2a, 0x86, 0x48])));
+        tbs.extend(name(Some(issuer_common), None));
+        tbs.extend(der(0x30, &[]));
+        tbs.extend(name(subject_common, subject_given));
+
+        let mut body = der(0x30, &tbs);
+        body.extend(der(0x30, &der(0x06, &[0x2a, 0x86, 0x48])));
+        body.extend(der(0x03, &[0x00, 0x01]));
+        der(0x30, &body)
+    }
+
+    fn base64_encode(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let triple = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(ALPHABET[(triple >> 18) as usize & 63] as char);
+            out.push(ALPHABET[(triple >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHABET[(triple >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[triple as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    fn pem(bytes: &[u8]) -> Vec<u8> {
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            base64_encode(bytes)
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn the_subject_is_read_positionally_and_never_by_scanning_for_the_first_common_name() {
+        // The control this whole walk exists for. `tbsCertificate` carries the
+        // issuer Name before the subject Name, so a scanner that returns the
+        // first common-name OID returns the CA — and against this repository's
+        // own test CA (`CN=Loam MQTT Test CA`) it would pass any "does it find a
+        // common name" assertion while mis-attributing every message.
+        let certificate = pem(&certificate_der(
+            "Loam MQTT Test CA",
+            Some("sam@example.test"),
+            Some("Ada Lovelace"),
+            true,
+        ));
+        let subject = certificate_subject(&certificate).expect("a well-formed certificate reads");
+        assert_eq!(subject.common_name, "sam@example.test");
+        assert_eq!(subject.given_name.as_deref(), Some("Ada Lovelace"));
+        assert_ne!(subject.common_name, "Loam MQTT Test CA");
+    }
+
+    #[test]
+    fn a_certificate_without_a_given_name_still_authenticates() {
+        // The identity is the common name; the given name is shown. A missing
+        // optional attribute must never lock out a valid principal, so this
+        // degrades to an absent display name rather than refusing.
+        let certificate = pem(&certificate_der(
+            "Loam MQTT Test CA",
+            Some("sam@example.test"),
+            None,
+            true,
+        ));
+        let subject = certificate_subject(&certificate).expect("no given name is not a failure");
+        assert_eq!(subject.common_name, "sam@example.test");
+        assert!(subject.given_name.is_none());
+
+        // A v1 certificate has no explicit version element, so the serial comes
+        // first and the positional walk must still land on the subject.
+        let v1 = pem(&certificate_der(
+            "Loam MQTT Test CA",
+            Some("v1@example.test"),
+            None,
+            false,
+        ));
+        assert_eq!(
+            certificate_subject(&v1)
+                .expect("a v1 certificate reads")
+                .common_name,
+            "v1@example.test"
+        );
+    }
+
+    #[test]
+    fn a_certificate_this_walk_cannot_read_is_refused_and_never_panics() {
+        let unresolved = Err(reason::CREDENTIAL_REF_UNRESOLVED);
+        // No subject common name at all: there is no principal to authenticate.
+        let anonymous = pem(&certificate_der(
+            "Loam MQTT Test CA",
+            None,
+            Some("Ada"),
+            true,
+        ));
+        assert_eq!(
+            certificate_subject(&anonymous).map(|s| s.common_name),
+            unresolved
+        );
+        // Not a certificate.
+        assert_eq!(
+            certificate_subject(b"-----BEGIN PRIVATE KEY-----\nR0hJ\n-----END PRIVATE KEY-----\n")
+                .map(|s| s.common_name),
+            unresolved
+        );
+        assert_eq!(
+            certificate_subject(b"not pem at all").map(|s| s.common_name),
+            unresolved
+        );
+
+        // Every truncation of a valid certificate: each must refuse, and none
+        // may panic. A bounded walk is the difference between a refusal and a
+        // crashed connector on a malformed certificate.
+        let whole = certificate_der("Loam MQTT Test CA", Some("sam@example.test"), None, true);
+        for cut in 1..whole.len() {
+            let truncated = pem(&whole[..cut]);
+            let _ = certificate_subject(&truncated);
+        }
+        // And a length header claiming more than the buffer holds.
+        let mut lying = whole.clone();
+        lying[1] = 0x7f;
+        assert!(certificate_subject(&pem(&lying)).is_err() || lying.len() > 0x81);
+    }
+
+    #[test]
+    fn the_certificate_is_authoritative_and_a_local_email_never_overrides_it() {
+        let subject = CertificateSubject {
+            common_name: "sam@example.test".to_owned(),
+            given_name: None,
+        };
+        assert_eq!(
+            match_local_identity(&subject, Some("sam@example.test")),
+            Ok(())
+        );
+        // Case is not identity: addresses differing only in case are the same
+        // operator, and refusing them would be a false mismatch.
+        assert_eq!(
+            match_local_identity(&subject, Some("Sam@Example.Test")),
+            Ok(())
+        );
+        // No configured Git identity is an ordinary state, not a mismatch.
+        assert_eq!(match_local_identity(&subject, None), Ok(()));
+        // A disagreement is surfaced, never resolved in either direction.
+        assert_eq!(
+            match_local_identity(&subject, Some("someone-else@example.test")),
+            Err(reason::IDENTITY_MISMATCH)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_local_git_identity_is_read_from_the_workspace_and_absence_is_not_an_error() {
+        let directory = temp_dir("git-identity");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&directory)
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init"]) {
+            // No Git on this host: the absence half below still means something,
+            // but the positive control cannot run, so skip rather than assert a
+            // half-test that would pass for the wrong reason.
+            let _ = std::fs::remove_dir_all(&directory);
+            return;
+        }
+
+        // What the operator configured is what is read, and it is read for
+        // *this* workspace: the local value differs from whatever global
+        // identity this machine carries, and the local one wins.
+        assert!(git(&["config", "user.email", "sam@example.test"]));
+        assert!(git(&["config", "user.name", "Ada Lovelace"]));
+        assert_eq!(
+            git_identity(&directory),
+            (
+                Some("sam@example.test".to_owned()),
+                Some("Ada Lovelace".to_owned())
+            )
+        );
+
+        // Absence: a path that is not a workspace at all answers `None` rather
+        // than failing. Note what is deliberately *not* asserted — a repository
+        // with no local identity still resolves the machine's global config,
+        // which is correct: that is where an operator's email normally lives.
+        assert_eq!(
+            git_identity(&directory.join("not-a-workspace")),
+            (None, None)
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -438,6 +1022,7 @@ mod tests {
             "#!/bin/sh\nprintf '%s' 'usage: security find-generic-password'\nexit 44\n",
         )
         .expect("script is rewritable");
+        wait_until_executable(std::path::Path::new(noisy.program_path()));
         assert!(
             lookup(&noisy, "acme/loam/mqtt").is_none(),
             "a backend that prints and then fails must resolve nothing"
@@ -514,6 +1099,7 @@ mod tests {
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
                 .expect("script is executable");
         }
+        wait_until_executable(&script);
         let backend = Backend::Custom(script.to_string_lossy().into_owned());
         let secret = lookup(&backend, "acme/loam/mqtt").expect("the backend answers");
         assert_eq!(secret, b"BEGIN-SECRET-MATERIAL");
@@ -589,6 +1175,23 @@ mod tests {
             split_credential(format!("{CERTIFICATE}{KEY}{CERTIFICATE}").as_bytes()),
             unresolved
         );
+        // Anything outside an accepted block is refused rather than ignored:
+        // trailing junk, a stray marker, and leading noise are all shapes a
+        // scanner that only looked at markers would silently accept.
+        assert_eq!(
+            split_credential(format!("{CERTIFICATE}{KEY}trailing junk\n").as_bytes()),
+            unresolved
+        );
+        assert_eq!(
+            split_credential(format!("{CERTIFICATE}{KEY}-----BEGIN CERTIFICATE-----\n").as_bytes()),
+            unresolved
+        );
+        assert_eq!(
+            split_credential(format!("Bag Attributes\n{CERTIFICATE}{KEY}").as_bytes()),
+            unresolved
+        );
+        // Whitespace between and around blocks is not content.
+        assert!(split_credential(format!("\n\n{CERTIFICATE}\n{KEY}\n\n").as_bytes()).is_ok());
         // A block that opens and never closes.
         assert_eq!(
             split_credential(
@@ -656,15 +1259,58 @@ mod tests {
             Err(reason::CA_UNRESOLVED)
         );
 
-        // No bundle anywhere is also a refusal rather than an empty store.
-        let missing = directory.join("absent.pem");
-        assert!(
-            system_trust_anchors(Some(&missing.to_string_lossy())).is_err()
-                || std::path::Path::new(SYSTEM_TRUST_BUNDLES[0]).exists()
+        // A present-but-blank reference is malformed, not absent: reading it as
+        // "no CA pinned" would turn a typo into a silently wider trust decision.
+        assert_eq!(
+            resolve_trust_anchors(&backend, Some("   "), Some(&bundle.to_string_lossy())),
+            Err(reason::CA_UNRESOLVED)
         );
 
         let _ = std::fs::remove_dir_all(directory);
         let _ = std::fs::remove_dir_all(failing_dir);
+    }
+
+    #[test]
+    fn finding_no_trust_bundle_refuses_rather_than_trusting_an_empty_store() {
+        // Every candidate points at a path that does not exist, so this holds on
+        // any host. Baking the real list in would let a machine that happens to
+        // carry `/etc/ssl/certs/ca-certificates.crt` — which is every Linux
+        // host — satisfy the search and leave this branch unexercised.
+        let directory = temp_dir("no-bundle");
+        let absent = directory.join("absent.pem");
+        let nowhere = [
+            "/nonexistent/loam/ca-certificates.crt",
+            "/nonexistent/loam/ca-bundle.crt",
+        ];
+        assert_eq!(
+            system_trust_anchors_among(Some(&absent.to_string_lossy()), &nowhere),
+            Err(reason::CA_UNRESOLVED)
+        );
+
+        // Positive control in the same run: the identical call finds a bundle
+        // when one of the candidates exists, so the refusal above is the search
+        // failing rather than the function always refusing.
+        let present = directory.join("present.pem");
+        std::fs::write(
+            &present,
+            "-----BEGIN CERTIFICATE-----\nfound\n-----END CERTIFICATE-----\n",
+        )
+        .expect("bundle is writable");
+        let found = system_trust_anchors_among(None, &[&present.to_string_lossy(), nowhere[0]])
+            .expect("an existing candidate resolves");
+        assert!(String::from_utf8_lossy(&found).contains("found"));
+
+        // An empty file is not a trust store: it would build a root store that
+        // refuses every connection, which is a broken session rather than a
+        // resolved one.
+        let empty = directory.join("empty.pem");
+        std::fs::write(&empty, "").expect("empty bundle is writable");
+        assert_eq!(
+            system_trust_anchors_among(Some(&empty.to_string_lossy()), &nowhere),
+            Err(reason::CA_UNRESOLVED)
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
