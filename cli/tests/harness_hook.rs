@@ -98,6 +98,17 @@ fn run_hook(harness: &str, stdin: &[u8], global_root: &Path, skills_root: &Path)
     }
 }
 
+/// A path as a JSON *string body* — escaped, without the surrounding quotes.
+/// A Windows path is full of backslashes, and pasting one straight into a hand
+/// built frame produces invalid escapes (`\\U`, `\\l`), so the hook correctly
+/// refuses the frame as malformed and the test asserts against an empty body
+/// for entirely the wrong reason. Real harnesses emit escaped JSON; the test
+/// must too.
+fn json_path(path: &Path) -> String {
+    let quoted = Value::String(path.to_string_lossy().into_owned()).to_json();
+    quoted[1..quoted.len() - 1].to_owned()
+}
+
 fn fixture() -> Value {
     loam::json::parse(FRAMES).expect("frame corpus parses")
 }
@@ -145,13 +156,13 @@ fn every_harness_returns_its_native_envelope_for_every_frame_shape() {
     let corpus = fixture();
     let (global_root, skills_root) = installation("envelopes");
     let root = workspace();
-    let root = root.to_str().unwrap();
+    let root = json_path(&root);
 
     for harness in cases(&corpus, "harnesses") {
         let id = harness.get("id").and_then(Value::as_str).expect("id");
         for case in cases(&corpus, "frames") {
             let name = text(case, "name");
-            let stdin = text(case, "text").replace("WORKSPACE", root);
+            let stdin = text(case, "text").replace("WORKSPACE", &root);
             let run = run_hook(id, stdin.as_bytes(), &global_root, &skills_root);
             assert_eq!(run.status, 0, "{id}/{name}: {}", run.stderr);
 
@@ -177,7 +188,7 @@ fn the_same_snapshot_produces_one_body_across_all_four_harnesses() {
     let corpus = fixture();
     let (global_root, skills_root) = installation("identical-body");
     let root = workspace();
-    let stdin = format!(r#"{{"cwd":"{}"}}"#, root.to_str().unwrap());
+    let stdin = format!(r#"{{"cwd":"{}"}}"#, json_path(&root));
 
     let mut bodies = Vec::new();
     for harness in cases(&corpus, "harnesses") {
@@ -260,7 +271,7 @@ fn a_workspace_with_no_connector_still_gets_its_baseline_and_says_federation_is_
     // federation is not available.
     let (global_root, skills_root) = installation("no-connector");
     let root = workspace();
-    let stdin = format!(r#"{{"cwd":"{}"}}"#, root.to_str().unwrap());
+    let stdin = format!(r#"{{"cwd":"{}"}}"#, json_path(&root));
     let run = run_hook("claude", stdin.as_bytes(), &global_root, &skills_root);
     assert_eq!(run.status, 0, "{}", run.stderr);
 
@@ -298,7 +309,7 @@ fn a_workspace_with_no_connector_still_gets_its_baseline_and_says_federation_is_
 fn a_non_git_workspace_degrades_without_failing_the_session() {
     let (global_root, skills_root) = installation("non-git");
     let outside = temp_root("not-a-repo");
-    let stdin = format!(r#"{{"cwd":"{}"}}"#, outside.to_str().unwrap());
+    let stdin = format!(r#"{{"cwd":"{}"}}"#, json_path(&outside));
     let run = run_hook("cursor", stdin.as_bytes(), &global_root, &skills_root);
     assert_eq!(run.status, 0, "{}", run.stderr);
     let body = body_of(
