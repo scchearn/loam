@@ -911,6 +911,30 @@ impl ChannelRegistry {
 // restarted connector therefore serves nothing until state re-delivers, which is
 // correct rather than a bug.
 
+/// Whether a received work claim was reconciled against Git *at receive time*.
+///
+/// Every direction other than a real proof — a provisional claim, an oracle that
+/// could not be built for the project, an unreachable commit, a failed fetch —
+/// is [`Publication::Unverified`], so the fail-safe answer is always "sender
+/// claim, not reconciled". The renderer can only display a work claim as current
+/// when this says `Verified`, which is why the stamp lives here on the receive
+/// path rather than in the 2 s session hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Publication {
+    #[default]
+    Unverified,
+    Verified,
+}
+
+impl Publication {
+    pub fn code(self) -> &'static str {
+        match self {
+            Publication::Unverified => "unverified",
+            Publication::Verified => "verified",
+        }
+    }
+}
+
 /// One renderable item in a project's snapshot: normalized, already-deduped, and
 /// already-expiry-filtered. Carries no envelope bytes, no credential, and no raw
 /// remote URL — only what a hook may render.
@@ -932,6 +956,9 @@ pub struct SnapshotItem {
     pub from_instance_id: String,
     pub payload: crate::json::Value,
     pub expires_at: DateTime<Utc>,
+    /// Git-first reconciliation result, stamped by the receive path before the
+    /// item is ever readable. Never derived from the sender's own claim.
+    pub publication: Publication,
 }
 
 /// A bounded, per-project, in-memory item store with the same drop-on-restart
@@ -958,14 +985,21 @@ impl SnapshotStore {
     /// duplicate, stale, or conflicting outcome changes nothing here, which is
     /// what makes one logical item per message hold under QoS 1. Returns whether
     /// the store changed.
-    pub fn admit(&mut self, topic: &str, outcome: &ReceiveOutcome) -> bool {
+    /// `publication` is the receive path's Git verdict for this frame; the store
+    /// never derives it, so a sender cannot stamp its own claim as verified.
+    pub fn admit(
+        &mut self,
+        topic: &str,
+        outcome: &ReceiveOutcome,
+        publication: Publication,
+    ) -> bool {
         let Ok(parsed) = crate::envelope::parse_topic(topic) else {
             return false;
         };
         match outcome {
             ReceiveOutcome::Accepted(validated) => {
                 let key = accepted_key(&parsed.delivery, &validated.as_envelope().id);
-                let Some(item) = snapshot_item(key, validated) else {
+                let Some(item) = snapshot_item(key, validated, publication) else {
                     return false;
                 };
                 self.store(parsed.project, item)
@@ -1046,7 +1080,11 @@ fn tombstone_key(delivery: &crate::envelope::TopicDelivery<'_>) -> Option<String
     }
 }
 
-fn snapshot_item(key: String, validated: &ValidatedEnvelope) -> Option<SnapshotItem> {
+fn snapshot_item(
+    key: String,
+    validated: &ValidatedEnvelope,
+    publication: Publication,
+) -> Option<SnapshotItem> {
     let envelope = validated.as_envelope();
     let expires_at = DateTime::parse_from_rfc3339(&envelope.data.expires_at)
         .ok()?
@@ -1070,6 +1108,7 @@ fn snapshot_item(key: String, validated: &ValidatedEnvelope) -> Option<SnapshotI
         from_instance_id: envelope.data.from.instance_id.clone(),
         payload: envelope.data.payload.clone(),
         expires_at,
+        publication,
     })
 }
 
@@ -1146,6 +1185,10 @@ impl SessionState {
 /// flag. Short enough that a detach is prompt, long enough that an idle project
 /// costs nothing.
 const PUMP_POLL: Duration = Duration::from_millis(500);
+/// How long a receive-path reconciliation stays fresh before the oracle refetches.
+/// The pump is not on a session's critical path, so this trades a little
+/// staleness for not running `git ls-remote` on every received work claim.
+const RECONCILE_FRESHNESS: Duration = Duration::from_secs(30);
 /// Renderable items retained per project. The hook's own item budget is smaller;
 /// this is the store's ceiling, not the render budget.
 const SNAPSHOT_CAPACITY: usize = 64;
@@ -1237,12 +1280,17 @@ impl ProjectSessions {
             }
         }
 
+        // Built before the pump starts, from the enrollment and the same roster
+        // the receive path admits frames against. `None` is the fail-safe: every
+        // work claim then renders as an unreconciled sender claim.
+        let oracle = receive_oracle(row, &roster);
+
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (outbound, inbound) = std::sync::mpsc::channel();
         let thread = std::thread::spawn({
             let stop = std::sync::Arc::clone(&stop);
             let snapshots = std::sync::Arc::clone(&self.snapshots);
-            move || pump(transport, roster, snapshots, stop, inbound)
+            move || pump(transport, roster, oracle, snapshots, stop, inbound)
         });
         self.live.insert(
             row.project_id.clone(),
@@ -1318,9 +1366,54 @@ fn live_filters(org_id: &str, project_id: &str, identity: &SessionIdentity) -> V
 /// Pump one project's received frames into the snapshot store until stopped. The
 /// pump only reads: it never publishes, and a lost session simply goes quiet
 /// rather than fabricating state.
+/// The receive path's Git oracle for one project, derived entirely from the
+/// enrollment row and the provisioned roster — never from a message. Returns
+/// `None` whenever the workspace, remote, wiki root, scope, or origin set cannot
+/// be resolved, which leaves every work claim stamped as a sender claim.
+fn receive_oracle(
+    row: &crate::enrollment::EnrolledRow,
+    roster: &PeerRoster,
+) -> Option<crate::transport::GitOracle> {
+    let remote = row.remotes.first()?;
+    let workspace = std::path::PathBuf::from(&row.display_path);
+    let wiki_root = workspace.join("wiki");
+    let scope =
+        crate::transport::GitScope::new(&row.org_id, &row.project_id, &row.repository_id).ok()?;
+    crate::transport::GitOracle::new(
+        &workspace,
+        &wiki_root,
+        &remote.name,
+        scope,
+        &remote.allowed_refs,
+        &roster.origins,
+        RECONCILE_FRESHNESS,
+    )
+    .ok()
+}
+
+/// The Git verdict for one received frame. Only an `io.loam.work.state` frame
+/// that the oracle proves published earns [`Publication::Verified`]; every other
+/// outcome, including every error, falls back to the sender-claim answer.
+fn stamp_publication(
+    oracle: Option<&mut crate::transport::GitOracle>,
+    outcome: &ReceiveOutcome,
+) -> Publication {
+    let (Some(oracle), ReceiveOutcome::Accepted(validated)) = (oracle, outcome) else {
+        return Publication::Unverified;
+    };
+    if validated.as_envelope().message_type != "io.loam.work.state" {
+        return Publication::Unverified;
+    }
+    match oracle.evaluate_work_state(validated) {
+        Ok(crate::transport::PublicationStatus::Verified(_)) => Publication::Verified,
+        _ => Publication::Unverified,
+    }
+}
+
 fn pump(
     mut transport: MqttTransport,
     roster: PeerRoster,
+    mut oracle: Option<crate::transport::GitOracle>,
     snapshots: std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     outbound: std::sync::mpsc::Receiver<ValidatedEnvelope>,
@@ -1335,8 +1428,11 @@ fn pump(
         }
         match transport.receive_outcome(PUMP_POLL, Utc::now(), &roster) {
             Ok(Some((topic, outcome))) => {
+                // Git-first: reconcile *before* the item is readable, so a hook
+                // can never display a provisional claim as current.
+                let publication = stamp_publication(oracle.as_mut(), &outcome);
                 if let Ok(mut store) = snapshots.lock() {
-                    store.admit(&topic, &outcome);
+                    store.admit(&topic, &outcome, publication);
                 }
             }
             Ok(None) => {}
@@ -1817,6 +1913,12 @@ fn snapshot_json(project_id: &str, items: &[SnapshotItem]) -> crate::json::Value
                     ]),
                 ),
                 ("payload".into(), item.payload.clone()),
+                // The receive path's Git verdict. Always present and always
+                // explicit, so a missing field can never read as verified.
+                (
+                    "publication".into(),
+                    Value::String(item.publication.code().to_owned()),
+                ),
             ])
         })
         .collect();
@@ -2804,6 +2906,7 @@ mod service_tests {
                     from_instance_id: "instance-01".into(),
                     payload: crate::json::Value::Object(vec![]),
                     expires_at: Utc::now() + chrono::Duration::hours(1),
+                    publication: Publication::Unverified,
                 },
             );
         }
@@ -3803,7 +3906,7 @@ mod snapshot_tests {
                 let outcome = processor
                     .receive(&topic, &bytes, &identity, now)
                     .unwrap_or_else(|error| panic!("{name}: frame rejected: {error:?}"));
-                store.admit(&topic, &outcome);
+                store.admit(&topic, &outcome, Publication::Unverified);
             }
 
             let read_at =
@@ -3880,7 +3983,7 @@ mod snapshot_tests {
         let mut processor =
             DeliveryProcessor::new(ValidationConfig::default(), 8, 8, 8).expect("processor");
         let outcome = processor.receive(&topic, &bytes, &identity, now).unwrap();
-        assert!(before.admit(&topic, &outcome));
+        assert!(before.admit(&topic, &outcome, Publication::Unverified));
         assert_eq!(before.len("project-7M3"), 1);
 
         drop(before);
@@ -4017,6 +4120,7 @@ mod snapshot_tests {
             from_instance_id: SENDER_INSTANCE.into(),
             payload: crate::json::Value::Object(vec![]),
             expires_at: base_time(),
+            publication: Publication::Unverified,
         };
         let text = snapshot_json("project-7M3", std::slice::from_ref(&item)).to_json();
         for field in [
