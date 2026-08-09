@@ -1,9 +1,16 @@
 import { homedir } from 'node:os';
+import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const OWN_MARKER = 'You have loam';
+const UNAVAILABLE = '<LOAM_IMPORTANT>\nYou have loam.\nLoam is unavailable. Run: npx @scchearn/loam setup\n</LOAM_IMPORTANT>';
+
+// Filled in by setup when this plugin is staged. OpenCode loads the plugin
+// in-process, so the absolute private runtime is written here rather than
+// resolved at session time; setup rewrites it whenever the runtime moves.
+const RUNTIME_PATH = "__LOAM_RUNTIME_PATH__";
 
 async function defaultIntegrationPath() {
   if (process.env.LOAM_INTEGRATION_PATH) return process.env.LOAM_INTEGRATION_PATH;
@@ -41,19 +48,27 @@ const {
   beginHookRun, finishHookRun, startHookWorker, finishHookWorker,
 } = await loadIngestModules().catch(() => ({}));
 
-async function defaultContext({ integrationPath, workspace }) {
-  try {
-    integrationPath ||= await defaultIntegrationPath();
-    const integration = await import(pathToFileURL(integrationPath).href);
-    const chunks = [];
-    await integration.runIntegration(
-      ['hook', '--harness', 'opencode', '--workspace', workspace],
-      { integrationPath, output: { write: (chunk) => chunks.push(String(chunk)) } },
-    );
-    return chunks.join('');
-  } catch {
-    return '<LOAM_IMPORTANT>\nYou have loam.\nLoam is unavailable. Run: npx @scchearn/loam setup\n</LOAM_IMPORTANT>';
-  }
+// The whole OpenCode context surface: run the native read path and take its
+// stdout. No shared Node integration, no IPC of our own, no broker.
+async function defaultContext({ workspace }) {
+  return new Promise((settle) => {
+    let child;
+    try {
+      child = spawn(RUNTIME_PATH, ['hook', 'opencode', '--workspace', workspace], {
+        stdio: ['pipe', 'pipe', 'ignore'],
+      });
+    } catch {
+      settle(UNAVAILABLE);
+      return;
+    }
+    let body = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { body += chunk; });
+    child.once('error', () => settle(UNAVAILABLE));
+    child.once('close', () => settle(body.trim() || UNAVAILABLE));
+    child.stdin.on('error', () => {});
+    child.stdin.end('{}');
+  });
 }
 
 function responseData(response) { return response?.data ?? response; }

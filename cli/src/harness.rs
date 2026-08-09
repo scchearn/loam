@@ -59,12 +59,15 @@ impl Harness {
     /// envelope. This is the entire per-harness surface: the body is identical
     /// across all four, and only the key spelling differs — Claude's camelCase
     /// `additionalContext` against Cursor's snake_case `additional_context`.
-    pub fn envelope(&self, body: &str) -> String {
+    pub fn envelope(&self, body: &str, event: HookEvent) -> String {
         match self {
             Harness::Claude => Value::Object(vec![(
                 "hookSpecificOutput".into(),
                 Value::Object(vec![
-                    ("hookEventName".into(), Value::String("SessionStart".into())),
+                    (
+                        "hookEventName".into(),
+                        Value::String(event.hook_event_name().into()),
+                    ),
                     ("additionalContext".into(), Value::String(body.to_owned())),
                 ]),
             )])
@@ -78,6 +81,35 @@ impl Harness {
             // part. Codex's shape is unconfirmed until the T7 gate, so it gets
             // the same plain body rather than an invented envelope key.
             Harness::OpenCode | Harness::Codex => body.to_owned(),
+        }
+    }
+}
+
+/// The lifecycle boundaries a registration may name. A closed set, like the
+/// harness ids: a registration says which boundary fired, and the caller cannot
+/// invent one. Only Claude's envelope carries the name back, but every harness
+/// parses it so a bad registration is refused rather than silently mislabelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookEvent {
+    SessionStart,
+    UserPromptSubmit,
+}
+
+impl HookEvent {
+    /// Each harness spells its own boundary: Claude uses PascalCase hook names,
+    /// Cursor uses camelCase. Both map onto the same two boundaries.
+    pub fn parse(id: &str) -> Option<HookEvent> {
+        match id {
+            "SessionStart" | "sessionStart" => Some(HookEvent::SessionStart),
+            "UserPromptSubmit" | "userPromptSubmit" => Some(HookEvent::UserPromptSubmit),
+            _ => None,
+        }
+    }
+
+    pub fn hook_event_name(&self) -> &'static str {
+        match self {
+            HookEvent::SessionStart => "SessionStart",
+            HookEvent::UserPromptSubmit => "UserPromptSubmit",
         }
     }
 }
@@ -888,10 +920,18 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         return 1;
     };
     let mut paths = HookPaths::from_env();
+    let mut event = HookEvent::SessionStart;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--workspace" => match args.next() {
                 Some(value) => paths.cwd = PathBuf::from(value),
+                None => {
+                    usage();
+                    return 1;
+                }
+            },
+            "--event" => match args.next().as_deref().and_then(HookEvent::parse) {
+                Some(value) => event = value,
                 None => {
                     usage();
                     return 1;
@@ -912,18 +952,18 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         use std::io::Read;
         let mut reader = std::io::stdin().take((config.max_frame_bytes + 1) as u64);
         if reader.read_to_end(&mut input).is_err() {
-            return refuse(harness, "frame_unreadable");
+            return refuse(harness, event, "frame_unreadable");
         }
     }
 
     let frame = match parse_frame(&input, &config) {
         Ok(frame) => frame,
-        Err(error) => return refuse(harness, error.code()),
+        Err(error) => return refuse(harness, event, error.code()),
     };
 
     println!(
         "{}",
-        harness.envelope(&compose_body(&paths, &config, &frame, None))
+        harness.envelope(&compose_body(&paths, &config, &frame, None), event)
     );
     0
 }
@@ -931,14 +971,14 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
 /// A refused frame renders no payload and mutates nothing: the diagnostic is a
 /// stable code on stderr and the harness receives an empty envelope, never a
 /// half-built context assembled from input we could not parse.
-fn refuse(harness: Harness, code: &str) -> i32 {
+fn refuse(harness: Harness, event: HookEvent, code: &str) -> i32 {
     eprintln!("loam hook: {code}");
-    println!("{}", harness.envelope(""));
+    println!("{}", harness.envelope("", event));
     0
 }
 
 fn usage() {
-    eprintln!("Usage: loam hook <opencode|claude|codex|cursor> [--workspace <absolute-path>]");
+    eprintln!("Usage: loam hook <opencode|claude|codex|cursor> [--workspace <absolute-path>] [--event <SessionStart|UserPromptSubmit>]");
 }
 
 #[cfg(test)]
@@ -1033,15 +1073,63 @@ mod tests {
     fn the_two_context_key_spellings_cannot_drift_into_each_other() {
         // The whole envelope-mapping surface: Claude's camelCase against
         // Cursor's snake_case, asserted together so a rename touches both.
-        let claude = Harness::Claude.envelope("BODY");
-        let cursor = Harness::Cursor.envelope("BODY");
+        let claude = Harness::Claude.envelope("BODY", HookEvent::SessionStart);
+        let cursor = Harness::Cursor.envelope("BODY", HookEvent::SessionStart);
         assert!(claude.contains("\"additionalContext\":\"BODY\""));
         assert!(!claude.contains("additional_context"));
         assert!(cursor.contains("\"additional_context\":\"BODY\""));
         assert!(!cursor.contains("additionalContext"));
         // The two plain-body harnesses carry the identical body, unwrapped.
-        assert_eq!(Harness::OpenCode.envelope("BODY"), "BODY");
-        assert_eq!(Harness::Codex.envelope("BODY"), "BODY");
+        assert_eq!(
+            Harness::OpenCode.envelope("BODY", HookEvent::SessionStart),
+            "BODY"
+        );
+        assert_eq!(
+            Harness::Codex.envelope("BODY", HookEvent::SessionStart),
+            "BODY"
+        );
+    }
+
+    #[test]
+    fn the_refresh_boundary_is_a_closed_set_and_only_relabels_claude() {
+        // A registration names its boundary; Claude echoes it back so the
+        // harness accepts the context, and the closed set means a malformed
+        // registration is refused rather than silently mislabelled.
+        assert_eq!(
+            HookEvent::parse("SessionStart"),
+            Some(HookEvent::SessionStart)
+        );
+        assert_eq!(
+            HookEvent::parse("sessionStart"),
+            Some(HookEvent::SessionStart)
+        );
+        assert_eq!(
+            HookEvent::parse("UserPromptSubmit"),
+            Some(HookEvent::UserPromptSubmit)
+        );
+        for unknown in ["Stop", "PreToolUse", "", "userpromptsubmit"] {
+            assert_eq!(
+                HookEvent::parse(unknown),
+                None,
+                "{unknown} is not a boundary"
+            );
+        }
+
+        let refresh = Harness::Claude.envelope("BODY", HookEvent::UserPromptSubmit);
+        assert!(refresh.contains("\"hookEventName\":\"UserPromptSubmit\""));
+        assert!(refresh.contains("\"additionalContext\":\"BODY\""));
+        // Positive control that the label is not a constant: the same harness
+        // and body under the other boundary carries the other name.
+        let start = Harness::Claude.envelope("BODY", HookEvent::SessionStart);
+        assert!(start.contains("\"hookEventName\":\"SessionStart\""));
+        assert_ne!(start, refresh);
+        // The other three envelopes are boundary-independent by construction.
+        for harness in [Harness::Cursor, Harness::OpenCode, Harness::Codex] {
+            assert_eq!(
+                harness.envelope("BODY", HookEvent::SessionStart),
+                harness.envelope("BODY", HookEvent::UserPromptSubmit)
+            );
+        }
     }
 
     #[test]
@@ -1446,7 +1534,7 @@ mod render_tests {
             Harness::Codex,
         ]
         .iter()
-        .map(|harness| harness.envelope(&body))
+        .map(|harness| harness.envelope(&body, HookEvent::SessionStart))
         .collect();
         for envelope in &envelopes {
             assert!(

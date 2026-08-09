@@ -166,7 +166,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
         home: discovery.home,
         globalRoot: discovery.globalRoot,
         pluginVersion: discovery.packageVersion,
-        integrationPath,
+        runtimePath: runtime.path,
         detected: effectiveHarnesses,
       });
       const harnesses = harnessInstall;

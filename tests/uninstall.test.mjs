@@ -38,14 +38,15 @@ async function readyFixture() {
   await mkdir(join(home, '.cursor'), { recursive: true });
   await mkdir(join(home, '.agents', 'skills', 'loam-using'), { recursive: true });
   await writeFile(join(home, '.agents', 'skills', 'loam-using', 'SKILL.md'), '# using\n');
+  const runtimePath = join(globalRoot, 'bin', '0.9.1', 'x86_64-unknown-linux-musl', 'loam');
   const detected = await detectHarnesses({ home });
-  const installed = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', detected });
+  const installed = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', runtimePath, detected });
   const install = {
     schema_version: 1,
     plugin_version: '0.8.3',
     runtime_version: '0.9.1',
     target: 'x86_64-unknown-linux-musl',
-    runtime_path: join(globalRoot, 'bin', '0.9.1', 'x86_64-unknown-linux-musl', 'loam'),
+    runtime_path: runtimePath,
     runtime_sha256: 'a'.repeat(64),
     adapter_root: installed.versionRoot,
     integration_path: join(globalRoot, 'integration', 'loam.mjs'),
@@ -79,12 +80,17 @@ test('uninstall removes the global root, skills, adapter, and Loam-owned hooks; 
   const claudePath = join(home, '.claude', 'settings.json');
   const codexPath = join(home, '.codex', 'hooks.json');
   const cursorPath = join(home, '.cursor', 'hooks.json');
+  // Both registration generations: the retired Node shim a previous install
+  // left in user config, and the native `hook` command this one writes.
+  const legacyClaude = { type: 'command', command: 'node', args: [join(globalRoot, 'plugins', 'old', 'claude-session-start.mjs')] };
+  const nativeClaude = { type: 'command', command: install.runtime_path, args: ['hook', 'claude', '--event', 'SessionStart'] };
+  const legacyCodexSession = { type: 'command', command: `node ${JSON.stringify(join(globalRoot, 'plugins', 'old', 'codex-session-start.mjs'))}` };
   const claude = { hooks: {
-    SessionStart: [{ hooks: [{ type: 'command', command: 'node', args: [installed.claude.path] }] }],
+    SessionStart: [{ hooks: [legacyClaude, nativeClaude] }],
     Stop: [],
   } };
   const codex = { hooks: {
-    SessionStart: [{ hooks: [{ type: 'command', command: `node ${JSON.stringify(installed.codex.sessionPath)}` }] }],
+    SessionStart: [{ hooks: [legacyCodexSession] }],
     Stop: [{ hooks: [{ type: 'command', command: `node ${JSON.stringify(installed.codex.stopPath)}` }] }],
   } };
   const cursor = JSON.parse(await readFile(cursorPath, 'utf8'));
@@ -127,10 +133,11 @@ test('uninstall removes the global root, skills, adapter, and Loam-owned hooks; 
   assert.deepEqual(codexSessionHooks[0], unrelatedCodexSession, 'unrelated codex SessionStart hook preserved');
   assert.deepEqual(codexStopHooks[0], unrelatedCodexStop, 'unrelated codex Stop hook preserved');
   assert.deepEqual(cursorHooks[0], unrelatedCursor, 'unrelated cursor hook preserved');
-  assert.equal(claudeHooks.filter((h) => h.command === 'node' && h.args?.[0] === installed.claude.path).length, 0, 'loam claude hook removed');
-  assert.equal(codexSessionHooks.filter((h) => h.command === `node ${JSON.stringify(installed.codex.sessionPath)}`).length, 0, 'loam codex SessionStart hook removed');
+  assert.equal(claudeHooks.length, 1, 'both the legacy shim and the native claude hook removed');
+  assert.equal(codexSessionHooks.filter((h) => h.command === legacyCodexSession.command).length, 0, 'loam codex SessionStart hook removed');
   assert.equal(codexStopHooks.filter((h) => h.command === `node ${JSON.stringify(installed.codex.stopPath)}`).length, 0, 'loam codex Stop hook removed');
-  assert.equal(cursorHooks.filter((h) => h.command === 'node' && h.args?.[0] === installed.cursor.path).length, 0, 'loam cursor hook removed');
+  assert.equal(cursorHooks.length, 1, 'the native cursor hook removed');
+  assert.equal(cursorHooks.filter((h) => h.command === install.runtime_path).length, 0, 'no native runtime command survives uninstall');
 });
 
 test('uninstall removes backup files created by setup', async () => {
