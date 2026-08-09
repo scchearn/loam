@@ -137,6 +137,12 @@ impl HookPaths {
     fn run_dir(&self) -> PathBuf {
         self.global_root.join("run")
     }
+
+    /// The installed-handler allowlist. Absent is the normal case and means
+    /// render-only for everything — see [`load_allowlist`].
+    fn allowlist(&self) -> PathBuf {
+        self.global_root.join("handler-allowlist.toml")
+    }
 }
 
 fn absolute_env(name: &str) -> Option<PathBuf> {
@@ -314,10 +320,16 @@ fn call_connector(run_dir: &Path, request: &[u8], config: &IpcConfig) -> Result<
     ipc::read_frame(&mut connection, config)
 }
 
-/// Render the federation half of the context. T3 replaces the item body with the
-/// shared injection-safe renderer and the default-DENY allowlist; the section
-/// framing and the budget live here.
-fn federation_section(federation: &Federation, config: &HookConfig) -> String {
+/// Render the federation half of the context: the shared injection-safe
+/// renderer, the default-DENY allowlist, and the budget. Harness-agnostic by
+/// construction — it returns one bounded text body, and only the envelope mapper
+/// knows which key each harness wants.
+fn federation_section(
+    federation: &Federation,
+    config: &HookConfig,
+    allowlist_path: &Path,
+) -> String {
+    let allowlist = load_allowlist(allowlist_path);
     let mut lines = vec!["## Federation".to_owned(), String::new()];
     match federation {
         Federation::Unenrolled => {
@@ -356,29 +368,260 @@ fn federation_section(federation: &Federation, config: &HookConfig) -> String {
             }
             for item in items.iter().skip(dropped) {
                 lines.push(String::new());
-                lines.push(item_line(item, config.item_budget_bytes));
+                lines.push(render_item(item, config.item_budget_bytes, &allowlist));
             }
         }
     }
     lines.join("\n")
 }
 
-fn item_line(item: &Value, budget: usize) -> String {
-    let field = |key: &str| clean_text(item.get(key).and_then(Value::as_str).unwrap_or(""), 256);
-    let sender = item
-        .get("from")
-        .and_then(|from| from.get("principal_id"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    format!(
-        "- from {} · {} — {}",
-        clean_text(sender, 256),
-        field("type"),
-        clean_text(
-            item.get("summary").and_then(Value::as_str).unwrap_or(""),
-            budget
-        )
-    )
+// ---------------------------------------------------------------------------
+// T3 — the shared injection-safe renderer and the default-DENY allowlist
+// ---------------------------------------------------------------------------
+
+/// What an installed handler is permitted to do with a type. Default-DENY: this
+/// resolves to [`Effect::Render`] for an absent file, an unlisted type, and any
+/// entry that cannot be read whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    Render,
+    Notify,
+    Nothing,
+}
+
+/// One admitted allowlist entry. An entry that fails to parse never becomes one
+/// of these — it is discarded, which is what makes the default DENY rather than
+/// "whatever the reader guessed".
+#[derive(Debug, Clone)]
+struct HandlerEntry {
+    sender_scope: Vec<String>,
+    effect: Effect,
+}
+
+/// Every snapshot item reaches this process over the enrolled project's own
+/// topic filters, so the sender scope a rendered item is evaluated against is
+/// always the project.
+const ITEM_SENDER_SCOPE: &str = "project";
+
+/// Parse the default-DENY handler allowlist. Deliberately small and total: a
+/// line it cannot read discards the entry it belongs to rather than aborting the
+/// file or admitting a half-read entry, and a missing file is an empty
+/// allowlist. Both roads lead to render-only.
+fn load_allowlist(path: &Path) -> std::collections::BTreeMap<String, HandlerEntry> {
+    let mut admitted = std::collections::BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return admitted;
+    };
+    let mut key: Option<String> = None;
+    let mut scope: Option<Vec<String>> = None;
+    let mut effect: Option<Effect> = None;
+    let mut broken = false;
+
+    // Close the section that just ended; only a complete, wholly-parsed entry is
+    // admitted.
+    fn flush(
+        admitted: &mut std::collections::BTreeMap<String, HandlerEntry>,
+        key: &mut Option<String>,
+        scope: &mut Option<Vec<String>>,
+        effect: &mut Option<Effect>,
+        broken: &mut bool,
+    ) {
+        if let (Some(name), Some(sender_scope), Some(value), false) =
+            (key.take(), scope.take(), effect.take(), *broken)
+        {
+            admitted.insert(
+                name,
+                HandlerEntry {
+                    sender_scope,
+                    effect: value,
+                },
+            );
+        }
+        *broken = false;
+    }
+
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            flush(
+                &mut admitted,
+                &mut key,
+                &mut scope,
+                &mut effect,
+                &mut broken,
+            );
+            let name = header.trim().trim_matches('"');
+            if name.is_empty() {
+                broken = true;
+            } else {
+                key = Some(name.to_owned());
+            }
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            broken = true;
+            continue;
+        };
+        let value = value.trim();
+        match name.trim() {
+            "sender_scope" => match value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+                Some(list) => {
+                    scope = Some(
+                        list.split(',')
+                            .map(|entry| entry.trim().trim_matches('"').to_owned())
+                            .filter(|entry| !entry.is_empty())
+                            .collect(),
+                    );
+                }
+                // A scalar where a list belongs is a broken entry, not an
+                // entry with one scope.
+                None => broken = true,
+            },
+            "effect" => match value.trim_matches('"') {
+                "render" => effect = Some(Effect::Render),
+                "notify" => effect = Some(Effect::Notify),
+                "none" => effect = Some(Effect::Nothing),
+                _ => broken = true,
+            },
+            // An unknown key is not a reason to admit an entry this parser only
+            // partly understands.
+            _ => broken = true,
+        }
+    }
+    flush(
+        &mut admitted,
+        &mut key,
+        &mut scope,
+        &mut effect,
+        &mut broken,
+    );
+    admitted
+}
+
+/// Resolve one item's type to an effect. Everything unlisted, out of scope, or
+/// unreadable is render-only.
+fn resolve_effect(
+    allowlist: &std::collections::BTreeMap<String, HandlerEntry>,
+    item_type: &str,
+) -> Effect {
+    match allowlist.get(item_type) {
+        Some(entry) if entry.sender_scope.iter().any(|s| s == ITEM_SENDER_SCOPE) => entry.effect,
+        _ => Effect::Render,
+    }
+}
+
+/// Render untrusted sender text so it can enter model context without being able
+/// to act or to forge Loam's own framing.
+///
+/// Three things happen, in this order: the text is flattened to one line so no
+/// item can open a heading or close the context envelope; links are reduced to
+/// their host and marked as not followed, so no URL survives as a fetch target;
+/// and fences are defanged so a command block reads as text. The 2026-08-08
+/// trust amendment means this is attribution, not quarantine — the words survive
+/// intact, only their power to act does not.
+fn sanitize_untrusted(text: &str, budget: usize) -> String {
+    let flattened = clean_text(text, budget * 2)
+        .replace(['\n', '\r'], " ⏎ ")
+        .replace('\t', " ")
+        .replace("```", "'''")
+        .replace("<LOAM_IMPORTANT>", "‹LOAM_IMPORTANT›")
+        .replace("</LOAM_IMPORTANT>", "‹/LOAM_IMPORTANT›");
+    let delinked = defang_links(&flattened);
+    // Collapse the runs the flattening leaves behind, then apply the real budget.
+    let mut collapsed = String::with_capacity(delinked.len());
+    let mut spaces = 0usize;
+    for character in delinked.chars() {
+        if character == ' ' {
+            spaces += 1;
+            if spaces > 1 {
+                continue;
+            }
+        } else {
+            spaces = 0;
+        }
+        collapsed.push(character);
+    }
+    clean_text(collapsed.trim(), budget)
+}
+
+/// Replace every URL — Markdown-wrapped or bare — with its host and an explicit
+/// "not followed" marker. The link text survives; the target does not.
+fn defang_links(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("http://").or_else(|| rest.find("https://")) {
+        output.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == ')' || c == '>' || c == '"')
+            .unwrap_or(tail.len());
+        let url = &tail[..end];
+        let host = url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split(['/', '?', '#', ':'])
+            .next()
+            .unwrap_or("");
+        output.push_str(&format!("[loam:link {host} — not followed]"));
+        rest = &tail[end..];
+    }
+    output.push_str(rest);
+    output
+}
+
+/// One rendered item: attributed to its verified sender, bounded, inert, and
+/// identical on every harness.
+fn render_item(
+    item: &Value,
+    budget: usize,
+    allowlist: &std::collections::BTreeMap<String, HandlerEntry>,
+) -> String {
+    let item_type = clean_text(item.get("type").and_then(Value::as_str).unwrap_or(""), 256);
+    let sender = clean_text(
+        item.get("from")
+            .and_then(|from| from.get("principal_id"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        256,
+    );
+    let summary = sanitize_untrusted(
+        item.get("summary").and_then(Value::as_str).unwrap_or(""),
+        budget,
+    );
+
+    let mut line = format!("- from {sender} · {item_type} — {summary}");
+
+    // A work claim is a sender assertion until Git says otherwise, so it can
+    // never render as current fact on its own authority.
+    if item_type == "io.loam.work.state" {
+        let state = clean_text(
+            item.get("payload")
+                .and_then(|payload| payload.get("state"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            64,
+        );
+        let verified = item.get("publication").and_then(Value::as_str) == Some("verified");
+        line.push_str(&if verified {
+            format!(" [loam:work {state} · verified against Git]")
+        } else {
+            format!(" [loam:work {state} · unverified — sender claim, not reconciled against Git]")
+        });
+    }
+
+    match resolve_effect(allowlist, &item_type) {
+        // Listing a type never authorizes acting on it: the effect is announced
+        // and left for explicit local policy, agent, or user approval.
+        Effect::Notify => {
+            line.push_str(" [loam:effect notify — requires explicit approval; not performed]");
+        }
+        Effect::Render | Effect::Nothing => line.push_str(" [loam:render-only]"),
+    }
+    line.push_str(" [loam:untrusted]");
+    line
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +845,7 @@ pub fn compose_body(
         skill_body(&paths.skills_root),
         command,
         workspace_state_section(&workspace),
-        federation_section(&federation, config),
+        federation_section(&federation, config, &paths.allowlist()),
     ];
     let content = sections
         .iter()
@@ -946,7 +1189,11 @@ mod tests {
             item_budget_bytes: 64,
             ..HookConfig::default()
         };
-        let section = federation_section(&Federation::Snapshot(snapshot.clone()), &config);
+        let section = federation_section(
+            &Federation::Snapshot(snapshot.clone()),
+            &config,
+            Path::new("/nonexistent/handler-allowlist.toml"),
+        );
         assert!(section.contains("items: 8"), "{section}");
         assert!(
             section.contains("[loam:truncated] 5 older item(s) omitted"),
@@ -966,6 +1213,7 @@ mod tests {
                 item_budget_bytes: 4,
                 ..config
             },
+            Path::new("/nonexistent/handler-allowlist.toml"),
         );
         assert!(clipped.contains("ite…"), "{clipped}");
         assert!(!clipped.contains("item-7"), "{clipped}");
@@ -1033,5 +1281,196 @@ mod tests {
         assert_eq!(clean_text("a\u{0}b", 64), "a\u{fffd}b");
         assert_eq!(clean_text("abcdef", 3), "ab…");
         assert_eq!(clean_text("line\nbreak", 64), "line\nbreak");
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    //! T3 — the shared renderer, the default-DENY allowlist, and the budget.
+    //!
+    //! The renderer is a pure function over a snapshot, which is what makes
+    //! "drives nothing" structural rather than aspirational: it has no process,
+    //! network, or filesystem-write capability to reach, and the crate guard in
+    //! `envelope.rs` keeps it that way. What these cases pin is the other half —
+    //! that untrusted text cannot escape the framing, cannot leave a fetchable
+    //! target behind, and cannot acquire an effect it was not granted.
+
+    use super::*;
+
+    const CASES: &str = include_str!("../tests/fixtures/mqtt/harness-render-cases.json");
+
+    fn allowlist_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("mqtt")
+            .join("handler-allowlist.toml")
+    }
+
+    fn cases() -> Value {
+        crate::json::parse(CASES).expect("render corpus parses")
+    }
+
+    fn strings(case: &Value, key: &str) -> Vec<String> {
+        case.get(key)
+            .and_then(Value::as_array)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn every_render_case_is_attributed_bounded_and_inert() {
+        let allowlist = load_allowlist(&allowlist_path());
+        assert!(
+            !allowlist.is_empty(),
+            "the fixture allowlist must actually parse, or every case below \
+             passes for the wrong reason"
+        );
+        let corpus = cases();
+        let all = corpus
+            .get("cases")
+            .and_then(Value::as_array)
+            .expect("cases");
+        assert_eq!(all.len(), 14, "the corpus must not shrink silently");
+
+        for case in all {
+            let name = case.get("name").and_then(Value::as_str).unwrap_or("?");
+            let item = case.get("item").expect("item");
+            let budget = case
+                .get("budget")
+                .and_then(Value::as_str)
+                .and_then(|v| v.parse().ok())
+                .or_else(|| match case.get("budget") {
+                    Some(Value::Number(literal)) => literal.parse().ok(),
+                    _ => None,
+                })
+                .unwrap_or(4096usize);
+            let line = render_item(item, budget, &allowlist);
+
+            for needle in strings(case, "contains") {
+                assert!(
+                    line.contains(&needle),
+                    "case `{name}` must render `{needle}`:\n{line}"
+                );
+            }
+            for needle in strings(case, "absent") {
+                assert!(
+                    !line.contains(&needle),
+                    "case `{name}` must not render `{needle}`:\n{line}"
+                );
+            }
+            // Universal to every case: one line, attributed, and marked.
+            assert!(!line.contains('\n'), "case `{name}` escaped its line");
+            assert!(line.starts_with("- from "), "case `{name}`: {line}");
+            assert!(line.contains("[loam:untrusted]"), "case `{name}`: {line}");
+        }
+    }
+
+    #[test]
+    fn an_absent_allowlist_file_renders_everything_and_grants_nothing() {
+        // The default-DENY road most installations actually travel.
+        let absent = load_allowlist(Path::new("/nonexistent/handler-allowlist.toml"));
+        assert!(absent.is_empty());
+        let item = crate::json::parse(
+            r#"{"type":"io.loam.work.state","summary":"ready","from":{"principal_id":"employee-1"},"payload":{"state":"ready"}}"#,
+        )
+        .unwrap();
+        let line = render_item(&item, 4096, &absent);
+        assert!(line.contains("[loam:render-only]"), "{line}");
+        assert!(!line.contains("[loam:effect"), "{line}");
+        // The item is still shown: default-DENY denies effects, not visibility.
+        assert!(line.contains("ready"), "{line}");
+
+        // Positive control: with the fixture allowlist present, this exact type
+        // does resolve to a non-render effect — so the absence above is the
+        // file's doing, not a renderer that can never grant anything.
+        let listed = load_allowlist(&allowlist_path());
+        assert_eq!(
+            resolve_effect(&listed, "io.loam.work.state"),
+            Effect::Notify
+        );
+        assert!(
+            render_item(&item, 4096, &listed).contains("[loam:effect notify"),
+            "the same item under the fixture allowlist must announce its effect"
+        );
+    }
+
+    #[test]
+    fn every_allowlist_failure_mode_resolves_to_render_only() {
+        let listed = load_allowlist(&allowlist_path());
+        for unreadable in [
+            "io.loam.broken.effect",  // effect value this parser cannot read
+            "io.loam.broken.scope",   // sender_scope is not a list
+            "io.loam.out.of.scope",   // well-formed, but not this sender's scope
+            "com.example.deploy.req", // never listed at all
+        ] {
+            assert_eq!(
+                resolve_effect(&listed, unreadable),
+                Effect::Render,
+                "`{unreadable}` must resolve to render-only"
+            );
+        }
+        // The two entries that parse whole are admitted — without this the test
+        // above would pass against a parser that admits nothing.
+        assert_eq!(resolve_effect(&listed, "io.loam.message"), Effect::Render);
+        assert_eq!(
+            resolve_effect(&listed, "io.loam.work.state"),
+            Effect::Notify
+        );
+        // Three entries parse whole; the two broken ones never became entries at
+        // all. `io.loam.out.of.scope` is admitted and still does not apply —
+        // parsing and applying are separate gates.
+        assert_eq!(listed.len(), 3, "only wholly-parsed entries are admitted");
+        assert!(listed.contains_key("io.loam.out.of.scope"));
+        assert!(!listed.contains_key("io.loam.broken.effect"));
+        assert!(!listed.contains_key("io.loam.broken.scope"));
+    }
+
+    #[test]
+    fn the_same_snapshot_renders_the_same_body_on_every_harness() {
+        // The renderer is harness-agnostic; only the envelope key differs. If
+        // this ever diverges, four harnesses start seeing four different truths.
+        let snapshot = Federation::Snapshot(
+            crate::json::parse(
+                r#"{"project_id":"loam","items":[{"type":"io.loam.message","summary":"hello","from":{"principal_id":"employee-1"},"payload":{}}]}"#,
+            )
+            .unwrap(),
+        );
+        let body = federation_section(&snapshot, &HookConfig::default(), &allowlist_path());
+        let envelopes: Vec<String> = [
+            Harness::Claude,
+            Harness::Cursor,
+            Harness::OpenCode,
+            Harness::Codex,
+        ]
+        .iter()
+        .map(|harness| harness.envelope(&body))
+        .collect();
+        for envelope in &envelopes {
+            assert!(
+                envelope.contains("hello"),
+                "every harness carries the same rendered body"
+            );
+        }
+        // The bodies are identical; the keys are not.
+        assert!(envelopes[0].contains("additionalContext"));
+        assert!(envelopes[1].contains("additional_context"));
+    }
+
+    #[test]
+    fn a_link_leaves_no_fetchable_target_but_ordinary_text_survives() {
+        let defanged = sanitize_untrusted("go to https://evil.example/a?b=c now", 4096);
+        assert_eq!(
+            defanged,
+            "go to [loam:link evil.example — not followed] now"
+        );
+        // Positive control: text that merely mentions a host is not mangled, and
+        // ordinary punctuation survives — sanitizing must not eat the message.
+        assert_eq!(
+            sanitize_untrusted("ship it — see docs/auth.md (line 42) [urgent]", 4096),
+            "ship it — see docs/auth.md (line 42) [urgent]"
+        );
     }
 }

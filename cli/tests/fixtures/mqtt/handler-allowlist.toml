@@ -1,0 +1,34 @@
+# Installed-handler allowlist — default DENY.
+#
+# Keyed by namespaced message type. An absent file, an unlisted type, and any
+# entry this parser cannot read all resolve to render-only. A listed effect
+# beyond `render` still requires explicit local policy, agent, or user approval
+# at render time: listing a type here never authorizes an action on its own.
+#
+# Shared verbatim with Slice B — do not diverge the format.
+
+["io.loam.message"]
+sender_scope = ["project"]
+effect = "render"
+
+["io.loam.work.state"]
+sender_scope = ["project"]
+effect = "notify"
+
+# Unparseable effect. Default-DENY means this falls back to render-only rather
+# than to whatever the reader guesses the author meant.
+["io.loam.broken.effect"]
+sender_scope = ["project"]
+effect = "sudo"
+
+# Well-formed, but scoped to senders this workspace never sees: the entry does
+# not apply, so the type is render-only.
+["io.loam.out.of.scope"]
+sender_scope = ["organization"]
+effect = "notify"
+
+# A structurally broken entry: `sender_scope` is not a list. The entry is
+# discarded, not half-read.
+["io.loam.broken.scope"]
+sender_scope = "project"
+effect = "notify"
