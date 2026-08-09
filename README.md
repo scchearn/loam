@@ -18,8 +18,27 @@ npx @scchearn/loam setup
 That's it. Setup installs the skills and a small native helper globally (once,
 not per project), automatically configures detected OpenCode and Cursor
 integrations, and offers to install the Loam marketplace plugin for detected
-Claude Code and Codex installations. Those marketplace plugins own their
-`SessionStart` and `Stop` hooks; setup never adds duplicate user hooks.
+Claude Code and Codex installations. Setup points each harness's session hooks
+straight at the private native helper and owns that registration; it never adds
+duplicate user hooks.
+
+### Collaboration compatibility
+
+Loam's federated collaboration features are advertised per harness, and only
+after every row of the compatibility matrix has been observed passing against
+that harness's released version.
+
+| Harness | Collaboration state in a session |
+| ------- | -------------------------------- |
+| Claude Code | **automatically compatible** — injected at session start and refreshed at the next prompt |
+| Codex CLI | **withheld — not evaluated on a released version**; CLI retrieval only |
+| OpenCode | **withheld — not evaluated on a released version**; CLI retrieval only |
+| Cursor | **withheld — not installed/evaluated**; CLI retrieval only |
+
+Withheld means exactly that: the claim is not made, and no shim, bridge, or
+polling fallback was added to simulate one. A withheld harness still gets the
+full skill set and the baseline Loam context — only the automatic collaboration
+claim is withheld, and collaboration state remains reachable from the CLI.
 
 Use `--yes` to configure every detected harness without prompting, or
 `--dry-run` to preview without downloads or mutation. Nothing is added to your

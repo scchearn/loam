@@ -26,6 +26,18 @@ should include `You have loam (v<plugin-version>).` and a real workspace-state
 block when the native runtime is ready. If the runtime is unavailable, the
 context reports `npx @scchearn/loam setup` rather than synthetic state.
 
+The plugin invokes the absolute private native runtime directly; setup writes
+that path in when the plugin is staged and rewrites it on update. There is no
+shared Node integration in the session path.
+
+**OpenCode collaboration compatibility is withheld — not evaluated on a
+released version.** At the compatibility gate the plugin's context mapper was
+verified in process, but no observable non-interactive boundary on OpenCode
+1.18.15 delivered that context into model context, so the automatic
+collaboration claim is withheld rather than made. Collaboration state is
+reachable through the CLI. The skills and the baseline Loam context above are
+unaffected.
+
 ## Updating
 
 Update global skill content through Skills CLI, then reconcile the runtime and

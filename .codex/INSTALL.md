@@ -49,8 +49,13 @@ user prompt. It is a read path: it cannot publish, it reads no transcript, and
 it never starts a background service. If the runtime is unavailable, the harness
 is left with its own context rather than a partial claim.
 
-Codex's session-context injection is confirmed at the compatibility gate; until
-that gate records a pass, treat the Codex row as unadvertised.
+**Codex collaboration compatibility is withheld — not evaluated on a released
+version.** At the compatibility gate, a registered `SessionStart` hook did not
+fire on Codex CLI 0.142.4 and no injected context reached the model-visible
+prompt, and the interactive path could not be evaluated on the gate machine. The
+claim is therefore withheld rather than made: collaboration state is reachable
+through the CLI, and no shim was added to simulate automatic injection. The
+skills and the baseline Loam context are unaffected.
 
 ## Background ingestion
 
