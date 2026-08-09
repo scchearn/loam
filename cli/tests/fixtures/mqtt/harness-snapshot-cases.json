@@ -1,5 +1,5 @@
 {
-  "comment": "Slice D T1 snapshot cases. Each case feeds frames through Slice B's DeliveryProcessor into the connector's bounded in-memory SnapshotStore, then reads the snapshot back. `frames` are published in order on the given topic; an empty `body` is a tombstone (an empty MQTT payload). `expect` is the ordered list of logical item keys the snapshot must serve, oldest first; the optional `expect_summaries` asserts the served bodies, not only the keys.",
+  "comment": "Snapshot cases. Each case feeds frames through the DeliveryProcessor into the connector's bounded in-memory SnapshotStore, then reads the snapshot back. `frames` are published in order on the given topic; an empty `body` is a tombstone (an empty MQTT payload). `expect` is the ordered list of logical item keys the snapshot must serve, oldest first; the optional `expect_summaries` asserts the served bodies, not only the keys.",
   "org_id": "org-3A1",
   "project_id": "project-7M3",
   "other_project_id": "project-9Q4",

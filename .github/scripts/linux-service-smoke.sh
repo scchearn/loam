@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Slice C T8 dormant-lifecycle service smoke (Linux/systemd).
+# Dormant-lifecycle service smoke (Linux/systemd).
 # Proves: install writes the disabled unit and exercises systemctl --user;
 # status is observational; uninstall removes it. No broker egress, no start.
 set -euo pipefail

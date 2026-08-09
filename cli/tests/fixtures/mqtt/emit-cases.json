@@ -1,5 +1,5 @@
 {
-  "comment": "Slice D T5 emit corpus. `accepted` operations must derive cleanly and refuse nothing. `overrides` each take the message.reply base and add one authority-bearing field the caller must not be able to set: the derived value must win and the attempt must be reported in `refused`. `rejected` operations must fail with the stated typed code rather than dispatch. `payload_is_not_authority` proves the refusal scan stops at the payload boundary — a payload field named `id` is caller data, not an authority claim.",
+  "comment": "Emit corpus. `accepted` operations must derive cleanly and refuse nothing. `overrides` each take the message.reply base and add one authority-bearing field the caller must not be able to set: the derived value must win and the attempt must be reported in `refused`. `rejected` operations must fail with the stated typed code rather than dispatch. `payload_is_not_authority` proves the refusal scan stops at the payload boundary — a payload field named `id` is caller data, not an authority claim.",
   "base_reply": {
     "type": "message.reply",
     "causation_id": "01K6Q6ESWMT48TP1",

@@ -10,7 +10,7 @@ import {
 // The federation lifecycle helper delegates entirely to the private runtime's
 // hidden `federation service <verb>` commands; the platform manager specifics
 // (systemd/launchd/schtasks) live in the Rust service module and are proven by
-// the hosted service-smoke legs (T8). Here we inject a recording runner so the
+// the hosted service-smoke legs. Here we inject a recording runner so the
 // delegation contract — verbs, ordering, runtime-path linkage, desired-state
 // preservation, rollback, and egress denial — is deterministic and offline.
 

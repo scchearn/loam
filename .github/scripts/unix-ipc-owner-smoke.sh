@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Slice C T6/T15 Unix-socket owner smoke. Runs on Linux and macOS.
+# Unix-socket owner smoke. Runs on Linux and macOS.
 #
 # Proves on a real host what no in-process test can, against the two barriers
 # the Unix endpoint actually has — the same two-barrier shape the Windows gate

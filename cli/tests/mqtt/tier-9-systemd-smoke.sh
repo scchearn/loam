@@ -2,7 +2,7 @@
 #
 # Tier-9 operational smoke: run a real Mosquitto broker as an isolated,
 # uniquely named transient systemd *user* unit and prove the operational
-# properties Slice B depends on — TLS, no anonymous listener, restart
+# properties the transport depends on — TLS, no anonymous listener, restart
 # persistence, and backup/restore — on an Arch-compatible host.
 #
 # This is a manual/operational gate, not a package installer or a CI job. It

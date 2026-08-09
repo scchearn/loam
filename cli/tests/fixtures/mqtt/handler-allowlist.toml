@@ -5,7 +5,7 @@
 # beyond `render` still requires explicit local policy, agent, or user approval
 # at render time: listing a type here never authorizes an action on its own.
 #
-# Shared verbatim with Slice B — do not diverge the format.
+# Shared verbatim with the transport — do not diverge the format.
 
 ["io.loam.message"]
 sender_scope = ["project"]

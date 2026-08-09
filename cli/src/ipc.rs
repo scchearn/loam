@@ -1,16 +1,16 @@
-//! Slice C local IPC v1: bounded length-prefixed framing, the request/response
+//! Local IPC v1: bounded length-prefixed framing, the request/response
 //! model, the closed operation enum, and stable typed errors.
 //!
 //! This module is platform-independent: it owns the wire *format* and its
 //! rejection rules, never a socket. The owner-authenticated Unix socket
-//! (`ipc/unix.rs`, T6) and Windows named pipe (`ipc/windows.rs`, T7) bring their
+//! (`ipc/unix.rs`) and Windows named pipe (`ipc/windows.rs`) bring their
 //! own peer-credential proof and apply the deadlines this module's config
 //! carries; they hand raw frames here only after that proof. Nothing in this
 //! module trusts a caller: an oversized frame is refused before allocation, a
 //! malformed request mutates nothing and reflects no payload, and diagnostics
 //! are bounded and value-free.
 //!
-//! Consumed by the platform endpoints (T6/T7) and the connector loop (T9), which
+//! Consumed by the platform endpoints and the connector loop, which
 //! retire this module-level allow once the codec is wired to a live socket.
 #![allow(dead_code)]
 
@@ -56,9 +56,9 @@ impl Default for IpcConfig {
     }
 }
 
-/// The closed Slice C operation enum. Unknown operations return
+/// The closed operation enum. Unknown operations return
 /// [`IpcError::UnknownOperation`]; there is no string-to-handler registry and no
-/// generic payload dispatch. Named variants extend it — Slice E's live delivery
+/// generic payload dispatch. Named variants extend it — the live-injection delivery
 /// registers an inject channel via `session.register-inject` (T18), which is a
 /// named variant here, not a generic dispatch surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,15 +68,15 @@ pub enum Operation {
     ProjectDetach,
     /// A session hands the connector an inject channel (2026-08-08 amendment).
     /// The channel is held in a volatile in-memory registry; injection over it is
-    /// Slice E. Never persisted.
+    /// Live injection. Never persisted.
     SessionRegisterInject,
     /// Read the connector's bounded, normalized, already-deduped snapshot of a
-    /// project's current inbox items and work state (Slice D T1). A read: it
+    /// project's current inbox items and work state. A read: it
     /// mutates nothing, persists nothing, and carries no envelope bytes,
     /// credential, or raw remote URL back to the caller.
     SnapshotGet,
     /// Forward one already-derived outbound operation for the connector to
-    /// publish (Slice D T5). A named variant beside the read: the CLI derives
+    /// publish. A named variant beside the read: the CLI derives
     /// every authority-bearing field and never opens a broker connection, and
     /// the connector binds `data.from` from its live session's authenticated
     /// identity before anything is validated or shipped.

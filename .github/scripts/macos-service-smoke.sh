@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Slice C T8 dormant-lifecycle service smoke (macOS/LaunchAgent).
+# Dormant-lifecycle service smoke (macOS/LaunchAgent).
 # Proves our rendered plist round-trips through real launchctl: install writes a
 # valid dormant plist, launchctl bootstraps and prints it, then bootout + our
 # uninstall remove it. RunAtLoad=false, so bootstrapping never starts it.

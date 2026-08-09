@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Slice D T7 — the four-harness compatibility matrix as an admission gate.
+# The four-harness compatibility matrix as an admission gate.
 #
 # Every row is evaluated against the harness's *released, installed* version.
 # A harness is advertised only when every required row passes against it. A row

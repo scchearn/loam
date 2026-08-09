@@ -67,7 +67,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Slice C T8: prove the dormant per-user service definition installs, is
+  # Prove the dormant per-user service definition installs, is
   # observable, and uninstalls on the real native managers (systemd --user,
   # macOS LaunchAgent via launchctl, Windows Task Scheduler via schtasks). No
   # `if:` draft guard, so this dispatches on draft PRs too. The enrolled-start
@@ -95,7 +95,7 @@ jobs:
       - name: Dormant service lifecycle smoke
         run: ${{ matrix.run }}
 
-  # Slice C T7: the Windows named-pipe endpoint's owner proof. The in-process
+  # The Windows named-pipe endpoint's owner proof. The in-process
   # tests (`--test ipc_owner`) run inside `build` on windows-2022; this job adds
   # the one thing they cannot do — a second local user, in its own logon session,
   # being denied at pipe open while the owning session round-trips a frame.
@@ -108,7 +108,7 @@ jobs:
       - name: Named-pipe owner smoke (alternate-user denial)
         run: pwsh .github/scripts/windows-ipc-owner-smoke.ps1
 
-  # Slice C T6: the Unix domain-socket endpoint's owner proof, and the mirror of
+  # The Unix domain-socket endpoint's owner proof, and the mirror of
   # the Windows job above. The in-process tests cover the positive path and the
   # path-safety rules; this job adds the one thing they cannot do — a real second
   # account being refused, first by the 0700 directory and then, once the owner

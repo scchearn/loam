@@ -1,4 +1,4 @@
-//! Slice C connector service integration tests (T9).
+//! Connector service integration tests.
 //!
 //! `cli` is bin-only, so these drive the built binary. They cover the
 //! inert-by-default guarantee: `federation service run` against an unenrolled
@@ -67,7 +67,7 @@ fn service_run_on_an_unenrolled_machine_is_inert() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// --- enrolled-start positive control (T8 fast-follow) ---
+// --- enrolled-start positive control ---
 //
 // Every inertness assertion here and in the hosted service smokes is an absence
 // check, and an absence check needs a run where the thing really does appear.

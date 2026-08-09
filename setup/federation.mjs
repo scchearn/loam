@@ -1,7 +1,7 @@
 import { invokeRuntime, safeDetail } from '../integration/runtime.mjs';
 
 // Bounded delegation to the private runtime's hidden federation service
-// lifecycle commands (Slice C T8/T12). Node NEVER renders a service definition,
+// lifecycle commands. Node NEVER renders a service definition,
 // calls a manager (systemctl/launchctl/schtasks) directly, or starts the
 // connector — the Rust CLI owns all of that. No credential is resolved and no
 // broker is contacted here: these commands only manage the dormant per-user

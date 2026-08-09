@@ -1,4 +1,4 @@
-//! The owner-proof gate for the Windows named-pipe endpoint (T7).
+//! The owner-proof gate for the Windows named-pipe endpoint.
 //!
 //! Every test here runs on a Windows target only; the hosted `windows-2022`
 //! runner is where this gate actually executes, together with the alternate-user

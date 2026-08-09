@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden valid Slice C enrollment descriptor plus a rejection corpus. The valid object is the positive control; each rejection names the exact EnrollmentError variant the case must produce. Loaded by cli/src/enrollment.rs in-module tests. No secret material appears here: credential_ref/ca_ref are opaque references, never credentials.",
+  "_comment": "Golden valid enrollment descriptor plus a rejection corpus. The valid object is the positive control; each rejection names the exact EnrollmentError variant the case must produce. Loaded by cli/src/enrollment.rs in-module tests. No secret material appears here: credential_ref/ca_ref are opaque references, never credentials.",
   "valid": {
     "schema": 1,
     "org_id": "acme",

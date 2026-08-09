@@ -1,9 +1,9 @@
-//! Slice C T8: a stable non-secret instance identity and dormant per-user
+//! A stable non-secret instance identity and dormant per-user
 //! service definitions for the three native managers.
 //!
 //! The definitions are installed **disabled**: install renders the manager's
 //! definition and registers it, but does not start it. A per-user connector is
-//! enabled/started only after the first enrollment (Slice C T10/T12), and the
+//! enabled/started only after the first enrollment, and the
 //! empty state stays dormant. This module never starts the connector, never
 //! contacts a broker, and never creates the SQLite store — the instance identity
 //! lives in its own file so an unenrolled machine has no database.

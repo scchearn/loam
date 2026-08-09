@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Slice D T8 — the recorded real-harness / real-broker suite.
+# The recorded real-harness / real-broker suite.
 #
 # This is the Phase-1 evidence tier: a local Mosquitto carries real frames, the
 # connector holds a genuinely subscribed session, and `loam hook` / `loam
@@ -38,11 +38,11 @@ fi
 
 mkdir -p "$(dirname "$EVIDENCE")"
 {
-  printf '# Slice D T8 — recorded e2e evidence\n\n'
+  printf '# Recorded e2e evidence\n\n'
   printf -- '- Recorded: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf -- '- Broker: local %s, throwaway fixture per case\n' \
     "$(mosquitto -h 2>&1 | grep -om1 'mosquitto version [0-9.]*')"
-  printf -- '- Session: explicitly provisioned in-test (the T1 credential and\n'
+  printf -- '- Session: explicitly provisioned in-test (the credential and\n'
   printf -- '  peer-roster seams). Production `provision_session` still returns\n'
   printf -- '  `None`, so a shipped connector still answers `credentials-unresolved`.\n'
   printf -- '- Suite: `cargo +1.94.1 test --locked --test mqtt_harness -- --ignored`\n'

@@ -1,5 +1,5 @@
-//! Slice D T8: the whole mechanism end to end against a real broker, a real
-//! connector, the real CLI, and the native hook — plus T4's cannot-publish
+//! The whole mechanism end to end against a real broker, a real
+//! connector, the real CLI, and the native hook — plus the cannot-publish
 //! proof, which this file absorbs.
 //!
 //! What makes this tier different from every other one in the slice: nothing is
@@ -8,7 +8,7 @@
 //! for real, and `loam hook <harness>` / `loam federation emit` run as separate
 //! processes exactly as a harness invokes them.
 //!
-//! **The T1 provisioning seams are filled here and only here.** Production
+//! **The provisioning seams are filled here and only here.** Production
 //! `connector::provision_session` still returns `None`, so a shipped connector
 //! still answers `credentials-unresolved`; this suite supplies the resolved
 //! credentials and peer roster itself through `ProjectSessions::attach`, which
@@ -26,7 +26,7 @@
 //! is left unproven there by this file's absence.
 #![cfg(unix)]
 
-// The broker fixture is Slice B's; this gate uses part of it and never edits it.
+// The broker fixture is reused; this gate uses part of it and never edits it.
 #[allow(dead_code)]
 #[path = "support/mqtt_broker.rs"]
 mod mqtt_broker;
@@ -247,7 +247,7 @@ fn the_full_mechanism_runs_end_to_end_against_a_real_broker() {
 }
 
 // ---------------------------------------------------------------------------
-// (g) + T4: the read path publishes nothing, and mutates nothing
+// The read path publishes nothing, and mutates nothing
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -616,7 +616,7 @@ impl Federation {
         let row = enrolled_row(root.path());
         let our_instance = row.instance_id.clone();
 
-        // The T1 seam, filled in-test only: resolved credentials plus the peer
+        // The provisioning seam, filled in-test only: resolved credentials plus the peer
         // roster this session admits frames from. Production still resolves
         // neither, and `provision_session` is untouched.
         let session = MqttSession {

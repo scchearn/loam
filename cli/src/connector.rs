@@ -1,17 +1,17 @@
-//! Slice C connector: the authority-preserving transport seam, its in-memory
+//! The connector: the authority-preserving transport seam, its in-memory
 //! stub, and the enrollment connection probe.
 //!
 //! The transport seam is a trait consumed by **generics** (static dispatch) —
 //! never a trait object — so the crate's no-dispatch tripwire stays green and no
 //! callable capability is introduced. [`StubTransport`] keeps the probe testable
-//! without a broker; [`MqttTransport`] (T13) implements the same seam over Slice
-//! B's public `transport` surface and is the only code here that touches it.
+//! without a broker; [`MqttTransport`] implements the same seam over the
+//! transport layer's public `transport` surface and is the only code here that touches it.
 //!
 //! `AuthenticatedPrincipal` is constructed only inside a transport adapter,
 //! after the transport reports an authenticated session. The probe derives every
 //! authority-bearing envelope field in trusted code; nothing is caller-supplied.
 //!
-//! Consumed by the connect orchestration in T9/T10, which retires this
+//! Consumed by the connect orchestration, which retires this
 //! module-level allow once the stub and probe are wired to the CLI surface.
 #![allow(dead_code)]
 
@@ -22,7 +22,7 @@ use chrono::{DateTime, Utc};
 use crate::envelope::{self, AuthenticatedPrincipal, ValidatedEnvelope, ValidationConfig};
 
 /// What a transport can report and do. Implemented by [`StubTransport`] here and
-/// by the real Slice B adapter in T13. Consumed only through generics.
+/// by the real transport adapter. Consumed only through generics.
 pub trait Transport {
     /// Authenticate the session. On success the adapter learns the canonical
     /// principal and the claims it may assert; only the adapter may turn these
@@ -166,10 +166,10 @@ fn short_suffix(instance: &str) -> String {
 /// `intent=inform`, `delivery.class=event`, project-recipient, no body, with a
 /// summary that says it is a capability probe rather than enrollment/readiness.
 ///
-/// Built as JSON directly (never touching the merged Slice A envelope module) so
+/// Built as JSON directly (never touching the envelope module) so
 /// the connector owns nothing but data. Every value here is derived by the
 /// connector in trusted code; none is caller-supplied. The shape mirrors the
-/// event-class exemplar so it passes Slice A's structural, identity, topic,
+/// event-class exemplar so it passes the envelope module's structural, identity, topic,
 /// anchor, and context-inventory validators, which `run_probe` re-checks.
 fn probe_envelope_json(
     context: &ProbeContext,
@@ -431,13 +431,13 @@ fn corrupt_id(bytes: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Real MQTT adapter over the Slice B transport (T13)
+// Real MQTT adapter over the transport
 // ---------------------------------------------------------------------------
 //
 // The only place an accepted broker session becomes an `AuthenticatedPrincipal`:
 // no authority exists before the CONNACK, and the caller can never supply one.
-// Wire encoding is delegated to Slice B's `transport::publish` (the single
-// encoder) and every received frame is admitted by Slice B's `DeliveryProcessor`
+// Wire encoding is delegated to `transport::publish` (the single
+// encoder) and every received frame is admitted by the `DeliveryProcessor`
 // (the single validator/deduplicator). This adapter adds no second encoder and
 // no capability of its own: certificate bytes arrive from the caller, so the
 // module stays filesystem-free, and rumqttc owns the socket.
@@ -465,7 +465,7 @@ const TRACKING_CAPACITY: usize = 32;
 /// One authenticated broker session's inputs. Secrets live only here, never in
 /// an envelope, a registry row, or a report.
 pub struct MqttSession {
-    /// Slice B's validated broker configuration (endpoint, client id, bounds).
+    /// The validated broker configuration (endpoint, client id, bounds).
     pub config: TransportConfig,
     pub username: String,
     pub password: String,
@@ -477,7 +477,7 @@ pub struct MqttSession {
     pub claimed_identity: SessionIdentity,
 }
 
-/// The real transport: a connected rumqttc client plus Slice B's delivery
+/// The real transport: a connected rumqttc client plus the delivery
 /// processor, exposed through the same seam the stub implements.
 pub struct MqttTransport {
     session: MqttSession,
@@ -597,7 +597,7 @@ impl Transport for MqttTransport {
         envelope: &ValidatedEnvelope,
         retain: bool,
     ) -> Result<(), ProbeError> {
-        // The probe is never retained, and Slice B derives both the topic and
+        // The probe is never retained, and the transport derives both the topic and
         // the retain flag from the validated envelope itself — a probe that
         // asked to be retained would mean the class is no longer `event`.
         if retain {
@@ -671,7 +671,7 @@ impl Transport for MqttTransport {
 
 impl MqttTransport {
     /// Ship one already-validated outbound envelope on the live session. Unlike
-    /// the probe's publish this honors Slice B's retain derivation (state and
+    /// the probe's publish this honors the transport's retain derivation (state and
     /// inbox are retained; an event is not) and takes `now` per call, because a
     /// live session outlives the timestamp it was constructed with.
     fn publish_outbound(
@@ -700,7 +700,7 @@ impl MqttTransport {
         }
     }
 
-    /// Pump exactly one inbound frame through Slice B's `DeliveryProcessor` and
+    /// Pump exactly one inbound frame through the `DeliveryProcessor` and
     /// report the topic together with the delivery outcome.
     ///
     /// Unlike [`Transport::receive`], which exists to find the probe's own echo
@@ -800,7 +800,7 @@ fn await_control(
 }
 
 // ---------------------------------------------------------------------------
-// Inert-by-default connector service loop (T9)
+// Inert-by-default connector service loop
 // ---------------------------------------------------------------------------
 //
 // One per-user connector hosts every enrolled project. The empty registry is the
@@ -815,8 +815,8 @@ use std::path::Path;
 
 use crate::ipc::{self, IpcConfig, Operation, Request};
 
-/// The connector's volatile in-process state: the Slice C inject-channel
-/// registry and Slice D's live project sessions with their snapshot store. All
+/// The connector's volatile in-process state: the inject-channel
+/// registry and the live project sessions with their snapshot store. All
 /// of it dies with the process and none of it is ever written to SQLite.
 pub struct ConnectorState {
     pub channels: ChannelRegistry,
@@ -856,7 +856,7 @@ pub enum ServiceError {
 /// A volatile, in-memory per-session inject-channel registry (2026-08-08
 /// amendment, T18). Held only for the life of one connector process: a restart
 /// drops every channel, and nothing here is ever written to the SQLite registry.
-/// Injection over a channel is Slice E; Slice C only admits, holds, hands back,
+/// Injection over a channel is live injection; the connector only admits, holds, hands back,
 /// and drops it.
 #[derive(Debug, Default)]
 pub struct ChannelRegistry {
@@ -899,10 +899,10 @@ impl ChannelRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// Bounded in-memory snapshot store and live project sessions (Slice D T1)
+// Bounded in-memory snapshot store and live project sessions
 // ---------------------------------------------------------------------------
 //
-// Slice B's `DeliveryProcessor` is the single validator, deduplicator, and
+// The `DeliveryProcessor` is the single validator, deduplicator, and
 // expiry tracker; it tracks *ids*, not bodies. The store below is the only place
 // a renderable body is retained, and it retains one per logical item so QoS 1
 // duplicates and redelivery collapse. It is in-memory only: there is no snapshot
@@ -1070,7 +1070,7 @@ fn accepted_key(delivery: &crate::envelope::TopicDelivery<'_>, envelope_id: &str
 }
 
 /// The logical key an empty-payload tombstone resolves. An event cannot be
-/// tombstoned (Slice B rejects that), so only state and inbox have one.
+/// tombstoned (the transport rejects that), so only state and inbox have one.
 fn tombstone_key(delivery: &crate::envelope::TopicDelivery<'_>) -> Option<String> {
     use crate::envelope::TopicDelivery;
     match delivery {
@@ -1112,7 +1112,7 @@ fn snapshot_item(
     })
 }
 
-/// Who a project's live session will admit frames from. Slice B checks every
+/// Who a project's live session will admit frames from. The transport checks every
 /// received frame's topic origin and `data.from.principal_id` against these, so
 /// a session with no roster hears only its own instance. Injected by the
 /// deployment at provisioning time — never invented here and never supplied by
@@ -1195,7 +1195,7 @@ const SNAPSHOT_CAPACITY: usize = 64;
 
 /// The live broker sessions this connector process holds — one per enrolled
 /// project, in the same process, with no second daemon. Each pumps its received
-/// frames through Slice B's `DeliveryProcessor` into the shared snapshot store.
+/// frames through the `DeliveryProcessor` into the shared snapshot store.
 pub struct ProjectSessions {
     snapshots: std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
     live: std::collections::HashMap<String, LiveSession>,
@@ -1349,8 +1349,8 @@ impl ProjectSessions {
 }
 
 /// A live session hears colleagues, not only itself: every origin's events and
-/// state for the project, plus this connector's own three typed inboxes. Slice
-/// B's per-frame origin and principal checks are what actually bound admission;
+/// state for the project, plus this connector's own three typed inboxes. The
+/// transport's per-frame origin and principal checks are what actually bound admission;
 /// the filters only decide what the broker sends.
 fn live_filters(org_id: &str, project_id: &str, identity: &SessionIdentity) -> Vec<String> {
     let base = format!("loam/v1/{org_id}/{project_id}");
@@ -1613,7 +1613,7 @@ fn dispatch_for_key(
                 .map_err(|_| ipc::IpcError::Internal)?;
             if removed {
                 // Any live inject channels for this project become moot; the real
-                // per-session drop is driven by Slice E's session end. The live
+                // per-session drop is driven by the live-injection session end. The live
                 // broker session and its snapshot go now, so a detached project
                 // is never readable.
                 state.sessions.detach(&row.project_id);
@@ -1626,7 +1626,7 @@ fn dispatch_for_key(
             // Admit the session's inject channel to the volatile in-memory
             // registry (2026-08-08 amendment). The enrollment + project binding
             // were already proven above. Nothing is written to SQLite; injection
-            // over the channel is Slice E.
+            // over the channel is live injection.
             let session_id = request
                 .payload
                 .get("session_id")
@@ -1647,7 +1647,7 @@ fn dispatch_for_key(
         Operation::FederationEmit => {
             // The CLI derived every authority-bearing field except one: the
             // authenticated principal, which only a live session knows. Bind it
-            // here, validate the finished envelope through Slice A, and hand it
+            // here, validate the finished envelope through the envelope module, and hand it
             // to the session that owns the client. Nothing publishes from the
             // CLI process.
             let Some(identity) = state.sessions.identity(&row.project_id) else {
@@ -1726,7 +1726,7 @@ fn emit_json(
 
 /// Build the outbound CloudEvents document and its topic from the CLI's derived
 /// operation plus the live session's authenticated identity. Returns `None` for
-/// a structurally impossible operation; everything else is Slice A's job to
+/// a structurally impossible operation; everything else is the envelope module's job to
 /// refuse when the document is validated.
 fn outbound_envelope(
     operation: &crate::json::Value,
@@ -2616,7 +2616,7 @@ mod probe_tests {
 
     #[test]
     fn probe_envelope_is_a_valid_non_retained_event_message() {
-        // The probe envelope must pass Slice A validation on its event topic.
+        // The probe envelope must pass envelope validation on its event topic.
         let id = probe_id(&identity(), now());
         let json = probe_envelope_json(&context(), &identity(), &id, now());
         let topic = probe_topic(&context(), &identity());
@@ -2840,7 +2840,7 @@ mod service_tests {
     }
 
     /// A whole snapshot session — attach, admit real frames, read repeatedly —
-    /// must leave the database byte-identical (Slice D T1). The snapshot is
+    /// must leave the database byte-identical. The snapshot is
     /// in-memory only: no snapshot table, no schema bump, no enrollment churn.
     #[test]
     fn a_full_snapshot_session_leaves_sqlite_byte_unchanged() {
@@ -3656,9 +3656,9 @@ mod lifecycle_tests {
 
 #[cfg(test)]
 mod snapshot_tests {
-    //! The bounded in-memory snapshot contract (Slice D T1).
+    //! The bounded in-memory snapshot contract.
     //!
-    //! Every case drives real frames through Slice B's `DeliveryProcessor` — the
+    //! Every case drives real frames through the `DeliveryProcessor` — the
     //! single validator, deduplicator, and expiry tracker — and then reads the
     //! store back, so "exactly one logical item per message" is proven against
     //! the actual dedupe path rather than a hand-written stub of it.
@@ -3739,7 +3739,7 @@ mod snapshot_tests {
                     .expect("state_key");
                 let topic = format!("loam/v1/{org}/{project}/state/{SENDER_INSTANCE}/{key}");
                 if flag(frame, "tombstone") {
-                    // An empty MQTT payload is the tombstone: Slice B resolves it
+                    // An empty MQTT payload is the tombstone: the transport resolves it
                     // and the store must drop the same logical item.
                     return (topic, Vec::new());
                 }
@@ -4145,7 +4145,7 @@ mod snapshot_tests {
 
 #[cfg(test)]
 mod outbound_tests {
-    //! T5 fixup: the CLI derives an *operation*; this module builds the
+    //! The CLI derives an *operation*; this module builds the
     //! envelope from it. Nothing tested that seam, and `work.report` was broken
     //! across it — `revision` was derived as a JSON number and read back with
     //! `as_str`, so `outbound_envelope` returned `None` and every work report

@@ -1,4 +1,4 @@
-# Slice C T8 dormant-lifecycle service smoke (Windows/Task Scheduler).
+# Dormant-lifecycle service smoke (Windows/Task Scheduler).
 # Proves our CLI drives real schtasks: install creates a disabled current-user
 # logon task, status/query finds it, uninstall removes it. No start, no broker.
 $ErrorActionPreference = "Stop"
@@ -23,7 +23,7 @@ try {
   if (Test-Path (Join-Path $Root "loam.sqlite3")) { throw "database created by status" }
   # enable/disable are what setup uses to preserve active desired state across a
   # runtime update; exercise them against real schtasks. The empty registry keeps
-  # the connector inert (the Windows endpoint itself lands in T7), so no daemon
+  # the connector inert (the Windows endpoint itself is a separate concern), so no daemon
   # and no database result.
   & $Bin federation service enable --global-root $Root
   if ($LASTEXITCODE -ne 0) { throw "enable exited $LASTEXITCODE" }

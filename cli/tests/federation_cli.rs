@@ -1,7 +1,7 @@
-//! Slice C `loam federation` CLI integration tests.
+//! `loam federation` CLI integration tests.
 //!
 //! `cli` is a bin-only crate, so these drive the built binary through
-//! `std::process::Command` and feed the descriptor on stdin. T2 covers the
+//! `std::process::Command` and feed the descriptor on stdin. This suite covers the
 //! `connect` descriptor-validation path (typed JSON errors, exit codes) and a
 //! full happy path against hermetic local Git repositories.
 
@@ -319,7 +319,7 @@ fn git(args: &[&str], cwd: Option<&Path>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Slice D T5 — `loam federation emit`
+// `loam federation emit`
 // ---------------------------------------------------------------------------
 
 fn run_emit(workspace: Option<&Path>, global_root: &Path, stdin: &[u8]) -> (i32, String, String) {

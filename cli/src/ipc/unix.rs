@@ -1,4 +1,4 @@
-//! Slice C Unix IPC endpoint: an owner-only domain socket whose accepted peer's
+//! Unix IPC endpoint: an owner-only domain socket whose accepted peer's
 //! effective UID must match the connector before any frame byte is read.
 //!
 //! Two barriers guard the endpoint. First, filesystem permissions: the run
@@ -14,7 +14,7 @@
 //! bindings are narrow, documented, and covered by a same-user positive test
 //! plus the cross-user smoke.
 //!
-//! Consumed by the connector loop (T9), which retires this allow once the
+//! Consumed by the connector loop, which retires this allow once the
 //! endpoint is wired to the running service.
 #![allow(dead_code)]
 

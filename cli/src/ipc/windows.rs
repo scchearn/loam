@@ -1,4 +1,4 @@
-//! Slice C Windows IPC endpoint: a named pipe whose security descriptor names
+//! Windows IPC endpoint: a named pipe whose security descriptor names
 //! only the current logon session, and whose connected client's token SID must
 //! equal the connector's before any frame byte is read.
 //!
@@ -23,13 +23,13 @@
 //!    the process aborts rather than freeing memory the kernel still owns —
 //!    the rule is absolute, not bounded by a second timeout.
 //!
-//! Raw FFI (approved Route A, T1). Each declaration carries the Win32 signature
+//! Raw FFI (approved Route A). Each declaration carries the Win32 signature
 //! it was matched against; a mis-declared signature or constant is the one risk
 //! this route carries, so the surface is narrow, documented, and covered by the
 //! Windows-target tests in `cli/tests/ipc_owner.rs` plus the alternate-user
 //! PowerShell smoke on the hosted Windows runner.
 //!
-//! Consumed by the connector loop (T9) on Windows, which retires this allow once
+//! Consumed by the connector loop on Windows, which retires this allow once
 //! the endpoint is wired to the running service.
 #![allow(dead_code)]
 

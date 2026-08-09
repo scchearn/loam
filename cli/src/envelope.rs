@@ -2271,10 +2271,10 @@ mod tests {
             Err(Violation::UnknownContextField)
         );
 
-        // Union of the Slice B and Slice C process-capable admissions. Slice C:
+        // Union of the transport and connector process-capable admissions. The connector:
         // `enrollment.rs` + `service.rs` run git/manager subprocesses (the
         // isolated commit-reachability fetch and the native service managers).
-        // Slice B: `transport.rs` runs the git-transport subprocess. Every other
+        // The transport: `transport.rs` runs the git-transport subprocess. Every other
         // module stays barred; the guard is the security boundary for both slices.
         let process_files = [
             "checkpoint.rs",
@@ -2291,7 +2291,7 @@ mod tests {
             "codegraph.rs",
             "datecheck.rs",
             "enrollment.rs",
-            // Slice D T2: the harness read path reads the installed skill body,
+            // The harness read path reads the installed skill body,
             // `install.json`, and the workspace state that the retired Node
             // integration used to assemble. Reads only — it opens no file for
             // writing and the registry connection it takes is read-only.
@@ -2304,7 +2304,7 @@ mod tests {
             "sha256.rs",
             "state.rs",
         ];
-        // The Slice C owner-authenticated IPC endpoint uses a local Unix domain
+        // The owner-authenticated IPC endpoint uses a local Unix domain
         // socket (`UnixStream`/`UnixListener`) for same-host, same-user IPC — not
         // network egress. It is admitted here alone; every other module stays
         // barred, and no TCP/UDP/HTTP surface is ever allowed.

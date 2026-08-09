@@ -1,4 +1,4 @@
-//! The real-broker gate for the Slice C connector adapter (T13).
+//! The real-broker gate for the connector adapter.
 //!
 //! The stub suite (`connector::probe_tests`) proves the ordered probe contract
 //! deterministically; this proves the same contract against a real Mosquitto:
@@ -7,7 +7,7 @@
 //! inbox axis binding, and a probe that leaves nothing retained — with a
 //! positive retained control in the same run so the absence is meaningful.
 
-// The shared fixture is Slice B's; this gate uses only part of it and never
+// The shared broker fixture is reused; this gate uses only part of it and never
 // edits it, so its unused surface is allowed here rather than trimmed there.
 #[allow(dead_code)]
 #[path = "support/mqtt_broker.rs"]

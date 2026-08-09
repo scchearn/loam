@@ -1,4 +1,4 @@
-# Slice C T7 Windows named-pipe owner smoke.
+# Windows named-pipe owner smoke.
 #
 # Proves on a real Windows host what no in-process test can, against the two
 # barriers the endpoint actually has:

@@ -1,6 +1,6 @@
 //! `loam federation` CLI orchestration and typed command errors.
 //!
-//! Slice C T2 wires the `connect` descriptor + workspace validation path only:
+//! Wiring the `connect` descriptor + workspace validation path only:
 //! read one bounded descriptor from stdin, validate it, and, when a workspace is
 //! given, prove physical identity, remote digests, and commit reachability. The
 //! enrollment probe, transactional registry commit, and service activation are
@@ -317,7 +317,7 @@ fn service(mut args: impl Iterator<Item = String>) -> i32 {
         "uninstall" => service_lifecycle(&root, ServiceAction::Uninstall),
         "status" => service_lifecycle(&root, ServiceAction::Status),
         // enable/disable let packaged setup preserve active/inert desired state
-        // across a runtime-path update (T12): they reuse the same T8 manager
+        // across a runtime-path update: they reuse the same manager
         // functions connect/disconnect use, so no definition logic lives in Node.
         "enable" => service_lifecycle(&root, ServiceAction::Enable),
         "disable" => service_lifecycle(&root, ServiceAction::Disable),
@@ -659,7 +659,7 @@ fn error_json(error: &EnrollmentError) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Slice D T5 — `loam federation emit`
+// `loam federation emit`
 // ---------------------------------------------------------------------------
 
 /// The Phase-1 vocabulary, closed. A well-formed namespaced extension type is
@@ -1078,7 +1078,7 @@ fn run_emit(
 
     // Before the publish, never after. First-write-wins under BEGIN IMMEDIATE.
     // The responder identity is this machine's enrolled instance: the ledger is
-    // same-machine only, and cross-machine dedup resolves through Slice B's
+    // same-machine only, and cross-machine dedup resolves through the transport's
     // inbox-clear.
     if let Some(causation_id) = &derived.causation_id {
         let mut write = enrollment::open_writable(&db_path).map_err(|_| EmitError::Unenrolled)?;
@@ -1211,7 +1211,7 @@ fn emit_round_trip(
 
 #[cfg(test)]
 mod emit_tests {
-    //! The outbound contract (Slice D T5): every authority-bearing field is
+    //! The outbound contract: every authority-bearing field is
     //! derived, every caller override is refused *and reported*, the vocabulary
     //! is exactly three types, and the dedup ledger is consulted before the
     //! forward — never after.

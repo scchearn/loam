@@ -1,11 +1,11 @@
-//! Slice D T2: the `loam hook <harness>` read path, driven through the built
+//! The `loam hook <harness>` read path, driven through the built
 //! binary exactly as a harness invokes it — event JSON on stdin, the native
 //! response envelope on stdout.
 //!
-//! This is the T1 CI tier: real CLI, real workspace resolution, no broker and no
+//! This is the CI tier: real CLI, real workspace resolution, no broker and no
 //! installed harness. The connector-live half is proven against a real broker
-//! and a real installed harness at T8; the structural "this path cannot publish"
-//! property is proven at T4.
+//! and a real installed harness in the e2e suite; the structural "this path cannot publish"
+//! property is proven by the cannot-publish test.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

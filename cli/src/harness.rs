@@ -1,4 +1,4 @@
-//! Slice D T2: the `loam hook <harness>` read path.
+//! The `loam hook <harness>` read path.
 //!
 //! One private CLI entry point behind every harness's session event. It reads
 //! that harness's native event JSON on stdin, canonicalizes the workspace,
@@ -78,7 +78,7 @@ impl Harness {
             )])
             .to_json(),
             // OpenCode's in-process mapper prepends the plain body as a text
-            // part. Codex's shape is unconfirmed until the T7 gate, so it gets
+            // part. Codex's shape is unconfirmed until the compatibility gate, so it gets
             // the same plain body rather than an invented envelope key.
             Harness::OpenCode | Harness::Codex => body.to_owned(),
         }
@@ -408,7 +408,7 @@ fn federation_section(
 }
 
 // ---------------------------------------------------------------------------
-// T3 — the shared injection-safe renderer and the default-DENY allowlist
+// The shared injection-safe renderer and the default-DENY allowlist
 // ---------------------------------------------------------------------------
 
 /// What an installed handler is permitted to do with a type. Default-DENY: this
@@ -1090,7 +1090,7 @@ mod tests {
         // An ALLOWLIST, not a denylist: enumerate every `Operation::` the read
         // path names and require each one to be the read. A frozen list of
         // forbidden variant names goes green the moment a new write operation is
-        // added to the enum — `Operation::FederationEmit` (T5) is exactly that
+        // added to the enum — `Operation::FederationEmit` is exactly that
         // case — so the invariant is stated as "SnapshotGet is the only
         // reachable operation" and costs nothing to maintain.
         let named: Vec<&str> = production
@@ -1442,7 +1442,7 @@ mod tests {
 
 #[cfg(test)]
 mod render_tests {
-    //! T3 — the shared renderer, the default-DENY allowlist, and the budget.
+    //! The shared renderer, the default-DENY allowlist, and the budget.
     //!
     //! The renderer is a pure function over a snapshot, which is what makes
     //! "drives nothing" structural rather than aspirational: it has no process,

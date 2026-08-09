@@ -1,6 +1,6 @@
 # Tier-9 — systemd operational smoke
 
-Manual/operational gate for the Slice B MQTT transport. It runs a real
+Manual/operational gate for the MQTT transport. It runs a real
 Mosquitto broker as an **isolated, uniquely named transient systemd _user_
 unit** and proves the operational properties the transport depends on on an
 Arch-compatible host. It is not a CI job, not a package installer, and not part

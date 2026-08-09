@@ -1,4 +1,4 @@
-//! Slice C enrollment: descriptor validation, physical Git workspace identity,
+//! Enrollment: descriptor validation, physical Git workspace identity,
 //! remote-URL digests, and isolated commit-reachability proof.
 //!
 //! This module turns a bounded, non-secret stdin descriptor into a typed
@@ -12,7 +12,7 @@
 //! touches the enrolled worktree.
 //!
 //! It constructs no `AuthenticatedPrincipal` and resolves no credential; those
-//! belong to the transport adapter (Slice B seam, Slice C T4/T10).
+//! belong to the transport adapter.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -252,10 +252,10 @@ pub enum PlatformIdentity {
     /// Unix device + inode: robust against symlink, case, and bind-mount aliases.
     #[cfg_attr(not(unix), allow(dead_code))]
     Unix { device: u64, inode: u64 },
-    /// Windows carries only the canonical final path in Slice C T2; the
-    /// volume-serial/file-index refinement lands in T7 alongside the other
+    /// Windows carries only the canonical final path currently; the
+    /// volume-serial/file-index refinement is deferred alongside the other
     /// Win32 handle FFI, where the hosted Windows CI leg proves it.
-    // ponytail: Windows volume/file-index deferred to T7 (all Win32 raw FFI in one CI-verified place)
+    // ponytail: Windows volume/file-index deferred (all Win32 raw FFI in one CI-verified place)
     #[cfg_attr(unix, allow(dead_code))]
     WindowsPath,
 }
@@ -605,7 +605,7 @@ fn platform_identity(canonical: &Path) -> Result<PlatformIdentity, EnrollmentErr
 
 #[cfg(not(unix))]
 fn platform_identity(_canonical: &Path) -> Result<PlatformIdentity, EnrollmentError> {
-    // Windows uses the canonical final path as identity in T2; T7 adds the
+    // Windows uses the canonical final path as identity currently; a later change adds the
     // volume-serial/file-index refinement under the reviewed Win32 FFI.
     Ok(PlatformIdentity::WindowsPath)
 }
@@ -1306,7 +1306,7 @@ pub mod registry {
         Ok(out)
     }
 
-    /// The derived instance identity for an enrollment. Slice C T8 owns the stable
+    /// The derived instance identity for an enrollment. The service owns the stable
     /// per-install `instance_id`; until it is wired, a stable value derived from the
     /// physical identity populates the registry column.
     fn instance_id_for(enrolled: &ValidatedEnrollment) -> String {
@@ -1318,12 +1318,12 @@ pub mod registry {
     // -------------------------------------------------------------------------
     //
     // The multi-terminal single-response contract's HARD layer: exactly one
-    // response per `(causation_id, responder principal_id)` ships. Slice D's
-    // `emit` calls `record_response` before shipping; the first write for a pair
+    // response per `(causation_id, responder principal_id)` ships. The `emit`
+    // path calls `record_response` before shipping; the first write for a pair
     // wins under `BEGIN IMMEDIATE`, and every later attempt is `AlreadyResponded`.
     // The ledger stores correlation identity only — never a message body,
     // summary, or payload. Cross-connector races are out of scope and resolve
-    // through Slice B's inbox-clear-after-first-response (eventually consistent).
+    // through the transport's inbox-clear-after-first-response (eventually consistent).
 
     /// The outcome of a check-and-record against the response-dedup ledger.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1815,7 +1815,7 @@ mod registry_tests {
 
     #[test]
     fn a_cleared_slot_can_be_taken_again_but_an_uncleared_one_cannot() {
-        // Slice D T5 fixup: the slot is taken before the forward, so a forward
+        // The slot is taken before the forward, so a forward
         // that provably queued nothing must give it back — otherwise one
         // transient outage makes that response permanently un-emittable.
         let path = temp_db("dedup-clear");

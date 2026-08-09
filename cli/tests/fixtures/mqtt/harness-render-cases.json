@@ -1,5 +1,5 @@
 {
-  "comment": "Slice D T3. Every case renders one snapshot item through the shared renderer with the fixture allowlist beside this file. `contains` and `absent` are substring assertions on the rendered line. The 2026-08-08 trust amendment means these render as attributed communication, not as quarantined text \u2014 what the tests pin is that nothing in them can act or escape the envelope.",
+  "comment": "Every case renders one snapshot item through the shared renderer with the fixture allowlist beside this file. `contains` and `absent` are substring assertions on the rendered line. The 2026-08-08 trust amendment means these render as attributed communication, not as quarantined text \u2014 what the tests pin is that nothing in them can act or escape the envelope.",
   "cases": [
     {
       "name": "prompt-injection-text",
@@ -252,7 +252,7 @@
     },
     {
       "name": "work-state-payload-escape-attempt",
-      "why": "The reported T3 defect: payload.state reached the framed body through clean_text alone, so a newline plus a literal closing tag forged Loam's own framing. Summary was not the only hostile field.",
+      "why": "The reported defect: payload.state reached the framed body through clean_text alone, so a newline plus a literal closing tag forged Loam's own framing. Summary was not the only hostile field.",
       "item": {
         "source": "loam://acme/loam/instance-09",
         "type": "io.loam.work.state",
