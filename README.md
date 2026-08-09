@@ -31,7 +31,7 @@ that harness's released version.
 | Harness | Collaboration state in a session |
 | ------- | -------------------------------- |
 | Claude Code | **automatically compatible** — injected at session start and refreshed at the next prompt |
-| Codex CLI | **withheld — not evaluated on a released version**; CLI retrieval only |
+| Codex CLI | **automatically compatible** — injected on the first turn of a session, once Codex's one-time hook-trust review has approved the Loam hook |
 | OpenCode | **withheld — not evaluated on a released version**; CLI retrieval only |
 | Cursor | **withheld — not installed/evaluated**; CLI retrieval only |
 
@@ -39,6 +39,12 @@ Withheld means exactly that: the claim is not made, and no shim, bridge, or
 polling fallback was added to simulate one. A withheld harness still gets the
 full skill set and the baseline Loam context — only the automatic collaboration
 claim is withheld, and collaboration state remains reachable from the CLI.
+
+Codex runs its `SessionStart` hooks on the first turn rather than before it, so
+the context arrives with your first message rather than ahead of it. Codex also
+gates every hook behind a one-time trust review and truncates long hook output
+in model context; the framing, the workspace state, and the federation section
+survive, and part of the skill body may be elided.
 
 Use `--yes` to configure every detected harness without prompting, or
 `--dry-run` to preview without downloads or mutation. Nothing is added to your
