@@ -602,6 +602,131 @@ pub fn match_local_identity(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Whom a session admits
+// ---------------------------------------------------------------------------
+//
+// The peer roster is an authorization boundary, so it defaults to admitting
+// nobody and every unreadable shape is refused whole. A partially parsed roster
+// is never half-admitted: the entry that did not parse might have been the one
+// constraining the entries that did.
+
+/// Where per-project rosters live, resolved through three rungs.
+///
+/// The connector never resolves the home directory itself — every entry point
+/// takes an explicit global root — but `provision_session` keeps its
+/// `(&EnrolledRow)` shape and so holds no root. Rung 2 exists for that gap: an
+/// install whose global root is not the default would otherwise read an empty
+/// directory forever and report `roster-absent` with nothing wrong.
+pub fn roster_root(
+    explicit: Option<&str>,
+    loam_home: Option<&str>,
+    home: Option<&str>,
+) -> Result<std::path::PathBuf, &'static str> {
+    let present = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    };
+    if let Some(path) = present(explicit) {
+        return Ok(path);
+    }
+    if let Some(path) = present(loam_home) {
+        return Ok(path.join("federation").join("rosters"));
+    }
+    if let Some(path) = present(home) {
+        return Ok(path
+            .join(".agents")
+            .join("loam")
+            .join("federation")
+            .join("rosters"));
+    }
+    Err(reason::ROSTER_ABSENT)
+}
+
+/// The roster root this process should use.
+pub fn configured_roster_root() -> Result<std::path::PathBuf, &'static str> {
+    roster_root(
+        std::env::var("LOAM_FEDERATION_ROSTER_DIR").ok().as_deref(),
+        std::env::var("LOAM_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// An entry that would admit everyone. `*` and `#` never occur in a principal
+/// id or an instance id; a bare `+` is the MQTT single-level wildcard, but a `+`
+/// *within* an entry is ordinary — `sam+loam@example.test` is one address, not
+/// a pattern.
+fn is_wildcard(entry: &str) -> bool {
+    let trimmed = entry.trim();
+    trimmed == "+" || trimmed.contains('*') || trimmed.contains('#')
+}
+
+/// Read one list of bare ids. `None` means the file does not describe a roster
+/// this reader understands, which is refused whole rather than partly read.
+fn bare_ids(value: Option<&crate::json::Value>) -> Option<Vec<String>> {
+    let entries = value?.as_array()?;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // Ids are passed through untransformed in both directions: nothing is
+        // prefixed here and no `urn:loam:instance:` is stripped, because the
+        // writer does not add one and a reader that stripped would disagree
+        // with a writer that did not.
+        let text = entry.as_str()?.trim();
+        if text.is_empty() {
+            return None;
+        }
+        out.push(text.to_owned());
+    }
+    Some(out)
+}
+
+/// Read the peer roster for one project.
+///
+/// Absent, empty, one-sided, wildcard, and malformed are five distinct answers
+/// and one outcome: no session opens. The distinction is for the operator; the
+/// default admits nobody either way.
+pub fn read_roster(
+    root: &std::path::Path,
+    org_id: &str,
+    project_id: &str,
+) -> Result<crate::connector::PeerRoster, &'static str> {
+    let path = root.join(org_id).join(format!("{project_id}.json"));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Err(reason::ROSTER_ABSENT);
+    };
+    let Ok(document) = crate::json::parse(&text) else {
+        return Err(reason::ROSTER_MALFORMED);
+    };
+    let (Some(principals), Some(origins)) = (
+        bare_ids(document.get("principals")),
+        bare_ids(document.get("origins")),
+    ) else {
+        return Err(reason::ROSTER_MALFORMED);
+    };
+    if principals
+        .iter()
+        .chain(origins.iter())
+        .any(|e| is_wildcard(e))
+    {
+        return Err(reason::ROSTER_WILDCARD);
+    }
+    match (principals.is_empty(), origins.is_empty()) {
+        (true, true) => Err(reason::ROSTER_EMPTY),
+        // One-sided rosters open a session that looks connected and hears
+        // nobody. The receive path admits an origin *and* a principal, so a
+        // roster missing either half admits no colleague at all — and a live
+        // session that silently hears nothing is worse than an honest refusal.
+        (false, true) => Err(reason::ROSTER_NO_ORIGINS),
+        (true, false) => Err(reason::ROSTER_NO_PRINCIPALS),
+        (false, false) => Ok(crate::connector::PeerRoster {
+            principals,
+            origins,
+        }),
+    }
+}
+
 /// The backend this process should use, from the environment and the platform.
 pub fn configured_backend() -> Result<Backend, ProvisionFailure> {
     select_backend(
@@ -958,6 +1083,173 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    // --- the peer roster ---------------------------------------------------
+
+    fn write_roster(root: &std::path::Path, org: &str, project: &str, body: &str) {
+        let directory = root.join(org);
+        std::fs::create_dir_all(&directory).expect("roster directory is creatable");
+        std::fs::write(directory.join(format!("{project}.json")), body)
+            .expect("roster file is writable");
+    }
+
+    #[test]
+    fn the_roster_root_walks_three_rungs_in_order() {
+        // The explicit override wins.
+        assert_eq!(
+            roster_root(Some("/explicit"), Some("/loam-home"), Some("/home/op")).unwrap(),
+            std::path::PathBuf::from("/explicit")
+        );
+        // Then the global root, which is why this rung exists: the connector's
+        // root arrives as an argument and `provision_session` never sees it, so
+        // a non-default install would otherwise read an empty directory forever.
+        assert_eq!(
+            roster_root(None, Some("/loam-home"), Some("/home/op")).unwrap(),
+            std::path::PathBuf::from("/loam-home/federation/rosters")
+        );
+        // Then the default install location.
+        assert_eq!(
+            roster_root(None, None, Some("/home/op")).unwrap(),
+            std::path::PathBuf::from("/home/op/.agents/loam/federation/rosters")
+        );
+        // Blank is not a value at any rung.
+        assert_eq!(
+            roster_root(Some("  "), Some(""), Some("/home/op")).unwrap(),
+            std::path::PathBuf::from("/home/op/.agents/loam/federation/rosters")
+        );
+        // Nothing at all is an absent roster, not a path built from nothing.
+        assert_eq!(roster_root(None, None, None), Err(reason::ROSTER_ABSENT));
+    }
+
+    #[test]
+    fn a_well_formed_roster_is_admitted_exactly_as_written() {
+        // The positive control every refusal below is measured against.
+        let root = temp_dir("roster-ok");
+        write_roster(
+            &root,
+            "acme",
+            "loam",
+            r#"{"principals":["ada@example.test"],"origins":["instance-02"]}"#,
+        );
+        let roster = read_roster(&root, "acme", "loam").expect("a well-formed roster is admitted");
+        assert_eq!(roster.principals, vec!["ada@example.test".to_owned()]);
+        assert_eq!(roster.origins, vec!["instance-02".to_owned()]);
+
+        // Ids are passed through untransformed in both directions: no prefix is
+        // added here and none is stripped, because the writer does neither.
+        write_roster(
+            &root,
+            "acme",
+            "prefixed",
+            r#"{"principals":["urn:loam:principal:ada"],"origins":["urn:loam:instance:instance-02"]}"#,
+        );
+        let verbatim = read_roster(&root, "acme", "prefixed").expect("verbatim ids are admitted");
+        assert_eq!(
+            verbatim.origins,
+            vec!["urn:loam:instance:instance-02".to_owned()]
+        );
+
+        // A roster is per (org, project): the same project name under another
+        // org is a different file and does not leak across.
+        assert_eq!(
+            read_roster(&root, "other-org", "loam"),
+            Err(reason::ROSTER_ABSENT)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_unusable_roster_refuses_with_its_own_reason_and_admits_nothing() {
+        let root = temp_dir("roster-refuse");
+        let cases: [(&str, &str, &str); 9] = [
+            (
+                "empty",
+                r#"{"principals":[],"origins":[]}"#,
+                reason::ROSTER_EMPTY,
+            ),
+            (
+                "no-origins",
+                r#"{"principals":["ada@example.test"],"origins":[]}"#,
+                reason::ROSTER_NO_ORIGINS,
+            ),
+            (
+                "no-principals",
+                r#"{"principals":[],"origins":["instance-02"]}"#,
+                reason::ROSTER_NO_PRINCIPALS,
+            ),
+            (
+                "wildcard-star",
+                r#"{"principals":["*"],"origins":["instance-02"]}"#,
+                reason::ROSTER_WILDCARD,
+            ),
+            (
+                "wildcard-hash",
+                r##"{"principals":["ada@example.test"],"origins":["#"]}"##,
+                reason::ROSTER_WILDCARD,
+            ),
+            (
+                "wildcard-plus",
+                r#"{"principals":["ada@example.test"],"origins":["+"]}"#,
+                reason::ROSTER_WILDCARD,
+            ),
+            ("malformed-json", "{not json", reason::ROSTER_MALFORMED),
+            (
+                "malformed-entry",
+                r#"{"principals":["ada@example.test",7],"origins":["instance-02"]}"#,
+                reason::ROSTER_MALFORMED,
+            ),
+            (
+                "malformed-missing-key",
+                r#"{"principals":["ada@example.test"]}"#,
+                reason::ROSTER_MALFORMED,
+            ),
+        ];
+        for (project, body, expected) in cases {
+            write_roster(&root, "acme", project, body);
+            assert_eq!(
+                read_roster(&root, "acme", project).map(|r| r.principals),
+                Err(expected),
+                "{project} must refuse with {expected}"
+            );
+        }
+
+        // Absent is its own answer, distinct from every malformed one.
+        assert_eq!(
+            read_roster(&root, "acme", "never-written"),
+            Err(reason::ROSTER_ABSENT)
+        );
+
+        // Discard, never half-admit: the well-formed entry in a file whose
+        // other entry is unreadable is not admitted either. The entry that did
+        // not parse might have been the one constraining the entry that did.
+        write_roster(
+            &root,
+            "acme",
+            "partial",
+            r#"{"principals":["ada@example.test",{"id":"mallory"}],"origins":["instance-02"]}"#,
+        );
+        assert_eq!(
+            read_roster(&root, "acme", "partial").map(|r| r.principals),
+            Err(reason::ROSTER_MALFORMED)
+        );
+
+        // An address containing a plus is an address, not a pattern: refusing
+        // `sam+loam@example.test` would lock out a legitimate colleague.
+        write_roster(
+            &root,
+            "acme",
+            "plus-address",
+            r#"{"principals":["sam+loam@example.test"],"origins":["instance-02"]}"#,
+        );
+        assert_eq!(
+            read_roster(&root, "acme", "plus-address")
+                .expect("a plus address is admitted")
+                .principals,
+            vec!["sam+loam@example.test".to_owned()]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

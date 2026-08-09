@@ -1132,7 +1132,7 @@ fn snapshot_item(
 /// a session with no roster hears only its own instance. Injected by the
 /// deployment at provisioning time — never invented here and never supplied by
 /// an IPC caller.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerRoster {
     pub principals: Vec<String>,
     pub origins: Vec<String>,
@@ -1187,6 +1187,10 @@ pub mod reason {
     /// admits nothing, because the receive path checks the topic origin first.
     /// A session opened on it would look connected and hear no one.
     pub const ROSTER_NO_ORIGINS: &str = "roster-no-origins";
+    /// Origins but no principals: the mirror of `ROSTER_NO_ORIGINS`, and deaf
+    /// for the same reason — the session would admit only its own principal, so
+    /// a colleague's frame arriving from an admitted origin is still refused.
+    pub const ROSTER_NO_PRINCIPALS: &str = "roster-no-principals";
     pub const ROSTER_WILDCARD: &str = "roster-wildcard";
     pub const ROSTER_MALFORMED: &str = "roster-malformed";
 }
