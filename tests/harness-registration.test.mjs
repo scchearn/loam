@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { cp, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,8 +9,7 @@ import { detectHarnesses, installHarnesses } from '../setup/harnesses.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 
-// The files a harness actually loads or executes at session time. Everything
-// else in the repo is setup-time or test-time and is not the runtime path.
+// The files a harness loads or executes directly at session time.
 const RUNTIME_PATH_FILES = [
   '.opencode/plugins/loam.js',
   'adapters/opencode.mjs',
@@ -18,11 +17,36 @@ const RUNTIME_PATH_FILES = [
   'plugins/loam-adapter/hooks/stop.mjs',
 ];
 
+// ...and the subtree those four reach *in the same process*: they resolve an
+// integration root and then `import(new URL('<sibling>.mjs', root).href)`, and
+// `integration/ingest.mjs` spawns `adapters/ingest-worker.mjs`. Scanned as whole
+// directories rather than a hand-written closure — the closure is built from
+// computed URLs, so a maintained list falls silently behind a new sibling and
+// the prohibitions stop covering code that runs inside the plugin.
+const INGESTION_SUBTREE_DIRS = ['integration', 'adapters'];
+
+// One class is asserted on the four session-time files only: Stop/ingestion is
+// the Node boundary this slice deliberately *kept*, and `integration/loam.mjs`
+// is its entry point. Everything the plugin could otherwise reach — a broker,
+// our IPC, the OS service manager, the registry/dedupe ledger, collaboration
+// state — is asserted over the whole subtree.
+const SUBTREE_EXEMPT = new Set(['retired-node-integration']);
+
 // Each pattern is one structural claim the slice makes about the runtime path.
-// The scanner is only worth trusting because the positive-control test below
-// plants each of these deliberately and proves the scan catches it.
+// The scanner is only worth trusting because the positive-control tests below
+// plant each of these deliberately and prove the scan catches it.
+//
+// `retired-node-integration` matches how this codebase actually loads a module
+// — `import(new URL('context.mjs', root).href)`, with no `integration/` prefix —
+// as well as the static spelling. Naming `loam.mjs` as a *path anchor*
+// (resolving the integration root) is not a violation; loading it is.
+// ponytail: a literal-filename grep, so `import(new URL(NAME, root))` with a
+// computed name would evade it — tighten to an AST walk only if that shape appears.
 const FORBIDDEN = [
-  ['retired-node-integration', /integration\/(loam|context)\.mjs|formatContext|runIntegration/],
+  [
+    'retired-node-integration',
+    /(?:new URL|import|from)\s*\(?\s*['"`][^'"`]*(?:loam|context)\.mjs|\bformatContext\b|\brunIntegration\s*\(|--harness\b/,
+  ],
   ['broker', /rumqttc|MqttTransport|MqttSession|DeliveryProcessor|\bmqtts?:\/\//],
   ['connector-ipc', /node:net\b|UnixStream|createConnection|federation\.snapshot/],
   ['registry-or-dedupe', /record_response|causation_id|ChannelRegistry|SnapshotStore/],
@@ -30,8 +54,26 @@ const FORBIDDEN = [
   ['service-manager', /systemctl|launchctl|\bsc\.exe|LaunchAgents|systemd/],
 ];
 
-function scanSource(source) {
-  return FORBIDDEN.filter(([, pattern]) => pattern.test(source)).map(([name]) => name);
+function scanSource(source, { exempt = new Set() } = {}) {
+  return FORBIDDEN
+    .filter(([name, pattern]) => !exempt.has(name) && pattern.test(source))
+    .map(([name]) => name);
+}
+
+async function ingestionSubtreeFiles() {
+  const files = [];
+  for (const dir of INGESTION_SUBTREE_DIRS) {
+    for (const name of await readdir(join(packageRoot, dir))) {
+      if (name.endsWith('.mjs')) files.push(`${dir}/${name}`);
+    }
+  }
+  return files.sort();
+}
+
+// The runtime is version- and target-qualified, which is the whole reason the
+// command has to be written at stage time rather than resolved at session time.
+function stagedRuntime(globalRoot, runtimeVersion) {
+  return join(globalRoot, 'bin', runtimeVersion, 'x86_64-unknown-linux-gnu', 'loam');
 }
 
 async function missing(path) {
@@ -43,10 +85,10 @@ async function missing(path) {
   }
 }
 
-async function harnessFixture(prefix, { pluginVersion = '0.9.10' } = {}) {
+async function harnessFixture(prefix, { pluginVersion = '0.9.10', runtimeVersion = '0.9.10' } = {}) {
   const home = await mkdtemp(join(tmpdir(), prefix));
   const globalRoot = join(home, '.agents', 'loam');
-  const runtimePath = join(globalRoot, 'bin', '0.9.10', 'x86_64-unknown-linux-gnu', 'loam');
+  const runtimePath = stagedRuntime(globalRoot, runtimeVersion);
   await mkdir(join(home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(home, '.cursor'), { recursive: true });
   await mkdir(join(home, '.claude'), { recursive: true });
@@ -151,7 +193,6 @@ test('the structural scan catches a deliberately planted violation', async () =>
   // the wrong reason — a broken pattern reads exactly like a clean tree.
   const clean = await readFile(join(packageRoot, 'adapters', 'opencode.mjs'), 'utf8');
   const planted = [
-    ['retired-node-integration', "import { formatContext } from '../integration/context.mjs';"],
     ['broker', 'const url = "mqtts://broker.example";'],
     ['connector-ipc', "import net from 'node:net';"],
     ['registry-or-dedupe', 'const key = causation_id;'],
@@ -162,6 +203,124 @@ test('the structural scan catches a deliberately planted violation', async () =>
     assert.deepEqual(scanSource(`${clean}\n${line}\n`), [expected], `planted ${expected} must be caught`);
   }
   assert.deepEqual(scanSource(clean), []);
+});
+
+test('the retired-integration scan catches the idiom this codebase actually uses', async () => {
+  // A control that only plants a spelling the repo never writes proves nothing.
+  // Every runtime-path file reaches a sibling module through
+  // `import(new URL('<name>.mjs', root).href)`, so that is the shape a
+  // re-introduced context read path would take.
+  const clean = await readFile(join(packageRoot, 'adapters', 'opencode.mjs'), 'utf8');
+  for (const line of [
+    "const m = await import(new URL('context.mjs', root).href); await m.render();",
+    'const m = await import(new URL("loam.mjs", root).href);',
+    "import { formatContext } from '../integration/context.mjs';",
+    "const body = formatContext({ workspace });",
+    "await runIntegration(['hook', 'claude', workspace]);",
+    'spawn(process.execPath, [loamEntry, "hook", "--harness", "claude"]);',
+  ]) {
+    assert.deepEqual(
+      scanSource(`${clean}\n${line}\n`),
+      ['retired-node-integration'],
+      `planted retired spelling must be caught: ${line}`,
+    );
+  }
+  // ...and resolving the integration *root* by naming `loam.mjs` as a path is
+  // still legal, which is what the two adapters do today. If this ever fires,
+  // the pattern got broad rather than the tree getting dirty.
+  assert.deepEqual(
+    scanSource(`${clean}\nconst anchor = join(globalRoot, 'integration', 'loam.mjs');\n`),
+    [],
+  );
+});
+
+test('the in-process ingestion subtree reaches no broker, IPC, or service manager either', async () => {
+  const files = await ingestionSubtreeFiles();
+  // The enumeration is part of the claim: an empty or wrong file list would
+  // read exactly like a clean subtree.
+  for (const expected of [
+    'integration/ingest.mjs',
+    'integration/hooks.mjs',
+    'integration/paths.mjs',
+    'integration/runtime.mjs',
+    'integration/metadata.mjs',
+    'integration/shadow.mjs',
+    'integration/ingest-process.mjs',
+    'integration/ingest-fingerprint.mjs',
+    'integration/loam.mjs',
+    'adapters/ingest-worker.mjs',
+    'adapters/ingest-modules.mjs',
+  ]) {
+    assert.ok(files.includes(expected), `${expected} must be inside the scanned subtree`);
+  }
+
+  for (const relative of files) {
+    const source = await readFile(join(packageRoot, relative), 'utf8');
+    assert.deepEqual(
+      scanSource(source, { exempt: SUBTREE_EXEMPT }),
+      [],
+      `${relative} runs inside the plugin and must reach none of these`,
+    );
+  }
+});
+
+test('the extended scan catches a violation planted in the ingestion subtree', async () => {
+  // The subtree is reached through computed dynamic imports, so the risk is not
+  // a bad pattern — it is a file that never gets handed to the scanner at all.
+  const clean = await readFile(join(packageRoot, 'integration', 'ingest.mjs'), 'utf8');
+  assert.deepEqual(scanSource(clean, { exempt: SUBTREE_EXEMPT }), []);
+  for (const [expected, line] of [
+    ['broker', 'const url = "mqtts://broker.example";'],
+    ['connector-ipc', "import net from 'node:net'; net.createConnection();"],
+    ['service-manager', 'spawn("systemctl", ["--user", "start", "loam"]);'],
+    ['registry-or-dedupe', 'const key = causation_id;'],
+    ['collaboration-state', 'const scope = { sender_scope: [] };'],
+  ]) {
+    assert.deepEqual(
+      scanSource(`${clean}\n${line}\n`, { exempt: SUBTREE_EXEMPT }),
+      [expected],
+      `planted ${expected} in the ingestion subtree must be caught`,
+    );
+  }
+
+  // The one exemption is real and scoped to exactly one class: the same planted
+  // line is legal in the subtree and illegal on a session-time file.
+  const retired = `${clean}\nconst m = await import(new URL('context.mjs', root).href);\n`;
+  assert.deepEqual(scanSource(retired, { exempt: SUBTREE_EXEMPT }), []);
+  assert.deepEqual(scanSource(retired), ['retired-node-integration']);
+});
+
+test('a plugin update that resets the shipped hooks file is re-staged onto the new runtime', async () => {
+  // Positive control for the "tracks the staged runtime" claim on the *update*
+  // path: two fresh fixtures only prove the renderer reads its argument, not
+  // that an already-installed slot is rewritten when the runtime moves.
+  const { home, globalRoot, claudeCache, codexCache, runtimePath } =
+    await harnessFixture('loam-native-registration-update-');
+  const startCommand = async (cache) => {
+    const hooks = JSON.parse(await readFile(join(cache, 'hooks', 'hooks.json'), 'utf8'));
+    return sessionEntries(hooks, 'SessionStart')[0]?.command;
+  };
+  const openCodeSource = () => readFile(join(home, '.config', 'opencode', 'plugins', 'loam.js'), 'utf8');
+  assert.equal(await startCommand(claudeCache), runtimePath);
+  assert.ok((await openCodeSource()).includes(JSON.stringify(runtimePath)));
+
+  // `plugin update` replaces the installed hooks file with the shipped one,
+  // which carries Stop only — and the new runtime lands in a new version dir.
+  const shipped = join(packageRoot, 'plugins', 'loam-adapter', 'hooks', 'hooks.json');
+  for (const cache of [claudeCache, codexCache]) await cp(shipped, join(cache, 'hooks', 'hooks.json'));
+  assert.equal(await startCommand(claudeCache), undefined, 'the update reset must really have happened');
+
+  const next = stagedRuntime(globalRoot, '0.9.11');
+  assert.notEqual(next, runtimePath);
+  const detected = await detectHarnesses({ home, pluginVersion: '0.9.10' });
+  const result = await installHarnesses({ home, globalRoot, pluginVersion: '0.9.10', runtimePath: next, detected });
+
+  for (const [id, cache] of [['claude', claudeCache], ['codex', codexCache]]) {
+    assert.equal(result[id].state, 'ready');
+    assert.equal(await startCommand(cache), next, `${id} SessionStart must flip to the new runtime`);
+  }
+  assert.ok((await openCodeSource()).includes(JSON.stringify(next)));
+  assert.ok(!(await openCodeSource()).includes(JSON.stringify(runtimePath)), 'no stale runtime may survive');
 });
 
 test('the shared Node session integration is gone from the tree', async () => {

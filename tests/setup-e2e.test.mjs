@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -561,6 +561,40 @@ test('harness readiness ignores hook paths outside the setup-owned root', async 
   result = await verifyInstallation({ discovery, packageRoot, runtimeRunner: fixture.smokeRunner });
   assert.equal(result.ready, true);
   assert.equal(result.harnesses.claude.ready, true);
+});
+
+test('a stale staged runtime is a registration failure, not a silent pass', async () => {
+  // Both registrations name an absolute runtime that setup wrote at stage time,
+  // so the failure mode is a slot that was never rewritten — a `plugin update`
+  // that restored the shipped hooks file, or a runtime that moved underneath an
+  // already-baked OpenCode plugin. Neither is visible at session time.
+  const { fixture, discovery } = await readyHarnessFixture();
+  const install = JSON.parse(await readFile(join(fixture.home, '.agents', 'loam', 'install.json'), 'utf8'));
+
+  // Positive control: the freshly staged install verifies ready, so what the
+  // assertions below detect is the staleness and not some unrelated gap.
+  let result = await verifyInstallation({ discovery, packageRoot, runtimeRunner: fixture.smokeRunner });
+  assert.equal(result.harnesses.claude.ready, true);
+  assert.equal(result.harnesses.opencode.ready, true);
+
+  // `plugin update` restores the shipped hooks file, which carries Stop only.
+  const cache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
+  await cp(join(packageRoot, 'plugins', 'loam-adapter', 'hooks', 'hooks.json'), join(cache, 'hooks', 'hooks.json'));
+
+  // OpenCode's plugin is baked at stage time, so a moved runtime leaves the
+  // installed file naming a path the current install no longer uses.
+  const pluginPath = join(fixture.home, '.config', 'opencode', 'plugins', 'loam.js');
+  const staged = await readFile(pluginPath, 'utf8');
+  const stale = staged.replaceAll(JSON.stringify(install.runtime_path), JSON.stringify('/previous/bin/loam'));
+  assert.notEqual(stale, staged, 'the staged plugin must actually name the current runtime');
+  await writeFile(pluginPath, stale);
+
+  result = await verifyInstallation({ discovery, packageRoot, runtimeRunner: fixture.smokeRunner });
+  assert.equal(result.harnesses.claude.ready, false);
+  assert.equal(result.harnesses.claude.category, 'registration_missing');
+  assert.equal(result.harnesses.opencode.ready, false);
+  assert.equal(result.harnesses.opencode.category, 'registration_mismatch');
+  assert.equal(result.ready, false);
 });
 
 test('harness readiness rejects duplicate setup-owned registrations', async () => {
