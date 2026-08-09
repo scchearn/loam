@@ -629,8 +629,8 @@ impl Federation {
                 ValidationConfig::default(),
             )
             .expect("the session transport configuration is valid"),
-            username: "actor-a".to_owned(),
-            password: broker.password().to_owned(),
+            username: Some("actor-a".to_owned()),
+            password: Some(broker.password().to_owned()),
             ca_certificate: broker
                 .ca_certificate()
                 .expect("the fixture CA certificate is readable"),

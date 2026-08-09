@@ -467,8 +467,13 @@ const TRACKING_CAPACITY: usize = 32;
 pub struct MqttSession {
     /// The validated broker configuration (endpoint, client id, bounds).
     pub config: TransportConfig,
-    pub username: String,
-    pub password: String,
+    /// Password authentication, which a provisioned session never uses: mTLS is
+    /// the sole authentication and the effective username is the certificate CN
+    /// the broker assigns. Sending a username would be an identity claim the
+    /// client is not entitled to make. Both stay for the password-port test tier
+    /// and are sent only when both are present.
+    pub username: Option<String>,
+    pub password: Option<String>,
     /// PEM bytes supplied by the caller: this module reads no files.
     pub ca_certificate: Vec<u8>,
     pub client_authentication: Option<(Vec<u8>, Vec<u8>)>,
@@ -534,8 +539,14 @@ impl Transport for MqttTransport {
             return Ok(identity.clone());
         }
         let mut options = self.session.config.mqtt_options();
+        // Only when both are present: an empty username is still a username on
+        // the wire, and an mTLS broker that assigns the CN would refuse it.
+        if let (Some(username), Some(password)) = (&self.session.username, &self.session.password) {
+            if !username.is_empty() {
+                options.set_credentials(username, password);
+            }
+        }
         options
-            .set_credentials(&self.session.username, &self.session.password)
             .set_transport(rumqttc::Transport::tls(
                 self.session.ca_certificate.clone(),
                 self.session.client_authentication.clone(),
@@ -4161,8 +4172,8 @@ mod snapshot_tests {
             Ok((
                 MqttSession {
                     config,
-                    username: "actor-a".into(),
-                    password: "unused".into(),
+                    username: None,
+                    password: None,
                     ca_certificate: Vec::new(),
                     client_authentication: None,
                     claimed_identity: SessionIdentity {

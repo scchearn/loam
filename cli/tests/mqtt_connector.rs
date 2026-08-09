@@ -14,7 +14,9 @@
 mod mqtt_broker;
 
 use chrono::Utc;
-use loam::connector::{run_probe, MqttSession, MqttTransport, ProbeContext, SessionIdentity};
+use loam::connector::{
+    run_probe, MqttSession, MqttTransport, ProbeContext, SessionIdentity, Transport,
+};
 use loam::envelope::ValidationConfig;
 use loam::transport::TransportConfig;
 use mqtt_broker::BrokerFixture;
@@ -58,8 +60,8 @@ fn enrollment_round_trip() {
             validation.clone(),
         )
         .expect("the probe transport configuration should be valid"),
-        username: "actor-a".to_owned(),
-        password: broker.password().to_owned(),
+        username: Some("actor-a".to_owned()),
+        password: Some(broker.password().to_owned()),
         ca_certificate: broker
             .ca_certificate()
             .expect("the fixture CA certificate should be readable"),
@@ -150,6 +152,66 @@ fn no_local_set_suppresses_the_self_delivery_the_probe_depends_on() {
         1,
         "No Local unset must deliver this client's own publication: {received:?}"
     );
+
+    broker
+        .finish()
+        .expect("broker fixture should remove only its temporary directory");
+}
+
+#[test]
+#[ignore = "requires LOAM_MQTT_TEST=1 and a real Mosquitto/OpenSSL installation"]
+fn mtls_authenticates_with_no_username_and_no_password() {
+    if std::env::var("LOAM_MQTT_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set LOAM_MQTT_TEST=1 to require the real broker tier");
+        return;
+    }
+
+    // mTLS is the sole authentication for a provisioned session: the effective
+    // username is the certificate CN the broker assigns, so sending a username
+    // would be an identity claim the client is not entitled to make. The
+    // password-port suite above is the positive control that making the two
+    // fields optional did not break password authentication.
+    let broker =
+        BrokerFixture::provision("mtls-only").expect("the real broker fixture should provision");
+    let validation = ValidationConfig::default();
+    let session = MqttSession {
+        config: TransportConfig::new(
+            "localhost",
+            broker.mtls_port(),
+            "loam-connector-mtls",
+            8,
+            MAX_PACKET_BYTES,
+            validation.clone(),
+        )
+        .expect("the mTLS transport configuration should be valid"),
+        username: None,
+        password: None,
+        ca_certificate: broker
+            .ca_certificate()
+            .expect("the fixture CA certificate should be readable"),
+        client_authentication: Some((
+            broker
+                .client_certificate()
+                .expect("the fixture client certificate should be readable"),
+            broker
+                .client_key()
+                .expect("the fixture client key should be readable"),
+        )),
+        claimed_identity: SessionIdentity {
+            principal_id: "mtls-actor".to_owned(),
+            agent_id: "agent-72".to_owned(),
+            instance_id: INSTANCE.to_owned(),
+            allowed_claims: Vec::new(),
+        },
+    };
+
+    let mut transport = MqttTransport::new(session, validation, Utc::now())
+        .expect("the adapter should build its delivery processor");
+    let identity = transport
+        .authenticate()
+        .expect("mTLS alone must reach an accepted CONNACK");
+    assert_eq!(identity.instance_id, INSTANCE);
+    transport.disconnect();
 
     broker
         .finish()
