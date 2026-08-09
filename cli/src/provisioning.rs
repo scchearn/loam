@@ -676,12 +676,18 @@ fn is_wildcard(entry: &str) -> bool {
 /// silently replaces rather than appends. This is the authorization boundary,
 /// so the scope is validated before it becomes a path.
 fn is_path_atom(value: &str) -> bool {
-    !value.is_empty()
-        && value != "."
-        && value != ".."
-        && !value.contains('/')
-        && !value.contains('\\')
-        && !value.contains('\0')
+    // A valid scope atom is exactly one ordinary path component equal to itself.
+    // This rejects empty, ".", "..", separators, and absolute roots — AND a
+    // Windows drive prefix ("C:foo", "C:"), which `Path::join` treats as a root
+    // and uses to REPLACE the roster root, escaping it into a cross-tenant read.
+    // A character blacklist misses the drive prefix; `Component::Normal` does
+    // not, on every platform. The `to_str` equality also rejects any value that
+    // normalizes away (a trailing separator, an embedded "./").
+    let mut components = std::path::Path::new(value).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(only)), None) => only.to_str() == Some(value),
+        _ => false,
+    }
 }
 
 /// Read one list of bare ids. `None` means the file does not describe a roster
@@ -1519,6 +1525,42 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_scope_atom_is_one_ordinary_path_component_equal_to_itself() {
+        // The predicate under the roster path join, tested directly. Each of
+        // these escapes or normalizes away on every platform and must refuse.
+        for bad in [
+            "",
+            ".",
+            "..",
+            "/",
+            "/abs",
+            "a/b",
+            "a/../b",
+            "sub/dir",
+            "trailing/",
+        ] {
+            assert!(!is_path_atom(bad), "{bad:?} must not be a scope atom");
+        }
+        for good in ["acme", "loam", "instance-01", "sam+loam@example.test"] {
+            assert!(is_path_atom(good), "{good:?} must be a scope atom");
+        }
+        // A Windows drive prefix or UNC root escapes the roster root via
+        // `Path::join` (push replaces self on a prefixed/rooted segment) — the
+        // residual the Unix-form blacklist missed. It is a prefix only on
+        // Windows; on Unix "C:foo" is an ordinary filename that stays in root,
+        // so it is asserted where the escape can actually happen.
+        #[cfg(windows)]
+        {
+            for rooted in ["C:secrets", "C:", r"C:\abs", r"\\server\share", r"a\b"] {
+                assert!(
+                    !is_path_atom(rooted),
+                    "{rooted:?} is a drive/root/separator and must be refused on Windows"
+                );
+            }
+        }
     }
 
     #[test]
