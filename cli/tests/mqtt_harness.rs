@@ -650,7 +650,7 @@ impl Federation {
         let mut state = ConnectorState::new();
         let attached = state
             .sessions
-            .attach(&row, Some((session, roster)), Utc::now());
+            .attach(&row, Ok((session, roster)), Utc::now());
         assert_eq!(
             attached,
             SessionState::Live,

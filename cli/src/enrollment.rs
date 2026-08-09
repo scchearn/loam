@@ -961,6 +961,14 @@ pub mod registry {
         pub display_path: String,
         pub instance_id: String,
         pub broker_profile: String,
+        /// The stored `mqtts://host:port` the connector dials. Read back so a
+        /// session can be provisioned from the row alone.
+        pub broker_endpoint: String,
+        pub tls_server_name: String,
+        /// Opaque lookup keys for the secret backend — never the material.
+        pub credential_ref: String,
+        /// Absent means "use the system trust roots"; present means pinned.
+        pub ca_ref: Option<String>,
         pub commit: String,
         pub capabilities: CapabilityRecord,
         pub remotes: Vec<ValidatedRemote>,
@@ -1189,7 +1197,8 @@ pub mod registry {
         let row = connection
             .query_row(
                 "SELECT id, identity_key, org_id, project_id, repository_id, descriptor_digest,
-                    display_path, instance_id, broker_profile, commit_oid,
+                    display_path, instance_id, broker_profile, broker_endpoint,
+                    tls_server_name, credential_ref, ca_ref, commit_oid,
                     cap_authentication, cap_publish, cap_subscribe, cap_self_receive, verified_at
              FROM federation_enrollment WHERE identity_key = ?1",
                 [key],
@@ -1210,7 +1219,8 @@ pub mod registry {
         let mut statement = connection
             .prepare(
                 "SELECT id, identity_key, org_id, project_id, repository_id, descriptor_digest,
-                    display_path, instance_id, broker_profile, commit_oid,
+                    display_path, instance_id, broker_profile, broker_endpoint,
+                    tls_server_name, credential_ref, ca_ref, commit_oid,
                     cap_authentication, cap_publish, cap_subscribe, cap_self_receive, verified_at
              FROM federation_enrollment ORDER BY id",
             )
@@ -1267,13 +1277,17 @@ pub mod registry {
                 display_path: row.get(6)?,
                 instance_id: row.get(7)?,
                 broker_profile: row.get(8)?,
-                commit: row.get(9)?,
+                broker_endpoint: row.get(9)?,
+                tls_server_name: row.get(10)?,
+                credential_ref: row.get(11)?,
+                ca_ref: row.get(12)?,
+                commit: row.get(13)?,
                 capabilities: CapabilityRecord {
-                    authentication: row.get::<_, i64>(10)? != 0,
-                    publish: row.get::<_, i64>(11)? != 0,
-                    subscribe: row.get::<_, i64>(12)? != 0,
-                    self_receive: row.get::<_, i64>(13)? != 0,
-                    verified_at: row.get(14)?,
+                    authentication: row.get::<_, i64>(14)? != 0,
+                    publish: row.get::<_, i64>(15)? != 0,
+                    subscribe: row.get::<_, i64>(16)? != 0,
+                    self_receive: row.get::<_, i64>(17)? != 0,
+                    verified_at: row.get(18)?,
                 },
                 remotes: Vec::new(),
             },
@@ -1691,6 +1705,45 @@ mod registry_tests {
         assert_eq!(row.remotes[0].url_digest, "a".repeat(64));
         assert!(row.capabilities.self_receive);
         assert_eq!(list_enrollments(&connection).unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_read_projection_carries_the_provisioning_fields() {
+        let path = temp_db("provisioning-projection");
+        let mut connection = open_writable(&path).unwrap();
+
+        let mut pinned = sample(4, 40, "0123456789abcdef0123456789abcdef01234567");
+        pinned.ca_ref = Some("vault://acme/loam/ca".into());
+        insert_enrollment(&mut connection, &pinned, &caps(), "t").unwrap();
+        let row = lookup(&connection, &identity_key(&pinned.workspace))
+            .unwrap()
+            .expect("present");
+        assert_eq!(row.broker_endpoint, "mqtts://broker.acme.example:8883");
+        assert_eq!(row.tls_server_name, "broker.acme.example");
+        assert_eq!(row.credential_ref, "vault://acme/loam/mqtt");
+        assert_eq!(row.ca_ref.as_deref(), Some("vault://acme/loam/ca"));
+        // The instance id is the single source of session identity downstream,
+        // so a projection that reads it back empty would be a silent defect.
+        assert!(!row.instance_id.is_empty());
+
+        // Both readers share one projection: widening the SELECT in `lookup` and
+        // not in `list_enrollments` is exactly the half-fix that reads clean here.
+        let listed = list_enrollments(&connection).unwrap();
+        assert_eq!(listed[0].credential_ref, row.credential_ref);
+        assert_eq!(listed[0].broker_endpoint, row.broker_endpoint);
+        assert_eq!(listed[0].ca_ref, row.ca_ref);
+
+        // Control: an absent CA reference reads back absent, never an empty
+        // string — "use system roots" and "pinned to nothing" must not collapse.
+        let mut system_roots = sample(5, 50, "0123456789abcdef0123456789abcdef01234567");
+        system_roots.ca_ref = None;
+        insert_enrollment(&mut connection, &system_roots, &caps(), "t").unwrap();
+        let absent = lookup(&connection, &identity_key(&system_roots.workspace))
+            .unwrap()
+            .expect("present");
+        assert!(absent.ca_ref.is_none());
+
         let _ = std::fs::remove_file(&path);
     }
 

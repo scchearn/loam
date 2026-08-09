@@ -1144,12 +1144,43 @@ impl PeerRoster {
 /// The seam is a plain function rather than a stored callable on purpose: the
 /// crate capability guard bars function-pointer and trait-object capabilities,
 /// and a provisioner that could be swapped at runtime would be exactly that.
-/// ponytail: returns None. Fill it in when provisioning lands a secret backend
-/// and a peer roster; `ProjectSessions::attach` already takes the resolved value.
+/// ponytail: returns the credential refusal. Fill it in when `provisioning`
+/// lands the secret backend and the roster reader; `ProjectSessions::attach`
+/// already takes the resolved value.
 pub fn provision_session(
     _row: &crate::enrollment::EnrolledRow,
-) -> Option<(MqttSession, PeerRoster)> {
-    None
+) -> Result<(MqttSession, PeerRoster), ProvisionFailure> {
+    Err(ProvisionFailure::Credentials(
+        reason::CREDENTIAL_REF_UNRESOLVED,
+    ))
+}
+
+/// The stable reasons the two provisioning failure states carry. They name the
+/// *input* that failed and never any material behind it, and they are additive:
+/// the `code()` strings above them are a tested IPC contract and do not move.
+pub mod reason {
+    pub const ENDPOINT_MALFORMED: &str = "endpoint-malformed";
+    pub const CREDENTIAL_REF_UNRESOLVED: &str = "credential-ref-unresolved";
+    pub const CA_UNRESOLVED: &str = "ca-unresolved";
+    pub const ROSTER_ABSENT: &str = "roster-absent";
+    pub const ROSTER_EMPTY: &str = "roster-empty";
+    /// Principals but no origins: not empty by `PeerRoster::is_empty`, yet it
+    /// admits nothing, because the receive path checks the topic origin first.
+    /// A session opened on it would look connected and hear no one.
+    pub const ROSTER_NO_ORIGINS: &str = "roster-no-origins";
+    pub const ROSTER_WILDCARD: &str = "roster-wildcard";
+    pub const ROSTER_MALFORMED: &str = "roster-malformed";
+}
+
+/// Why provisioning refused, split by which half failed so the connector maps it
+/// to a state without sniffing the reason string. Carrying the reason is what
+/// lets an operator tell six failed inputs apart without six new states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionFailure {
+    /// The endpoint, the credential reference, or the CA did not resolve.
+    Credentials(&'static str),
+    /// Credentials resolved; the peer roster did not.
+    Roster(&'static str),
 }
 
 /// What a `project.attach` actually achieved. Reported honestly: an unopened
@@ -1160,11 +1191,11 @@ pub enum SessionState {
     Live,
     /// A session for this project was already live; attach is idempotent.
     AlreadyLive,
-    /// No secret backend resolved this enrollment's `credential_ref`.
-    CredentialsUnresolved,
-    /// Credentials resolved but no peer roster was provisioned, so the session
-    /// could admit no colleague and was not opened.
-    NoPeerRoster,
+    /// An endpoint, credential, or CA input did not resolve.
+    CredentialsUnresolved(&'static str),
+    /// Credentials resolved but no usable peer roster was provisioned, so the
+    /// session could admit no colleague and was not opened.
+    NoPeerRoster(&'static str),
     /// Credentials and roster resolved but the broker refused the session.
     Unreachable(String),
 }
@@ -1174,9 +1205,20 @@ impl SessionState {
         match self {
             SessionState::Live => "live",
             SessionState::AlreadyLive => "already-live",
-            SessionState::CredentialsUnresolved => "credentials-unresolved",
-            SessionState::NoPeerRoster => "no-peer-roster",
+            SessionState::CredentialsUnresolved(_) => "credentials-unresolved",
+            SessionState::NoPeerRoster(_) => "no-peer-roster",
             SessionState::Unreachable(_) => "unreachable",
+        }
+    }
+
+    /// Which input failed, for the two states that have one. `None` is not a
+    /// missing reason — it means nothing failed to resolve.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            SessionState::CredentialsUnresolved(reason) | SessionState::NoPeerRoster(reason) => {
+                Some(reason)
+            }
+            _ => None,
         }
     }
 }
@@ -1254,17 +1296,21 @@ impl ProjectSessions {
     pub fn attach(
         &mut self,
         row: &crate::enrollment::EnrolledRow,
-        provisioned: Option<(MqttSession, PeerRoster)>,
+        provisioned: Result<(MqttSession, PeerRoster), ProvisionFailure>,
         now: DateTime<Utc>,
     ) -> SessionState {
         if self.live.contains_key(&row.project_id) {
             return SessionState::AlreadyLive;
         }
-        let Some((session, roster)) = provisioned else {
-            return SessionState::CredentialsUnresolved;
+        let (session, roster) = match provisioned {
+            Ok(pair) => pair,
+            Err(ProvisionFailure::Credentials(reason)) => {
+                return SessionState::CredentialsUnresolved(reason)
+            }
+            Err(ProvisionFailure::Roster(reason)) => return SessionState::NoPeerRoster(reason),
         };
         if roster.is_empty() {
-            return SessionState::NoPeerRoster;
+            return SessionState::NoPeerRoster(reason::ROSTER_EMPTY);
         }
         let mut transport = match MqttTransport::new(session, ValidationConfig::default(), now) {
             Ok(transport) => transport,
@@ -1945,6 +1991,9 @@ fn attach_json(
             Value::String(session_state.code().to_owned()),
         ),
     ];
+    if let Some(reason) = session_state.reason() {
+        fields.push(("reason".into(), Value::String(reason.to_owned())));
+    }
     if let SessionState::Unreachable(reason) = session_state {
         fields.push(("session_diagnostic".into(), Value::String(reason.clone())));
     }
@@ -3992,13 +4041,11 @@ mod snapshot_tests {
         assert!(after.is_empty());
     }
 
-    #[test]
-    fn an_unprovisioned_attach_opens_no_session_and_says_so() {
-        // Phase 1 ships no secret backend and no peer roster, so the honest
-        // answer is `credentials-unresolved` — never a fabricated live session.
-        let mut sessions = ProjectSessions::new(4);
-        let row = crate::enrollment::EnrolledRow {
-            identity_key: "unix:1:1".into(),
+    /// One enrolled row for the attach-path tests. Only the identity key varies,
+    /// so a test that needs two distinct workspaces cannot collide by accident.
+    fn sample_row(identity_key: &str) -> crate::enrollment::EnrolledRow {
+        crate::enrollment::EnrolledRow {
+            identity_key: identity_key.into(),
             org_id: "org-3A1".into(),
             project_id: "project-7M3".into(),
             repository_id: "repo-2F8".into(),
@@ -4006,6 +4053,10 @@ mod snapshot_tests {
             display_path: "/w".into(),
             instance_id: RECIPIENT_INSTANCE.into(),
             broker_profile: "p".into(),
+            broker_endpoint: "mqtts://broker.example:8883".into(),
+            tls_server_name: "broker.example".into(),
+            credential_ref: "loam/test/credential".into(),
+            ca_ref: None,
             commit: "84be000000000000000000000000000000000001".into(),
             capabilities: crate::enrollment::CapabilityRecord {
                 authentication: true,
@@ -4015,10 +4066,79 @@ mod snapshot_tests {
                 verified_at: "2026-07-24T14:20:00Z".into(),
             },
             remotes: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn the_failure_codes_are_unchanged_and_the_reasons_are_additive() {
+        // `code()` is a tested IPC contract other slices pin, so the reason is
+        // an added field and never a renamed state. An operator debugging a real
+        // deployment needs to know which of eight inputs failed; the eight do
+        // not each deserve a variant.
+        assert_eq!(SessionState::Live.code(), "live");
+        assert_eq!(SessionState::AlreadyLive.code(), "already-live");
+        assert_eq!(
+            SessionState::CredentialsUnresolved(reason::CREDENTIAL_REF_UNRESOLVED).code(),
+            "credentials-unresolved"
+        );
+        assert_eq!(
+            SessionState::NoPeerRoster(reason::ROSTER_ABSENT).code(),
+            "no-peer-roster"
+        );
+        assert_eq!(SessionState::Unreachable("x".into()).code(), "unreachable");
+
+        // Every reason is reachable and distinct: a duplicated constant would
+        // make two different failures indistinguishable to the operator.
+        let all = [
+            reason::ENDPOINT_MALFORMED,
+            reason::CREDENTIAL_REF_UNRESOLVED,
+            reason::CA_UNRESOLVED,
+            reason::ROSTER_ABSENT,
+            reason::ROSTER_EMPTY,
+            reason::ROSTER_NO_ORIGINS,
+            reason::ROSTER_WILDCARD,
+            reason::ROSTER_MALFORMED,
+        ];
+        let mut seen = all.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), all.len(), "reason codes must be distinct");
+
+        let row = sample_row("unix:1:9");
+        for state in [
+            SessionState::CredentialsUnresolved(reason::ENDPOINT_MALFORMED),
+            SessionState::NoPeerRoster(reason::ROSTER_WILDCARD),
+        ] {
+            let json = attach_json(&row, &state).to_json();
+            assert!(
+                json.contains(&format!(
+                    "\"reason\":\"{}\"",
+                    state.reason().expect("reason")
+                )),
+                "attach JSON must name the failed input: {json}"
+            );
+            assert!(
+                json.contains(&format!("\"session_state\":\"{}\"", state.code())),
+                "the code contract must survive alongside the reason: {json}"
+            );
+        }
+
+        // Positive control: a state with no failed input carries no reason key,
+        // so `reason` is never a decorative always-present field.
+        assert!(SessionState::Live.reason().is_none());
+        let live = attach_json(&row, &SessionState::Live).to_json();
+        assert!(!live.contains("\"reason\""), "{live}");
+    }
+
+    #[test]
+    fn an_unprovisioned_attach_opens_no_session_and_says_so() {
+        // Phase 1 ships no secret backend and no peer roster, so the honest
+        // answer is `credentials-unresolved` — never a fabricated live session.
+        let mut sessions = ProjectSessions::new(4);
+        let row = sample_row("unix:1:1");
         assert_eq!(
             sessions.attach(&row, provision_session(&row), base_time()),
-            SessionState::CredentialsUnresolved
+            SessionState::CredentialsUnresolved(reason::CREDENTIAL_REF_UNRESOLVED)
         );
         assert!(!sessions.is_live(&row.project_id));
         assert!(sessions.snapshot(&row.project_id, base_time()).is_empty());
@@ -4028,7 +4148,7 @@ mod snapshot_tests {
     fn a_provisioned_but_rosterless_project_opens_no_session() {
         // Credentials without a peer roster would open a session that can admit
         // no colleague; refusing it beats a live session that hears nothing.
-        fn rosterless() -> Option<(MqttSession, PeerRoster)> {
+        fn rosterless() -> Result<(MqttSession, PeerRoster), ProvisionFailure> {
             let config = TransportConfig::new(
                 "localhost",
                 1883,
@@ -4038,7 +4158,7 @@ mod snapshot_tests {
                 ValidationConfig::default(),
             )
             .expect("transport config");
-            Some((
+            Ok((
                 MqttSession {
                     config,
                     username: "actor-a".into(),
@@ -4057,28 +4177,10 @@ mod snapshot_tests {
         }
 
         let mut sessions = ProjectSessions::new(4);
-        let row = crate::enrollment::EnrolledRow {
-            identity_key: "unix:1:2".into(),
-            org_id: "org-3A1".into(),
-            project_id: "project-7M3".into(),
-            repository_id: "repo-2F8".into(),
-            descriptor_digest: "d".into(),
-            display_path: "/w".into(),
-            instance_id: RECIPIENT_INSTANCE.into(),
-            broker_profile: "p".into(),
-            commit: "84be000000000000000000000000000000000001".into(),
-            capabilities: crate::enrollment::CapabilityRecord {
-                authentication: true,
-                publish: true,
-                subscribe: true,
-                self_receive: true,
-                verified_at: "2026-07-24T14:20:00Z".into(),
-            },
-            remotes: Vec::new(),
-        };
+        let row = sample_row("unix:1:2");
         assert_eq!(
             sessions.attach(&row, rosterless(), base_time()),
-            SessionState::NoPeerRoster
+            SessionState::NoPeerRoster(reason::ROSTER_EMPTY)
         );
         assert!(!sessions.is_live(&row.project_id));
     }
@@ -4164,6 +4266,10 @@ mod outbound_tests {
             display_path: "/w".into(),
             instance_id: "instance-01".into(),
             broker_profile: "p".into(),
+            broker_endpoint: "mqtts://broker.example:8883".into(),
+            tls_server_name: "broker.example".into(),
+            credential_ref: "loam/test/credential".into(),
+            ca_ref: None,
             commit: "84be000000000000000000000000000000000001".into(),
             capabilities: crate::enrollment::CapabilityRecord {
                 authentication: true,

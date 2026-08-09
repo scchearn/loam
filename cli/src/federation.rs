@@ -1241,6 +1241,10 @@ mod emit_tests {
             display_path: "/w".into(),
             instance_id: "instance-02".into(),
             broker_profile: "p".into(),
+            broker_endpoint: "mqtts://broker.example:8883".into(),
+            tls_server_name: "broker.example".into(),
+            credential_ref: "loam/test/credential".into(),
+            ca_ref: None,
             commit: "84be000000000000000000000000000000000001".into(),
             capabilities: enrollment::CapabilityRecord {
                 authentication: true,
