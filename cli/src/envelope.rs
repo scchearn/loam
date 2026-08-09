@@ -2364,6 +2364,14 @@ mod tests {
             "codegraph.rs",
             "enrollment.rs",
             "main.rs",
+            // The platform secret store is a program, not a library: libsecret
+            // on Linux and the keychain on macOS are reached by running
+            // `secret-tool` / `security` and reading the secret off standard
+            // output. This is the only subprocess this module runs, and it is
+            // the reason the credential resolver lives here rather than in
+            // `connector.rs`, which holds the broker socket and is admitted to
+            // neither list.
+            "provisioning.rs",
             "service.rs",
             "state.rs",
             "transport.rs",
@@ -2383,6 +2391,10 @@ mod tests {
             "ipc/unix.rs",
             "markdown.rs",
             "memory.rs",
+            // Reads only, and only two things: the per-project peer roster that
+            // decides whom a session admits, and the platform trust bundle when
+            // an enrollment pins no CA of its own.
+            "provisioning.rs",
             "service.rs",
             "sha256.rs",
             "state.rs",

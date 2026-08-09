@@ -13,6 +13,7 @@ pub mod json;
 mod lint;
 mod markdown;
 mod memory;
+pub mod provisioning;
 mod service;
 mod sha256;
 mod state;
