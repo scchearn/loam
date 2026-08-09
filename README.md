@@ -32,7 +32,7 @@ that harness's released version.
 | ------- | -------------------------------- |
 | Claude Code | **automatically compatible** — injected at session start and refreshed at the next prompt |
 | Codex CLI | **automatically compatible** — injected on the first turn of a session, once Codex's one-time hook-trust review has approved the Loam hook |
-| OpenCode | **withheld — not evaluated on a released version**; CLI retrieval only |
+| OpenCode | **automatically compatible** — prepended to the first user message of a session by the in-process plugin |
 | Cursor | **withheld — not installed/evaluated**; CLI retrieval only |
 
 Withheld means exactly that: the claim is not made, and no shim, bridge, or

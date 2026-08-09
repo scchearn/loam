@@ -30,13 +30,13 @@ The plugin invokes the absolute private native runtime directly; setup writes
 that path in when the plugin is staged and rewrites it on update. There is no
 shared Node integration in the session path.
 
-**OpenCode collaboration compatibility is withheld — not evaluated on a
-released version.** At the compatibility gate the plugin's context mapper was
-verified in process, but no observable non-interactive boundary on OpenCode
-1.18.15 delivered that context into model context, so the automatic
-collaboration claim is withheld rather than made. Collaboration state is
-reachable through the CLI. The skills and the baseline Loam context above are
-unaffected.
+**OpenCode collaboration compatibility is advertised — observed on OpenCode
+1.18.15.** The plugin's `experimental.chat.messages.transform` prepends the
+context to the first user message of a session, so it reaches the model without
+being written to the session store. That is worth knowing if you go looking for
+it: `opencode export` will not show the injected text, because the transform
+runs on the outbound message list rather than on the persisted session. Ask the
+model instead — that is the surface the context is delivered to.
 
 ## Updating
 
