@@ -719,12 +719,16 @@ impl Federation {
             .stderr(Stdio::piped())
             .spawn()
             .expect("emit spawns");
-        child
+        match child
             .stdin
             .as_mut()
             .expect("emit stdin")
             .write_all(operation.as_bytes())
-            .expect("write the operation");
+        {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(error) => panic!("write the emit operation: {error}"),
+        }
         let started = Instant::now();
         let output = child.wait_with_output().expect("emit completes");
         Run {
@@ -1228,12 +1232,14 @@ fn run_hook(id: &str, stdin: &[u8], root: &Path, skills: &Path, workspace: &Path
         .spawn()
         .expect("hook spawns");
     let started = Instant::now();
-    child
-        .stdin
-        .as_mut()
-        .expect("hook stdin")
-        .write_all(stdin)
-        .expect("write the frame");
+    // Same race as `harness_hook`: a frame the hook refuses before draining
+    // stdin closes the pipe under this write, which is the behaviour rather
+    // than a failure. Every other IO error still fails loudly.
+    match child.stdin.as_mut().expect("hook stdin").write_all(stdin) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("write the hook frame: {error}"),
+    }
     let output = child.wait_with_output().expect("hook completes");
     Run {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),

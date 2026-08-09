@@ -1303,10 +1303,15 @@ mod tests {
         assert!(body.starts_with("<LOAM_IMPORTANT>"));
         assert!(body.ends_with("</LOAM_IMPORTANT>"));
         assert!(body.contains("You have loam"), "{body}");
-        assert!(
-            body.contains("Native runtime command: '/opt/loam/bin/loam'"),
-            "{body}"
-        );
+        // Both spellings are pinned as literals rather than rebuilt from
+        // `quote_runtime`, which would assert the renderer against itself.
+        // Windows carries the PowerShell call operator; Unix does not.
+        let expected = if cfg!(windows) {
+            "Native runtime command: & '/opt/loam/bin/loam'"
+        } else {
+            "Native runtime command: '/opt/loam/bin/loam'"
+        };
+        assert!(body.contains(expected), "{body}");
         assert!(body.contains("## Workspace state"), "{body}");
         assert!(body.contains("Workspace: "), "{body}");
         assert!(

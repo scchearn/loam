@@ -82,12 +82,14 @@ fn run_hook(harness: &str, stdin: &[u8], global_root: &Path, skills_root: &Path)
         .stderr(Stdio::piped())
         .spawn()
         .expect("hook spawns");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(stdin)
-        .expect("write stdin");
+    // A hook that refuses *before* reading stdin — an unknown harness id is
+    // exactly that case — closes the pipe under this write. Losing the race is
+    // the behaviour under test, not a failure; every other IO error still is.
+    match child.stdin.as_mut().expect("stdin").write_all(stdin) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("write the hook frame: {error}"),
+    }
     let output = child.wait_with_output().expect("hook completes");
     Run {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
