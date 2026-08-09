@@ -741,18 +741,40 @@ mod tests {
                 "the read path acquired a write surface: {forbidden}"
             );
         }
-        for operation in [
-            "ProjectAttach",
-            "ProjectDetach",
-            "SessionRegisterInject",
-            "StatusGet",
-        ] {
-            assert!(
-                !production.contains(operation),
-                "the read path named a non-read IPC operation: {operation}"
+        // An ALLOWLIST, not a denylist: enumerate every `Operation::` the read
+        // path names and require each one to be the read. A frozen list of
+        // forbidden variant names goes green the moment a new write operation is
+        // added to the enum — `Operation::FederationEmit` (T5) is exactly that
+        // case — so the invariant is stated as "SnapshotGet is the only
+        // reachable operation" and costs nothing to maintain.
+        let named: Vec<&str> = production
+            .match_indices("Operation::")
+            .map(|(index, _)| {
+                let rest = &production[index + "Operation::".len()..];
+                let end = rest
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+        assert!(
+            !named.is_empty(),
+            "the read path must name the read operation explicitly"
+        );
+        for variant in &named {
+            assert_eq!(
+                *variant, "SnapshotGet",
+                "the read path named a non-read IPC operation: Operation::{variant}"
             );
         }
+        // The import must not pull the enum in under another name either.
         assert!(production.contains("Operation::SnapshotGet"));
+        for reachable in ["crate::connector", "crate::service", "run_service"] {
+            assert!(
+                !production.contains(reachable),
+                "the read path reached the connector's own surface: {reachable}"
+            );
+        }
     }
 
     #[test]

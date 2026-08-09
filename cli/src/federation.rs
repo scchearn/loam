@@ -10,6 +10,8 @@
 use std::io::Read;
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
+
 use crate::enrollment::{self, EnrollmentError, MAX_DESCRIPTOR_BYTES};
 use crate::json::Value;
 
@@ -20,12 +22,14 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         Some("service") => service(args),
         Some("disconnect") => disconnect(args),
         Some("status") => status(args),
+        Some("emit") => emit(args),
         _ => {
             eprintln!(
                 "Usage:\n  \
                  loam federation connect [<workspace>] --json   (reads one descriptor on stdin)\n  \
                  loam federation disconnect <workspace> --global-root <path> [--json]\n  \
-                 loam federation status [<workspace>] --global-root <path> [--json]"
+                 loam federation status [<workspace>] --global-root <path> [--json]\n  \
+                 loam federation emit [<workspace>] --global-root <path> [--json]   (reads one operation on stdin)"
             );
             64
         }
@@ -652,4 +656,767 @@ fn error_json(error: &EnrollmentError) -> Value {
             ]),
         ),
     ])
+}
+
+// ---------------------------------------------------------------------------
+// Slice D T5 — `loam federation emit`
+// ---------------------------------------------------------------------------
+
+/// The Phase-1 vocabulary, closed. A well-formed namespaced extension type is
+/// render-only and is refused here rather than dispatched.
+pub const EMIT_TYPES: [&str; 3] = ["message.reply", "message.ack", "work.report"];
+
+/// Envelope fields whose value is derived in trusted code. A caller-supplied
+/// value for any of them is rejected — never merged — and reported. The scan
+/// deliberately skips the `payload` subtree: that is the caller's own data,
+/// preserved verbatim, and a payload field named `id` is not an authority claim.
+const AUTHORITY_FIELDS: [&str; 13] = [
+    "source",
+    "id",
+    "time",
+    "specversion",
+    "dataschema",
+    "from",
+    "principal_id",
+    "agent_id",
+    "instance_id",
+    "context",
+    "org_id",
+    "project_id",
+    "repository_id",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmitError {
+    NotAnObject,
+    TooLarge,
+    UnsupportedType,
+    MissingCausation,
+    MissingRecipient,
+    MissingStateKey,
+    InvalidWorkState,
+    Unenrolled,
+    AlreadyResponded,
+    ConnectorUnreachable,
+    ConnectorRefused,
+}
+
+impl EmitError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            EmitError::NotAnObject => "operation_not_an_object",
+            EmitError::TooLarge => "operation_too_large",
+            EmitError::UnsupportedType => "unsupported_operation_type",
+            EmitError::MissingCausation => "missing_causation_id",
+            EmitError::MissingRecipient => "missing_recipient",
+            EmitError::MissingStateKey => "missing_state_key",
+            EmitError::InvalidWorkState => "invalid_work_state",
+            EmitError::Unenrolled => "workspace_unenrolled",
+            EmitError::AlreadyResponded => "already_responded",
+            EmitError::ConnectorUnreachable => "connector_unreachable",
+            EmitError::ConnectorRefused => "connector_refused",
+        }
+    }
+
+    fn sysexit(&self) -> i32 {
+        match self {
+            // An already-responded outcome is a correct, expected result, not a
+            // failure: exactly one terminal ships and the others say so.
+            EmitError::AlreadyResponded => 0,
+            EmitError::Unenrolled => 78,
+            EmitError::ConnectorUnreachable | EmitError::ConnectorRefused => 69,
+            _ => 65,
+        }
+    }
+}
+
+/// One derived operation, ready for the connector, plus every override the
+/// caller attempted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DerivedEmit {
+    pub operation: Value,
+    pub refused: Vec<String>,
+    pub causation_id: Option<String>,
+    pub event_id: String,
+}
+
+/// Subtrees the refusal scan does not descend into: they carry caller data whose
+/// field names collide with authority names without claiming any authority. A
+/// recipient's `id` names who to reach, an artifact's `id` names a task, and a
+/// payload is preserved verbatim — none of the three is an envelope claim.
+const CALLER_DATA_SUBTREES: [&str; 3] = ["payload", "to", "artifacts"];
+
+/// Collect every authority-bearing key the caller tried to set, at any depth
+/// outside the caller-data subtrees. Order is stable so the reported list is
+/// deterministic.
+fn refused_overrides(value: &Value, found: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                refused_overrides(item, found);
+            }
+        }
+        Value::Object(entries) => {
+            for (key, child) in entries {
+                if CALLER_DATA_SUBTREES.contains(&key.as_str()) {
+                    continue;
+                }
+                if AUTHORITY_FIELDS.contains(&key.as_str()) && !found.contains(key) {
+                    found.push(key.clone());
+                }
+                refused_overrides(child, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A non-secret, collision-resistant event id in the 26-character upper-case
+/// base32 shape the rest of the corpus uses. Derived, never caller-supplied.
+fn derive_event_id(now: DateTime<Utc>, salt: &str) -> String {
+    use crate::sha256::Sha256;
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut hasher = Sha256::default();
+    hasher.update(
+        now.timestamp_nanos_opt()
+            .unwrap_or_default()
+            .to_le_bytes()
+            .as_slice(),
+    );
+    // The workspace identity key is the per-machine salt: two workspaces
+    // emitting in the same nanosecond still derive different ids, and no
+    // process-spawning capability is needed to get there.
+    hasher.update(salt.as_bytes());
+    hasher
+        .finish()
+        .bytes()
+        .take(26)
+        .map(|byte| ALPHABET[(byte as usize) % ALPHABET.len()] as char)
+        .collect()
+}
+
+/// Derive every authority-bearing field from trusted state and refuse the rest.
+/// Pure: no registry, no socket, no clock of its own.
+pub fn derive_emit(
+    operation: &Value,
+    row: &enrollment::EnrolledRow,
+    now: DateTime<Utc>,
+) -> Result<DerivedEmit, EmitError> {
+    let Value::Object(_) = operation else {
+        return Err(EmitError::NotAnObject);
+    };
+    let operation_type = operation
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !EMIT_TYPES.contains(&operation_type) {
+        return Err(EmitError::UnsupportedType);
+    }
+
+    let mut refused = Vec::new();
+    refused_overrides(operation, &mut refused);
+
+    let event_id = derive_event_id(now, &row.identity_key);
+    let time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let expires_at =
+        (now + chrono::Duration::hours(24)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let causation_id = match operation_type {
+        "work.report" => None,
+        _ => Some(
+            operation
+                .get("causation_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or(EmitError::MissingCausation)?
+                .to_owned(),
+        ),
+    };
+
+    let mut derived = vec![
+        ("type".into(), Value::String(operation_type.to_owned())),
+        // Derived, not accepted: the instance the enrollment binds this
+        // workspace to. The connector binds the principal at publish time.
+        (
+            "source".into(),
+            Value::String(format!("urn:loam:instance:{}", row.instance_id)),
+        ),
+        ("id".into(), Value::String(event_id.clone())),
+        ("time".into(), Value::String(time)),
+        ("expires_at".into(), Value::String(expires_at)),
+        (
+            "summary".into(),
+            Value::String(
+                operation
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+        ),
+        (
+            "payload".into(),
+            operation
+                .get("payload")
+                .cloned()
+                .unwrap_or(Value::Object(Vec::new())),
+        ),
+        (
+            "thread".into(),
+            Value::Object(vec![
+                ("id".into(), Value::String(format!("thread-{event_id}"))),
+                // Correlation is derived: this event's own id. Causation is the
+                // one thread field a caller legitimately supplies — it names the
+                // request being answered, it grants no authority.
+                ("correlation_id".into(), Value::String(event_id.clone())),
+                (
+                    "causation_id".into(),
+                    match &causation_id {
+                        Some(value) => Value::String(value.clone()),
+                        None => Value::Null,
+                    },
+                ),
+            ]),
+        ),
+    ];
+
+    if operation_type == "work.report" {
+        let key = operation
+            .get("state_key")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(EmitError::MissingStateKey)?;
+        let state = operation
+            .get("payload")
+            .and_then(|payload| payload.get("state"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(
+            state,
+            "active" | "blocked" | "ready" | "published" | "abandoned"
+        ) {
+            return Err(EmitError::InvalidWorkState);
+        }
+        derived.push(("state_key".into(), Value::String(key.to_owned())));
+        derived.push((
+            "revision".into(),
+            Value::Number(
+                operation
+                    .get("revision")
+                    .and_then(Value::as_str)
+                    .unwrap_or("1")
+                    .to_owned(),
+            ),
+        ));
+        derived.push((
+            "artifacts".into(),
+            match operation.get("artifacts") {
+                Some(artifacts @ Value::Array(_)) => artifacts.clone(),
+                _ => Value::Array(Vec::new()),
+            },
+        ));
+    } else {
+        let recipients = operation
+            .get("to")
+            .and_then(Value::as_array)
+            .filter(|recipients| {
+                recipients.iter().any(|recipient| {
+                    matches!(
+                        recipient.get("kind").and_then(Value::as_str),
+                        Some("agent" | "principal" | "instance")
+                    ) && recipient
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| !id.is_empty())
+                })
+            })
+            .ok_or(EmitError::MissingRecipient)?;
+        derived.push(("to".into(), Value::Array(recipients.to_vec())));
+    }
+
+    Ok(DerivedEmit {
+        operation: Value::Object(derived),
+        refused,
+        causation_id,
+        event_id,
+    })
+}
+
+/// `loam federation emit [<workspace>] --global-root <path> [--json]`.
+fn emit(mut args: impl Iterator<Item = String>) -> i32 {
+    let mut workspace: Option<PathBuf> = None;
+    let mut global_root: Option<PathBuf> = None;
+    let mut json_output = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => json_output = true,
+            "--global-root" => match args.next() {
+                Some(value) => global_root = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("federation emit: --global-root needs a value");
+                    return 64;
+                }
+            },
+            other if other.starts_with("--") => {
+                eprintln!("federation emit: unknown flag `{other}`");
+                return 64;
+            }
+            other => {
+                if workspace.is_some() {
+                    eprintln!("federation emit: workspace given twice");
+                    return 64;
+                }
+                workspace = Some(PathBuf::from(other));
+            }
+        }
+    }
+    let Some(root) = global_root else {
+        eprintln!("federation emit: --global-root is required");
+        return 64;
+    };
+    let workspace = workspace.unwrap_or_else(|| PathBuf::from("."));
+
+    let bytes = match read_bounded_stdin() {
+        Ok(bytes) => bytes,
+        Err(code) => return code,
+    };
+    match run_emit(&bytes, &workspace, &root, chrono::Utc::now()) {
+        Ok(result) => {
+            if json_output {
+                println!("{}", result.to_json());
+            } else {
+                println!(
+                    "{}: {}",
+                    result
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown"),
+                    result.get("event_id").and_then(Value::as_str).unwrap_or("")
+                );
+            }
+            0
+        }
+        Err(error) => {
+            if json_output {
+                println!("{}", emit_error_json(&error).to_json());
+            } else {
+                eprintln!("federation emit: {}", error.code());
+            }
+            error.sysexit()
+        }
+    }
+}
+
+fn emit_error_json(error: &EmitError) -> Value {
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        ("status".into(), Value::String("error".into())),
+        (
+            "error".into(),
+            Value::Object(vec![("code".into(), Value::String(error.code().into()))]),
+        ),
+    ])
+}
+
+/// Resolve, derive, dedup, forward. The dedup ledger is consulted *before* the
+/// forward, never after: two terminals of one principal answering the same
+/// request must ship exactly one response.
+fn run_emit(
+    bytes: &[u8],
+    workspace: &std::path::Path,
+    global_root: &std::path::Path,
+    now: DateTime<Utc>,
+) -> Result<Value, EmitError> {
+    if bytes.len() > MAX_DESCRIPTOR_BYTES {
+        return Err(EmitError::TooLarge);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| EmitError::NotAnObject)?;
+    let operation = crate::json::parse(text).map_err(|_| EmitError::NotAnObject)?;
+
+    // The vocabulary check runs before the registry is opened: an unlisted or
+    // extension type is refused by name, never dispatched, and never costs a
+    // workspace resolution.
+    if !EMIT_TYPES.contains(
+        &operation
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    ) {
+        return Err(match operation {
+            Value::Object(_) => EmitError::UnsupportedType,
+            _ => EmitError::NotAnObject,
+        });
+    }
+
+    let physical =
+        enrollment::PhysicalWorkspace::resolve(workspace).map_err(|_| EmitError::Unenrolled)?;
+    let key = enrollment::identity_key(&physical);
+    let db_path = global_root.join("loam.sqlite3");
+    let row = {
+        let read = enrollment::open_readonly(&db_path)
+            .map_err(|_| EmitError::Unenrolled)?
+            .ok_or(EmitError::Unenrolled)?;
+        enrollment::lookup(&read, &key)
+            .map_err(|_| EmitError::Unenrolled)?
+            .ok_or(EmitError::Unenrolled)?
+    };
+
+    let derived = derive_emit(&operation, &row, now)?;
+
+    // Before the publish, never after. First-write-wins under BEGIN IMMEDIATE.
+    // The responder identity is this machine's enrolled instance: the ledger is
+    // same-machine only, and cross-machine dedup resolves through Slice B's
+    // inbox-clear.
+    if let Some(causation_id) = &derived.causation_id {
+        let mut write = enrollment::open_writable(&db_path).map_err(|_| EmitError::Unenrolled)?;
+        let outcome = enrollment::record_response(
+            &mut write,
+            causation_id,
+            &row.instance_id,
+            &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .map_err(|_| EmitError::Unenrolled)?;
+        if outcome == enrollment::DedupOutcome::AlreadyResponded {
+            return Err(EmitError::AlreadyResponded);
+        }
+    }
+
+    let response = forward_emit(global_root, &physical.display_path, &derived.operation)?;
+    let refused = derived
+        .refused
+        .iter()
+        .map(|name| Value::String(name.clone()))
+        .collect();
+    Ok(Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        (
+            "status".into(),
+            response
+                .get("status")
+                .cloned()
+                .unwrap_or(Value::String("unknown".into())),
+        ),
+        (
+            "reason".into(),
+            response.get("reason").cloned().unwrap_or(Value::Null),
+        ),
+        ("event_id".into(), Value::String(derived.event_id)),
+        ("project_id".into(), Value::String(row.project_id)),
+        // Every override the caller attempted, reported rather than merged.
+        ("refused_overrides".into(), Value::Array(refused)),
+    ]))
+}
+
+/// Hand the derived operation to the connector. The CLI never opens a broker
+/// connection: this is the only outbound step it performs.
+fn forward_emit(
+    global_root: &std::path::Path,
+    workspace: &str,
+    operation: &Value,
+) -> Result<Value, EmitError> {
+    let request = Value::Object(vec![
+        ("version".into(), Value::Number("1".into())),
+        ("request_id".into(), Value::String("emit".into())),
+        ("workspace".into(), Value::String(workspace.to_owned())),
+        (
+            "operation".into(),
+            Value::String(crate::ipc::Operation::FederationEmit.as_str().to_owned()),
+        ),
+        ("payload".into(), operation.clone()),
+    ])
+    .to_json();
+    let config = crate::ipc::IpcConfig::default();
+    let body = emit_round_trip(&global_root.join("run"), request.as_bytes(), &config)
+        .map_err(|_| EmitError::ConnectorUnreachable)?;
+    let text = std::str::from_utf8(&body).map_err(|_| EmitError::ConnectorRefused)?;
+    let value = crate::json::parse(text).map_err(|_| EmitError::ConnectorRefused)?;
+    match value.get("status").and_then(Value::as_str) {
+        Some("ok") => value
+            .get("result")
+            .cloned()
+            .ok_or(EmitError::ConnectorRefused),
+        _ => Err(EmitError::ConnectorRefused),
+    }
+}
+
+#[cfg(unix)]
+fn emit_round_trip(
+    run_dir: &std::path::Path,
+    request: &[u8],
+    config: &crate::ipc::IpcConfig,
+) -> Result<Vec<u8>, crate::ipc::IpcError> {
+    let mut connection = crate::ipc::unix::connect(run_dir, config.lifecycle_deadline)?;
+    crate::ipc::write_frame(&mut connection, request, config)?;
+    crate::ipc::read_frame(&mut connection, config)
+}
+
+#[cfg(windows)]
+fn emit_round_trip(
+    run_dir: &std::path::Path,
+    request: &[u8],
+    config: &crate::ipc::IpcConfig,
+) -> Result<Vec<u8>, crate::ipc::IpcError> {
+    let sid = crate::ipc::windows::endpoint_sid()?;
+    let name = crate::ipc::windows::pipe_name_for(run_dir, &sid);
+    let mut connection = crate::ipc::windows::connect(&name)?;
+    crate::ipc::write_frame(&mut connection, request, config)?;
+    crate::ipc::read_frame(&mut connection, config)
+}
+
+#[cfg(test)]
+mod emit_tests {
+    //! The outbound contract (Slice D T5): every authority-bearing field is
+    //! derived, every caller override is refused *and reported*, the vocabulary
+    //! is exactly three types, and the dedup ledger is consulted before the
+    //! forward — never after.
+
+    use super::*;
+    use crate::json::Value;
+
+    const CASES: &str = include_str!("../tests/fixtures/mqtt/emit-cases.json");
+
+    fn cases() -> Value {
+        crate::json::parse(CASES).expect("emit corpus parses")
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-24T14:20:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn row() -> enrollment::EnrolledRow {
+        enrollment::EnrolledRow {
+            identity_key: "unix:9:99".into(),
+            org_id: "org-3A1".into(),
+            project_id: "loam".into(),
+            repository_id: "repo-2F8".into(),
+            descriptor_digest: "d".into(),
+            display_path: "/w".into(),
+            instance_id: "instance-02".into(),
+            broker_profile: "p".into(),
+            commit: "84be000000000000000000000000000000000001".into(),
+            capabilities: enrollment::CapabilityRecord {
+                authentication: true,
+                publish: true,
+                subscribe: true,
+                self_receive: true,
+                verified_at: "2026-07-24T14:20:00Z".into(),
+            },
+            remotes: Vec::new(),
+        }
+    }
+
+    /// Merge one override patch onto the base reply, as a caller would.
+    fn patched(base: &Value, patch: &Value) -> Value {
+        let (Value::Object(base), Value::Object(patch)) = (base, patch) else {
+            panic!("both sides must be objects");
+        };
+        let mut merged = base.clone();
+        for (key, value) in patch {
+            merged.retain(|(existing, _)| existing != key);
+            merged.push((key.clone(), value.clone()));
+        }
+        Value::Object(merged)
+    }
+
+    #[test]
+    fn every_accepted_type_derives_and_refuses_nothing() {
+        let corpus = cases();
+        let row = row();
+        for case in corpus.get("accepted").and_then(Value::as_array).unwrap() {
+            let name = case.get("name").and_then(Value::as_str).unwrap();
+            let operation = case.get("operation").unwrap();
+            let derived = derive_emit(operation, &row, now())
+                .unwrap_or_else(|error| panic!("{name}: {:?}", error));
+            assert!(derived.refused.is_empty(), "{name}: {:?}", derived.refused);
+
+            // Every authority field comes from trusted state, not the caller.
+            let field = |key: &str| {
+                derived
+                    .operation
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            assert_eq!(field("source"), "urn:loam:instance:instance-02", "{name}");
+            assert_eq!(field("time"), "2026-07-24T14:20:00Z", "{name}");
+            assert_eq!(field("id"), derived.event_id, "{name}");
+            assert_eq!(derived.event_id.len(), 26, "{name}");
+            // Correlation is derived; causation is the one thread field a
+            // caller legitimately supplies.
+            let thread = derived.operation.get("thread").unwrap();
+            assert_eq!(
+                thread.get("correlation_id").and_then(Value::as_str),
+                Some(derived.event_id.as_str()),
+                "{name}"
+            );
+            let expected = case.get("expect_causation").and_then(Value::as_str);
+            assert_eq!(derived.causation_id.as_deref(), expected, "{name}");
+            assert_eq!(
+                thread.get("causation_id").and_then(Value::as_str),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_authority_override_loses_to_the_derived_value_and_is_reported() {
+        let corpus = cases();
+        let base = corpus.get("base_reply").unwrap();
+        let row = row();
+        for case in corpus.get("overrides").and_then(Value::as_array).unwrap() {
+            let name = case.get("name").and_then(Value::as_str).unwrap();
+            let operation = patched(base, case.get("patch").unwrap());
+            let derived = derive_emit(&operation, &row, now()).expect(name);
+
+            for expected in case.get("refused").and_then(Value::as_array).unwrap() {
+                let expected = expected.as_str().unwrap();
+                assert!(
+                    derived.refused.iter().any(|found| found == expected),
+                    "{name}: `{expected}` was not reported as refused: {:?}",
+                    derived.refused
+                );
+            }
+            // Nothing the caller sent survives into the derived operation.
+            let text = derived.operation.to_json();
+            for forged in [
+                "impostor",
+                "01KFORGEDFORGEDFORGED00001",
+                "2000-01-01",
+                "employee-999",
+                "someone-elses-project",
+                "org-other",
+                "repo-other",
+                "9.9",
+                "urn:loam:schema:anything:1",
+            ] {
+                assert!(!text.contains(forged), "{name}: forged `{forged}` survived");
+            }
+            assert!(text.contains("urn:loam:instance:instance-02"), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_payload_is_caller_data_not_an_authority_claim() {
+        // The refusal scan stops at the payload boundary, or every message
+        // carrying an ordinary `id` field would be reported as an attack.
+        let corpus = cases();
+        let operation = corpus.get("payload_is_not_authority").unwrap();
+        let derived = derive_emit(operation, &row(), now()).expect("derives");
+        assert!(derived.refused.is_empty(), "{:?}", derived.refused);
+        let text = derived.operation.to_json();
+        assert!(
+            text.contains("ticket-7"),
+            "payload was not preserved: {text}"
+        );
+        assert!(text.contains("their-tracker"), "{text}");
+        assert!(text.contains("urn:loam:instance:instance-02"), "{text}");
+    }
+
+    #[test]
+    fn every_type_outside_the_vocabulary_is_refused_with_a_typed_error() {
+        let corpus = cases();
+        let row = row();
+        for case in corpus.get("rejected").and_then(Value::as_array).unwrap() {
+            let name = case.get("name").and_then(Value::as_str).unwrap();
+            let code = case.get("code").and_then(Value::as_str).unwrap();
+            let error = derive_emit(case.get("operation").unwrap(), &row, now()).expect_err(name);
+            assert_eq!(error.code(), code, "{name}");
+        }
+        // A non-object operation never reaches the vocabulary check.
+        assert_eq!(
+            derive_emit(&Value::Array(Vec::new()), &row, now()),
+            Err(EmitError::NotAnObject)
+        );
+    }
+
+    #[test]
+    fn the_vocabulary_is_exactly_three_types() {
+        assert_eq!(EMIT_TYPES.len(), 3);
+        for accepted in ["message.reply", "message.ack", "work.report"] {
+            assert!(EMIT_TYPES.contains(&accepted));
+        }
+    }
+
+    #[test]
+    fn concurrent_responses_from_one_instance_ship_exactly_once() {
+        // `record_response` is first-write-wins under BEGIN IMMEDIATE. The emit
+        // path calls it *before* the forward, so N terminals answering one
+        // request produce one ship and N-1 typed already-responded outcomes.
+        let path = std::env::temp_dir().join(format!(
+            "loam-emit-dedup-{}.sqlite3",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut connection = enrollment::open_writable(&path).unwrap();
+            let stamp = "2026-07-24T14:20:00Z";
+            let mut recorded = 0;
+            let mut already = 0;
+            for _ in 0..8 {
+                match enrollment::record_response(
+                    &mut connection,
+                    "01K6Q6ESWMT48TP1",
+                    "instance-02",
+                    stamp,
+                )
+                .unwrap()
+                {
+                    enrollment::DedupOutcome::Recorded => recorded += 1,
+                    enrollment::DedupOutcome::AlreadyResponded => already += 1,
+                }
+            }
+            assert_eq!(recorded, 1, "exactly one response may ship");
+            assert_eq!(already, 7);
+
+            // A different request from the same instance is a different answer.
+            assert_eq!(
+                enrollment::record_response(
+                    &mut connection,
+                    "01K6Q6ESWMT48TP9",
+                    "instance-02",
+                    stamp
+                )
+                .unwrap(),
+                enrollment::DedupOutcome::Recorded
+            );
+        }
+    }
+
+    #[test]
+    fn an_oversized_operation_is_refused_before_it_is_parsed() {
+        let big = vec![b' '; MAX_DESCRIPTOR_BYTES + 1];
+        let error = run_emit(
+            &big,
+            std::path::Path::new("/nonexistent-workspace"),
+            std::path::Path::new("/nonexistent-root"),
+            now(),
+        )
+        .expect_err("oversize is refused");
+        assert_eq!(error, EmitError::TooLarge);
+    }
+
+    #[test]
+    fn an_unenrolled_workspace_never_reaches_the_connector() {
+        let error = run_emit(
+            br#"{"type":"message.ack","causation_id":"c","to":[{"kind":"instance","id":"i"}],"payload":{}}"#,
+            std::path::Path::new("/nonexistent-workspace"),
+            std::path::Path::new("/nonexistent-root"),
+            now(),
+        )
+        .expect_err("unenrolled is refused");
+        assert_eq!(error, EmitError::Unenrolled);
+        assert_eq!(error.code(), "workspace_unenrolled");
+    }
+
+    #[test]
+    fn an_already_responded_outcome_is_a_typed_result_not_a_failure() {
+        assert_eq!(EmitError::AlreadyResponded.sysexit(), 0);
+        assert_eq!(EmitError::AlreadyResponded.code(), "already_responded");
+    }
 }

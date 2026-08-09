@@ -670,6 +670,36 @@ impl Transport for MqttTransport {
 }
 
 impl MqttTransport {
+    /// Ship one already-validated outbound envelope on the live session. Unlike
+    /// the probe's publish this honors Slice B's retain derivation (state and
+    /// inbox are retained; an event is not) and takes `now` per call, because a
+    /// live session outlives the timestamp it was constructed with.
+    fn publish_outbound(
+        &mut self,
+        envelope: &ValidatedEnvelope,
+        now: DateTime<Utc>,
+    ) -> Result<(), ProbeError> {
+        let (Some(client), Some(connection)) = (self.client.clone(), self.connection.as_mut())
+        else {
+            return Err(ProbeError::PublishDenied);
+        };
+        crate::transport::publish(&client, envelope.clone(), now)
+            .map_err(|_| ProbeError::PublishDenied)?;
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        loop {
+            match await_control(connection, &mut self.pending, deadline) {
+                Some(Packet::PubAck(ack)) => {
+                    return match ack.reason {
+                        PubAckReason::Success | PubAckReason::NoMatchingSubscribers => Ok(()),
+                        _ => Err(ProbeError::PublishDenied),
+                    };
+                }
+                Some(_) => {}
+                None => return Err(ProbeError::PublishDenied),
+            }
+        }
+    }
+
     /// Pump exactly one inbound frame through Slice B's `DeliveryProcessor` and
     /// report the topic together with the delivery outcome.
     ///
@@ -1131,6 +1161,22 @@ pub struct ProjectSessions {
 struct LiveSession {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The session's authenticated identity, captured at CONNACK. This — not
+    /// anything a caller supplies — is what binds `data.from` on an outbound
+    /// emit, which is why `federation emit` forwards a derived operation rather
+    /// than a finished envelope.
+    identity: SessionIdentity,
+    /// Outbound queue drained by the pump thread, which owns the client. The
+    /// CLI never opens a broker connection; the connector owns every publish.
+    outbound: std::sync::mpsc::Sender<ValidatedEnvelope>,
+}
+
+/// What happened to one outbound emit. `NotShipped` is observational: an
+/// unopened session is reported as such, never as a silent success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmitOutcome {
+    Queued,
+    NotShipped(&'static str),
 }
 
 impl ProjectSessions {
@@ -1192,19 +1238,43 @@ impl ProjectSessions {
         }
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (outbound, inbound) = std::sync::mpsc::channel();
         let thread = std::thread::spawn({
             let stop = std::sync::Arc::clone(&stop);
             let snapshots = std::sync::Arc::clone(&self.snapshots);
-            move || pump(transport, roster, snapshots, stop)
+            move || pump(transport, roster, snapshots, stop, inbound)
         });
         self.live.insert(
             row.project_id.clone(),
             LiveSession {
                 stop,
                 thread: Some(thread),
+                identity,
+                outbound,
             },
         );
         SessionState::Live
+    }
+
+    /// The authenticated identity of a project's live session, if one is open.
+    /// The emit path needs it to bind `data.from` before validating.
+    pub fn identity(&self, project_id: &str) -> Option<SessionIdentity> {
+        self.live
+            .get(project_id)
+            .map(|session| session.identity.clone())
+    }
+
+    /// Hand one validated envelope to the project's live session for publishing.
+    /// Refuses honestly when no session is open rather than dropping it.
+    pub fn ship(&self, project_id: &str, envelope: ValidatedEnvelope) -> EmitOutcome {
+        let Some(session) = self.live.get(project_id) else {
+            return EmitOutcome::NotShipped("no-live-session");
+        };
+        match session.outbound.send(envelope) {
+            Ok(()) => EmitOutcome::Queued,
+            // The pump ended; the session is live in the map but not in fact.
+            Err(_) => EmitOutcome::NotShipped("session-ended"),
+        }
     }
 
     /// Stop the project's session, if any. A detached project keeps no session
@@ -1253,8 +1323,16 @@ fn pump(
     roster: PeerRoster,
     snapshots: std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    outbound: std::sync::mpsc::Receiver<ValidatedEnvelope>,
 ) {
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        // Outbound first: an emit the user just made should not wait behind a
+        // full poll interval of inbound traffic.
+        while let Ok(envelope) = outbound.try_recv() {
+            // A refused publish is the connector's problem, not the session's:
+            // one rejected envelope never takes the pump down.
+            let _ = transport.publish_outbound(&envelope, Utc::now());
+        }
         match transport.receive_outcome(PUMP_POLL, Utc::now(), &roster) {
             Ok(Some((topic, outcome))) => {
                 if let Ok(mut store) = snapshots.lock() {
@@ -1470,6 +1548,38 @@ fn dispatch_for_key(
             });
             Ok(register_ack_json(session_id, &row.project_id))
         }
+        Operation::FederationEmit => {
+            // The CLI derived every authority-bearing field except one: the
+            // authenticated principal, which only a live session knows. Bind it
+            // here, validate the finished envelope through Slice A, and hand it
+            // to the session that owns the client. Nothing publishes from the
+            // CLI process.
+            let Some(identity) = state.sessions.identity(&row.project_id) else {
+                return Ok(emit_json(&row, "not-shipped", "no-live-session", ""));
+            };
+            let (document, topic) = outbound_envelope(&request.payload, &row, &identity)
+                .ok_or(ipc::IpcError::InvalidRequest)?;
+            let owned_claims: Vec<String> = if identity.allowed_claims.is_empty() {
+                vec![identity.principal_id.clone()]
+            } else {
+                identity.allowed_claims.clone()
+            };
+            let claims: Vec<&str> = owned_claims.iter().map(String::as_str).collect();
+            let principal = AuthenticatedPrincipal::new(&identity.principal_id, &claims);
+            let validated = crate::envelope::validate(
+                document.as_bytes(),
+                &topic,
+                &principal,
+                &ValidationConfig::default(),
+                Utc::now(),
+            )
+            .map_err(|_| ipc::IpcError::InvalidRequest)?;
+            let event_id = validated.as_envelope().id.clone();
+            match state.sessions.ship(&row.project_id, validated) {
+                EmitOutcome::Queued => Ok(emit_json(&row, "queued", "queued", &event_id)),
+                EmitOutcome::NotShipped(reason) => Ok(emit_json(&row, "not-shipped", reason, "")),
+            }
+        }
         Operation::SnapshotGet => {
             // A read. Enrollment and project binding were already proven above,
             // so an unenrolled or cross-project caller never reaches here. The
@@ -1500,6 +1610,164 @@ fn attach_enrolled(db_path: &Path, state: &mut ConnectorState) {
 /// the store, and deliberately body-shaped: `source`, `type`, `summary`, `to`,
 /// `context`, sender attribution, and the preserved payload — never envelope
 /// bytes, a credential, or a raw remote URL.
+/// The emit projection. `status` is observational: an operation that reached no
+/// live session is reported as not shipped, never as sent.
+fn emit_json(
+    row: &crate::enrollment::EnrolledRow,
+    status: &str,
+    reason: &str,
+    event_id: &str,
+) -> crate::json::Value {
+    use crate::json::Value;
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        ("status".into(), Value::String(status.to_owned())),
+        ("reason".into(), Value::String(reason.to_owned())),
+        ("project_id".into(), Value::String(row.project_id.clone())),
+        ("event_id".into(), Value::String(event_id.to_owned())),
+    ])
+}
+
+/// Build the outbound CloudEvents document and its topic from the CLI's derived
+/// operation plus the live session's authenticated identity. Returns `None` for
+/// a structurally impossible operation; everything else is Slice A's job to
+/// refuse when the document is validated.
+fn outbound_envelope(
+    operation: &crate::json::Value,
+    row: &crate::enrollment::EnrolledRow,
+    identity: &SessionIdentity,
+) -> Option<(String, String)> {
+    use crate::json::Value;
+    let string = |key: &str| operation.get(key).and_then(Value::as_str).unwrap_or("");
+    let owned = |key: &str| operation.get(key).cloned().unwrap_or(Value::Null);
+
+    let (message_type, dataschema, class, intent) = match string("type") {
+        "message.reply" => (
+            "io.loam.message",
+            "urn:loam:schema:message:1",
+            "inbox",
+            "response",
+        ),
+        "message.ack" => (
+            "io.loam.message",
+            "urn:loam:schema:message:1",
+            "inbox",
+            "ack",
+        ),
+        "work.report" => (
+            "io.loam.work.state",
+            "urn:loam:schema:work-state:1",
+            "latest-state",
+            "inform",
+        ),
+        _ => return None,
+    };
+
+    let event_id = string("id");
+    let prefix = format!("loam/v1/{}/{}", row.org_id, row.project_id);
+    let (delivery, to, topic) = if class == "inbox" {
+        let recipients = operation.get("to").and_then(Value::as_array)?;
+        let first = recipients.iter().find(|recipient| {
+            matches!(
+                recipient.get("kind").and_then(Value::as_str),
+                Some("agent" | "principal" | "instance")
+            )
+        })?;
+        let kind = first.get("kind").and_then(Value::as_str)?;
+        let id = first.get("id").and_then(Value::as_str)?;
+        (
+            Value::Object(vec![("class".into(), Value::String("inbox".into()))]),
+            Value::Array(recipients.to_vec()),
+            format!(
+                "{prefix}/inbox/{kind}/{id}/{}/{event_id}",
+                identity.instance_id
+            ),
+        )
+    } else {
+        let key = operation.get("state_key").and_then(Value::as_str)?;
+        let revision = operation.get("revision").and_then(Value::as_str)?;
+        (
+            Value::Object(vec![
+                ("class".into(), Value::String("latest-state".into())),
+                ("key".into(), Value::String(key.to_owned())),
+                ("revision".into(), Value::Number(revision.to_owned())),
+            ]),
+            Value::Array(vec![Value::Object(vec![
+                ("kind".into(), Value::String("project".into())),
+                ("id".into(), Value::String(row.project_id.clone())),
+            ])]),
+            format!("{prefix}/state/{}/{key}", identity.instance_id),
+        )
+    };
+
+    let mut context = vec![
+        ("org_id".into(), Value::String(row.org_id.clone())),
+        ("project_id".into(), Value::String(row.project_id.clone())),
+        (
+            "repository_id".into(),
+            Value::String(row.repository_id.clone()),
+        ),
+        (
+            "git".into(),
+            Value::Object(vec![("base_oid".into(), Value::String(row.commit.clone()))]),
+        ),
+    ];
+    context.push((
+        "artifacts".into(),
+        match operation.get("artifacts") {
+            Some(artifacts @ Value::Array(_)) => artifacts.clone(),
+            _ => Value::Array(Vec::new()),
+        },
+    ));
+
+    let document = Value::Object(vec![
+        ("specversion".into(), Value::String("1.0".into())),
+        ("id".into(), Value::String(event_id.to_owned())),
+        ("source".into(), Value::String(string("source").to_owned())),
+        ("type".into(), Value::String(message_type.to_owned())),
+        ("time".into(), Value::String(string("time").to_owned())),
+        (
+            "datacontenttype".into(),
+            Value::String("application/json".into()),
+        ),
+        ("dataschema".into(), Value::String(dataschema.to_owned())),
+        (
+            "data".into(),
+            Value::Object(vec![
+                ("intent".into(), Value::String(intent.to_owned())),
+                (
+                    "from".into(),
+                    Value::Object(vec![
+                        (
+                            "principal_id".into(),
+                            Value::String(identity.principal_id.clone()),
+                        ),
+                        ("agent_id".into(), Value::String(identity.agent_id.clone())),
+                        (
+                            "instance_id".into(),
+                            Value::String(identity.instance_id.clone()),
+                        ),
+                    ]),
+                ),
+                ("to".into(), to),
+                ("delivery".into(), delivery),
+                ("thread".into(), owned("thread")),
+                ("context".into(), Value::Object(context)),
+                (
+                    "expires_at".into(),
+                    Value::String(string("expires_at").to_owned()),
+                ),
+                (
+                    "summary".into(),
+                    Value::String(string("summary").to_owned()),
+                ),
+                ("payload".into(), owned("payload")),
+            ]),
+        ),
+    ]);
+    Some((document.to_json(), topic))
+}
+
 fn snapshot_json(project_id: &str, items: &[SnapshotItem]) -> crate::json::Value {
     use crate::json::Value;
     let rendered = items

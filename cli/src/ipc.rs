@@ -75,6 +75,12 @@ pub enum Operation {
     /// mutates nothing, persists nothing, and carries no envelope bytes,
     /// credential, or raw remote URL back to the caller.
     SnapshotGet,
+    /// Forward one already-derived outbound operation for the connector to
+    /// publish (Slice D T5). A named variant beside the read: the CLI derives
+    /// every authority-bearing field and never opens a broker connection, and
+    /// the connector binds `data.from` from its live session's authenticated
+    /// identity before anything is validated or shipped.
+    FederationEmit,
 }
 
 impl Operation {
@@ -85,6 +91,7 @@ impl Operation {
             "project.detach" => Some(Operation::ProjectDetach),
             "session.register-inject" => Some(Operation::SessionRegisterInject),
             "federation.snapshot" => Some(Operation::SnapshotGet),
+            "federation.emit" => Some(Operation::FederationEmit),
             _ => None,
         }
     }
@@ -96,6 +103,7 @@ impl Operation {
             Operation::ProjectDetach => "project.detach",
             Operation::SessionRegisterInject => "session.register-inject",
             Operation::SnapshotGet => "federation.snapshot",
+            Operation::FederationEmit => "federation.emit",
         }
     }
 }

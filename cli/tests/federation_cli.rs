@@ -317,3 +317,88 @@ fn git(args: &[&str], cwd: Option<&Path>) -> String {
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
+
+// ---------------------------------------------------------------------------
+// Slice D T5 — `loam federation emit`
+// ---------------------------------------------------------------------------
+
+fn run_emit(workspace: Option<&Path>, global_root: &Path, stdin: &[u8]) -> (i32, String, String) {
+    let mut command = Command::new(binary());
+    command.arg("federation").arg("emit");
+    if let Some(ws) = workspace {
+        command.arg(ws);
+    }
+    command
+        .arg("--global-root")
+        .arg(global_root)
+        .arg("--json")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("emit spawns");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(stdin)
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("emit completes");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn emit_refuses_an_extension_type_with_a_typed_error_rather_than_dispatching() {
+    let root = temp_dir("emit-extension");
+    let operation = br#"{"type":"com.example.deploy.request","causation_id":"c-1","summary":"Deploy please.","to":[{"kind":"instance","id":"instance-01"}],"payload":{}}"#;
+    // The workspace is this repository: real, Git, and deliberately unenrolled
+    // in the throwaway global root.
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let (code, stdout, _stderr) = run_emit(Some(&workspace), &root, operation);
+    assert_eq!(code, 65, "{stdout}");
+    assert!(
+        stdout.contains("unsupported_operation_type"),
+        "an extension type must be refused by name, not dispatched: {stdout}"
+    );
+    // The vocabulary check runs before anything is reached: no registry was
+    // created and no endpoint was opened.
+    assert!(!root.join("loam.sqlite3").exists());
+    assert!(!root.join("run").exists());
+}
+
+#[test]
+fn emit_rejects_an_unenrolled_workspace_before_it_reaches_the_connector() {
+    let root = temp_dir("emit-unenrolled");
+    let operation = br#"{"type":"message.ack","causation_id":"c-1","summary":"Received.","to":[{"kind":"instance","id":"instance-01"}],"payload":{"action":"collaboration.ack","params":{}}}"#;
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let (code, stdout, _stderr) = run_emit(Some(&workspace), &root, operation);
+    assert_eq!(code, 78, "{stdout}");
+    assert!(stdout.contains("workspace_unenrolled"), "{stdout}");
+    assert!(!root.join("run").exists(), "emit opened an endpoint");
+}
+
+#[test]
+fn emit_requires_a_global_root_and_reports_its_usage() {
+    let mut command = Command::new(binary());
+    let output = command
+        .arg("federation")
+        .arg("emit")
+        .stdin(Stdio::null())
+        .output()
+        .expect("emit runs");
+    assert_eq!(output.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--global-root"));
+}
+
+#[test]
+fn emit_appears_in_the_federation_usage() {
+    let output = Command::new(binary())
+        .arg("federation")
+        .output()
+        .expect("federation runs");
+    let usage = String::from_utf8_lossy(&output.stderr);
+    assert!(usage.contains("loam federation emit"), "{usage}");
+}
