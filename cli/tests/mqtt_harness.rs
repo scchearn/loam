@@ -17,6 +17,14 @@
 //! touched — the broker here is a throwaway local one.
 //!
 //! Every absence assertion carries a positive control in the same run.
+//!
+//! Unix-only, and deliberately so rather than by omission: the connector's
+//! endpoint here is a Unix domain socket, `connector::serve_one` exists only on
+//! that platform, and the enrollment identity is a device/inode pair. The
+//! Windows endpoint is a named pipe with its own owner proof and its own gate —
+//! the `windows-ipc-owner` and `service-smoke (windows-2022)` lanes — so nothing
+//! is left unproven there by this file's absence.
+#![cfg(unix)]
 
 // The broker fixture is Slice B's; this gate uses part of it and never edits it.
 #[allow(dead_code)]
