@@ -2291,6 +2291,11 @@ mod tests {
             "codegraph.rs",
             "datecheck.rs",
             "enrollment.rs",
+            // Slice D T2: the harness read path reads the installed skill body,
+            // `install.json`, and the workspace state that the retired Node
+            // integration used to assemble. Reads only — it opens no file for
+            // writing and the registry connection it takes is read-only.
+            "harness.rs",
             "hooks.rs",
             "ipc/unix.rs",
             "markdown.rs",

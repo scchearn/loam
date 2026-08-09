@@ -203,6 +203,45 @@ pub fn bind(run_dir: &Path) -> Result<OwnedEndpoint, IpcError> {
     })
 }
 
+/// Open the connector's endpoint as a client, proving the *server's* effective
+/// UID before a byte is written — the same peer-credential check the server runs
+/// on us, so a socket planted by another user is refused rather than talked to.
+/// The deadline bounds both directions: a connector that stops answering costs
+/// the caller that long, never the session.
+pub fn connect(run_dir: &Path, deadline: std::time::Duration) -> Result<ClientConn, IpcError> {
+    let stream = UnixStream::connect(run_dir.join(SOCKET_NAME)).map_err(|_| IpcError::Internal)?;
+    verify_peer(&stream)?;
+    stream
+        .set_read_timeout(Some(deadline))
+        .map_err(|_| IpcError::Internal)?;
+    stream
+        .set_write_timeout(Some(deadline))
+        .map_err(|_| IpcError::Internal)?;
+    Ok(ClientConn { stream })
+}
+
+/// The client half. Like [`VerifiedConn`] it exposes only `Read`/`Write`, so no
+/// caller outside this module ever names a socket type.
+pub struct ClientConn {
+    stream: UnixStream,
+}
+
+impl std::io::Read for ClientConn {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.read(buffer)
+    }
+}
+
+impl std::io::Write for ClientConn {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 fn prepare_run_dir(run_dir: &Path) -> Result<(), IpcError> {
     match std::fs::symlink_metadata(run_dir) {
         Ok(meta) => {

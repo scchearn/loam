@@ -1,0 +1,42 @@
+{
+  "comment": "Slice D T2 hook-frame corpus. `harnesses` is the closed id set and the response key each one expects — a null key means the harness takes the plain context body (OpenCode's in-process mapper; Codex until the T7 gate confirms its shape). `frames` are well-formed native session-event payloads, one per harness shape, with WORKSPACE substituted for the test's Git workspace. `malformed` frames are byte sequences the read path must refuse with a bounded code, rendering no payload.",
+  "harnesses": [
+    { "id": "opencode", "key": null },
+    { "id": "claude", "key": "additionalContext" },
+    { "id": "codex", "key": null },
+    { "id": "cursor", "key": "additional_context" }
+  ],
+  "frames": [
+    {
+      "name": "claude-session-start",
+      "text": "{\"session_id\":\"s-1\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"WORKSPACE\"}"
+    },
+    {
+      "name": "cursor-session-start",
+      "text": "{\"conversation_id\":\"c-1\",\"workspaceRoot\":\"WORKSPACE\"}"
+    },
+    {
+      "name": "opencode-transform",
+      "text": "{\"workspace\":{\"root\":\"WORKSPACE\"}}"
+    },
+    {
+      "name": "codex-plugin-event",
+      "text": "{\"session\":{\"cwd\":\"WORKSPACE\"}}"
+    },
+    {
+      "name": "no-root-reported",
+      "text": "{}"
+    },
+    {
+      "name": "absent-frame",
+      "text": ""
+    }
+  ],
+  "malformed": [
+    { "name": "truncated-json", "text": "{not json", "code": "frame_not_json" },
+    { "name": "array-frame", "text": "[1,2]", "code": "frame_not_an_object" },
+    { "name": "bare-string-frame", "text": "\"cwd\"", "code": "frame_not_an_object" },
+    { "name": "non-utf8", "bytes": [123, 34, 99, 34, 58, 34, 255, 254, 34, 125], "code": "frame_not_utf8" },
+    { "name": "oversized", "repeat_byte": 120, "repeat_count": 262145, "code": "frame_too_large" }
+  ]
+}

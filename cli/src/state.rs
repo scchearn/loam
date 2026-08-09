@@ -44,7 +44,7 @@ fn usage() {
     eprintln!("Usage: loam state [--fast] <workspace-root>");
 }
 
-fn aggregate(workspace: &Path, fast: bool) -> String {
+pub(crate) fn aggregate(workspace: &Path, fast: bool) -> String {
     let Some(wiki_root) = resolve_wiki_root(workspace) else {
         return minimal_state();
     };
