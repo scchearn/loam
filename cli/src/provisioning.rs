@@ -660,7 +660,28 @@ pub fn configured_roster_root() -> Result<std::path::PathBuf, &'static str> {
 /// a pattern.
 fn is_wildcard(entry: &str) -> bool {
     let trimmed = entry.trim();
-    trimmed == "+" || trimmed.contains('*') || trimmed.contains('#')
+    // Bare only, for the same reason `+` is: an entry that merely *contains*
+    // one of these bytes is an id this reader does not recognize, not a pattern,
+    // and refusing the whole roster for it is the mirror of the false positive
+    // that would have locked out `sam+loam@example.test`.
+    trimmed == "+" || trimmed == "*" || trimmed == "#"
+}
+
+/// One path atom: a name that can only ever resolve *inside* the root it is
+/// joined to. An org or project id is caller-adjacent data that reaches this
+/// reader from an enrollment row, and enrollment bounds its length and refuses
+/// control characters — it does not refuse separators or `..`. Joining one
+/// unchecked would let `../victim-org/their-project` read another tenant's
+/// roster, and an absolute id would discard the root entirely, since `join`
+/// silently replaces rather than appends. This is the authorization boundary,
+/// so the scope is validated before it becomes a path.
+fn is_path_atom(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains('\0')
 }
 
 /// Read one list of bare ids. `None` means the file does not describe a roster
@@ -692,6 +713,9 @@ pub fn read_roster(
     org_id: &str,
     project_id: &str,
 ) -> Result<crate::connector::PeerRoster, &'static str> {
+    if !is_path_atom(org_id) || !is_path_atom(project_id) {
+        return Err(reason::ROSTER_MALFORMED);
+    }
     let path = root.join(org_id).join(format!("{project_id}.json"));
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Err(reason::ROSTER_ABSENT);
@@ -699,6 +723,20 @@ pub fn read_roster(
     let Ok(document) = crate::json::parse(&text) else {
         return Err(reason::ROSTER_MALFORMED);
     };
+    // A repeated key is refused rather than first-wins. The shared parser keeps
+    // every occurrence and reads the first, so a second `principals` narrowing
+    // the first would be silently ignored — a half-admit wearing a whole
+    // roster's shape.
+    let crate::json::Value::Object(fields) = &document else {
+        return Err(reason::ROSTER_MALFORMED);
+    };
+    let mut names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
+    let written = names.len();
+    names.sort_unstable();
+    names.dedup();
+    if names.len() != written {
+        return Err(reason::ROSTER_MALFORMED);
+    }
     let (Some(principals), Some(origins)) = (
         bare_ids(document.get("principals")),
         bare_ids(document.get("origins")),
@@ -749,7 +787,16 @@ pub fn resolve(
     let credentials = ProvisionFailure::Credentials;
     let (host, port) = split_endpoint(&row.broker_endpoint).map_err(credentials)?;
     let backend = configured_backend()?;
-    let material = resolve_credentials(&backend, &row.credential_ref, row.ca_ref.as_deref(), None)?;
+    let material = resolve_credentials(
+        &backend,
+        &row.credential_ref,
+        row.ca_ref.as_deref(),
+        // The conventional trust-bundle override, and the first rung the search
+        // documents. Reading it here is what makes that rung real: passing
+        // `None` left the documented override unconsulted, which the
+        // two-instance tier caught by failing to trust its own fixture CA.
+        std::env::var("SSL_CERT_FILE").ok().as_deref(),
+    )?;
 
     // Who this session is, read from the certificate the broker will
     // authenticate and from nothing the caller can influence.
@@ -1082,10 +1129,26 @@ mod tests {
             let truncated = pem(&whole[..cut]);
             let _ = certificate_subject(&truncated);
         }
-        // And a length header claiming more than the buffer holds.
-        let mut lying = whole.clone();
-        lying[1] = 0x7f;
-        assert!(certificate_subject(&pem(&lying)).is_err() || lying.len() > 0x81);
+        // A length header claiming *more* than the buffer holds. Asserted
+        // unconditionally: an earlier form of this hedged behind `|| the cert is
+        // long`, which is always true, so it proved nothing. The outer length is
+        // long-form here, so raising its high byte claims roughly 64 KiB more
+        // than exists.
+        let mut lying = certificate_der("Loam MQTT Test CA", Some("sam@example.test"), None, true);
+        if lying[1] < 0x80 {
+            let claimed = 0x7f_usize;
+            assert!(
+                claimed > lying.len() - 2,
+                "the doctored length must claim more than the buffer holds"
+            );
+            lying[1] = 0x7f;
+        } else {
+            lying[2] = lying[2].wrapping_add(1);
+        }
+        assert!(
+            certificate_subject(&pem(&lying)).is_err(),
+            "a length claiming more than the buffer holds must be refused"
+        );
     }
 
     #[test]
@@ -1385,6 +1448,58 @@ mod tests {
         );
         assert_eq!(
             read_roster(&root, "acme", "partial").map(|r| r.principals),
+            Err(reason::ROSTER_MALFORMED)
+        );
+
+        // Cross-tenant traversal: an org or project id is enrollment data, and
+        // enrollment bounds its length and refuses control characters but not
+        // separators. Joined unchecked, each of these would read a roster
+        // outside this project's scope — the first another tenant's, the second
+        // and third somewhere else on the filesystem entirely.
+        let elsewhere = temp_dir("roster-elsewhere");
+        std::fs::create_dir_all(elsewhere.join("victim")).expect("victim scope is creatable");
+        std::fs::write(
+            elsewhere.join("victim").join("their-project.json"),
+            r#"{"principals":["their-principal"],"origins":["their-instance"]}"#,
+        )
+        .expect("victim roster is writable");
+        for (org, project) in [
+            ("acme", "../victim/their-project"),
+            ("..", "victim/their-project"),
+            (elsewhere.to_string_lossy().as_ref(), "victim/their-project"),
+            ("acme/..", "ordinary"),
+            ("", "ordinary"),
+            (".", "ordinary"),
+        ] {
+            let escaped = read_roster(&root, org, project);
+            assert_eq!(
+                escaped,
+                Err(reason::ROSTER_MALFORMED),
+                "{org}/{project} must not resolve outside this project's scope"
+            );
+        }
+        // Positive control in the same run: an ordinary scope still resolves,
+        // so the refusals above are the traversal and not a broken reader.
+        write_roster(
+            &root,
+            "acme",
+            "ordinary",
+            r#"{"principals":["ada@example.test"],"origins":["instance-02"]}"#,
+        );
+        assert!(read_roster(&root, "acme", "ordinary").is_ok());
+        let _ = std::fs::remove_dir_all(elsewhere);
+
+        // A covering key is refused rather than first-wins: the shared parser
+        // keeps both and reads the first, so a second `principals` that narrows
+        // the first would be silently ignored.
+        write_roster(
+            &root,
+            "acme",
+            "covering",
+            r#"{"principals":["broad@example.test"],"origins":["instance-02"],"principals":["narrow@example.test"]}"#,
+        );
+        assert_eq!(
+            read_roster(&root, "acme", "covering").map(|r| r.principals),
             Err(reason::ROSTER_MALFORMED)
         );
 

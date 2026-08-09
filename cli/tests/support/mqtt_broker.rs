@@ -167,6 +167,15 @@ impl BrokerFixture {
         read_file(&self.root.join("client.crt"))
     }
 
+    /// The same principal, with a given name in its subject.
+    pub fn named_client_certificate(&self) -> Result<Vec<u8>, String> {
+        read_file(&self.root.join("client-named.crt"))
+    }
+
+    pub fn named_client_key(&self) -> Result<Vec<u8>, String> {
+        read_file(&self.root.join("client-named.key"))
+    }
+
     pub fn client_key(&self) -> Result<Vec<u8>, String> {
         read_file(&self.root.join("client.key"))
     }
@@ -654,7 +663,53 @@ fn write_certificates(openssl: &Path, root: &Path) -> Result<(), String> {
         ],
         "sign client certificate",
     )?;
-    for name in ["ca.key", "server.key", "client.key"] {
+    // A second client certificate with the *same* common name and a given name
+    // added. Same CN means the same broker principal and therefore no ACL
+    // change; the given name gives the display-name control its other half, and
+    // the pair is the real two-machine shape — one person, one email, one
+    // principal, two nodes distinguished only by their client id.
+    openssl_checked(
+        openssl,
+        root,
+        &[
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-nodes",
+            "-subj",
+            "/GN=Ada Lovelace/CN=mtls-actor",
+            "-keyout",
+            "client-named.key",
+            "-out",
+            "client-named.csr",
+        ],
+        "create named client certificate request",
+    )?;
+    openssl_checked(
+        openssl,
+        root,
+        &[
+            "x509",
+            "-req",
+            "-in",
+            "client-named.csr",
+            "-CA",
+            "ca.crt",
+            "-CAkey",
+            "ca.key",
+            "-CAcreateserial",
+            "-days",
+            "2",
+            "-sha256",
+            "-extfile",
+            "client.ext",
+            "-out",
+            "client-named.crt",
+        ],
+        "sign named client certificate",
+    )?;
+    for name in ["ca.key", "server.key", "client.key", "client-named.key"] {
         set_private_permissions(&root.join(name), false)?;
     }
     Ok(())

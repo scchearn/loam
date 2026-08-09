@@ -1,3 +1,5 @@
+// The shared fixture grows for other tiers; this one uses part of it.
+#[allow(dead_code)]
 #[path = "support/mqtt_broker.rs"]
 mod mqtt_broker;
 
