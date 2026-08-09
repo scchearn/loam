@@ -197,6 +197,12 @@ fn the_same_snapshot_produces_one_body_across_all_four_harnesses() {
         assert_eq!(run.status, 0, "{id}: {}", run.stderr);
         bodies.push(body_of(harness, &run.stdout));
     }
+    // Equality alone would pass on four identically-empty bodies.
+    assert!(
+        bodies[0].contains("SKILL-BODY-MARKER"),
+        "no baseline in the rendered body: {:?}",
+        bodies[0]
+    );
     // One shared renderer: only the envelope key differs, never the text.
     assert!(
         bodies.windows(2).all(|pair| pair[0] == pair[1]),
