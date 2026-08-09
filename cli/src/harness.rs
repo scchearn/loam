@@ -634,13 +634,28 @@ fn render_item(
     // key below reads a raw field, and it is compared, never rendered.
     let raw_type = clean_text(item.get("type").and_then(Value::as_str).unwrap_or(""), 256);
     let item_type = sanitize_untrusted(&raw_type, 256);
-    let sender = sanitize_untrusted(
+    let principal = sanitize_untrusted(
         item.get("from")
             .and_then(|from| from.get("principal_id"))
             .and_then(Value::as_str)
             .unwrap_or(""),
         256,
     );
+    // The sender's given name, from their authenticated certificate. Shown
+    // beside the principal id and never instead of it: the id is the identity,
+    // and a name rendered alone is an impersonation surface.
+    let display_name = sanitize_untrusted(
+        item.get("from")
+            .and_then(|from| from.get("display_name"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        128,
+    );
+    let sender = if display_name.trim().is_empty() {
+        principal
+    } else {
+        format!("{display_name} <{principal}>")
+    };
     let source = sanitize_untrusted(
         item.get("source").and_then(Value::as_str).unwrap_or(""),
         256,
@@ -1526,6 +1541,10 @@ mod render_tests {
                     ),
                     ("agent_id".into(), pick("from.agent_id", "agent-2")),
                     (
+                        "display_name".into(),
+                        pick("from.display_name", "Ada Lovelace"),
+                    ),
+                    (
                         "instance_id".into(),
                         pick("from.instance_id", "instance-02"),
                     ),
@@ -1541,7 +1560,7 @@ mod render_tests {
     /// Every sender-derived string that lands in the framed body. The list is
     /// the point: the original defect was that `summary` was the only field
     /// treated as hostile, so the invariant has to be exercised per field.
-    const SENDER_DERIVED_FIELDS: [&str; 11] = [
+    const SENDER_DERIVED_FIELDS: [&str; 12] = [
         "source",
         "type",
         "summary",
@@ -1553,6 +1572,7 @@ mod render_tests {
         "from.principal_id",
         "from.agent_id",
         "from.instance_id",
+        "from.display_name",
         // payload.state is rendered for a work claim and was the escape.
     ];
 
@@ -1585,6 +1605,40 @@ mod render_tests {
                 "`{field}` lost its marker:\n{line}"
             );
         }
+    }
+
+    #[test]
+    fn a_display_name_is_shown_beside_the_principal_and_never_instead_of_it() {
+        // The name is cosmetic; the principal id is the identity. Rendering the
+        // name *instead* would let a chosen given name impersonate a colleague,
+        // so both are always shown.
+        let allowlist = load_allowlist(&allowlist_path());
+        let named = render_item(&item_with_hostile("none"), 4096, &allowlist);
+        assert!(
+            named.contains("Ada Lovelace") && named.contains("employee-77"),
+            "a display name must accompany the principal id, not replace it:\n{named}"
+        );
+
+        // Control: an absent given name renders the principal id alone rather
+        // than an empty pair of brackets or a defaulted name. A certificate
+        // without a GN still authenticates, so this is the common case.
+        let mut anonymous = item_with_hostile("none");
+        if let Value::Object(fields) = &mut anonymous {
+            if let Some((_, Value::Object(from))) =
+                fields.iter_mut().find(|(name, _)| name == "from")
+            {
+                from.retain(|(name, _)| name != "display_name");
+            }
+        }
+        let line = render_item(&anonymous, 4096, &allowlist);
+        assert!(
+            line.contains("employee-77") && !line.contains("Ada Lovelace"),
+            "an absent display name must degrade to the principal id:\n{line}"
+        );
+        assert!(
+            !line.contains("()") && !line.contains("  "),
+            "an absent display name must leave no empty slot behind:\n{line}"
+        );
     }
 
     #[test]

@@ -325,6 +325,10 @@ pub struct Producer {
     pub principal_id: String,
     pub agent_id: String,
     pub instance_id: String,
+    /// The sender's given name, taken from their authenticated certificate.
+    /// Provenance, never authority: it binds nothing and is rendered through
+    /// the untrusted-text sanitizer like every other sender-derived string.
+    pub display_name: Option<String>,
     pub runtime: Option<String>,
     extra: Vec<(String, Value)>,
 }
@@ -495,11 +499,13 @@ impl Producer {
         let principal_id = take_string(&mut fields, "principal_id")?;
         let agent_id = take_string(&mut fields, "agent_id")?;
         let instance_id = take_string(&mut fields, "instance_id")?;
+        let display_name = take_optional_string(&mut fields, "display_name")?;
         let runtime = take_optional_string(&mut fields, "runtime")?;
         Some(Self {
             principal_id,
             agent_id,
             instance_id,
+            display_name,
             runtime,
             extra: fields,
         })
@@ -510,6 +516,9 @@ impl Producer {
         push_string(&mut fields, "principal_id", self.principal_id);
         push_string(&mut fields, "agent_id", self.agent_id);
         push_string(&mut fields, "instance_id", self.instance_id);
+        if let Some(display_name) = self.display_name {
+            push_string(&mut fields, "display_name", display_name);
+        }
         if let Some(runtime) = self.runtime {
             push_string(&mut fields, "runtime", runtime);
         }
@@ -928,7 +937,13 @@ fn validate_producer(data: &[(String, Value)]) -> Result<(), Violation> {
     let producer = field(data, "from")
         .and_then(as_object)
         .ok_or(Violation::InvalidEnvelopeShape)?;
-    for name in ["principal_id", "agent_id", "instance_id", "runtime"] {
+    for name in [
+        "principal_id",
+        "agent_id",
+        "instance_id",
+        "display_name",
+        "runtime",
+    ] {
         if let Some(value) = field(producer, name) {
             if value.as_str().is_none() {
                 return Err(Violation::InvalidEnvelopeShape);
@@ -1845,6 +1860,74 @@ mod tests {
     }
 
     #[test]
+    fn the_display_name_round_trips_and_is_never_written_twice() {
+        // The display name is the authenticated certificate's given name. It is
+        // provenance, never authority, so it follows `runtime`: optional on the
+        // wire, absent when absent, and never defaulted into existence.
+        let mut root = crate::json::parse(fixture("work-state")).expect("fixture parses");
+        set_display_name(&mut root, Some("Ada Lovelace"));
+        let document = root.to_json();
+
+        let config = ValidationConfig::default();
+        let now = DateTime::parse_from_rfc3339("2026-07-24T14:21:00Z")
+            .expect("test time should parse")
+            .with_timezone(&Utc);
+        let validated = validate(
+            document.as_bytes(),
+            topic_for("work-state"),
+            &authenticated_principal(),
+            &config,
+            now,
+        )
+        .expect("a display name must not change the verdict");
+        assert_eq!(
+            validated.as_envelope().data.from.display_name.as_deref(),
+            Some("Ada Lovelace")
+        );
+
+        // Typed, not carried in `extra`: a field read into both would serialize
+        // twice and the second copy would win at the far end.
+        let written = validated.as_envelope().to_json();
+        assert_eq!(
+            written.matches("\"display_name\"").count(),
+            1,
+            "the display name must be written exactly once: {written}"
+        );
+
+        // Control: absent stays absent rather than becoming an empty string.
+        let absent = validate(
+            fixture("work-state").as_bytes(),
+            topic_for("work-state"),
+            &authenticated_principal(),
+            &config,
+            now,
+        )
+        .expect("the unmodified fixture still validates");
+        assert!(absent.as_envelope().data.from.display_name.is_none());
+        assert!(!absent.as_envelope().to_json().contains("display_name"));
+    }
+
+    #[test]
+    fn a_non_string_display_name_is_refused_like_every_other_identity_field() {
+        // It is sender-supplied text, so its shape is validated with the rest of
+        // the producer rather than trusted because it is only cosmetic.
+        let mut root = crate::json::parse(fixture("work-state")).expect("fixture parses");
+        set_display_name_value(&mut root, Some(Value::Number("7".into())));
+        let config = ValidationConfig::default();
+        let now = DateTime::parse_from_rfc3339("2026-07-24T14:21:00Z")
+            .expect("test time should parse")
+            .with_timezone(&Utc);
+        assert!(validate(
+            root.to_json().as_bytes(),
+            topic_for("work-state"),
+            &authenticated_principal(),
+            &config,
+            now,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn identity_subject_is_optional_and_never_defaulted() {
         let config = ValidationConfig::default();
         let now = DateTime::parse_from_rfc3339("2026-07-24T14:21:00Z")
@@ -2519,6 +2602,36 @@ mod tests {
         producer.retain(|(name, _)| name != "runtime");
         if let Some(runtime) = runtime {
             producer.push(("runtime".to_owned(), Value::String(runtime.to_owned())));
+        }
+    }
+
+    fn set_display_name(root: &mut Value, name: Option<&str>) {
+        set_display_name_value(root, name.map(|value| Value::String(value.to_owned())));
+    }
+
+    fn set_display_name_value(root: &mut Value, value: Option<Value>) {
+        let Value::Object(outer) = root else {
+            panic!("fixture root should be an object");
+        };
+        let data = outer
+            .iter_mut()
+            .find(|(name, _)| name == "data")
+            .map(|(_, value)| value)
+            .expect("fixture should have data");
+        let Value::Object(data) = data else {
+            panic!("fixture data should be an object");
+        };
+        let producer = data
+            .iter_mut()
+            .find(|(name, _)| name == "from")
+            .map(|(_, value)| value)
+            .expect("fixture should have from");
+        let Value::Object(producer) = producer else {
+            panic!("fixture from should be an object");
+        };
+        producer.retain(|(name, _)| name != "display_name");
+        if let Some(value) = value {
+            producer.push(("display_name".to_owned(), value));
         }
     }
 

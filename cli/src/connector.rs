@@ -963,6 +963,9 @@ pub struct SnapshotItem {
     pub project_id: String,
     pub repository_id: String,
     pub from_principal_id: String,
+    /// The sender's given name from their authenticated certificate, when they
+    /// published one. Absent is the ordinary case, not an error.
+    pub from_display_name: Option<String>,
     pub from_agent_id: String,
     pub from_instance_id: String,
     pub payload: crate::json::Value,
@@ -1115,6 +1118,7 @@ fn snapshot_item(
         project_id: envelope.data.context.project_id.clone(),
         repository_id: envelope.data.context.repository_id.clone(),
         from_principal_id: envelope.data.from.principal_id.clone(),
+        from_display_name: envelope.data.from.display_name.clone(),
         from_agent_id: envelope.data.from.agent_id.clone(),
         from_instance_id: envelope.data.from.instance_id.clone(),
         payload: envelope.data.payload.clone(),
@@ -1957,17 +1961,26 @@ fn snapshot_json(project_id: &str, items: &[SnapshotItem]) -> crate::json::Value
                 ),
                 (
                     "from".into(),
-                    Value::Object(vec![
-                        (
-                            "principal_id".into(),
-                            Value::String(item.from_principal_id.clone()),
-                        ),
-                        ("agent_id".into(), Value::String(item.from_agent_id.clone())),
-                        (
-                            "instance_id".into(),
-                            Value::String(item.from_instance_id.clone()),
-                        ),
-                    ]),
+                    Value::Object(
+                        vec![
+                            (
+                                "principal_id".into(),
+                                Value::String(item.from_principal_id.clone()),
+                            ),
+                            ("agent_id".into(), Value::String(item.from_agent_id.clone())),
+                            (
+                                "instance_id".into(),
+                                Value::String(item.from_instance_id.clone()),
+                            ),
+                        ]
+                        .into_iter()
+                        .chain(item.from_display_name.clone().map(|name| {
+                            // Only when the sender published one: an always-present
+                            // empty name would render as an anonymous colleague.
+                            ("display_name".to_owned(), Value::String(name))
+                        }))
+                        .collect(),
+                    ),
                 ),
                 ("payload".into(), item.payload.clone()),
                 // The receive path's Git verdict. Always present and always
@@ -2962,6 +2975,7 @@ mod service_tests {
                     project_id: "loam".into(),
                     repository_id: "repo-2F8".into(),
                     from_principal_id: "employee-184".into(),
+                    from_display_name: None,
                     from_agent_id: "agent-72".into(),
                     from_instance_id: "instance-01".into(),
                     payload: crate::json::Value::Object(vec![]),
@@ -4229,6 +4243,7 @@ mod snapshot_tests {
             project_id: "project-7M3".into(),
             repository_id: "repo-2F8".into(),
             from_principal_id: SENDER_PRINCIPAL.into(),
+            from_display_name: None,
             from_agent_id: "agent-72".into(),
             from_instance_id: SENDER_INSTANCE.into(),
             payload: crate::json::Value::Object(vec![]),
