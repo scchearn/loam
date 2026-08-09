@@ -54,6 +54,9 @@ pub struct SessionIdentity {
     pub principal_id: String,
     pub agent_id: String,
     pub instance_id: String,
+    /// The sender's given name from the same authenticated certificate the
+    /// principal came from. Provenance, never authority.
+    pub display_name: Option<String>,
     pub allowed_claims: Vec<String>,
 }
 
@@ -1147,27 +1150,19 @@ impl PeerRoster {
 /// Resolve one enrolled project into a live broker session and the peer roster
 /// its received frames are checked against — the single injection point for both.
 ///
-/// It returns `None` today, and that is the honest Phase-1 answer, not an
-/// oversight: `credential_ref` is a deployment-owned reference (`vault://…`) with
-/// no secret backend behind it yet, and no enrollment field carries a per-project
-/// peer roster. Both are **named residuals owned by the broker-provisioning and
-/// enrollment track**, not by harness integration, and until they are filled the
-/// federation is not operational — an agent cannot actually see a real colleague.
-/// `project.attach` therefore answers `credentials-unresolved` rather than
-/// fabricating a session.
+/// The work happens in `crate::provisioning`, which is admitted to the capability
+/// guard's filesystem and process lists by name. This module holds the broker
+/// socket, so it takes the resolved value and reaches for neither capability
+/// itself; that separation is the whole reason the resolver is a delegate rather
+/// than a body.
 ///
 /// The seam is a plain function rather than a stored callable on purpose: the
 /// crate capability guard bars function-pointer and trait-object capabilities,
 /// and a provisioner that could be swapped at runtime would be exactly that.
-/// ponytail: returns the credential refusal. Fill it in when `provisioning`
-/// lands the secret backend and the roster reader; `ProjectSessions::attach`
-/// already takes the resolved value.
 pub fn provision_session(
-    _row: &crate::enrollment::EnrolledRow,
+    row: &crate::enrollment::EnrolledRow,
 ) -> Result<(MqttSession, PeerRoster), ProvisionFailure> {
-    Err(ProvisionFailure::Credentials(
-        reason::CREDENTIAL_REF_UNRESOLVED,
-    ))
+    crate::provisioning::resolve(row)
 }
 
 /// The stable reasons the two provisioning failure states carry. They name the
@@ -1902,17 +1897,26 @@ fn outbound_envelope(
                 ("intent".into(), Value::String(intent.to_owned())),
                 (
                     "from".into(),
-                    Value::Object(vec![
-                        (
-                            "principal_id".into(),
-                            Value::String(identity.principal_id.clone()),
-                        ),
-                        ("agent_id".into(), Value::String(identity.agent_id.clone())),
-                        (
-                            "instance_id".into(),
-                            Value::String(identity.instance_id.clone()),
-                        ),
-                    ]),
+                    Value::Object(
+                        vec![
+                            (
+                                "principal_id".into(),
+                                Value::String(identity.principal_id.clone()),
+                            ),
+                            ("agent_id".into(), Value::String(identity.agent_id.clone())),
+                            (
+                                "instance_id".into(),
+                                Value::String(identity.instance_id.clone()),
+                            ),
+                        ]
+                        .into_iter()
+                        .chain(identity.display_name.clone().map(|name| {
+                            // From the certificate the broker authenticated, so a
+                            // caller cannot supply it and an absent one stays absent.
+                            ("display_name".to_owned(), Value::String(name))
+                        }))
+                        .collect(),
+                    ),
                 ),
                 ("to".into(), to),
                 ("delivery".into(), delivery),
@@ -2540,6 +2544,7 @@ mod probe_tests {
             principal_id: "employee-184".into(),
             agent_id: "agent-72".into(),
             instance_id: "instance-01".into(),
+            display_name: None,
             allowed_claims: vec![],
         }
     }
@@ -3239,6 +3244,7 @@ mod connect_tests {
             principal_id: "employee-184".into(),
             agent_id: "agent-72".into(),
             instance_id: "instance-01".into(),
+            display_name: None,
             allowed_claims: vec![],
         }
     }
@@ -4164,14 +4170,18 @@ mod snapshot_tests {
     }
 
     #[test]
-    fn an_unprovisioned_attach_opens_no_session_and_says_so() {
-        // Phase 1 ships no secret backend and no peer roster, so the honest
-        // answer is `credentials-unresolved` — never a fabricated live session.
+    fn an_unresolvable_attach_opens_no_session_and_names_the_input() {
+        // Driven through the real seam, and deliberately through the one input
+        // that fails *before* the secret store is consulted: a unit test must
+        // not depend on this machine's keyring, and it must never risk a
+        // desktop unlock prompt inside `cargo test`. The backend's own refusals
+        // are covered against an explicit failing backend in `provisioning`.
         let mut sessions = ProjectSessions::new(4);
-        let row = sample_row("unix:1:1");
+        let mut row = sample_row("unix:1:1");
+        row.broker_endpoint = "not-an-endpoint".into();
         assert_eq!(
             sessions.attach(&row, provision_session(&row), base_time()),
-            SessionState::CredentialsUnresolved(reason::CREDENTIAL_REF_UNRESOLVED)
+            SessionState::CredentialsUnresolved(reason::ENDPOINT_MALFORMED)
         );
         assert!(!sessions.is_live(&row.project_id));
         assert!(sessions.snapshot(&row.project_id, base_time()).is_empty());
@@ -4202,6 +4212,7 @@ mod snapshot_tests {
                         principal_id: SENDER_PRINCIPAL.into(),
                         agent_id: "agent-72".into(),
                         instance_id: RECIPIENT_INSTANCE.into(),
+                        display_name: None,
                         allowed_claims: Vec::new(),
                     },
                 },
@@ -4224,6 +4235,7 @@ mod snapshot_tests {
             principal_id: SENDER_PRINCIPAL.into(),
             agent_id: "agent-72".into(),
             instance_id: RECIPIENT_INSTANCE.into(),
+            display_name: None,
             allowed_claims: Vec::new(),
         };
         let filters = live_filters("org-3A1", "project-7M3", &identity);
@@ -4321,6 +4333,7 @@ mod outbound_tests {
             principal_id: "employee-42".into(),
             agent_id: "agent-7".into(),
             instance_id: "instance-01".into(),
+            display_name: None,
             allowed_claims: vec!["employee-42".into()],
         }
     }
@@ -4338,6 +4351,80 @@ mod outbound_tests {
         let derived =
             crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
         outbound_envelope(&derived.operation, &row(), &identity())
+    }
+
+    /// The same round trip, but with a session claiming an instance other than
+    /// the enrolled row's.
+    fn round_trip_with(
+        operation: &str,
+        identity: &SessionIdentity,
+    ) -> Result<crate::envelope::ValidatedEnvelope, crate::envelope::Violation> {
+        let parsed = crate::json::parse(operation).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+        let (document, topic) = outbound_envelope(&derived.operation, &row(), identity)
+            .expect("the connector builds an envelope");
+        let claims: Vec<&str> = identity.allowed_claims.iter().map(String::as_str).collect();
+        let principal =
+            crate::envelope::AuthenticatedPrincipal::new(&identity.principal_id, &claims);
+        crate::envelope::validate(
+            document.as_bytes(),
+            &topic,
+            &principal,
+            &ValidationConfig::default(),
+            now(),
+        )
+    }
+
+    #[test]
+    fn a_session_claiming_another_instance_is_refused_and_ships_nothing() {
+        // The negative control that makes the instance-id unification
+        // load-bearing. `federation emit` derives `source` from the enrolled
+        // row while the connector derives the topic origin from the session, so
+        // a deployment that opened a session under any other instance id would
+        // ship envelopes Slice A rejects — surfacing to a user as an
+        // unexplained `connector_refused` with no hint of the cause.
+        let operation = r#"{"type":"work.report","state_key":"task-7","revision":"12","summary":"ready","payload":{"state":"ready"}}"#;
+
+        // Positive control first, in the same run: the enrolled instance id
+        // validates, so the refusal below is the mismatch and not the fixture.
+        assert!(
+            round_trip_with(operation, &identity()).is_ok(),
+            "the enrolled instance must validate"
+        );
+
+        let mut divergent = identity();
+        divergent.instance_id = "instance-99".into();
+        let violation = round_trip_with(operation, &divergent)
+            .expect_err("a divergent instance id must be refused");
+        assert_eq!(
+            violation,
+            crate::envelope::Violation::SourceInstanceMismatch,
+            "a divergent session must be refused as a source mismatch, not accepted"
+        );
+    }
+
+    #[test]
+    fn the_certificate_display_name_reaches_the_envelope_and_an_absent_one_stays_absent() {
+        let operation = r#"{"type":"work.report","state_key":"task-7","revision":"12","summary":"ready","payload":{"state":"ready"}}"#;
+        let parsed = crate::json::parse(operation).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+
+        let mut named = identity();
+        named.display_name = Some("Ada Lovelace".into());
+        let (document, _) =
+            outbound_envelope(&derived.operation, &row(), &named).expect("envelope");
+        assert!(
+            document.contains("\"display_name\":\"Ada Lovelace\""),
+            "the authenticated given name must reach data.from: {document}"
+        );
+
+        // Control: a certificate without a given name leaves the field absent
+        // rather than sending an empty one.
+        let (plain, _) =
+            outbound_envelope(&derived.operation, &row(), &identity()).expect("envelope");
+        assert!(!plain.contains("display_name"), "{plain}");
     }
 
     #[test]

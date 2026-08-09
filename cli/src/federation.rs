@@ -491,6 +491,7 @@ fn orchestrate_cli(
         principal_id: format!("connector-{instance_id}"),
         agent_id: format!("agent-{instance_id}"),
         instance_id,
+        display_name: None,
         allowed_claims: vec![],
     };
     let mut transport = crate::connector::StubTransport::healthy(identity);

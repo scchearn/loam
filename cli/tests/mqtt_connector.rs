@@ -70,6 +70,7 @@ fn enrollment_round_trip() {
             principal_id: "employee-184".to_owned(),
             agent_id: "agent-72".to_owned(),
             instance_id: INSTANCE.to_owned(),
+            display_name: None,
             allowed_claims: Vec::new(),
         },
     };
@@ -201,6 +202,7 @@ fn mtls_authenticates_with_no_username_and_no_password() {
             principal_id: "mtls-actor".to_owned(),
             agent_id: "agent-72".to_owned(),
             instance_id: INSTANCE.to_owned(),
+            display_name: None,
             allowed_claims: Vec::new(),
         },
     };
@@ -212,6 +214,78 @@ fn mtls_authenticates_with_no_username_and_no_password() {
         .expect("mTLS alone must reach an accepted CONNACK");
     assert_eq!(identity.instance_id, INSTANCE);
     transport.disconnect();
+
+    broker
+        .finish()
+        .expect("broker fixture should remove only its temporary directory");
+}
+
+#[test]
+#[ignore = "requires LOAM_MQTT_TEST=1 and a real Mosquitto/OpenSSL installation"]
+fn an_empty_trust_store_refuses_the_session_rather_than_trusting_anything() {
+    if std::env::var("LOAM_MQTT_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set LOAM_MQTT_TEST=1 to require the real broker tier");
+        return;
+    }
+
+    // The backstop the resolver's "system roots need real bytes" reasoning
+    // depends on, confirmed where the session is actually built rather than
+    // asserted in a comment: handing the transport no trust anchors must refuse
+    // the connection. If it instead connected, an unresolvable CA could have
+    // been spelled as an empty vector and every broker would be trusted.
+    let broker =
+        BrokerFixture::provision("empty-trust").expect("the real broker fixture should provision");
+    let validation = ValidationConfig::default();
+    let build = |ca: Vec<u8>| MqttSession {
+        config: TransportConfig::new(
+            "localhost",
+            broker.mtls_port(),
+            "loam-connector-empty-trust",
+            8,
+            MAX_PACKET_BYTES,
+            validation.clone(),
+        )
+        .expect("the transport configuration should be valid"),
+        username: None,
+        password: None,
+        ca_certificate: ca,
+        client_authentication: Some((
+            broker
+                .client_certificate()
+                .expect("the fixture client certificate should be readable"),
+            broker
+                .client_key()
+                .expect("the fixture client key should be readable"),
+        )),
+        claimed_identity: SessionIdentity {
+            principal_id: "mtls-actor".to_owned(),
+            agent_id: "agent-72".to_owned(),
+            instance_id: INSTANCE.to_owned(),
+            display_name: None,
+            allowed_claims: Vec::new(),
+        },
+    };
+
+    let mut empty = MqttTransport::new(build(Vec::new()), validation.clone(), Utc::now())
+        .expect("the adapter should build its delivery processor");
+    assert!(
+        empty.authenticate().is_err(),
+        "an empty trust store must refuse the session, never accept the broker unverified"
+    );
+    empty.disconnect();
+
+    // Positive control in the same run: the identical session with the real CA
+    // does authenticate, so the refusal above is the empty store and not the
+    // broker being unreachable.
+    let ca = broker
+        .ca_certificate()
+        .expect("the fixture CA certificate should be readable");
+    let mut trusted = MqttTransport::new(build(ca), validation, Utc::now())
+        .expect("the adapter should build its delivery processor");
+    trusted
+        .authenticate()
+        .expect("the same session with real trust anchors authenticates");
+    trusted.disconnect();
 
     broker
         .finish()

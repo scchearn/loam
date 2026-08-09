@@ -639,6 +639,7 @@ impl Federation {
                 principal_id: OUR_PRINCIPAL.to_owned(),
                 agent_id: OUR_AGENT.to_owned(),
                 instance_id: our_instance.clone(),
+                display_name: None,
                 allowed_claims: Vec::new(),
             },
         };

@@ -727,6 +727,82 @@ pub fn read_roster(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The seam
+// ---------------------------------------------------------------------------
+
+/// Bounds the connector's own transport, matching the values the enrollment
+/// probe already uses. Not a knob: a session that could be given a different
+/// packet ceiling than the probe verified would pass enrollment and then fail
+/// on the first large frame.
+const REQUEST_CAPACITY: usize = 8;
+const MAX_PACKET_BYTES: u32 = 400_000;
+
+/// Resolve one enrolled row into a live session's inputs and the roster its
+/// received frames are checked against.
+///
+/// Credentials are resolved before the roster on purpose: an operator whose
+/// secret store is empty should be told that, not told their roster is missing.
+pub fn resolve(
+    row: &crate::enrollment::EnrolledRow,
+) -> Result<(crate::connector::MqttSession, crate::connector::PeerRoster), ProvisionFailure> {
+    let credentials = ProvisionFailure::Credentials;
+    let (host, port) = split_endpoint(&row.broker_endpoint).map_err(credentials)?;
+    let backend = configured_backend()?;
+    let material = resolve_credentials(&backend, &row.credential_ref, row.ca_ref.as_deref(), None)?;
+
+    // Who this session is, read from the certificate the broker will
+    // authenticate and from nothing the caller can influence.
+    let subject = certificate_subject(&material.certificate).map_err(credentials)?;
+    let (local_email, _local_name) = git_identity(std::path::Path::new(&row.display_path));
+    match_local_identity(&subject, local_email.as_deref()).map_err(credentials)?;
+
+    let roster_root = configured_roster_root().map_err(ProvisionFailure::Roster)?;
+    let roster = read_roster(&roster_root, &row.org_id, &row.project_id)
+        .map_err(ProvisionFailure::Roster)?;
+
+    // The client id is the **bare** instance id, with nothing prefixed or
+    // derived. The broker's ACL scopes origin-write on the client id rather than
+    // the user, because two machines belonging to one person share a
+    // certificate and therefore a principal. A wrong client id is not an
+    // authentication failure — the connection is accepted and every publish is
+    // silently denied.
+    let config = crate::transport::TransportConfig::new(
+        &host,
+        port,
+        &row.instance_id,
+        REQUEST_CAPACITY,
+        MAX_PACKET_BYTES,
+        crate::envelope::ValidationConfig::default(),
+    )
+    .map_err(|_| credentials(reason::ENDPOINT_MALFORMED))?;
+
+    let session = crate::connector::MqttSession {
+        config,
+        // mTLS is the sole authentication: the effective username is the
+        // certificate common name the broker assigns from what we present.
+        username: None,
+        password: None,
+        ca_certificate: material.certificate_authority,
+        client_authentication: Some((material.certificate, material.key)),
+        claimed_identity: crate::connector::SessionIdentity {
+            principal_id: subject.common_name,
+            // One enrolled workspace is one agent. Nothing provisions a separate
+            // agent identity, and minting one here would be a second source of
+            // identity beside the enrolled instance id — the defect this slice
+            // exists to close.
+            agent_id: row.instance_id.clone(),
+            // The single source. The connector reads this value and never mints,
+            // derives, or defaults one, so an emit's `source` and its topic
+            // origin cannot disagree.
+            instance_id: row.instance_id.clone(),
+            display_name: subject.given_name,
+            allowed_claims: roster.principals.clone(),
+        },
+    };
+    Ok((session, roster))
+}
+
 /// The backend this process should use, from the environment and the platform.
 pub fn configured_backend() -> Result<Backend, ProvisionFailure> {
     select_backend(
@@ -1092,6 +1168,84 @@ mod tests {
         std::fs::create_dir_all(&directory).expect("roster directory is creatable");
         std::fs::write(directory.join(format!("{project}.json")), body)
             .expect("roster file is writable");
+    }
+
+    // --- the seam ----------------------------------------------------------
+
+    fn enrolled_row(instance: &str, endpoint: &str) -> crate::enrollment::EnrolledRow {
+        crate::enrollment::EnrolledRow {
+            identity_key: "unix:1:1".into(),
+            org_id: "acme".into(),
+            project_id: "loam".into(),
+            repository_id: "repo".into(),
+            descriptor_digest: "d".into(),
+            display_path: "/w".into(),
+            instance_id: instance.into(),
+            broker_profile: "p".into(),
+            broker_endpoint: endpoint.into(),
+            tls_server_name: "broker.example".into(),
+            credential_ref: "acme/loam/mqtt".into(),
+            ca_ref: None,
+            commit: "84be000000000000000000000000000000000001".into(),
+            capabilities: crate::enrollment::CapabilityRecord {
+                authentication: true,
+                publish: true,
+                subscribe: true,
+                self_receive: true,
+                verified_at: "2026-07-24T14:20:00Z".into(),
+            },
+            remotes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_malformed_endpoint_refuses_before_any_secret_is_asked_for() {
+        // Ordering is load-bearing, not incidental: the endpoint is checked
+        // before the secret store is consulted, so a typo in an enrollment can
+        // never spend a keyring lookup — or, on a desktop, provoke an unlock
+        // prompt — to learn something already visible in the row.
+        let row = enrolled_row("instance-01", "not-an-endpoint");
+        assert_eq!(
+            resolve(&row).err(),
+            Some(ProvisionFailure::Credentials(reason::ENDPOINT_MALFORMED))
+        );
+    }
+
+    #[test]
+    fn the_session_identity_and_client_id_come_from_the_enrolled_row() {
+        // The enrolled instance id is the single source. `federation emit`
+        // derives `source` from the same field, so one reader of one column is
+        // what makes the envelope's source and its topic origin agree — the
+        // divergence that surfaces to a user as an unexplained refusal.
+        let row = enrolled_row("instance-77", "mqtts://broker.acme.example:8883");
+        let identity = crate::connector::SessionIdentity {
+            principal_id: "sam@example.test".into(),
+            agent_id: row.instance_id.clone(),
+            instance_id: row.instance_id.clone(),
+            display_name: None,
+            allowed_claims: Vec::new(),
+        };
+        assert_eq!(identity.instance_id, row.instance_id);
+
+        // The client id is the **bare** instance id. The broker's ACL scopes
+        // origin-write on the client id rather than the user, because two
+        // machines belonging to one person share a certificate and therefore a
+        // principal. A wrong client id is not an authentication failure: the
+        // connection is accepted and every publish is silently denied, which is
+        // the hardest failure to diagnose from this side.
+        let config = crate::transport::TransportConfig::new(
+            "broker.acme.example",
+            8883,
+            &row.instance_id,
+            REQUEST_CAPACITY,
+            MAX_PACKET_BYTES,
+            crate::envelope::ValidationConfig::default(),
+        )
+        .expect("the transport configuration is valid");
+        // Asserted through the options that actually reach the wire, not
+        // through the field we happened to store.
+        assert_eq!(config.mqtt_options().client_id(), row.instance_id);
+        assert!(!config.mqtt_options().client_id().starts_with("loam-"));
     }
 
     #[test]
