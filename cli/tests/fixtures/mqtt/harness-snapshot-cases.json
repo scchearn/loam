@@ -1,5 +1,5 @@
 {
-  "comment": "Slice D T1 snapshot cases. Each case feeds frames through Slice B's DeliveryProcessor into the connector's bounded in-memory SnapshotStore, then reads the snapshot back. `frames` are published in order on the given topic; an empty `body` is a tombstone (an empty MQTT payload). `expect` is the ordered list of logical item keys the snapshot must serve, oldest first.",
+  "comment": "Slice D T1 snapshot cases. Each case feeds frames through Slice B's DeliveryProcessor into the connector's bounded in-memory SnapshotStore, then reads the snapshot back. `frames` are published in order on the given topic; an empty `body` is a tombstone (an empty MQTT payload). `expect` is the ordered list of logical item keys the snapshot must serve, oldest first; the optional `expect_summaries` asserts the served bodies, not only the keys.",
   "org_id": "org-3A1",
   "project_id": "project-7M3",
   "other_project_id": "project-9Q4",
@@ -46,6 +46,16 @@
       ],
       "reads": 2,
       "expect": ["state:instance-01/work-SB-42"]
+    },
+    {
+      "name": "newer-state-revision-replaces-in-place",
+      "capacity": 4,
+      "frames": [
+        { "kind": "state", "state_key": "work-SB-44", "revision": "1", "summary": "Work is active on SB-44." },
+        { "kind": "state", "state_key": "work-SB-44", "revision": "2", "summary": "Work is ready on SB-44." }
+      ],
+      "expect": ["state:instance-01/work-SB-44"],
+      "expect_summaries": ["Work is ready on SB-44."]
     },
     {
       "name": "tombstone-resolves-a-retained-item",

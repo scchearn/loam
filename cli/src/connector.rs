@@ -2585,6 +2585,23 @@ mod service_tests {
             crate::enrollment::list_enrollments(&witness).unwrap().len(),
             1
         );
+
+        // Positive control: the witness *can* see a write. A real committed
+        // insert from another connection must advance the very `data_version`
+        // asserted unchanged above, so "unchanged" is evidence of no write
+        // rather than of a blind witness.
+        let mut writer = crate::enrollment::open_writable(&path).unwrap();
+        crate::enrollment::insert_enrollment(&mut writer, &synthetic(19, 190), &caps(), "t")
+            .unwrap();
+        assert_ne!(
+            data_version(&witness),
+            before_version,
+            "the witness must observe a real committed write, or the unchanged assertion is vacuous"
+        );
+        assert_eq!(
+            crate::enrollment::list_enrollments(&witness).unwrap().len(),
+            2
+        );
     }
 
     /// The snapshot read inherits `dispatch_for_key`'s enrollment resolution and
@@ -3531,6 +3548,18 @@ mod snapshot_tests {
                 .map(|value| value.as_str().unwrap().to_owned())
                 .collect();
 
+            // Keys alone would not catch an in-place *content* update, so a case
+            // may also pin the served summaries.
+            let expected_summaries: Option<Vec<String>> = case
+                .get("expect_summaries")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| value.as_str().unwrap().to_owned())
+                        .collect()
+                });
+
             // A read never consumes: an unresolved item must still be there on
             // the next hook, so repeated reads must agree.
             for round in 0..number(case, "reads").unwrap_or(1) {
@@ -3540,6 +3569,16 @@ mod snapshot_tests {
                     expected,
                     "{name}: snapshot mismatch on read {round}"
                 );
+                if let Some(summaries) = &expected_summaries {
+                    assert_eq!(
+                        &items
+                            .iter()
+                            .map(|item| item.summary.clone())
+                            .collect::<Vec<_>>(),
+                        summaries,
+                        "{name}: served summary mismatch on read {round}"
+                    );
+                }
             }
         }
     }
