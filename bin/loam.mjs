@@ -20,7 +20,10 @@ export async function main(argv = process.argv.slice(2), output = process.stdout
 
     if (parsed.command === 'setup' || parsed.command === 'update') {
       const { runSetup } = await import('../setup/main.mjs');
-      return await runSetup(parsed, { output, errorOutput });
+      // ponytail: release base as an env knob, not a flag. It exists so a
+      // preview line can be installed from a staged release (or a file:// dir)
+      // without a published one; unset means the default GitHub release base.
+      return await runSetup(parsed, { output, errorOutput, releaseBaseUrl: process.env.LOAM_RELEASE_BASE_URL });
     }
     if (parsed.command === 'doctor') {
       const { runDoctor } = await import('../setup/doctor.mjs');
