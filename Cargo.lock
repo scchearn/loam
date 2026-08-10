@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "loam"
-version = "0.9.5"
+version = "0.99.0"
 dependencies = [
  "chrono",
  "pulldown-cmark",
