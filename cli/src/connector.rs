@@ -2169,6 +2169,7 @@ pub fn orchestrate_from_validated<T: Transport, R: service::CommandRunner>(
     match crate::enrollment::insert_enrollment(
         &mut connection,
         enrolled,
+        &service_ctx.instance_id,
         &capabilities,
         &now.to_rfc3339(),
     )
@@ -2775,7 +2776,14 @@ mod service_tests {
         let path = temp_db(label);
         let mut connection = crate::enrollment::open_writable(&path).unwrap();
         let enrollment = synthetic(device, inode);
-        crate::enrollment::insert_enrollment(&mut connection, &enrollment, &caps(), "t").unwrap();
+        crate::enrollment::insert_enrollment(
+            &mut connection,
+            &enrollment,
+            "instance-under-test",
+            &caps(),
+            "t",
+        )
+        .unwrap();
         let key = crate::enrollment::identity_key(&enrollment.workspace);
         (path, key)
     }
@@ -3049,8 +3057,14 @@ mod service_tests {
         // asserted unchanged above, so "unchanged" is evidence of no write
         // rather than of a blind witness.
         let mut writer = crate::enrollment::open_writable(&path).unwrap();
-        crate::enrollment::insert_enrollment(&mut writer, &synthetic(19, 190), &caps(), "t")
-            .unwrap();
+        crate::enrollment::insert_enrollment(
+            &mut writer,
+            &synthetic(19, 190),
+            "instance-under-test",
+            &caps(),
+            "t",
+        )
+        .unwrap();
         assert_ne!(
             data_version(&witness),
             before_version,
@@ -3549,7 +3563,14 @@ mod lifecycle_tests {
 
     fn insert(db: &Path, enrollment: &ValidatedEnrollment) {
         let mut connection = crate::enrollment::open_writable(db).unwrap();
-        crate::enrollment::insert_enrollment(&mut connection, enrollment, &caps(), "t").unwrap();
+        crate::enrollment::insert_enrollment(
+            &mut connection,
+            enrollment,
+            "instance-under-test",
+            &caps(),
+            "t",
+        )
+        .unwrap();
     }
 
     fn key_of(enrollment: &ValidatedEnrollment) -> String {

@@ -127,6 +127,7 @@ fn seed_enrollment(root: &std::path::Path) {
     insert_enrollment(
         &mut connection,
         &smoke_enrollment(root),
+        "instance-under-test",
         &capabilities,
         "2026-08-08T00:00:00Z",
     )

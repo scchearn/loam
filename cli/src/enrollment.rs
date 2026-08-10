@@ -1108,6 +1108,7 @@ pub mod registry {
     pub fn insert_enrollment(
         connection: &mut Connection,
         enrolled: &ValidatedEnrollment,
+        instance_id: &str,
         capabilities: &CapabilityRecord,
         now_rfc3339: &str,
     ) -> Result<InsertOutcome, RegistryError> {
@@ -1154,7 +1155,7 @@ pub mod registry {
                     enrolled.repository_id,
                     digest,
                     enrolled.workspace.display_path,
-                    instance_id_for(enrolled),
+                    instance_id,
                     enrolled.broker_profile,
                     enrolled.broker_endpoint,
                     enrolled.tls_server_name,
@@ -1318,13 +1319,6 @@ pub mod registry {
             out.push(row.map_err(RegistryError::backend)?);
         }
         Ok(out)
-    }
-
-    /// The derived instance identity for an enrollment. The service owns the stable
-    /// per-install `instance_id`; until it is wired, a stable value derived from the
-    /// physical identity populates the registry column.
-    fn instance_id_for(enrolled: &ValidatedEnrollment) -> String {
-        identity_key(&enrolled.workspace)
     }
 
     // -------------------------------------------------------------------------
@@ -1694,7 +1688,14 @@ mod registry_tests {
         let mut connection = open_writable(&path).unwrap();
         let enrolled = sample(1, 10, "0123456789abcdef0123456789abcdef01234567");
         assert_eq!(
-            insert_enrollment(&mut connection, &enrolled, &caps(), "2026-08-08T10:00:00Z").unwrap(),
+            insert_enrollment(
+                &mut connection,
+                &enrolled,
+                "instance-under-test",
+                &caps(),
+                "2026-08-08T10:00:00Z"
+            )
+            .unwrap(),
             InsertOutcome::Inserted
         );
         let key = identity_key(&enrolled.workspace);
@@ -1715,7 +1716,14 @@ mod registry_tests {
 
         let mut pinned = sample(4, 40, "0123456789abcdef0123456789abcdef01234567");
         pinned.ca_ref = Some("vault://acme/loam/ca".into());
-        insert_enrollment(&mut connection, &pinned, &caps(), "t").unwrap();
+        insert_enrollment(
+            &mut connection,
+            &pinned,
+            "instance-under-test",
+            &caps(),
+            "t",
+        )
+        .unwrap();
         let row = lookup(&connection, &identity_key(&pinned.workspace))
             .unwrap()
             .expect("present");
@@ -1738,7 +1746,14 @@ mod registry_tests {
         // string — "use system roots" and "pinned to nothing" must not collapse.
         let mut system_roots = sample(5, 50, "0123456789abcdef0123456789abcdef01234567");
         system_roots.ca_ref = None;
-        insert_enrollment(&mut connection, &system_roots, &caps(), "t").unwrap();
+        insert_enrollment(
+            &mut connection,
+            &system_roots,
+            "instance-under-test",
+            &caps(),
+            "t",
+        )
+        .unwrap();
         let absent = lookup(&connection, &identity_key(&system_roots.workspace))
             .unwrap()
             .expect("present");
@@ -1752,11 +1767,25 @@ mod registry_tests {
         let path = temp_db("idempotent");
         let mut connection = open_writable(&path).unwrap();
         let enrolled = sample(2, 20, "0123456789abcdef0123456789abcdef01234567");
-        insert_enrollment(&mut connection, &enrolled, &caps(), "t").unwrap();
+        insert_enrollment(
+            &mut connection,
+            &enrolled,
+            "instance-under-test",
+            &caps(),
+            "t",
+        )
+        .unwrap();
 
         // Same identity, same digest -> AlreadyEnrolled, no duplicate row.
         assert_eq!(
-            insert_enrollment(&mut connection, &enrolled, &caps(), "t").unwrap(),
+            insert_enrollment(
+                &mut connection,
+                &enrolled,
+                "instance-under-test",
+                &caps(),
+                "t"
+            )
+            .unwrap(),
             InsertOutcome::AlreadyEnrolled
         );
         assert_eq!(list_enrollments(&connection).unwrap().len(), 1);
@@ -1764,7 +1793,14 @@ mod registry_tests {
         // Same identity, different binding (commit) -> Conflict, still one row.
         let changed = sample(2, 20, "ffffffffffffffffffffffffffffffffffffffff");
         assert_eq!(
-            insert_enrollment(&mut connection, &changed, &caps(), "t").unwrap(),
+            insert_enrollment(
+                &mut connection,
+                &changed,
+                "instance-under-test",
+                &caps(),
+                "t"
+            )
+            .unwrap(),
             InsertOutcome::Conflict
         );
         let row = lookup(&connection, &identity_key(&enrolled.workspace))
@@ -1782,7 +1818,14 @@ mod registry_tests {
         let path = temp_db("delete");
         let mut connection = open_writable(&path).unwrap();
         let enrolled = sample(3, 30, "0123456789abcdef0123456789abcdef01234567");
-        insert_enrollment(&mut connection, &enrolled, &caps(), "t").unwrap();
+        insert_enrollment(
+            &mut connection,
+            &enrolled,
+            "instance-under-test",
+            &caps(),
+            "t",
+        )
+        .unwrap();
         let key = identity_key(&enrolled.workspace);
         assert!(delete_enrollment(&mut connection, &key).unwrap());
         assert!(!delete_enrollment(&mut connection, &key).unwrap());
@@ -1808,6 +1851,7 @@ mod registry_tests {
         insert_enrollment(
             &mut connection,
             &sample(4, 40, "0123456789abcdef0123456789abcdef01234567"),
+            "instance-under-test",
             &caps(),
             "t",
         )

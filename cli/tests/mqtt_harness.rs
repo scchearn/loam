@@ -1178,6 +1178,7 @@ fn seed_enrollment(root: &Path, org: &str, workspace: &Path) {
     insert_enrollment(
         &mut connection,
         &enrollment,
+        "instance-under-test",
         &CapabilityRecord {
             authentication: true,
             publish: true,

@@ -485,19 +485,73 @@ fn orchestrate_cli(
         instance_id: instance_id.clone(),
         runtime_path,
     };
-    // The connector's own authenticated identity is supplied by the transport in
-    // production (T13). The stub reports this derived identity.
-    let identity = crate::connector::SessionIdentity {
-        principal_id: format!("connector-{instance_id}"),
-        agent_id: format!("agent-{instance_id}"),
-        instance_id,
-        display_name: None,
-        allowed_claims: vec![],
-    };
-    let mut transport = crate::connector::StubTransport::healthy(identity);
     let runner = crate::service::RealRunner;
     let db_path = root.join("loam.sqlite3");
     let now = chrono::Utc::now();
+
+    // T13 — probe against the REAL broker, not the stub. Build the session inputs
+    // from the validated descriptor plus this machine's instance id, exactly as
+    // `provisioning::resolve` builds them from the committed row, so the enrollment
+    // probe authenticates over mTLS, subscribes, publishes, and requires its own
+    // echoed event *before* the row is committed and the service activated. The
+    // transport alone learns the canonical principal from the certificate.
+    let report_error = |code: &str| -> i32 {
+        if json_output {
+            println!(
+                "{}",
+                Value::Object(vec![
+                    ("schema".into(), Value::Number("1".into())),
+                    ("status".into(), Value::String("error".into())),
+                    (
+                        "error".into(),
+                        Value::Object(vec![("code".into(), Value::String(code.into()))]),
+                    ),
+                ])
+                .to_json()
+            );
+        } else {
+            eprintln!("federation connect: {code}");
+        }
+        69
+    };
+    let row = crate::enrollment::EnrolledRow {
+        identity_key: crate::enrollment::identity_key(&enrolled.workspace),
+        org_id: enrolled.org_id.clone(),
+        project_id: enrolled.project_id.clone(),
+        repository_id: enrolled.repository_id.clone(),
+        descriptor_digest: crate::enrollment::descriptor_digest(enrolled),
+        display_path: enrolled.workspace.display_path.clone(),
+        instance_id: instance_id.clone(),
+        broker_profile: enrolled.broker_profile.clone(),
+        broker_endpoint: enrolled.broker_endpoint.clone(),
+        tls_server_name: enrolled.tls_server_name.clone(),
+        credential_ref: enrolled.credential_ref.clone(),
+        ca_ref: enrolled.ca_ref.clone(),
+        commit: enrolled.commit.clone(),
+        capabilities: crate::enrollment::CapabilityRecord {
+            authentication: false,
+            publish: false,
+            subscribe: false,
+            self_receive: false,
+            verified_at: now.to_rfc3339(),
+        },
+        remotes: enrolled.remotes.clone(),
+    };
+    let (session, _roster) = match crate::provisioning::resolve(&row) {
+        Ok(pair) => pair,
+        Err(crate::connector::ProvisionFailure::Credentials(reason))
+        | Err(crate::connector::ProvisionFailure::Roster(reason)) => {
+            return report_error(reason);
+        }
+    };
+    let mut transport = match crate::connector::MqttTransport::new(
+        session,
+        crate::envelope::ValidationConfig::default(),
+        now,
+    ) {
+        Ok(transport) => transport,
+        Err(error) => return report_error(error.code()),
+    };
 
     match crate::connector::orchestrate_from_validated(
         enrolled,
@@ -1492,6 +1546,7 @@ mod emit_tests {
         enrollment::insert_enrollment(
             &mut connection,
             &enrolled,
+            "test-instance",
             &enrollment::CapabilityRecord {
                 authentication: true,
                 publish: true,
