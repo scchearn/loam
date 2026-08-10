@@ -595,3 +595,177 @@ fn diff_with_an_explicit_bad_wiki_root_still_reports_the_did_you_mean_hint() {
     assert_eq!(output.status.code(), Some(2), "stderr: {message}");
     assert!(message.contains("did you mean"), "{message}");
 }
+
+/// Repo with one committed source file, a wiki page carrying its real `content_id`, and a
+/// populated body store. Returns the repo root.
+fn repo_with_published_body(label: &str) -> std::path::PathBuf {
+    let repo = temporary_root(label);
+    fs::create_dir_all(repo.join("src")).expect("src should be created");
+    fs::write(repo.join("src/main.rs"), "fn main() {}\n").expect("source should be written");
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "tests@example.invalid"],
+        vec!["config", "user.name", "Loam Tests"],
+        vec!["add", "-A"],
+        vec!["commit", "-qm", "initial"],
+    ] {
+        let status = Command::new("git")
+            .args(&args)
+            .current_dir(&repo)
+            .status()
+            .expect("git should run");
+        assert!(status.success(), "git {args:?} failed");
+    }
+    let content_id = walk_field(&repo, "src/main.rs", "content_id");
+    assert!(content_id.starts_with("git:"), "content_id: {content_id}");
+    let wiki = repo.join("wiki");
+    wiki_with_page(
+        &wiki,
+        &format!("source_path: src/main.rs\ningested_at: \"1700000000\"\ncontent_id: {content_id}\ngenerator_version: loam-code-page-v1\n"),
+        "src-main-rs",
+    );
+    // Publishing happens as a side effect of diff, so the store needs no agent step.
+    let output = loam(&[
+        "codegraph",
+        "diff",
+        repo.to_str().unwrap(),
+        "--generator-version",
+        "loam-code-page-v1",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    repo
+}
+
+fn store_bodies(repo: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn walk(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().and_then(|value| value.to_str()) == Some("md") {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&repo.join(".git/loam/code-bodies"), &mut found);
+    found
+}
+
+#[test]
+fn diff_publishes_page_bodies_to_the_shared_store() {
+    let repo = repo_with_published_body("store-publish");
+    let bodies = store_bodies(&repo);
+    let body = bodies
+        .first()
+        .map(|path| fs::read_to_string(path).expect("body should read"));
+    let tracked = Command::new("git")
+        .args(["status", "--short", "--untracked-files=all"])
+        .current_dir(&repo)
+        .output()
+        .expect("git should run");
+    let status = String::from_utf8_lossy(&tracked.stdout).to_string();
+    fs::remove_dir_all(&repo).ok();
+
+    assert_eq!(bodies.len(), 1, "expected exactly one stored body");
+    let body = body.expect("stored body should exist");
+    assert!(body.contains("# page"), "body: {body}");
+    // Frontmatter carries the producing worktree's source_path; the consumer writes its own.
+    assert!(!body.contains("source_path"), "body: {body}");
+    // The store lives inside .git, so it can never enter a commit.
+    assert!(!status.contains("loam/code-bodies"), "status: {status}");
+}
+
+#[test]
+fn diff_reuses_a_stored_body_in_a_sibling_worktree_after_the_producer_is_removed() {
+    let repo = repo_with_published_body("store-reuse");
+    let sibling = repo.join("sibling");
+    let status = Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            sibling.to_str().unwrap(),
+            "HEAD",
+        ])
+        .current_dir(&repo)
+        .status()
+        .expect("git should run");
+    assert!(status.success(), "worktree add failed");
+    // A fresh worktree starts with no code graph, which is the whole defect.
+    fs::create_dir_all(sibling.join("wiki/code")).expect("wiki should be created");
+    fs::write(sibling.join("wiki/SCHEMA.md"), "# schema\n").expect("schema should be written");
+    // Remove the producing worktree's pages: reuse must come from the store, not from a
+    // sibling that happens to still exist.
+    fs::remove_dir_all(repo.join("wiki/code")).expect("producer pages should be removed");
+
+    let output = loam(&[
+        "codegraph",
+        "diff",
+        sibling.to_str().unwrap(),
+        "--generator-version",
+        "loam-code-page-v1",
+    ]);
+    let text = stdout(&output);
+    fs::remove_dir_all(&repo).ok();
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(text.contains("\"path\":\"src/main.rs\""), "{text}");
+    assert!(text.contains("\"reason\":\"new\""), "{text}");
+    assert!(text.contains("\"reuse_body_path\":\""), "{text}");
+    assert!(text.contains("loam/code-bodies/"), "{text}");
+}
+
+#[test]
+fn diff_does_not_reuse_across_diverged_content() {
+    let repo = repo_with_published_body("store-diverged");
+    // Same path, different bytes: a different content_id, so no store hit and a real summary.
+    fs::write(repo.join("src/main.rs"), "fn main() { diverged(); }\n")
+        .expect("source should change");
+    fs::remove_dir_all(repo.join("wiki/code")).expect("pages should be removed");
+    fs::create_dir_all(repo.join("wiki/code")).expect("code dir should be recreated");
+
+    let output = loam(&[
+        "codegraph",
+        "diff",
+        repo.to_str().unwrap(),
+        "--generator-version",
+        "loam-code-page-v1",
+    ]);
+    let text = stdout(&output);
+    fs::remove_dir_all(&repo).ok();
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(text.contains("\"path\":\"src/main.rs\""), "{text}");
+    assert!(!text.contains("reuse_body_path"), "{text}");
+}
+
+#[test]
+fn diff_outside_git_creates_no_store_and_emits_no_reuse_field() {
+    let codebase = temporary_root("store-nongit-code");
+    fs::create_dir_all(codebase.join("src")).expect("src should be created");
+    fs::write(codebase.join("src/main.rs"), "fn main() {}\n").expect("source should be written");
+    let wiki = codebase.join("wiki");
+    fs::create_dir_all(wiki.join("code")).expect("wiki should be created");
+    fs::write(wiki.join("SCHEMA.md"), "# schema\n").expect("schema should be written");
+
+    let output = loam(&[
+        "codegraph",
+        "diff",
+        codebase.to_str().unwrap(),
+        "--generator-version",
+        "loam-code-page-v1",
+    ]);
+    let text = stdout(&output);
+    let store_exists = codebase.join(".git").exists();
+    fs::remove_dir_all(&codebase).ok();
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(text.contains("\"content_id\":\"sha256:"), "{text}");
+    assert!(!text.contains("reuse_body_path"), "{text}");
+    assert!(!store_exists, "no Git directory should be created");
+}

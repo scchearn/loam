@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 
+import { createClaudeAdapter, workspaceFromPayload as claudeWorkspace } from '../adapters/claude-session-start.mjs';
+import { createCursorAdapter, workspaceFromPayload as cursorWorkspace } from '../adapters/cursor-session-start.mjs';
 import { createOpenCodeAdapter } from '../adapters/opencode.mjs';
 import { main as runIngestWorker } from '../adapters/ingest-worker.mjs';
 import { dedupe, mergeJsonConfig } from '../setup/config.mjs';
@@ -52,8 +54,9 @@ test('OpenCode background events queue work and normalize the all-session status
       gate: async () => { order.push('gate'); gateCalls += 1; return { action: 'spawn_worker', workspace: '/workspace' }; },
       resolveGlobalRoot: () => root,
       resolveSkillsRoot: () => root,
-      runWorker: async ({ openCodeSession, hookRun }) => {
+      runWorker: async ({ openCodeSession, hookRun, notify }) => {
         assert.deepEqual(hookRun, { id: 9 });
+        assert.equal(notify, undefined, 'missing showToast must be detected before use');
         const child = await openCodeSession.createChild({ parentId: 'parent-1', title: 'test' });
         await openCodeSession.promptAsync({ sessionId: child.id, parts: [] });
         observed = await openCodeSession.status(child.id);
@@ -101,6 +104,134 @@ test('OpenCode background events queue work and normalize the all-session status
   ]);
 });
 
+test('OpenCode toast visibility uses the pinned SDK shape for launch and terminal outcomes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loam-opencode-toast-'));
+  const calls = [];
+  let finished;
+  const done = new Promise((resolvePromise) => { finished = resolvePromise; });
+  const plugin = await createOpenCodeAdapter({
+    client: {
+      session: {},
+      tui: { showToast: async (input) => { calls.push(input); return true; } },
+    },
+    ingestion: {
+      gate: async () => ({ action: 'spawn_worker', workspace: '/workspace' }),
+      resolveGlobalRoot: () => root,
+      resolveSkillsRoot: () => root,
+      runWorker: async ({ notify }) => {
+        const launch = new AbortController();
+        const terminal = new AbortController();
+        await notify({ phase: 'launch', visibility: 'toast', signal: launch.signal });
+        await notify({ phase: 'terminal', visibility: 'toast', status: 'failed', signal: terminal.signal });
+        await notify({ phase: 'terminal', visibility: 'native', status: 'ok', signal: terminal.signal });
+        return { reason: 'ok' };
+      },
+    },
+    hookRuns: {
+      resolveGlobalRoot: () => root,
+      beginHookRun: async () => ({ id: 1 }),
+      finishHookRun: async () => undefined,
+      startHookWorker: async () => undefined,
+      finishHookWorker: async () => { finished(); },
+    },
+  })({ directory: '/workspace' });
+
+  await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-toast' } });
+  await done;
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map(({ query, body }) => ({ query, body })), [
+    {
+      query: { directory: '/workspace' },
+      body: { title: 'Loam', message: 'Background code ingestion started.', variant: 'info' },
+    },
+    {
+      query: { directory: '/workspace' },
+      body: { title: 'Loam', message: 'Background code ingestion failed.', variant: 'error' },
+    },
+  ]);
+  assert.ok(calls.every(({ signal }) => signal instanceof AbortSignal));
+});
+
+test('OpenCode toast request rejects with AbortError when the seam aborts its signal', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loam-opencode-toast-abort-'));
+  let aborted = false;
+  let finished;
+  const done = new Promise((resolvePromise) => { finished = resolvePromise; });
+  const plugin = await createOpenCodeAdapter({
+    client: {
+      session: {},
+      tui: {
+        showToast: ({ signal }) => new Promise((_resolvePromise, reject) => {
+          signal.addEventListener('abort', () => {
+            aborted = true;
+            reject(new DOMException('toast aborted', 'AbortError'));
+          }, { once: true });
+        }),
+      },
+    },
+    ingestion: {
+      gate: async () => ({ action: 'spawn_worker', workspace: '/workspace' }),
+      resolveGlobalRoot: () => root,
+      resolveSkillsRoot: () => root,
+      runWorker: async ({ notify }) => {
+        const controller = new AbortController();
+        const request = notify({ phase: 'launch', visibility: 'toast', signal: controller.signal });
+        controller.abort();
+        await assert.rejects(request, { name: 'AbortError' });
+        return { reason: 'ok' };
+      },
+    },
+    hookRuns: {
+      resolveGlobalRoot: () => root,
+      beginHookRun: async () => ({ id: 2 }),
+      finishHookRun: async () => undefined,
+      startHookWorker: async () => undefined,
+      finishHookWorker: async () => { finished(); },
+    },
+  })({ directory: '/workspace' });
+
+  await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-abort' } });
+  await done;
+  assert.equal(aborted, true);
+});
+
+test('OpenCode toast maps a successful persisted terminal outcome to success', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loam-opencode-toast-success-'));
+  const calls = [];
+  let finished;
+  const done = new Promise((resolvePromise) => { finished = resolvePromise; });
+  const plugin = await createOpenCodeAdapter({
+    client: {
+      session: {},
+      tui: { showToast: async (input) => { calls.push(input); return true; } },
+    },
+    ingestion: {
+      gate: async () => ({ action: 'spawn_worker', workspace: '/workspace' }),
+      resolveGlobalRoot: () => root,
+      resolveSkillsRoot: () => root,
+      runWorker: async ({ notify }) => {
+        const controller = new AbortController();
+        await notify({ phase: 'terminal', visibility: 'toast', status: 'ok', signal: controller.signal });
+        return { reason: 'ok' };
+      },
+    },
+    hookRuns: {
+      resolveGlobalRoot: () => root,
+      beginHookRun: async () => ({ id: 3 }),
+      finishHookRun: async () => undefined,
+      startHookWorker: async () => undefined,
+      finishHookWorker: async () => { finished(); },
+    },
+  })({ directory: '/workspace' });
+
+  await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-success' } });
+  await done;
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].body, {
+    title: 'Loam', message: 'Background code ingestion completed.', variant: 'success',
+  });
+});
+
 test('detached workers report their result without changing worker failures', async () => {
   const calls = [];
   const options = {
@@ -136,6 +267,25 @@ test('detached workers report their result without changing worker failures', as
   assert.equal(calls[0][0], 'finish');
   assert.equal(calls[0][1].reason, 'unavailable');
   assert.match(calls[0][1].detail, /worker crashed/);
+});
+
+test('a detached fallback worker records codex_native/fallback/taken and finishes as fallback', async () => {
+  const calls = [];
+  await runIngestWorker({
+    harness: 'codex', workspace: '/workspace', hookRunId: 12, globalRoot: '/global',
+    skillsRoot: '/skills', env: {}, workerOrigin: 'fallback',
+    startHookWorker: async (input) => calls.push(['start', input]),
+    finishHookWorker: async (input) => calls.push(['finish', input]),
+    runWorker: async () => ({ reason: 'ok' }),
+  });
+  assert.equal(calls[0][0], 'start');
+  assert.equal(calls[0][1].origin, 'fallback');
+  assert.deepEqual(calls[0][1].events, [
+    { event: 'codex_native', phase: 'fallback', outcome: 'taken', visibility: 'native' },
+  ]);
+  assert.equal(calls[1][0], 'finish');
+  assert.equal(calls[1][1].origin, 'fallback');
+  assert.equal(calls[1][1].reason, 'ok');
 });
 
 test('OpenCode hook-run logging remains fail-open', async () => {
@@ -178,6 +328,26 @@ test('OpenCode finishes a catchable gate failure without rejecting the hook', as
   assert.match(finished[0].detail, /gate failed/);
 });
 
+test('Claude and Cursor adapters use payload workspace roots and emit documented envelopes', async () => {
+  const getContext = async ({ workspace }) => `context for ${workspace}`;
+  const claude = createClaudeAdapter({ getContext });
+  const cursor = createCursorAdapter({ getContext });
+  const workspace = resolve('/payload/workspace');
+  const payload = { cwd: workspace, workspace: { root: resolve('/nested/root') } };
+
+  assert.equal(claudeWorkspace(payload), workspace);
+  assert.equal(cursorWorkspace(payload), workspace);
+  const claudeOutput = await claude(payload);
+  const cursorOutput = await cursor(payload);
+  assert.deepEqual(claudeOutput, {
+    hookSpecificOutput: {
+      hookEventName: 'SessionStart',
+      additionalContext: `context for ${workspace}`,
+    },
+  });
+  assert.deepEqual(cursorOutput, { additional_context: `context for ${workspace}` });
+});
+
 test('config merge preserves unrelated JSON, creates a backup, and deduplicates Loam entries', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-config-'));
   const filePath = join(home, 'settings.json');
@@ -212,7 +382,6 @@ test('malformed and policy-owned config is rejected without mutation', async () 
 test('harness installation preserves unrelated hook commands containing loam', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-hook-ownership-'));
   const globalRoot = join(home, '.agents', 'loam');
-  const runtimePath = join(globalRoot, 'bin', '0.9.1', 'target', 'loam');
   await mkdir(join(home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(home, '.claude'), { recursive: true });
   await mkdir(join(home, '.cursor'), { recursive: true });
@@ -228,7 +397,6 @@ test('harness installation preserves unrelated hook commands containing loam', a
     home,
     globalRoot,
     pluginVersion: '0.8.3',
-    runtimePath,
     detected: await detectHarnesses({ home }),
   });
   const claude = JSON.parse(await readFile(join(home, '.claude', 'settings.json'), 'utf8'));
@@ -238,18 +406,14 @@ test('harness installation preserves unrelated hook commands containing loam', a
 
   assert.deepEqual(claudeHooks[0], unrelatedClaude);
   assert.deepEqual(cursorHooks[0], unrelatedCursor);
-  assert.equal(claudeHooks.filter((entry) => entry.command === runtimePath).length, 0, 'Claude is registered in its plugin, not in user settings');
-  assert.deepEqual(
-    cursorHooks.filter((entry) => entry.command === runtimePath).map((entry) => entry.args),
-    [['hook', 'cursor', '--event', 'sessionStart']],
-  );
+  assert.equal(claudeHooks.filter((entry) => entry.command === 'node' && entry.args?.[0] === result.claude.path).length, 0);
+  assert.equal(cursorHooks.filter((entry) => entry.command === 'node' && entry.args?.[0] === result.cursor.path).length, 1);
   await result.rollback();
 });
 
 test('harness detection and installation use only user HOME paths and are idempotent', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-home-'));
   const globalRoot = join(home, '.agents', 'loam');
-  const runtimePath = join(globalRoot, 'bin', '0.9.1', 'target', 'loam');
   await mkdir(join(home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(home, '.claude'), { recursive: true });
   await mkdir(join(home, '.cursor'), { recursive: true });
@@ -261,8 +425,8 @@ test('harness detection and installation use only user HOME paths and are idempo
   assert.equal(detected.claude.state, 'detected');
   assert.equal(detected.cursor.state, 'detected');
 
-  const first = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', runtimePath, detected });
-  const second = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', runtimePath, detected });
+  const first = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', detected });
+  const second = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', detected });
   assert.deepEqual(first.opencode.state, 'ready');
   assert.deepEqual(first.claude.state, 'skipped');
   assert.deepEqual(first.cursor.state, 'ready');
@@ -279,7 +443,6 @@ test('harness detection and installation use only user HOME paths and are idempo
 test('marketplace plugins own all Claude and Codex lifecycle hooks', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-owned-'));
   const globalRoot = join(home, '.agents', 'loam');
-  const runtimePath = join(globalRoot, 'bin', '0.9.1', 'target', 'loam');
   const oldRoot = join(globalRoot, 'plugins', 'old');
   const oldClaude = { type: 'command', command: `node ${JSON.stringify(join(oldRoot, 'claude-session-start.mjs'))}` };
   const oldCodex = { type: 'command', command: `node ${JSON.stringify(join(oldRoot, 'codex-session-start.mjs'))}` };
@@ -293,14 +456,14 @@ test('marketplace plugins own all Claude and Codex lifecycle hooks', async () =>
   await writeFile(join(home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
   const claudeCache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
   await mkdir(join(claudeCache, 'hooks'), { recursive: true });
-  await writeFile(join(claudeCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
+  await writeFile(join(claudeCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
   await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
     version: 2,
     plugins: { 'loam@loam': [{ scope: 'user', installPath: claudeCache, version: '0.8.6' }] },
   }));
   const codexCache = join(home, '.codex', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
   await mkdir(join(codexCache, 'hooks'), { recursive: true });
-  await writeFile(join(codexCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
+  await writeFile(join(codexCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
   await writeFile(join(home, '.codex', 'hooks.json'), JSON.stringify({
     hooks: { SessionStart: [{ hooks: [unrelated, oldCodex] }] },
   }));
@@ -313,7 +476,7 @@ test('marketplace plugins own all Claude and Codex lifecycle hooks', async () =>
   const stale = await detectHarnesses({ home, pluginVersion: '0.9.4' });
   assert.equal(stale.claude.marketplaceReady, false);
   assert.equal(stale.codex.marketplaceReady, false);
-  const owned = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.6', runtimePath, detected });
+  const owned = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.6', detected });
   const claude = JSON.parse(await readFile(join(home, '.claude', 'settings.json'), 'utf8'));
   const codex = JSON.parse(await readFile(join(home, '.codex', 'hooks.json'), 'utf8'));
   assert.equal(owned.claude.owner, 'marketplace');
@@ -332,7 +495,6 @@ test('marketplace plugins own all Claude and Codex lifecycle hooks', async () =>
     home: fallbackHome,
     globalRoot: join(fallbackHome, '.agents', 'loam'),
     pluginVersion: '0.8.6',
-    runtimePath: join(fallbackHome, '.agents', 'loam', 'bin', '0.9.1', 'target', 'loam'),
     detected: fallbackDetected,
   });
   assert.equal(fallback.codex.state, 'skipped');
@@ -358,7 +520,7 @@ test('disabled marketplace plugins remain discoverable for uninstall', async () 
   const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-disabled-'));
   const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.2');
   await mkdir(join(cache, 'hooks'), { recursive: true });
-  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
   await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': false } }));
   await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
     version: 2,
@@ -374,7 +536,7 @@ test('project-scoped Claude plugins do not satisfy a user-scoped install', async
   const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-project-scope-'));
   const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.4');
   await mkdir(join(cache, 'hooks'), { recursive: true });
-  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
   await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
   await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
     version: 2,
@@ -397,7 +559,6 @@ test('managed harness policy becomes partial without changing its settings', asy
     home,
     globalRoot: join(home, '.agents', 'loam'),
     pluginVersion: '0.8.3',
-    runtimePath: join(home, '.agents', 'loam', 'bin', '0.9.1', 'target', 'loam'),
     detected,
   });
 
@@ -413,7 +574,6 @@ test('absent harnesses remain absent and do not receive project-local hook files
     home,
     globalRoot: join(home, '.agents', 'loam'),
     pluginVersion: '0.8.3',
-    runtimePath: join(home, '.agents', 'loam', 'bin', '0.9.1', 'target', 'loam'),
     detected,
   });
 
@@ -433,11 +593,81 @@ test('Codex cleanup preserves unrelated hook groups without adding setup hooks',
     home,
     globalRoot: join(home, '.agents', 'loam'),
     pluginVersion: '0.8.3',
-    runtimePath: join(home, '.agents', 'loam', 'bin', '0.9.1', 'target', 'loam'),
     detected: { opencode: { id: 'opencode', state: 'absent' }, claude: { id: 'claude', state: 'absent' }, cursor: { id: 'cursor', state: 'absent' }, codex: { id: 'codex', state: 'detected', root: join(home, '.codex') } },
   });
   assert.equal(result.codex.state, 'skipped', JSON.stringify(result.codex));
   const config = JSON.parse(await readFile(join(home, '.codex', 'hooks.json'), 'utf8'));
   assert.equal(config.hooks.Stop.length, 1);
   assert.deepEqual(config.hooks.Stop[0].hooks, [unrelated]);
+});
+
+test('Claude readiness follows the plugin cache when installed_plugins.json lags behind', async () => {
+  // Reproduces the observed race: `claude plugin install` creates the 0.9.15 cache directory,
+  // but installed_plugins.json still names 0.9.14 when setup writes install.json. Reading the
+  // registry alone dropped Claude from configured_harnesses for the whole release.
+  const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-lag-'));
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({
+    enabledPlugins: { 'loam@loam': true },
+  }));
+  const stale = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.14');
+  const fresh = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.15');
+  for (const cache of [stale, fresh]) {
+    await mkdir(join(cache, 'hooks'), { recursive: true });
+    await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  }
+  // The registry has not caught up: it still points at the previous version.
+  await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'user', installPath: stale, version: '0.9.14' }] },
+  }));
+
+  const detected = await detectHarnesses({ home, pluginVersion: '0.9.15' });
+  assert.equal(detected.claude.marketplaceInstalled, true);
+  assert.equal(detected.claude.marketplaceOwned, true);
+  assert.equal(detected.claude.marketplaceReady, true, 'the freshly installed cache version must count as ready');
+
+  // installHarnesses is what writes the harness state that becomes configured_harnesses.
+  const installed = await installHarnesses({
+    home,
+    globalRoot: join(home, '.agents', 'loam'),
+    pluginVersion: '0.9.15',
+    detected,
+  });
+  assert.equal(installed.claude.state, 'ready');
+  assert.equal(installed.claude.owner, 'marketplace');
+
+  // A version that was never installed still must not report ready.
+  const missing = await detectHarnesses({ home, pluginVersion: '0.9.99' });
+  assert.equal(missing.claude.marketplaceReady, false);
+});
+
+test('Claude readiness works from the plugin cache with no registry file at all', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-noregistry-'));
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({
+    enabledPlugins: { 'loam@loam': true },
+  }));
+  const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.15');
+  await mkdir(join(cache, 'hooks'), { recursive: true });
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+
+  const detected = await detectHarnesses({ home, pluginVersion: '0.9.15' });
+  assert.equal(detected.claude.marketplaceInstalled, true);
+  assert.equal(detected.claude.marketplaceReady, true);
+});
+
+test('Claude is not ready when the cached plugin is missing its required hooks', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-nohooks-'));
+  await mkdir(join(home, '.claude'), { recursive: true });
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({
+    enabledPlugins: { 'loam@loam': true },
+  }));
+  const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.15');
+  await mkdir(join(cache, 'hooks'), { recursive: true });
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}] } }));
+
+  const detected = await detectHarnesses({ home, pluginVersion: '0.9.15' });
+  assert.equal(detected.claude.marketplaceInstalled, true);
+  assert.equal(detected.claude.marketplaceReady, false, 'a cache without a Stop hook is not ready');
 });

@@ -4,10 +4,20 @@
   <img src="loam.svg" alt="loam" width="120">
 </p>
 
+<p align="center">
+  <a href="./WHY.md"><img alt="Why Loam exists" src="https://img.shields.io/badge/why-Loam%3F-6b5b45"></a>
+  <a href="https://www.npmjs.com/package/@scchearn/loam"><img alt="npm version" src="https://img.shields.io/npm/v/@scchearn/loam?logo=npm&amp;label=npm"></a>
+  <a href="https://github.com/scchearn/loam/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/scchearn/loam/ci.yml?branch=main&amp;label=CI&amp;logo=githubactions"></a>
+  <a href="https://github.com/scchearn/loam/releases"><img alt="runtime version" src="https://img.shields.io/github/v/tag/scchearn/loam?filter=cli-v*&amp;label=runtime&amp;logo=rust"></a>
+  <a href="./LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/scchearn/loam"></a>
+</p>
+
 loam is a collection of workflow skills for AI coding agents.
 It gives an agent a structured way to plan work, research questions,
 execute plans, and maintain a persistent knowledge base, so
 sessions build on each other instead of starting from scratch.
+
+[Why Loam exists →](./WHY.md)
 
 ## Install
 
@@ -71,6 +81,17 @@ changing it. `uninstall` also removes Loam's globally installed skills.
 
 For agent-specific setup notes, see [`.opencode/INSTALL.md`](./.opencode/INSTALL.md)
 and [`.codex/INSTALL.md`](./.codex/INSTALL.md).
+
+### Background session harvest
+
+Background session-learning harvest is enabled by default: on every turn end
+the hook measures what has been said since the last harvest, and when enough
+new conversation exists a detached agent reviews the window and routes durable
+learnings through `loam::learning-from-session`. Each session keeps its own
+cursor and harvests into its workspace's memory; harvest shares the
+per-workspace memory-writer lease with code ingestion and never runs while
+another worker holds it. To opt out, set `LOAM_HARVEST_BACKGROUND=0` or
+`background_harvest.enabled: false` in `~/.agents/loam/config.json`.
 
 ## What you get
 
@@ -177,7 +198,7 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::adding-to-memory | 592 | 116 | 217 | 2,301 |
 | loam::amending-memory | 505 | 114 | 180 | 1,951 |
 | loam::auditing-guidance | 410 | 85 | 252 | 2,528 |
-| loam::ingesting-codebase | 329 | 76 | 287 | 3,511 |
+| loam::ingesting-codebase | 329 | 76 | 288 | 3,640 |
 | loam::learning-from-session | 487 | 101 | 365 | 4,202 |
 | loam::linting-memory | 471 | 102 | 312 | 4,985 |
 | loam::normalizing-memory | 457 | 101 | 261 | 2,665 |

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { cp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +15,7 @@ import { PACKAGE_VERSION } from '../setup/constants.mjs';
 import { discover } from '../setup/discovery.mjs';
 import { verifyInstallation } from '../setup/verify.mjs';
 import { detectTarget, runtimePath } from '../setup/target.mjs';
+import { uninstall } from '../setup/uninstall.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 const target = detectTarget();
@@ -75,16 +76,56 @@ async function baseFixture() {
       cursor: { id: 'cursor', state: 'absent' },
     },
     smokeRunner: async () => ({ code: 0, stdout: '{"exists":false}', stderr: '' }),
-    // Delegated federation service lifecycle: status reports "not enabled" (a
-    // fresh machine is inert), every other verb succeeds. The real runtime is a
-    // dummy file in these fixtures, so we never actually spawn a manager.
-    federationRunner: async (request) => ({
-      code: request.args.includes('status') ? 1 : 0,
-      stdout: '',
-      stderr: '',
-    }),
   };
 }
+
+test('harvest_packaging: fresh install stages every harvest module and the harvest worker', async () => {
+  const fixture = await baseFixture();
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['setup', '--yes']), {
+    ...fixture,
+    packageRoot,
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+  assert.equal(code, 0, capture.text());
+  const globalRoot = join(fixture.home, '.agents', 'loam');
+  const install = JSON.parse(await readFile(join(globalRoot, 'install.json'), 'utf8'));
+  const integrationPath = install.integration_path;
+  const integrationRoot = join(integrationPath, '..');
+  for (const module of [
+    'harvest-state.mjs', 'harvest-window.mjs', 'harvest-store.mjs',
+    'harvest-claude.mjs', 'harvest-codex.mjs', 'harvest-opencode.mjs', 'harvest.mjs',
+  ]) {
+    assert.ok(
+      (await readdir(integrationRoot)).includes(module),
+      `fresh install must stage ${module}`,
+    );
+  }
+  const adapterRoot = install.adapter_root;
+  assert.ok(
+    (await readdir(adapterRoot)).includes('harvest-worker.mjs'),
+    'fresh install must stage harvest-worker.mjs in the adapter root',
+  );
+});
+
+test('harvest_packaging: upgrade stages harvest modules idempotently and final verification passes', async () => {
+  const fixture = await baseFixture();
+  const first = outputCapture();
+  await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, output: first.output, errorOutput: first.output });
+  const second = outputCapture();
+  const code = await runSetup(parseArgs(['setup', '--yes']), {
+    ...fixture,
+    packageRoot,
+    output: second.output,
+    errorOutput: second.output,
+  });
+  assert.equal(code, 0, second.text());
+  const globalRoot = join(fixture.home, '.agents', 'loam');
+  const install = JSON.parse(await readFile(join(globalRoot, 'install.json'), 'utf8'));
+  const integrationRoot = join(install.integration_path, '..');
+  assert.ok((await readdir(integrationRoot)).includes('harvest.mjs'), 'upgrade is idempotent');
+});
 
 test('clean --yes setup completes and publishes verified install metadata', async () => {
   const fixture = await baseFixture();
@@ -176,7 +217,7 @@ test('setup reconciles an install from an older plugin version', async () => {
   assert.equal(await readFile(databasePath, 'utf8'), 'operational history');
 });
 
-test('marketplace-owned Claude and Codex satisfy readiness without user hooks', async () => {
+test('marketplace-owned Claude and Codex satisfy readiness with the Codex agent profile and without user hooks', async () => {
   const fixture = await baseFixture();
   await mkdir(join(fixture.home, '.claude'), { recursive: true });
   await mkdir(join(fixture.home, '.codex'), { recursive: true });
@@ -211,6 +252,55 @@ test('marketplace-owned Claude and Codex satisfy readiness without user hooks', 
   assert.deepEqual(claude.hooks.SessionStart, []);
   assert.equal((claude.hooks.Stop || []).flatMap((entry) => entry.hooks || []).length, 0);
   await assert.rejects(() => readFile(join(fixture.home, '.codex', 'hooks.json')), { code: 'ENOENT' });
+  assert.equal(
+    await readFile(join(fixture.home, '.codex', 'agents', 'loam_ingestor.toml'), 'utf8'),
+    await readFile(join(packageRoot, 'adapters', 'loam_ingestor.toml'), 'utf8'),
+  );
+
+  const profilePath = join(fixture.home, '.codex', 'agents', 'loam_ingestor.toml');
+  await writeFile(profilePath, '# Managed by @scchearn/loam setup.\nname = "loam_ingestor"\n');
+  const tampered = await verifyInstallation({
+    discovery: await discover({ home: fixture.home, workspace: fixture.workspace, packageRoot }),
+    packageRoot,
+    runtimeRunner: fixture.smokeRunner,
+  });
+  assert.equal(tampered.harnesses.codex.category, 'agent_profile_mismatch');
+
+  const updateCode = await runSetup(parseArgs(['update']), {
+    ...fixture,
+    packageRoot,
+    output: outputCapture().output,
+  });
+  assert.equal(updateCode, 0);
+  assert.equal(
+    await readFile(profilePath, 'utf8'),
+    await readFile(join(packageRoot, 'adapters', 'loam_ingestor.toml'), 'utf8'),
+  );
+});
+
+test('failed setup restores a pre-existing Codex agent profile collision', async () => {
+  const fixture = await baseFixture();
+  const profilePath = join(fixture.home, '.codex', 'agents', 'loam_ingestor.toml');
+  const original = 'name = "personal_ingestor"\ndescription = "User profile"\ndeveloper_instructions = "Keep me"\n';
+  await mkdir(join(fixture.home, '.codex', 'agents'), { recursive: true });
+  await writeFile(profilePath, original);
+
+  let observedManagedProfile = false;
+  const code = await runSetup(parseArgs(['setup', '--yes']), {
+    ...fixture,
+    packageRoot,
+    beforeActivate: async () => {
+      observedManagedProfile = (await readFile(profilePath, 'utf8')).includes('name = "loam_ingestor"');
+      assert.equal(await readFile(`${profilePath}.loam-backup`, 'utf8'), original);
+      throw new Error('controlled interruption');
+    },
+    output: outputCapture().output,
+  });
+
+  assert.equal(code, 1);
+  assert.equal(observedManagedProfile, true);
+  assert.equal(await readFile(profilePath, 'utf8'), original);
+  await assert.rejects(() => readFile(`${profilePath}.loam-backup`), { code: 'ENOENT' });
 });
 
 test('setup verifies an updated marketplace plugin from disk instead of trusting CLI success', async () => {
@@ -561,40 +651,6 @@ test('harness readiness ignores hook paths outside the setup-owned root', async 
   result = await verifyInstallation({ discovery, packageRoot, runtimeRunner: fixture.smokeRunner });
   assert.equal(result.ready, true);
   assert.equal(result.harnesses.claude.ready, true);
-});
-
-test('a stale staged runtime is a registration failure, not a silent pass', async () => {
-  // Both registrations name an absolute runtime that setup wrote at stage time,
-  // so the failure mode is a slot that was never rewritten — a `plugin update`
-  // that restored the shipped hooks file, or a runtime that moved underneath an
-  // already-baked OpenCode plugin. Neither is visible at session time.
-  const { fixture, discovery } = await readyHarnessFixture();
-  const install = JSON.parse(await readFile(join(fixture.home, '.agents', 'loam', 'install.json'), 'utf8'));
-
-  // Positive control: the freshly staged install verifies ready, so what the
-  // assertions below detect is the staleness and not some unrelated gap.
-  let result = await verifyInstallation({ discovery, packageRoot, runtimeRunner: fixture.smokeRunner });
-  assert.equal(result.harnesses.claude.ready, true);
-  assert.equal(result.harnesses.opencode.ready, true);
-
-  // `plugin update` restores the shipped hooks file, which carries Stop only.
-  const cache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
-  await cp(join(packageRoot, 'plugins', 'loam-adapter', 'hooks', 'hooks.json'), join(cache, 'hooks', 'hooks.json'));
-
-  // OpenCode's plugin is baked at stage time, so a moved runtime leaves the
-  // installed file naming a path the current install no longer uses.
-  const pluginPath = join(fixture.home, '.config', 'opencode', 'plugins', 'loam.js');
-  const staged = await readFile(pluginPath, 'utf8');
-  const stale = staged.replaceAll(JSON.stringify(install.runtime_path), JSON.stringify('/previous/bin/loam'));
-  assert.notEqual(stale, staged, 'the staged plugin must actually name the current runtime');
-  await writeFile(pluginPath, stale);
-
-  result = await verifyInstallation({ discovery, packageRoot, runtimeRunner: fixture.smokeRunner });
-  assert.equal(result.harnesses.claude.ready, false);
-  assert.equal(result.harnesses.claude.category, 'registration_missing');
-  assert.equal(result.harnesses.opencode.ready, false);
-  assert.equal(result.harnesses.opencode.category, 'registration_mismatch');
-  assert.equal(result.ready, false);
 });
 
 test('harness readiness rejects duplicate setup-owned registrations', async () => {

@@ -1,0 +1,14 @@
+This is a background session-learning harvest. Your live conversation context does not contain the session under review; the conversation to review is in the window file at the absolute path below.
+
+Workspace: /home/user/projects/example-app
+Window file: /home/user/projects/example-app/run/harvest/<session-hash>.window.md
+
+Read the window file in full. Treat it as the conversation of the session to review, in place of live session context. Then invoke the loam::learning-from-session skill exactly once, using this session as the focus, and follow its routing report format.
+
+The window contains only records from the current session after the last harvested cursor; it is already normalised and truncated, and it may contain nothing admissible. Do not re-parse, re-classify, or pre-judge the material — the skill owns all judgment.
+
+Rules:
+- Do not spawn or delegate to another agent, subagent, or process.
+- Do not modify source files, commit, or push.
+- Do not read the harness store; the window is the only conversation content you may use.
+- If the window yields nothing admissible, report that outcome and stop.

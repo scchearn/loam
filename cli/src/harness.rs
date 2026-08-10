@@ -999,6 +999,11 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     };
     let mut paths = HookPaths::from_env();
     let mut event = HookEvent::SessionStart;
+    // `--body` emits the composed context body only, without the harness-native
+    // envelope. The marketplace adapter (main's session-start path) re-wraps it,
+    // so it consumes the same sanitized baseline+federation body the native hook
+    // would emit, without double-wrapping the envelope.
+    let mut body_only = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--workspace" => match args.next() {
@@ -1015,6 +1020,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
                     return 1;
                 }
             },
+            "--body" => body_only = true,
             _ => {
                 usage();
                 return 1;
@@ -1030,33 +1036,40 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         use std::io::Read;
         let mut reader = std::io::stdin().take((config.max_frame_bytes + 1) as u64);
         if reader.read_to_end(&mut input).is_err() {
-            return refuse(harness, event, "frame_unreadable");
+            return refuse(harness, event, "frame_unreadable", body_only);
         }
     }
 
     let frame = match parse_frame(&input, &config) {
         Ok(frame) => frame,
-        Err(error) => return refuse(harness, event, error.code()),
+        Err(error) => return refuse(harness, event, error.code(), body_only),
     };
 
-    println!(
-        "{}",
-        harness.envelope(&compose_body(&paths, &config, &frame, None), event)
-    );
+    let body = compose_body(&paths, &config, &frame, None);
+    if body_only {
+        println!("{body}");
+    } else {
+        println!("{}", harness.envelope(&body, event));
+    }
     0
 }
 
 /// A refused frame renders no payload and mutates nothing: the diagnostic is a
-/// stable code on stderr and the harness receives an empty envelope, never a
-/// half-built context assembled from input we could not parse.
-fn refuse(harness: Harness, event: HookEvent, code: &str) -> i32 {
+/// stable code on stderr and the harness receives an empty envelope (or, in
+/// `--body` mode, an empty body), never a half-built context assembled from
+/// input we could not parse.
+fn refuse(harness: Harness, event: HookEvent, code: &str, body_only: bool) -> i32 {
     eprintln!("loam hook: {code}");
-    println!("{}", harness.envelope("", event));
+    if body_only {
+        println!();
+    } else {
+        println!("{}", harness.envelope("", event));
+    }
     0
 }
 
 fn usage() {
-    eprintln!("Usage: loam hook <opencode|claude|codex|cursor> [--workspace <absolute-path>] [--event <SessionStart|UserPromptSubmit>]");
+    eprintln!("Usage: loam hook <opencode|claude|codex|cursor> [--workspace <absolute-path>] [--event <SessionStart|UserPromptSubmit>] [--body]");
 }
 
 #[cfg(test)]

@@ -37,6 +37,13 @@ jobs:
         env:
           LOAM_MQTT_TEST: "1"
         run: cargo +1.94.1 test --locked --test mqtt_connector -- --ignored --test-threads=1
+      # The two-instance federation proof points the resolver at per-test
+      # fixtures through process-global env vars, so it must run single-threaded
+      # like every sibling tier or concurrent tests clobber each other's roster.
+      - name: Run the two-instance federation operational proof against a real broker
+        env:
+          LOAM_MQTT_TEST: "1"
+        run: cargo +1.94.1 test --locked --test mqtt_operational -- --ignored --test-threads=1
       # This lane has a real broker but no installed harness, so it
       # runs the real-broker half of the e2e suite and never claims harness
       # compatibility: `bin/real-harness-suite.sh` stays local and opt-in behind

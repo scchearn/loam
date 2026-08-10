@@ -1,0 +1,15 @@
+{"timestamp":"2026-08-07T08:00:00Z","type":"event_msg","payload":{"message":{"role":"user","content":[{"type":"input_text","text":"first real user question"}]}},"session_id":"sess-c"}
+{"timestamp":"2026-08-07T08:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant answer in response_item format"}]},"session_id":"sess-c"}
+{"timestamp":"2026-08-07T08:00:02Z","type":"event_msg","payload":{"type":"agent_message","content":[{"type":"output_text","text":"assistant answer in response_item format"}]},"session_id":"sess-c"}
+{"timestamp":"2026-08-07T08:00:03Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call_1","arguments":"{\"command\":\"ls -la\"}","status":"completed"},"session_id":"sess-c"}
+{"timestamp":"2026-08-07T08:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"drwxr-xr-x 2 sam sam 4096 ."},"session_id":"sess-c"}
+{"timestamp":"2026-08-07T08:00:05Z","type":"response_item","payload":{"type":"function_call","name":"read_file","call_id":"call_2","arguments":"{\"file_path\":\"/workspace/README.md\"}","status":"completed"},"session_id":"sess-c"}
+{"timestamp":"2026-08-07T08:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_2","output":"[{\"type\":\"input_text\",\"text\":\"# README\\n\"}]"},"session_id":"sess-c"}
+{"timestamp":"2026-08-07T08:00:07Z","type":"event_msg","payload":{"type":"user_message","content":[{"type":"input_text","text":"<environment_context>\npath=/workspace\n"}]},"session_id":"sess-c"}
+{"timestamp":"2026-08-07T08:00:08Z","type":"event_msg","payload":{"type":"user_message","content":[{"type":"input_text","text":"# AGENTS.md\nagent guidance injected"}]},"session_id":"sess-c"}
+{"timestamp":"2026-08-07T08:00:09Z","type":"event_msg","payload":{"type":"user_message","content":[{"type":"input_text","text":"<permissions>\n{\"rules\":[]}"}]},"session_id":"sess-c"}
+{"timestamp":"2026-08-07T08:00:10Z","type":"event_msg","payload":{"type":"user_message","content":[{"type":"input_text","text":"second real user question after injected turns"}]},"session_id":"sess-c"}
+{"timestamp":"2026-08-07T08:00:11Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call_3","arguments":"{\"command\":\"false\"}","status":"completed"},"session_id":"sess-c"}
+{"timestamp":"2026-08-07T08:00:12Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_3","output":"Exit code: 1\nboom"},"session_id":"sess-c"}
+{"type":"user_message","payload":{"message":{"role":"user","content":[{"type":"input_text","text":"third real user turn"}]},"session_id":"sess-c"}
+{"timestamp":"2026-08-07T08:00:14Z","type":"event_msg","payload":{"type":"user_message","content":[{"type":"input_text","text":"trailing user turn without completion"}]},"session_id":"sess-c"}

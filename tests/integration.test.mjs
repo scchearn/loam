@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
+import { formatContext, formatNativeRuntimeCommand } from '../integration/context.mjs';
 import {
   beginHookRun, finishHookRun, finishHookWorker, startHookWorker,
 } from '../integration/hooks.mjs';
@@ -87,7 +88,19 @@ test('ready state invokes native state once and formats one common context', asy
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].args, ['state', '--fast', fixtureData.home]);
 
-  assert.equal(result.state.collection, 'project-wiki');
+  const context = formatContext({
+    skillContent: '---\nname: loam::using\n---\n\n# Using loam\n',
+    state: result.state,
+    pluginVersion: '0.8.3',
+    runtimePath: fixtureData.runtimePath,
+    platform: 'linux',
+  });
+  assert.match(context, /^<LOAM_IMPORTANT>/);
+  assert.match(context, /You have loam \(v0\.8\.3\)/);
+  assert.match(context, /Native runtime command: '/);
+  assert.match(context, new RegExp(fixtureData.runtimePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(context, /project-wiki/);
+  assert.doesNotMatch(context, /^name: loam::using$/m);
 });
 
 test('versioned integration path resolves the global Loam root', async () => {
@@ -110,6 +123,14 @@ test('legacy integration path still resolves the global Loam root', () => {
   const integrationPath = join(globalRoot, 'integration', 'loam.mjs');
 
   assert.equal(resolveGlobalRoot({ env: {}, integrationPath }), globalRoot);
+});
+
+test('quotes native runtime paths for POSIX and PowerShell commands', () => {
+  const posixPath = '/home/Sam User/.agents/loam/bin/0.9.1/loam';
+  const windowsPath = String.raw`C:\Users\Sam User\.agents\loam\bin\0.9.1\loam.exe`;
+
+  assert.equal(formatNativeRuntimeCommand(posixPath, 'linux'), `'${posixPath}'`);
+  assert.equal(formatNativeRuntimeCommand(windowsPath, 'win32'), `& '${windowsPath}'`);
 });
 
 test('target detection accepts the five release targets and rejects unsupported hosts', () => {
@@ -138,6 +159,14 @@ test('missing runtime reports unavailable without invoking state or fabricating 
   assert.equal(result.category, 'runtime_missing');
   assert.equal(result.state, undefined);
   assert.equal(calls, 0);
+  const context = formatContext({
+    skillContent: '# Using loam\n',
+    unavailable: result,
+    pluginVersion: '0.8.3',
+  });
+  assert.match(context, /npx @scchearn\/loam setup/);
+  assert.match(context, /No workspace state was generated/);
+  assert.doesNotMatch(context, /## Workspace state/);
 });
 
 test('runtime version mismatch fails readiness before execution', async () => {
@@ -379,11 +408,179 @@ test('direct runtime invocation closes stdin', async () => {
     runtimePath: process.execPath,
     args: ['-e', "process.stdin.resume(); process.stdin.on('end', () => process.stdout.write('closed'))"],
     cwd: process.cwd(),
-    timeoutMs: 1000,
+    // Generous timeout: node startup under a loaded pre-commit run can exceed a
+    // tight bound and this test is about the closed-stdin contract, not latency.
+    timeoutMs: 15000,
   });
 
   assert.equal(result.code, 0, result.stderr);
   assert.equal(result.stdout, 'closed');
+});
+
+test('direct runtime invocation writes a supplied stdin payload then closes it', async () => {
+  const result = await invokeRuntime({
+    runtimePath: process.execPath,
+    args: ['-e', "let d=''; process.stdin.on('data', (c) => d += c); process.stdin.on('end', () => process.stdout.write(d))"],
+    cwd: process.cwd(),
+    // Generous timeout: node startup under a loaded pre-commit run can exceed a
+    // tight bound and this test is about the write path, not latency.
+    timeoutMs: 15000,
+    input: '{"schema":1,"events":[]}',
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout, '{"schema":1,"events":[]}');
+});
+
+test('invokeRuntime threads input through the runner seam', async () => {
+  let seen;
+  const result = await invokeRuntime({
+    runtimePath: '/runtime',
+    args: ['hooks', 'finish'],
+    cwd: process.cwd(),
+    timeoutMs: 100,
+    input: 'payload',
+    runner: async (request) => {
+      seen = request;
+      return { code: 0, signal: null, stdout: '', stderr: '' };
+    },
+  });
+
+  assert.equal(result.code, 0);
+  assert.equal(seen.input, 'payload');
+  // A call without input still reaches the runner with input undefined.
+  await invokeRuntime({
+    runtimePath: '/runtime',
+    args: ['hooks', 'begin'],
+    cwd: process.cwd(),
+    timeoutMs: 100,
+    runner: async (request) => {
+      seen = request;
+      return { code: 0, signal: null, stdout: '', stderr: '' };
+    },
+  });
+  assert.equal(seen.input, undefined);
+});
+
+test('a stdin write to a child that exits without reading stays fail-open', async () => {
+  const result = await invokeRuntime({
+    runtimePath: process.execPath,
+    args: ['-e', 'process.exit(0)'],
+    cwd: process.cwd(),
+    timeoutMs: 15000,
+    input: 'x'.repeat(4096),
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+});
+
+const syntheticRun = () => ({ id: 42, globalRoot: '/g', workspace: '/w', runtimePath: '/r' });
+
+test('finishHookRun attaches a bounded event batch on the same subprocess call', async () => {
+  const calls = [];
+  const runner = async (request) => {
+    calls.push(request);
+    return { code: 0, signal: null, stdout: '', stderr: '' };
+  };
+  const events = [
+    { event: 'ingest_visibility', phase: 'launch', outcome: 'started', visibility: 'native', launch_mode: 'claude_bg' },
+  ];
+  const ok = await finishHookRun({
+    run: syntheticRun(), status: 'succeeded', action: 'spawn_worker', events, runner,
+  });
+
+  assert.equal(ok, true);
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].args.includes('--events-stdin'));
+  assert.equal(calls[0].input, JSON.stringify({ schema: 1, events }));
+});
+
+test('finishHookRun without events keeps the closed-stdin call unchanged', async () => {
+  const calls = [];
+  const runner = async (request) => {
+    calls.push(request);
+    return { code: 0, signal: null, stdout: '', stderr: '' };
+  };
+  const ok = await finishHookRun({
+    run: syntheticRun(), status: 'succeeded', action: 'skip', reason: 'nothing_to_do', runner,
+  });
+
+  assert.equal(ok, true);
+  assert.equal(calls.length, 1);
+  assert.ok(!calls[0].args.includes('--events-stdin'));
+  assert.equal(calls[0].input, undefined);
+});
+
+test('an out-of-bounds event batch is dropped without a flag, process, or lost transition', async () => {
+  for (const events of [
+    Array.from({ length: 17 }, () => ({ event: 'ingest_visibility' })),
+    [{ event: 'ingest_visibility', detail: 'z'.repeat(20000) }],
+    [{ event: 'ingest_visibility' }, 'not-an-object'],
+    [],
+  ]) {
+    const calls = [];
+    const runner = async (request) => {
+      calls.push(request);
+      return { code: 0, signal: null, stdout: '', stderr: '' };
+    };
+    const ok = await finishHookRun({
+      run: syntheticRun(), status: 'succeeded', action: 'spawn_worker', events, runner,
+    });
+
+    assert.equal(ok, true);
+    assert.equal(calls.length, 1, 'the transition still runs as one subprocess');
+    assert.ok(!calls[0].args.includes('--events-stdin'));
+    assert.equal(calls[0].input, undefined);
+  }
+});
+
+test('emitting events keeps the lifecycle subprocess count constant', async () => {
+  // Each wrapper makes exactly one runtime invocation whether or not it carries
+  // an event batch — the batch rides that call, never a per-observation process.
+  const run = syntheticRun();
+  const events = [
+    { event: 'ingest_visibility', phase: 'launch', outcome: 'started', visibility: 'native', launch_mode: 'claude_bg' },
+  ];
+  for (const withEvents of [false, true]) {
+    for (const [label, invoke] of [
+      ['finish', (extra) => finishHookRun({ run, status: 'succeeded', action: 'spawn_worker', ...extra })],
+      ['worker-start', (extra) => startHookWorker({ run, sessionId: 'w', ...extra })],
+      ['worker-finish', (extra) => finishHookWorker({ run, reason: 'ok', ...extra })],
+    ]) {
+      const calls = [];
+      const runner = async (request) => {
+        calls.push(request);
+        return { code: 0, signal: null, stdout: '', stderr: '' };
+      };
+      await invoke({ runner, ...(withEvents ? { events } : {}) });
+      assert.equal(calls.length, 1, `${label} is one subprocess (events=${withEvents})`);
+      assert.equal(calls[0].args.includes('--events-stdin'), withEvents, label);
+    }
+  }
+});
+
+test('worker lifecycle wrappers forward their batch on their own single call', async () => {
+  const calls = [];
+  const runner = async (request) => {
+    calls.push(request);
+    return { code: 0, signal: null, stdout: '', stderr: '' };
+  };
+  const run = syntheticRun();
+  const startEvents = [
+    { event: 'subagent', phase: 'start', outcome: 'observed', agent_type: 'loam_ingestor', session_id: 'c1' },
+  ];
+  const finishEvents = [
+    { event: 'subagent', phase: 'stop', outcome: 'succeeded', agent_type: 'loam_ingestor', session_id: 'c1' },
+  ];
+
+  assert.equal(await startHookWorker({ run, sessionId: 'c1', events: startEvents, runner }), true);
+  assert.equal(await finishHookWorker({ run, reason: 'ok', events: finishEvents, runner }), true);
+
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].args.includes('--events-stdin'));
+  assert.equal(calls[0].input, JSON.stringify({ schema: 1, events: startEvents }));
+  assert.ok(calls[1].args.includes('--events-stdin'));
+  assert.equal(calls[1].input, JSON.stringify({ schema: 1, events: finishEvents }));
 });
 
 test('malformed native state is reported without synthetic fields', async () => {
@@ -445,8 +642,9 @@ test('legacy shadow detection handles a workspace with no shadow directories', a
   assert.deepEqual(report, { shadows: [], unsafe: [] });
 });
 
-test('the integration boundary is status-only and refuses the retired hook command', async () => {
+test('status and hook commands share one read-only integration boundary', async () => {
   const fixtureData = await fixture();
+  const workspace = fixtureData.home;
   const before = await readFile(join(fixtureData.skillsRoot, 'loam-using', 'SKILL.md'), 'utf8');
   const statusChunks = [];
   const statusCode = await runIntegration(['status'], {
@@ -460,18 +658,33 @@ test('the integration boundary is status-only and refuses the retired hook comma
   assert.equal(statusCode, 0);
   assert.equal(JSON.parse(statusChunks.join('')).ready, true);
 
-  // The harness read path is the native `loam hook <harness>` command now;
-  // the shared Node integration no longer serves one at any spelling.
-  for (const argv of [
-    ['run', '--', 'check', 'versions', fixtureData.home],
-    ['hook', '--harness', 'claude', '--workspace', fixtureData.home],
-    ['hook', '--harness', 'opencode', '--workspace', fixtureData.home],
-  ]) {
-    await assert.rejects(
-      () => runIntegration(argv, { globalRoot: fixtureData.globalRoot }),
-      /usage: loam\.mjs status \| ingest-status/,
+  await assert.rejects(
+    () => runIntegration(['run', '--', 'check', 'versions', fixtureData.home], { globalRoot: fixtureData.globalRoot }),
+    /usage: loam\.mjs status \| hook/,
+  );
+
+  const contexts = [];
+  for (const harness of ['opencode', 'claude', 'cursor']) {
+    const chunks = [];
+    const code = await runIntegration(
+      ['hook', '--harness', harness, '--workspace', workspace],
+      {
+        globalRoot: fixtureData.globalRoot,
+        skillsRoot: fixtureData.skillsRoot,
+        integrationPath: fixtureData.integrationPath,
+        target,
+        runner: async () => ({ code: 0, signal: null, stdout: JSON.stringify(state), stderr: '' }),
+        output: { write: (chunk) => chunks.push(String(chunk)) },
+      },
     );
+    assert.equal(code, 0);
+    contexts.push(chunks.join(''));
   }
+
+  assert.ok(contexts.every((context) => context.includes('<LOAM_IMPORTANT>')));
+  const runtimeCommand = formatNativeRuntimeCommand(fixtureData.runtimePath);
+  assert.ok(contexts.every((context) => context.includes(`Native runtime command: ${runtimeCommand}`)));
+  assert.deepEqual(new Set(contexts).size, 1);
   assert.equal(await readFile(join(fixtureData.skillsRoot, 'loam-using', 'SKILL.md'), 'utf8'), before);
 });
 

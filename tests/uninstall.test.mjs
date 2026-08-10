@@ -29,7 +29,7 @@ function skillsRunner({ installed = true, calls = [] } = {}) {
   };
 }
 
-async function readyFixture() {
+async function readyFixture({ codexProfile } = {}) {
   const home = await mkdtemp(join(tmpdir(), 'loam-uninstall-'));
   const globalRoot = join(home, '.agents', 'loam');
   await mkdir(join(home, '.config', 'opencode'), { recursive: true });
@@ -37,16 +37,19 @@ async function readyFixture() {
   await mkdir(join(home, '.codex'), { recursive: true });
   await mkdir(join(home, '.cursor'), { recursive: true });
   await mkdir(join(home, '.agents', 'skills', 'loam-using'), { recursive: true });
+  if (codexProfile !== undefined) {
+    await mkdir(join(home, '.codex', 'agents'), { recursive: true });
+    await writeFile(join(home, '.codex', 'agents', 'loam_ingestor.toml'), codexProfile);
+  }
   await writeFile(join(home, '.agents', 'skills', 'loam-using', 'SKILL.md'), '# using\n');
-  const runtimePath = join(globalRoot, 'bin', '0.9.1', 'x86_64-unknown-linux-musl', 'loam');
   const detected = await detectHarnesses({ home });
-  const installed = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', runtimePath, detected });
+  const installed = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', detected });
   const install = {
     schema_version: 1,
     plugin_version: '0.8.3',
     runtime_version: '0.9.1',
     target: 'x86_64-unknown-linux-musl',
-    runtime_path: runtimePath,
+    runtime_path: join(globalRoot, 'bin', '0.9.1', 'x86_64-unknown-linux-musl', 'loam'),
     runtime_sha256: 'a'.repeat(64),
     adapter_root: installed.versionRoot,
     integration_path: join(globalRoot, 'integration', 'loam.mjs'),
@@ -80,17 +83,12 @@ test('uninstall removes the global root, skills, adapter, and Loam-owned hooks; 
   const claudePath = join(home, '.claude', 'settings.json');
   const codexPath = join(home, '.codex', 'hooks.json');
   const cursorPath = join(home, '.cursor', 'hooks.json');
-  // Both registration generations: the retired Node shim a previous install
-  // left in user config, and the native `hook` command this one writes.
-  const legacyClaude = { type: 'command', command: 'node', args: [join(globalRoot, 'plugins', 'old', 'claude-session-start.mjs')] };
-  const nativeClaude = { type: 'command', command: install.runtime_path, args: ['hook', 'claude', '--event', 'SessionStart'] };
-  const legacyCodexSession = { type: 'command', command: `node ${JSON.stringify(join(globalRoot, 'plugins', 'old', 'codex-session-start.mjs'))}` };
   const claude = { hooks: {
-    SessionStart: [{ hooks: [legacyClaude, nativeClaude] }],
+    SessionStart: [{ hooks: [{ type: 'command', command: 'node', args: [installed.claude.path] }] }],
     Stop: [],
   } };
   const codex = { hooks: {
-    SessionStart: [{ hooks: [legacyCodexSession] }],
+    SessionStart: [{ hooks: [{ type: 'command', command: `node ${JSON.stringify(installed.codex.sessionPath)}` }] }],
     Stop: [{ hooks: [{ type: 'command', command: `node ${JSON.stringify(installed.codex.stopPath)}` }] }],
   } };
   const cursor = JSON.parse(await readFile(cursorPath, 'utf8'));
@@ -120,6 +118,7 @@ test('uninstall removes the global root, skills, adapter, and Loam-owned hooks; 
   assert.match(output, /local operational history/);
   assert.equal(await exists(join(home, '.config', 'opencode', 'plugins', 'loam.js')), false, 'opencode adapter removed');
   assert.equal(await exists(join(home, '.config', 'opencode', 'plugins', 'loam.mjs')), false, 'legacy opencode adapter removed');
+  assert.equal(await exists(join(home, '.codex', 'agents', 'loam_ingestor.toml')), false, 'Loam Codex agent profile removed');
   assert.equal(await exists(join(home, '.agents', 'skills', 'loam-using', 'SKILL.md')), true, 'fixture skill tree is not touched directly');
 
   const claudeAfter = JSON.parse(await readFile(claudePath, 'utf8'));
@@ -133,11 +132,35 @@ test('uninstall removes the global root, skills, adapter, and Loam-owned hooks; 
   assert.deepEqual(codexSessionHooks[0], unrelatedCodexSession, 'unrelated codex SessionStart hook preserved');
   assert.deepEqual(codexStopHooks[0], unrelatedCodexStop, 'unrelated codex Stop hook preserved');
   assert.deepEqual(cursorHooks[0], unrelatedCursor, 'unrelated cursor hook preserved');
-  assert.equal(claudeHooks.length, 1, 'both the legacy shim and the native claude hook removed');
-  assert.equal(codexSessionHooks.filter((h) => h.command === legacyCodexSession.command).length, 0, 'loam codex SessionStart hook removed');
+  assert.equal(claudeHooks.filter((h) => h.command === 'node' && h.args?.[0] === installed.claude.path).length, 0, 'loam claude hook removed');
+  assert.equal(codexSessionHooks.filter((h) => h.command === `node ${JSON.stringify(installed.codex.sessionPath)}`).length, 0, 'loam codex SessionStart hook removed');
   assert.equal(codexStopHooks.filter((h) => h.command === `node ${JSON.stringify(installed.codex.stopPath)}`).length, 0, 'loam codex Stop hook removed');
-  assert.equal(cursorHooks.length, 1, 'the native cursor hook removed');
-  assert.equal(cursorHooks.filter((h) => h.command === install.runtime_path).length, 0, 'no native runtime command survives uninstall');
+  assert.equal(cursorHooks.filter((h) => h.command === 'node' && h.args?.[0] === installed.cursor.path).length, 0, 'loam cursor hook removed');
+});
+
+test('uninstall restores a Codex profile preserved during setup', async () => {
+  const original = 'name = "personal_ingestor"\ndescription = "User profile"\ndeveloper_instructions = "Keep me"\n';
+  const { home, globalRoot } = await readyFixture({ codexProfile: original });
+  const profilePath = join(home, '.codex', 'agents', 'loam_ingestor.toml');
+  assert.notEqual(await readFile(profilePath, 'utf8'), original, 'setup installed the Loam profile');
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
+
+  assert.equal(code, 0);
+  assert.equal(await readFile(profilePath, 'utf8'), original);
+  assert.equal(await exists(`${profilePath}.loam-backup`), false);
+});
+
+test('uninstall preserves a Codex profile the user replaced after setup', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const profilePath = join(home, '.codex', 'agents', 'loam_ingestor.toml');
+  const replacement = 'name = "personal_ingestor"\ndescription = "User replacement"\ndeveloper_instructions = "Keep me"\n';
+  await writeFile(profilePath, replacement);
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
+
+  assert.equal(code, 0);
+  assert.equal(await readFile(profilePath, 'utf8'), replacement);
 });
 
 test('uninstall removes backup files created by setup', async () => {
@@ -162,6 +185,46 @@ test('uninstall without install.json reports nothing to remove', async () => {
 
   assert.equal(code, 0);
   assert.match(message, /Nothing to uninstall/);
+});
+
+test('harvest_packaging: uninstall removes harvest state and window files with the global root', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const runRoot = join(globalRoot, 'run', 'workspace-hash');
+  await mkdir(join(runRoot, 'harvest'), { recursive: true });
+  await writeFile(join(runRoot, 'harvest', 'abc123.window.md'), '# window\n');
+  await writeFile(join(runRoot, 'harvest', 'abc123.json'), '{"schema":1}\n');
+  await writeFile(join(runRoot, 'harvest-last-run.json'), '{"schema":1}\n');
+  await writeFile(join(runRoot, 'lease.json'), JSON.stringify({
+    schema: 1, lease_id: 'lease-dead', workspace: '/workspace', harness: 'opencode',
+    owner_pid: 99999999, boot_id: 'dead', process_start: 'dead',
+    started_at: 0, hard_deadline: new Date(0).toISOString(),
+    launch_mode: 'opencode_child', launch_state: 'launched', planned_identity: null, child_identity: null,
+  }) + '\n');
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
+
+  assert.equal(code, 0);
+  assert.equal(await exists(join(runRoot, 'harvest', 'abc123.window.md')), false, 'window file removed');
+  assert.equal(await exists(join(runRoot, 'harvest-last-run.json')), false, 'harvest last-run removed');
+  assert.equal(await exists(join(globalRoot, 'run')), false, 'run root removed');
+});
+
+test('harvest_packaging: uninstall is blocked while a harvest lease is live', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const runRoot = join(globalRoot, 'run', 'workspace-hash');
+  await mkdir(join(runRoot, 'harvest'), { recursive: true });
+  const identity = await childIdentity(process.pid);
+  await writeFile(join(runRoot, 'lease.json'), JSON.stringify({
+    schema: 1, lease_id: 'lease-live', workspace: '/workspace', harness: 'opencode',
+    owner_pid: identity.pid, boot_id: identity.boot_id, process_start: identity.process_start,
+    started_at: Date.now(), hard_deadline: new Date(Date.now() + 60000).toISOString(),
+    launch_mode: 'opencode_child', launch_state: 'launched', planned_identity: null, child_identity: null,
+  }) + '\n');
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
+
+  assert.equal(code, 1, 'uninstall blocked by live lease');
+  assert.equal(await exists(join(runRoot, 'harvest')), true, 'harvest state retained while a worker is live');
 });
 
 test('uninstall cancelled without --yes returns 130', async () => {

@@ -19,7 +19,17 @@ function styled(output) {
   return output === process.stdout ? prompts : null;
 }
 
-const HARNESS_LABELS = { claude: 'Claude Code', codex: 'Codex' };
+const HARNESS_LABELS = {
+  claude: 'Claude Code',
+  codex: 'Codex',
+  opencode: 'OpenCode',
+  cursor: 'Cursor',
+};
+const HARNESS_ORDER = ['claude', 'codex', 'opencode', 'cursor'];
+
+export function harnessLabel(id) {
+  return HARNESS_LABELS[id] || id;
+}
 
 // Opens the run: a heading plus one indented block. Also primes the prompts
 // cache that the synchronous `stage`/`finish` writers read.
@@ -35,17 +45,21 @@ export async function announce(output, title, lines, { level = 'info' } = {}) {
 }
 
 export function renderDiscovery(discovery, output, { action = 'Setup', dryRun = false } = {}) {
+  const detected = HARNESS_ORDER
+    .filter((id) => discovery.harnesses?.[id]?.state !== 'absent')
+    .map((id) => HARNESS_LABELS[id]);
   const rows = [
     ['Home', discovery.home],
     ['Global root', discovery.globalRoot],
     ['Skills source', 'scchearn/loam (global, universal)'],
     ['Runtime target', discovery.target],
     ['Workspace', discovery.workspace],
+    ['Harnesses', detected.length ? detected.join(', ') : 'none detected'],
   ];
   const width = Math.max(...rows.map(([key]) => key.length));
   return announce(
     output,
-    `Loam ${action}${dryRun ? ' (dry-run)' : ''}`,
+    `🌱 Loam ${action}${dryRun ? ' (dry-run)' : ''}`,
     rows.map(([key, value]) => `${key}:${' '.repeat(width - key.length)} ${value}`),
   );
 }
@@ -95,40 +109,70 @@ export function confirmUninstall({ yes = false, confirm, input = process.stdin, 
   });
 }
 
-export async function selectMarketplaceHarnesses({
+// Unified harness picker. Returns { selected, toRemove } (or null on cancel).
+// - selected: harnesses to configure this run (all four are eligible).
+// - toRemove: harnesses that were previously configured but are now deselected;
+//   interactive-only, since a deselect means "tear this one down". Non-interactive
+//   runs (including `update`) never remove.
+// Backwards compat anchors on `previouslyConfigured` (install.json's
+// configured_harnesses): update maintains exactly that set, so an OpenCode that
+// was auto-configured before an upgrade keeps working.
+export async function selectHarnesses({
   yes = false,
+  refresh = false,
   harnesses = {},
+  previouslyConfigured = [],
   select,
   input = process.stdin,
   output = process.stdout,
 } = {}) {
-  const candidates = ['claude', 'codex'].filter((id) => harnesses[id]?.state !== 'absent');
-  if (yes || candidates.length === 0) return candidates;
+  const detected = HARNESS_ORDER.filter((id) => harnesses[id]?.state !== 'absent');
+  const prev = new Set(previouslyConfigured);
+  if (detected.length === 0) return { selected: [], toRemove: [] };
+
+  if (yes) {
+    // update: maintain the previously-configured set only (no add, no remove).
+    // fresh --yes: configure everything detected.
+    const selected = refresh ? detected.filter((id) => prev.has(id)) : detected;
+    return { selected, toRemove: [] };
+  }
+
+  const finalize = (selected) => {
+    const chosen = new Set(selected);
+    return {
+      selected,
+      toRemove: detected.filter((id) => prev.has(id) && !chosen.has(id)),
+    };
+  };
+
   let isCancel = () => false;
-  if (!select) {
+  let widget = select;
+  if (!widget) {
     const ui = await loadPrompts(output);
     if (!ui) {
-      // ponytail: all-or-nothing when clack is unavailable. Per-harness choice
-      // needs a multiselect widget; rerun setup to change an individual one.
-      const names = candidates.map((id) => HARNESS_LABELS[id]).join(' and ');
+      // ponytail: all-or-nothing when clack's multiselect is unavailable. Per-harness
+      // toggling needs the widget; rerun setup to change an individual one.
+      const names = detected.map((id) => HARNESS_LABELS[id]).join(', ');
       const accepted = await confirmAction({
         input,
         output,
-        promptText: `Install Loam marketplace plugins for ${names}? [y/N] `,
-        nonInteractiveMessage: 'Marketplace plugin selection requires confirmation; rerun with --yes.',
+        promptText: `Configure Loam for ${names}? [y/N] `,
+        nonInteractiveMessage: 'Harness selection requires confirmation; rerun with --yes.',
       });
-      return accepted ? candidates : [];
+      return finalize(accepted ? detected : []);
     }
-    select = ui.multiselect;
+    widget = ui.multiselect;
     isCancel = ui.isCancel;
   }
-  const selected = await select({
-    message: 'Install Loam marketplace plugins',
-    options: candidates.map((value) => ({ value, label: HARNESS_LABELS[value] })),
-    initialValues: candidates,
+
+  const chosen = await widget({
+    message: 'Configure Loam for',
+    options: detected.map((value) => ({ value, label: HARNESS_LABELS[value] })),
+    initialValues: detected,
     required: false,
   });
-  return isCancel(selected) ? null : selected;
+  if (isCancel(chosen)) return null;
+  return finalize(Array.isArray(chosen) ? chosen : []);
 }
 
 export function stage(output, name, detail = '') {
@@ -139,6 +183,53 @@ export function stage(output, name, detail = '') {
     return;
   }
   output.write(`${line}\n`);
+}
+
+// Rich-narration primitives. Each degrades to a prefixed plain line off-TTY.
+export function stepStart(output, message) {
+  const ui = styled(output);
+  if (ui) {
+    ui.log.step(message);
+    return;
+  }
+  output.write(`→ ${message}\n`);
+}
+
+export function stepDetail(output, message) {
+  const ui = styled(output);
+  if (ui) {
+    (ui.log.message || ui.log.info)(message);
+    return;
+  }
+  output.write(`    ${message}\n`);
+}
+
+export function stepDone(output, message) {
+  const ui = styled(output);
+  if (ui) {
+    ui.log.success(message);
+    return;
+  }
+  output.write(`✓ ${message}\n`);
+}
+
+export function stepSkip(output, message) {
+  const ui = styled(output);
+  if (ui) {
+    ui.log.warn(message);
+    return;
+  }
+  output.write(`– ${message}\n`);
+}
+
+export function summaryNote(output, title, body) {
+  const ui = styled(output);
+  if (ui && ui.note) {
+    ui.note(body, title);
+    return;
+  }
+  output.write(`\n${title}\n`);
+  for (const line of body.split('\n')) output.write(`  ${line}\n`);
 }
 
 export function finish(output, name, detail = '') {

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 
-import { processDescriptor } from '../integration/ingest-process.mjs';
+import { processDescriptor, terminateChild } from '../integration/ingest-process.mjs';
 import { safeDetail } from '../integration/runtime.mjs';
 
 export const SKILLS_CLI_VERSION = '1.5.20';
@@ -69,6 +69,16 @@ export function runCommand({
   });
 }
 
+function killTree(child) {
+  // ponytail: on Windows the child is cmd.exe/npx.cmd and child.kill() leaves the
+  // node/skills descendants orphaned; taskkill /T (via terminateChild) tears down the
+  // whole tree. On unix child.kill() is the proven path — terminateChild's group-kill
+  // assumes a detached child, which spawnCommand is not. (issue #50)
+  if (process.platform === 'win32') return terminateChild(child, { platform: 'win32' });
+  child.kill();
+  return Promise.resolve();
+}
+
 function spawnCommand({ command, args, cwd, env, timeoutMs }) {
   return new Promise((resolvePromise) => {
     const descriptor = processDescriptor({ command, args, env });
@@ -89,8 +99,7 @@ function spawnCommand({ command, args, cwd, env, timeoutMs }) {
       resolvePromise({ code, signal, stdout, stderr, ...(category ? { category } : {}) });
     };
     const timer = setTimeout(() => {
-      child.kill();
-      finish(null, 'SIGTERM', 'timeout');
+      killTree(child).finally(() => finish(null, 'SIGTERM', 'timeout'));
     }, timeoutMs);
     child.stdout?.on('data', (chunk) => {
       if (stdout.length < 1_048_576) stdout += chunk.toString();

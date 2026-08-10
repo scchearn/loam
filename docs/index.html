@@ -1,0 +1,873 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How loam works</title>
+<meta name="description" content="A visual, plain-language explainer of loam: the skills, runtime, plugin, memory, and search that give AI coding agents a persistent memory in plain markdown.">
+<link rel="canonical" href="https://scchearn.github.io/loam/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="How loam works">
+<meta property="og:description" content="A visual, plain-language explainer of loam: the skills, runtime, plugin, memory, and search that give AI coding agents a persistent memory in plain markdown.">
+<meta property="og:url" content="https://scchearn.github.io/loam/">
+<meta name="theme-color" content="#4f8e1e">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20120%20120'%3E%3Cpath%20d='M24%20102%20h72'%20fill='none'%20stroke='%237B4B2B'%20stroke-width='7'%20stroke-linecap='round'/%3E%3Cpath%20d='M60%20100%20V48'%20fill='none'%20stroke='%234F8E1E'%20stroke-width='8'%20stroke-linecap='round'/%3E%3Cpath%20d='M60%2066%20C39%2063%2030%2051%2027%2036%20C48%2036%2057%2048%2060%2066%20Z'%20fill='%235E9D24'/%3E%3Cpath%20d='M60%2057%20C78%2054%2087%2042%2090%2030%20C72%2030%2063%2039%2060%2057%20Z'%20fill='%238BC43A'/%3E%3Ccircle%20cx='60'%20cy='39'%20r='9'%20fill='%23E3A93C'/%3E%3C/svg%3E">
+</head>
+<body>
+<style>
+  :root{
+    --ground:#e9e5d8; --surface:#f4f1e8; --sunk:#e0dbc9;
+    --ink:#2a1c13; --ink-soft:#5c4a3a; --ink-faint:#8a7660;
+    --line:#cfc6b1; --line-soft:#ddd6c3;
+    --soil:#7b4b2b; --seed:#a9781f; --sprout:#47811b; --sprout-bright:#4f8e1e;
+    --crit:#a8482d;
+    --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --font-mono:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,Consolas,monospace;
+    --measure:70ch;
+    --shadow:0 1px 2px rgba(42,28,19,.06),0 8px 26px -14px rgba(42,28,19,.22);
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#17100a; --surface:#231811; --sunk:#0f0a06;
+      --ink:#ece4d4; --ink-soft:#b1a08a; --ink-faint:#7d6b56;
+      --line:#392a1d; --line-soft:#2b1f15;
+      --soil:#a5714a; --seed:#f2d097; --sprout:#8bc43a; --sprout-bright:#96cf47;
+      --crit:#cf7053;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 14px 34px -18px rgba(0,0,0,.7);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#17100a; --surface:#231811; --sunk:#0f0a06;
+    --ink:#ece4d4; --ink-soft:#b1a08a; --ink-faint:#7d6b56;
+    --line:#392a1d; --line-soft:#2b1f15;
+    --soil:#a5714a; --seed:#f2d097; --sprout:#8bc43a; --sprout-bright:#96cf47;
+    --crit:#cf7053;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 14px 34px -18px rgba(0,0,0,.7);
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0;background:var(--ground);color:var(--ink);
+    font-family:var(--font-sans);
+    font-size:clamp(16px,1rem + .1vw,17px);line-height:1.62;
+    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+  }
+  ::selection{background:color-mix(in oklab,var(--sprout) 30%,transparent)}
+
+  .wrap{max-width:1000px;margin:0 auto;padding:0 24px}
+  .prose{max-width:var(--measure)}
+  section{padding:clamp(40px,7vw,84px) 0;border-top:1px solid var(--line-soft)}
+  section:first-of-type{border-top:0}
+
+  h1,h2,h3{line-height:1.12;text-wrap:balance;letter-spacing:-.02em;font-weight:800}
+  h2{font-size:clamp(1.7rem,1.2rem + 2.2vw,2.5rem);margin:0 0 .5em}
+  h3{font-size:clamp(1.15rem,1rem + .8vw,1.4rem);margin:2.4em 0 .5em;letter-spacing:-.01em;font-weight:750}
+  p{margin:0 0 1.05em}
+  a{color:inherit;text-decoration-color:var(--sprout);text-underline-offset:3px}
+  strong{font-weight:680}
+
+  .eyebrow{
+    font-family:var(--font-mono);font-size:.72rem;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--sprout);font-weight:600;
+    display:inline-flex;align-items:center;gap:.6em;margin:0 0 1.1em
+  }
+  .eyebrow::before{content:"";width:22px;height:2px;background:var(--sprout);display:inline-block}
+  .num{font-family:var(--font-mono);color:var(--ink-faint);font-weight:500}
+
+  code,kbd{font-family:var(--font-mono);font-size:.86em}
+  p code,li code,td code{
+    background:var(--sunk);border:1px solid var(--line-soft);
+    padding:.08em .38em;border-radius:4px;color:var(--soil);white-space:nowrap
+  }
+  .lede{font-size:clamp(1.12rem,1.02rem + .6vw,1.35rem);line-height:1.5;color:var(--ink-soft);font-weight:420}
+  .lede strong{color:var(--ink);font-weight:640}
+
+  /* hero */
+  .hero{
+    padding:clamp(48px,9vw,110px) 0 clamp(36px,6vw,64px);
+    background:
+      radial-gradient(120% 80% at 82% -10%,color-mix(in oklab,var(--sprout) 12%,transparent),transparent 60%),
+      linear-gradient(180deg,color-mix(in oklab,var(--soil) 8%,var(--ground)),var(--ground));
+    border-top:0
+  }
+  .brandrow{display:flex;align-items:center;gap:14px;margin-bottom:clamp(28px,5vw,52px)}
+  .brandrow .mark{width:38px;height:38px;flex:0 0 auto}
+  .wordmark{font-weight:800;font-size:1.5rem;letter-spacing:-.03em}
+  .wordmark b{color:var(--sprout)}
+  .tag-badge{
+    margin-left:auto;font-family:var(--font-mono);font-size:.7rem;letter-spacing:.1em;
+    text-transform:uppercase;color:var(--ink-faint);border:1px solid var(--line);
+    padding:.4em .7em;border-radius:999px
+  }
+  .ghlink{
+    display:inline-flex;align-items:center;gap:.55em;font-family:var(--font-mono);
+    font-size:.8rem;font-weight:600;letter-spacing:.02em;color:var(--ink);text-decoration:none;
+    border:1px solid var(--line);background:var(--surface);padding:.6em 1em;border-radius:999px;
+    box-shadow:var(--shadow);transition:border-color .15s ease,transform .15s ease
+  }
+  .ghlink:hover{border-color:var(--sprout);transform:translateY(-1px)}
+  .ghlink:focus-visible{outline:2px solid var(--sprout);outline-offset:2px}
+  .ghlink svg{width:16px;height:16px;flex:0 0 auto}
+  .ghlink .arr{color:var(--sprout);font-weight:700}
+  .hero h1{font-size:clamp(2.3rem,1.5rem + 4.4vw,4.1rem);margin:0 0 .35em;max-width:16ch}
+  .hero h1 em{font-style:normal;color:var(--sprout);position:relative;white-space:nowrap}
+  .hero .lede{max-width:60ch}
+
+  /* layout helpers */
+  .grid{display:grid;gap:18px}
+  @media(min-width:720px){.g2{grid-template-columns:1fr 1fr}.g3{grid-template-columns:repeat(3,1fr)}}
+  .card{
+    background:var(--surface);border:1px solid var(--line);border-radius:12px;
+    padding:20px 20px 18px;box-shadow:var(--shadow)
+  }
+  .card h4{margin:0 0 .5em;font-size:1.02rem;font-weight:720;letter-spacing:-.01em;display:flex;align-items:center;gap:.55em}
+  .card p{margin:0;font-size:.94rem;color:var(--ink-soft)}
+  .card .k{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--sprout);font-weight:600}
+  .dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:var(--sprout)}
+  .dot.soil{background:var(--soil)}.dot.seed{background:var(--seed)}.dot.crit{background:var(--crit)}
+
+  /* callouts */
+  .callout{
+    background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--sprout);
+    border-radius:10px;padding:16px 18px;margin:1.6em 0;font-size:.95rem;box-shadow:var(--shadow)
+  }
+  .callout.warm{border-left-color:var(--seed)}
+  .callout.clay{border-left-color:var(--crit)}
+  .callout .lbl{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-faint);font-weight:600;display:block;margin-bottom:.5em}
+  .callout p:last-child{margin-bottom:0}
+
+  /* mono command / hint line */
+  .cli{
+    font-family:var(--font-mono);font-size:.82rem;line-height:1.55;
+    background:var(--sunk);border:1px solid var(--line-soft);border-radius:10px;
+    padding:14px 16px;margin:1.4em 0;overflow-x:auto;color:var(--ink)
+  }
+  .cli .c{color:var(--ink-faint)}
+  .cli .g{color:var(--sprout)}
+  .cli .s{color:var(--seed)}
+  .cli .p{color:var(--soil)}
+  .cli b{color:var(--ink);font-weight:700}
+
+  /* table */
+  .tablewrap{overflow-x:auto;margin:1.6em 0;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow)}
+  table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--surface)}
+  th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line-soft);vertical-align:top}
+  thead th{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint);font-weight:600;background:var(--sunk)}
+  tbody tr:last-child td{border-bottom:0}
+  td code{color:var(--soil)}
+  .tablewrap.tight td:first-child{font-family:var(--font-mono);font-size:.82rem;color:var(--sprout);white-space:nowrap;font-weight:600}
+
+  /* figures */
+  figure{margin:2em 0;padding:0}
+  figure svg{display:block;width:100%;height:auto;max-width:100%}
+  .figframe{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:clamp(16px,3vw,30px);box-shadow:var(--shadow)}
+  figcaption{margin-top:14px;font-size:.85rem;color:var(--ink-faint);line-height:1.5;text-align:center;max-width:64ch;margin-left:auto;margin-right:auto}
+  figcaption b{color:var(--ink-soft);font-weight:640}
+
+  /* diagram text + accents (theme-aware via tokens) */
+  .dg{color:var(--ink-soft)}
+  .dg text{font-family:var(--font-sans);fill:var(--ink)}
+  .dg .lab{fill:var(--ink)}
+  .dg .mut{fill:var(--ink-soft)}
+  .dg .mono{font-family:var(--font-mono)}
+  .dg .box{fill:var(--surface);stroke:var(--line);stroke-width:1.5}
+  .dg .sunk{fill:var(--sunk);stroke:var(--line-soft);stroke-width:1.5}
+  .dg .edge{stroke:var(--ink-faint);stroke-width:1.6;fill:none}
+  .dg .edge-mut{stroke:var(--line);stroke-width:1.4;fill:none}
+  .dg .fillsprout{fill:var(--sprout)}
+  .dg .strokesprout{stroke:var(--sprout);stroke-width:1.8;fill:none}
+  .dg .txsprout{fill:var(--sprout)}
+  .dg .txseed{fill:var(--seed)}
+  .dg .txsoil{fill:var(--soil)}
+  .dg .arrowhead{fill:var(--ink-faint)}
+  .dg .arrowhead-s{fill:var(--sprout)}
+
+  ul.clean{list-style:none;padding:0;margin:1.2em 0}
+  ul.clean li{position:relative;padding-left:1.6em;margin-bottom:.7em;color:var(--ink-soft)}
+  ul.clean li::before{content:"";position:absolute;left:0;top:.62em;width:7px;height:7px;border-radius:50%;background:var(--sprout)}
+  ul.clean li strong{color:var(--ink)}
+
+  /* timeline */
+  .timeline{margin:2.2em 0}
+  .tl-session{margin:0 0 2.2em}
+  .tl-head{display:flex;align-items:baseline;gap:.8em;flex-wrap:wrap;margin:0 0 1.1em;padding-bottom:.6em;border-bottom:1px solid var(--line-soft)}
+  .tl-head .day{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;font-weight:700;color:var(--ink-faint)}
+  .tl-head.warm .day{color:var(--sprout)}
+  .tl-head h3{margin:0;font-size:1.12rem;font-weight:720;letter-spacing:-.01em}
+  .tl-head .sub{font-size:.85rem;color:var(--ink-faint);margin-left:auto}
+  .tl-steps{list-style:none;margin:0;padding:0}
+  .tl-step{position:relative;padding:0 0 1.2em 36px}
+  .tl-step::before{content:"";position:absolute;left:5px;top:4px;width:11px;height:11px;border-radius:50%;background:var(--surface);border:2px solid var(--soil);z-index:1}
+  .tl-step::after{content:"";position:absolute;left:10.5px;top:13px;bottom:-3px;width:2px;background:var(--line)}
+  .tl-step:last-child::after{display:none}
+  .tl-step.key::before{border-color:var(--sprout);background:var(--sprout);box-shadow:0 0 0 4px color-mix(in oklab,var(--sprout) 16%,transparent)}
+  .tl-time{font-family:var(--font-mono);font-size:.72rem;color:var(--ink-faint);font-weight:600}
+  .tl-step p{margin:.2em 0 0;font-size:.95rem;color:var(--ink-soft)}
+  .tl-step p strong{color:var(--ink)}
+  .tl-tag{display:inline-block;font-family:var(--font-mono);font-size:.64rem;letter-spacing:.05em;text-transform:uppercase;color:var(--sprout);background:color-mix(in oklab,var(--sprout) 12%,transparent);border:1px solid color-mix(in oklab,var(--sprout) 32%,transparent);padding:.15em .55em;border-radius:5px;margin-top:.55em;font-weight:600}
+  .tl-tag.mut{color:var(--ink-faint);background:var(--sunk);border-color:var(--line)}
+
+  .kicker{font-family:var(--font-mono);font-size:.74rem;letter-spacing:.06em;color:var(--ink-faint);margin-top:3em}
+  footer{padding:48px 0 64px;border-top:1px solid var(--line-soft);color:var(--ink-faint);font-size:.85rem}
+  footer .wordmark{font-size:1.05rem}
+
+  @media (prefers-reduced-motion:no-preference){
+    .grow{animation:grow 1.1s ease-out both}
+    @keyframes grow{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  }
+</style>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="brandrow">
+      <svg class="mark" viewBox="0 0 40 40" role="img" aria-label="loam sprout mark">
+        <path d="M8 34 h24" stroke="var(--soil)" stroke-width="2.4" stroke-linecap="round"/>
+        <path d="M20 33 V16" stroke="var(--sprout)" stroke-width="2.6" stroke-linecap="round"/>
+        <path d="M20 22 C13 21 10 17 9 12 C16 12 19 16 20 22 Z" fill="var(--sprout)"/>
+        <path d="M20 19 C26 18 29 14 30 10 C24 10 21 13 20 19 Z" fill="var(--sprout-bright)"/>
+        <circle cx="20" cy="13" r="3" fill="var(--seed)"/>
+      </svg>
+      <span class="wordmark">loam</span>
+      <span class="tag-badge">how it works</span>
+    </div>
+    <h1>A memory that survives the <em>reboot</em>.</h1>
+    <p class="lede">AI coding agents are brilliant and completely amnesiac. Every session starts from zero and re-learns what last session already figured out. <strong>loam gives the agent a place to write down what it learns (plain markdown, in your git repo) and a fast way to find it again.</strong> This page opens the hood on how the pieces fit: the skills, the runtime, the plugin, the memory, and the search.</p>
+    <p style="margin-top:1.7em;margin-bottom:0">
+      <a class="ghlink" href="https://github.com/scchearn/loam">
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        <span>scchearn / loam</span>
+        <span class="arr">&rarr;</span>
+      </a>
+    </p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap prose">
+    <p class="eyebrow">The problem it solves</p>
+    <h2>Rediscovery is the tax you pay every session</h2>
+    <p>Picture hiring a genius contractor with total amnesia. Every morning they arrive knowing their craft perfectly, and nothing about <em>your</em> project. The API quirk they diagnosed on Tuesday, the import that only works with one flag, the reason you chose library A over B: they re-derive all of it, from scratch, every single day. You pay for that re-derivation in time and in tokens.</p>
+    <p>A single <code>AGENTS.md</code> guidance file helps, but it goes stale, grows without bound, and can't hold structured knowledge. What's missing is a <strong>substrate</strong>: a memory surface an agent can write to in a shape it can later query, that any agent can read, and that you can <code>git log</code> like any other file. That's loam.</p>
+
+    <div class="callout">
+      <span class="lbl">The whole bet in one line</span>
+      <p>Keep the memory as <strong>plain markdown in git</strong>: no database, no embeddings service, no vendor lock-in. If loam vanished tomorrow, your knowledge is still a folder of notes you can open in any editor. Everything else is machinery for writing those notes well and finding them fast.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="prose">
+      <p class="eyebrow">The big picture</p>
+      <h2>Four layers, one folder of markdown at the bottom</h2>
+      <p>loam is best understood as sediment. The agent works at the surface; underneath it are layers that each do one job, and at the very bottom sits the memory, the fertile soil the whole thing is named for. Knowledge grows <em>upward</em>: what gets written into the soil resurfaces in the next session's context.</p>
+    </div>
+
+    <figure>
+      <div class="figframe">
+        <svg class="dg" viewBox="0 0 900 500" role="img" aria-label="Four-layer architecture: the agent on top, then skills, then adapter and plugin, then the native runtime, over a bedrock of markdown memory in git. A green sprout of knowledge grows upward from the memory into the agent.">
+          <defs>
+            <marker id="ah1" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0,0 9,4.5 0,9" class="arrowhead"/></marker>
+            <marker id="ah1s" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0,0 9,4.5 0,9" class="arrowhead-s"/></marker>
+          </defs>
+
+          <!-- agent -->
+          <rect x="250" y="18" width="400" height="58" rx="12" class="box"/>
+          <text x="450" y="42" text-anchor="middle" class="lab" font-weight="700" font-size="15">AI coding agent</text>
+          <text x="450" y="61" text-anchor="middle" class="mut mono" font-size="11">Claude Code · Codex · OpenCode · Cursor</text>
+
+          <!-- layer 1 skills -->
+          <rect x="150" y="112" width="600" height="66" rx="11" class="box"/>
+          <text x="176" y="139" class="mono txsprout" font-size="10.5" font-weight="700">LAYER 1 · SKILLS</text>
+          <text x="176" y="160" class="lab" font-size="13.5" font-weight="650">21 markdown "recipe cards" + a router</text>
+          <text x="734" y="150" text-anchor="end" class="mut mono" font-size="10.5">~/.agents/skills/</text>
+
+          <!-- layer 2 adapter -->
+          <rect x="150" y="196" width="600" height="66" rx="11" class="box"/>
+          <text x="176" y="223" class="mono txsprout" font-size="10.5" font-weight="700">LAYER 2 · ADAPTER + PLUGIN</text>
+          <text x="176" y="244" class="lab" font-size="13.5" font-weight="650">Node glue &amp; per-harness hooks (start / stop)</text>
+          <text x="734" y="234" text-anchor="end" class="mut mono" font-size="10.5">marketplace plugin</text>
+
+          <!-- layer 3 runtime -->
+          <rect x="150" y="280" width="600" height="66" rx="11" class="box"/>
+          <text x="176" y="307" class="mono txsprout" font-size="10.5" font-weight="700">LAYER 3 · NATIVE RUNTIME</text>
+          <text x="176" y="328" class="lab" font-size="13.5" font-weight="650">One small Rust binary, read-only probes</text>
+          <text x="734" y="318" text-anchor="end" class="mut mono" font-size="10.5">bin/&lt;ver&gt;/&lt;target&gt;/loam</text>
+
+          <!-- bedrock memory -->
+          <rect x="90" y="372" width="720" height="104" rx="12" fill="var(--sunk)" stroke="var(--soil)" stroke-width="1.8"/>
+          <text x="116" y="400" class="mono txsoil" font-size="10.5" font-weight="700">BEDROCK · MEMORY (plain markdown, in git)</text>
+          <text x="116" y="426" class="lab" font-size="13.5" font-weight="650">wiki · guidance · checkpoints</text>
+          <text x="116" y="452" class="mut mono" font-size="11">goals/ · specs/ · plans/  · the workflow artifacts</text>
+
+          <!-- knowledge grows up: a small sprout rooted in the bedrock, dashed arrow rising -->
+          <line x1="128" y1="334" x2="128" y2="106" class="strokesprout" stroke-dasharray="4 6" marker-end="url(#ah1s)" opacity="0.85"/>
+          <path d="M128 372 V346" class="strokesprout" stroke-width="2.6" stroke-linecap="round"/>
+          <path d="M128 360 C119 358 114 352 113 346 C121 346 126 352 128 360 Z" class="fillsprout"/>
+          <path d="M128 355 C137 353 142 347 143 341 C135 341 130 347 128 355 Z" fill="var(--sprout-bright)"/>
+          <circle cx="128" cy="343" r="3.4" fill="var(--seed)"/>
+
+          <!-- flow arrows on the right spine -->
+          <line x1="640" y1="76" x2="640" y2="110" class="edge" marker-end="url(#ah1)"/>
+          <line x1="640" y1="178" x2="640" y2="194" class="edge" marker-end="url(#ah1)"/>
+          <line x1="640" y1="262" x2="640" y2="278" class="edge" marker-end="url(#ah1)"/>
+          <line x1="640" y1="346" x2="640" y2="370" class="edge" marker-end="url(#ah1)"/>
+
+          <text x="858" y="250" text-anchor="middle" class="mut mono" font-size="9.5" transform="rotate(90 858 250)">calls downward</text>
+          <text x="60" y="250" text-anchor="middle" class="txsprout mono" font-size="9.5" transform="rotate(-90 60 250)" font-weight="700">knowledge grows up</text>
+        </svg>
+      </div>
+      <figcaption><b>The stack.</b> Each session, the agent (top) calls down through skills, glue, and runtime; all of it reads from and writes to the same folder of markdown at the bottom. The green arrow is the point: what one session buries in the soil resurfaces in the next session's opening context.</figcaption>
+    </figure>
+
+    <div class="grid g2 prose" style="max-width:none">
+      <div class="card"><h4><span class="dot"></span>Runtime-agnostic by format</h4><p>Skills are just <code>SKILL.md</code> files. Any harness that loads skills can run them: no runtime owns the plan or the memory. A plan written under one agent resumes under another.</p></div>
+      <div class="card"><h4><span class="dot soil"></span>Installed once, globally</h4><p>Skills and the binary live under <code>~/.agents/</code>, not per project. A workspace owns only its own memory. Nothing is added to your <code>PATH</code>.</p></div>
+      <div class="card"><h4><span class="dot seed"></span>Degrades gracefully</h4><p>The search accelerator (<code>qmd</code>) speeds things up when present and is invisible when absent. The substrate is always plain files.</p></div>
+      <div class="card"><h4><span class="dot crit"></span>It routes itself</h4><p>You never memorize skill names. Say <em>"the wiki is wrong about X"</em> or <em>"stopping work"</em> and a router skill dispatches the right one.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap prose">
+    <p class="eyebrow"><span class="num">01</span> &nbsp;Layer one</p>
+    <h2>Skills: recipe cards the agent follows</h2>
+    <p>A <strong>skill</strong> is a single markdown file (<code>SKILL.md</code>) written as a careful procedure: "to add a source to memory, first resolve the file, then read the schema, then check for existing pages, then write, then log it." The agent doesn't invent a process; it follows a tested one. loam ships 21 of them, grouped by job.</p>
+    <p>Only a skill's one-line <em>description</em> loads at session start; its full body loads only when that skill actually runs. That keeps the agent's context window lean, a running theme in loam's design.</p>
+
+    <div class="grid g3" style="max-width:none">
+      <div class="card"><span class="k">Planning &amp; execution</span><h4 style="margin-top:.4em">Do the work</h4><p>writing-spec · planning · starting · resuming · checkpointing · amending-plan · setting-goals · configuring-agents</p></div>
+      <div class="card"><span class="k">Memory</span><h4 style="margin-top:.4em">Grow the soil</h4><p>adding-to-memory · querying-memory · amending-memory · linting-memory · reviewing-memory · learning-from-session · auditing-guidance · ingesting-codebase · syncing-code-graph · normalizing-memory</p></div>
+      <div class="card"><span class="k">Ground</span><h4 style="margin-top:.4em">Set it up</h4><p>scaffolding-wiki · initializing-vault, plus the always-on <strong>using</strong> router that sits above all of them.</p></div>
+    </div>
+
+    <h3>The router is the thing you actually talk to</h3>
+    <p>The <code>loam::using</code> skill isn't a task; it's a dispatcher. It loads at the top of every session and maps plain-language intent onto the right skill, so a person never has to learn the catalogue. It carries the rules that apply across <em>all</em> skills: the memory model, the routing matrix, the admission rubric, and the correction flow.</p>
+
+    <div class="cli"><span class="c"># you say → the router picks</span>
+<span class="g">"write a spec for what we discussed"</span>   <span class="c">→</span> loam::writing-spec
+<span class="g">"plan the work from that spec"</span>         <span class="c">→</span> loam::planning
+<span class="g">"stopping work, need to step away"</span>     <span class="c">→</span> loam::checkpointing
+<span class="g">"what does memory say about auth?"</span>      <span class="c">→</span> loam::querying-memory
+<span class="g">"memory is wrong about the retry logic"</span> <span class="c">→</span> loam::amending-memory</div>
+    <p class="prose" style="color:var(--ink-faint);font-size:.9rem">The router never does the work itself; it recognizes intent and hands off. That single indirection is why loam feels like one tool instead of twenty-one.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="prose">
+      <p class="eyebrow"><span class="num">02</span> &nbsp;Layer two</p>
+      <h2>The plugin &amp; adapter: the doorman</h2>
+      <p>Skills are passive; something has to <em>wake loam up</em> when a session starts and hand the agent its briefing. That's the job of a small marketplace <strong>plugin</strong> (for Claude Code and Codex) and equivalent adapters (for OpenCode and Cursor). The plugin owns two moments: the <strong>SessionStart hook</strong> (walk in the door) and the <strong>Stop hook</strong> (turn just ended).</p>
+      <p>At startup, the doorman assembles a briefing (the <code>&lt;LOAM_IMPORTANT&gt;</code> block) and injects it straight into the agent's context. That block is the router doc, the exact command to reach the runtime, and a fresh snapshot of <em>this</em> workspace's state.</p>
+    </div>
+
+    <figure>
+      <div class="figframe">
+        <svg class="dg" viewBox="0 0 900 300" role="img" aria-label="Session startup pipeline: session starts, the SessionStart hook calls the adapter, which calls the shared integration, which in parallel runs the native state probe and reads the router skill, then formats a LOAM_IMPORTANT block that is injected into the agent's context.">
+          <defs>
+            <marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0,0 9,4.5 0,9" class="arrowhead"/></marker>
+            <marker id="ah2s" markerWidth="9" markerHeight="9" refX="7.5" refY="4.5" orient="auto"><polygon points="0,0 9,4.5 0,9" class="arrowhead-s"/></marker>
+          </defs>
+          <!-- step boxes -->
+          <rect x="20" y="118" width="120" height="60" rx="10" class="sunk"/>
+          <text x="80" y="145" text-anchor="middle" class="lab" font-size="12" font-weight="650">Session</text>
+          <text x="80" y="162" text-anchor="middle" class="lab" font-size="12" font-weight="650">starts</text>
+
+          <rect x="170" y="118" width="140" height="60" rx="10" class="box"/>
+          <text x="240" y="143" text-anchor="middle" class="lab" font-size="12" font-weight="650">SessionStart</text>
+          <text x="240" y="160" text-anchor="middle" class="mut mono" font-size="10">hook → adapter</text>
+
+          <rect x="340" y="118" width="150" height="60" rx="10" class="box"/>
+          <text x="415" y="143" text-anchor="middle" class="lab" font-size="12" font-weight="650">integration</text>
+          <text x="415" y="160" text-anchor="middle" class="mut mono" font-size="10">runIntegration('hook')</text>
+
+          <!-- parallel fork -->
+          <rect x="530" y="60" width="170" height="52" rx="10" class="box"/>
+          <text x="615" y="82" text-anchor="middle" class="lab" font-size="11.5" font-weight="650">native probe</text>
+          <text x="615" y="99" text-anchor="middle" class="mono txsprout" font-size="10">loam state --fast</text>
+
+          <rect x="530" y="184" width="170" height="52" rx="10" class="box"/>
+          <text x="615" y="206" text-anchor="middle" class="lab" font-size="11.5" font-weight="650">read router doc</text>
+          <text x="615" y="223" text-anchor="middle" class="mono mut" font-size="10">loam-using/SKILL.md</text>
+
+          <rect x="726" y="118" width="150" height="60" rx="10" fill="var(--surface)" stroke="var(--sprout)" stroke-width="2"/>
+          <text x="801" y="141" text-anchor="middle" class="mono txsprout" font-size="10.5" font-weight="700">&lt;LOAM_IMPORTANT&gt;</text>
+          <text x="801" y="160" text-anchor="middle" class="mut" font-size="10">injected into</text>
+          <text x="801" y="172" text-anchor="middle" class="mut" font-size="10">agent context</text>
+
+          <!-- edges -->
+          <line x1="140" y1="148" x2="168" y2="148" class="edge" marker-end="url(#ah2)"/>
+          <line x1="310" y1="148" x2="338" y2="148" class="edge" marker-end="url(#ah2)"/>
+          <path d="M490 140 C512 130 512 100 528 90" class="edge" marker-end="url(#ah2)"/>
+          <path d="M490 156 C512 166 512 200 528 206" class="edge" marker-end="url(#ah2)"/>
+          <path d="M700 90 C720 100 712 128 728 140" class="edge" marker-end="url(#ah2)"/>
+          <path d="M700 206 C720 196 712 168 728 156" class="edge" marker-end="url(#ah2)"/>
+
+          <text x="415" y="40" text-anchor="middle" class="txsprout mono" font-size="10" font-weight="700">readiness gate: version · target · checksum</text>
+          <line x1="415" y1="48" x2="415" y2="116" class="edge-mut" stroke-dasharray="3 4"/>
+        </svg>
+      </div>
+      <figcaption><b>The startup briefing.</b> Before the agent reads a word, the doorman runs a real state probe and reads the current router doc, then formats both into one block. If the runtime's version, platform, or <b>checksum</b> don't verify, the block degrades to a one-line "loam is unavailable → run setup" instead of faking state.</figcaption>
+    </figure>
+
+    <div class="prose">
+      <h3>Why a plugin instead of editing your settings</h3>
+      <p>The plugin <em>owns</em> its hooks through the harness's own plugin system, so loam never permanently scribbles in your <code>settings.json</code>. Install detects which agents you have (Claude Code, Codex, OpenCode, Cursor) and wires each through the same shared Node code, differing only in how that harness expects its hook input and output. One brain, four thin mouths.</p>
+
+      <div class="callout warm">
+        <span class="lbl">The install, in one breath</span>
+        <p><code>npx @scchearn/loam setup</code> installs the skills globally, downloads the matching Rust binary from GitHub over HTTPS, <strong>verifies its SHA-256 against a published checksum, and smoke-tests it</strong> before trusting it: no install script is ever executed. It records everything in one <code>install.json</code> that every hook reads later. <code>update</code> refreshes in place; <code>doctor</code> checks without changing anything; <code>uninstall</code> removes it all.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="prose">
+      <p class="eyebrow"><span class="num">03</span> &nbsp;Layer three</p>
+      <h2>The runtime: a fast, honest librarian</h2>
+      <p>Some questions are expensive for an agent to answer by reading files: <em>Is there a wiki here? How stale is it? Which source files changed since I last summarized them?</em> Answering those by hand burns tokens and is fragile across operating systems. So loam ships one tiny <strong>Rust binary</strong> that answers them in a single line of machine-readable JSON.</p>
+      <p>It is deliberately boring and trustworthy: <strong>read-only, offline, and fail-soft</strong>. It inspects files, occasionally asks <code>git</code> a read-only question, prints JSON, and exits. It never edits your code, never phones home, and when a tool is missing it returns "false" rather than crashing.</p>
+    </div>
+
+    <div class="tablewrap tight prose" style="max-width:none">
+      <table>
+        <thead><tr><th>Command</th><th>What it answers, in plain terms</th></tr></thead>
+        <tbody>
+          <tr><td>state</td><td>"What's the situation here?" Is there a wiki, is search ready, how many checkpoints, is the tree dirty, and what should I probably do next (the <em>hints</em>).</td></tr>
+          <tr><td>codegraph</td><td>"Which source files does memory not yet reflect?" Walk the code, compare against what's recorded, list only what's new or changed.</td></tr>
+          <tr><td>lint</td><td>"Is the memory healthy?" Broken links, orphan pages, stale claims, malformed notes, as one finding per line.</td></tr>
+          <tr><td>datecheck</td><td>"Are the timestamps consistent?" The one command allowed to rewrite files, and only to fix timezone drift.</td></tr>
+          <tr><td>checkpoint</td><td>"Is this restart note valid, and what was I doing?" Verifies a checkpoint's pointers; never blocks a save.</td></tr>
+          <tr><td>check versions</td><td>"Do the release version numbers all agree?" An offline pre-commit gate.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="prose">
+      <h3>The startup probe: <code>state --fast</code></h3>
+      <p>This is the command the doorman runs every session. The <code>--fast</code> flag skips the two expensive full-tree scans, so it stays cheap enough to run on every start. Its most useful output is the <strong>hints array</strong>: small, advisory nudges that turn silent state into a suggested next action. Hints are <em>surfaced to you</em>, never auto-run.</p>
+      <div class="cli"><span class="c"># a hint is a nudge, not a command that fires</span>
+<span class="p">[loam:hint]</span> <span class="s">checkpoint_stale</span>   tree dirty, last checkpoint 40 min ago   <span class="g">→ /loam::checkpointing</span>
+<span class="p">[loam:hint]</span> <span class="s">code_ingest_pending</span> 3 source files new or changed             <span class="g">→ /loam::ingesting-codebase</span>
+<span class="p">[loam:hint]</span> <span class="s">spec_ready_for_plan</span> approved spec has no plan yet             <span class="g">→ /loam::planning</span></div>
+      <p style="color:var(--ink-faint);font-size:.9rem">Other hint kinds cover resumable checkpoints, stale memory (no lint in 7 days), an over-long log, a legacy structure to consolidate, and in-progress plans. Each names a stable key the relevant skill can "satisfy" and suppress once it acts. The loop closes: state signals, a skill acts, the next signal surfaces.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="prose">
+      <p class="eyebrow">Inside the runtime</p>
+      <h2>The code graph: <span class="txsprout">walk</span> − <span class="txsoil">index</span> = the work list</h2>
+      <p>Re-summarizing an entire codebase every time is wasteful: most files didn't change. loam's code graph solves this the way a good backup tool does: by identity, not by clock. It gives every file a <strong>content identity</strong> (in a git repo, git's own blob hash) so a file that hasn't <em>changed</em> is recognized as unchanged even if its timestamp moved. Then the answer to "what needs work?" is pure subtraction.</p>
+    </div>
+
+    <figure>
+      <div class="figframe">
+        <svg class="dg" viewBox="0 0 900 340" role="img" aria-label="The code graph diff: WALK enumerates source files on disk each with a content-identity hash; INDEX is what memory already recorded with stored hashes; matching them by identity yields DIFF, the list of new and stale files. Unchanged files with matching hashes are skipped.">
+          <defs>
+            <marker id="ah3" markerWidth="10" markerHeight="10" refX="7.5" refY="5" orient="auto"><polygon points="0,0 10,5 0,10" class="arrowhead"/></marker>
+          </defs>
+          <!-- WALK -->
+          <rect x="24" y="60" width="230" height="250" rx="12" class="box"/>
+          <text x="44" y="88" class="mono txsprout" font-size="11" font-weight="700">WALK</text>
+          <text x="44" y="105" class="mut" font-size="10.5">source files on disk</text>
+          <g font-size="10.5" class="mono">
+            <rect x="44" y="120" width="190" height="30" rx="6" class="sunk"/><text x="54" y="139" class="lab">state.rs</text><text x="224" y="139" text-anchor="end" class="txsprout">git:a1f…</text>
+            <rect x="44" y="156" width="190" height="30" rx="6" class="sunk"/><text x="54" y="175" class="lab">codegraph.rs</text><text x="224" y="175" text-anchor="end" class="txsprout">git:9c2…</text>
+            <rect x="44" y="192" width="190" height="30" rx="6" class="sunk"/><text x="54" y="211" class="lab">lint.rs</text><text x="224" y="211" text-anchor="end" class="txsprout">git:4e7…</text>
+            <rect x="44" y="228" width="190" height="30" rx="6" class="sunk"/><text x="54" y="247" class="lab">check.rs</text><text x="224" y="247" text-anchor="end" class="txsprout">git:bb0…</text>
+          </g>
+
+          <text x="288" y="180" text-anchor="middle" font-size="30" class="mut" font-weight="300">−</text>
+
+          <!-- INDEX -->
+          <rect x="322" y="60" width="230" height="250" rx="12" class="box"/>
+          <text x="342" y="88" class="mono txsoil" font-size="11" font-weight="700">INDEX</text>
+          <text x="342" y="105" class="mut" font-size="10.5">what memory recorded</text>
+          <g font-size="10.5" class="mono">
+            <rect x="342" y="120" width="190" height="30" rx="6" class="sunk"/><text x="352" y="139" class="lab">state.rs</text><text x="522" y="139" text-anchor="end" class="txsoil">git:a1f…</text>
+            <rect x="342" y="156" width="190" height="30" rx="6" class="sunk"/><text x="352" y="175" class="lab">codegraph.rs</text><text x="522" y="175" text-anchor="end" class="txsoil">git:71d…</text>
+            <rect x="342" y="192" width="190" height="30" rx="6" class="sunk"/><text x="352" y="211" class="lab">lint.rs</text><text x="522" y="211" text-anchor="end" class="txsoil">git:4e7…</text>
+          </g>
+
+          <text x="588" y="180" text-anchor="middle" font-size="26" class="mut" font-weight="300">=</text>
+
+          <!-- DIFF -->
+          <rect x="622" y="60" width="254" height="250" rx="12" fill="var(--surface)" stroke="var(--sprout)" stroke-width="2"/>
+          <text x="644" y="88" class="mono txsprout" font-size="11" font-weight="700">DIFF: the work list</text>
+          <text x="644" y="105" class="mut" font-size="10.5">only what actually changed</text>
+          <g font-size="10.5" class="mono">
+            <rect x="644" y="122" width="210" height="34" rx="6" fill="var(--sunk)" stroke="var(--sprout)" stroke-width="1.3"/><text x="656" y="143" class="lab">codegraph.rs</text><text x="844" y="143" text-anchor="end" class="txsprout" font-weight="700">stale</text>
+            <rect x="644" y="164" width="210" height="34" rx="6" fill="var(--sunk)" stroke="var(--sprout)" stroke-width="1.3"/><text x="656" y="185" class="lab">check.rs</text><text x="844" y="185" text-anchor="end" class="txsprout" font-weight="700">new</text>
+          </g>
+          <text x="644" y="238" class="mut" font-size="10.5" font-family="var(--font-sans)">state.rs, lint.rs: hashes match,</text>
+          <text x="644" y="255" class="mut" font-size="10.5" font-family="var(--font-sans)">so they're skipped entirely.</text>
+          <line x1="644" y1="272" x2="856" y2="272" class="edge-mut"/>
+          <text x="644" y="292" class="txseed" font-size="10.5" font-family="var(--font-sans)">Seen this blob in a sibling worktree?</text>
+          <text x="644" y="306" class="txseed" font-size="10.5" font-family="var(--font-sans)">Reuse the cached summary.</text>
+
+          <!-- connecting arrows -->
+          <line x1="254" y1="45" x2="254" y2="45" class="edge"/>
+        </svg>
+      </div>
+      <figcaption><b>Identity, not timestamps.</b> Each file's content hash on disk is matched against the hash memory stored. Same hash → skip. Different or missing → <b>stale</b> or <b>new</b>, and only those reach the summarizer. Git provenance rides along, so a committed file is marked committed and an uncommitted edit stays "provisional" until it lands.</figcaption>
+    </figure>
+    <p class="prose">The subtraction has a bonus twist: if a file's blob was <em>already summarized in a sibling git worktree</em>, the diff points the agent at that cached summary instead of paying to write a new one. Work done once is reused everywhere the same bytes appear.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="prose">
+      <p class="eyebrow"><span class="num">04</span> &nbsp;The bedrock</p>
+      <h2>Memory: three substrates, one umbrella</h2>
+      <p>"Memory" is the umbrella term for everything loam remembers. Underneath it are three <strong>substrates</strong>, each with a different lifespan and a different maintainer. Keeping them separate is what stops memory from rotting into a junk drawer.</p>
+    </div>
+
+    <div class="grid g3 prose" style="max-width:none">
+      <div class="card"><span class="k">durable · agent-owned</span><h4 style="margin-top:.4em"><span class="dot"></span>Wiki</h4><p>Obsidian-friendly notes under <code>wiki/</code>: topic, entity, concept, and analysis pages, cross-linked with <code>[[wikilinks]]</code>. The lasting knowledge. This is what search indexes.</p></div>
+      <div class="card"><span class="k">durable · prompt context</span><h4 style="margin-top:.4em"><span class="dot soil"></span>Guidance</h4><p><code>AGENTS.md</code> is canonical; <code>CLAUDE.md</code> is a thin shim to it. This is <em>how to work here</em> (commands, conventions, gotchas) loaded as context by the harness.</p></div>
+      <div class="card"><span class="k">transient · one restart</span><h4 style="margin-top:.4em"><span class="dot seed"></span>Checkpoints</h4><p>Restart notes under <code>wiki/checkpoints/</code>. Work-state for picking up where you paused, used once, then superseded. Never durable knowledge.</p></div>
+    </div>
+
+    <div class="prose">
+      <h3>The gate: not everything earns a page</h3>
+      <p>The failure mode of "AI memory" is hoarding: writing down every passing thought until search returns noise. loam guards against that with a three-part <strong>admission rubric</strong>. A fact earns a durable page only if it clears all three tests. If it doesn't, it's routed elsewhere or discarded.</p>
+    </div>
+
+    <figure>
+      <div class="figframe">
+        <svg class="dg" viewBox="0 0 900 300" role="img" aria-label="The admission rubric routes a candidate fact through three gates: is it reusable, is it about the project, is it costly to reconstruct. Passing all three writes a durable wiki page. Facts that fail route to guidance, a checkpoint, a task, or are discarded.">
+          <defs>
+            <marker id="ah4" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0,0 9,4.5 0,9" class="arrowhead"/></marker>
+            <marker id="ah4s" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0,0 9,4.5 0,9" class="arrowhead-s"/></marker>
+          </defs>
+          <rect x="20" y="120" width="150" height="60" rx="10" class="sunk"/>
+          <text x="95" y="146" text-anchor="middle" class="lab" font-size="12" font-weight="650">a candidate</text>
+          <text x="95" y="164" text-anchor="middle" class="lab" font-size="12" font-weight="650">fact appears</text>
+
+          <!-- three gates -->
+          <g>
+            <rect x="212" y="118" width="126" height="64" rx="10" class="box"/>
+            <text x="275" y="142" text-anchor="middle" class="mono txsprout" font-size="10.5" font-weight="700">R1</text>
+            <text x="275" y="160" text-anchor="middle" class="lab" font-size="11">Reusable?</text>
+            <text x="275" y="174" text-anchor="middle" class="mut" font-size="9.5">a later session</text>
+          </g>
+          <g>
+            <rect x="368" y="118" width="126" height="64" rx="10" class="box"/>
+            <text x="431" y="142" text-anchor="middle" class="mono txsprout" font-size="10.5" font-weight="700">R2</text>
+            <text x="431" y="160" text-anchor="middle" class="lab" font-size="11">About the</text>
+            <text x="431" y="174" text-anchor="middle" class="mut" font-size="9.5">project / domain?</text>
+          </g>
+          <g>
+            <rect x="524" y="118" width="132" height="64" rx="10" class="box"/>
+            <text x="590" y="142" text-anchor="middle" class="mono txsprout" font-size="10.5" font-weight="700">R3</text>
+            <text x="590" y="160" text-anchor="middle" class="lab" font-size="11">Costly to</text>
+            <text x="590" y="174" text-anchor="middle" class="mut" font-size="9.5">reconstruct?</text>
+          </g>
+
+          <!-- pass destination -->
+          <rect x="700" y="112" width="180" height="76" rx="11" fill="var(--surface)" stroke="var(--sprout)" stroke-width="2"/>
+          <text x="790" y="140" text-anchor="middle" class="txsprout" font-size="12" font-weight="750">durable wiki page</text>
+          <text x="790" y="160" text-anchor="middle" class="mut" font-size="10">passes all three →</text>
+          <text x="790" y="174" text-anchor="middle" class="mut" font-size="10">it goes in the soil</text>
+
+          <line x1="170" y1="150" x2="210" y2="150" class="edge" marker-end="url(#ah4)"/>
+          <line x1="338" y1="150" x2="366" y2="150" class="edge" marker-end="url(#ah4)"/>
+          <line x1="494" y1="150" x2="522" y2="150" class="edge" marker-end="url(#ah4)"/>
+          <line x1="656" y1="150" x2="698" y2="150" class="edge" marker-end="url(#ah4s)" stroke="var(--sprout)"/>
+
+          <!-- fail routes -->
+          <text x="150" y="250" text-anchor="middle" class="mut mono" font-size="9.5">fails a test → route elsewhere, don't hoard:</text>
+          <g font-size="10" class="mono mut" text-anchor="middle">
+            <rect x="300" y="228" width="130" height="42" rx="8" class="sunk"/><text x="365" y="246" class="lab">how-to-work-here</text><text x="365" y="261" class="txsoil">→ AGENTS.md</text>
+            <rect x="444" y="228" width="120" height="42" rx="8" class="sunk"/><text x="504" y="246" class="lab">work-state</text><text x="504" y="261" class="txseed">→ checkpoint</text>
+            <rect x="578" y="228" width="120" height="42" rx="8" class="sunk"/><text x="638" y="246" class="lab">per-task note</text><text x="638" y="261" class="txsoil">→ plan file</text>
+            <rect x="712" y="228" width="110" height="42" rx="8" class="sunk"/><text x="767" y="246" class="lab">one-off</text><text x="767" y="261" class="crit" fill="var(--crit)">→ discard</text>
+          </g>
+        </svg>
+      </div>
+      <figcaption><b>Admission, not hoarding.</b> Reusable, about the project, and costly to re-derive from a live source: a fact needs all three to become a durable page. Anything reconstructable from one file read or command is deliberately <em>not</em> stored. How-to-work facts go to guidance; work-state goes to a checkpoint; the rest is discarded.</figcaption>
+    </figure>
+
+    <div class="callout clay prose">
+      <span class="lbl">Agent-owned, self-correcting</span>
+      <p>The agent writes, corrects, and archives memory <strong>without asking permission</strong>, humans read it, flag it, and inherit it. When a session reads a page that contradicts fresh evidence, it moves the old page to <code>wiki/.archive/</code>, writes the correction in place, logs it, and keeps going. A human saying "this page is wrong" triggers the exact same flow: a correction, not an approval request.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="prose">
+      <p class="eyebrow"><span class="num">05</span> &nbsp;The flywheel</p>
+      <h2>How a piece of work actually moves</h2>
+      <p>The planning skills form a chain from a vague ambition to verified, resumable execution. Each stage produces a real markdown artifact in your repo, and memory feeds every stage. loam even runs this on itself: its own <code>goals/</code>, <code>specs/</code>, and <code>plans/</code> folders live right in the repo.</p>
+    </div>
+
+    <figure>
+      <div class="figframe">
+        <svg class="dg" viewBox="0 0 900 340" role="img" aria-label="The workflow lifecycle as a cycle: a goal becomes a spec, a spec becomes a plan, a plan is executed by the starting skill, and work is paused with checkpoints and picked up by resuming. Memory feeds every stage, and learnings flow back into memory.">
+          <defs>
+            <marker id="ah5" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0,0 9,4.5 0,9" class="arrowhead-s"/></marker>
+            <marker id="ah5m" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0,0 9,4.5 0,9" class="arrowhead"/></marker>
+          </defs>
+
+          <!-- top row chain -->
+          <g text-anchor="middle">
+            <rect x="30" y="40" width="150" height="60" rx="11" class="box"/>
+            <text x="105" y="66" class="lab" font-size="13" font-weight="700">Goal</text>
+            <text x="105" y="84" class="mut mono" font-size="9.5">setting-goals</text>
+
+            <rect x="230" y="40" width="150" height="60" rx="11" class="box"/>
+            <text x="305" y="66" class="lab" font-size="13" font-weight="700">Spec</text>
+            <text x="305" y="84" class="mut mono" font-size="9.5">writing-spec</text>
+
+            <rect x="430" y="40" width="150" height="60" rx="11" class="box"/>
+            <text x="505" y="66" class="lab" font-size="13" font-weight="700">Plan</text>
+            <text x="505" y="84" class="mut mono" font-size="9.5">planning</text>
+
+            <rect x="630" y="40" width="240" height="60" rx="11" fill="var(--surface)" stroke="var(--sprout)" stroke-width="2"/>
+            <text x="750" y="66" class="lab txsprout" font-size="13" font-weight="750">Execute</text>
+            <text x="750" y="84" class="mut mono" font-size="9.5">starting → checkpointing → resuming</text>
+          </g>
+
+          <line x1="180" y1="70" x2="228" y2="70" class="edge-mut" marker-end="url(#ah5)"/>
+          <line x1="380" y1="70" x2="428" y2="70" class="edge-mut" marker-end="url(#ah5)"/>
+          <line x1="580" y1="70" x2="628" y2="70" class="edge-mut" marker-end="url(#ah5)"/>
+
+          <text x="205" y="60" text-anchor="middle" class="mut mono" font-size="8.5">verifiable</text>
+          <text x="405" y="60" text-anchor="middle" class="mut mono" font-size="8.5">approved</text>
+          <text x="605" y="60" text-anchor="middle" class="mut mono" font-size="8.5">ordered</text>
+
+          <!-- memory band -->
+          <rect x="30" y="200" width="840" height="66" rx="12" fill="var(--sunk)" stroke="var(--soil)" stroke-width="1.6"/>
+          <text x="450" y="228" text-anchor="middle" class="txsoil mono" font-size="11" font-weight="700">MEMORY · wiki · guidance · checkpoints</text>
+          <text x="450" y="248" text-anchor="middle" class="mut" font-size="10.5">every stage reads from it; finished work writes learnings back into it</text>
+
+          <!-- feeds up -->
+          <line x1="105" y1="200" x2="105" y2="102" class="strokesprout" marker-end="url(#ah5)" opacity=".8"/>
+          <line x1="305" y1="200" x2="305" y2="102" class="strokesprout" marker-end="url(#ah5)" opacity=".8"/>
+          <line x1="505" y1="200" x2="505" y2="102" class="strokesprout" marker-end="url(#ah5)" opacity=".8"/>
+          <line x1="750" y1="200" x2="750" y2="102" class="strokesprout" marker-end="url(#ah5)" opacity=".8"/>
+          <!-- learnings back down -->
+          <path d="M810 100 C840 130 850 160 840 198" class="edge" marker-end="url(#ah5m)"/>
+          <text x="862" y="150" text-anchor="middle" class="mut mono" font-size="9" transform="rotate(90 862 150)">learnings</text>
+
+          <text x="450" y="300" text-anchor="middle" class="mut" font-size="10.5" font-style="italic">A plan's tasks carry checkable acceptance criteria: [ ] open · [x] done, with evidence · [&gt;] needs re-check · [-] no longer applies.</text>
+        </svg>
+      </div>
+      <figcaption><b>The compounding loop.</b> Ambition → spec → plan → execution, with a verifiable outcome at the top and a checkable criterion on every task. Memory sits under all of it: each stage draws on what's known, and finished work deposits new learnings back into the soil for the next cycle.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="prose">
+      <p class="eyebrow"><span class="num">06</span> &nbsp;While you're away</p>
+      <h2>Background workers: memory that tends itself</h2>
+      <p>loam doesn't only remember when you tell it to. When a turn ends, the <strong>Stop hook</strong> can quietly spin up a detached helper to harvest learnings from the conversation or ingest changed code into memory, using a cheap, fast model, entirely in the background. The design problem is obvious: two background writers editing the same memory at once would corrupt it. loam solves that with a <strong>per-workspace lease</strong>: a simple lock file that guarantees only one writer touches a workspace's memory at a time.</p>
+    </div>
+
+    <figure>
+      <div class="figframe">
+        <svg class="dg" viewBox="0 0 900 300" role="img" aria-label="The Stop hook passes three gates: an on/off env flag, a recursion guard, and a debounce timer, then tries to acquire a per-workspace lease. If the lease is free it spawns a detached background agent that writes memory and releases the lease; if held, it skips.">
+          <defs>
+            <marker id="ah6" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0,0 9,4.5 0,9" class="arrowhead"/></marker>
+            <marker id="ah6s" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><polygon points="0,0 9,4.5 0,9" class="arrowhead-s"/></marker>
+          </defs>
+
+          <rect x="16" y="118" width="118" height="60" rx="10" class="sunk"/>
+          <text x="75" y="144" text-anchor="middle" class="lab" font-size="12" font-weight="650">Stop hook</text>
+          <text x="75" y="162" text-anchor="middle" class="mut mono" font-size="9.5">turn ended</text>
+
+          <!-- gates -->
+          <g text-anchor="middle" font-size="10">
+            <rect x="160" y="120" width="98" height="56" rx="9" class="box"/><text x="209" y="143" class="lab" font-size="10.5" font-weight="650">env flag</text><text x="209" y="160" class="mut mono" font-size="9">on / off</text>
+            <rect x="278" y="120" width="98" height="56" rx="9" class="box"/><text x="327" y="143" class="lab" font-size="10.5" font-weight="650">recursion</text><text x="327" y="160" class="mut mono" font-size="9">not in a worker</text>
+            <rect x="396" y="120" width="98" height="56" rx="9" class="box"/><text x="445" y="143" class="lab" font-size="10.5" font-weight="650">debounce</text><text x="445" y="160" class="mut mono" font-size="9">ran recently?</text>
+          </g>
+
+          <!-- lease -->
+          <g>
+            <rect x="516" y="112" width="120" height="72" rx="11" fill="var(--surface)" stroke="var(--seed)" stroke-width="2"/>
+            <text x="576" y="140" text-anchor="middle" class="lab txseed" font-size="12" font-weight="750">acquire lease</text>
+            <text x="576" y="158" text-anchor="middle" class="mut" font-size="9.5">one writer</text>
+            <text x="576" y="171" text-anchor="middle" class="mut" font-size="9.5">per workspace</text>
+          </g>
+
+          <!-- detached agent -->
+          <rect x="676" y="60" width="200" height="70" rx="11" fill="var(--surface)" stroke="var(--sprout)" stroke-width="2"/>
+          <text x="776" y="86" text-anchor="middle" class="txsprout lab" font-size="12" font-weight="750">detached agent</text>
+          <text x="776" y="104" text-anchor="middle" class="mut mono" font-size="9.5">haiku · one skill · read-only code</text>
+          <text x="776" y="120" text-anchor="middle" class="mut" font-size="9.5">harvester or ingestor → writes memory</text>
+
+          <!-- held -> skip -->
+          <rect x="676" y="170" width="200" height="52" rx="11" class="sunk"/>
+          <text x="776" y="192" text-anchor="middle" class="lab" font-size="11" font-weight="650">held → skip</text>
+          <text x="776" y="209" text-anchor="middle" class="mut" font-size="9.5">another writer is busy; try later</text>
+
+          <line x1="134" y1="148" x2="158" y2="148" class="edge" marker-end="url(#ah6)"/>
+          <line x1="258" y1="148" x2="276" y2="148" class="edge" marker-end="url(#ah6)"/>
+          <line x1="376" y1="148" x2="394" y2="148" class="edge" marker-end="url(#ah6)"/>
+          <line x1="494" y1="148" x2="514" y2="148" class="edge" marker-end="url(#ah6)"/>
+          <path d="M636 138 C656 120 656 100 674 92" class="edge" marker-end="url(#ah6s)" stroke="var(--sprout)"/>
+          <path d="M636 164 C656 178 656 190 674 194" class="edge-mut" marker-end="url(#ah6)"/>
+          <text x="662" y="86" text-anchor="middle" class="txsprout mono" font-size="9" font-weight="700">free</text>
+        </svg>
+      </div>
+      <figcaption><b>Fail-closed by default.</b> Three gates decide whether a background helper even starts: an on/off flag (<code>LOAM_HARVEST_BACKGROUND</code> / <code>LOAM_INGEST_BACKGROUND</code>), a guard so a worker can't spawn a worker, and a debounce. Only then does it reach for the lease. Uncertain process identity, a live lease, or any race makes it skip rather than risk a double write.</figcaption>
+    </figure>
+    <p class="prose" style="color:var(--ink-faint);font-size:.92rem">The harvester only fires when enough <em>new</em> conversation has accumulated since last time; it measures the transcript's growth and skips below a threshold. The ingestor only fires when the code graph reports files pending. Neither ever changes your source, commits, or pushes. On Codex, which can't spawn detached children, the same logic instead instructs Codex to run its own subagent, one brain, adapted per harness again.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="prose">
+      <p class="eyebrow">The accelerator</p>
+      <h2>qmd: search that speeds up memory, and vanishes when absent</h2>
+      <p>As a wiki grows, grep gets slow and dumb. <strong>qmd</strong> is an optional local search engine (a separate tool) that indexes the wiki and answers both keyword and meaning-based queries. loam detects it automatically: when it's ready, skills prefer it for finding related pages; when it's not, they fall back to plain grep and glob without missing a beat.</p>
+      <div class="grid g2" style="max-width:none">
+        <div class="card"><h4><span class="dot"></span>Keyword &amp; semantic</h4><p>Fast BM25 keyword search for exact terms, plus vector search for "find pages that <em>mean</em> this", used to discover existing related notes before writing a new one, so knowledge links up instead of duplicating.</p></div>
+        <div class="card"><h4><span class="dot seed"></span>Discover, then verify</h4><p>qmd finds candidate <em>paths</em>; the skill still opens the actual file to confirm content. And it covers code too: the <code>wiki/code/</code> summaries are indexed, so the agent maps the codebase before scanning raw bytes.</p></div>
+      </div>
+      <div class="callout warm">
+        <span class="lbl">A subtle two-step</span>
+        <p>After writing to a qmd-backed wiki, refreshing the file index (<code>qmd update</code>) is <em>not</em> enough: the vector embeddings go stale until <code>qmd embed</code> runs too. loam treats these as two separate outcomes and never claims a write is "verified" unless both succeed. The kind of honesty that keeps memory trustworthy.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="prose">
+      <p class="eyebrow">The payoff, concretely</p>
+      <h2>A day in the life, well, two</h2>
+      <p>Every mechanism above earns its keep in one story: a session pays to learn something once, and the next session gets it for free. Here's the same feature (adding rate limiting to a payments API) across two mornings in a workspace that already has loam set up.</p>
+    </div>
+
+    <div class="timeline prose" style="max-width:76ch">
+      <div class="tl-session">
+        <div class="tl-head">
+          <span class="day">Tuesday</span>
+          <h3>The expensive discovery</h3>
+          <span class="sub">cold start · full token cost</span>
+        </div>
+        <ul class="tl-steps">
+          <li class="tl-step">
+            <span class="tl-time">09:14 · session start</span>
+            <p>You open your agent. The doorman injects the briefing: <strong>wiki present, qmd ready,</strong> plus one hint: <code>code_ingest_pending</code>, two source files changed since last ingest. You've read nothing yet and already know the lay of the land.</p>
+            <span class="tl-tag mut">SessionStart injection</span>
+          </li>
+          <li class="tl-step">
+            <span class="tl-time">09:15</span>
+            <p>You type <em>"add rate limiting to the payments API."</em> No skill names. The router hears the intent and walks you through <code>writing-spec</code> → <code>planning</code>, landing an ordered plan with checkable acceptance criteria.</p>
+            <span class="tl-tag mut">router · skills · flywheel</span>
+          </li>
+          <li class="tl-step">
+            <span class="tl-time">10:40 · the wall</span>
+            <p>Mid-build, the Redis client silently fails until you discover it only connects with one non-obvious flag. You burn <strong>25 minutes and a pile of tokens</strong> diagnosing it. This is the rediscovery tax, and the exact thing about to get killed.</p>
+            <span class="tl-tag mut">the cost loam targets</span>
+          </li>
+          <li class="tl-step">
+            <span class="tl-time">17:30 · wrapping up</span>
+            <p>You say <em>"stopping for the day."</em> The router dispatches <code>checkpointing</code>, which writes a compact restart note: what you were doing, what's next, which files.</p>
+            <span class="tl-tag mut">checkpoint substrate</span>
+          </li>
+          <li class="tl-step">
+            <span class="tl-time">17:30 · turn ends (you're gone)</span>
+            <p>The Stop hook fires. The <strong>harvester</strong> clears its gates, grabs the workspace lease, and a cheap background agent reviews the session, routing the Redis-flag gotcha through the admission rubric into a durable wiki page <em>and</em> an <code>AGENTS.md</code> line. You never asked. It just happened.</p>
+            <span class="tl-tag mut">background worker · lease · rubric</span>
+          </li>
+        </ul>
+      </div>
+
+      <div class="tl-session">
+        <div class="tl-head warm">
+          <span class="day">Wednesday</span>
+          <h3>The payoff</h3>
+          <span class="sub">cold model, maybe a different harness entirely</span>
+        </div>
+        <ul class="tl-steps">
+          <li class="tl-step">
+            <span class="tl-time">08:40 · session start</span>
+            <p>A brand-new session, fresh context, zero memory of Tuesday in the model. The briefing arrives with a <code>resume_available</code> hint pointing at yesterday's checkpoint. Because the plan is plain markdown, it doesn't matter that this could be a different agent than wrote it.</p>
+            <span class="tl-tag">SessionStart injection · portable plan</span>
+          </li>
+          <li class="tl-step">
+            <span class="tl-time">08:41</span>
+            <p>You say <em>"pick up where I left off."</em> The <code>resuming</code> skill reads the checkpoint, verifies the current files still match, and orients on the safest next step, no re-reading the whole conversation.</p>
+            <span class="tl-tag">resuming</span>
+          </li>
+          <li class="tl-step key">
+            <span class="tl-time">09:05 · the moment it all pays off</span>
+            <p>The work touches the Redis client again. Instead of re-diagnosing, the agent <strong>queries memory</strong>: qmd returns yesterday's gotcha page in one hop, and the flag is applied immediately. <strong>The 25-minute wall from Tuesday costs zero seconds today.</strong> That single hop is the entire reason loam exists.</p>
+            <span class="tl-tag">querying-memory · qmd</span>
+          </li>
+          <li class="tl-step">
+            <span class="tl-time">11:20 · shipping</span>
+            <p>The feature lands. The code graph's <code>walk − index = diff</code> flags only the two genuinely-new source files; a background ingest later summarizes just those, reusing anything whose bytes it had already seen. The plan's criteria flip to <code>[x]</code> with inline evidence.</p>
+            <span class="tl-tag">code graph · flywheel</span>
+          </li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="callout prose">
+      <span class="lbl">The whole point, in the difference between two mornings</span>
+      <p>Tuesday paid the tax; Wednesday didn't, and a different agent entirely would have found the same page. Nothing here required a database, an embeddings bill, or you remembering a single skill name. The knowledge went into the soil, and the next session reached down and pulled it back up.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap prose">
+    <p class="eyebrow">Why it's built this way</p>
+    <h2>The principles under every decision</h2>
+    <ul class="clean">
+      <li><strong>Markdown-first, git-diffable.</strong> The memory is files. You can <code>git log</code> it, open it in any editor, and it survives any vendor. No database to migrate, no service to pay for.</li>
+      <li><strong>Harness-neutral.</strong> Skills are portable markdown; a plan written under one agent resumes under another. The plan is the asset, not any runtime's private state.</li>
+      <li><strong>Optional tools degrade, never block.</strong> qmd speeds up search; the Rust binary speeds up probes. Remove either and loam still works on plain files.</li>
+      <li><strong>Read-only and honest at the edges.</strong> The runtime never edits your code or phones home. Startup never downloads or "repairs" silently. Background workers fail closed when uncertain.</li>
+      <li><strong>Small on purpose.</strong> Each skill is budgeted in tokens; only descriptions load until a skill runs. Context is treated as the scarce resource it is.</li>
+      <li><strong>Durable is separated from transient.</strong> Wiki and guidance last; checkpoints are used once. Conflating them is exactly how memory turns to garbage, so loam refuses to.</li>
+    </ul>
+
+    <div class="callout">
+      <span class="lbl">What success looks like, in one sentence</span>
+      <p>Tuesday's session learned something, Wednesday's session <em>reached for it</em> instead of re-deriving it, and a different agent entirely would have found the same thing. That's the whole project. Everything on this page is machinery in service of that one outcome.</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="brandrow" style="margin-bottom:12px">
+      <svg class="mark" viewBox="0 0 40 40" style="width:26px;height:26px" role="img" aria-label="loam mark">
+        <path d="M8 34 h24" stroke="var(--soil)" stroke-width="2.4" stroke-linecap="round"/>
+        <path d="M20 33 V16" stroke="var(--sprout)" stroke-width="2.6" stroke-linecap="round"/>
+        <path d="M20 22 C13 21 10 17 9 12 C16 12 19 16 20 22 Z" fill="var(--sprout)"/>
+        <path d="M20 19 C26 18 29 14 30 10 C24 10 21 13 20 19 Z" fill="var(--sprout-bright)"/>
+        <circle cx="20" cy="13" r="3" fill="var(--seed)"/>
+      </svg>
+      <span class="wordmark">loam</span>
+    </div>
+    <p>A collection of workflow skills that give AI coding agents a persistent, agent-authored memory in plain markdown, so sessions build on each other instead of starting from scratch. Install with <code>npx @scchearn/loam setup</code>. MIT licensed.</p>
+    <p class="kicker" style="margin-top:1.4em">An explainer of the runtime, plugin, skills, memory, and search, assembled from the source.</p>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,16 +1,9 @@
 import { homedir } from 'node:os';
-import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const OWN_MARKER = 'You have loam';
-const UNAVAILABLE = '<LOAM_IMPORTANT>\nYou have loam.\nLoam is unavailable. Run: npx @scchearn/loam setup\n</LOAM_IMPORTANT>';
-
-// Filled in by setup when this plugin is staged. OpenCode loads the plugin
-// in-process, so the absolute private runtime is written here rather than
-// resolved at session time; setup rewrites it whenever the runtime moves.
-const RUNTIME_PATH = "__LOAM_RUNTIME_PATH__";
 
 async function defaultIntegrationPath() {
   if (process.env.LOAM_INTEGRATION_PATH) return process.env.LOAM_INTEGRATION_PATH;
@@ -31,13 +24,14 @@ async function loadIngestModules() {
   if (integrationPath) roots.push(new URL('./', pathToFileURL(integrationPath)));
   for (const root of roots) {
     try {
-      const [paths, ingest] = await Promise.all([
+      const [paths, ingest, harvest] = await Promise.all([
         import(new URL('paths.mjs', root).href),
         import(new URL('ingest.mjs', root).href),
+        import(new URL('harvest.mjs', root).href).catch(() => ({})),
       ]);
       let hooks = {};
       try { hooks = await import(new URL('hooks.mjs', root).href); } catch {}
-      return { ...paths, ...ingest, ...hooks };
+      return { ...paths, ...ingest, ...harvest, ...hooks };
     } catch {}
   }
   throw new Error('loam ingestion integration is unavailable');
@@ -46,29 +40,22 @@ async function loadIngestModules() {
 const {
   resolveGlobalRoot, resolveSkillsRoot, gate, runWorker,
   beginHookRun, finishHookRun, startHookWorker, finishHookWorker,
+  harvestTick, runHarvest: harvestRunWorker,
 } = await loadIngestModules().catch(() => ({}));
 
-// The whole OpenCode context surface: run the native read path and take its
-// stdout. No shared Node integration, no IPC of our own, no broker.
-async function defaultContext({ workspace }) {
-  return new Promise((settle) => {
-    let child;
-    try {
-      child = spawn(RUNTIME_PATH, ['hook', 'opencode', '--workspace', workspace], {
-        stdio: ['pipe', 'pipe', 'ignore'],
-      });
-    } catch {
-      settle(UNAVAILABLE);
-      return;
-    }
-    let body = '';
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk) => { body += chunk; });
-    child.once('error', () => settle(UNAVAILABLE));
-    child.once('close', () => settle(body.trim() || UNAVAILABLE));
-    child.stdin.on('error', () => {});
-    child.stdin.end('{}');
-  });
+async function defaultContext({ integrationPath, workspace }) {
+  try {
+    integrationPath ||= await defaultIntegrationPath();
+    const integration = await import(pathToFileURL(integrationPath).href);
+    const chunks = [];
+    await integration.runIntegration(
+      ['hook', '--harness', 'opencode', '--workspace', workspace],
+      { integrationPath, output: { write: (chunk) => chunks.push(String(chunk)) } },
+    );
+    return chunks.join('');
+  } catch {
+    return '<LOAM_IMPORTANT>\nYou have loam.\nLoam is unavailable. Run: npx @scchearn/loam setup\n</LOAM_IMPORTANT>';
+  }
 }
 
 function responseData(response) { return response?.data ?? response; }
@@ -133,6 +120,7 @@ export function createOpenCodeAdapter({
       }
       let failure;
       let gated;
+      let harvestGated;
       try {
         if (!ingestGate || !ingestWorker || !ingestGlobalRoot || !ingestSkillsRoot) {
           throw new Error('Loam ingestion integration is unavailable');
@@ -146,6 +134,23 @@ export function createOpenCodeAdapter({
           env,
         });
         if (gated.action === 'spawn_worker' && sdk?.session) {
+          const notify = typeof sdk?.tui?.showToast === 'function'
+            ? ({ phase, status, visibility, signal }) => {
+                if (visibility !== 'toast') return;
+                const failed = phase === 'terminal' && status !== 'ok';
+                return sdk.tui.showToast({
+                  query: { directory: workspace },
+                  body: {
+                    title: 'Loam',
+                    message: phase === 'launch'
+                      ? 'Background code ingestion started.'
+                      : failed ? 'Background code ingestion failed.' : 'Background code ingestion completed.',
+                    variant: phase === 'launch' ? 'info' : failed ? 'error' : 'success',
+                  },
+                  signal,
+                });
+              }
+            : undefined;
           const childSession = {
             parentSessionId: childId,
             createChild: async ({ parentId, title }) => {
@@ -188,6 +193,7 @@ export function createOpenCodeAdapter({
                 env,
                 openCodeSession: childSession,
                 hookRun,
+                notify,
               });
               if (hookRun && hookWorkerFinish) {
                 try {
@@ -195,6 +201,7 @@ export function createOpenCodeAdapter({
                     run: hookRun,
                     reason: result?.reason,
                     ...(result?.detail !== undefined ? { detail: result.detail } : {}),
+                    ...(result?.events?.length ? { events: result.events } : {}),
                   });
                 } catch {}
               }
@@ -213,17 +220,78 @@ export function createOpenCodeAdapter({
             }
           })();
         }
+        if (harvestTick && harvestRunWorker) {
+          try {
+            harvestGated = await harvestTick({
+              harness: 'opencode',
+              payload: { cwd: workspace, session_id: childId },
+              globalRoot,
+              env,
+            });
+            if (harvestGated?.action === 'spawn_worker' && sdk?.session) {
+              void (async () => {
+                const childSession = {
+                  parentSessionId: childId,
+                  createChild: async ({ parentId, title }) => {
+                    const child = responseData(await sdk.session.create({
+                      query: { directory: workspace },
+                      body: { parentID: parentId, title: title || 'Loam background session harvest' },
+                    }));
+                    const id = child?.id || child?.session_id || child?.sessionID;
+                    if (id) { childSession.lastChildId = String(id); childSessions.add(String(id)); }
+                    return child;
+                  },
+                  promptAsync: async ({ sessionId, parts }) => {
+                    await sdk.session.promptAsync({
+                      path: { id: sessionId },
+                      query: { directory: workspace },
+                      body: { parts },
+                    });
+                    childSessions.add(String(sessionId));
+                  },
+                  status: async (id) => {
+                    if (typeof sdk.session.status !== 'function') throw new Error('OpenCode session status is unavailable');
+                    const response = responseData(await sdk.session.status({ query: { directory: workspace } }));
+                    return response?.[id] || response?.data?.[id] || response;
+                  },
+                  abort: async (id) => {
+                    if (typeof sdk.session.abort !== 'function') throw new Error('OpenCode session abort is unavailable');
+                    return responseData(await sdk.session.abort({ path: { id }, query: { directory: workspace } }));
+                  },
+                };
+                try {
+                  await harvestRunWorker({
+                    harness: 'opencode',
+                    workspace: harvestGated.workspace || workspace,
+                    sessionId: childId,
+                    globalRoot,
+                    skillsRoot,
+                    env,
+                    openCodeSession: childSession,
+                    hookRun,
+                  });
+                } catch {}
+                finally {
+                  if (childSession.lastChildId) rememberCompleted(childSession.lastChildId);
+                }
+              })();
+            }
+          } catch {}
+        }
       } catch (error) {
         failure = error;
       }
       if (hookRun && hookFinish) {
         try {
+          const harvestRecorded = harvestGated?.action === 'spawn_worker'
+            ? { action: harvestGated.action, reason: 'harvest_dispatched' }
+            : null;
           await hookFinish({
             run: hookRun,
             status: failure ? 'failed' : 'succeeded',
             ...(failure
               ? { detail: failure instanceof Error ? failure.message : String(failure) }
-              : {
+              : harvestRecorded || {
                   action: gated?.action,
                   ...(gated?.reason !== undefined ? { reason: gated.reason } : {}),
                   ...(gated?.detail !== undefined ? { detail: gated.detail } : {}),
