@@ -1,11 +1,24 @@
 import { fileURLToPath } from 'node:url';
 import { basename, resolve } from 'node:path';
 
+import { PACKAGE_VERSION } from './constants.mjs';
 import { loadSkillInventory } from './inventory.mjs';
 import { readRequiredVersion, readSkillContent } from '../integration/metadata.mjs';
 import { runSkills } from './process.mjs';
 
 const defaultPackageRoot = fileURLToPath(new URL('..', import.meta.url));
+
+// Skills are installed from the repository, never from the npm package. For a
+// final release that is the default-branch HEAD (`skills add scchearn/loam`),
+// which is design-intentional: skills are live the moment they merge to main.
+// A prerelease package must instead pin the matching tag: the branch skills
+// carry a CLI_VERSION that mis-pairs the prerelease runtime, and the plugin
+// release tag v<version> exists before anyone can run the package.
+export function skillsSourceFor(version) {
+  return version.includes('-')
+    ? `https://github.com/scchearn/loam/tree/v${version}`
+    : 'scchearn/loam';
+}
 
 // Read-back of a large global inventory across many agent roots can outrun the
 // default 120s command timeout on Windows (issue #50). The list is read-only,
@@ -124,7 +137,7 @@ export async function ensureGlobalSkills(options = {}) {
   if (current.ready && !options.refresh) return current;
 
   const added = await runSkills(
-    ['add', 'scchearn/loam', '--global', '--agent', '*', '--yes'],
+    ['add', skillsSourceFor(options.packageVersion || PACKAGE_VERSION), '--global', '--agent', '*', '--yes'],
     { cwd: options.cwd, runner: options.runner },
   );
   if (!added.ok) {
