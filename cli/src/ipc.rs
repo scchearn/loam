@@ -75,6 +75,11 @@ pub enum Operation {
     /// mutates nothing, persists nothing, and carries no envelope bytes,
     /// credential, or raw remote URL back to the caller.
     SnapshotGet,
+    /// Drain one registered session's mailbox queue (T2): every item admitted
+    /// to the snapshot store since the session's last poll, consumed once. A
+    /// read of volatile in-memory state — it mutates only the mailbox, persists
+    /// nothing, and carries no envelope bytes, credential, or raw remote URL.
+    SessionPollInject,
     /// Forward one already-derived outbound operation for the connector to
     /// publish. A named variant beside the read: the CLI derives
     /// every authority-bearing field and never opens a broker connection, and
@@ -91,6 +96,7 @@ impl Operation {
             "project.detach" => Some(Operation::ProjectDetach),
             "session.register-inject" => Some(Operation::SessionRegisterInject),
             "federation.snapshot" => Some(Operation::SnapshotGet),
+            "session.poll-inject" => Some(Operation::SessionPollInject),
             "federation.emit" => Some(Operation::FederationEmit),
             _ => None,
         }
@@ -103,6 +109,7 @@ impl Operation {
             Operation::ProjectDetach => "project.detach",
             Operation::SessionRegisterInject => "session.register-inject",
             Operation::SnapshotGet => "federation.snapshot",
+            Operation::SessionPollInject => "session.poll-inject",
             Operation::FederationEmit => "federation.emit",
         }
     }

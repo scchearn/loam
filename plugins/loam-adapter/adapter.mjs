@@ -1,8 +1,7 @@
 import { homedir } from 'node:os';
 import { readFile } from 'node:fs/promises';
-import { basename, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { spawn } from 'node:child_process';
 
 const CODEX_START_FAILURE_MESSAGE = 'Loam background ingestion could not start. Run npx @scchearn/loam setup to repair the installation.';
 
@@ -22,46 +21,6 @@ async function defaultIntegrationPath() {
   } catch {
     return fallback;
   }
-}
-
-// The staged native runtime binary. Setup records it in install.json; the
-// session-start context is served through it so the injected body carries the
-// sanitized federation section on top of the baseline the Node path produced.
-async function defaultRuntimePath() {
-  if (process.env.LOAM_RUNTIME_PATH) return process.env.LOAM_RUNTIME_PATH;
-  try {
-    const metadata = JSON.parse(await readFile(join(homedir(), '.agents', 'loam', 'install.json'), 'utf8'));
-    if (typeof metadata.runtime_path === 'string' && metadata.runtime_path) return metadata.runtime_path;
-  } catch {}
-  return '';
-}
-
-// Run `<runtime> hook <harness> --body` and return the composed context body.
-// The runtime is the ONLY renderer of federation data (it sanitizes every
-// sender field); the adapter only relays its stdout and never parses federation
-// content itself. `spawn` with an argv array — no shell — so the workspace path
-// cannot be interpreted. Returns '' on any failure so the caller can fall back.
-function runRuntimeHook(runtimePath, harness, workspace, payload = {}) {
-  return new Promise((resolvePromise) => {
-    let stdout = '';
-    let settled = false;
-    const done = (value) => { if (!settled) { settled = true; resolvePromise(value); } };
-    let child;
-    try {
-      child = spawn(runtimePath, ['hook', harness, '--workspace', workspace, '--body'], { stdio: ['pipe', 'pipe', 'ignore'] });
-    } catch {
-      return done('');
-    }
-    const timer = setTimeout(() => { try { child.kill(); } catch {} done(''); }, 5000);
-    child.stdout.on('data', (chunk) => { stdout += chunk; });
-    child.once('error', () => { clearTimeout(timer); done(''); });
-    child.once('close', (code) => { clearTimeout(timer); done(code === 0 ? stdout : ''); });
-    try {
-      child.stdin.end(JSON.stringify(payload ?? {}));
-    } catch {
-      // stdin already closed/broken; the runtime still has --workspace to work from.
-    }
-  });
 }
 
 async function defaultIngestModules({ integrationPath } = {}) {
@@ -87,69 +46,6 @@ async function defaultHookModules({ integrationPath } = {}) {
 export function workspaceFromPayload(payload = {}, fallback = process.cwd()) {
   const value = payload.cwd || payload.workspaceRoot || payload.workspace?.root || payload.session?.cwd || fallback;
   return resolve(value);
-}
-
-async function defaultContext({ harness, integrationPath, workspace, runtimePath, payload } = {}) {
-  // Primary path: the federation-aware runtime renders the full baseline
-  // (reproducing the Node context) plus the sanitized federation section.
-  try {
-    // undefined => resolve the staged runtime; an explicit '' forces the Node
-    // fallback (used by the legacy-integration compatibility tests).
-    if (runtimePath === undefined) runtimePath = await defaultRuntimePath();
-    if (runtimePath) {
-      const body = (await runRuntimeHook(runtimePath, harness, workspace, payload)).trim();
-      if (body) return body;
-    }
-  } catch {}
-  // Fallback: main's Node integration baseline (no federation section) keeps a
-  // session usable if the runtime is missing — losing the baseline entirely
-  // would be strictly worse than a session without the collaboration snapshot.
-  try {
-    integrationPath ||= await defaultIntegrationPath();
-    const integration = await import(pathToFileURL(integrationPath).href);
-    const candidates = harness === 'codex' ? ['codex', 'claude'] : [harness];
-    for (const [index, candidate] of candidates.entries()) {
-      const chunks = [];
-      try {
-        await integration.runIntegration(
-          ['hook', '--harness', candidate, '--workspace', workspace],
-          { integrationPath, output: { write: (chunk) => chunks.push(String(chunk)) } },
-        );
-        return chunks.join('');
-      } catch (error) {
-        if (index === candidates.length - 1) throw error;
-      }
-    }
-  } catch {
-    return '<LOAM_IMPORTANT>\nYou have loam.\nLoam is unavailable. Run: npx @scchearn/loam setup\n</LOAM_IMPORTANT>';
-  }
-}
-
-export function createMarketplaceAdapter({ harness = 'claude', integrationPath, runtimePath, getContext = defaultContext } = {}) {
-  return async (payload = {}) => ({
-    hookSpecificOutput: {
-      hookEventName: 'SessionStart',
-      additionalContext: await getContext({
-        harness,
-        workspace: workspaceFromPayload(payload),
-        integrationPath,
-        runtimePath,
-        payload,
-      }),
-    },
-  });
-}
-
-export function createClaudeAdapter(options = {}) {
-  return createMarketplaceAdapter({ ...options, harness: 'claude' });
-}
-
-export async function handleMarketplaceHook(payload, options = {}) {
-  return createMarketplaceAdapter(options)(typeof payload === 'string' ? JSON.parse(payload) : payload);
-}
-
-export async function handleClaudeHook(payload, options = {}) {
-  return handleMarketplaceHook(payload, { ...options, harness: 'claude' });
 }
 
 async function defaultHarvestModules({ integrationPath } = {}) {
@@ -380,12 +276,4 @@ export async function handleMarketplaceSubagentStop(payload = {}, {
     }
   } catch {}
   return {};
-}
-
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
-  let input = '';
-  process.stdin.setEncoding('utf8');
-  for await (const chunk of process.stdin) input += chunk;
-  const harness = basename(process.argv[1]).startsWith('codex-') ? 'codex' : 'claude';
-  process.stdout.write(`${JSON.stringify(await handleMarketplaceHook(input || '{}', { harness }))}\n`);
 }

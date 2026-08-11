@@ -1,9 +1,15 @@
 import { homedir } from 'node:os';
+import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const OWN_MARKER = 'You have loam';
+const UNAVAILABLE = '<LOAM_IMPORTANT>\nYou have loam.\nLoam is unavailable. Run: npx @scchearn/loam setup\n</LOAM_IMPORTANT>';
+
+// Filled in by setup when this plugin is staged. OpenCode loads the plugin
+// in-process, so the absolute private runtime is written here rather than
+// resolved at session time; setup rewrites it whenever the runtime moves.
+const RUNTIME_PATH = "__LOAM_RUNTIME_PATH__";
 
 async function defaultIntegrationPath() {
   if (process.env.LOAM_INTEGRATION_PATH) return process.env.LOAM_INTEGRATION_PATH;
@@ -43,19 +49,29 @@ const {
   harvestTick, runHarvest: harvestRunWorker,
 } = await loadIngestModules().catch(() => ({}));
 
-async function defaultContext({ integrationPath, workspace }) {
-  try {
-    integrationPath ||= await defaultIntegrationPath();
-    const integration = await import(pathToFileURL(integrationPath).href);
-    const chunks = [];
-    await integration.runIntegration(
-      ['hook', '--harness', 'opencode', '--workspace', workspace],
-      { integrationPath, output: { write: (chunk) => chunks.push(String(chunk)) } },
-    );
-    return chunks.join('');
-  } catch {
-    return '<LOAM_IMPORTANT>\nYou have loam.\nLoam is unavailable. Run: npx @scchearn/loam setup\n</LOAM_IMPORTANT>';
-  }
+// The whole OpenCode context surface: run the native read path and take its
+// stdout. No shared Node integration, no IPC of our own, no broker. The event
+// flag splits the injection: SessionStart renders the full block, per-turn
+// (UserPromptSubmit) renders the federation refresh only.
+async function defaultContext({ workspace, event = 'SessionStart' }) {
+  return new Promise((settle) => {
+    let child;
+    try {
+      child = spawn(RUNTIME_PATH, ['hook', 'opencode', '--workspace', workspace, '--event', event], {
+        stdio: ['pipe', 'pipe', 'ignore'],
+      });
+    } catch {
+      settle(UNAVAILABLE);
+      return;
+    }
+    let body = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { body += chunk; });
+    child.once('error', () => settle(UNAVAILABLE));
+    child.once('close', () => settle(body.trim() || UNAVAILABLE));
+    child.stdin.on('error', () => {});
+    child.stdin.end('{}');
+  });
 }
 
 function responseData(response) { return response?.data ?? response; }
@@ -89,14 +105,20 @@ export function createOpenCodeAdapter({
   const hookGlobalRoot = hookRuns.resolveGlobalRoot || resolveGlobalRoot;
   return async ({ directory, client: invocationClient } = {}) => {
     const sdk = client || invocationClient;
+    // T4: the first transform fire is the session start (full block); every
+    // later fire is a per-turn refresh (federation only). The native hook
+    // renders the right shape for the event, so the adapter only tracks which
+    // boundary it is on.
+    let sessionStarted = false;
     return {
     'experimental.chat.messages.transform': async (_input, output) => {
       if (!output?.messages?.length) return;
       const firstUser = output.messages.find((message) => message.info?.role === 'user');
       if (!firstUser?.parts?.length) return;
-      if (firstUser.parts.some((part) => part.type === 'text' && part.text.includes(OWN_MARKER))) return;
-      const context = await getContext({ harness: 'opencode', workspace: directory || process.cwd(), integrationPath });
+      const event = sessionStarted ? 'UserPromptSubmit' : 'SessionStart';
+      const context = await getContext({ harness: 'opencode', workspace: directory || process.cwd(), integrationPath, event });
       if (!context) return;
+      sessionStarted = true;
       const reference = firstUser.parts[0];
       firstUser.parts.unshift({ ...reference, type: 'text', text: context });
     },

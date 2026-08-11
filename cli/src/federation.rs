@@ -51,7 +51,29 @@ fn service_context(root: &std::path::Path) -> Result<crate::service::ServiceCont
         global_root: root.to_path_buf(),
         instance_id,
         runtime_path,
+        systemd_user_dir: systemd_user_dir(),
     })
+}
+
+/// The systemd `--user` unit directory for this machine: `$XDG_CONFIG_HOME/
+/// systemd/user`, else `$HOME/.config/systemd/user`. `None` when neither
+/// variable is set — the Linux symlink step then no-ops.
+fn systemd_user_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|home| std::path::PathBuf::from(home).join(".config"))
+        })?;
+    Some(base.join("systemd").join("user"))
 }
 
 /// Resolve a workspace path to its physical-identity key, exactly as enrollment
@@ -376,6 +398,7 @@ fn service_lifecycle(root: &std::path::Path, action: ServiceAction) -> i32 {
         global_root: root.to_path_buf(),
         instance_id,
         runtime_path,
+        systemd_user_dir: systemd_user_dir(),
     };
     let runner = crate::service::RealRunner;
     let result = match action {
@@ -484,6 +507,7 @@ fn orchestrate_cli(
         global_root: root.to_path_buf(),
         instance_id: instance_id.clone(),
         runtime_path,
+        systemd_user_dir: systemd_user_dir(),
     };
     let runner = crate::service::RealRunner;
     let db_path = root.join("loam.sqlite3");

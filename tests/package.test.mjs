@@ -75,13 +75,10 @@ test('packed setup is offline, direct-native, and preserves the legacy entry', a
     const integration = await readFile(join(fixture.root, 'integration', 'loam.mjs'), 'utf8');
     assert.doesNotMatch(integration, /run --|command === ['"]run['"]/);
     assert.match(integration, /status/);
-    assert.match(integration, /hook/);
-
-    const context = await import(pathToFileURL(join(fixture.root, 'integration', 'context.mjs')).href);
-    assert.equal(
-      context.formatNativeRuntimeCommand(String.raw`C:\Users\Sam User\.agents\loam\bin\loam.exe`, 'win32'),
-      String.raw`& 'C:\Users\Sam User\.agents\loam\bin\loam.exe'`,
-    );
+    // The harness read path is the native runtime now; the packed integration
+    // must not ship a `hook` command or the retired context renderer.
+    assert.doesNotMatch(integration, /command === 'hook'/);
+    await assert.rejects(() => readFile(join(fixture.root, 'integration', 'context.mjs')));
 
     const legacy = await import(pathToFileURL(join(fixture.root, '.opencode', 'plugins', 'loam.js')).href);
     assert.equal(typeof legacy.LoamPlugin, 'function');
@@ -172,32 +169,10 @@ test('packed marketplaces expose loam:ingestor, the loam_ingestor profile, and s
     assert.match(codexAgent, /^description = "[^"\r\n]+"$/mu);
     assert.match(codexAgent, /^developer_instructions = """$/mu);
     assert.doesNotMatch(codexAgent, /^(?:model|model_reasoning_effort|sandbox_mode)\s*=/mu);
-    await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'session-start.mjs'), 'utf8'));
+    await assert.rejects(() => readFile(join(adapterRoot, 'hooks', 'session-start.mjs'), 'utf8'));
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'stop.mjs'), 'utf8'));
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'subagent-start.mjs'), 'utf8'));
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'subagent-stop.mjs'), 'utf8'));
-  } finally {
-    await rm(fixture.directory, { recursive: true, force: true });
-  }
-});
-
-test('the packed session-start adapter sources context through the federation-aware runtime hook', async () => {
-  const fixture = await packedRoot();
-  try {
-    const adapterRoot = join(fixture.root, 'plugins', 'loam-adapter');
-    // Main's session-start structure is intact: the marketplace adapter and its
-    // SessionStart hook file both ship.
-    const adapter = await readFile(join(adapterRoot, 'adapter.mjs'), 'utf8');
-    await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'session-start.mjs'), 'utf8'));
-    assert.match(adapter, /createMarketplaceAdapter/);
-    // ...and additively, the injected context is sourced from the native runtime
-    // `<runtime> hook <harness> --body`, so the baseline it carries now includes
-    // the sanitized federation section (federation experience present — layered
-    // on main's path, not the baseline-only Node shim). The runtime renders and
-    // sanitizes the federation data; the adapter only relays its output.
-    assert.match(adapter, /defaultRuntimePath/, 'adapter must resolve the staged runtime path');
-    assert.match(adapter, /runtime_path/, 'runtime path comes from install.json');
-    assert.match(adapter, /'hook'[\s\S]{0,120}--body/, 'context is sourced from `hook … --body`');
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
   }

@@ -267,27 +267,57 @@ pub enum Federation {
 /// Ask the connector for its snapshot. Any failure — absent endpoint, refused
 /// peer, timeout, malformed response, protocol mismatch — degrades rather than
 /// propagating, and no branch here starts the service.
-fn request_body(workspace: &str) -> String {
+fn request_body(workspace: &str, operation: Operation, session_id: Option<&str>) -> String {
+    let mut payload = Vec::new();
+    if let Some(session_id) = session_id {
+        payload.push(("session_id".into(), Value::String(session_id.to_owned())));
+    }
     Value::Object(vec![
         ("version".into(), Value::Number("1".into())),
         ("request_id".into(), Value::String("hook".into())),
         ("workspace".into(), Value::String(workspace.to_owned())),
         (
             "operation".into(),
-            Value::String(Operation::SnapshotGet.as_str().to_owned()),
+            Value::String(operation.as_str().to_owned()),
         ),
-        ("payload".into(), Value::Object(Vec::new())),
+        ("payload".into(), Value::Object(payload)),
     ])
     .to_json()
 }
 
-fn query_snapshot(paths: &HookPaths, workspace: &str, config: &HookConfig) -> Federation {
-    let request = request_body(workspace);
+/// Query the connector for the federation state at one boundary. On a per-turn
+/// boundary (`UserPromptSubmit`) the mailbox is drained first — items admitted
+/// since the last poll are consumed exactly once — and the full snapshot is the
+/// fallback when the session is not registered (e.g. after a connector restart,
+/// when mailboxes are empty by design). On session start the snapshot is the
+/// only read. Any failure — absent endpoint, refused peer, timeout, malformed
+/// response, protocol mismatch — degrades rather than propagating, and no branch
+/// here starts the service.
+fn query_federation(
+    paths: &HookPaths,
+    workspace: &str,
+    config: &HookConfig,
+    event: HookEvent,
+    session_id: Option<&str>,
+) -> Federation {
     let ipc_config = IpcConfig {
         read_deadline: config.timeout,
         lifecycle_deadline: config.timeout,
         ..IpcConfig::default()
     };
+    // Per-turn: drain the mailbox first. The connector refuses an unregistered
+    // session, which is the restart case — fall back to the snapshot.
+    if event == HookEvent::UserPromptSubmit {
+        if let Some(session_id) = session_id {
+            let poll = request_body(workspace, Operation::SessionPollInject, Some(session_id));
+            if let Ok(body) = call_connector(&paths.run_dir(), poll.as_bytes(), &ipc_config) {
+                if let Federation::Snapshot(_) = interpret_response(&body) {
+                    return interpret_response(&body);
+                }
+            }
+        }
+    }
+    let request = request_body(workspace, Operation::SnapshotGet, None);
     let body = match call_connector(&paths.run_dir(), request.as_bytes(), &ipc_config) {
         Ok(body) => body,
         Err(IpcError::UnauthorizedPeer) => return Federation::Degraded("connector_unauthorized"),
@@ -924,20 +954,40 @@ fn number(state: &Value, key: &str) -> i64 {
 // Composition
 // ---------------------------------------------------------------------------
 
-/// Build the complete context body for one hook invocation: the full baseline
-/// first, then the federation section. The baseline is unconditional — it is
-/// what the retired Node integration produced, and losing it because a broker
-/// connector is down would be a strictly worse session than before federation
-/// existed.
+/// Build the complete context body for one hook invocation. On session start
+/// the full baseline is composed (skills, runtime command, workspace state,
+/// federation). On a per-turn boundary (`UserPromptSubmit`) only the federation
+/// section is re-injected — the baseline is already in the session, and
+/// re-sending the whole block on every turn would burn context for no new
+/// information. The baseline is unconditional on session start — it is what the
+/// retired Node integration produced, and losing it because a broker connector
+/// is down would be a strictly worse session than before federation existed.
 pub fn compose_body(
     paths: &HookPaths,
     config: &HookConfig,
     frame: &Value,
+    event: HookEvent,
     federation_override: Option<Federation>,
 ) -> String {
     let workspace = workspace_from_frame(frame, &paths.cwd);
-    let federation = federation_override
-        .unwrap_or_else(|| resolve_federation(paths, config, workspace.as_path()));
+    let session_id = frame.get("session_id").and_then(Value::as_str).or_else(|| {
+        frame
+            .get("session")
+            .and_then(|s| s.get("id"))
+            .and_then(Value::as_str)
+    });
+    let federation = federation_override.unwrap_or_else(|| {
+        resolve_federation(paths, config, workspace.as_path(), event, session_id)
+    });
+
+    if event == HookEvent::UserPromptSubmit {
+        // Per-turn refresh: federation only, wrapped in the same framing so the
+        // harness treats it as the same kind of context it already has.
+        return format!(
+            "<LOAM_IMPORTANT>\n\n{}\n\n</LOAM_IMPORTANT>",
+            federation_section(&federation, config, &paths.allowlist())
+        );
+    }
 
     let version = plugin_version(&paths.global_root);
     let heading = if version.is_empty() {
@@ -966,10 +1016,16 @@ pub fn compose_body(
     format!("<LOAM_IMPORTANT>\n\n{content}\n\n</LOAM_IMPORTANT>")
 }
 
-/// Canonicalize, prove enrollment locally, then read the snapshot. Resolving
-/// enrollment here means an unenrolled or non-Git workspace never opens the
-/// endpoint at all — the cheapest possible "no federation" answer.
-fn resolve_federation(paths: &HookPaths, config: &HookConfig, workspace: &Path) -> Federation {
+/// Canonicalize, prove enrollment locally, then read the federation state.
+/// Resolving enrollment here means an unenrolled or non-Git workspace never
+/// opens the endpoint at all — the cheapest possible "no federation" answer.
+fn resolve_federation(
+    paths: &HookPaths,
+    config: &HookConfig,
+    workspace: &Path,
+    event: HookEvent,
+    session_id: Option<&str>,
+) -> Federation {
     let Ok(physical) = crate::enrollment::PhysicalWorkspace::resolve(workspace) else {
         return Federation::Unenrolled;
     };
@@ -982,7 +1038,7 @@ fn resolve_federation(paths: &HookPaths, config: &HookConfig, workspace: &Path) 
     if !enrolled {
         return Federation::Unenrolled;
     }
-    query_snapshot(paths, &physical.display_path, config)
+    query_federation(paths, &physical.display_path, config, event, session_id)
 }
 
 /// `loam hook <harness>` — read stdin, write the harness-native envelope on
@@ -1045,7 +1101,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         Err(error) => return refuse(harness, event, error.code(), body_only),
     };
 
-    let body = compose_body(&paths, &config, &frame, None);
+    let body = compose_body(&paths, &config, &frame, event, None);
     if body_only {
         println!("{body}");
     } else {
@@ -1116,11 +1172,11 @@ mod tests {
             );
         }
         // An ALLOWLIST, not a denylist: enumerate every `Operation::` the read
-        // path names and require each one to be the read. A frozen list of
+        // path names and require each one to be a read. A frozen list of
         // forbidden variant names goes green the moment a new write operation is
         // added to the enum — `Operation::FederationEmit` is exactly that
-        // case — so the invariant is stated as "SnapshotGet is the only
-        // reachable operation" and costs nothing to maintain.
+        // case — so the invariant is stated as "only the two read operations
+        // are reachable" and costs nothing to maintain.
         let named: Vec<&str> = production
             .match_indices("Operation::")
             .map(|(index, _)| {
@@ -1136,13 +1192,14 @@ mod tests {
             "the read path must name the read operation explicitly"
         );
         for variant in &named {
-            assert_eq!(
-                *variant, "SnapshotGet",
+            assert!(
+                matches!(*variant, "SnapshotGet" | "SessionPollInject"),
                 "the read path named a non-read IPC operation: Operation::{variant}"
             );
         }
         // The import must not pull the enum in under another name either.
         assert!(production.contains("Operation::SnapshotGet"));
+        assert!(production.contains("Operation::SessionPollInject"));
         for reachable in ["crate::connector", "crate::service", "run_service"] {
             assert!(
                 !production.contains(reachable),
@@ -1326,6 +1383,7 @@ mod tests {
             &paths,
             &HookConfig::default(),
             &frame,
+            HookEvent::SessionStart,
             Some(Federation::Degraded("connector_unreachable")),
         );
         assert!(body.starts_with("<LOAM_IMPORTANT>"));
@@ -1352,6 +1410,42 @@ mod tests {
             body.find("## Workspace state") < body.find("## Federation"),
             "{body}"
         );
+    }
+
+    #[test]
+    fn the_per_turn_boundary_renders_federation_only_and_session_start_renders_the_full_block() {
+        // T3: `UserPromptSubmit` re-injects only the federation section — the
+        // baseline is already in the session, and re-sending the whole block
+        // every turn would burn context for no new information. Session start
+        // keeps the full block.
+        let paths = paths();
+        let frame = Value::Object(Vec::new());
+        let config = HookConfig::default();
+        let federation = Some(Federation::Degraded("connector_unreachable"));
+
+        let refresh = compose_body(
+            &paths,
+            &config,
+            &frame,
+            HookEvent::UserPromptSubmit,
+            federation.clone(),
+        );
+        assert!(refresh.starts_with("<LOAM_IMPORTANT>"));
+        assert!(refresh.ends_with("</LOAM_IMPORTANT>"));
+        assert!(refresh.contains("## Federation"), "{refresh}");
+        assert!(
+            refresh.contains("federation: degraded (connector_unreachable)"),
+            "{refresh}"
+        );
+        // The baseline is not re-sent on a per-turn refresh.
+        assert!(!refresh.contains("You have loam"), "{refresh}");
+        assert!(!refresh.contains("## Workspace state"), "{refresh}");
+        assert!(!refresh.contains("Native runtime command"), "{refresh}");
+
+        let start = compose_body(&paths, &config, &frame, HookEvent::SessionStart, federation);
+        assert!(start.contains("You have loam"), "{start}");
+        assert!(start.contains("## Workspace state"), "{start}");
+        assert!(start.contains("## Federation"), "{start}");
     }
 
     #[test]
@@ -1437,8 +1531,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         });
 
-        let body = call_connector(&run_dir, request_body("/w").as_bytes(), &config)
-            .expect("the client reaches a real endpoint");
+        let body = call_connector(
+            &run_dir,
+            request_body("/w", Operation::SnapshotGet, None).as_bytes(),
+            &config,
+        )
+        .expect("the client reaches a real endpoint");
         assert!(matches!(interpret_response(&body), Federation::Snapshot(_)));
         server.join().expect("server thread");
 
@@ -1450,7 +1548,13 @@ mod tests {
             ..paths()
         };
         assert_eq!(
-            query_snapshot(&paths, "/w", &HookConfig::default()),
+            query_federation(
+                &paths,
+                "/w",
+                &HookConfig::default(),
+                HookEvent::SessionStart,
+                None,
+            ),
             Federation::Degraded("connector_unreachable")
         );
     }

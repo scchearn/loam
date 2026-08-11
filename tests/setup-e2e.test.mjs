@@ -227,14 +227,14 @@ test('marketplace-owned Claude and Codex satisfy readiness with the Codex agent 
   await writeFile(join(fixture.home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
   const claudeCache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
   await mkdir(join(claudeCache, 'hooks'), { recursive: true });
-  await writeFile(join(claudeCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  await writeFile(join(claudeCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
   await writeFile(join(fixture.home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
     version: 2,
     plugins: { 'loam@loam': [{ scope: 'user', installPath: claudeCache, version: PACKAGE_VERSION }] },
   }));
   const codexCache = join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
   await mkdir(join(codexCache, 'hooks'), { recursive: true });
-  await writeFile(join(codexCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  await writeFile(join(codexCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
   const capture = outputCapture();
 
   const code = await runSetup(parseArgs(['setup', '--yes']), {
@@ -307,7 +307,7 @@ test('setup verifies an updated marketplace plugin from disk instead of trusting
   const fixture = await baseFixture();
   const cache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
   await mkdir(join(cache, 'hooks'), { recursive: true });
-  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
   await writeFile(join(fixture.home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
   await writeFile(join(fixture.home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
     version: 2,
@@ -337,7 +337,7 @@ test('setup --yes installs a missing Codex plugin in one pass', async () => {
       await writeFile(join(fixture.home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
       const cache = join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
       await mkdir(join(cache, 'hooks'), { recursive: true });
-      await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+      await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
     }
     return { code: 0, stdout: '', stderr: '' };
   };
@@ -380,7 +380,7 @@ test('partial marketplace failure keeps successful installs and removes legacy h
         await writeFile(join(fixture.home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
         const cache = join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
         await mkdir(join(cache, 'hooks'), { recursive: true });
-        await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+        await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
       }
       return { code: 0, stdout: '', stderr: '' };
     }
@@ -616,7 +616,7 @@ async function readyHarnessFixture() {
     if (request.args.includes('install')) {
       const cache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
       await mkdir(join(cache, 'hooks'), { recursive: true });
-      await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+      await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
       await writeFile(join(fixture.home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
       await writeFile(join(fixture.home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
         version: 2,
@@ -656,11 +656,10 @@ test('harness readiness ignores hook paths outside the setup-owned root', async 
 test('harness readiness rejects duplicate setup-owned registrations', async () => {
   const { fixture, discovery } = await readyHarnessFixture();
   const metadata = JSON.parse(await readFile(join(fixture.home, '.agents', 'loam', 'install.json'), 'utf8'));
-  const assetPath = join(metadata.adapter_root, 'claude-session-start.mjs');
   const settingsPath = join(fixture.home, '.claude', 'settings.json');
   const settings = JSON.parse(await readFile(settingsPath, 'utf8'));
-  const command = `node ${JSON.stringify(assetPath)}`;
-  settings.hooks.SessionStart = [{ hooks: [{ type: 'command', command }, { type: 'command', command }] }];
+  const command = `node ${JSON.stringify(join(metadata.adapter_root, 'claude-stop.mjs'))}`;
+  settings.hooks.Stop = [{ hooks: [{ type: 'command', command }, { type: 'command', command }] }];
   await writeFile(settingsPath, JSON.stringify(settings));
 
   let result = await verifyInstallation({ discovery, packageRoot, runtimeRunner: fixture.smokeRunner });
@@ -680,17 +679,15 @@ test('failed post-harness setup restores every active harness mutation', async (
     metadata.integration_path,
     join(fixture.home, '.config', 'opencode', 'plugins', 'loam.js'),
     join(adapterRoot, 'opencode.mjs'),
-    join(adapterRoot, 'claude-session-start.mjs'),
-    join(adapterRoot, 'cursor-session-start.mjs'),
+    join(adapterRoot, 'claude-stop.mjs'),
     join(fixture.home, '.claude', 'settings.json'),
     join(fixture.home, '.cursor', 'hooks.json'),
   ];
   await writeFile(files[2], 'previous OpenCode adapter');
   await writeFile(files[3], 'previous OpenCode asset');
   await writeFile(files[4], 'previous Claude asset');
-  await writeFile(files[5], 'previous Cursor asset');
+  await writeFile(files[5], '{"unrelated":true}');
   await writeFile(files[6], '{"unrelated":true}');
-  await writeFile(files[7], '{"unrelated":true}');
   const before = new Map(await Promise.all(files.map(async (file) => [file, await readFile(file, 'utf8')])));
   const beforePluginEntries = await readdir(join(globalRoot, 'plugins'));
   const beforeClaudeEntries = await readdir(join(fixture.home, '.claude'));

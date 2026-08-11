@@ -7,7 +7,7 @@ import { readInstallMetadata, readRequiredVersion, readSkillContent } from '../i
 import { resolveExclusions } from '../integration/ingest.mjs';
 import { checkReadiness, probeState } from '../integration/runtime.mjs';
 import { verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
-import { isOwnedCommand } from './harnesses.mjs';
+import { isOwnedCommand, renderOpenCodePlugin } from './harnesses.mjs';
 import { verifyFederationService } from './federation.mjs';
 
 async function fileExists(path) {
@@ -26,19 +26,6 @@ async function localSkills(skillsRoot) {
   } catch (error) {
     return { ready: false, category: 'skills_missing', detail: error instanceof Error ? error.message : String(error) };
   }
-}
-
-function ownsCommand(entry, path) {
-  if (Array.isArray(entry?.hooks)) return entry.hooks.some((hook) => ownsCommand(hook, path));
-  if (entry?.type !== 'command') return false;
-  const candidates = [];
-  if (entry.command === 'node' && Array.isArray(entry.args) && entry.args.length === 1) candidates.push(entry.args[0]);
-  for (const value of [entry.command, entry.commandWindows]) {
-    if (typeof value !== 'string' || !value.startsWith('node ')) continue;
-    const raw = value.slice(5).trim();
-    try { candidates.push(JSON.parse(raw)); } catch { candidates.push(raw); }
-  }
-  return candidates.some((candidate) => candidate === path || candidate === path.replaceAll('/', '\\'));
 }
 
 async function verifyIngestExclusions(skillsRoot) {
@@ -84,6 +71,19 @@ async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, 
   return result?.additional_context === context;
 }
 
+// One registration is correct only when it runs the staged private runtime as a
+// `hook <id>` read. Anything else — a Node shim, a stale asset path, a runtime
+// from a previous install — is a mismatch, not a variant.
+function nativeHookCommands(entries, runtimePath, harnessId) {
+  return entries
+    .flatMap((entry) => (Array.isArray(entry?.hooks) ? entry.hooks : [entry]))
+    .filter((entry) => entry?.type === 'command'
+      && entry.command === runtimePath
+      && Array.isArray(entry.args)
+      && entry.args[0] === 'hook'
+      && entry.args[1] === harnessId);
+}
+
 async function verifyHarness(id, harness, { packageRoot, globalRoot, install, workspace }) {
   if (harness.state === 'absent') return { ...harness, ready: true };
   if (id === 'codex') {
@@ -105,13 +105,10 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
     if (harness.state === 'skipped') return { ...harness, ready: true, owner: 'setup' };
   } else if (harness.state === 'skipped') return { ...harness, ready: true };
   if (!install) return { ...harness, ready: false, category: 'install_metadata_missing' };
-  const assetRoot = install.adapter_root;
-  const assetName = id === 'opencode' ? 'opencode.mjs' : `${id}-session-start.mjs`;
-  const assetPath = join(assetRoot, id === 'codex' ? 'codex-stop.mjs' : assetName);
-  const sessionAssetPath = join(assetRoot, assetName);
+  const runtimePath = install.runtime_path;
   try {
     if (id === 'claude' || id === 'codex') {
-      if (!harness.marketplaceReady) return { ...harness, ready: false, category: 'plugin_incomplete' };
+      if (!harness.marketplaceReady || !harness.marketplaceRoot) return { ...harness, ready: false, category: 'plugin_incomplete' };
       const configPath = id === 'claude' ? join(harness.root, 'settings.json') : join(harness.root, 'hooks.json');
       let config = {};
       try { config = JSON.parse(await readFile(configPath, 'utf8')); }
@@ -122,34 +119,37 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
         || stop.some((entry) => isOwnedCommand(entry, globalRoot, `${id}-stop.mjs`))) {
         return { ...harness, ready: false, category: 'registration_duplicate' };
       }
+      const plugin = JSON.parse(await readFile(join(harness.marketplaceRoot, 'hooks', 'hooks.json'), 'utf8'));
+      const start = nativeHookCommands(Array.isArray(plugin.hooks?.SessionStart) ? plugin.hooks.SessionStart : [], runtimePath, id);
+      const refresh = nativeHookCommands(Array.isArray(plugin.hooks?.UserPromptSubmit) ? plugin.hooks.UserPromptSubmit : [], runtimePath, id);
+      if (start.length !== 1 || refresh.length !== 1) {
+        return { ...harness, ready: false, category: start.length || refresh.length ? 'registration_duplicate' : 'registration_missing' };
+      }
       return { ...harness, ready: true, owner: 'marketplace' };
     }
     if (id === 'opencode') {
       const stablePath = join(harness.root, 'plugins', 'loam.js');
-      const [actual, expected] = await Promise.all([
+      const [actual, source] = await Promise.all([
         readFile(stablePath, 'utf8'),
         readFile(join(packageRoot, 'adapters', 'opencode.mjs'), 'utf8'),
       ]);
-      if (actual !== expected) return { ...harness, ready: false, category: 'registration_mismatch' };
-    } else {
-      const configPath = id === 'claude' ? join(harness.root, 'settings.json') : join(harness.root, 'hooks.json');
-      const config = JSON.parse(await readFile(configPath, 'utf8'));
-      const commands = id === 'claude'
-        ? (Array.isArray(config.hooks?.SessionStart) ? config.hooks.SessionStart : []).flatMap((entry) => Array.isArray(entry?.hooks) ? entry.hooks : [])
-        : (Array.isArray(config.hooks?.sessionStart) ? config.hooks.sessionStart : []);
-      const owned = commands.filter((entry) => ownsCommand(entry, assetPath));
-      const expectedSessionCount = 1;
-      if (owned.length !== expectedSessionCount) {
-        return {
-          ...harness,
-          ready: false,
-          category: owned.length ? 'registration_duplicate' : 'registration_missing',
-        };
+      if (actual !== renderOpenCodePlugin(source, runtimePath)) {
+        return { ...harness, ready: false, category: 'registration_mismatch' };
       }
+      const assetPath = join(install.adapter_root, 'opencode.mjs');
+      if (!(await fileExists(assetPath)) || !(await verifyAdapterEnvelope(id, assetPath, workspace, install.integration_path, globalRoot))) {
+        return { ...harness, ready: false, category: 'adapter_envelope_invalid' };
+      }
+      return { ...harness, ready: true, owner: 'setup' };
     }
-
-    if (!(await fileExists(assetPath)) || !(await verifyAdapterEnvelope(id, assetPath, workspace, install.integration_path, globalRoot))) {
-      return { ...harness, ready: false, category: 'adapter_envelope_invalid' };
+    const config = JSON.parse(await readFile(join(harness.root, 'hooks.json'), 'utf8'));
+    const owned = nativeHookCommands(
+      Array.isArray(config.hooks?.sessionStart) ? config.hooks.sessionStart : [],
+      runtimePath,
+      id,
+    );
+    if (owned.length !== 1) {
+      return { ...harness, ready: false, category: owned.length ? 'registration_duplicate' : 'registration_missing' };
     }
     return { ...harness, ready: true, owner: 'setup' };
   } catch (error) {

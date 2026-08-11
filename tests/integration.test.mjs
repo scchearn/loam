@@ -6,7 +6,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { formatContext, formatNativeRuntimeCommand } from '../integration/context.mjs';
 import {
   beginHookRun, finishHookRun, finishHookWorker, startHookWorker,
 } from '../integration/hooks.mjs';
@@ -89,19 +88,7 @@ test('ready state invokes native state once and formats one common context', asy
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].args, ['state', '--fast', fixtureData.home]);
 
-  const context = formatContext({
-    skillContent: '---\nname: loam::using\n---\n\n# Using loam\n',
-    state: result.state,
-    pluginVersion: '0.8.3',
-    runtimePath: fixtureData.runtimePath,
-    platform: 'linux',
-  });
-  assert.match(context, /^<LOAM_IMPORTANT>/);
-  assert.match(context, /You have loam \(v0\.8\.3\)/);
-  assert.match(context, /Native runtime command: '/);
-  assert.match(context, new RegExp(fixtureData.runtimePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(context, /project-wiki/);
-  assert.doesNotMatch(context, /^name: loam::using$/m);
+  assert.equal(result.state.collection, 'project-wiki');
 });
 
 test('metadata validation accepts prerelease versions and rejects build metadata', async () => {
@@ -183,14 +170,6 @@ test('legacy integration path still resolves the global Loam root', () => {
   assert.equal(resolveGlobalRoot({ env: {}, integrationPath }), globalRoot);
 });
 
-test('quotes native runtime paths for POSIX and PowerShell commands', () => {
-  const posixPath = '/home/Sam User/.agents/loam/bin/0.9.1/loam';
-  const windowsPath = String.raw`C:\Users\Sam User\.agents\loam\bin\0.9.1\loam.exe`;
-
-  assert.equal(formatNativeRuntimeCommand(posixPath, 'linux'), `'${posixPath}'`);
-  assert.equal(formatNativeRuntimeCommand(windowsPath, 'win32'), `& '${windowsPath}'`);
-});
-
 test('target detection accepts the five release targets and rejects unsupported hosts', () => {
   assert.equal(detectTarget({ platform: 'linux', arch: 'x64' }), 'x86_64-unknown-linux-musl');
   assert.equal(detectTarget({ platform: 'linux', arch: 'arm64' }), 'aarch64-unknown-linux-musl');
@@ -217,14 +196,6 @@ test('missing runtime reports unavailable without invoking state or fabricating 
   assert.equal(result.category, 'runtime_missing');
   assert.equal(result.state, undefined);
   assert.equal(calls, 0);
-  const context = formatContext({
-    skillContent: '# Using loam\n',
-    unavailable: result,
-    pluginVersion: '0.8.3',
-  });
-  assert.match(context, /npx @scchearn\/loam setup/);
-  assert.match(context, /No workspace state was generated/);
-  assert.doesNotMatch(context, /## Workspace state/);
 });
 
 test('runtime version mismatch fails readiness before execution', async () => {
@@ -700,9 +671,8 @@ test('legacy shadow detection handles a workspace with no shadow directories', a
   assert.deepEqual(report, { shadows: [], unsafe: [] });
 });
 
-test('status and hook commands share one read-only integration boundary', async () => {
+test('the integration boundary is status-only and refuses the retired hook command', async () => {
   const fixtureData = await fixture();
-  const workspace = fixtureData.home;
   const before = await readFile(join(fixtureData.skillsRoot, 'loam-using', 'SKILL.md'), 'utf8');
   const statusChunks = [];
   const statusCode = await runIntegration(['status'], {
@@ -716,33 +686,18 @@ test('status and hook commands share one read-only integration boundary', async 
   assert.equal(statusCode, 0);
   assert.equal(JSON.parse(statusChunks.join('')).ready, true);
 
-  await assert.rejects(
-    () => runIntegration(['run', '--', 'check', 'versions', fixtureData.home], { globalRoot: fixtureData.globalRoot }),
-    /usage: loam\.mjs status \| hook/,
-  );
-
-  const contexts = [];
-  for (const harness of ['opencode', 'claude', 'cursor']) {
-    const chunks = [];
-    const code = await runIntegration(
-      ['hook', '--harness', harness, '--workspace', workspace],
-      {
-        globalRoot: fixtureData.globalRoot,
-        skillsRoot: fixtureData.skillsRoot,
-        integrationPath: fixtureData.integrationPath,
-        target,
-        runner: async () => ({ code: 0, signal: null, stdout: JSON.stringify(state), stderr: '' }),
-        output: { write: (chunk) => chunks.push(String(chunk)) },
-      },
+  // The harness read path is the native `loam hook <harness>` command now;
+  // the shared Node integration no longer serves one at any spelling.
+  for (const argv of [
+    ['run', '--', 'check', 'versions', fixtureData.home],
+    ['hook', '--harness', 'claude', '--workspace', fixtureData.home],
+    ['hook', '--harness', 'opencode', '--workspace', fixtureData.home],
+  ]) {
+    await assert.rejects(
+      () => runIntegration(argv, { globalRoot: fixtureData.globalRoot }),
+      /usage: loam\.mjs status \| ingest-status/,
     );
-    assert.equal(code, 0);
-    contexts.push(chunks.join(''));
   }
-
-  assert.ok(contexts.every((context) => context.includes('<LOAM_IMPORTANT>')));
-  const runtimeCommand = formatNativeRuntimeCommand(fixtureData.runtimePath);
-  assert.ok(contexts.every((context) => context.includes(`Native runtime command: ${runtimeCommand}`)));
-  assert.deepEqual(new Set(contexts).size, 1);
   assert.equal(await readFile(join(fixtureData.skillsRoot, 'loam-using', 'SKILL.md'), 'utf8'), before);
 });
 

@@ -134,7 +134,47 @@ pub fn lookup(backend: &Backend, reference: &str) -> Option<Vec<u8>> {
     if !output.status.success() || output.stdout.is_empty() {
         return None;
     }
-    Some(output.stdout)
+    Some(decode_backend_output(backend, &output.stdout))
+}
+
+/// macOS `security find-generic-password -w` hex-encodes any value containing
+/// newlines — which every PEM blob does — so the raw stdout is hex, not PEM.
+/// The decode is conservative: only the `Security` backend is touched, and only
+/// when the output does not already look like PEM and is valid hex. A PEM blob
+/// that happens to be all-hex on one line is pathological and is never decoded.
+fn decode_backend_output(backend: &Backend, stdout: &[u8]) -> Vec<u8> {
+    if !matches!(backend, Backend::Security(_)) {
+        return stdout.to_vec();
+    }
+    let Ok(text) = std::str::from_utf8(stdout) else {
+        return stdout.to_vec();
+    };
+    if text.contains("-----BEGIN") {
+        return stdout.to_vec();
+    }
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() || !compact.len().is_multiple_of(2) {
+        return stdout.to_vec();
+    }
+    if !compact.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return stdout.to_vec();
+    }
+    let mut decoded = Vec::with_capacity(compact.len() / 2);
+    for pair in compact.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0]);
+        let low = hex_nibble(pair[1]);
+        decoded.push((high << 4) | low);
+    }
+    decoded
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => 0,
+    }
 }
 
 /// Split the stored `mqtts://host:port` into the host and port the transport
@@ -1958,5 +1998,72 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(directory);
         let _ = std::fs::remove_dir_all(failing_dir);
+    }
+
+    // --- T7: macOS Keychain hex-encoding -----------------------------------
+    //
+    // `security find-generic-password -w` hex-encodes any value containing
+    // newlines — which every PEM blob does — so the raw stdout is hex, not PEM.
+    // The decode is conservative: only the `Security` backend is touched, and
+    // only when the output does not already look like PEM and is valid hex.
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn a_hex_encoded_pem_blob_from_the_security_backend_is_decoded() {
+        let pem = b"-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n";
+        let hex = hex_of(pem);
+        let backend = Backend::Security("security".into());
+        assert_eq!(
+            decode_backend_output(&backend, hex.as_bytes()),
+            pem,
+            "the Security backend's hex-encoded stdout must be hex-decoded"
+        );
+    }
+
+    #[test]
+    fn raw_pem_passes_through_unchanged() {
+        let pem = b"-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n";
+        let backend = Backend::Security("security".into());
+        assert_eq!(
+            decode_backend_output(&backend, pem),
+            pem,
+            "a PEM-looking answer is never hex-decoded"
+        );
+    }
+
+    #[test]
+    fn a_hex_looking_value_that_is_not_pem_is_decoded_only_for_security() {
+        // "deadbeef" is valid hex but not PEM: the Security backend decodes it,
+        // the SecretTool backend passes it through raw (Linux returns raw PEM).
+        let backend = Backend::Security("security".into());
+        assert_eq!(
+            decode_backend_output(&backend, b"deadbeef"),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        let linux = Backend::SecretTool("secret-tool".into());
+        assert_eq!(
+            decode_backend_output(&linux, b"deadbeef"),
+            b"deadbeef",
+            "the Linux backend is never hex-decoded"
+        );
+    }
+
+    #[test]
+    fn odd_length_or_non_hex_output_is_left_alone() {
+        let backend = Backend::Security("security".into());
+        // Odd length cannot be hex pairs.
+        assert_eq!(decode_backend_output(&backend, b"abc"), b"abc");
+        // Not hex at all.
+        assert_eq!(decode_backend_output(&backend, b"zzzz"), b"zzzz");
+        // Whitespace is tolerated between pairs (security may wrap lines).
+        assert_eq!(
+            decode_backend_output(&backend, b"de ad\nbe ef"),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        // Empty output is not decoded (the caller already refused empty stdout).
+        assert_eq!(decode_backend_output(&backend, b""), b"");
     }
 }

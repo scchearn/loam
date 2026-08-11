@@ -830,8 +830,9 @@ use std::path::Path;
 use crate::ipc::{self, IpcConfig, Operation, Request};
 
 /// The connector's volatile in-process state: the inject-channel
-/// registry and the live project sessions with their snapshot store. All
-/// of it dies with the process and none of it is ever written to SQLite.
+/// registry, the per-session mailbox queues, and the live project sessions with
+/// their snapshot store. All of it dies with the process and none of it is ever
+/// written to SQLite.
 pub struct ConnectorState {
     pub channels: ChannelRegistry,
     pub sessions: ProjectSessions,
@@ -868,13 +869,25 @@ pub enum ServiceError {
 }
 
 /// A volatile, in-memory per-session inject-channel registry (2026-08-08
-/// amendment, T18). Held only for the life of one connector process: a restart
-/// drops every channel, and nothing here is ever written to the SQLite registry.
-/// Injection over a channel is live injection; the connector only admits, holds, hands back,
+/// amendment, T18) and per-session mailbox queue (T2). Held only for the life
+/// of one connector process: a restart drops every channel and every mailbox,
+/// and nothing here is ever written to the SQLite registry. Injection over a
+/// channel is live injection; the connector only admits, holds, hands back,
 /// and drops it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ChannelRegistry {
+    inner: std::sync::Arc<std::sync::Mutex<MailboxInner>>,
+}
+
+/// The shared mailbox state: the channel registry and the per-session bounded
+/// queues. One mutex guards both so the receive path can atomically see which
+/// sessions belong to a project and enqueue for exactly those — a session that
+/// registers between the lookup and the push is not missed, and one that drops
+/// between them is not written to.
+#[derive(Debug, Default)]
+struct MailboxInner {
     sessions: std::collections::HashMap<String, InjectChannel>,
+    mailboxes: std::collections::HashMap<String, std::collections::VecDeque<SnapshotItem>>,
 }
 
 /// One registered inject channel. `channel_ref` is opaque: the plugin hands it
@@ -892,23 +905,80 @@ impl ChannelRegistry {
     }
 
     pub fn register(&mut self, channel: InjectChannel) {
-        self.sessions.insert(channel.session_id.clone(), channel);
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.sessions.insert(channel.session_id.clone(), channel);
+        }
     }
 
     pub fn drop_session(&mut self, session_id: &str) -> bool {
-        self.sessions.remove(session_id).is_some()
+        if let Ok(mut inner) = self.inner.lock() {
+            let removed = inner.sessions.remove(session_id).is_some();
+            inner.mailboxes.remove(session_id);
+            return removed;
+        }
+        false
     }
 
     pub fn contains(&self, session_id: &str) -> bool {
-        self.sessions.contains_key(session_id)
+        self.inner
+            .lock()
+            .map(|inner| inner.sessions.contains_key(session_id))
+            .unwrap_or(false)
     }
 
     pub fn len(&self) -> usize {
-        self.sessions.len()
+        self.inner
+            .lock()
+            .map(|inner| inner.sessions.len())
+            .unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
+        self.inner
+            .lock()
+            .map(|inner| inner.sessions.is_empty())
+            .unwrap_or(true)
+    }
+
+    /// Enqueue one admitted item into every registered session's mailbox for
+    /// the given project. Non-blocking: a full queue drops the oldest item
+    /// (same eviction as the snapshot store). Never blocks the receive loop.
+    pub fn push(&self, project_id: &str, item: &SnapshotItem, capacity: usize) {
+        if let Ok(mut inner) = self.inner.lock() {
+            // Collect the matching session ids first: the mailboxes map is
+            // borrowed mutably per entry, so the sessions map cannot stay
+            // borrowed across it.
+            let session_ids: Vec<String> = inner
+                .sessions
+                .values()
+                .filter(|channel| channel.project_id == project_id)
+                .map(|channel| channel.session_id.clone())
+                .collect();
+            for session_id in session_ids {
+                let queue = inner.mailboxes.entry(session_id).or_default();
+                if queue.len() == capacity {
+                    queue.pop_front();
+                }
+                queue.push_back(item.clone());
+            }
+        }
+    }
+
+    /// Drain one session's mailbox, oldest first, consuming every item that
+    /// arrived since the last poll. `None` when the session is not registered.
+    pub fn poll(&self, session_id: &str) -> Option<Vec<SnapshotItem>> {
+        let mut inner = self.inner.lock().ok()?;
+        if !inner.sessions.contains_key(session_id) {
+            return None;
+        }
+        Some(
+            inner
+                .mailboxes
+                .remove(session_id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        )
     }
 }
 
@@ -1259,6 +1329,9 @@ const SNAPSHOT_CAPACITY: usize = 64;
 pub struct ProjectSessions {
     snapshots: std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
     live: std::collections::HashMap<String, LiveSession>,
+    /// The shared channel registry + mailbox state, handed to each pump so the
+    /// receive path can push admitted items into registered sessions' mailboxes.
+    channels: ChannelRegistry,
 }
 
 struct LiveSession {
@@ -1289,6 +1362,7 @@ impl ProjectSessions {
                 SnapshotStore::new(capacity).expect("snapshot capacity is a non-zero constant"),
             )),
             live: std::collections::HashMap::new(),
+            channels: ChannelRegistry::new(),
         }
     }
 
@@ -1298,6 +1372,11 @@ impl ProjectSessions {
         std::sync::Arc::clone(&self.snapshots)
     }
 
+    /// The shared channel registry + mailbox state, so a test can register a
+    /// session and drive the push/poll path without a broker.
+    pub fn channels(&self) -> &ChannelRegistry {
+        &self.channels
+    }
     pub fn snapshot(&self, project_id: &str, now: DateTime<Utc>) -> Vec<SnapshotItem> {
         match self.snapshots.lock() {
             Ok(mut store) => store.snapshot(project_id, now),
@@ -1354,7 +1433,12 @@ impl ProjectSessions {
         let thread = std::thread::spawn({
             let stop = std::sync::Arc::clone(&stop);
             let snapshots = std::sync::Arc::clone(&self.snapshots);
-            move || pump(transport, roster, oracle, snapshots, stop, inbound)
+            let channels = self.channels.clone();
+            move || {
+                pump(
+                    transport, roster, oracle, snapshots, channels, stop, inbound,
+                )
+            }
         });
         self.live.insert(
             row.project_id.clone(),
@@ -1479,6 +1563,7 @@ fn pump(
     roster: PeerRoster,
     mut oracle: Option<crate::transport::GitOracle>,
     snapshots: std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
+    channels: ChannelRegistry,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     outbound: std::sync::mpsc::Receiver<ValidatedEnvelope>,
 ) {
@@ -1496,7 +1581,20 @@ fn pump(
                 // can never display a provisional claim as current.
                 let publication = stamp_publication(oracle.as_mut(), &outcome);
                 if let Ok(mut store) = snapshots.lock() {
-                    store.admit(&topic, &outcome, publication);
+                    let changed = store.admit(&topic, &outcome, publication);
+                    // Push delivery (T2): every registered session for this
+                    // project gets the new item in its mailbox, so the next
+                    // turn boundary can drain it without re-reading the whole
+                    // snapshot. The push is non-blocking and never fails the
+                    // receive loop.
+                    if changed {
+                        if let Ok(parsed) = crate::envelope::parse_topic(&topic) {
+                            let items = store.snapshot(parsed.project, Utc::now());
+                            for item in items {
+                                channels.push(parsed.project, &item, SNAPSHOT_CAPACITY);
+                            }
+                        }
+                    }
                 }
             }
             Ok(None) => {}
@@ -1585,7 +1683,12 @@ pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
     if !registry_has_enrollments(&db_path)? {
         return Ok(ServiceOutcome::Inert);
     }
-    let endpoint = ipc::windows::bind(global_root).map_err(ServiceError::Ipc)?;
+    // The pipe name is a digest of the run dir, and every client (the harness
+    // hook, `federation emit`) derives it from `global_root/run` — so the
+    // endpoint must bind the same directory the clients digest, or the two
+    // sides can never agree on a name.
+    let run_dir = global_root.join("run");
+    let endpoint = ipc::windows::bind(&run_dir).map_err(ServiceError::Ipc)?;
     let mut state = ConnectorState::new();
     attach_enrolled(&db_path, &mut state);
     let config = IpcConfig::default();
@@ -1746,6 +1849,25 @@ fn dispatch_for_key(
             // snapshot is served from memory: nothing is opened for writing,
             // nothing is persisted, and no envelope bytes leave the connector.
             let items = state.sessions.snapshot(&row.project_id, Utc::now());
+            Ok(snapshot_json(&row.project_id, &items))
+        }
+        Operation::SessionPollInject => {
+            // Drain the session's mailbox (T2). The session must be registered
+            // and bound to this project; the enrollment + project binding were
+            // already proven above. The mailbox is volatile in-memory state:
+            // nothing is persisted, and the drain consumes each item exactly
+            // once. An unregistered session is refused, not silently empty —
+            // a hook that never registered would otherwise read "no new items"
+            // forever.
+            let session_id = request
+                .payload
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .ok_or(ipc::IpcError::InvalidRequest)?;
+            let items = state
+                .channels
+                .poll(session_id)
+                .ok_or(ipc::IpcError::InvalidRequest)?;
             Ok(snapshot_json(&row.project_id, &items))
         }
     }
@@ -3135,6 +3257,198 @@ mod service_tests {
         assert!(!state.channels.drop_session("sess-2")); // idempotent
     }
 
+    // --- T2: mailbox queue + SessionPollInject ---
+
+    fn poll_request(session_id: &str) -> Request {
+        Request {
+            request_id: "r-poll".into(),
+            workspace: "/w/proj".into(),
+            operation: Operation::SessionPollInject,
+            payload: crate::json::Value::Object(vec![(
+                "session_id".into(),
+                crate::json::Value::String(session_id.into()),
+            )]),
+        }
+    }
+
+    fn sample_item(key: &str, summary: &str) -> SnapshotItem {
+        SnapshotItem {
+            key: key.into(),
+            source: "urn:loam:instance:instance-01".into(),
+            item_type: "io.loam.message".into(),
+            summary: summary.into(),
+            to: vec![("instance".into(), "instance-02".into())],
+            org_id: "acme".into(),
+            project_id: "loam".into(),
+            repository_id: "repo".into(),
+            from_principal_id: "employee-184".into(),
+            from_display_name: None,
+            from_agent_id: "agent-72".into(),
+            from_instance_id: "instance-01".into(),
+            payload: crate::json::Value::Object(vec![]),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            publication: Publication::Unverified,
+        }
+    }
+
+    #[test]
+    fn poll_inject_drains_the_mailbox_and_a_second_poll_is_empty() {
+        let (path, key) = enrolled_db("poll-drain", 11, 110);
+        let mut state = ConnectorState::new();
+        dispatch_for_key(
+            &register_request("sess-poll", "chan-poll"),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register");
+
+        // The pump pushes after admit; drive the same push the pump performs.
+        state
+            .channels
+            .push("loam", &sample_item("inbox:01", "Held."), SNAPSHOT_CAPACITY);
+
+        let first =
+            dispatch_for_key(&poll_request("sess-poll"), &key, &path, &mut state).expect("poll");
+        let text = first.to_json();
+        assert!(
+            text.contains("Held."),
+            "the poll must return the item: {text}"
+        );
+
+        let second = dispatch_for_key(&poll_request("sess-poll"), &key, &path, &mut state)
+            .expect("poll again");
+        assert!(
+            !second.to_json().contains("Held."),
+            "a second poll must be empty (drained): {}",
+            second.to_json()
+        );
+    }
+
+    #[test]
+    fn two_sessions_on_the_same_project_both_receive_the_item() {
+        let (path, key) = enrolled_db("poll-two", 12, 120);
+        let mut state = ConnectorState::new();
+        for session in ["sess-a", "sess-b"] {
+            dispatch_for_key(
+                &register_request(session, &format!("chan-{session}")),
+                &key,
+                &path,
+                &mut state,
+            )
+            .expect("register");
+        }
+
+        state
+            .channels
+            .push("loam", &sample_item("inbox:02", "Both."), SNAPSHOT_CAPACITY);
+
+        for session in ["sess-a", "sess-b"] {
+            let polled =
+                dispatch_for_key(&poll_request(session), &key, &path, &mut state).expect("poll");
+            assert!(
+                polled.to_json().contains("Both."),
+                "session {session} must receive the item: {}",
+                polled.to_json()
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_on_another_project_does_not_receive_the_item() {
+        let (path, key) = enrolled_db("poll-other-project", 13, 130);
+        let mut state = ConnectorState::new();
+        dispatch_for_key(
+            &register_request("sess-other", "chan-other"),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register");
+
+        // The registered session is bound to "loam"; pushing for another
+        // project must not reach it.
+        state.channels.push(
+            "other-project",
+            &sample_item("inbox:03", "Not yours."),
+            SNAPSHOT_CAPACITY,
+        );
+
+        let polled =
+            dispatch_for_key(&poll_request("sess-other"), &key, &path, &mut state).expect("poll");
+        assert!(
+            !polled.to_json().contains("Not yours."),
+            "a session must not receive another project's items: {}",
+            polled.to_json()
+        );
+    }
+
+    #[test]
+    fn drop_session_removes_its_mailbox_and_poll_refuses() {
+        let (path, key) = enrolled_db("poll-drop", 14, 140);
+        let mut state = ConnectorState::new();
+        dispatch_for_key(
+            &register_request("sess-drop", "chan-drop"),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register");
+        state.channels.push(
+            "loam",
+            &sample_item("inbox:04", "Dropped."),
+            SNAPSHOT_CAPACITY,
+        );
+
+        assert!(state.channels.drop_session("sess-drop"));
+        assert!(!state.channels.contains("sess-drop"));
+
+        // An unregistered session is refused, not silently empty.
+        let outcome = dispatch_for_key(&poll_request("sess-drop"), &key, &path, &mut state);
+        assert_eq!(outcome.err(), Some(ipc::IpcError::InvalidRequest));
+    }
+
+    #[test]
+    fn poll_inject_requires_an_enrolled_workspace() {
+        let (path, _key) = enrolled_db("poll-unenrolled", 15, 150);
+        let outcome = dispatch_for_key(
+            &poll_request("sess-x"),
+            "unix:404:404",
+            &path,
+            &mut ConnectorState::new(),
+        );
+        assert_eq!(outcome.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
+    }
+
+    #[test]
+    fn a_restart_starts_with_empty_mailboxes() {
+        // Register + push for real, then drop the state: a restarted connector
+        // must recover no mailbox (in-memory only, like the channel registry).
+        let (path, key) = enrolled_db("poll-restart", 16, 160);
+        let mut before = ConnectorState::new();
+        dispatch_for_key(
+            &register_request("sess-restart", "chan-restart"),
+            &key,
+            &path,
+            &mut before,
+        )
+        .expect("register");
+        before.channels.push(
+            "loam",
+            &sample_item("inbox:05", "Volatile."),
+            SNAPSHOT_CAPACITY,
+        );
+
+        drop(before);
+        let mut after = ConnectorState::new();
+        let outcome = dispatch_for_key(&poll_request("sess-restart"), &key, &path, &mut after);
+        assert_eq!(
+            outcome.err(),
+            Some(ipc::IpcError::InvalidRequest),
+            "a restarted connector must recover no mailbox"
+        );
+    }
+
     #[test]
     fn a_restart_starts_with_an_empty_registry() {
         // Register a channel for real, against a real enrolled database, so the
@@ -3301,6 +3615,15 @@ mod connect_tests {
             global_root: root.clone(),
             instance_id,
             runtime_path: std::env::temp_dir().join("loam-rt").join("loam"),
+            // A temp systemd user dir, so the Linux symlink step never touches
+            // a real user config in tests.
+            systemd_user_dir: Some(std::env::temp_dir().join(format!(
+                    "loam-connect-{label}-systemd-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))),
         };
         (root.join("loam.sqlite3"), ctx)
     }
@@ -3557,6 +3880,15 @@ mod lifecycle_tests {
             global_root: root.clone(),
             instance_id,
             runtime_path: std::env::temp_dir().join("loam-rt").join("loam"),
+            // A temp systemd user dir, so the Linux symlink step never touches
+            // a real user config in tests.
+            systemd_user_dir: Some(std::env::temp_dir().join(format!(
+                    "loam-lifecycle-{label}-systemd-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))),
         };
         (root.join("loam.sqlite3"), ctx)
     }

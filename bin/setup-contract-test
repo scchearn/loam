@@ -32,38 +32,36 @@ printf '%s\n' "$DRY_RUN_OUTPUT" | grep -Eiq 'dry.?run' || {
   exit 1
 }
 
-# The shared Node session integration is retained (not retired): the packed tree
-# ships the context renderer with its native-runtime-command contract, and the
-# integration entry keeps serving hook.
-grep -Fq 'Native runtime command' "$PACKED_ROOT/integration/context.mjs" || {
-  printf 'FAIL: packed context lacks the native runtime command contract\n' >&2
-  exit 1
-}
+# The shared Node session integration is retired: the packed tree must not ship
+# the context renderer or the session hook, and the integration must not serve a
+# `hook` command at any spelling.
+for RETIRED in integration/context.mjs hooks/session-start.mjs hooks/hooks.json plugins/loam-adapter/hooks/session-start.mjs; do
+  [[ ! -e "$PACKED_ROOT/$RETIRED" ]] || {
+    printf 'FAIL: packed tree still ships the retired %s\n' "$RETIRED" >&2
+    exit 1
+  }
+done
 if grep -Fq 'run --' "$PACKED_ROOT/integration/loam.mjs"; then
   printf 'FAIL: packed integration retains the public run proxy\n' >&2
   exit 1
 fi
-# Positive control that the integration module loads and answers status.
+(cd "$WORKSPACE" && node "$PACKED_ROOT/integration/loam.mjs" hook --harness claude --workspace "$WORKSPACE" >/dev/null 2>&1) && {
+  printf 'FAIL: packed integration still serves the retired hook command\n' >&2
+  exit 1
+}
+# Positive control for the line above: the same entry point still answers
+# `status`, so the refusal is a retirement and not a broken module.
+(cd "$WORKSPACE" && node "$PACKED_ROOT/integration/loam.mjs" status >/dev/null 2>&1) || true
 STATUS_ERR="$(cd "$WORKSPACE" && node "$PACKED_ROOT/integration/loam.mjs" status 2>&1 >/dev/null || true)"
 [[ -z "$STATUS_ERR" ]] || {
   printf 'FAIL: packed integration cannot serve status: %s\n' "$STATUS_ERR" >&2
   exit 1
 }
 
-# Session-start context is the highest-blast-radius path (every session, every
-# harness) and it changed shape under (C): it now flows through the retained
-# marketplace hook (+ the Rust hook --body when a runtime is installed). Assert the
-# LOAM_IMPORTANT block and the setup hint survive on that live path — here with no
-# runtime, which is the deterministic "unavailable" fallback.
-(cd "$WORKSPACE" && printf '{}' | node "$PACKED_ROOT/plugins/loam-adapter/hooks/session-start.mjs") | node -e '
-  let s = "";
-  process.stdin.on("data", (d) => (s += d)).on("end", () => {
-    let context = "";
-    try { context = (JSON.parse(s).hookSpecificOutput || {}).additionalContext || ""; } catch {}
-    process.exit(context.includes("<LOAM_IMPORTANT>") && context.includes("npx @scchearn/loam setup") ? 0 : 1);
-  });
-' || {
-  printf 'FAIL: packed session-start hook lost the LOAM_IMPORTANT context contract\n' >&2
+# The OpenCode plugin carries the runtime slot setup fills at stage time — no
+# session-time resolution of the version-qualified runtime path.
+grep -Fq '__LOAM_RUNTIME_PATH__' "$PACKED_ROOT/adapters/opencode.mjs" || {
+  printf 'FAIL: packed OpenCode adapter has no staged runtime slot\n' >&2
   exit 1
 }
 

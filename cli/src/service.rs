@@ -46,6 +46,11 @@ pub struct ServiceContext {
     pub global_root: PathBuf,
     pub instance_id: String,
     pub runtime_path: PathBuf,
+    /// The systemd `--user` unit directory (`~/.config/systemd/user/` or
+    /// `$XDG_CONFIG_HOME/systemd/user`). `None` when no user config dir can be
+    /// resolved — the Linux symlink step then no-ops. Carried explicitly so
+    /// tests inject a temp dir instead of touching a real user config.
+    pub systemd_user_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,10 +166,13 @@ pub fn render_systemd_unit(ctx: &ServiceContext) -> Result<String, ServiceError>
 
 /// The disabled macOS LaunchAgent plist. No `RunAtLoad`, no `KeepAlive` until
 /// enabled — install writes it and `launchctl` bootstraps it only after first
-/// enrollment.
+/// enrollment. An `EnvironmentVariables` dict carries the `LOAM_*` overrides
+/// the connector needs (launchd does not expand `$HOME`, so values are absolute
+/// or literal).
 pub fn render_launchagent_plist(ctx: &ServiceContext) -> Result<String, ServiceError> {
     let runtime = absolute_utf8(&ctx.runtime_path)?;
     let root = absolute_utf8(&ctx.global_root)?;
+    let environment = launchagent_environment();
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -177,8 +185,32 @@ pub fn render_launchagent_plist(ctx: &ServiceContext) -> Result<String, ServiceE
          \t</array>\n\
          \t<key>RunAtLoad</key><false/>\n\
          \t<key>KeepAlive</key><false/>\n\
+         {environment}\
          </dict>\n</plist>\n"
     ))
+}
+
+/// The `EnvironmentVariables` plist block: every `LOAM_*` variable set in this
+/// process's environment, as `<string>` values (never `<data>`). Empty dict
+/// when none are set. launchd does not expand `$HOME`, so the values are
+/// passed through verbatim — an absolute path stays absolute.
+fn launchagent_environment() -> String {
+    let mut names: Vec<String> = std::env::vars()
+        .filter(|(name, _)| name.starts_with("LOAM_"))
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return "\t<key>EnvironmentVariables</key>\n\t<dict/>\n".to_owned();
+    }
+    let mut block = "\t<key>EnvironmentVariables</key>\n\t<dict>\n".to_owned();
+    for name in names {
+        if let Ok(value) = std::env::var(&name) {
+            block.push_str(&format!("\t\t<key>{name}</key><string>{value}</string>\n"));
+        }
+    }
+    block.push_str("\t</dict>\n");
+    block
 }
 
 /// launchd domain naming. Manager commands are argv vectors run without a
@@ -350,25 +382,115 @@ fn status_command(ctx: &ServiceContext) -> ManagerCommand {
 }
 
 // ---------------------------------------------------------------------------
+// systemd user-unit discoverability (Linux)
+// ---------------------------------------------------------------------------
+//
+// systemd --user searches `~/.config/systemd/user/` (or `$XDG_CONFIG_HOME/
+// systemd/user/`), never the versioned unit under the global root. The unit
+// stays where loam owns it; a symlink makes it discoverable. `install` places
+// it, `enable_start` verifies it, `uninstall` removes it. The target dir is
+// carried in [`ServiceContext`] so tests inject a temp dir instead of touching
+// a real user config.
+
+/// The symlink target inside the systemd user dir.
+fn systemd_symlink_target(dir: &Path) -> PathBuf {
+    dir.join("loam-connector.service")
+}
+
+/// Create a symlink, cross-platform. `std::fs::symlink` is Unix-only; Windows
+/// needs the file variant. The systemd user dir is only ever used on Linux, but
+/// this module compiles on every platform.
+#[cfg(unix)]
+fn make_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, target)
+}
+
+#[cfg(windows)]
+fn make_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(source, target)
+}
+
+/// Place the discoverability symlink, idempotently. A symlink already pointing
+/// at the versioned unit is a no-op; a stale or wrong symlink is replaced; a
+/// real file at the target is refused rather than clobbered.
+fn ensure_systemd_symlink(ctx: &ServiceContext, dir: &Path) -> Result<(), ServiceError> {
+    let source = definition_path(ctx);
+    let target = systemd_symlink_target(dir);
+    std::fs::create_dir_all(dir).map_err(|e| ServiceError::Io(e.to_string()))?;
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let current =
+                std::fs::read_link(&target).map_err(|e| ServiceError::Io(e.to_string()))?;
+            if current == source {
+                return Ok(());
+            }
+            std::fs::remove_file(&target).map_err(|e| ServiceError::Io(e.to_string()))?;
+        }
+        Ok(_) => {
+            return Err(ServiceError::Io(format!(
+                "{} exists and is not a symlink; refusing to replace it",
+                target.display()
+            )));
+        }
+        Err(_) => {}
+    }
+    make_symlink(&source, &target).map_err(|e| ServiceError::Io(e.to_string()))
+}
+
+/// Whether the discoverability symlink is in place for this context.
+fn systemd_symlink_present(ctx: &ServiceContext, dir: &Path) -> bool {
+    let source = definition_path(ctx);
+    let target = systemd_symlink_target(dir);
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => std::fs::read_link(&target)
+            .map(|current| current == source)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// The clear error `enable_start` reports when the symlink is absent.
+fn systemd_symlink_missing_error() -> ServiceError {
+    ServiceError::Io(
+        "the systemd user unit is not symlinked into ~/.config/systemd/user/; \
+         run `loam federation service install` first"
+            .into(),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
 /// Install the dormant definition: write the definition file (where the platform
-/// uses one) and run the disabled-registration manager commands. Never starts
-/// the connector. Idempotent: re-installing overwrites the definition and
-/// re-runs the same disabled registration.
+/// uses one), place the systemd discoverability symlink (Linux), and run the
+/// disabled-registration manager commands. Never starts the connector.
+/// Idempotent: re-installing overwrites the definition and re-runs the same
+/// disabled registration.
 pub fn install<R: CommandRunner>(runner: &R, ctx: &ServiceContext) -> Result<(), ServiceError> {
     write_definition(ctx)?;
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = &ctx.systemd_user_dir {
+        ensure_systemd_symlink(ctx, dir)?;
+    }
     run_all(runner, &install_commands(ctx))
 }
 
-/// Remove the definition and its file. Idempotent and never contacts a broker.
+/// Remove the definition, its file, and (Linux) the discoverability symlink.
+/// Idempotent and never contacts a broker.
 pub fn uninstall<R: CommandRunner>(runner: &R, ctx: &ServiceContext) -> Result<(), ServiceError> {
     // Manager teardown first (best-effort), then the file.
     let _ = run_all(runner, &uninstall_commands(ctx));
     let path = definition_path(ctx);
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| ServiceError::Io(e.to_string()))?;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = &ctx.systemd_user_dir {
+        // Only our own symlink: one pointing elsewhere is the operator's.
+        if systemd_symlink_present(ctx, dir) {
+            let _ = std::fs::remove_file(systemd_symlink_target(dir));
+        }
     }
     Ok(())
 }
@@ -379,11 +501,20 @@ pub fn status<R: CommandRunner>(runner: &R, ctx: &ServiceContext) -> Result<i32,
 }
 
 /// Enable and start the connector after the first enrollment (T10 activation).
-/// Idempotent — safe to call when already active.
+/// Idempotent — safe to call when already active. On Linux the systemd
+/// discoverability symlink must be in place first: `enable --now` on a unit
+/// systemd cannot see silently no-ops, so a missing symlink is refused with a
+/// clear error instead.
 pub fn enable_start<R: CommandRunner>(
     runner: &R,
     ctx: &ServiceContext,
 ) -> Result<(), ServiceError> {
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = &ctx.systemd_user_dir {
+        if !systemd_symlink_present(ctx, dir) {
+            return Err(systemd_symlink_missing_error());
+        }
+    }
     run_all(runner, &enable_start_commands(ctx))
 }
 
@@ -397,10 +528,14 @@ pub fn disable_stop<R: CommandRunner>(
 
 #[cfg(target_os = "linux")]
 fn enable_start_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
-    vec![ManagerCommand::new(
-        "systemctl",
-        &["--user", "enable", "--now", "loam-connector.service"],
-    )]
+    vec![
+        // Reload so the freshly-symlinked unit is visible to the manager.
+        ManagerCommand::new("systemctl", &["--user", "daemon-reload"]),
+        ManagerCommand::new(
+            "systemctl",
+            &["--user", "enable", "--now", "loam-connector.service"],
+        ),
+    ]
 }
 
 #[cfg(target_os = "linux")]
@@ -538,6 +673,15 @@ mod tests {
             // Absolute on every platform (temp_dir is absolute on Windows too),
             // so `absolute_utf8` accepts it in the render tests.
             runtime_path: std::env::temp_dir().join("loam-runtime").join("loam"),
+            // A temp systemd user dir, so the Linux symlink step never touches
+            // a real user config in tests.
+            systemd_user_dir: Some(std::env::temp_dir().join(format!(
+                    "loam-svc8-{label}-systemd-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))),
         }
     }
 
@@ -598,6 +742,33 @@ mod tests {
     }
 
     #[test]
+    fn launchagent_plist_carries_an_environment_variables_key() {
+        let context = ctx("launchd-env");
+        let plist = render_launchagent_plist(&context).unwrap();
+        assert!(
+            plist.contains("<key>EnvironmentVariables</key>"),
+            "the plist must carry an EnvironmentVariables key"
+        );
+        // The dict is present even when empty (launchd accepts an empty dict).
+        assert!(plist.contains("<dict/>") || plist.contains("</dict>"));
+    }
+
+    #[test]
+    fn launchagent_environment_renders_loam_vars_as_strings() {
+        // The renderer reads the process environment, so the test sets one
+        // LOAM_* variable and asserts it appears as a <string>, never <data>.
+        // The variable is removed afterwards so a parallel test never sees it.
+        std::env::set_var("LOAM_SECRET_BACKEND", "security");
+        let block = launchagent_environment();
+        std::env::remove_var("LOAM_SECRET_BACKEND");
+        assert!(
+            block.contains("<key>LOAM_SECRET_BACKEND</key><string>security</string>"),
+            "LOAM_* vars must render as <string> values; got: {block}"
+        );
+        assert!(!block.contains("<data>"), "values must never be <data>");
+    }
+
+    #[test]
     fn task_scheduler_create_is_least_privilege_logon_without_invalid_disable_flag() {
         let create = task_scheduler_create_command(&ctx("schtasks")).unwrap();
         assert_eq!(create.program, "schtasks");
@@ -653,5 +824,155 @@ mod tests {
         // Re-installing overwrites without error.
         install(&runner, &context).unwrap();
         let _ = std::fs::remove_dir_all(&context.global_root);
+    }
+
+    // --- T6: systemd user-unit discoverability symlink (Linux) ---
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_symlinks_the_unit_into_the_systemd_user_dir() {
+        let context = ctx("symlink");
+        let runner = FakeRunner::new();
+        install(&runner, &context).unwrap();
+        let dir = context.systemd_user_dir.as_ref().unwrap();
+        let target = systemd_symlink_target(dir);
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "install must symlink the unit into the systemd user dir"
+        );
+        assert_eq!(
+            std::fs::read_link(&target).unwrap(),
+            definition_path(&context),
+            "the symlink must point at the versioned unit under the global root"
+        );
+        let _ = std::fs::remove_dir_all(&context.global_root);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_replaces_a_stale_symlink_and_is_idempotent() {
+        let context = ctx("symlink-stale");
+        let runner = FakeRunner::new();
+        let dir = context.systemd_user_dir.as_ref().unwrap();
+        let target = systemd_symlink_target(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        // A stale symlink pointing elsewhere must be replaced, not followed.
+        std::os::unix::fs::symlink("/nowhere/loam-connector.service", &target).unwrap();
+        install(&runner, &context).unwrap();
+        assert_eq!(
+            std::fs::read_link(&target).unwrap(),
+            definition_path(&context),
+            "a stale symlink must be replaced"
+        );
+        // Idempotent: a second install leaves the correct symlink alone.
+        install(&runner, &context).unwrap();
+        assert_eq!(
+            std::fs::read_link(&target).unwrap(),
+            definition_path(&context)
+        );
+        let _ = std::fs::remove_dir_all(&context.global_root);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_refuses_to_clobber_a_real_file_at_the_target() {
+        let context = ctx("symlink-file");
+        let runner = FakeRunner::new();
+        let dir = context.systemd_user_dir.as_ref().unwrap();
+        let target = systemd_symlink_target(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(&target, "operator-owned").unwrap();
+        assert!(
+            install(&runner, &context).is_err(),
+            "a real file at the target must be refused, not clobbered"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "operator-owned",
+            "the operator's file must survive"
+        );
+        let _ = std::fs::remove_dir_all(&context.global_root);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enable_start_succeeds_when_the_symlink_is_present() {
+        let context = ctx("enable-ok");
+        let runner = FakeRunner::new();
+        install(&runner, &context).unwrap();
+        enable_start(&runner, &context).unwrap();
+        let joined: Vec<String> = runner
+            .recorded
+            .borrow()
+            .iter()
+            .map(|c| c.args.join(" "))
+            .collect();
+        assert!(
+            joined.iter().any(|line| line.contains("daemon-reload")),
+            "enable_start must daemon-reload before enable --now"
+        );
+        assert!(
+            joined
+                .iter()
+                .any(|line| line.contains("enable") && line.contains("--now")),
+            "enable_start must run enable --now"
+        );
+        let _ = std::fs::remove_dir_all(&context.global_root);
+        let _ = std::fs::remove_dir_all(context.systemd_user_dir.as_ref().unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enable_start_fails_clearly_when_the_symlink_is_missing() {
+        let context = ctx("enable-missing");
+        let runner = FakeRunner::new();
+        // No install: the symlink was never placed.
+        let error = enable_start(&runner, &context).unwrap_err();
+        assert!(
+            error.to_string().contains("not symlinked"),
+            "the error must name the missing symlink; got: {error}"
+        );
+        assert!(
+            runner.recorded.borrow().is_empty(),
+            "no manager command may run when the symlink is missing"
+        );
+        let _ = std::fs::remove_dir_all(&context.global_root);
+        let _ = std::fs::remove_dir_all(context.systemd_user_dir.as_ref().unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_removes_the_symlink_but_not_a_foreign_one() {
+        let context = ctx("uninstall-symlink");
+        let runner = FakeRunner::new();
+        install(&runner, &context).unwrap();
+        let dir = context.systemd_user_dir.as_ref().unwrap();
+        let target = systemd_symlink_target(dir);
+        assert!(target.exists(), "install placed the symlink");
+        uninstall(&runner, &context).unwrap();
+        assert!(
+            !target.exists(),
+            "uninstall must remove the discoverability symlink"
+        );
+
+        // A symlink pointing elsewhere is the operator's; uninstall leaves it.
+        let foreign = std::fs::symlink_metadata(&target).is_ok();
+        if !foreign {
+            std::fs::create_dir_all(dir).unwrap();
+            std::os::unix::fs::symlink("/operator/unit.service", &target).unwrap();
+            uninstall(&runner, &context).unwrap();
+            assert_eq!(
+                std::fs::read_link(&target).unwrap(),
+                PathBuf::from("/operator/unit.service"),
+                "a foreign symlink must survive uninstall"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&context.global_root);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

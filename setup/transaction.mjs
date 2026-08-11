@@ -186,7 +186,9 @@ export async function executeSetup(parsed, discovery, options = {}) {
       });
       for (const id of selectedMarketplaceHarnesses) {
         if (marketplace[id]?.state === 'ready' && !refreshedHarnesses[id]?.marketplaceReady) {
-          marketplace[id] = { ...marketplace[id], state: 'partial', category: 'verification_failed' };
+          // Verification failed: fall back to the refreshed detection, whose
+          // marketplaceReady/marketplaceRoot reflect what is actually on disk.
+          marketplace[id] = { ...refreshedHarnesses[id], state: 'partial', category: 'verification_failed' };
         }
         const st = marketplace[id];
         if (st?.state === 'ready') {
@@ -206,6 +208,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
         home: discovery.home,
         globalRoot: discovery.globalRoot,
         pluginVersion: discovery.packageVersion,
+        runtimePath: runtime.path,
         integrationPath,
         detected: effectiveHarnesses,
       });
