@@ -264,3 +264,47 @@ test('malformed and target-incomplete manifests fail closed', async () => {
     /manifest has no runtime for target/,
   );
 });
+
+test('prerelease runtime versions install through the cli-v tag URL', async () => {
+  const release = await releaseFixture({ version: '0.9.1-next.0' });
+  const globalRoot = await rootFixture();
+  const result = await installRuntime({
+    globalRoot,
+    version: '0.9.1-next.0',
+    target,
+    releaseBaseUrl: release.url,
+    smokeRunner: async () => ({ code: 0, stdout: '{}', stderr: '' }),
+  });
+  assert.equal(result.published, true);
+  assert.equal(result.path, runtimePath(globalRoot, '0.9.1-next.0', target));
+  assert.equal(await readFile(result.path, 'utf8'), release.bytes);
+});
+
+test('runtime version validation accepts prerelease and rejects build metadata', async () => {
+  const globalRoot = await rootFixture();
+  for (const version of ['0.9.1-next.0', '0.9.1-next.1', '0.9.1-rc.1']) {
+    const release = await releaseFixture({ version });
+    const result = await installRuntime({
+      globalRoot,
+      version,
+      target,
+      releaseBaseUrl: release.url,
+      smokeRunner: async () => ({ code: 0, stdout: '{}', stderr: '' }),
+    });
+    assert.equal(result.published, true, `prerelease ${version} should install`);
+  }
+  const release = await releaseFixture();
+  for (const version of ['0.9.1+build', '0.9.1-next.0+build', '0.9.1-', 'not-a-version', '0.9.1-next.01']) {
+    await assert.rejects(
+      () => installRuntime({
+        globalRoot,
+        version,
+        target,
+        releaseBaseUrl: release.url,
+        smokeRunner: async () => ({ code: 0, stdout: '{}', stderr: '' }),
+      }),
+      /invalid runtime version/,
+      `version ${version} should be rejected`,
+    );
+  }
+});

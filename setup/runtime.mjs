@@ -7,7 +7,11 @@ import { invokeRuntime, verifyRuntimeFile } from '../integration/runtime.mjs';
 import { createStagingDirectory, cleanupStaging, publishAtomic } from './atomic.mjs';
 import { assertSupportedTarget, detectTarget, runtimePath } from './target.mjs';
 
-const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+// Core semver with optional semver 2.0.0 prerelease (`-` plus dot-separated
+// identifiers). Build metadata (`+...`) stays rejected: npm refuses it and
+// `+` in tag-derived URLs is unsafe. Numeric prerelease identifiers must not
+// have leading zeros.
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?$/;
 const SHA256 = /^[a-f0-9]{64}$/i;
 const DEFAULT_RELEASE_BASE = 'https://github.com/scchearn/loam/releases/download';
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
