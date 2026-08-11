@@ -182,6 +182,9 @@ test('refresh forces the Loam source add even when the global inventory is compl
     packageRoot,
     skillsRoot,
     refresh: true,
+    // Finals assert the bare-repo source; pin the version so the case is
+    // independent of whatever version the checkout happens to carry.
+    packageVersion: '0.12.0',
     runner: async (request) => {
       calls.push(request);
       return { code: 0, stdout: JSON.stringify(await completeList()), stderr: '' };
@@ -213,6 +216,9 @@ test('incomplete global inventory invokes the pinned public add and re-verifies'
   const result = await ensureGlobalSkills({
     packageRoot,
     skillsRoot,
+    // Finals assert the bare-repo source; pin the version so the case is
+    // independent of whatever version the checkout happens to carry.
+    packageVersion: '0.12.0',
     runner: async (request) => {
       calls.push(request);
       if (request.args.includes('list')) {
