@@ -868,6 +868,7 @@ pub fn configured_backend() -> Result<Backend, ProvisionFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::io::Write;
 
     const CERTIFICATE: &str = "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n";
@@ -946,6 +947,7 @@ mod tests {
     }
 
     impl Backend {
+        #[cfg(unix)]
         fn program_path(&self) -> &str {
             match self {
                 Backend::SecretTool(program)
