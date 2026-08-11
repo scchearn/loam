@@ -17,6 +17,10 @@
 #                         -> released as tag  cli-v<version>   (only cli-v*
 #                            triggers the dist / raw-runtime build)
 #
+# Versions are SemVer MAJOR.MINOR.PATCH, optionally with a prerelease suffix
+# (-next.0 and friends) for prerelease channels; build metadata (+...) is
+# rejected. The two lanes are independent, and a prerelease in one lane never
+# implies the other.
 # The two versions are deliberately NOT kept equal. A plugin-only change must
 # not force a runtime release, and a runtime release must not churn the version
 # every harness displays. `CLI_VERSION` is the one value that escapes the repo:
@@ -61,6 +65,9 @@ show_usage() {
   echo "  --runtime  cli/Cargo.toml, Cargo.lock, CLI_VERSION"
   echo "             released as tag cli-v<version> (triggers dist)"
   echo
+  echo "Versions are MAJOR.MINOR.PATCH with an optional -PRERELEASE suffix"
+  echo "(e.g. 0.13.0-next.0); build metadata (+...) is rejected."
+  echo
   echo "The plugin and runtime versions are independent; neither implies the other."
 }
 
@@ -86,11 +93,13 @@ NEW="${1:-}"
 shift
 [[ $# -eq 0 ]] || fail "unexpected argument: $1"
 
-# Strict SemVer core only. Prerelease and build metadata are rejected on
-# purpose: the release lane derives the tag, the runtime manifest URL, and the
-# scope-derived runtime directory from this string.
-if [[ ! "$NEW" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-  fail "not a strict SemVer version: '$NEW' (expected MAJOR.MINOR.PATCH, no prerelease or build metadata, no leading zeros)"
+# SemVer core with an optional semver 2.0.0 prerelease (-next.N and friends);
+# build metadata (+...) stays rejected. Prerelease is accepted because the tag,
+# manifest URL, and scope-derived runtime directory are exact-string
+# compositions of the version, which holds for prerelease strings too — the
+# federation branch publishes X.Y.Z-next.N versions through the same lanes.
+if [[ ! "$NEW" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+  fail "not a SemVer version: '$NEW' (expected MAJOR.MINOR.PATCH, optionally -PRERELEASE; no build metadata, no leading zeros)"
 fi
 
 git -C "$ROOT" rev-parse --git-dir > /dev/null 2>&1 || fail "not a git repository: $ROOT"

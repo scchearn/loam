@@ -34,7 +34,11 @@ jobs:
       # the test steps above keep the npm they expect.
       - run: npm install -g npm@latest
 
-      # Auth is via GitHub OIDC (Trusted Publishing) — no token. Requires the
-      # trusted publisher to be configured on npmjs.com for this repo + workflow.
+      # npm does not auto-route prerelease versions away from `latest`; without
+      # an explicit --tag a -next version would silently move production. One
+      # hardcoded channel: `next` when the version carries a prerelease
+      # component, `latest` otherwise.
       - name: Publish package
-        run: npm publish --access public --provenance
+        env:
+          NPM_DIST_TAG: ${{ contains(github.ref_name, '-') && 'next' || 'latest' }}
+        run: npm publish --access public --provenance --tag "$NPM_DIST_TAG"

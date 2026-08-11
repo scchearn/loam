@@ -3,7 +3,11 @@ import { isAbsolute, join, resolve } from 'node:path';
 
 import { assertInside, resolveSkillsRoot } from './paths.mjs';
 
-const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+// Core semver with optional semver 2.0.0 prerelease (`-` plus dot-separated
+// identifiers). Build metadata (`+...`) stays rejected: npm refuses it and
+// `+` in tag-derived URLs is unsafe. Numeric prerelease identifiers must not
+// have leading zeros.
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?$/;
 const SHA256 = /^[a-f0-9]{64}$/i;
 
 function requireString(value, label) {

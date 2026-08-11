@@ -46,15 +46,18 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          PRERELEASE_FLAG: ${{ contains(github.ref_name, '-') && '--prerelease' || '' }}
         shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#cli-v}"
+          # shellcheck disable=SC2086
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Loam runtime $version" \
             --generate-notes \
+            $PRERELEASE_FLAG \
             raw-runtimes/*
 
       - name: Verify published runtime resolution
