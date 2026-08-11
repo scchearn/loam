@@ -50,4 +50,21 @@ STATUS_ERR="$(cd "$WORKSPACE" && node "$PACKED_ROOT/integration/loam.mjs" status
   exit 1
 }
 
+# Session-start context is the highest-blast-radius path (every session, every
+# harness) and it changed shape under (C): it now flows through the retained
+# marketplace hook (+ the Rust hook --body when a runtime is installed). Assert the
+# LOAM_IMPORTANT block and the setup hint survive on that live path — here with no
+# runtime, which is the deterministic "unavailable" fallback.
+(cd "$WORKSPACE" && printf '{}' | node "$PACKED_ROOT/plugins/loam-adapter/hooks/session-start.mjs") | node -e '
+  let s = "";
+  process.stdin.on("data", (d) => (s += d)).on("end", () => {
+    let context = "";
+    try { context = (JSON.parse(s).hookSpecificOutput || {}).additionalContext || ""; } catch {}
+    process.exit(context.includes("<LOAM_IMPORTANT>") && context.includes("npx @scchearn/loam setup") ? 0 : 1);
+  });
+' || {
+  printf 'FAIL: packed session-start hook lost the LOAM_IMPORTANT context contract\n' >&2
+  exit 1
+}
+
 printf 'OK: packaged setup contract passed\n'
