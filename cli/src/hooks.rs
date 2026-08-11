@@ -156,7 +156,7 @@ fn parse_begin(args: Vec<String>) -> Result<BeginArgs, String> {
         .map_err(|_| "workspace must be valid UTF-8".to_owned())?;
     let plugin_version = plugin_version.ok_or_else(|| "missing --plugin-version".to_owned())?;
     if !valid_semver(&plugin_version) {
-        return Err("plugin version must be MAJOR.MINOR.PATCH".to_owned());
+        return Err("plugin version must be MAJOR.MINOR.PATCH with an optional -PRERELEASE (no build metadata)".to_owned());
     }
     let session_id = optional_session_id(session_id)?;
     Ok(BeginArgs {
@@ -1304,14 +1304,48 @@ fn valid_detail(value: &str) -> bool {
     !value.is_empty() && value.chars().count() <= 1024
 }
 
+// Core semver with an optional semver 2.0.0 prerelease: `-` followed by
+// dot-separated identifiers of [0-9A-Za-z-], no empty identifiers, numeric
+// identifiers without leading zeros. Build metadata (`+...`) stays rejected.
+// An installed @next plugin injects a prerelease plugin version here, so this
+// loosening is what keeps session hooks working on prerelease installs.
 fn valid_semver(value: &str) -> bool {
-    let parts: Vec<_> = value.split('.').collect();
-    parts.len() == 3
-        && parts.iter().all(|part| {
-            !part.is_empty()
-                && part.bytes().all(|byte| byte.is_ascii_digit())
-                && (part == &"0" || !part.starts_with('0'))
-        })
+    fn core_part(part: &str) -> bool {
+        !part.is_empty()
+            && part.bytes().all(|byte| byte.is_ascii_digit())
+            && (part == "0" || !part.starts_with('0'))
+    }
+    fn identifier(part: &str) -> bool {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && !(part.bytes().all(|byte| byte.is_ascii_digit())
+                && part.len() > 1
+                && part.starts_with('0'))
+    }
+
+    let (core, prerelease) = match value.split_once('-') {
+        Some((core, rest)) => (core, Some(rest)),
+        None => (value, None),
+    };
+    let mut parts = core.split('.');
+    if !core_part(parts.next().unwrap_or_default())
+        || !core_part(parts.next().unwrap_or_default())
+        || !core_part(parts.next().unwrap_or_default())
+        || parts.next().is_some()
+    {
+        return false;
+    }
+    match prerelease {
+        None => true,
+        Some(rest) => {
+            if rest.contains('+') {
+                return false;
+            }
+            !rest.is_empty() && rest.split('.').all(identifier)
+        }
+    }
 }
 
 fn begin(args: BeginArgs) -> Result<(), String> {
@@ -2216,4 +2250,59 @@ fn private_permissions(_path: &Path, _mode: u32) -> Result<(), String> {
 
 fn usage() -> String {
     "usage: loam hooks begin <global-root> --harness <id> --hook <id> --workspace <absolute-path> --plugin-version <semver> [--session-id <id>]\n       loam hooks finish <global-root> --id <positive-integer> --status <succeeded|failed|continued> [--action <spawn_worker|skip|request_worker>] [--reason <id>] [--detail <diagnostic>]\n       loam hooks event <global-root> --id <positive-integer> --event <type> [--phase <phase>] --outcome <outcome> [typed event fields]\n       loam hooks worker-start <global-root> --id <positive-integer> [--origin <external|fallback>] [--session-id <id>]\n       loam hooks worker-finish <global-root> --id <positive-integer> --status <succeeded|skipped|failed> --reason <id> [--origin <external|fallback>] [--session-id <id>] [--detail <diagnostic>]\n       loam hooks list [<global-root>] [--harness <id>] [--hook <id>] [--status <started|succeeded|failed|continued>] [--session-id <id>] [--limit <1..1000>]".to_owned()
+}
+
+#[cfg(test)]
+mod semver_tests {
+    use super::valid_semver;
+
+    #[test]
+    fn prerelease_versions_are_accepted() {
+        for version in [
+            "0.13.0-next.0",
+            "0.13.0-next.1",
+            "0.13.0-rc.1",
+            "0.13.0-alpha",
+            "0.13.0-alpha.1-beta.2",
+            "0.13.0-0",
+        ] {
+            assert!(valid_semver(version), "expected {version} to be valid");
+        }
+    }
+
+    #[test]
+    fn core_versions_are_accepted() {
+        for version in ["0.13.0", "1.0.0", "0.0.1", "10.20.30"] {
+            assert!(valid_semver(version), "expected {version} to be valid");
+        }
+    }
+
+    #[test]
+    fn build_metadata_is_rejected() {
+        for version in ["0.13.0+build", "0.13.0-next.0+build", "1.2.3+sha.abc"] {
+            assert!(!valid_semver(version), "expected {version} to be rejected");
+        }
+    }
+
+    #[test]
+    fn malformed_prereleases_are_rejected() {
+        for version in [
+            "0.13.0-",
+            "0.13.0-next.",
+            "0.13.0-.next",
+            "0.13.0-next.01",
+            "0.13.0-01",
+            "0.13.0-next..1",
+            "0.13.0-000000",
+        ] {
+            assert!(!valid_semver(version), "expected {version} to be rejected");
+        }
+    }
+
+    #[test]
+    fn malformed_core_is_rejected() {
+        for version in ["", "0.13", "0.13.0.1", "01.13.0", "0.13.0x", "abc"] {
+            assert!(!valid_semver(version), "expected {version} to be rejected");
+        }
+    }
 }

@@ -121,7 +121,9 @@ for args in "0.9.1" "--both 0.9.1" "--plugin" "--runtime" "--plugin 0.9.1 extra"
 done
 
 # --- 4. invalid versions are rejected without mutating -----------------------
-for bad in "1.2" "v1.2.3" "1.2.3-rc.1" "1.2.3+build" "01.2.3" "abc" "1.2.3.4"; do
+# Build metadata and garbage stay rejected; prerelease (-next.N) is legal now
+# and covered by section 4b.
+for bad in "1.2" "v1.2.3" "1.2.3+build" "1.2.3+build.1" "01.2.3" "abc" "1.2.3.4" "1.2.3-"; do
   for lane in --plugin --runtime; do
     fixture="$tmp/bad"
     make_fixture "$fixture"
@@ -132,6 +134,32 @@ for bad in "1.2" "v1.2.3" "1.2.3-rc.1" "1.2.3+build" "01.2.3" "abc" "1.2.3.4"; d
     [[ "$before" == "$(fingerprint "$fixture")" ]] || fail "invalid version '$bad' mutated the tree on $lane"
   done
 done
+
+# --- 4b. prerelease versions bump cleanly in both lanes -----------------------
+for prerelease in "0.9.1-next.0" "0.9.1-next.1" "1.0.0-rc.1"; do
+  for lane in --plugin --runtime; do
+    lane_name="${lane#--}"
+    fixture="$tmp/pre-$lane"
+    make_fixture "$fixture"
+    if out="$(run_bump "$fixture" "$lane" "$prerelease")"; then
+      grep -Fq "bump-release: $lane_name" <<< "$out" || fail "prerelease bump '$prerelease' on $lane did not report the transition: $out"
+      grep -Fq "version agreement: $lane_name PASS" <<< "$out" || fail "prerelease bump '$prerelease' on $lane did not verify: $out"
+    else
+      fail "prerelease bump '$prerelease' on $lane exited non-zero: $out"
+    fi
+  done
+done
+fixture="$tmp/pre-plugin"
+make_fixture "$fixture"
+run_bump "$fixture" --plugin 0.9.1-next.0 > /dev/null
+count_in "$fixture/package.json" '"version": "0.9.1-next.0"' 1 "package.json prerelease"
+count_in "$fixture/package-lock.json" '"version": "0.9.1-next.0"' 2 "both package-lock prerelease fields"
+fixture="$tmp/pre-runtime"
+make_fixture "$fixture"
+run_bump "$fixture" --runtime 0.9.1-next.0 > /dev/null
+count_in "$fixture/cli/Cargo.toml" 'version = "0.9.1-next.0"' 1 "cargo package prerelease"
+[[ "$(tr -d ' \t\r\n' < "$fixture/skills/loam-using/scripts/CLI_VERSION")" == "0.9.1-next.0" ]] \
+  || fail "CLI_VERSION was not set to the prerelease"
 
 # --- 5. the same version is refused, per lane --------------------------------
 fixture="$tmp/same-plugin"

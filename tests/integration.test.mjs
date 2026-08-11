@@ -11,6 +11,7 @@ import {
   beginHookRun, finishHookRun, finishHookWorker, startHookWorker,
 } from '../integration/hooks.mjs';
 import { runIntegration } from '../integration/loam.mjs';
+import { readInstallMetadata, readRequiredVersion, validateInstallMetadata } from '../integration/metadata.mjs';
 import { detectLegacyShadow } from '../integration/shadow.mjs';
 import { detectTarget, resolveGlobalRoot, SUPPORTED_TARGETS, runtimePath } from '../integration/paths.mjs';
 import { invokeRuntime, probeState, verifyRuntimeFile } from '../integration/runtime.mjs';
@@ -101,6 +102,63 @@ test('ready state invokes native state once and formats one common context', asy
   assert.match(context, new RegExp(fixtureData.runtimePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(context, /project-wiki/);
   assert.doesNotMatch(context, /^name: loam::using$/m);
+});
+
+test('metadata validation accepts prerelease versions and rejects build metadata', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-meta-'));
+  const globalRoot = join(home, '.agents', 'loam');
+  await mkdir(join(globalRoot, 'bin', '0.9.1-next.0', target), { recursive: true });
+  const base = {
+    schema_version: 1,
+    plugin_version: '0.8.3',
+    runtime_version: '0.9.1',
+    target,
+    runtime_path: runtimePath(globalRoot, '0.9.1', target),
+    runtime_sha256: 'a'.repeat(64),
+    adapter_root: join(globalRoot, 'plugins', '0.8.3'),
+    integration_path: join(globalRoot, 'integration', '0.8.3-fixture', 'loam.mjs'),
+    skills_scope: 'global',
+    skills_source: 'scchearn/loam',
+    configured_harnesses: [],
+  };
+  const valid = await validateInstallMetadata(globalRoot, {
+    ...base,
+    runtime_version: '0.9.1-next.0',
+    runtime_path: runtimePath(globalRoot, '0.9.1-next.0', target),
+  });
+  assert.equal(valid.runtime_version, '0.9.1-next.0');
+  for (const bad of ['0.9.1+build', '0.9.1-next.0+build', '0.9.1-', '0.9.1-next.01', 'not-a-version']) {
+    assert.throws(
+      () => validateInstallMetadata(globalRoot, { ...base, runtime_version: bad }),
+      /runtime_version is invalid/,
+      `runtime_version ${bad} should be rejected`,
+    );
+  }
+});
+
+test('CLI_VERSION accepts prerelease and rejects build metadata', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-cliversion-'));
+  const skillsRoot = join(home, '.agents', 'skills');
+  const scripts = join(skillsRoot, 'loam-using', 'scripts');
+  await mkdir(scripts, { recursive: true });
+  for (const version of ['0.9.1-next.0', '0.9.1-next.1', '0.9.1-rc.1']) {
+    await writeFile(join(scripts, 'CLI_VERSION'), `${version}\n`);
+    assert.equal(await readRequiredVersion({ skillsRoot }), version, `CLI_VERSION ${version} should be accepted`);
+  }
+  for (const bad of ['0.9.1+build', '0.9.1-', '0.9.1-next.01', 'not-a-version']) {
+    await writeFile(join(scripts, 'CLI_VERSION'), `${bad}\n`);
+    await assert.rejects(
+      () => readRequiredVersion({ skillsRoot }),
+      /invalid CLI_VERSION/,
+      `CLI_VERSION ${bad} should be rejected`,
+    );
+  }
+});
+
+test('readInstallMetadata passes a prerelease fixture through', async () => {
+  const fixtureData = await fixture({ runtimeVersion: '0.9.1-next.0' });
+  const install = await readInstallMetadata(fixtureData.globalRoot);
+  assert.equal(install.runtime_version, '0.9.1-next.0');
 });
 
 test('versioned integration path resolves the global Loam root', async () => {
