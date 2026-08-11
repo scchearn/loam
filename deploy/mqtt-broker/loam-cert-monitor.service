@@ -1,0 +1,10 @@
+# Loam MQTT — cert-expiry monitor (T7). Oneshot run by loam-cert-monitor.timer.
+[Unit]
+Description=Loam MQTT org-CA client-cert expiry monitor
+
+[Service]
+Type=oneshot
+EnvironmentFile=${MOSQ_ETC}/loam-mqtt.params
+ExecStart=${MOSQ_ETC}/cert-monitor.sh run
+# non-zero exit (a near-expiry cert) is surfaced by systemd as a failed unit,
+# which the host's monitoring/journal alerting picks up.
