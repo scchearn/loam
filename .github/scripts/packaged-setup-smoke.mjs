@@ -5,7 +5,10 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 const execFileAsync = promisify(execFile);
-const semver = /^\d+\.\d+\.\d+$/;
+// Core semver with optional semver 2.0.0 prerelease, same formulation as
+// setup/runtime.mjs — the smoke runs against `next` dist-tag prereleases as
+// readily as against `latest` finals.
+const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?$/;
 const pluginVersion = process.env.LOAM_PLUGIN_VERSION || '';
 const runtimeVersion = process.env.LOAM_RUNTIME_VERSION || '';
 

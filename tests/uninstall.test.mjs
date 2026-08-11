@@ -267,6 +267,32 @@ test('uninstall removes globally installed Loam skills through the Skills CLI', 
   assert.equal(await exists(skillsPath), true, 'the Skills CLI owns removal of skill files');
 });
 
+test('uninstall detects skills installed from a prerelease tag tree URL', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const calls = [];
+  let active = true;
+  const runner = async ({ args }) => {
+    calls.push(args);
+    if (args.includes('list')) {
+      return {
+        code: 0,
+        stdout: JSON.stringify(active ? [{ name: 'loam::using', source: 'https://github.com/scchearn/loam/tree/v0.13.0-next.0' }] : []),
+        stderr: '',
+      };
+    }
+    if (args.includes('remove')) {
+      active = false;
+      return { code: 0, stdout: '', stderr: '' };
+    }
+    return { code: 1, stdout: '', stderr: 'unexpected Skills CLI command' };
+  };
+  const code = await uninstall({ home, globalRoot, yes: true, runner, output: { write: () => {} } });
+  assert.equal(code, 0);
+  assert.deepEqual(calls.find((args) => args.includes('remove')), [
+    '--yes', '--package', 'skills@1.5.20', 'skills', 'remove', 'loam::using', '--global', '--yes',
+  ]);
+});
+
 test('uninstall delegates marketplace plugin removal to Claude and Codex', async () => {
   const { home, globalRoot } = await readyFixture();
   const claudeCache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.2');

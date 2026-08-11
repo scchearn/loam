@@ -10,7 +10,7 @@ import { loadSkillInventory } from '../setup/inventory.mjs';
 import { discover } from '../setup/discovery.mjs';
 import { detectLegacyProject, migrateLegacyProject } from '../setup/migration.mjs';
 import { npxCommand, runCommand, runSkills } from '../setup/process.mjs';
-import { ensureGlobalSkills, skillsAgentsFor } from '../setup/skills.mjs';
+import { ensureGlobalSkills, skillsAgentsFor, skillsSourceFor } from '../setup/skills.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 
@@ -33,8 +33,13 @@ async function completeList() {
   };
 }
 
-test('Skills CLI commands use an argument array and the exact pinned global add', async () => {
-  const calls = [];
+test('skillsSourceFor pins the tag for prerelease packages and keeps the bare repo for finals', () => {
+  assert.equal(skillsSourceFor('0.12.0'), 'scchearn/loam');
+  assert.equal(skillsSourceFor('0.13.0-next.0'), 'https://github.com/scchearn/loam/tree/v0.13.0-next.0');
+  assert.equal(skillsSourceFor('0.13.0-rc.1'), 'https://github.com/scchearn/loam/tree/v0.13.0-rc.1');
+});
+
+test('Skills CLI commands use an argument array and the exact pinned global add', async () => {  const calls = [];
   await runSkills(
     ['add', 'scchearn/loam', '--global', '--agent', '*', '--yes'],
     {
@@ -231,6 +236,45 @@ test('incomplete global inventory invokes the pinned public add and re-verifies'
     'skills',
     'add',
     'scchearn/loam',
+    '--global',
+    '--agent',
+    '*',
+    '--yes',
+  ]);
+});
+
+test('a prerelease package adds skills from the pinned tag tree URL', async () => {
+  const skillsRoot = await skillsRootFixture();
+  const full = await completeList();
+  let listCalls = 0;
+  const calls = [];
+  const result = await ensureGlobalSkills({
+    packageRoot,
+    skillsRoot,
+    packageVersion: '0.13.0-next.0',
+    runner: async (request) => {
+      calls.push(request);
+      if (request.args.includes('list')) {
+        listCalls += 1;
+        return {
+          code: 0,
+          stdout: JSON.stringify(listCalls === 1 ? { skills: full.skills.slice(0, 1) } : full),
+          stderr: '',
+        };
+      }
+      return { code: 0, stdout: 'installed', stderr: '' };
+    },
+  });
+
+  assert.equal(result.ready, true);
+  assert.equal(result.changed, true);
+  assert.deepEqual(calls[1].args, [
+    '--yes',
+    '--package',
+    'skills@1.5.20',
+    'skills',
+    'add',
+    'https://github.com/scchearn/loam/tree/v0.13.0-next.0',
     '--global',
     '--agent',
     '*',
