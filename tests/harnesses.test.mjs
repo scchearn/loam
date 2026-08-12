@@ -12,6 +12,7 @@ import { detectHarnesses, installHarnesses } from '../setup/harnesses.mjs';
 
 test('OpenCode re-injects on every turn: full block first, federation refresh after', async () => {
   const calls = [];
+  const wakeStarts = [];
   const plugin = await createOpenCodeAdapter({
     getContext: async ({ workspace, event }) => {
       calls.push({ workspace, event });
@@ -19,9 +20,13 @@ test('OpenCode re-injects on every turn: full block first, federation refresh af
         ? `<LOAM_IMPORTANT>\nYou have loam.\n${workspace}\n</LOAM_IMPORTANT>`
         : `<LOAM_IMPORTANT>\n## Federation\nrefresh\n</LOAM_IMPORTANT>`;
     },
+    wakeServer: async ({ workspace, sessionId }) => {
+      wakeStarts.push({ workspace, sessionId });
+      return { wakeRef: 'notify-tcp://127.0.0.1:0', registered: false, close: async () => {} };
+    },
   })({ directory: '/workspace' });
   const output = {
-    messages: [{ info: { role: 'user' }, parts: [{ type: 'text', text: 'superpowers context' }] }],
+    messages: [{ info: { role: 'user', sessionID: 'sess-1' }, parts: [{ type: 'text', text: 'superpowers context' }] }],
   };
 
   await plugin['experimental.chat.messages.transform']({}, output);
@@ -35,6 +40,10 @@ test('OpenCode re-injects on every turn: full block first, federation refresh af
     { workspace: '/workspace', event: 'UserPromptSubmit' },
     { workspace: '/workspace', event: 'UserPromptSubmit' },
   ]);
+  // The notify listener opens once, on the first fire, against the session id
+  // carried on the first user message (OpenCode emits no session.created for
+  // the main session).
+  assert.deepEqual(wakeStarts, [{ workspace: '/workspace', sessionId: 'sess-1' }]);
   const parts = output.messages[0].parts.filter((part) => part.type === 'text');
   assert.equal(parts.length, 4, 'one full block + two refreshes');
   // unshift puts the newest injection first: the two refreshes, then the full
@@ -309,6 +318,14 @@ test('OpenCode hook-run logging remains fail-open', async () => {
       resolveGlobalRoot: () => '/global',
       beginHookRun: async () => { calls += 1; throw new Error('locked'); },
       finishHookRun: async () => { throw new Error('must not finish'); },
+    },
+    // The idle event must not spawn the real gate's node subprocess after the
+    // test ends; this test is about hook-run logging, not ingestion.
+    ingestion: {
+      gate: async () => ({ action: 'skip' }),
+      resolveGlobalRoot: () => '/global',
+      resolveSkillsRoot: () => '/skills',
+      runWorker: async () => undefined,
     },
   })({ directory: '/workspace' });
 

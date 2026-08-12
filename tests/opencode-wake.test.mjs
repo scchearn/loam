@@ -96,7 +96,8 @@ test('wake injection renders through the native read path and lands via promptAs
     },
   })({ directory: '/workspace' });
 
-  await plugin.event({ event: { type: 'session.created', sessionID: 'sess-w' } });
+  const output = { messages: [{ info: { role: 'user', sessionID: 'sess-w' }, parts: [{ type: 'text', text: 'prompt' }] }] };
+  await plugin['experimental.chat.messages.transform']({}, output);
   await poll(async () => promptParts.length === 0 || true); // listener spin-up
   await wait(50);
   assert.equal(promptParts.length, 0, 'no injection before any wake frame');
@@ -118,9 +119,18 @@ test('a session without the runtime still starts and the wake server degrades si
   const plugin = await createOpenCodeAdapter({
     client: { session: {} },
     wakeServer: async () => { throw new Error('no listener'); },
+    // The idle event must not spawn the real gate's node subprocess after the
+    // test ends; this test is about wake degradation, not ingestion.
+    ingestion: {
+      gate: async () => ({ action: 'skip' }),
+      resolveGlobalRoot: () => root,
+      resolveSkillsRoot: () => root,
+      runWorker: async () => undefined,
+    },
   })({ directory: '/workspace' });
   // Must not reject: no listener, no wake, per-turn boundary still delivers.
-  await plugin.event({ event: { type: 'session.created', sessionID: 'sess-x' } });
+  const output = { messages: [{ info: { role: 'user', sessionID: 'sess-x' }, parts: [{ type: 'text', text: 'prompt' }] }] };
+  await plugin['experimental.chat.messages.transform']({}, output);
   await plugin.event({ event: { type: 'session.idle', sessionID: 'sess-x' } });
   await plugin.event({ event: { type: 'session.deleted', sessionID: 'sess-x' } });
 });

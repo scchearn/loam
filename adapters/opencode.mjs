@@ -233,18 +233,14 @@ export function createOpenCodeAdapter({
       const event = sessionStarted ? 'UserPromptSubmit' : 'SessionStart';
       const context = await getContext({ harness: 'opencode', workspace: directory || process.cwd(), integrationPath, event });
       if (!context) return;
-      sessionStarted = true;
-      const reference = firstUser.parts[0];
-      firstUser.parts.unshift({ ...reference, type: 'text', text: context });
-    },
-    event: async ({ event } = {}) => {
-      if (event?.type === 'session.created' && !loamWake.server) {
-        // First session of this adapter instance: open the notify listener and
-        // register the wake_ref with the connector. One listener per plugin
-        // instance; later sessions share it (the connector fans out per
-        // registered session id).
-        const childId = event.sessionID || event.session_id || event.properties?.sessionID || event.properties?.session_id;
-        const workspace = directory || event.directory || process.cwd();
+      if (!sessionStarted) {
+        // First fire of this adapter instance is the SessionStart boundary.
+        // OpenCode does not emit session.created for the main session, so the
+        // notify listener opens here: once per plugin instance, registered
+        // against the session id carried on the first user message.
+        sessionStarted = true;
+        const childId = firstUser.info?.sessionID || firstUser.info?.session_id;
+        const workspace = directory || process.cwd();
         loamWake.sessionId = typeof childId === 'string' ? childId : null;
         void (async () => {
           try {
@@ -258,8 +254,11 @@ export function createOpenCodeAdapter({
             // No listener, no wake: the per-turn boundary still delivers.
           }
         })();
-        return;
       }
+      const reference = firstUser.parts[0];
+      firstUser.parts.unshift({ ...reference, type: 'text', text: context });
+    },
+    event: async ({ event } = {}) => {
       if ((event?.type === 'session.deleted' || event?.type === 'session.ended') && loamWake.server) {
         const teardown = loamWake.server;
         loamWake.server = null;

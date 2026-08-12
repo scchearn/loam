@@ -46,7 +46,13 @@ async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, 
   }
   const context = '<LOAM_IMPORTANT>\nverification context\n</LOAM_IMPORTANT>';
   if (id === 'opencode') {
-    const adapter = await module.createOpenCodeAdapter({ getContext: async () => context })({ directory: workspace });
+    const adapter = await module.createOpenCodeAdapter({
+      getContext: async () => context,
+      // The envelope check fires the transform, which starts the notify
+      // listener on its first fire; a real listener would keep the process
+      // alive, so verification uses a stub.
+      wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', registered: false, close: async () => {} }),
+    })({ directory: workspace });
     const output = { messages: [{ info: { role: 'user' }, parts: [{ type: 'text', text: 'prompt' }] }] };
     await adapter['experimental.chat.messages.transform']({}, output);
     const previous = process.env.LOAM_INGEST_BACKGROUND;
