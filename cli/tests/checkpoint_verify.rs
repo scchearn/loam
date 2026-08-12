@@ -264,7 +264,9 @@ fn comma_separated_and_indented_pointers_are_both_collected() {
 }
 
 #[test]
-fn trailing_parenthetical_context_is_stripped_before_resolution() {
+fn a_parenthetical_annotation_keeps_the_pointer_from_resolving() {
+    // Context annotations were formerly stripped for hcom thread pointers;
+    // with that class gone, a file pointer is taken verbatim.
     let directory = temporary_directory("parenthetical");
     write(&directory.join("present.md"), "# Present\n");
     let path = directory.join("note.md");
@@ -277,7 +279,8 @@ fn trailing_parenthetical_context_is_stripped_before_resolution() {
 
     assert_eq!(code, 0);
     assert!(
-        stdout.contains("  POINTER ./present.md: OK\n"),
+        stdout
+            .contains("  POINTER ./present.md (events 1-9): MISSING: ./present.md (events 1-9)\n"),
         "output: {stdout}"
     );
 }
@@ -326,7 +329,7 @@ fn an_absolute_pointer_that_exists_is_reported_ok() {
 }
 
 #[test]
-fn a_taskwarrior_uuid_pointer_is_recognised_as_a_task() {
+fn an_unslashed_uuid_pointer_is_reported_unrecognized() {
     let directory = temporary_directory("uuid");
     let path = directory.join("note.md");
     write(
@@ -337,23 +340,36 @@ fn a_taskwarrior_uuid_pointer_is_recognised_as_a_task() {
     let (code, stdout, _) = verify(&path);
 
     assert_eq!(code, 0);
-    // `task` may or may not be installed; either degradation is contractual,
-    // but the pointer must be classified as a task and never as a path.
     assert!(
-        stdout.contains("  POINTER task 550e8400-e29b-41d4-a716-446655440000: "),
-        "output: {stdout}"
-    );
-    assert!(
-        stdout.contains("TASK: not available\n")
-            || stdout.contains("NOT FOUND\n")
-            || stdout.contains(": OK\n"),
+        stdout.contains(
+            "  POINTER 550e8400-e29b-41d4-a716-446655440000: (unrecognized format, not checked by verify)\n"
+        ),
         "output: {stdout}"
     );
 }
 
 #[test]
-fn an_hcom_thread_pointer_is_recognised_as_a_thread() {
-    let directory = temporary_directory("hcom");
+fn a_slashed_pointer_under_an_hcom_named_directory_resolves_as_a_path() {
+    let directory = temporary_directory("no-hcom");
+    write(&directory.join("hcom threads/alpha-1.md"), "# Alpha\n");
+    let path = directory.join("note.md");
+    write(
+        &path,
+        "# Checkpoint\n\n- Format: v1\n\n## Workstreams\n\n### Only\n- Status: active\n- Next: go\n- Pointers: hcom threads/alpha-1.md\n",
+    );
+
+    let (code, stdout, _) = verify(&path);
+
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("  POINTER hcom threads/alpha-1.md: OK (resolved to "),
+        "output: {stdout}"
+    );
+}
+
+#[test]
+fn a_bare_thread_mention_is_reported_unrecognized() {
+    let directory = temporary_directory("no-hcom");
     let path = directory.join("note.md");
     write(
         &path,
@@ -364,7 +380,9 @@ fn an_hcom_thread_pointer_is_recognised_as_a_thread() {
 
     assert_eq!(code, 0);
     assert!(
-        stdout.contains("  POINTER hcom thread alpha-1: "),
+        stdout.contains(
+            "  POINTER hcom thread `alpha-1`: (unrecognized format, not checked by verify)\n"
+        ),
         "output: {stdout}"
     );
 }
@@ -385,6 +403,55 @@ fn an_unrecognised_pointer_is_reported_but_not_resolved() {
         stdout.contains(
             "  POINTER some free-form note: (unrecognized format, not checked by verify)\n"
         ),
+        "output: {stdout}"
+    );
+}
+
+#[test]
+fn a_pointer_resolving_from_the_workspace_root_is_reported_ok() {
+    let directory = temporary_directory("workspace-relative");
+    write(&directory.join("sub/shared.md"), "# Shared\n");
+    let notes = directory.join("notes");
+    let path = notes.join("note.md");
+    write(
+        &path,
+        "# Checkpoint\n\n- Format: v1\n\n## Workstreams\n\n### Only\n- Status: active\n- Next: go\n- Pointers: sub/shared.md\n",
+    );
+
+    let binary = std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide the loam binary");
+    let output = Command::new(binary)
+        .args(["checkpoint", "verify", path.to_str().unwrap()])
+        .env("WORKSPACE", &directory)
+        .output()
+        .expect("loam should run");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        stdout.contains("  POINTER sub/shared.md: OK (resolved to "),
+        "output: {stdout}"
+    );
+}
+
+#[test]
+fn an_existing_unslashed_pointer_is_reported_ok_verbatim() {
+    let directory = temporary_directory("unslashed");
+    let target = directory.join("present.md");
+    write(&target, "# Present\n");
+    let path = directory.join("note.md");
+    write(
+        &path,
+        &format!(
+            "# Checkpoint\n\n- Format: v1\n\n## Workstreams\n\n### Only\n- Status: active\n- Next: go\n- Pointers: {}\n",
+            target.display()
+        ),
+    );
+
+    let (code, stdout, _) = verify(&path);
+
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains(&format!("  POINTER {}: OK\n", target.display())),
         "output: {stdout}"
     );
 }

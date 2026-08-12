@@ -93,14 +93,12 @@ Rules:
 
 When relevant, capture as pointers inside the workstream:
 
-- `hcom thread <name> (pending: #<id>)` — never agent names; they are regenerated each session
 - delegated work not yet returned, described by task ("a reviewer was auditing X") — never by delegate name
-- TaskWarrior **UUIDs** or a `project:` filter — never bare IDs (they renumber on completion)
 - files edited but unfinished this session
 - flag session-local or `/tmp` pointers `(volatile)`
 - open `hcom listen` / `events sub` state goes in `Status: waiting` + `Blocker` (record the awaited condition, not the subscription)
 - the controlling goal path (`goals/<slug>.md`) when work is goal-backed — point to the path only, never copy goal state into the checkpoint
-- run `<native-runtime-command> checkpoint state [--window MIN]` to get a pre-filtered digest of hcom threads, TaskWarrior items, and recently-touched files; select from its output rather than re-querying inline. If the native runtime reports unavailable, stop and report `npx @scchearn/loam setup`.
+- run `<native-runtime-command> checkpoint state [--window MIN]` to get a pre-filtered digest of recently-touched files; select from its output rather than re-querying inline. If the native runtime reports unavailable, stop and report `npx @scchearn/loam setup`.
 - relative pointer paths must be unambiguous from the workspace root; when the workspace has multiple top-level subprojects with similar directory structure, prefix with the subproject name (e.g., `aenon-local-business-website-pipeline/workflows/x.ts`, not just `workflows/x.ts`)
 
 If `Next` is vague, the checkpoint failed.

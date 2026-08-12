@@ -182,7 +182,7 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::syncing-code-graph | 363 | 84 | 223 | 2,770 |
 | loam::using | 368 | 77 | 244 | 4,063 |
 | loam::amending-plan | 437 | 88 | 273 | 3,059 |
-| loam::checkpointing | 365 | 69 | 180 | 2,188 |
+| loam::checkpointing | 365 | 69 | 178 | 2,126 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,176 |
 | loam::planning | 327 | 62 | 323 | 4,314 |
 | loam::resuming | 376 | 77 | 142 | 1,807 |
