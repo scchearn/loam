@@ -1,9 +1,8 @@
 //! Minimal JSON reader and writer.
 //!
-//! It exists so the release-version gate can read plugin manifests without a
-//! `python3` runtime and the checkpoint digest can read `hcom`/`task` output
-//! without `jq`. Both were host-tool dependencies that do not exist on a stock
-//! Windows machine.
+//! It exists so the release-version gate and hook-event parsing can read
+//! manifests without a `python3` runtime and without `jq`. Both were
+//! host-tool dependencies that do not exist on a stock Windows machine.
 //!
 //! Numbers keep their literal source text rather than becoming floats, so
 //! message identifiers round-trip exactly as they were written.
