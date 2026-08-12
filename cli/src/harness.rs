@@ -990,9 +990,28 @@ pub fn compose_body(
             .and_then(|s| s.get("id"))
             .and_then(Value::as_str)
     });
+    // SessionStart: register the frame's session with the connector (no
+    // wake_ref) before serving reads, so per-turn mailbox drains work for
+    // every harness without a plugin. Fire-and-forget: a refusal (unenrolled,
+    // connector down, restart) is ignored silently — the snapshot fallback
+    // already covers the unregistered flow.
+    if event == HookEvent::SessionStart {
+        if let Some(session_id) = session_id {
+            register_session(paths, config, &workspace, session_id);
+        }
+    }
     let federation = federation_override.unwrap_or_else(|| {
         resolve_federation(paths, config, workspace.as_path(), event, session_id)
     });
+    // Mark-current: after the snapshot render, drain-and-discard the mailbox
+    // so a later wake/per-turn drain does not re-render the items this
+    // snapshot already showed. An unregistered session (post-restart) is
+    // expected and ignored silently.
+    if event == HookEvent::SessionStart {
+        if let Some(session_id) = session_id {
+            drain_and_discard(paths, config, &workspace, session_id);
+        }
+    }
 
     if matches!(
         event,
@@ -1031,6 +1050,7 @@ pub fn compose_body(
         command,
         workspace_state_section(&workspace),
         federation_section(&federation, config, &paths.allowlist()),
+        collaboration_section(&federation, paths, &workspace),
     ];
     let content = sections
         .iter()
@@ -1039,6 +1059,41 @@ pub fn compose_body(
         .collect::<Vec<_>>()
         .join("\n\n");
     format!("<LOAM_IMPORTANT>\n\n{content}\n\n</LOAM_IMPORTANT>")
+}
+
+/// Register the frame's session with the connector (live-push T5): no
+/// wake_ref — hook-launched harnesses get per-turn boundary drains only.
+/// Fire-and-forget: any failure is ignored silently.
+fn register_session(paths: &HookPaths, config: &HookConfig, workspace: &Path, session_id: &str) {
+    let ipc_config = IpcConfig {
+        read_deadline: config.timeout,
+        lifecycle_deadline: config.timeout,
+        ..IpcConfig::default()
+    };
+    let request = request_body(
+        &workspace.display().to_string(),
+        Operation::SessionRegisterInject,
+        Some(session_id),
+    );
+    let _ = call_connector(&paths.run_dir(), request.as_bytes(), &ipc_config);
+}
+
+/// Drain-and-discard the session's mailbox (mark-current, live-push T5): the
+/// snapshot render above already showed these items, so a later wake/per-turn
+/// drain must not re-render them. An unregistered session (post-restart) is
+/// expected and ignored silently.
+fn drain_and_discard(paths: &HookPaths, config: &HookConfig, workspace: &Path, session_id: &str) {
+    let ipc_config = IpcConfig {
+        read_deadline: config.timeout,
+        lifecycle_deadline: config.timeout,
+        ..IpcConfig::default()
+    };
+    let request = request_body(
+        &workspace.display().to_string(),
+        Operation::SessionPollInject,
+        Some(session_id),
+    );
+    let _ = call_connector(&paths.run_dir(), request.as_bytes(), &ipc_config);
 }
 
 /// Whether a resolved federation state carries nothing to render. The tool
@@ -1053,6 +1108,37 @@ fn federation_has_no_items(federation: &Federation) -> bool {
             .unwrap_or(true),
         Federation::Unenrolled | Federation::Degraded(_) => true,
     }
+}
+
+/// The `## Collaboration` emit-guidance section (live-push T5): present-tense
+/// instructional text with the emit command pre-filled from the hook's own
+/// paths (already local, already trusted). Enrolled workspaces get it;
+/// unenrolled and degraded get nothing — the section is filtered out by
+/// `filter(!section.is_empty())`.
+fn collaboration_section(federation: &Federation, paths: &HookPaths, workspace: &Path) -> String {
+    if matches!(federation, Federation::Unenrolled | Federation::Degraded(_)) {
+        return String::new();
+    }
+    let runtime = match &paths.runtime {
+        Some(path) => quote_runtime(path),
+        None => return String::new(),
+    };
+    let workspace = quote_runtime(workspace);
+    let global_root = quote_runtime(&paths.global_root);
+    let mut lines = vec!["## Collaboration".to_owned(), String::new()];
+    lines.push("Federation is live on this workspace. Others can see your work state.".to_owned());
+    lines.push(
+        "Tell them what you are doing when you start something, switch focus, get blocked, or finish:"
+            .to_owned(),
+    );
+    lines.push(format!(
+        "{runtime} federation emit {workspace} --global-root {global_root} --json"
+    ));
+    lines.push(
+        "Send: {\"type\":\"work.report\",\"state_key\":\"<what>\",\"summary\":\"<one-line>\",\"payload\":{\"state\":\"active|blocked|ready|published\"}}"
+            .to_owned(),
+    );
+    lines.join("\n")
 }
 
 /// Canonicalize, prove enrollment locally, then read the federation state.
@@ -1214,8 +1300,11 @@ mod tests {
         // path names and require each one to be a read. A frozen list of
         // forbidden variant names goes green the moment a new write operation is
         // added to the enum — `Operation::FederationEmit` is exactly that
-        // case — so the invariant is stated as "only the two read operations
-        // are reachable" and costs nothing to maintain.
+        // case — so the invariant is stated as "only the read operations and
+        // the session's own registration are reachable" and costs nothing to
+        // maintain. `SessionRegisterInject` is the session registering itself
+        // (live-push T5): it writes only the volatile in-memory channel
+        // registry, never the broker, and carries no envelope bytes.
         let named: Vec<&str> = production
             .match_indices("Operation::")
             .map(|(index, _)| {
@@ -1232,13 +1321,17 @@ mod tests {
         );
         for variant in &named {
             assert!(
-                matches!(*variant, "SnapshotGet" | "SessionPollInject"),
+                matches!(
+                    *variant,
+                    "SnapshotGet" | "SessionPollInject" | "SessionRegisterInject"
+                ),
                 "the read path named a non-read IPC operation: Operation::{variant}"
             );
         }
         // The import must not pull the enum in under another name either.
         assert!(production.contains("Operation::SnapshotGet"));
         assert!(production.contains("Operation::SessionPollInject"));
+        assert!(production.contains("Operation::SessionRegisterInject"));
         for reachable in ["crate::connector", "crate::service", "run_service"] {
             assert!(
                 !production.contains(reachable),
@@ -1557,6 +1650,103 @@ mod tests {
             Some(empty),
         );
         assert!(body.contains("## Federation"), "{body}");
+    }
+
+    #[test]
+    fn collaboration_section_shows_for_enrolled_and_is_absent_for_unenrolled() {
+        // T5: enrolled workspaces get the emit guidance with the hook's own
+        // pre-filled paths; unenrolled and degraded get nothing.
+        let paths = paths();
+        let enrolled = Federation::Snapshot(Value::Object(vec![
+            ("project_id".into(), Value::String("loam".into())),
+            ("items".into(), Value::Array(Vec::new())),
+        ]));
+        let section = collaboration_section(&enrolled, &paths, Path::new("/w/proj"));
+        assert!(section.starts_with("## Collaboration"), "{section}");
+        assert!(
+            section.contains("Federation is live on this workspace"),
+            "{section}"
+        );
+        assert!(section.contains("work.report"), "{section}");
+        // The emit command is pre-filled with the hook's own paths, quoted.
+        let expected = if cfg!(windows) {
+            "& '/opt/loam/bin/loam' federation emit '/w/proj' --global-root '/nonexistent-loam-root' --json"
+        } else {
+            "'/opt/loam/bin/loam' federation emit '/w/proj' --global-root '/nonexistent-loam-root' --json"
+        };
+        assert!(section.contains(expected), "{section}");
+
+        for federation in [
+            Federation::Unenrolled,
+            Federation::Degraded("connector_unreachable"),
+        ] {
+            assert_eq!(
+                collaboration_section(&federation, &paths, Path::new("/w/proj")),
+                "",
+                "unenrolled/degraded must not get the section"
+            );
+        }
+    }
+
+    #[test]
+    fn session_start_registers_and_marks_current_through_the_connector() {
+        // T5: on SessionStart with a session_id, the hook registers the session
+        // (no wake_ref) and then drains-and-discards the mailbox after the
+        // snapshot render. Both are fire-and-forget: an absent endpoint only
+        // degrades, never fails the session.
+        let root = std::path::PathBuf::from("/tmp").join(format!(
+            "loam-hook-t5-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let run_dir = root.join("run");
+        let endpoint = ipc::unix::bind(&run_dir).expect("bind");
+        let server = std::thread::spawn(move || {
+            // SessionStart makes two calls: the registration, then the
+            // mark-current drain. Serve both.
+            for _ in 0..2 {
+                let mut connection = endpoint.accept_verified().expect("accept");
+                let request =
+                    ipc::read_frame(&mut connection, &IpcConfig::default()).expect("request");
+                let parsed =
+                    crate::json::parse(std::str::from_utf8(&request).expect("utf8")).expect("json");
+                // The first call is the registration; the second is the
+                // mark-current drain. Both are the session's own read-path
+                // operations.
+                let operation = parsed.get("operation").and_then(Value::as_str).unwrap();
+                assert!(
+                    operation == "session.register-inject" || operation == "session.poll-inject",
+                    "unexpected operation {operation}"
+                );
+                let response = ipc::ok_response(
+                    "hook",
+                    crate::json::parse(r#"{"schema":1,"project_id":"loam","items":[]}"#).unwrap(),
+                );
+                ipc::write_frame(&mut connection, &response, &IpcConfig::default())
+                    .expect("respond");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+
+        let paths = HookPaths {
+            global_root: root,
+            ..paths()
+        };
+        let frame = crate::json::parse(r#"{"session_id":"sess-t5"}"#).unwrap();
+        let body = compose_body(
+            &paths,
+            &HookConfig::default(),
+            &frame,
+            HookEvent::SessionStart,
+            Some(Federation::Snapshot(Value::Object(vec![
+                ("project_id".into(), Value::String("loam".into())),
+                ("items".into(), Value::Array(Vec::new())),
+            ]))),
+        );
+        assert!(body.contains("## Collaboration"), "{body}");
+        server.join().expect("server thread");
     }
 
     #[test]
