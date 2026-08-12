@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import net from 'node:net';
 
 const UNAVAILABLE = '<LOAM_IMPORTANT>\nYou have loam.\nLoam is unavailable. Run: npx @scchearn/loam setup\n</LOAM_IMPORTANT>';
 
@@ -76,17 +77,131 @@ async function defaultContext({ workspace, event = 'SessionStart' }) {
 
 function responseData(response) { return response?.data ?? response; }
 
+// ---------------------------------------------------------------------------
+// Live wake server (live-push T4): a localhost notify listener that receives
+// the connector's one-shot wake frame and injects the rendered federation
+// refresh into the live session with `client.session.promptAsync()` — the item
+// lands before the agent's next user message. The plugin opens no connection
+// to the connector; it only listens on 127.0.0.1 and calls the native runtime.
+// ---------------------------------------------------------------------------
+
+const WAKE_KIND = 'loam-wake';
+
+async function spawnRuntime(args) {
+  return new Promise((settle) => {
+    let child;
+    try {
+      child = spawn(RUNTIME_PATH, args, { stdio: ['pipe', 'pipe', 'ignore'] });
+    } catch {
+      settle({ ok: false, body: '' });
+      return;
+    }
+    let body = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { body += chunk; });
+    child.once('error', () => settle({ ok: false, body: '' }));
+    child.once('close', () => settle({ ok: true, body: body.trim() }));
+    child.stdin.on('error', () => {});
+    child.stdin.end('{}');
+  });
+}
+
+/**
+ * Start the notify listener and register the wake_ref with the connector.
+ * `onWake` receives the rendered body and must inject it into the session.
+ * Returns a teardown that stops the listener and deregisters the session.
+ */
+export async function startLoamNotifyServer({
+  workspace,
+  sessionId,
+  globalRoot,
+  onWake,
+  register = null,
+}) {
+  const server = net.createServer((socket) => {
+    let frame = '';
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk) => {
+      frame += chunk;
+      if (frame.includes('"kind":"loam-wake"')) {
+        socket.end();
+        void onWake();
+      }
+    });
+    socket.on('error', () => {});
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  const wakeRef = `notify-tcp://127.0.0.1:${port}`;
+  const runDir = join(globalRoot, 'run');
+  const reg = register || (async (action, ref) => {
+    const args = [
+      'federation', 'inject', action,
+      '--workspace', workspace,
+      '--global-root', globalRoot,
+      '--session-id', sessionId,
+    ];
+    if (ref) args.push('--wake-ref', ref);
+    return spawnRuntime(args);
+  });
+  const registered = await reg('register', wakeRef).catch(() => null);
+  return {
+    wakeRef,
+    registered: Boolean(registered?.ok),
+    close: async () => {
+      await new Promise((resolve) => server.close(resolve));
+      await reg('drop', null).catch(() => {});
+    },
+  };
+}
+
 export function createOpenCodeAdapter({
   client,
   integrationPath,
   getContext = defaultContext,
   ingestion = {},
   hookRuns = {},
+  wakeServer = startLoamNotifyServer,
 } = {}) {
   const childSessions = new Set();
   const completedChildSessions = new Set();
   const completedOrder = [];
   const COMPLETED_CHILD_MAX = 64;
+  // Live wake state (live-push T4), kept per adapter instance so tests that
+  // create several adapters in one process cannot cross-contaminate.
+  const loamWake = { server: null, pending: false, sessionId: null };
+
+  const resolveLoamRoot = () => {
+    if (process.env.LOAM_HOME && isAbsolute(process.env.LOAM_HOME)) return process.env.LOAM_HOME;
+    return join(homedir(), '.agents', 'loam');
+  };
+
+  // Wake injection: render the federation refresh through the same read path
+  // the per-turn boundary uses, then push it into the live session with
+  // promptAsync. The guard prevents two overlapping injections from queuing
+  // the same wake twice; the renderer collapses duplicate items by key anyway.
+  const injectWake = async (workspace) => {
+    if (loamWake.pending || !loamWake.sessionId || !sdk?.session?.promptAsync) return;
+    loamWake.pending = true;
+    try {
+      const context = await getContext({ harness: 'opencode', workspace, integrationPath, event: 'UserPromptSubmit' });
+      if (context && context !== UNAVAILABLE) {
+        await sdk.session.promptAsync({
+          path: { id: loamWake.sessionId },
+          body: { parts: [{ type: 'text', text: context }] },
+        });
+      }
+    } catch {
+      // Wake is best-effort: a failed injection degrades to the next natural
+      // turn boundary, which still drains the mailbox.
+    } finally {
+      loamWake.pending = false;
+    }
+  };
   const rememberCompleted = (id) => {
     childSessions.delete(id);
     if (completedChildSessions.has(id)) return;
@@ -123,6 +238,35 @@ export function createOpenCodeAdapter({
       firstUser.parts.unshift({ ...reference, type: 'text', text: context });
     },
     event: async ({ event } = {}) => {
+      if (event?.type === 'session.created' && !loamWake.server) {
+        // First session of this adapter instance: open the notify listener and
+        // register the wake_ref with the connector. One listener per plugin
+        // instance; later sessions share it (the connector fans out per
+        // registered session id).
+        const childId = event.sessionID || event.session_id || event.properties?.sessionID || event.properties?.session_id;
+        const workspace = directory || event.directory || process.cwd();
+        loamWake.sessionId = typeof childId === 'string' ? childId : null;
+        void (async () => {
+          try {
+            loamWake.server = await wakeServer({
+              workspace,
+              sessionId: loamWake.sessionId || 'unknown',
+              globalRoot: resolveLoamRoot(),
+              onWake: () => injectWake(workspace),
+            });
+          } catch {
+            // No listener, no wake: the per-turn boundary still delivers.
+          }
+        })();
+        return;
+      }
+      if ((event?.type === 'session.deleted' || event?.type === 'session.ended') && loamWake.server) {
+        const teardown = loamWake.server;
+        loamWake.server = null;
+        loamWake.sessionId = null;
+        void teardown.close().catch(() => {});
+        return;
+      }
       if (event?.type !== 'session.idle') return;
       const childId = event.sessionID || event.session_id || event.properties?.sessionID || event.properties?.session_id;
       if (childId && (childSessions.has(childId) || completedChildSessions.has(childId))) return;
