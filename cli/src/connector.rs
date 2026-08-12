@@ -15,6 +15,7 @@
 //! module-level allow once the stub and probe are wired to the CLI surface.
 #![allow(dead_code)]
 
+use std::io::Write;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -891,12 +892,15 @@ struct MailboxInner {
 }
 
 /// One registered inject channel. `channel_ref` is opaque: the plugin hands it
-/// over and the connector holds it without interpreting it.
+/// over and the connector holds it without interpreting it. `wake_ref` is the
+/// optional wake target the connector fires on new items — either or both may
+/// be absent (a registration may be mailbox-only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InjectChannel {
     pub session_id: String,
     pub project_id: String,
-    pub channel_ref: String,
+    pub channel_ref: Option<String>,
+    pub wake_ref: Option<String>,
 }
 
 impl ChannelRegistry {
@@ -980,6 +984,82 @@ impl ChannelRegistry {
                 .collect(),
         )
     }
+
+    /// Collect the wake targets of every registered session for a project,
+    /// without touching the lock: the caller performs the I/O after the lock
+    /// is dropped.
+    fn wake_targets(&self, project_id: &str) -> Vec<String> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        inner
+            .sessions
+            .values()
+            .filter(|channel| channel.project_id == project_id)
+            .filter_map(|channel| channel.wake_ref.clone())
+            .collect()
+    }
+}
+
+/// Wake frame shape shared by every adapter. Metadata-only by construction:
+/// `project` and `hint` are the only fields, and `hint` is a topic-derived id,
+/// never sender text. The structural test scans serialized wake bytes for
+/// every rendered field of the admitted item and finds none of them.
+fn wake_frame(project_id: &str, hint: Option<&str>) -> String {
+    crate::json::Value::Object(vec![
+        (
+            "kind".into(),
+            crate::json::Value::String("loam-wake".into()),
+        ),
+        (
+            "project".into(),
+            crate::json::Value::String(project_id.into()),
+        ),
+        (
+            "hint".into(),
+            crate::json::Value::String(hint.unwrap_or_default().into()),
+        ),
+    ])
+    .to_json()
+}
+
+/// Best-effort, one-shot wake of every registered session for a project after
+/// a changed admit. Never blocks the receive loop and never lets an error
+/// escape: connect failures and unknown schemes are all eaten silently per the
+/// degrade rule. Cross-platform std APIs only — no unix-only syscalls, so the
+/// windows-2022 CI legs exercise the same wake path.
+fn wake_all(channels: &ChannelRegistry, project_id: &str, hint: Option<&str>) {
+    // Collect targets under the lock, then do the I/O after it is dropped: a
+    // blocking connect inside the lock would stall every other pump sharing
+    // the mailbox mutex.
+    let targets = channels.wake_targets(project_id);
+    for target in targets {
+        let _ = wake_one(&target, project_id, hint);
+    }
+}
+
+fn wake_one(target: &str, project_id: &str, hint: Option<&str>) -> Result<(), String> {
+    let Some(rest) = target.strip_prefix("notify-tcp://") else {
+        // Unknown scheme: skip silently — a wake target a connector does not
+        // understand is a wake it does not attempt, and a malformed wake_ref
+        // never blocks the pump or fails the mailbox.
+        return Ok(());
+    };
+    let (host, port) = rest
+        .rsplit_once(':')
+        .ok_or_else(|| format!("malformed notify-tcp wake_ref: {target}"))?;
+    let address = format!("{host}:{port}");
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &address
+            .parse()
+            .map_err(|_| format!("bad address {address}"))?,
+        Duration::from_secs(1),
+    )
+    .map_err(|error| format!("wake connect to {address}: {error}"))?;
+    let frame = wake_frame(project_id, hint);
+    stream
+        .write_all(frame.as_bytes())
+        .map_err(|error| format!("wake write to {address}: {error}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1593,6 +1673,20 @@ fn pump(
                             for item in items {
                                 channels.push(parsed.project, &item, SNAPSHOT_CAPACITY);
                             }
+                            // Wake fanout (live-push T1): after the mailbox push,
+                            // fire a best-effort metadata-only wake to every
+                            // registered session on this project that asked for
+                            // one. The hint is the admitted envelope's event id
+                            // when the outcome carries one, else the topic class.
+                            let hint = match &outcome {
+                                ReceiveOutcome::Accepted(validated) => {
+                                    Some(validated.as_envelope().id.clone())
+                                }
+                                _ => {
+                                    Some(topic.split('/').next_back().unwrap_or("state").to_owned())
+                                }
+                            };
+                            wake_all(&channels, parsed.project, hint.as_deref());
                         }
                     }
                 }
@@ -1793,7 +1887,8 @@ fn dispatch_for_key(
             // Admit the session's inject channel to the volatile in-memory
             // registry (2026-08-08 amendment). The enrollment + project binding
             // were already proven above. Nothing is written to SQLite; injection
-            // over the channel is live injection.
+            // over the channel is live injection. Either ref may be absent: a
+            // wake_ref-only or mailbox-only registration is valid.
             let session_id = request
                 .payload
                 .get("session_id")
@@ -1803,11 +1898,17 @@ fn dispatch_for_key(
                 .payload
                 .get("channel_ref")
                 .and_then(|v| v.as_str())
-                .ok_or(ipc::IpcError::InvalidRequest)?;
+                .map(str::to_owned);
+            let wake_ref = request
+                .payload
+                .get("wake_ref")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
             state.channels.register(InjectChannel {
                 session_id: session_id.to_owned(),
                 project_id: row.project_id.clone(),
-                channel_ref: channel_ref.to_owned(),
+                channel_ref,
+                wake_ref,
             });
             Ok(register_ack_json(session_id, &row.project_id))
         }
@@ -2848,6 +2949,7 @@ mod service_tests {
     use crate::enrollment::{
         CapabilityRecord, PhysicalWorkspace, PlatformIdentity, ValidatedEnrollment, ValidatedRemote,
     };
+    use std::io::Read;
 
     fn temp_db(label: &str) -> std::path::PathBuf {
         // Leaked on purpose: connector.rs is not on the filesystem capability
@@ -3249,7 +3351,8 @@ mod service_tests {
         state.channels.register(InjectChannel {
             session_id: "sess-2".into(),
             project_id: "loam".into(),
-            channel_ref: "c".into(),
+            channel_ref: Some("c".into()),
+            wake_ref: None,
         });
         assert!(state.channels.contains("sess-2"));
         assert!(state.channels.drop_session("sess-2"));
@@ -3494,6 +3597,267 @@ mod service_tests {
             1,
             "the enrollment itself must survive the restart"
         );
+    }
+
+    // --- T1 (live-push): wake fanout ---
+
+    /// Bind a one-shot localhost TCP listener and return it plus its address,
+    /// so a test can register a `notify-tcp://` wake_ref and observe the wake
+    /// frame the connector delivers.
+    fn wake_listener() -> (std::net::TcpListener, std::net::SocketAddr) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind wake listener");
+        let address = listener.local_addr().expect("listener address");
+        (listener, address)
+    }
+
+    /// Accept one wake connection on the listener and return the bytes read,
+    /// waiting at most 2 seconds so a missing wake never hangs the test.
+    fn accept_wake_frame(listener: &std::net::TcpListener) -> String {
+        listener
+            .set_nonblocking(true)
+            .expect("listener nonblocking");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    let read = stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .and_then(|_| stream.read(&mut buffer))
+                        .unwrap_or(0);
+                    bytes.extend_from_slice(&buffer[..read]);
+                    return String::from_utf8_lossy(&bytes).into_owned();
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("no wake connection arrived within 2s");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(other) => panic!("wake accept failed: {other}"),
+            }
+        }
+    }
+
+    /// A wake_ref-bearing registration, mirroring the pump's fanout shape.
+    fn wake_register_request(session_id: &str, channel_ref: &str, wake_ref: &str) -> Request {
+        Request {
+            request_id: "r-wake".into(),
+            workspace: "/w/proj".into(),
+            operation: Operation::SessionRegisterInject,
+            payload: crate::json::Value::Object(vec![
+                (
+                    "session_id".into(),
+                    crate::json::Value::String(session_id.into()),
+                ),
+                (
+                    "channel_ref".into(),
+                    crate::json::Value::String(channel_ref.into()),
+                ),
+                (
+                    "wake_ref".into(),
+                    crate::json::Value::String(wake_ref.into()),
+                ),
+            ]),
+        }
+    }
+
+    /// The rendered field values of an admitted item that must never appear in
+    /// a wake frame. Scanning for these proves the wake channel is
+    /// metadata-only.
+    fn item_render_fields(item: &SnapshotItem) -> Vec<String> {
+        vec![
+            item.summary.clone(),
+            item.from_principal_id.clone(),
+            item.key.clone(),
+            item.payload.to_json(),
+        ]
+    }
+
+    #[test]
+    fn registered_session_with_wake_ref_receives_a_metadata_only_wake_frame() {
+        let (path, key) = enrolled_db("wake-tcp", 20, 200);
+        let mut state = ConnectorState::new();
+        let (listener, address) = wake_listener();
+        let wake_ref = format!("notify-tcp://{address}");
+        dispatch_for_key(
+            &wake_register_request("sess-wake", "chan-wake", &wake_ref),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register with wake_ref");
+
+        let item = sample_item("inbox:wake:01", "Private summary.");
+
+        // Fan out exactly as the pump does after a changed admit.
+        state.channels.push("loam", &item, SNAPSHOT_CAPACITY);
+        wake_all(&state.channels, "loam", Some("event-id-42"));
+
+        let frame = accept_wake_frame(&listener);
+        let parsed = crate::json::parse(&frame).expect("wake frame is valid JSON");
+        assert_eq!(
+            parsed.get("kind").and_then(crate::json::Value::as_str),
+            Some("loam-wake")
+        );
+        assert_eq!(
+            parsed.get("project").and_then(crate::json::Value::as_str),
+            Some("loam")
+        );
+        assert_eq!(
+            parsed.get("hint").and_then(crate::json::Value::as_str),
+            Some("event-id-42")
+        );
+        for field in item_render_fields(&item) {
+            assert!(
+                !frame.contains(&field),
+                "the wake frame must not carry item content, found {field:?}: {frame}"
+            );
+        }
+        assert!(
+            !frame.contains("summary") && !frame.contains("principal"),
+            "no sender-content keys may ride the wake frame: {frame}"
+        );
+    }
+
+    #[test]
+    fn session_without_wake_ref_produces_no_wake() {
+        let mut channels = ChannelRegistry::new();
+        let (listener, address) = wake_listener();
+        // Register without a wake_ref; a plain channel is the mailbox-only case.
+        channels.register(InjectChannel {
+            session_id: "sess-plain".into(),
+            project_id: "loam".into(),
+            channel_ref: Some("chan-plain".into()),
+            wake_ref: None,
+        });
+        // A second session has a wake_ref, so a wake *would* fire if the plain
+        // one's absence were mis-read.
+        channels.register(InjectChannel {
+            session_id: "sess-wakey".into(),
+            project_id: "loam".into(),
+            channel_ref: Some("chan-wakey".into()),
+            wake_ref: Some(format!("notify-tcp://{address}")),
+        });
+
+        channels.push(
+            "loam",
+            &sample_item("inbox:wake:02", "Plain."),
+            SNAPSHOT_CAPACITY,
+        );
+        wake_all(&channels, "loam", None);
+
+        // Only the wake_ref-bearing session connects.
+        let frame = accept_wake_frame(&listener);
+        assert!(
+            !frame.is_empty(),
+            "the wake_ref session must still be woken"
+        );
+    }
+
+    #[test]
+    fn wake_to_a_dead_port_never_blocks_or_fails_the_push() {
+        let mut channels = ChannelRegistry::new();
+        // An address nothing listens on: connect must fail fast, and the error
+        // must be swallowed — the pump loop keeps going either way.
+        channels.register(InjectChannel {
+            session_id: "sess-dead".into(),
+            project_id: "loam".into(),
+            channel_ref: Some("chan-dead".into()),
+            wake_ref: Some("notify-tcp://127.0.0.1:1".into()),
+        });
+
+        let item = sample_item("inbox:wake:03", "Still stored.");
+        channels.push("loam", &item, SNAPSHOT_CAPACITY);
+        // No panic, no hang: wake_all returns normally.
+        wake_all(&channels, "loam", Some("hint-dead"));
+
+        // And the mailbox still holds the item for the next poll.
+        let drained = channels.poll("sess-dead").expect("registered");
+        assert_eq!(drained.len(), 1);
+    }
+
+    #[test]
+    fn two_sessions_with_wake_refs_both_get_woken() {
+        let mut channels = ChannelRegistry::new();
+        let (listener_a, address_a) = wake_listener();
+        let (listener_b, address_b) = wake_listener();
+        channels.register(InjectChannel {
+            session_id: "sess-a".into(),
+            project_id: "loam".into(),
+            channel_ref: Some("chan-a".into()),
+            wake_ref: Some(format!("notify-tcp://{address_a}")),
+        });
+        channels.register(InjectChannel {
+            session_id: "sess-b".into(),
+            project_id: "loam".into(),
+            channel_ref: Some("chan-b".into()),
+            wake_ref: Some(format!("notify-tcp://{address_b}")),
+        });
+
+        channels.push(
+            "loam",
+            &sample_item("inbox:wake:04", "Both woken."),
+            SNAPSHOT_CAPACITY,
+        );
+        wake_all(&channels, "loam", Some("hint-both"));
+
+        let frame_a = accept_wake_frame(&listener_a);
+        let frame_b = accept_wake_frame(&listener_b);
+        assert!(frame_a.contains("loam-wake"));
+        assert!(frame_b.contains("loam-wake"));
+    }
+
+    #[test]
+    fn an_unknown_wake_scheme_is_ignored_silently() {
+        let mut channels = ChannelRegistry::new();
+        // A wake_ref the connector does not understand: skipped silently, and
+        // the mailbox still holds the item for the next poll.
+        channels.register(InjectChannel {
+            session_id: "sess-odd".into(),
+            project_id: "loam".into(),
+            channel_ref: Some("chan-odd".into()),
+            wake_ref: Some("telepathy://session-1".into()),
+        });
+        channels.push(
+            "loam",
+            &sample_item("inbox:wake:05", "Odd."),
+            SNAPSHOT_CAPACITY,
+        );
+        // Must not panic, must not hang, must not propagate an error.
+        wake_all(&channels, "loam", Some("hint-odd"));
+        let drained = channels.poll("sess-odd").expect("registered");
+        assert_eq!(drained.len(), 1, "mailbox survives an unknown wake scheme");
+        assert_eq!(channels.len(), 1, "the session stays registered");
+    }
+
+    #[test]
+    fn registration_accepts_mailbox_only_without_channel_or_wake_ref() {
+        let (path, key) = enrolled_db("wake-mailbox-only", 21, 210);
+        let mut state = ConnectorState::new();
+        // Neither ref present: mailbox-only registration, valid per the plan.
+        let request = Request {
+            request_id: "r-mb".into(),
+            workspace: "/w/proj".into(),
+            operation: Operation::SessionRegisterInject,
+            payload: crate::json::Value::Object(vec![(
+                "session_id".into(),
+                crate::json::Value::String("sess-mb".into()),
+            )]),
+        };
+        let result = dispatch_for_key(&request, &key, &path, &mut state).expect("register");
+        assert!(result.to_json().contains("inject-channel-registered"));
+        assert!(state.channels.contains("sess-mb"));
+        // And the channel is pollable: a mailbox-only session still receives
+        // items.
+        state.channels.push(
+            "loam",
+            &sample_item("inbox:wake:07", "Mailbox."),
+            SNAPSHOT_CAPACITY,
+        );
+        let drained = state.channels.poll("sess-mb").expect("registered");
+        assert_eq!(drained.len(), 1);
     }
 }
 

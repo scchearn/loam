@@ -2404,6 +2404,13 @@ mod tests {
         // network egress. It is admitted here alone; every other module stays
         // barred, and no TCP/UDP/HTTP surface is ever allowed.
         let unix_socket_ipc = "ipc/unix.rs";
+        // The connector's wake adapter (live-push T1): `notify-tcp://` does a
+        // one-shot localhost TCP connect with a metadata-only wake frame.
+        // Best-effort fire-and-forget with no persistent connection, no read
+        // of any response, and errors eaten per the degrade rule; the
+        // connector stays barred from subprocess spawn and from every other
+        // network surface.
+        let connector_wake = "connector.rs";
         for (path, production) in crate_production_sources() {
             for forbidden in [
                 "std::net",
@@ -2416,6 +2423,9 @@ mod tests {
                 "curl ",
             ] {
                 if forbidden == "UnixStream" && path == unix_socket_ipc {
+                    continue;
+                }
+                if (forbidden == "std::net" || forbidden == "TcpStream") && path == connector_wake {
                     continue;
                 }
                 assert!(
