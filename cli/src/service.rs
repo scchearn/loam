@@ -469,11 +469,17 @@ fn systemd_symlink_missing_error() -> ServiceError {
 /// disabled registration.
 pub fn install<R: CommandRunner>(runner: &R, ctx: &ServiceContext) -> Result<(), ServiceError> {
     write_definition(ctx)?;
+    run_all(runner, &install_commands(ctx))?;
+    // The manager's own `disable` removes every symlink to the unit from the
+    // unit path — including the discoverability symlink just placed (systemd
+    // `disable` undoes everything `enable` created, and the search-path symlink
+    // is one of them). Re-assert it after the manager commands so a dormant
+    // install still leaves the unit discoverable for the later `enable --now`.
     #[cfg(target_os = "linux")]
     if let Some(dir) = &ctx.systemd_user_dir {
         ensure_systemd_symlink(ctx, dir)?;
     }
-    run_all(runner, &install_commands(ctx))
+    Ok(())
 }
 
 /// Remove the definition, its file, and (Linux) the discoverability symlink.
@@ -974,5 +980,51 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&context.global_root);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A runner that simulates systemd's `disable` behavior: it removes the
+    /// discoverability symlink from the unit path, exactly as `systemctl
+    /// disable` undoes everything `enable` created. This is the regression the
+    /// cross-test caught — `install` placed the symlink, then the manager's
+    /// `disable` removed it, and `enable_start`'s presence check failed.
+    #[cfg(target_os = "linux")]
+    struct DisableRemovesSymlinkRunner {
+        dir: std::path::PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl CommandRunner for DisableRemovesSymlinkRunner {
+        fn run(&self, command: &ManagerCommand) -> Result<i32, ServiceError> {
+            if command.args.iter().any(|arg| arg == "disable") {
+                let target = systemd_symlink_target(&self.dir);
+                let _ = std::fs::remove_file(target);
+            }
+            Ok(0)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_reasserts_the_symlink_after_the_manager_disable_removes_it() {
+        let context = ctx("symlink-reassert");
+        let dir = context.systemd_user_dir.as_ref().unwrap().clone();
+        let runner = DisableRemovesSymlinkRunner { dir: dir.clone() };
+        install(&runner, &context).unwrap();
+        let target = systemd_symlink_target(&dir);
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "install must re-assert the symlink after the manager's disable removed it"
+        );
+        assert_eq!(
+            std::fs::read_link(&target).unwrap(),
+            definition_path(&context),
+            "the re-asserted symlink must point at the versioned unit"
+        );
+        // And enable_start must now succeed — the presence check passes.
+        enable_start(&runner, &context).unwrap();
+        let _ = std::fs::remove_dir_all(&context.global_root);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
