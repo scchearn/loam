@@ -174,6 +174,9 @@ export function createOpenCodeAdapter({
   // Live wake state (live-push T4), kept per adapter instance so tests that
   // create several adapters in one process cannot cross-contaminate.
   const loamWake = { server: null, pending: false, sessionId: null };
+  // sdk is assigned in the inner function below; declared here so injectWake's
+  // closure can see it (it's in the outer scope, not the inner return function).
+  let sdk = null;
 
   const resolveLoamRoot = () => {
     if (process.env.LOAM_HOME && isAbsolute(process.env.LOAM_HOME)) return process.env.LOAM_HOME;
@@ -191,8 +194,8 @@ export function createOpenCodeAdapter({
       const context = await getContext({ harness: 'opencode', workspace, integrationPath, event: 'UserPromptSubmit' });
       if (context && context !== UNAVAILABLE) {
         await sdk.session.promptAsync({
-          path: { id: loamWake.sessionId },
-          body: { parts: [{ type: 'text', text: context }] },
+          sessionID: loamWake.sessionId,
+          parts: [{ type: 'text', text: context }],
         });
       }
     } catch {
@@ -219,7 +222,7 @@ export function createOpenCodeAdapter({
   const hookWorkerFinish = hookRuns.finishHookWorker || finishHookWorker;
   const hookGlobalRoot = hookRuns.resolveGlobalRoot || resolveGlobalRoot;
   return async ({ directory, client: invocationClient } = {}) => {
-    const sdk = client || invocationClient;
+    sdk = client || invocationClient;
     // T4: the first transform fire is the session start (full block); every
     // later fire is a per-turn refresh (federation only). The native hook
     // renders the right shape for the event, so the adapter only tracks which
