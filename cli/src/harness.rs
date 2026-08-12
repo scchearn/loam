@@ -93,15 +93,24 @@ impl Harness {
 pub enum HookEvent {
     SessionStart,
     UserPromptSubmit,
+    /// A tool is about to run (Claude/Codex). A per-turn boundary like
+    /// `UserPromptSubmit`: the mailbox is drained first and the federation
+    /// refresh rendered only when there are items, else the harness's valid
+    /// empty envelope — bounded local cost, no broker contact.
+    PreToolUse,
+    /// A tool just ran (Claude/Codex). Same semantics as `PreToolUse`.
+    PostToolUse,
 }
 
 impl HookEvent {
     /// Each harness spells its own boundary: Claude uses PascalCase hook names,
-    /// Cursor uses camelCase. Both map onto the same two boundaries.
+    /// Cursor uses camelCase. Both map onto the same boundaries.
     pub fn parse(id: &str) -> Option<HookEvent> {
         match id {
             "SessionStart" | "sessionStart" => Some(HookEvent::SessionStart),
             "UserPromptSubmit" | "userPromptSubmit" => Some(HookEvent::UserPromptSubmit),
+            "PreToolUse" | "preToolUse" => Some(HookEvent::PreToolUse),
+            "PostToolUse" | "postToolUse" => Some(HookEvent::PostToolUse),
             _ => None,
         }
     }
@@ -110,6 +119,8 @@ impl HookEvent {
         match self {
             HookEvent::SessionStart => "SessionStart",
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
+            HookEvent::PreToolUse => "PreToolUse",
+            HookEvent::PostToolUse => "PostToolUse",
         }
     }
 }
@@ -307,7 +318,10 @@ fn query_federation(
     };
     // Per-turn: drain the mailbox first. The connector refuses an unregistered
     // session, which is the restart case — fall back to the snapshot.
-    if event == HookEvent::UserPromptSubmit {
+    if matches!(
+        event,
+        HookEvent::UserPromptSubmit | HookEvent::PreToolUse | HookEvent::PostToolUse
+    ) {
         if let Some(session_id) = session_id {
             let poll = request_body(workspace, Operation::SessionPollInject, Some(session_id));
             if let Ok(body) = call_connector(&paths.run_dir(), poll.as_bytes(), &ipc_config) {
@@ -980,9 +994,20 @@ pub fn compose_body(
         resolve_federation(paths, config, workspace.as_path(), event, session_id)
     });
 
-    if event == HookEvent::UserPromptSubmit {
+    if matches!(
+        event,
+        HookEvent::UserPromptSubmit | HookEvent::PreToolUse | HookEvent::PostToolUse
+    ) {
         // Per-turn refresh: federation only, wrapped in the same framing so the
-        // harness treats it as the same kind of context it already has.
+        // harness treats it as the same kind of context it already has. On the
+        // tool boundaries the empty path is the harness's valid empty envelope
+        // (the hook always exits 0), so a tool call with nothing new costs one
+        // short local IPC round trip and no broker contact.
+        if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
+            && federation_has_no_items(&federation)
+        {
+            return String::new();
+        }
         return format!(
             "<LOAM_IMPORTANT>\n\n{}\n\n</LOAM_IMPORTANT>",
             federation_section(&federation, config, &paths.allowlist())
@@ -1014,6 +1039,20 @@ pub fn compose_body(
         .collect::<Vec<_>>()
         .join("\n\n");
     format!("<LOAM_IMPORTANT>\n\n{content}\n\n</LOAM_IMPORTANT>")
+}
+
+/// Whether a resolved federation state carries nothing to render. The tool
+/// boundaries use this to emit the harness's valid empty envelope instead of a
+/// full federation section when the mailbox reported no items.
+fn federation_has_no_items(federation: &Federation) -> bool {
+    match federation {
+        Federation::Snapshot(result) => result
+            .get("items")
+            .and_then(Value::as_array)
+            .map(|items| items.is_empty())
+            .unwrap_or(true),
+        Federation::Unenrolled | Federation::Degraded(_) => true,
+    }
 }
 
 /// Canonicalize, prove enrollment locally, then read the federation state.
@@ -1125,7 +1164,7 @@ fn refuse(harness: Harness, event: HookEvent, code: &str, body_only: bool) -> i3
 }
 
 fn usage() {
-    eprintln!("Usage: loam hook <opencode|claude|codex|cursor> [--workspace <absolute-path>] [--event <SessionStart|UserPromptSubmit>] [--body]");
+    eprintln!("Usage: loam hook <opencode|claude|codex|cursor> [--workspace <absolute-path>] [--event <SessionStart|UserPromptSubmit|PreToolUse|PostToolUse>] [--body]");
 }
 
 #[cfg(test)]
@@ -1255,7 +1294,12 @@ mod tests {
             HookEvent::parse("UserPromptSubmit"),
             Some(HookEvent::UserPromptSubmit)
         );
-        for unknown in ["Stop", "PreToolUse", "", "userpromptsubmit"] {
+        assert_eq!(HookEvent::parse("PreToolUse"), Some(HookEvent::PreToolUse));
+        assert_eq!(
+            HookEvent::parse("postToolUse"),
+            Some(HookEvent::PostToolUse)
+        );
+        for unknown in ["Stop", "", "userpromptsubmit", "pretooluse"] {
             assert_eq!(
                 HookEvent::parse(unknown),
                 None,
@@ -1446,6 +1490,73 @@ mod tests {
         assert!(start.contains("You have loam"), "{start}");
         assert!(start.contains("## Workspace state"), "{start}");
         assert!(start.contains("## Federation"), "{start}");
+    }
+
+    #[test]
+    fn tool_boundaries_render_federation_only_and_empty_pool_emits_the_empty_envelope() {
+        // T3: PreToolUse/PostToolUse behave like UserPromptSubmit — federation
+        // only — except that an empty pool yields the harness's valid empty
+        // envelope (empty body) instead of a full federation section, so a tool
+        // call with nothing new costs one short local IPC round trip.
+        let paths = paths();
+        let frame = Value::Object(Vec::new());
+        let config = HookConfig::default();
+
+        // Empty snapshot: the tool boundary emits nothing at all.
+        let empty = Federation::Snapshot(Value::Object(vec![
+            ("project_id".into(), Value::String("loam".into())),
+            ("items".into(), Value::Array(Vec::new())),
+        ]));
+        for event in [HookEvent::PreToolUse, HookEvent::PostToolUse] {
+            let body = compose_body(&paths, &config, &frame, event, Some(empty.clone()));
+            assert_eq!(
+                body, "",
+                "{event:?} with an empty pool must emit the empty envelope"
+            );
+        }
+
+        // Pending items: the federation-only refresh renders, like UserPromptSubmit.
+        let items = vec![crate::json::parse(
+            r#"{"source":"s","type":"io.loam.message","summary":"Fresh.","from":{"principal_id":"employee-1"}}"#,
+        )
+        .unwrap()];
+        let pending = Federation::Snapshot(Value::Object(vec![
+            ("project_id".into(), Value::String("loam".into())),
+            ("items".into(), Value::Array(items)),
+        ]));
+        for event in [HookEvent::PreToolUse, HookEvent::PostToolUse] {
+            let body = compose_body(&paths, &config, &frame, event, Some(pending.clone()));
+            assert!(body.starts_with("<LOAM_IMPORTANT>"), "{event:?}");
+            assert!(body.contains("## Federation"), "{event:?}: {body}");
+            assert!(body.contains("Fresh."), "{event:?}: {body}");
+            assert!(!body.contains("You have loam"), "{event:?}: {body}");
+        }
+
+        // Degraded and unenrolled also emit the empty envelope on tool boundaries.
+        for federation in [
+            Federation::Degraded("connector_unreachable"),
+            Federation::Unenrolled,
+        ] {
+            let body = compose_body(
+                &paths,
+                &config,
+                &frame,
+                HookEvent::PreToolUse,
+                Some(federation),
+            );
+            assert_eq!(body, "", "degraded/unenrolled tool boundary must be empty");
+        }
+
+        // UserPromptSubmit keeps its current behavior: it always renders the
+        // federation section, even when the pool is empty.
+        let body = compose_body(
+            &paths,
+            &config,
+            &frame,
+            HookEvent::UserPromptSubmit,
+            Some(empty),
+        );
+        assert!(body.contains("## Federation"), "{body}");
     }
 
     #[test]

@@ -37,7 +37,11 @@ const INGESTION_SUBTREE_DIRS = ['integration', 'adapters'];
 const FORBIDDEN = [
   ['retired-node-integration', /integration\/(loam|context)\.mjs|formatContext|runIntegration/],
   ['broker', /rumqttc|MqttTransport|MqttSession|DeliveryProcessor|\bmqtts?:\/\//],
-  ['connector-ipc', /node:net\b|UnixStream|createConnection|federation\.snapshot/],
+  // The connector is reached only through the native runtime's `federation
+  // inject`/`hook` commands. `node:net` appears in the OpenCode adapter for
+  // the localhost notify wake listener only (live-push T4): it never connects
+  // to the connector socket and never opens the broker.
+  ['connector-ipc', /UnixStream|createConnection|federation\.snapshot|createClient|connect\(\{/],
   ['registry-or-dedupe', /record_response|causation_id|ChannelRegistry|SnapshotStore/],
   ['collaboration-state', /sender_scope|handler-allowlist|publication:\s*verified/],
   ['service-manager', /systemctl|launchctl|\bsc\.exe|LaunchAgents|systemd/],
@@ -122,11 +126,22 @@ test('every harness registration invokes the absolute native runtime, not a Node
     const hooks = JSON.parse(await readFile(join(cache, 'hooks', 'hooks.json'), 'utf8'));
     const start = sessionEntries(hooks, 'SessionStart');
     const refresh = sessionEntries(hooks, 'UserPromptSubmit');
+    const preTool = sessionEntries(hooks, 'PreToolUse');
+    const postTool = sessionEntries(hooks, 'PostToolUse');
     assert.equal(start.length, 1, `${id} SessionStart`);
     assert.equal(refresh.length, 1, `${id} UserPromptSubmit`);
+    assert.equal(preTool.length, 1, `${id} PreToolUse`);
+    assert.equal(postTool.length, 1, `${id} PostToolUse`);
     assert.equal(start[0].command, runtimePath);
     assert.deepEqual(start[0].args, ['hook', id, '--event', 'SessionStart']);
     assert.deepEqual(refresh[0].args, ['hook', id, '--event', 'UserPromptSubmit']);
+    assert.deepEqual(preTool[0].args, ['hook', id, '--event', 'PreToolUse']);
+    assert.deepEqual(postTool[0].args, ['hook', id, '--event', 'PostToolUse']);
+    // PreToolUse is restricted to the chatty tool names; PostToolUse runs after any tool.
+    const preToolGroup = hooks.hooks.PreToolUse[0];
+    const postToolGroup = hooks.hooks.PostToolUse[0];
+    assert.match(preToolGroup.matcher, /Bash\|Task\|Write\|Edit\|MultiEdit\|Glob\|Grep\|Read/);
+    assert.equal(postToolGroup.matcher, undefined);
     // Stop stays Node: it is the ingestion boundary, not the read path.
     assert.match(JSON.stringify(sessionEntries(hooks, 'Stop')), /stop\.mjs/);
   }
@@ -187,7 +202,7 @@ test('the structural scan catches a deliberately planted violation', async () =>
   const planted = [
     ['retired-node-integration', "import { formatContext } from '../integration/context.mjs';"],
     ['broker', 'const url = "mqtts://broker.example";'],
-    ['connector-ipc', "import net from 'node:net';"],
+    ['connector-ipc', 'net.createConnection();'],
     ['registry-or-dedupe', 'const key = causation_id;'],
     ['collaboration-state', 'const scope = { sender_scope: [] };'],
     ['service-manager', 'spawn("systemctl", ["--user", "start", "loam"]);'],
@@ -224,7 +239,7 @@ test('the extended scan catches a violation planted in the ingestion subtree', a
   assert.deepEqual(scanSubtreeSource(clean), []);
   for (const [expected, line] of [
     ['broker', 'const url = "mqtts://broker.example";'],
-    ['connector-ipc', "import net from 'node:net'; net.createConnection();"],
+    ['connector-ipc', 'net.createConnection();'],
     ['service-manager', 'spawn("systemctl", ["--user", "start", "loam"]);'],
     ['registry-or-dedupe', 'const key = causation_id;'],
     ['collaboration-state', 'const scope = { sender_scope: [] };'],

@@ -122,8 +122,10 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
       const plugin = JSON.parse(await readFile(join(harness.marketplaceRoot, 'hooks', 'hooks.json'), 'utf8'));
       const start = nativeHookCommands(Array.isArray(plugin.hooks?.SessionStart) ? plugin.hooks.SessionStart : [], runtimePath, id);
       const refresh = nativeHookCommands(Array.isArray(plugin.hooks?.UserPromptSubmit) ? plugin.hooks.UserPromptSubmit : [], runtimePath, id);
-      if (start.length !== 1 || refresh.length !== 1) {
-        return { ...harness, ready: false, category: start.length || refresh.length ? 'registration_duplicate' : 'registration_missing' };
+      const preTool = nativeHookCommands(Array.isArray(plugin.hooks?.PreToolUse) ? plugin.hooks.PreToolUse : [], runtimePath, id);
+      const postTool = nativeHookCommands(Array.isArray(plugin.hooks?.PostToolUse) ? plugin.hooks.PostToolUse : [], runtimePath, id);
+      if (start.length !== 1 || refresh.length !== 1 || preTool.length !== 1 || postTool.length !== 1) {
+        return { ...harness, ready: false, category: start.length || refresh.length || preTool.length || postTool.length ? 'registration_duplicate' : 'registration_missing' };
       }
       return { ...harness, ready: true, owner: 'marketplace' };
     }

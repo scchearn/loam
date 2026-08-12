@@ -183,7 +183,9 @@ export function nativeHookEntry(runtimePath, harness, event, { async: isAsync = 
 
 // The plugin hooks file setup writes into the installed marketplace plugin.
 // SessionStart and UserPromptSubmit are native; Stop stays Node because it is
-// the ingestion boundary, not the collaboration read path.
+// the ingestion boundary, not the collaboration read path. PreToolUse is
+// restricted to the chatty tool names to keep fire frequency sane; PostToolUse
+// runs after any tool.
 export function renderPluginHooks(runtimePath, harness) {
   return {
     hooks: {
@@ -192,6 +194,11 @@ export function renderPluginHooks(runtimePath, harness) {
         hooks: [nativeHookEntry(runtimePath, harness, 'SessionStart')],
       }],
       UserPromptSubmit: [{ hooks: [nativeHookEntry(runtimePath, harness, 'UserPromptSubmit')] }],
+      PreToolUse: [{
+        matcher: 'Bash|Task|Write|Edit|MultiEdit|Glob|Grep|Read',
+        hooks: [nativeHookEntry(runtimePath, harness, 'PreToolUse')],
+      }],
+      PostToolUse: [{ hooks: [nativeHookEntry(runtimePath, harness, 'PostToolUse')] }],
       Stop: [{ hooks: [{ type: 'command', command: 'node "${CLAUDE_PLUGIN_ROOT}/hooks/stop.mjs"', timeout: 5 }] }],
     },
   };

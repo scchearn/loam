@@ -80,6 +80,11 @@ pub enum Operation {
     /// read of volatile in-memory state — it mutates only the mailbox, persists
     /// nothing, and carries no envelope bytes, credential, or raw remote URL.
     SessionPollInject,
+    /// Remove one registered session from the volatile channel registry
+    /// (live-push T2): the session's mailbox is dropped with it. A read of
+    /// volatile in-memory state — nothing is persisted, and an unknown session
+    /// is refused, not silently accepted.
+    SessionDropInject,
     /// Forward one already-derived outbound operation for the connector to
     /// publish. A named variant beside the read: the CLI derives
     /// every authority-bearing field and never opens a broker connection, and
@@ -97,6 +102,7 @@ impl Operation {
             "session.register-inject" => Some(Operation::SessionRegisterInject),
             "federation.snapshot" => Some(Operation::SnapshotGet),
             "session.poll-inject" => Some(Operation::SessionPollInject),
+            "session.drop-inject" => Some(Operation::SessionDropInject),
             "federation.emit" => Some(Operation::FederationEmit),
             _ => None,
         }
@@ -110,6 +116,7 @@ impl Operation {
             Operation::SessionRegisterInject => "session.register-inject",
             Operation::SnapshotGet => "federation.snapshot",
             Operation::SessionPollInject => "session.poll-inject",
+            Operation::SessionDropInject => "session.drop-inject",
             Operation::FederationEmit => "federation.emit",
         }
     }

@@ -1833,7 +1833,7 @@ fn resolve_and_run(
 /// Dispatch a request that has already been resolved to a physical identity key.
 /// Separated from workspace resolution so the registry-binding and operation
 /// logic is testable without a Git workspace.
-fn dispatch_for_key(
+pub(crate) fn dispatch_for_key(
     request: &Request,
     key: &str,
     db_path: &Path,
@@ -1970,6 +1970,31 @@ fn dispatch_for_key(
                 .poll(session_id)
                 .ok_or(ipc::IpcError::InvalidRequest)?;
             Ok(snapshot_json(&row.project_id, &items))
+        }
+        Operation::SessionDropInject => {
+            // Remove the session from the volatile channel registry (live-push
+            // T2). The mailbox is dropped with it. An unknown session is
+            // refused, not silently accepted — a plugin that never registered
+            // would otherwise believe its wake target was still live.
+            let session_id = request
+                .payload
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .ok_or(ipc::IpcError::InvalidRequest)?;
+            if !state.channels.drop_session(session_id) {
+                return Err(ipc::IpcError::InvalidRequest);
+            }
+            Ok(crate::json::Value::Object(vec![
+                ("schema".into(), crate::json::Value::Number("1".into())),
+                (
+                    "action".into(),
+                    crate::json::Value::String("inject-channel-dropped".into()),
+                ),
+                (
+                    "session_id".into(),
+                    crate::json::Value::String(session_id.to_owned()),
+                ),
+            ]))
         }
     }
 }
