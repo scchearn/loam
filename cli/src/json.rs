@@ -1,9 +1,8 @@
 //! Minimal JSON reader.
 //!
-//! It exists so the release-version gate can read plugin manifests without a
-//! `python3` runtime and the checkpoint digest can read `hcom`/`task` output
-//! without `jq`. Both were host-tool dependencies that do not exist on a stock
-//! Windows machine.
+//! It exists so the release-version gate and hook-event parsing can read
+//! manifests without a `python3` runtime and without `jq`. Both were
+//! host-tool dependencies that do not exist on a stock Windows machine.
 //!
 //! Numbers keep their literal source text rather than becoming floats, so
 //! message identifiers round-trip exactly as they were written.
@@ -58,10 +57,6 @@ impl Value {
         }
     }
 
-    pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
-    }
-
     /// Rendered the way `jq -r` renders a scalar in string interpolation.
     pub fn render(&self) -> String {
         match self {
@@ -93,29 +88,6 @@ pub fn parse(input: &str) -> Result<Value, String> {
         return Err(format!("trailing input at byte {}", parser.position));
     }
     Ok(value)
-}
-
-/// Parses a stream of whitespace-separated JSON values, the shape `hcom events`
-/// emits. A single top-level array is flattened, so both framings work.
-pub fn parse_stream(input: &str) -> Result<Vec<Value>, String> {
-    let mut parser = Parser {
-        bytes: input.as_bytes(),
-        position: 0,
-    };
-    let mut values = Vec::new();
-    loop {
-        parser.skip_whitespace();
-        if parser.position == parser.bytes.len() {
-            break;
-        }
-        values.push(parser.value(0)?);
-    }
-    if values.len() == 1 {
-        if let Value::Array(items) = &values[0] {
-            return Ok(items.clone());
-        }
-    }
-    Ok(values)
 }
 
 struct Parser<'a> {
@@ -408,7 +380,9 @@ mod tests {
             value.get("intent").map(Value::render),
             Some("null".to_owned())
         );
-        assert!(value.get("intent").is_some_and(Value::is_null));
+        assert!(value
+            .get("intent")
+            .is_some_and(|value| value == &Value::Null));
         assert_eq!(value.get("missing"), None);
     }
 
@@ -454,29 +428,5 @@ mod tests {
         let input = "[".repeat(MAX_DEPTH + 5);
 
         assert!(parse(&input).is_err());
-    }
-
-    #[test]
-    fn reads_a_newline_delimited_stream() {
-        let values = parse_stream("{\"id\":1}\n{\"id\":2}\n").expect("stream should parse");
-
-        assert_eq!(values.len(), 2);
-        assert_eq!(values[1].get("id").map(Value::render), Some("2".to_owned()));
-    }
-
-    #[test]
-    fn flattens_a_single_top_level_array() {
-        let values = parse_stream("[{\"id\":1},{\"id\":2}]").expect("stream should parse");
-
-        assert_eq!(values.len(), 2);
-        assert_eq!(values[0].get("id").map(Value::render), Some("1".to_owned()));
-    }
-
-    #[test]
-    fn an_empty_stream_yields_nothing() {
-        assert_eq!(
-            parse_stream("  \n ").expect("empty stream is valid"),
-            vec![]
-        );
     }
 }

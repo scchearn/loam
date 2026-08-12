@@ -1,9 +1,8 @@
 //! `loam checkpoint state` — capture-side digest contract.
 //!
-//! The digest replaces a Bash script that required `jq`, GNU `date -d`, GNU
-//! `date -r`, `grep -oP`, and `find -mmin`. None of those exist on stock
-//! Windows, so every assertion here is platform-neutral and the optional
-//! `hcom`/TaskWarrior integrations are exercised through an emptied `PATH`.
+//! The digest replaces a Bash script that required GNU `date -d`, GNU
+//! `date -r`, and `find -mmin`. None of those exist on stock Windows, so
+//! every assertion here is platform-neutral.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,8 +26,6 @@ fn write(path: &Path, content: &str) {
     fs::write(path, content).expect("file should be written");
 }
 
-/// Runs with an emptied `PATH` so `hcom` and `task` are reliably absent: the
-/// graceful-degradation branches are the ones a fresh machine actually hits.
 fn state(workspace: &Path, extra: &[&str]) -> (i32, String, String) {
     let binary = std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide the loam binary");
     let mut arguments = vec!["checkpoint", "state"];
@@ -59,42 +56,18 @@ fn section<'a>(output: &'a str, heading: &str) -> &'a str {
 }
 
 #[test]
-fn the_three_sections_are_emitted_in_order_and_exit_zero() {
+fn the_digest_starts_with_the_recent_files_section_and_exits_zero() {
     let workspace = temporary_workspace("sections");
     write(&workspace.join("touched.md"), "# Touched\n");
 
     let (code, stdout, stderr) = state(&workspace, &[]);
 
     assert_eq!(code, 0, "stderr: {stderr}");
-    let hcom = stdout
-        .find("=== hcom threads ===\n")
-        .expect("hcom section should exist");
-    let task = stdout
-        .find("=== taskwarrior active ===\n")
-        .expect("taskwarrior section should exist");
-    let files = stdout
-        .find("=== files touched recently ===\n")
-        .expect("files section should exist");
-    assert!(hcom < task && task < files, "order drift:\n{stdout}");
-    assert!(stdout.starts_with("=== hcom threads ===\n"), "{stdout}");
-}
-
-#[test]
-fn absent_optional_tools_degrade_without_failing() {
-    let workspace = temporary_workspace("degraded");
-    write(&workspace.join("touched.md"), "# Touched\n");
-
-    let (code, stdout, _) = state(&workspace, &[]);
-
-    assert_eq!(code, 0);
-    assert_eq!(
-        section(&stdout, "=== hcom threads ===\n").trim_end(),
-        "hcom: not available"
+    assert!(
+        stdout.starts_with("=== files touched recently ===\n"),
+        "{stdout}"
     );
-    assert_eq!(
-        section(&stdout, "=== taskwarrior active ===\n").trim_end(),
-        "task: not available"
-    );
+    assert!(!stdout.contains("=== taskwarrior active ===\n"), "{stdout}");
 }
 
 #[test]
@@ -151,6 +124,18 @@ fn a_zero_window_reports_no_recent_files() {
         section(&stdout, "=== files touched recently ===\n").trim_end(),
         "none"
     );
+}
+
+#[test]
+fn a_fresh_file_within_an_explicit_window_is_listed() {
+    let workspace = temporary_workspace("window-now");
+    write(&workspace.join("fresh.md"), "# Fresh\n");
+
+    let (code, stdout, _) = state(&workspace, &["--window", "1"]);
+
+    assert_eq!(code, 0);
+    let files = section(&stdout, "=== files touched recently ===\n");
+    assert!(files.contains("fresh.md"), "output: {stdout}");
 }
 
 #[test]

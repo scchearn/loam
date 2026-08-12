@@ -12,18 +12,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::SystemTime;
-
-use crate::json;
 
 const REASONS: [&str; 4] = ["shutdown", "pause", "handoff", "context-switch"];
 const STATUSES: [&str; 5] = ["active", "blocked", "waiting", "ready-to-resume", "done"];
 const VOLATILE: &str = "VOLATILE \u{2014} may not survive into resumed session";
 const DEFAULT_WINDOW: u64 = 180;
 const RECENT_LIMIT: usize = 15;
-const TASK_LIMIT: usize = 10;
-const DESCRIPTION_LIMIT: usize = 60;
 
 pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     match args.next().as_deref() {
@@ -265,7 +260,7 @@ fn report_pointers(note: &Path, pointers: &[String]) {
     println!();
     println!("=== Pointer checks ===");
     for pointer in pointers {
-        report_pointer(note, &strip_trailing_context(pointer));
+        report_pointer(note, pointer);
     }
     if pointers.is_empty() {
         println!("  (no pointers found)");
@@ -284,22 +279,6 @@ fn report_pointer(note: &Path, pointer: &str) {
         }
         if pointer.contains("$TMPDIR") {
             println!("  POINTER {pointer}: {VOLATILE}");
-        }
-        return;
-    }
-    if let Some(thread) = hcom_thread(pointer) {
-        match hcom_recent(&thread) {
-            None => println!("  POINTER hcom thread {thread}: HCOM: not available"),
-            Some(true) => println!("  POINTER hcom thread {thread}: OK"),
-            Some(false) => println!("  POINTER hcom thread {thread}: STALE: {thread}"),
-        }
-        return;
-    }
-    if let Some(uuid) = task_uuid(pointer) {
-        match task_exists(&uuid) {
-            None => println!("  POINTER task {uuid}: TASK: not available"),
-            Some(true) => println!("  POINTER task {uuid}: OK"),
-            Some(false) => println!("  POINTER task {uuid}: NOT FOUND"),
         }
         return;
     }
@@ -333,28 +312,6 @@ fn report_pointer(note: &Path, pointer: &str) {
         return;
     }
     println!("  POINTER {pointer}: (unrecognized format, not checked by verify)");
-}
-
-/// Strips a trailing `(events ...)` or `(pending: ...)` annotation, then any
-/// trailing whitespace, in that order.
-fn strip_trailing_context(pointer: &str) -> String {
-    let mut value = pointer;
-    for prefix in ["(events ", "(pending:"] {
-        if let Some(stripped) = strip_trailing_group(value, prefix) {
-            value = stripped;
-        }
-    }
-    value.trim_end_matches(is_space).to_owned()
-}
-
-fn strip_trailing_group<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    let trimmed = value.trim_end_matches(is_space);
-    let rest = trimmed.strip_suffix(')')?;
-    let open = rest.rfind('(')?;
-    if !rest[open..].starts_with(prefix) || rest[open..].contains(')') {
-        return None;
-    }
-    Some(value[..open].trim_end_matches(is_space))
 }
 
 /// Pattern A: an absolute, note-relative, or home-relative filesystem path.
@@ -416,97 +373,8 @@ fn is_volatile(path: &str) -> bool {
     path.starts_with("/tmp") || path.starts_with("/run")
 }
 
-/// Pattern B: the last `hcom thread <name>` mention, backticks optional.
-fn hcom_thread(pointer: &str) -> Option<String> {
-    const MARKER: &str = "hcom thread";
-    let mut found = None;
-    let mut search = 0;
-    while let Some(offset) = pointer[search..].find(MARKER) {
-        let start = search + offset;
-        search = start + MARKER.len();
-        let rest = &pointer[search..];
-        let trimmed = rest.trim_start_matches(is_space);
-        if trimmed.len() == rest.len() {
-            continue;
-        }
-        let trimmed = trimmed.strip_prefix('`').unwrap_or(trimmed);
-        let name: String = trimmed
-            .chars()
-            .take_while(|value| value.is_ascii_alphanumeric() || *value == '_' || *value == '-')
-            .collect();
-        if !name.is_empty() {
-            found = Some(name);
-        }
-    }
-    found
-}
-
-/// `Some(true)` recent, `Some(false)` stale, `None` when `hcom` is absent.
-fn hcom_recent(thread: &str) -> Option<bool> {
-    let output = Command::new("hcom")
-        .args(["events", "--last", "500", "--type", "message", "--thread"])
-        .arg(thread)
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let first = stdout.lines().next().unwrap_or("");
-    Some(!first.is_empty() && first != "[]")
-}
-
-/// Pattern C: the first RFC-4122-shaped identifier on a word boundary.
-fn task_uuid(pointer: &str) -> Option<String> {
-    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
-    let characters: Vec<char> = pointer.chars().collect();
-    'start: for start in 0..characters.len() {
-        if start > 0 && is_word(characters[start - 1]) {
-            continue;
-        }
-        let mut position = start;
-        for (index, length) in GROUPS.iter().enumerate() {
-            if index > 0 {
-                if characters.get(position) != Some(&'-') {
-                    continue 'start;
-                }
-                position += 1;
-            }
-            for _ in 0..*length {
-                match characters.get(position) {
-                    Some(value) if value.is_ascii_digit() || ('a'..='f').contains(value) => {
-                        position += 1
-                    }
-                    _ => continue 'start,
-                }
-            }
-        }
-        if characters.get(position).copied().is_some_and(is_word) {
-            continue;
-        }
-        return Some(characters[start..position].iter().collect());
-    }
-    None
-}
-
-fn is_word(value: char) -> bool {
-    value.is_ascii_alphanumeric() || value == '_'
-}
-
-/// `Some(true)` known, `Some(false)` unknown, `None` when `task` is absent.
-fn task_exists(uuid: &str) -> Option<bool> {
-    let output = Command::new("task").args([uuid, "info"]).output().ok()?;
-    Some(output.status.success())
-}
-
-/// Pattern D: contains a `/`-delimited final segment and is not an `hcom` or
-/// `task` command fragment.
+/// Pattern D: contains a `/`-delimited final segment.
 fn looks_like_relative_path(pointer: &str) -> bool {
-    if pointer.starts_with("hcom") {
-        return false;
-    }
-    if let Some(rest) = pointer.strip_prefix("task") {
-        if !rest.starts_with(is_word) {
-            return false;
-        }
-    }
     let Some(slash) = pointer.rfind('/') else {
         return false;
     };
@@ -561,145 +429,9 @@ fn state(mut args: impl Iterator<Item = String>) -> i32 {
         return 1;
     }
 
-    println!("=== hcom threads ===");
-    report_threads(window);
-    println!();
-    println!("=== taskwarrior active ===");
-    report_tasks();
-    println!();
     println!("=== files touched recently ===");
     report_recent_files(&workspace, window);
     0
-}
-
-fn report_threads(window: u64) {
-    let cutoff = chrono::Local::now() - chrono::Duration::minutes(window as i64);
-    let cutoff = cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
-
-    let Ok(output) = Command::new("hcom")
-        .args(["events", "--last", "500"])
-        .output()
-    else {
-        println!("hcom: not available");
-        return;
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let Ok(events) = json::parse_stream(&stdout) else {
-        return;
-    };
-
-    // One row per thread, keeping the latest message; ties resolve to the last
-    // in input order, matching `max_by`.
-    let mut latest: Vec<(String, &json::Value)> = Vec::new();
-    for event in &events {
-        if event.get("type").and_then(json::Value::as_str) != Some("message") {
-            continue;
-        }
-        let Some(thread) = event
-            .get("data")
-            .and_then(|data| data.get("thread"))
-            .and_then(json::Value::as_str)
-        else {
-            continue;
-        };
-        let Some(timestamp) = event.get("ts").and_then(json::Value::as_str) else {
-            continue;
-        };
-        if timestamp < cutoff.as_str() {
-            continue;
-        }
-        match latest.iter_mut().find(|(name, _)| name == thread) {
-            Some((_, held)) => {
-                let previous = held.get("ts").and_then(json::Value::as_str).unwrap_or("");
-                if timestamp >= previous {
-                    *held = event;
-                }
-            }
-            None => latest.push((thread.to_owned(), event)),
-        }
-    }
-    latest.sort_by(|left, right| left.0.cmp(&right.0));
-
-    for (thread, event) in latest {
-        let identifier = field(event, &["id"]);
-        let intent = field(event, &["data", "intent"]);
-        let sender = field(event, &["data", "from"]);
-        println!("{thread} | msg #{identifier} | intent: {intent} | from: {sender}");
-    }
-}
-
-/// An absent key and an explicit `null` both render as `null`, as they did
-/// through `jq`'s string interpolation.
-fn field(value: &json::Value, path: &[&str]) -> String {
-    let mut current = value;
-    for key in path {
-        match current.get(key) {
-            Some(next) => current = next,
-            None => return "null".to_owned(),
-        }
-    }
-    current.render()
-}
-
-fn report_tasks() {
-    let Ok(output) = Command::new("task")
-        .args(["status:pending", "export"])
-        .output()
-    else {
-        println!("task: not available");
-        return;
-    };
-    if !output.status.success() {
-        println!("  (no pending tasks or export failed)");
-        return;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let Ok(parsed) = json::parse(stdout.trim()) else {
-        println!("  (no pending tasks or export failed)");
-        return;
-    };
-    let Some(items) = parsed.as_array() else {
-        println!("  (no pending tasks or export failed)");
-        return;
-    };
-    for item in items.iter().take(TASK_LIMIT) {
-        let uuid = item
-            .get("uuid")
-            .map(json::Value::render)
-            .unwrap_or_default();
-        let project = match item.get("project") {
-            Some(value) if !value.is_null() => value.render(),
-            _ => "none".to_owned(),
-        };
-        let description: String = item
-            .get("description")
-            .map(json::Value::render)
-            .unwrap_or_default()
-            .chars()
-            .take(DESCRIPTION_LIMIT)
-            .collect();
-        println!(
-            "{}\t{}\t{}",
-            tab_separated(&uuid),
-            tab_separated(&project),
-            tab_separated(&description)
-        );
-    }
-}
-
-/// `@tsv` escaping, so an embedded tab or newline cannot forge a column.
-fn tab_separated(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '\t' => output.push_str("\\t"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\\' => output.push_str("\\\\"),
-            other => output.push(other),
-        }
-    }
-    output
 }
 
 fn report_recent_files(workspace: &Path, window: u64) {
@@ -826,51 +558,60 @@ mod tests {
     }
 
     #[test]
-    fn trailing_annotations_are_stripped_in_order() {
-        assert_eq!(strip_trailing_context("a.md (events 1-9)"), "a.md");
-        assert_eq!(strip_trailing_context("a.md (pending: #4)"), "a.md");
-        assert_eq!(strip_trailing_context("a.md  "), "a.md");
-        assert_eq!(strip_trailing_context("a (b) c"), "a (b) c");
+    fn pointers_split_on_commas_and_are_trimmed() {
+        assert_eq!(
+            collect_pointers_values(" ./a.md, b.md ,c.md"),
+            vec!["./a.md", "b.md", "c.md"]
+        );
     }
 
     #[test]
-    fn the_last_hcom_thread_mention_wins() {
-        assert_eq!(
-            hcom_thread("hcom thread `alpha-1`").as_deref(),
-            Some("alpha-1")
-        );
-        assert_eq!(hcom_thread("hcom thread beta_2").as_deref(), Some("beta_2"));
-        assert_eq!(
-            hcom_thread("hcom thread one then hcom thread two").as_deref(),
-            Some("two")
-        );
-        assert_eq!(hcom_thread("hcom threadless"), None);
-        assert_eq!(hcom_thread("a plain note"), None);
+    fn empty_and_whitespace_pointers_are_dropped() {
+        assert_eq!(collect_pointers_values(",  ,"), Vec::<String>::new());
+        assert_eq!(collect_pointers_values(""), Vec::<String>::new());
     }
 
     #[test]
-    fn task_uuids_are_matched_on_word_boundaries() {
+    fn filesystem_prefix_resolves_tilde_and_dot_forms() {
+        let note = Path::new("/work/checkpoints/note.md");
         assert_eq!(
-            task_uuid("550e8400-e29b-41d4-a716-446655440000").as_deref(),
-            Some("550e8400-e29b-41d4-a716-446655440000")
+            filesystem_prefix(note, "./a.md").as_deref(),
+            Some(Path::new("/work/checkpoints/./a.md"))
         );
         assert_eq!(
-            task_uuid("see 550e8400-e29b-41d4-a716-446655440000 now").as_deref(),
-            Some("550e8400-e29b-41d4-a716-446655440000")
+            filesystem_prefix(note, "../b.md").as_deref(),
+            Some(Path::new("/work/checkpoints/../b.md"))
         );
-        assert_eq!(task_uuid("550e8400-e29b-41d4-a716-44665544000"), None);
-        assert_eq!(task_uuid("x550e8400-e29b-41d4-a716-446655440000"), None);
+        assert_eq!(
+            filesystem_prefix(note, "~/.loam/x.md").as_deref(),
+            Some(Path::new(&format!("{}/.loam/x.md", home_directory())))
+        );
+        assert_eq!(
+            filesystem_prefix(note, "/abs/path.md").as_deref(),
+            Some(Path::new("/abs/path.md"))
+        );
+        assert_eq!(filesystem_prefix(note, "relative.md"), None);
+    }
+
+    fn collect_pointers_values(value: &str) -> Vec<String> {
+        let mut pointers = Vec::new();
+        collect_pointers(value, &mut pointers);
+        pointers
     }
 
     #[test]
-    fn relative_path_detection_excludes_command_fragments() {
+    fn relative_path_detection_excludes_unslashed_pointers() {
         assert!(looks_like_relative_path("wiki/checkpoints/a.md"));
-        assert!(!looks_like_relative_path("hcom thread alpha/beta"));
         assert!(!looks_like_relative_path("plain-note"));
+        assert!(!looks_like_relative_path(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
     }
 
     #[test]
-    fn tsv_escaping_cannot_forge_a_column() {
-        assert_eq!(tab_separated("a\tb\nc\\d"), "a\\tb\\nc\\\\d");
+    fn path_classification_rejects_disallowed_tail_characters() {
+        assert!(!looks_like_relative_path("dir/na me.md"));
+        assert!(!looks_like_relative_path("dir/"));
+        assert!(looks_like_relative_path("../up.md"));
     }
 }
