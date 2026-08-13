@@ -1331,6 +1331,10 @@ pub fn provision_session(
 pub mod reason {
     pub const ENDPOINT_MALFORMED: &str = "endpoint-malformed";
     pub const CREDENTIAL_REF_UNRESOLVED: &str = "credential-ref-unresolved";
+    /// No identity bundle at the identity path (`client.pem`/`key.pem` missing):
+    /// the certificate is the machine's only identity source, so a machine with
+    /// none cannot open a session and nothing is minted to paper over it.
+    pub const IDENTITY_REQUIRED: &str = "identity-required";
     pub const CA_UNRESOLVED: &str = "ca-unresolved";
     /// The local Git email and the authenticated certificate's common name
     /// disagree. The certificate is authoritative and the disagreement is
@@ -4937,6 +4941,7 @@ mod snapshot_tests {
         let all = [
             reason::ENDPOINT_MALFORMED,
             reason::CREDENTIAL_REF_UNRESOLVED,
+            reason::IDENTITY_REQUIRED,
             reason::CA_UNRESOLVED,
             reason::ROSTER_ABSENT,
             reason::ROSTER_EMPTY,

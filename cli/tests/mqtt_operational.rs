@@ -653,7 +653,7 @@ fn a_roster_that_would_hear_nobody_opens_no_session() {
         Utc::now(),
     );
     assert_eq!(state.code(), "credentials-unresolved");
-    assert_eq!(state.reason(), Some("credential-ref-unresolved"));
+    assert_eq!(state.reason(), Some("identity-required"));
 
     fixture
         .broker

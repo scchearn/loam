@@ -261,9 +261,9 @@ pub fn resolve_credentials(
 ) -> Result<CredentialMaterial, ProvisionFailure> {
     let credentials = ProvisionFailure::Credentials;
     let certificate = std::fs::read(identity_root.join("client.pem"))
-        .map_err(|_| credentials(reason::CREDENTIAL_REF_UNRESOLVED))?;
+        .map_err(|_| credentials(reason::IDENTITY_REQUIRED))?;
     let key = std::fs::read(identity_root.join("key.pem"))
-        .map_err(|_| credentials(reason::CREDENTIAL_REF_UNRESOLVED))?;
+        .map_err(|_| credentials(reason::IDENTITY_REQUIRED))?;
     let certificate_authority =
         resolve_trust_anchors(ca_ref, ssl_cert_file).map_err(ProvisionFailure::Credentials)?;
     Ok(CredentialMaterial {
@@ -2044,7 +2044,7 @@ mod tests {
             resolve_credentials(&empty, None, None).expect_err("an empty identity path refuses");
         assert_eq!(
             failure,
-            ProvisionFailure::Credentials(reason::CREDENTIAL_REF_UNRESOLVED)
+            ProvisionFailure::Credentials(reason::IDENTITY_REQUIRED)
         );
         assert!(!format!("{failure:?}").contains("client.pem"));
 
