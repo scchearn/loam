@@ -369,21 +369,31 @@ pub fn request_signed_certificate(
         .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
 
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    // Read until the header/body separator is present. The body is read once we
+    // know its length; the connection may then close without a clean TLS
+    // close_notify (common for simple Python/http servers), which after a
+    // complete body is not an error.
+    let header_end = loop {
+        if let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+            break header_end;
+        }
+        if response.len() > 1 << 16 {
+            return Err(EnrollmentFailure::MalformedSignerResponse);
+        }
+        let mut chunk = [0u8; 2048];
+        let read = match stream.read(&mut chunk) {
+            Ok(0) => break response.len(), // EOF before any separator
+            Ok(read) => read,
+            Err(_) => return Err(EnrollmentFailure::SignerUnreachable),
+        };
+        response.extend_from_slice(&chunk[..read]);
+    };
 
     // Response: `HTTP/1.1 <status> ...\r\n<header...>\r\n\r\n<body>`.
-    let (status_line, response_body) = match response.windows(4).position(|w| w == b"\r\n\r\n") {
-        Some(header_end) => {
-            let (head, response_body) = response.split_at(header_end);
-            let response_body = &response_body[4..];
-            (head, response_body)
-        }
-        None => return Err(EnrollmentFailure::MalformedSignerResponse),
-    };
+    let head = &response[..header_end];
+    let body_start = header_end + 4;
     // Status line: `HTTP/1.1 <code> <reason>`.
-    let status = match status_line
+    let status = match head
         .splitn(3, |b| *b == b' ')
         .nth(1)
         .and_then(|code| std::str::from_utf8(code).ok()?.parse::<u16>().ok())
@@ -401,12 +411,40 @@ pub fn request_signed_certificate(
         return Err(EnrollmentFailure::MalformedSignerResponse);
     }
 
-    // The signer returns the certificate PEM verbatim; a body that is not one
-    // certificate is a malformed response even if the status was 2xx.
-    if crate::provisioning::certificate_subject(response_body).is_err() {
+    // Content-Length tells us exactly how many body bytes to expect; read them
+    // (and only them) so a later abrupt close is not mistaken for an error.
+    let content_length = head
+        .split(|b| *b == b'\n')
+        .find_map(|line| {
+            let line = std::str::from_utf8(line).ok()?;
+            line.rsplit_once(':')
+                .filter(|(name, _)| name.trim().eq_ignore_ascii_case("Content-Length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        })
+        .ok_or(EnrollmentFailure::MalformedSignerResponse)?;
+    if content_length > 1 << 20 {
         return Err(EnrollmentFailure::MalformedSignerResponse);
     }
-    Ok(response_body.to_vec())
+    let mut response_body: Vec<u8> = response[body_start..].to_vec();
+    while response_body.len() < content_length {
+        let mut chunk = [0u8; 2048];
+        let read = match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => return Err(EnrollmentFailure::SignerUnreachable),
+        };
+        response_body.extend_from_slice(&chunk[..read]);
+    }
+    if response_body.len() != content_length {
+        return Err(EnrollmentFailure::MalformedSignerResponse);
+    }
+
+    // The signer returns the certificate PEM verbatim; a body that is not one
+    // certificate is a malformed response even if the status was 2xx.
+    if crate::provisioning::certificate_subject(&response_body).is_err() {
+        return Err(EnrollmentFailure::MalformedSignerResponse);
+    }
+    Ok(response_body)
 }
 
 /// A tiny `https://host:port/path` parser tailored to the signer URL; anything
@@ -432,9 +470,9 @@ fn parse_url(url: &str) -> Result<(String, u16, String), EnrollmentFailure> {
     Ok((host, port, path))
 }
 
-/// A minimal JSON string literal for a value with no control bytes (passwords
-/// from `openssl rand -base64` and PEM are both safe); backslash and quote are
-/// still escaped defensively.
+/// A minimal JSON string literal. Control bytes are escaped as JSON escapes
+/// (PEM bodies carry `\n`, which the signer must receive literally), and the
+/// quote/backslash cases are escaped too.
 fn json_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
@@ -442,7 +480,12 @@ fn json_string(value: &str) -> String {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push('\u{fffd}'),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
             c => out.push(c),
         }
     }
@@ -488,8 +531,11 @@ mod tests {
     }
 
     #[test]
-    fn json_string_escapes_quotes_and_backslashes() {
+    fn json_string_escapes_quotes_newlines_and_backslashes() {
         assert_eq!(json_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
         assert_eq!(json_string("plain"), "\"plain\"");
+        // PEM bodies carry newlines, which must round-trip as \n escapes, not
+        // be scrubbed into a replacement character.
+        assert_eq!(json_string("ic\nYQ=="), "\"ic\\nYQ==\"");
     }
 }

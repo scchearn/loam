@@ -41,6 +41,45 @@ fn run_connect(workspace: Option<&Path>, broker: &str, extra: &[&str]) -> (i32, 
     )
 }
 
+/// Run `connect` with the identity/config root pinned to a throwaway directory
+/// (via `LOAM_CONFIG_DIR`, the rung-1 identity-root resolver). The -global-root
+/// the CLI takes drives the connector service, but the machine identity path is
+/// governed by the config ladder; pinning it keeps these tests hermetic and
+/// never touching the real user config.
+fn run_connect_pinned(
+    workspace: Option<&Path>,
+    broker: &str,
+    root: &Path,
+    extra: &[&str],
+) -> (i32, String, String) {
+    let mut command = Command::new(binary());
+    command.arg("federation").arg("connect");
+    if let Some(ws) = workspace {
+        command.arg(ws);
+    }
+    command.arg(broker);
+    command.args(extra);
+    command
+        .env("LOAM_CONFIG_DIR", root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = command.output().expect("spawn loam");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// An empty HOME directory, so `git config` finds no global user.email/name and
+/// the machine-side enrollment sees no local git identity to name the CSR with.
+fn empty_home() -> PathBuf {
+    let home = temp_dir("empty-home");
+    std::fs::create_dir_all(&home).unwrap();
+    home
+}
+
 #[test]
 fn connect_requires_a_workspace_and_a_broker() {
     let (code, _stdout, stderr) = run_connect(None, "", &[]);
@@ -366,6 +405,140 @@ fn commit_reachability_is_not_required() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// `connect --token`: the auto-enrollment surface
+// ---------------------------------------------------------------------------
+
+#[test]
+fn connect_rejects_token_and_token_file_together() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let (code, _stdout, stderr) = run_connect(
+        Some(&workspace),
+        "mqtts://broker.example:8883",
+        &["--token", "secret", "--token-file", "/tmp/nope"],
+    );
+    assert_eq!(code, 64, "mutual exclusion is a usage error: {stderr}");
+    assert!(
+        stderr.contains("--token and --token-file are mutually exclusive"),
+        "got: {stderr}"
+    );
+}
+
+#[test]
+fn connect_rejects_an_unreadable_token_file() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let missing = temp_dir("missing-token");
+    let (code, _stdout, stderr) = run_connect(
+        Some(&workspace),
+        "mqtts://broker.example:8883",
+        &["--token-file", missing.join("absent").to_str().unwrap()],
+    );
+    assert_eq!(
+        code, 64,
+        "an unreadable token file is a usage error: {stderr}"
+    );
+    assert!(stderr.contains("cannot read --token-file"), "got: {stderr}");
+}
+
+#[test]
+fn connect_with_token_but_no_certificate_fails_fast_on_an_unreachable_signer() {
+    // A fresh machine: no identity bundle, but the operator supplies a token.
+    // Auto-enrollment engages and must report the unreachable signer as a typed
+    // refusal without writing any partial identity or session state.
+    let root = temp_dir("autoenroll-unreachable");
+    let identity = root.join("federation").join("identity");
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let (code, stdout, stderr) = run_connect_pinned(
+        Some(&workspace),
+        "mqtts://broker.example:8883",
+        &root,
+        &[
+            "--global-root",
+            root.to_str().unwrap(),
+            "--token",
+            "secret",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        code, 69,
+        "an unreachable signer is a typed refusal: {stdout} {stderr}"
+    );
+    assert!(
+        stdout.contains("signer-unreachable"),
+        "the refusal must name the failing input: {stdout}"
+    );
+    assert!(
+        !identity.join("client.pem").exists(),
+        "no certificate may be left behind: {identity:?}"
+    );
+    assert!(
+        !identity.join("key.pem").exists(),
+        "no private key may be left behind: {identity:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn connect_with_token_missing_git_identity_names_the_typed_refusal() {
+    // A workspace with no git user.email cannot name the CSR subject; this must
+    // be a typed git-identity-required refusal, not a silent partial state. The
+    // machine's git must see NO identity, so HOME is pinned to an empty dir
+    // (no global .gitconfig to fall back to).
+    let root = temp_dir("autoenroll-noident");
+    let work = root.join("work");
+    git(&["init", "--quiet", work.to_str().unwrap()], None);
+    // Validation infers org/project from the origin remote; give the workspace
+    // one, but deliberately no user.email so the CSR subject cannot be named.
+    git(
+        &[
+            "-C",
+            work.to_str().unwrap(),
+            "remote",
+            "add",
+            "origin",
+            "git@example.org:acme/loam.git",
+        ],
+        None,
+    );
+    // Spawn with both config and HOME pinned.
+    let mut command = Command::new(binary());
+    let output = command
+        .arg("federation")
+        .arg("connect")
+        .arg(&work)
+        .arg("mqtts://broker.example:8883")
+        .arg("--global-root")
+        .arg(&root)
+        .arg("--token")
+        .arg("secret")
+        .arg("--json")
+        .env("LOAM_CONFIG_DIR", &root)
+        .env("HOME", empty_home())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn loam");
+    let code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        code,
+        69,
+        "{stdout} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("git-identity-required"),
+        "a missing git identity must be its own typed refusal: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// `loam federation emit`
+// ---------------------------------------------------------------------------
 
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
