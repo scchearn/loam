@@ -29,6 +29,26 @@ function skillsRunner({ installed = true, calls = [] } = {}) {
   };
 }
 
+// Pin the config-dir resolution into the fixture home for the duration of a
+// test. `uninstall()` resolves the Loam config root through the environment
+// (LOAM_CONFIG_DIR -> XDG_CONFIG_HOME -> platform default), and CI sets
+// XDG_CONFIG_HOME, so without pinning, the purge/preserve assertions resolve
+// outside the fixture home and the asserted directory survives (or is missed)
+// regardless of what uninstall actually did. LOAM_CONFIG_DIR is the first rung,
+// so pointing it at the fixture's config dir makes the resolution deterministic
+// and env-hermetic. The previous value is restored afterwards, matching the
+// save/restore pattern used elsewhere in this suite.
+async function withPinnedConfigDir(configDir, fn) {
+  const previous = process.env.LOAM_CONFIG_DIR;
+  process.env.LOAM_CONFIG_DIR = configDir;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.LOAM_CONFIG_DIR;
+    else process.env.LOAM_CONFIG_DIR = previous;
+  }
+}
+
 async function readyFixture({ codexProfile } = {}) {
   const home = await mkdtemp(join(tmpdir(), 'loam-uninstall-'));
   const globalRoot = join(home, '.agents', 'loam');
@@ -169,13 +189,13 @@ test('uninstall preserves the Loam config dir by default (#86)', async () => {
   await writeFile(join(configDir, 'anything-else.json'), '{}');
 
   let output = '';
-  const code = await uninstall({
+  const code = await withPinnedConfigDir(configDir, () => uninstall({
     home,
     globalRoot,
     yes: true,
     runner: skillsRunner(),
     output: { write: (chunk) => { output += chunk; } },
-  });
+  }));
   assert.equal(code, 0);
   assert.equal(await exists(globalRoot), false, 'the install is removed');
   assert.equal(await exists(join(identityDir, 'client.pem')), true, 'the identity survives a default uninstall');
@@ -195,14 +215,14 @@ test('uninstall --purge destroys the whole Loam config dir with an explicit conf
   let output = '';
   // `yes: true` IS the explicit confirmation: no export prompt, the config dir
   // goes with the install, and the warning still names the identity.
-  const code = await uninstall({
+  const code = await withPinnedConfigDir(configDir, () => uninstall({
     home,
     globalRoot,
     yes: true,
     purge: true,
     runner: skillsRunner(),
     output: { write: (chunk) => { output += chunk; } },
-  });
+  }));
   assert.equal(code, 0);
   assert.equal(await exists(globalRoot), false);
   assert.equal(await exists(configDir), false, '--purge destroys the whole config dir');
@@ -231,7 +251,7 @@ test('uninstall --purge prompts export-or-confirm and preserves the install and 
     close: () => {},
     on: () => {},
   };
-  const code = await uninstall({
+  const code = await withPinnedConfigDir(configDir, () => uninstall({
     home,
     globalRoot,
     yes: false,
@@ -240,7 +260,7 @@ test('uninstall --purge prompts export-or-confirm and preserves the install and 
     runner: skillsRunner(),
     output: { write: (chunk) => { output += chunk; } },
     input: readlineLike,
-  });
+  }));
   assert.equal(code, 130, 'declining both prompts cancels the uninstall');
   assert.equal(await exists(join(identityDir, 'client.pem')), true, 'the identity survives a declined purge');
   assert.equal(await exists(configDir), true, 'the whole config dir survives a declined purge');
