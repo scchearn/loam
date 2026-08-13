@@ -53,9 +53,9 @@ case "${1:-install}" in
 Environment=ENROLL_CERT_FILE=${CERTBOT_LIVE_DIR}/fullchain.pem
 Environment=ENROLL_KEY_FILE=${CERTBOT_LIVE_DIR}/privkey.pem
 Environment=ENROLL_PASSWORD_FILE=${ENROLL_DIR}/password
-# 0.0.0.0 = auto-bind: signer.py picks the first 100.x tailnet address it
-# finds, refusing to sit on a public port when the tailnet is present. Override
-# ENROLL_BIND_ADDRESS here to force an explicit interface.
+# The port is public on a broker VPS; ENROLL_BIND_ADDRESS defaults to 0.0.0.0
+# (TLS + password + rate limit are the walls). Override to an explicit private
+# interface if the operator wants one.
 Environment=ENROLL_BIND_ADDRESS=0.0.0.0
 Environment=ENROLL_RATE_LIMIT=10
 Environment=ENROLL_RATE_WINDOW_SECONDS=60
@@ -63,7 +63,7 @@ EOF
     systemctl daemon-reload
     systemctl enable --now loam-enroll-signer.service
     systemctl status loam-enroll-signer.service --no-pager || true
-    echo "signer installed: https://<tailnet>:${ENROLL_PORT}/v1/enroll"
+    echo "signer installed: https://${BROKER_FQDN:-<host>}:${ENROLL_PORT}/v1/enroll"
     echo "share this password with machines joining the org:"
     echo "  $ENROLL_DIR/password  (0600; rotation = replace + re-share)"
     ;;

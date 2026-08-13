@@ -3,12 +3,12 @@
 # unit from params.env with envsubst. ${VARS} resolved from params.env.
 #
 # LIVE-HOST SAFETY: dedicated unprivileged ${ENROLL_USER} under a tight sandbox;
-# binds only ${ENROLL_PORT} (default 8443), on the tailnet interface when one is
-# present (the spec's primary hardening against public-port brute force). It may
-# read the org CA (ReadOnlyPaths) and must write CA-issued certs' inputs only
-# under its own temp dir (PrivateTmp). The shared enrollment password is a
-# separate 0600 file (PrivateTmp covers runtime, and ReadOnlyPaths marks the
-# deploy dir it lives next to if needed).
+# binds only ${ENROLL_PORT} (default 8443) on ${ENROLL_BIND_ADDRESS} (default
+# 0.0.0.0 — the port is public; TLS + the shared password + rate limiting are
+# the security walls). It may read the org CA (ReadOnlyPaths) and must write
+# CA-issued certs' inputs only under its own temp dir (PrivateTmp). The shared
+# enrollment password is a separate 0600 file (PrivateTmp covers runtime, and
+# ReadOnlyPaths marks the deploy dir it lives next to if needed).
 [Unit]
 Description=Loam Federation auto-enrollment signer
 After=network-online.target

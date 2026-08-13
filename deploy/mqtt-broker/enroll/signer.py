@@ -8,11 +8,14 @@ shared enrollment password — signs the CSR (subject verbatim, SAN carried from
 the CSR via `copy_extensions = copy`) and returns the certificate PEM.
 
 Security posture (the spec's named threat is brute force on a public port):
-  * binds to the tailnet interface (100.x) when one is present;
+  * binds to ENROLL_BIND_ADDRESS (default 0.0.0.0 — the port is public);
   * verifies the password in constant time (hmac.compare_digest);
   * rate-limits attempts per client address;
   * never logs the password, the CSR, or the issued certificate;
   * Mosquitto itself is untouched — this service only writes CA-issued certs.
+
+TLS + the shared enrollment password + rate limiting are the security walls
+on a public VPS; binding is not itself a security boundary.
 
 Dependency-free by construction: Python 3 stdlib + the system `openssl` the
 deploy already manages. Mirrors the deploy's bash+openssl style.
@@ -21,11 +24,9 @@ deploy already manages. Mirrors the deploy's bash+openssl style.
 import argparse
 import hmac
 import http.server
-import ipaddress
 import json
 import os
 import re
-import socket
 import ssl
 import subprocess
 import sys
@@ -52,30 +53,6 @@ class Config:
         self.rate_limit = int(os.environ.get("ENROLL_RATE_LIMIT", "10"))
         self.rate_window = float(os.environ.get("ENROLL_RATE_WINDOW_SECONDS", "60"))
         self.openssl = os.environ.get("ENROLL_OPENSSL", "openssl")
-
-    def tailnet_address(self) -> str | None:
-        """The first 100.x.y.z address on this host, if any (Tailscale/CGNAT).
-        Binding there keeps the signer off the public port entirely."""
-        fns = getattr(socket, "if_nameindex", None)
-        if fns is None:
-            return None
-        try:
-            for _, name in fns():
-                for family, kind, _, _, addr in socket.getaddrinfo(
-                    name, None, 0, 0, socket.SOCK_DGRAM
-                ):
-                    if kind == getattr(socket, "SOCK_DGRAM", 2) and family == socket.AF_INET:
-                        host = addr[0]
-                        if host.startswith("100."):
-                            try:
-                                ip = ipaddress.ip_address(host)
-                            except ValueError:
-                                continue
-                            if ip.is_private and host.startswith("100."):
-                                return host
-        except OSError:
-            pass
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -258,16 +235,12 @@ def main(argv: list[str]) -> int:
         print(f"pki_dir={config.pki_dir}")
         print(f"password_file={config.password_file}")
         print(f"listen={config.bind_address}:{config.listen_port}")
-        print(f"tailnet_address={config.tailnet_address()}")
         return 0
 
-    # Bind to the tailnet interface when one exists (the spec's primary
-    # hardening); ENROLL_BIND_ADDRESS still wins for an explicit override.
+    # The port is public on a broker VPS; ENROLL_BIND_ADDRESS (default
+    # 0.0.0.0) is an explicit override for an operator who wants a private
+    # interface. Binding is not itself a security boundary.
     bind = config.bind_address
-    if bind == "0.0.0.0":
-        tailnet = config.tailnet_address()
-        if tailnet:
-            bind = tailnet
 
     if not config.cert_file or not config.key_file:
         print("ENROLL_CERT_FILE and ENROLL_KEY_FILE are required", file=sys.stderr)
