@@ -27,7 +27,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         _ => {
             eprintln!(
                 "Usage:\n  \
-                 loam federation connect <workspace> <broker> [--project org/project] --global-root <path> [--json]\n  \
+                 loam federation connect <workspace> <broker> [--project org/project] --global-root <path> [--token <password>|--token-file <path>] [--json]\n  \
                  loam federation disconnect <workspace> --global-root <path> [--json]\n  \
                  loam federation status [<workspace>] --global-root <path> [--json]\n  \
                  loam federation emit [<workspace>] --global-root <path> [--json]   (reads one operation on stdin)\n  \
@@ -471,9 +471,25 @@ fn connect(mut args: impl Iterator<Item = String>) -> i32 {
     let mut project_override: Option<String> = None;
     let mut global_root: Option<PathBuf> = None;
     let mut json_output = false;
+    let mut token: Option<String> = None;
+    let mut token_file: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" => json_output = true,
+            "--token" => match args.next() {
+                Some(value) => token = Some(value),
+                None => {
+                    eprintln!("federation connect: --token needs a value");
+                    return 64;
+                }
+            },
+            "--token-file" => match args.next() {
+                Some(value) => token_file = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("federation connect: --token-file needs a value");
+                    return 64;
+                }
+            },
             "--project" => match args.next() {
                 Some(value) => project_override = Some(value),
                 None => {
@@ -509,6 +525,28 @@ fn connect(mut args: impl Iterator<Item = String>) -> i32 {
         return 64;
     };
 
+    let token = match (token, token_file) {
+        (Some(_), Some(_)) => {
+            eprintln!("federation connect: --token and --token-file are mutually exclusive");
+            return 64;
+        }
+        (Some(other), None) => Some(other),
+        (None, Some(path)) => match std::fs::read_to_string(&path) {
+            Ok(value) => Some(value.trim().to_owned()),
+            Err(_) => {
+                eprintln!(
+                    "federation connect: cannot read --token-file {}",
+                    path.display()
+                );
+                return 64;
+            }
+        },
+        (None, None) => match std::env::var("LOAM_FEDERATION_TOKEN") {
+            Ok(value) if !value.trim().is_empty() => Some(value),
+            _ => None,
+        },
+    };
+
     let enrolled = match validate_connect(&workspace, &broker, project_override.as_deref()) {
         Ok(enrolled) => enrolled,
         Err(error) => {
@@ -535,8 +573,90 @@ fn connect(mut args: impl Iterator<Item = String>) -> i32 {
             0
         }
         // With a global root: the full transactional connect.
-        Some(root) => orchestrate_cli(&enrolled, &root, json_output),
+        Some(root) => {
+            // Auto-enrollment: a machine with no identity bundle and a token
+            // self-enrolls first. An existing certificate means the enrollment
+            // path never engages, even with a token supplied.
+            if let Some(token) = token {
+                let identity_root = crate::provisioning::configured_identity_root()
+                    .ok()
+                    .filter(|root| root.join("client.pem").is_file());
+                if identity_root.is_none() {
+                    if let Err(failure) = auto_enroll(&enrolled, &token, &root) {
+                        let code = format!("enrollment: {}", failure.code());
+                        if json_output {
+                            println!(
+                                "{}",
+                                Value::Object(vec![
+                                    ("schema".into(), Value::Number("1".into())),
+                                    ("status".into(), Value::String("error".into())),
+                                    (
+                                        "error".into(),
+                                        Value::Object(vec![(
+                                            "code".into(),
+                                            Value::String(code.clone())
+                                        )]),
+                                    ),
+                                ])
+                                .to_json()
+                            );
+                        } else {
+                            eprintln!("federation connect: {code}");
+                        }
+                        return 69;
+                    }
+                }
+            }
+            orchestrate_cli(&enrolled, &root, json_output)
+        }
     }
+}
+
+/// Run the machine-side enrollment: generate keypair + CSR from git identity,
+/// POST to the signer, store the returned certificate through the existing
+/// identity path with the existing perms hardening.
+fn auto_enroll(
+    enrolled: &enrollment::ValidatedEnrollment,
+    token: &str,
+    root: &std::path::Path,
+) -> Result<(), crate::enrollment_auto::EnrollmentFailure> {
+    use crate::enrollment_auto::EnrollmentFailure;
+
+    let workspace = &enrolled.workspace.display_path;
+    let (email, display_name) = crate::provisioning::git_identity(std::path::Path::new(workspace));
+    let email = email.ok_or(EnrollmentFailure::GitIdentityRequired)?;
+    let display_name = display_name.unwrap_or_default();
+
+    let instance_id = crate::enrollment_auto::generate_instance_id()?;
+    let (key_pem, csr_pem) =
+        crate::enrollment_auto::generate_keypair_and_csr(&email, &display_name, &instance_id)?;
+
+    let host = enrolled
+        .broker_endpoint
+        .strip_prefix("mqtts://")
+        .and_then(|authority| {
+            authority
+                .rsplit_once(':')
+                .map(|(host, _)| host)
+                .or(Some(authority))
+        })
+        .unwrap_or_default();
+    let url = crate::enrollment_auto::signer_url(host);
+    let trust = crate::provisioning::resolve_trust_anchors(
+        enrolled.ca_ref.as_deref(),
+        std::env::var("SSL_CERT_FILE").ok().as_deref(),
+    )
+    .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    let certificate =
+        crate::enrollment_auto::request_signed_certificate(&url, token, &csr_pem, &trust)?;
+
+    let identity_root = crate::provisioning::configured_identity_root()
+        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    crate::provisioning::store_identity_bundle(&identity_root, &certificate, &key_pem)
+        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+
+    let _ = root;
+    Ok(())
 }
 
 /// Build the validated enrollment from the one-command surface: org/project

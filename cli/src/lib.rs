@@ -4,6 +4,7 @@ mod codegraph;
 pub mod connector;
 mod datecheck;
 pub mod enrollment;
+pub mod enrollment_auto;
 pub mod envelope;
 mod federation;
 pub mod harness;

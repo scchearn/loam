@@ -308,6 +308,24 @@ fn harden_identity_permissions(
     Ok(())
 }
 
+/// Store the auto-enrolled identity bundle: `client.pem` + `key.pem` at the
+/// identity root, created if absent, hardened with the same perms
+/// (`0700` dir / `0600` files on Unix) as `resolve_credentials` enforces on
+/// read. Returns `reason::IDENTITY_REQUIRED` on any failure so callers surface
+/// a single typed path.
+pub fn store_identity_bundle(
+    identity_root: &std::path::Path,
+    certificate_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<(), &'static str> {
+    std::fs::create_dir_all(identity_root).map_err(|_| reason::IDENTITY_REQUIRED)?;
+    let certificate_path = identity_root.join("client.pem");
+    let key_path = identity_root.join("key.pem");
+    std::fs::write(&certificate_path, certificate_pem).map_err(|_| reason::IDENTITY_REQUIRED)?;
+    std::fs::write(&key_path, key_pem).map_err(|_| reason::IDENTITY_REQUIRED)?;
+    harden_identity_permissions(identity_root, &certificate_path, &key_path)
+}
+
 // ---------------------------------------------------------------------------
 // Who the certificate says we are
 // ---------------------------------------------------------------------------
@@ -375,6 +393,31 @@ fn read_element(bytes: &[u8], from: usize) -> Option<Element> {
         content: (start, end),
         next: end,
     })
+}
+
+/// The DER bytes of every certificate block in a PEM blob, in order. Used by
+/// the auto-enrollment HTTPS client to seed its root store from the same trust
+/// material the MQTT session uses (bundled roots or a `ca_ref` PEM file).
+pub fn pem_certificate_ders(pem: &[u8]) -> Vec<Vec<u8>> {
+    let Ok(text) = std::str::from_utf8(pem) else {
+        return Vec::new();
+    };
+    pem_blocks(text)
+        .into_iter()
+        .filter(|block| block.label.contains("CERTIFICATE"))
+        .filter_map(|block| {
+            let body: String = text[block.start..block.end]
+                .lines()
+                .filter(|line| !line.starts_with("-----"))
+                .collect();
+            base64_decode(&body)
+        })
+        .collect()
+}
+
+/// The base64 (standard alphabet, with padding) encoding of `bytes`.
+pub fn base64_encode(bytes: &[u8]) -> Vec<u8> {
+    base64_encode_bytes(bytes)
 }
 
 /// Decode one PEM block body into DER. Written here rather than taken as a

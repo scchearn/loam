@@ -2503,6 +2503,13 @@ mod tests {
         // connector stays barred from subprocess spawn and from every other
         // network surface.
         let connector_wake = "connector.rs";
+        // Auto-enrollment (specs/federation-auto-enrollment.md): the one
+        // outbound HTTPS POST a connectionless machine makes, to the
+        // broker-host signer, to obtain its client certificate. Narrow by
+        // construction: a single POST with a fixed schema to a URL derived
+        // from the broker host; no persistent connection, no reads of foreign
+        // topics, no subprocess spawn. Every other module stays barred.
+        let auto_enrollment = "enrollment_auto.rs";
         for (path, production) in crate_production_sources() {
             for forbidden in [
                 "std::net",
@@ -2518,6 +2525,10 @@ mod tests {
                     continue;
                 }
                 if (forbidden == "std::net" || forbidden == "TcpStream") && path == connector_wake {
+                    continue;
+                }
+                if (forbidden == "std::net" || forbidden == "TcpStream") && path == auto_enrollment
+                {
                     continue;
                 }
                 assert!(
@@ -3008,10 +3019,18 @@ mod tests {
     fn assert_allowed_dependency(name: &str) {
         assert!(
             [
+                "aws-lc-rs",
                 "chrono",
                 "pulldown-cmark",
                 "rumqttc",
                 "rusqlite",
+                // Auto-enrollment's HTTPS client and keypair generation: already
+                // compiled in the tree as transitive rustls/rumqttc providers,
+                // promoted to direct for the one outbound POST (see
+                // enrollment_auto.rs). `rustls` is the TLS stack; `aws-lc-rs`
+                // is its default crypto provider here (ECDSA P-256 keygen +
+                // signing, and the RNG).
+                "rustls",
                 // Bundled Mozilla trust roots: the no-`ca_ref` default trust
                 // path, replacing the per-OS trust-file search. Compiled-in
                 // data, no network code.
