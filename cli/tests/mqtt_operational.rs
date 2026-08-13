@@ -588,7 +588,7 @@ fn an_origin_absent_from_the_roster_is_not_heard_and_the_same_origin_added_is() 
 
 #[test]
 #[ignore = "requires LOAM_MQTT_TEST=1 and a real Mosquitto/OpenSSL installation"]
-fn a_roster_that_would_hear_nobody_opens_no_session() {
+fn an_unusable_roster_is_refused_and_a_thin_roster_self_admits() {
     if !enabled() {
         return;
     }
@@ -601,19 +601,26 @@ fn a_roster_that_would_hear_nobody_opens_no_session() {
     let directory = fixture.root.join("rosters").join(&fixture.org);
     let path = directory.join(format!("{PROJECT}.json"));
 
+    // Self-announce re-scopes the gate: an enrolled machine always admits
+    // itself, so an absent/empty/one-sided roster is the ordinary first-join
+    // state — a self-only Live session — not a refusal.
+    for body in [
+        format!("{{\"principals\":[\"{PRINCIPAL}\"],\"origins\":[]}}"),
+        format!("{{\"principals\":[],\"origins\":[\"{INSTANCE_B}\"]}}"),
+        "{\"principals\":[],\"origins\":[]}".to_owned(),
+    ] {
+        std::fs::write(&path, &body).expect("roster is writable");
+        let mut sessions = ProjectSessions::new(4, ChannelRegistry::new());
+        assert_eq!(
+            sessions.attach(&row, loam::connector::provision_session(&row), Utc::now()),
+            SessionState::Live,
+            "{body}"
+        );
+        sessions.detach(PROJECT);
+    }
+
+    // The refusal survives only for genuinely unusable roster data.
     for (body, expected) in [
-        (
-            format!("{{\"principals\":[\"{PRINCIPAL}\"],\"origins\":[]}}"),
-            "roster-no-origins",
-        ),
-        (
-            format!("{{\"principals\":[],\"origins\":[\"{INSTANCE_B}\"]}}"),
-            "roster-no-principals",
-        ),
-        (
-            "{\"principals\":[],\"origins\":[]}".to_owned(),
-            "roster-empty",
-        ),
         (
             format!("{{\"principals\":[\"*\"],\"origins\":[\"{INSTANCE_B}\"]}}"),
             "roster-wildcard",

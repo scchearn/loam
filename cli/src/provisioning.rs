@@ -560,6 +560,7 @@ pub fn certificate_instance_id(pem: &[u8]) -> Result<String, &'static str> {
         return Err(unresolved);
     }
     cursor = serial.next;
+    // signature algorithm, issuer, validity, subject — four SEQUENCEs.
     for _ in 0..4 {
         let element = read_element(&der, cursor).ok_or(unresolved)?;
         if element.tag != 0x30 {
@@ -567,9 +568,17 @@ pub fn certificate_instance_id(pem: &[u8]) -> Result<String, &'static str> {
         }
         cursor = element.next;
     }
+    // subjectPublicKeyInfo: one more SEQUENCE every real certificate carries
+    // between the subject and the extensions. A walker that forgets it reads
+    // the SPKI as the extensions element and refuses every real certificate.
+    let spki = read_element(&der, cursor).ok_or(unresolved)?;
+    if spki.tag != 0x30 {
+        return Err(unresolved);
+    }
+    cursor = spki.next;
     // Optional issuer/subject unique IDs (`[1]`/`[2]` IMPLICIT) may sit between
-    // the subject and the extensions; skip them rather than misreading the
-    // extensions element.
+    // the subject public key and the extensions; skip them rather than
+    // misreading the extensions element.
     while let Some(element) = read_element(&der, cursor) {
         if element.tag == 0x81 || element.tag == 0x82 {
             cursor = element.next;
@@ -577,9 +586,15 @@ pub fn certificate_instance_id(pem: &[u8]) -> Result<String, &'static str> {
             break;
         }
     }
-    // Now at the extensions: `[3] EXPLICIT Extensions`.
-    let extensions = read_element(&der, cursor).ok_or(unresolved)?;
-    if extensions.tag != 0xa3 {
+    // Now at the extensions: `[3] EXPLICIT Extensions`, where Extensions is a
+    // SEQUENCE OF Extension — the wrapper must be entered before any
+    // extension's OID can be read.
+    let explicit = read_element(&der, cursor).ok_or(unresolved)?;
+    if explicit.tag != 0xa3 {
+        return Err(unresolved);
+    }
+    let extensions = read_element(&der, explicit.content.0).ok_or(unresolved)?;
+    if extensions.tag != 0x30 {
         return Err(unresolved);
     }
     let mut extension_cursor = extensions.content.0;
@@ -1677,6 +1692,9 @@ mod tests {
         tbs.extend(name(Some(issuer_common), None));
         tbs.extend(der(0x30, &[]));
         tbs.extend(name(subject_common, subject_given));
+        // Stand-in subjectPublicKeyInfo: real certificates carry an SPKI
+        // SEQUENCE here, and the SAN walk must skip it to reach the extensions.
+        tbs.extend(der(0x30, &der(0x03, &[0x00])));
         if let Some(uris) = san_uris {
             let mut names = Vec::new();
             for uri in uris {
@@ -1687,7 +1705,8 @@ mod tests {
                 body.extend(der(0x04, &der(0x30, &names)));
                 body
             });
-            tbs.extend(der(0xa3, &extension));
+            // RFC 5280: [3] EXPLICIT wraps an Extensions SEQUENCE OF Extension.
+            tbs.extend(der(0xa3, &der(0x30, &extension)));
         }
 
         let mut body = der(0x30, &tbs);
