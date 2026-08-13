@@ -6,6 +6,11 @@
 # idempotent, reversible. The signer reuses the broker host's Let's Encrypt
 # server certificate (same FQDN) so machines verify its TLS with public roots.
 #
+# The live dir is 0700 root-owned and unreadable by the dedicated service
+# user, so install copies fullchain.pem + privkey.pem into $ENROLL_DIR/tls/
+# (key 0640 root:loam-enroll) and a certbot renewal-hooks deploy hook re-copies
+# them + restarts the signer on certificate rotation (~90 days).
+#
 # usage: install-signer.sh [install|uninstall|status]
 set -euo pipefail
 
@@ -14,9 +19,47 @@ ENROLL_DIR="${ENROLL_DIR:-/etc/loam/enroll}"
 ENROLL_USER="${ENROLL_USER:-loam-enroll}"
 ENROLL_PORT="${ENROLL_PORT:-8443}"
 PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
+BROKER_FQDN="${BROKER_FQDN:-mqtt.example.org}"
 
 UNIT=/etc/systemd/system/loam-enroll-signer.service
+DEPLOY_HOOK=/etc/letsencrypt/renewal-hooks/deploy/loam-enroll-signer.sh
 HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# Copy the Let's Encrypt server certificate/key into the signer's own TLS dir.
+# The source live dir is 0700 root:certbot, which the dedicated loam-enroll
+# user cannot read; the copies are readable by it instead (key 0640
+# root:loam-enroll). Group-read is granted so the service user can load the
+# key without weakening root ownership. Idempotent; re-run refreshes a rotated
+# cert.
+copy_tls_material() {
+  install -d -m 750 -o root -g "$ENROLL_USER" "$ENROLL_DIR/tls"
+  install -m 644 -o root -g root "$CERTBOT_LIVE_DIR/fullchain.pem" "$ENROLL_DIR/tls/fullchain.pem"
+  install -m 640 -o root -g "$ENROLL_USER" "$CERTBOT_LIVE_DIR/privkey.pem" "$ENROLL_DIR/tls/privkey.pem"
+}
+
+# Install the certbot deploy hook: whenever certbot renews the server cert
+# (~90 days), re-copy the material and nudge the signer so it picks up the new
+# chain without a manual restart. Certbot executes deploy hooks with -x
+# (executable) and its own env; only the paths we bake below matter.
+install_deploy_hook() {
+  install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
+  cat > "$DEPLOY_HOOK" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+case "\${RENEWED_LINEAGE:-}" in
+  */"${BROKER_FQDN:-}") ;;
+  *) exit 0 ;;
+esac
+copy() {
+  install -d -m 750 -o root -g "${ENROLL_USER}" "${ENROLL_DIR}/tls"
+  install -m 644 -o root -g root "${CERTBOT_LIVE_DIR}/fullchain.pem" "${ENROLL_DIR}/tls/fullchain.pem"
+  install -m 640 -o root -g "${ENROLL_USER}" "${CERTBOT_LIVE_DIR}/privkey.pem" "${ENROLL_DIR}/tls/privkey.pem"
+}
+copy
+systemctl try-restart loam-enroll-signer.service || true
+EOF
+  chmod 755 "$DEPLOY_HOOK"
+}
 
 case "${1:-install}" in
   install)
@@ -36,7 +79,12 @@ case "${1:-install}" in
       openssl rand -base64 24 > "$ENROLL_DIR/password"
       chmod 600 "$ENROLL_DIR/password"
     fi
-    # 4. render + install the systemd unit (server cert = the host's LE cert).
+    # 4. copy the LE server cert + key into the signer's readable TLS dir and
+    #    install the certbot deploy hook that refreshes both on rotation.
+    copy_tls_material
+    install_deploy_hook
+    # 5. render + install the systemd unit (server cert = the host's LE cert,
+    #    as copied into $ENROLL_DIR/tls — the certbot live dir is 0700 root).
     PYTHON_BIN="$PYTHON_BIN" \
     ENROLL_USER="$ENROLL_USER" \
     ENROLL_DIR="$ENROLL_DIR" \
@@ -46,13 +94,13 @@ case "${1:-install}" in
       envsubst < "$HERE/loam-enroll-signer.service" > /tmp/loam-enroll-signer.service.$$
     install -D -m 644 /tmp/loam-enroll-signer.service.$$ "$UNIT"
     rm -f /tmp/loam-enroll-signer.service.$$
-    # 5. systemd override for the runtime env (TLS cert + ports + rate limit).
+    # 6. systemd override for the runtime env (TLS cert + ports + rate limit).
     mkdir -p /etc/systemd/system/loam-enroll-signer.service.d
     cat > /etc/systemd/system/loam-enroll-signer.service.d/env.conf <<EOF
 [Service]
-Environment=ENROLL_CERT_FILE=${CERTBOT_LIVE_DIR}/fullchain.pem
-Environment=ENROLL_KEY_FILE=${CERTBOT_LIVE_DIR}/privkey.pem
-Environment=ENROLL_PASSWORD_FILE=${ENROLL_DIR}/password
+Environment=ENROLL_CERT_FILE=${ENROLL_DIR}/tls/fullchain.pem
+Environment=ENROLL_KEY_FILE=${ENROLL_DIR}/tls/privkey.pem
+Environment=ENROLL_PASSWORD_FILE=%d/enrollment-password
 # The port is public on a broker VPS; ENROLL_BIND_ADDRESS defaults to 0.0.0.0
 # (TLS + password + rate limit are the walls). Override to an explicit private
 # interface if the operator wants one.
@@ -61,7 +109,8 @@ Environment=ENROLL_RATE_LIMIT=10
 Environment=ENROLL_RATE_WINDOW_SECONDS=60
 EOF
     systemctl daemon-reload
-    systemctl enable --now loam-enroll-signer.service
+    systemctl enable loam-enroll-signer.service
+    systemctl restart loam-enroll-signer.service
     systemctl status loam-enroll-signer.service --no-pager || true
     echo "signer installed: https://${BROKER_FQDN:-<host>}:${ENROLL_PORT}/v1/enroll"
     echo "share this password with machines joining the org:"
@@ -70,9 +119,10 @@ EOF
   uninstall)
     systemctl disable --now loam-enroll-signer.service 2>/dev/null || true
     rm -f "$UNIT" /etc/systemd/system/loam-enroll-signer.service.d/env.conf
+    rm -f "$DEPLOY_HOOK"
     systemctl daemon-reload
     rm -rf "$ENROLL_DIR"
-    echo "signer uninstalled (org CA and broker untouched)"
+    echo "signer uninstalled (org CA, broker, and certbot deploy hooks for other services untouched)"
     ;;
   status)
     systemctl status loam-enroll-signer.service --no-pager || true

@@ -18,6 +18,9 @@ Wants=network-online.target
 Type=simple
 User=${ENROLL_USER}
 Group=${ENROLL_USER}
+# Keep the source password root-only; systemd stages a readable private copy
+# in the service credential directory before dropping privileges.
+LoadCredential=enrollment-password:${ENROLL_DIR}/password
 ExecStartPre=${PYTHON_BIN} ${ENROLL_DIR}/signer.py --ping
 ExecStart=${PYTHON_BIN} ${ENROLL_DIR}/signer.py
 Restart=on-failure
@@ -32,7 +35,8 @@ ProtectControlGroups=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-# The org CA (read-only) and the enrollment password file must be readable:
+# The org CA is read-only; systemd stages the root-only enrollment password
+# through LoadCredential before dropping privileges.
 ReadOnlyPaths=${PKI_DIR} ${ENROLL_DIR}
 # No writable host path; PrivateTmp gives it its own scratch for CSR/cert.
 

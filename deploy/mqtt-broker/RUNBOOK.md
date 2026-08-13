@@ -45,13 +45,20 @@ mTLS cert — the machine mints its own keypair + CSR, nothing travels by hand:
   generated like `openssl rand -base64 24`. **Rotation** = replace that file and
   re-share via wiki/1Password; already-issued certs are unaffected.
 - Reuses the host's Let's Encrypt server cert (same FQDN), so machines verify
-  its TLS with public roots — no custom CA on the client.
+  its TLS with public roots — no custom CA on the client. Install copies
+  `fullchain.pem` + `privkey.pem` from the (0700 root) certbot live dir into
+  `${ENROLL_DIR}/tls/` (key `0640 root:loam-enroll`) and installs a certbot
+  renewal-hooks deploy hook that re-copies them + restarts the signer on every
+  certificate rotation (~90 days) — the signer never breaks when certbot
+  renews.
 - Binds `ENROLL_BIND_ADDRESS` (default `0.0.0.0` — the port is public);
   rate-limits per client (default 10 per 60s against the spec's
   brute-force-on-public-port threat); verifies the password in constant time;
   **never logs the password, CSR, or cert**. TLS + the shared password + the
   rate limit are the security walls on a public VPS.
 - Mosquitto is untouched: this service only issues org-CA-signed certs.
+- Uninstall removes the deploy hook and the `$ENROLL_DIR` copies too; the
+  certbot live dir, org CA, and broker are untouched.
 
 The machine-side command, one shot (no admin ceremony):
 
