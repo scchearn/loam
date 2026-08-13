@@ -2,7 +2,7 @@
 //!
 //! Every other tier in this slice proves a piece. This one proves the whole
 //! thing opens: two `EnrolledRow`s go through the real `provision_session`, the
-//! real secret backend, the real certificate walk, and the real roster reader,
+//! real PEM identity path, the real certificate walk, and the real roster reader,
 //! and two live sessions come out and hear each other.
 //!
 //! The two instances **share one certificate subject** and differ only in their
@@ -14,7 +14,7 @@
 //! could not have been given the same client id.
 //!
 //! Unix-only for the same reason the harness tier is: the fixtures are
-//! device/inode shaped and the fake secret backend is a shell script.
+//! device/inode shaped.
 #![cfg(unix)]
 
 // The broker fixture is reused; this gate uses part of it and never edits it.
@@ -22,7 +22,6 @@
 #[path = "support/mqtt_broker.rs"]
 mod mqtt_broker;
 
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -37,8 +36,8 @@ const REPOSITORY: &str = "repo-2F8";
 /// Both instances authenticate as this common name: the fixture ACL grants it
 /// `readwrite` on the project, and one person's two machines share it.
 const PRINCIPAL: &str = "mtls-actor";
-const INSTANCE_A: &str = "instance-a";
-const INSTANCE_B: &str = "instance-b";
+const INSTANCE_A: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const INSTANCE_B: &str = "01ARZ3NDEKTSV4RRFFQ69G5FBV";
 /// A second principal the fixture ACL also grants, listed in the roster so the
 /// origin refusal below is provably about the origin and not the principal.
 const OUTSIDER_PRINCIPAL: &str = "actor-a";
@@ -79,70 +78,42 @@ impl Federation {
         std::fs::create_dir_all(&root).expect("fixture root is creatable");
 
         let fixture = Federation { broker, root, org };
-        fixture.write_credentials();
-        fixture.write_backend();
+        fixture.write_identity();
         fixture.write_roster(&[INSTANCE_A, INSTANCE_B]);
         fixture.take_over_environment();
         fixture
     }
 
-    /// One blob per instance: certificate then key, exactly the shape the
-    /// resolver's contract describes. Instance B's certificate carries a given
-    /// name and A's does not, which is the display-name control's other half.
-    fn write_credentials(&self) {
-        let plain = [
-            self.broker
-                .client_certificate()
-                .expect("the fixture client certificate is readable"),
-            self.broker
-                .client_key()
-                .expect("the fixture client key is readable"),
-        ]
-        .concat();
-        let named = [
-            self.broker
-                .named_client_certificate()
-                .expect("the named client certificate is readable"),
-            self.broker
-                .named_client_key()
-                .expect("the named client key is readable"),
-        ]
-        .concat();
-        std::fs::write(self.root.join("credential-a.pem"), plain).expect("blob A is writable");
-        std::fs::write(self.root.join("credential-b.pem"), named).expect("blob B is writable");
-    }
-
-    /// A secret backend that answers on standard output, keyed by the reference
-    /// it is handed. The real one is `secret-tool`; this one needs no keyring
-    /// daemon and, more importantly, cannot raise an unlock prompt inside a
-    /// test run.
-    fn write_backend(&self) {
-        use std::os::unix::fs::PermissionsExt;
-        let script = self.root.join("secret-backend.sh");
-        let body = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  loam/a) cat '{root}/credential-a.pem' ;;\n  \
-             loam/b) cat '{root}/credential-b.pem' ;;\n  \
-             *) exit 1 ;;\nesac\n",
-            root = self.root.display()
-        );
-        let mut file = std::fs::File::create(&script).expect("backend is writable");
-        file.write_all(body.as_bytes()).expect("backend writes");
-        drop(file);
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
-            .expect("backend is executable");
-        // Wait out ETXTBSY: another thread can hold a write descriptor on a
-        // freshly created file across a fork, and Linux refuses to execute a
-        // file any process has open for writing.
-        for _ in 0..1000 {
-            match std::process::Command::new(&script)
-                .arg("warmup")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-            {
-                Err(error) if error.raw_os_error() == Some(26) => std::thread::yield_now(),
-                _ => break,
-            }
+    /// One identity directory per instance: `client.pem` + `key.pem`, exactly
+    /// the shape the resolver's contract describes. Instance B's certificate
+    /// carries a given name and A's does not, which is the display-name
+    /// control's other half.
+    fn write_identity(&self) {
+        for (instance, certificate, key) in [
+            (
+                INSTANCE_A,
+                self.broker
+                    .client_certificate()
+                    .expect("the fixture client certificate is readable"),
+                self.broker
+                    .client_key()
+                    .expect("the fixture client key is readable"),
+            ),
+            (
+                INSTANCE_B,
+                self.broker
+                    .named_client_certificate()
+                    .expect("the named client certificate is readable"),
+                self.broker
+                    .named_client_key()
+                    .expect("the named client key is readable"),
+            ),
+        ] {
+            let directory = self.root.join("identity").join(instance);
+            std::fs::create_dir_all(&directory).expect("identity directory is creatable");
+            std::fs::write(directory.join("client.pem"), certificate)
+                .expect("client certificate is writable");
+            std::fs::write(directory.join("key.pem"), key).expect("client key is writable");
         }
     }
 
@@ -174,19 +145,25 @@ impl Federation {
     /// rather than pretend, this tier removes the machine's Git identity from
     /// the picture entirely.
     fn take_over_environment(&self) {
-        std::env::set_var(
-            "LOAM_SECRET_BACKEND",
-            self.root.join("secret-backend.sh").as_os_str(),
-        );
         std::env::set_var("LOAM_FEDERATION_ROSTER_DIR", self.root.join("rosters"));
         std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
         std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
     }
 
-    /// An enrolled row for one instance. Only the instance id and the credential
-    /// reference differ between the two — everything else, including the broker
-    /// and the project, is shared.
-    fn row(&self, instance: &str, credential_ref: &str) -> EnrolledRow {
+    /// Point the resolver's identity path at one instance's PEM bundle. The
+    /// env var is read once per `resolve()` call, so two live sessions can each
+    /// resolve their own identity by switching before each attach.
+    fn use_identity(&self, instance: &str) {
+        std::env::set_var(
+            "LOAM_FEDERATION_IDENTITY_DIR",
+            self.root.join("identity").join(instance),
+        );
+    }
+
+    /// An enrolled row for one instance. Only the instance id differs between
+    /// the two — everything else, including the broker and the project, is
+    /// shared.
+    fn row(&self, instance: &str) -> EnrolledRow {
         EnrolledRow {
             identity_key: format!("unix:1:{instance}"),
             org_id: self.org.clone(),
@@ -198,7 +175,6 @@ impl Federation {
             broker_profile: "fixture".into(),
             broker_endpoint: format!("mqtts://localhost:{}", self.broker.mtls_port()),
             tls_server_name: "localhost".into(),
-            credential_ref: credential_ref.to_owned(),
             ca_ref: None,
             commit: "84be000000000000000000000000000000000001".into(),
             capabilities: CapabilityRecord {
@@ -398,19 +374,21 @@ fn two_provisioned_instances_hear_each_other_in_both_directions() {
     let fixture = Federation::provision("two-instance");
     std::env::set_var("SSL_CERT_FILE", fixture.trust_bundle());
 
-    let row_a = fixture.row(INSTANCE_A, "loam/a");
-    let row_b = fixture.row(INSTANCE_B, "loam/b");
+    let row_a = fixture.row(INSTANCE_A);
+    let row_b = fixture.row(INSTANCE_B);
 
-    // Both sessions come out of the real seam: the real secret backend, the
+    // Both sessions come out of the real seam: the real PEM identity path, the
     // real certificate walk, the real roster file. Nothing is hand-built.
     let mut a = ProjectSessions::new(16);
     let mut b = ProjectSessions::new(16);
     let now = Utc::now();
+    fixture.use_identity(INSTANCE_A);
     assert_eq!(
         a.attach(&row_a, loam::connector::provision_session(&row_a), now),
         SessionState::Live,
         "instance A must open a live session from its enrollment alone"
     );
+    fixture.use_identity(INSTANCE_B);
     assert_eq!(
         b.attach(&row_b, loam::connector::provision_session(&row_b), now),
         SessionState::Live,
@@ -531,8 +509,9 @@ fn an_origin_absent_from_the_roster_is_not_heard_and_the_same_origin_added_is() 
 
     // B's roster lists only itself, so A's origin is not admitted.
     fixture.write_roster(&[INSTANCE_B]);
-    let row_b = fixture.row(INSTANCE_B, "loam/b");
+    let row_b = fixture.row(INSTANCE_B);
     let mut b = ProjectSessions::new(16);
+    fixture.use_identity(INSTANCE_B);
     assert_eq!(
         b.attach(
             &row_b,
@@ -542,8 +521,9 @@ fn an_origin_absent_from_the_roster_is_not_heard_and_the_same_origin_added_is() 
         SessionState::Live
     );
 
-    let row_a = fixture.row(INSTANCE_A, "loam/a");
+    let row_a = fixture.row(INSTANCE_A);
     let mut a = ProjectSessions::new(16);
+    fixture.use_identity(INSTANCE_A);
     assert_eq!(
         a.attach(
             &row_a,
@@ -573,6 +553,7 @@ fn an_origin_absent_from_the_roster_is_not_heard_and_the_same_origin_added_is() 
     b.detach(PROJECT);
     fixture.write_roster(&[INSTANCE_A, INSTANCE_B]);
     let mut b = ProjectSessions::new(16);
+    fixture.use_identity(INSTANCE_B);
     assert_eq!(
         b.attach(
             &row_b,
@@ -615,7 +596,8 @@ fn a_roster_that_would_hear_nobody_opens_no_session() {
     // so the reason an operator sees is the reason this code produces.
     let fixture = Federation::provision("roster-refusals");
     std::env::set_var("SSL_CERT_FILE", fixture.trust_bundle());
-    let row = fixture.row(INSTANCE_A, "loam/a");
+    let row = fixture.row(INSTANCE_A);
+    fixture.use_identity(INSTANCE_A);
     let directory = fixture.root.join("rosters").join(&fixture.org);
     let path = directory.join(format!("{PROJECT}.json"));
 
@@ -656,10 +638,14 @@ fn a_roster_that_would_hear_nobody_opens_no_session() {
     );
     sessions.detach(PROJECT);
 
-    // A credential reference with nothing behind it refuses on the other state,
+    // An identity path with nothing behind it refuses on the other state,
     // naming the input rather than the roster.
-    let mut absent = fixture.row(INSTANCE_A, "loam/nothing-here");
+    let mut absent = fixture.row(INSTANCE_A);
     absent.instance_id = INSTANCE_A.to_owned();
+    std::env::set_var(
+        "LOAM_FEDERATION_IDENTITY_DIR",
+        fixture.root.join("identity").join("no-such-instance"),
+    );
     let mut sessions = ProjectSessions::new(4);
     let state = sessions.attach(
         &absent,

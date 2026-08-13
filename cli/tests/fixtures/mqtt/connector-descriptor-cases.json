@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden valid enrollment descriptor plus a rejection corpus. The valid object is the positive control; each rejection names the exact EnrollmentError variant the case must produce. Loaded by cli/src/enrollment.rs in-module tests. No secret material appears here: credential_ref/ca_ref are opaque references, never credentials.",
+  "_comment": "Golden valid enrollment descriptor plus a rejection corpus. The valid object is the positive control; each rejection names the exact EnrollmentError variant the case must produce. Loaded by cli/src/enrollment.rs in-module tests. No secret material appears here: ca_ref is an opaque reference, never a credential. credential_ref is gone: credentials are PEM files at the identity path, not store references.",
   "valid": {
     "schema": 1,
     "org_id": "acme",
@@ -9,7 +9,6 @@
       "profile": "acme-prod",
       "endpoint": "mqtts://broker.acme.example:8883",
       "tls_server_name": "broker.acme.example",
-      "credential_ref": "vault://acme/loam/mqtt-client",
       "ca_ref": "vault://acme/loam/org-ca"
     },
     "git": {
@@ -27,8 +26,7 @@
     "broker": {
       "profile": "acme-prod",
       "endpoint": "mqtts://broker.acme.example:8883",
-      "tls_server_name": "broker.acme.example",
-      "credential_ref": "vault://acme/loam/mqtt-client"
+      "tls_server_name": "broker.acme.example"
     },
     "git": {
       "commit": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",

@@ -2357,20 +2357,17 @@ mod tests {
         // Union of the transport and connector process-capable admissions. The connector:
         // `enrollment.rs` + `service.rs` run git/manager subprocesses (the
         // isolated commit-reachability fetch and the native service managers).
-        // The transport: `transport.rs` runs the git-transport subprocess. Every other
-        // module stays barred; the guard is the security boundary for both slices.
+        // The transport: `transport.rs` runs the git-transport subprocess. The
+        // federation CLI: `federation.rs` runs git for the one-command connect
+        // surface (remote-URL scope inference and the current commit). Every
+        // other module stays barred; the guard is the security boundary for
+        // both slices.
         let process_files = [
             "checkpoint.rs",
             "codegraph.rs",
             "enrollment.rs",
+            "federation.rs",
             "main.rs",
-            // The platform secret store is a program, not a library: libsecret
-            // on Linux and the keychain on macOS are reached by running
-            // `secret-tool` / `security` and reading the secret off standard
-            // output. This is the only subprocess this module runs, and it is
-            // the reason the credential resolver lives here rather than in
-            // `connector.rs`, which holds the broker socket and is admitted to
-            // neither list.
             "provisioning.rs",
             "service.rs",
             "state.rs",
@@ -2382,6 +2379,9 @@ mod tests {
             "codegraph.rs",
             "datecheck.rs",
             "enrollment.rs",
+            // The federation CLI reads the identity bundle and the registry for
+            // the one-command connect surface and the lifecycle verbs.
+            "federation.rs",
             // The harness read path reads the installed skill body,
             // `install.json`, and the workspace state that the retired Node
             // integration used to assemble. Reads only — it opens no file for
@@ -2392,8 +2392,7 @@ mod tests {
             "markdown.rs",
             "memory.rs",
             // Reads only, and only two things: the per-project peer roster that
-            // decides whom a session admits, and the platform trust bundle when
-            // an enrollment pins no CA of its own.
+            // decides whom a session admits, and the identity-path PEMs.
             "provisioning.rs",
             "service.rs",
             "sha256.rs",
@@ -2915,7 +2914,17 @@ mod tests {
 
     fn assert_allowed_dependency(name: &str) {
         assert!(
-            ["chrono", "pulldown-cmark", "rumqttc", "rusqlite"].contains(&name),
+            [
+                "chrono",
+                "pulldown-cmark",
+                "rumqttc",
+                "rusqlite",
+                // Bundled Mozilla trust roots: the no-`ca_ref` default trust
+                // path, replacing the per-OS trust-file search. Compiled-in
+                // data, no network code.
+                "webpki-roots",
+            ]
+            .contains(&name),
             "network-capable dependency requires review: {name}"
         );
     }

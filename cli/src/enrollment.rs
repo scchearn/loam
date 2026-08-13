@@ -39,13 +39,7 @@ const DESCRIPTOR_KEYS: &[&str] = &[
     "broker",
     "git",
 ];
-const BROKER_KEYS: &[&str] = &[
-    "profile",
-    "endpoint",
-    "tls_server_name",
-    "credential_ref",
-    "ca_ref",
-];
+const BROKER_KEYS: &[&str] = &["profile", "endpoint", "tls_server_name", "ca_ref"];
 const GIT_KEYS: &[&str] = &["commit", "remotes"];
 const REMOTE_KEYS: &[&str] = &["name", "refs"];
 
@@ -223,7 +217,6 @@ pub struct ValidatedEnrollment {
     pub broker_profile: String,
     pub broker_endpoint: String,
     pub tls_server_name: String,
-    pub credential_ref: String,
     pub ca_ref: Option<String>,
     pub commit: String,
     pub remotes: Vec<ValidatedRemote>,
@@ -307,7 +300,6 @@ pub struct BrokerDescriptor {
     pub profile: String,
     pub endpoint: String,
     pub tls_server_name: String,
-    pub credential_ref: String,
     pub ca_ref: Option<String>,
 }
 
@@ -331,13 +323,11 @@ fn parse_broker(
     let endpoint = required_bounded_string(entries, "endpoint")?;
     validate_endpoint(&endpoint)?;
     let tls_server_name = required_bounded_id(entries, "tls_server_name")?;
-    let credential_ref = required_bounded_string(entries, "credential_ref")?;
     let ca_ref = optional_bounded_string(entries, "ca_ref")?;
     Ok(BrokerDescriptor {
         profile,
         endpoint,
         tls_server_name,
-        credential_ref,
         ca_ref,
     })
 }
@@ -812,7 +802,6 @@ pub fn validate_enrollment(
         broker_profile: descriptor.broker.profile,
         broker_endpoint: descriptor.broker.endpoint,
         tls_server_name: descriptor.broker.tls_server_name,
-        credential_ref: descriptor.broker.credential_ref,
         ca_ref: descriptor.broker.ca_ref,
         commit: descriptor.git.commit,
         remotes,
@@ -869,7 +858,7 @@ pub mod registry {
     };
     use crate::sha256::Sha256;
 
-    const FEDERATION_SCHEMA_VERSION: i64 = 1;
+    const FEDERATION_SCHEMA_VERSION: i64 = 2;
     const REGISTRY_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5_000);
 
     const CREATE_FEDERATION_TABLES: &str = "\
@@ -886,7 +875,6 @@ pub mod registry {
         broker_profile TEXT NOT NULL,
         broker_endpoint TEXT NOT NULL,
         tls_server_name TEXT NOT NULL,
-        credential_ref TEXT NOT NULL,
         ca_ref TEXT,
         commit_oid TEXT NOT NULL,
         cap_authentication INTEGER NOT NULL,
@@ -965,9 +953,8 @@ pub mod registry {
         /// session can be provisioned from the row alone.
         pub broker_endpoint: String,
         pub tls_server_name: String,
-        /// Opaque lookup keys for the secret backend — never the material.
-        pub credential_ref: String,
-        /// Absent means "use the system trust roots"; present means pinned.
+        /// Absent means "use the bundled Mozilla roots"; present means a PEM
+        /// trust file pinned at this path.
         pub ca_ref: Option<String>,
         pub commit: String,
         pub capabilities: CapabilityRecord,
@@ -1005,7 +992,6 @@ pub mod registry {
             &enrolled.broker_profile,
             &enrolled.broker_endpoint,
             &enrolled.tls_server_name,
-            &enrolled.credential_ref,
             &enrolled.commit,
         ] {
             hasher.update(part.as_bytes());
@@ -1141,12 +1127,12 @@ pub mod registry {
                 "INSERT INTO federation_enrollment (
                 identity_key, org_id, project_id, repository_id, descriptor_digest,
                 display_path, instance_id, broker_profile, broker_endpoint,
-                tls_server_name, credential_ref, ca_ref, commit_oid,
+                tls_server_name, ca_ref, commit_oid,
                 cap_authentication, cap_publish, cap_subscribe, cap_self_receive,
                 verified_at, created_at
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17, ?18, ?19
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, ?18
             )",
                 rusqlite::params![
                     key,
@@ -1159,7 +1145,6 @@ pub mod registry {
                     enrolled.broker_profile,
                     enrolled.broker_endpoint,
                     enrolled.tls_server_name,
-                    enrolled.credential_ref,
                     enrolled.ca_ref,
                     enrolled.commit,
                     capabilities.authentication as i64,
@@ -1199,7 +1184,7 @@ pub mod registry {
             .query_row(
                 "SELECT id, identity_key, org_id, project_id, repository_id, descriptor_digest,
                     display_path, instance_id, broker_profile, broker_endpoint,
-                    tls_server_name, credential_ref, ca_ref, commit_oid,
+                    tls_server_name, ca_ref, commit_oid,
                     cap_authentication, cap_publish, cap_subscribe, cap_self_receive, verified_at
              FROM federation_enrollment WHERE identity_key = ?1",
                 [key],
@@ -1221,7 +1206,7 @@ pub mod registry {
             .prepare(
                 "SELECT id, identity_key, org_id, project_id, repository_id, descriptor_digest,
                     display_path, instance_id, broker_profile, broker_endpoint,
-                    tls_server_name, credential_ref, ca_ref, commit_oid,
+                    tls_server_name, ca_ref, commit_oid,
                     cap_authentication, cap_publish, cap_subscribe, cap_self_receive, verified_at
              FROM federation_enrollment ORDER BY id",
             )
@@ -1280,15 +1265,14 @@ pub mod registry {
                 broker_profile: row.get(8)?,
                 broker_endpoint: row.get(9)?,
                 tls_server_name: row.get(10)?,
-                credential_ref: row.get(11)?,
-                ca_ref: row.get(12)?,
-                commit: row.get(13)?,
+                ca_ref: row.get(11)?,
+                commit: row.get(12)?,
                 capabilities: CapabilityRecord {
-                    authentication: row.get::<_, i64>(14)? != 0,
-                    publish: row.get::<_, i64>(15)? != 0,
-                    subscribe: row.get::<_, i64>(16)? != 0,
-                    self_receive: row.get::<_, i64>(17)? != 0,
-                    verified_at: row.get(18)?,
+                    authentication: row.get::<_, i64>(13)? != 0,
+                    publish: row.get::<_, i64>(14)? != 0,
+                    subscribe: row.get::<_, i64>(15)? != 0,
+                    self_receive: row.get::<_, i64>(16)? != 0,
+                    verified_at: row.get(17)?,
                 },
                 remotes: Vec::new(),
             },
@@ -1474,7 +1458,7 @@ mod tests {
     #[test]
     fn duplicate_field_is_rejected() {
         // Two org_id keys; the parser preserves both in order so we can detect it.
-        let json = r#"{"schema":1,"org_id":"a","org_id":"b","project_id":"p","repository_id":"r","broker":{"profile":"x","endpoint":"mqtts://h:8883","tls_server_name":"h","credential_ref":"vault://c"},"git":{"commit":"0123456789abcdef0123456789abcdef01234567","remotes":[{"name":"origin","refs":["refs/heads/main"]}]}}"#;
+        let json = r#"{"schema":1,"org_id":"a","org_id":"b","project_id":"p","repository_id":"r","broker":{"profile":"x","endpoint":"mqtts://h:8883","tls_server_name":"h"},"git":{"commit":"0123456789abcdef0123456789abcdef01234567","remotes":[{"name":"origin","refs":["refs/heads/main"]}]}}"#;
         assert_eq!(
             parse_descriptor(json.as_bytes()),
             Err(EnrollmentError::DuplicateField {
@@ -1650,7 +1634,6 @@ mod registry_tests {
             broker_profile: "acme-prod".into(),
             broker_endpoint: "mqtts://broker.acme.example:8883".into(),
             tls_server_name: "broker.acme.example".into(),
-            credential_ref: "vault://acme/loam/mqtt".into(),
             ca_ref: None,
             commit: commit.into(),
             remotes: vec![ValidatedRemote {
@@ -1729,7 +1712,6 @@ mod registry_tests {
             .expect("present");
         assert_eq!(row.broker_endpoint, "mqtts://broker.acme.example:8883");
         assert_eq!(row.tls_server_name, "broker.acme.example");
-        assert_eq!(row.credential_ref, "vault://acme/loam/mqtt");
         assert_eq!(row.ca_ref.as_deref(), Some("vault://acme/loam/ca"));
         // The instance id is the single source of session identity downstream,
         // so a projection that reads it back empty would be a silent defect.
@@ -1738,7 +1720,6 @@ mod registry_tests {
         // Both readers share one projection: widening the SELECT in `lookup` and
         // not in `list_enrollments` is exactly the half-fix that reads clean here.
         let listed = list_enrollments(&connection).unwrap();
-        assert_eq!(listed[0].credential_ref, row.credential_ref);
         assert_eq!(listed[0].broker_endpoint, row.broker_endpoint);
         assert_eq!(listed[0].ca_ref, row.ca_ref);
 

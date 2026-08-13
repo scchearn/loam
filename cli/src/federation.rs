@@ -7,7 +7,6 @@
 //! added by later tasks (T10/T11); `disconnect` and `status` are stubs until
 //! then. No credential is resolved and no `AuthenticatedPrincipal` is built here.
 
-use std::io::Read;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -27,7 +26,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         _ => {
             eprintln!(
                 "Usage:\n  \
-                 loam federation connect [<workspace>] --json   (reads one descriptor on stdin)\n  \
+                 loam federation connect <workspace> <broker> [--project org/project] --global-root <path> [--json]\n  \
                  loam federation disconnect <workspace> --global-root <path> [--json]\n  \
                  loam federation status [<workspace>] --global-root <path> [--json]\n  \
                  loam federation emit [<workspace>] --global-root <path> [--json]   (reads one operation on stdin)\n  \
@@ -38,13 +37,22 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     }
 }
 
-/// Build the connector's service context (stable identity + absolute runtime) so
+/// Build the connector's service context (identity + absolute runtime) so
 /// disconnect/status can drive the real per-user manager. Shared by both.
+///
+/// The instance id is the client certificate's SAN suffix when a bundle is
+/// present, else a deterministic root-derived id. The certificate is the
+/// single identity source for *sessions*; disconnect/status on a dormant
+/// machine stay inert (no cert, no mint — just a stable scheduler label), and
+/// `connect` refuses without a certificate.
 fn service_context(root: &std::path::Path) -> Result<crate::service::ServiceContext, i32> {
-    let instance_id = crate::service::ensure_instance_id(root).map_err(|error| {
-        eprintln!("federation: {error}");
-        70
-    })?;
+    let instance_id = match crate::provisioning::configured_identity_root() {
+        Ok(identity_root) => std::fs::read(identity_root.join("client.pem"))
+            .ok()
+            .and_then(|cert| crate::provisioning::certificate_instance_id(&cert).ok())
+            .unwrap_or_else(|| root_derived_id(root)),
+        Err(_) => root_derived_id(root),
+    };
     let runtime_path = std::env::current_exe().map_err(|_| {
         eprintln!("federation: cannot resolve the current runtime path");
         70
@@ -377,17 +385,23 @@ enum ServiceAction {
 }
 
 /// Install/uninstall/status/enable/disable the native definition. Builds the
-/// service context (stable instance identity + the absolute current runtime) and
-/// drives the real per-user manager. `install`/`status`/`disable` never start the
-/// connector or contact a broker; `enable` re-asserts active desired state on the
-/// current runtime after a runtime-path update (setup delegates this, T12).
+/// service context (the absolute current runtime + an instance id) and drives
+/// the real per-user manager. `install`/`status`/`disable` never start the
+/// connector or contact a broker; `enable` re-asserts active desired state on
+/// the current runtime after a runtime-path update (setup delegates this, T12).
+///
+/// Unlike disconnect/status, the lifecycle verbs are identity-free: a dormant
+/// definition can be staged before any enrollment exists. The instance id is
+/// the certificate's SAN suffix when a bundle is present, else a deterministic
+/// id derived from the global root path — a scheduler label only, never a wire
+/// identity (the certificate remains the single identity source for sessions).
 fn service_lifecycle(root: &std::path::Path, action: ServiceAction) -> i32 {
-    let instance_id = match crate::service::ensure_instance_id(root) {
-        Ok(id) => id,
-        Err(error) => {
-            eprintln!("federation service: {error}");
-            return 70;
-        }
+    let instance_id = match crate::provisioning::configured_identity_root() {
+        Ok(identity_root) => std::fs::read(identity_root.join("client.pem"))
+            .ok()
+            .and_then(|cert| crate::provisioning::certificate_instance_id(&cert).ok())
+            .unwrap_or_else(|| root_derived_id(root)),
+        Err(_) => root_derived_id(root),
     };
     let runtime_path = match std::env::current_exe() {
         Ok(path) => path,
@@ -419,13 +433,51 @@ fn service_lifecycle(root: &std::path::Path, action: ServiceAction) -> i32 {
     }
 }
 
+/// A deterministic, non-secret instance id for the dormant service definition
+/// when no identity bundle exists yet: a 26-char Crockford-base32 digest of the
+/// canonical global root path. Stable across calls on the same root, so the
+/// Windows task name never churns; it is a scheduler label only and is replaced
+/// by the certificate-derived id the moment connect runs.
+fn root_derived_id(root: &std::path::Path) -> String {
+    use crate::sha256::Sha256;
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let canonical = std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let mut hasher = Sha256::default();
+    hasher.update(canonical.as_bytes());
+    hasher
+        .finish()
+        .bytes()
+        .take(26)
+        .map(|byte| ALPHABET[(byte as usize) % ALPHABET.len()] as char)
+        .collect()
+}
+
+/// `loam federation connect <workspace> <broker> [--project org/project]
+/// [--global-root <path>] [--json]`.
+///
+/// The one-command enrollment surface: workspace and broker are positional,
+/// org/project are inferred from the workspace's git remote URL (overridable
+/// with `--project`), and the machine's instance id is the client certificate's
+/// SAN suffix — nothing is minted and no descriptor ceremony remains.
 fn connect(mut args: impl Iterator<Item = String>) -> i32 {
     let mut workspace: Option<PathBuf> = None;
+    let mut broker: Option<String> = None;
+    let mut project_override: Option<String> = None;
     let mut global_root: Option<PathBuf> = None;
     let mut json_output = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" => json_output = true,
+            "--project" => match args.next() {
+                Some(value) => project_override = Some(value),
+                None => {
+                    eprintln!("federation connect: --project needs a value");
+                    return 64;
+                }
+            },
             "--global-root" => match args.next() {
                 Some(value) => global_root = Some(PathBuf::from(value)),
                 None => {
@@ -437,6 +489,9 @@ fn connect(mut args: impl Iterator<Item = String>) -> i32 {
                 eprintln!("federation connect: unknown flag `{other}`");
                 return 64;
             }
+            other if broker.is_none() && workspace.is_some() => {
+                broker = Some(other.to_owned());
+            }
             other => {
                 if workspace.is_some() {
                     eprintln!("federation connect: workspace given twice");
@@ -446,13 +501,12 @@ fn connect(mut args: impl Iterator<Item = String>) -> i32 {
             }
         }
     }
-
-    let descriptor_bytes = match read_bounded_stdin() {
-        Ok(bytes) => bytes,
-        Err(code) => return code,
+    let (Some(workspace), Some(broker)) = (workspace, broker) else {
+        eprintln!("federation connect: <workspace> and <broker> are required");
+        return 64;
     };
 
-    let enrolled = match validate(&descriptor_bytes, workspace.as_deref()) {
+    let enrolled = match validate_connect(&workspace, &broker, project_override.as_deref()) {
         Ok(enrolled) => enrolled,
         Err(error) => {
             if json_output {
@@ -465,7 +519,7 @@ fn connect(mut args: impl Iterator<Item = String>) -> i32 {
     };
 
     match global_root {
-        // No global root: validation-only (the descriptor + workspace proof).
+        // No global root: validation-only (the workspace + broker proof).
         None => {
             if json_output {
                 println!("{}", success_json(&enrolled).to_json());
@@ -477,50 +531,150 @@ fn connect(mut args: impl Iterator<Item = String>) -> i32 {
             }
             0
         }
-        // With a global root: the full transactional connect (T10). The transport
-        // is the deterministic stub until the real broker adapter lands (T13).
+        // With a global root: the full transactional connect.
         Some(root) => orchestrate_cli(&enrolled, &root, json_output),
     }
 }
 
-/// Drive the T10 transactional connect from the CLI: derive the connector's
-/// service context and identity, run the probe/commit/activate orchestration
-/// against the stub transport, and report the outcome.
+/// Build the validated enrollment from the one-command surface: org/project
+/// inferred from the workspace's git remote URL (overridable), the broker
+/// endpoint validated, and the physical-identity + commit-reachability proof
+/// run exactly as the descriptor path did.
+fn validate_connect(
+    workspace: &std::path::Path,
+    broker: &str,
+    project_override: Option<&str>,
+) -> Result<enrollment::ValidatedEnrollment, EnrollmentError> {
+    // The endpoint is validated before any git work: a typo in the broker must
+    // never spend a remote fetch to be discovered.
+    if !broker.starts_with("mqtts://")
+        || broker.strip_prefix("mqtts://").is_none_or(|rest| {
+            rest.is_empty()
+                || rest.contains('@')
+                || rest.contains('?')
+                || rest.contains('#')
+                || rest.contains('/')
+        })
+    {
+        return Err(EnrollmentError::InvalidEndpoint);
+    }
+    let (org_id, project_id) = match project_override {
+        Some(scope) => split_scope(scope)?,
+        None => infer_scope(workspace)?,
+    };
+    let descriptor = enrollment::Descriptor {
+        org_id,
+        project_id,
+        repository_id: "repo".to_owned(),
+        broker: enrollment::BrokerDescriptor {
+            profile: "default".to_owned(),
+            endpoint: broker.to_owned(),
+            tls_server_name: broker
+                .strip_prefix("mqtts://")
+                .and_then(|authority| authority.rsplit_once(':'))
+                .map(|(host, _)| host.to_owned())
+                .unwrap_or_default(),
+            ca_ref: None,
+        },
+        git: enrollment::GitDescriptor {
+            commit: current_commit(workspace)?,
+            remotes: vec![enrollment::RemoteDescriptor {
+                name: "origin".to_owned(),
+                refs: vec!["refs/heads/main".to_owned()],
+            }],
+        },
+    };
+    enrollment::validate_enrollment(descriptor, workspace)
+}
+
+/// Split a `--project org/project` value into its two atoms.
+fn split_scope(scope: &str) -> Result<(String, String), EnrollmentError> {
+    let (org, project) = scope
+        .split_once('/')
+        .ok_or(EnrollmentError::InvalidField { field: "project" })?;
+    if org.is_empty() || project.is_empty() || org.contains('/') || project.contains('/') {
+        return Err(EnrollmentError::InvalidField { field: "project" });
+    }
+    Ok((org.to_owned(), project.to_owned()))
+}
+
+/// Infer org/project from the workspace's `origin` remote URL path. The last
+/// two path segments of the repository path are the org and the project:
+/// `git@github.com:acme/loam.git` → `acme`/`loam`.
+fn infer_scope(workspace: &std::path::Path) -> Result<(String, String), EnrollmentError> {
+    let path_str = workspace
+        .to_str()
+        .ok_or(EnrollmentError::WorkspaceNotUtf8)?;
+    let output = std::process::Command::new("git")
+        .args(["-C", path_str, "remote", "get-url", "origin"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|_| EnrollmentError::GitUnavailable)?;
+    if !output.status.success() {
+        return Err(EnrollmentError::RemoteNotConfigured {
+            remote: "origin".to_owned(),
+        });
+    }
+    let url = String::from_utf8(output.stdout)
+        .map_err(|_| EnrollmentError::RemoteNotConfigured {
+            remote: "origin".to_owned(),
+        })?
+        .trim()
+        .to_owned();
+    let path = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&url)
+        .split_once(':')
+        .map(|(_, rest)| rest)
+        .unwrap_or(&url);
+    let path = path.trim_end_matches(".git").trim_end_matches('/');
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    let project = segments
+        .next_back()
+        .ok_or(EnrollmentError::InvalidField { field: "project" })?;
+    let org = segments
+        .next_back()
+        .ok_or(EnrollmentError::InvalidField { field: "org_id" })?;
+    if org.is_empty() || project.is_empty() {
+        return Err(EnrollmentError::InvalidField { field: "project" });
+    }
+    Ok((org.to_owned(), project.to_owned()))
+}
+
+/// The workspace's current HEAD commit, for the reachability proof.
+fn current_commit(workspace: &std::path::Path) -> Result<String, EnrollmentError> {
+    let path_str = workspace
+        .to_str()
+        .ok_or(EnrollmentError::WorkspaceNotUtf8)?;
+    let output = std::process::Command::new("git")
+        .args(["-C", path_str, "rev-parse", "HEAD"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|_| EnrollmentError::GitUnavailable)?;
+    if !output.status.success() {
+        return Err(EnrollmentError::InvalidCommit);
+    }
+    let commit = String::from_utf8(output.stdout)
+        .map_err(|_| EnrollmentError::InvalidCommit)?
+        .trim()
+        .to_owned();
+    if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(EnrollmentError::InvalidCommit);
+    }
+    Ok(commit)
+}
+
+/// Drive the transactional connect from the CLI: derive the connector's
+/// service context and identity from the certificate, run the
+/// probe/commit/activate orchestration, and report the outcome.
 fn orchestrate_cli(
     enrolled: &enrollment::ValidatedEnrollment,
     root: &std::path::Path,
     json_output: bool,
 ) -> i32 {
-    let instance_id = match crate::service::ensure_instance_id(root) {
-        Ok(id) => id,
-        Err(error) => {
-            eprintln!("federation connect: {error}");
-            return 70;
-        }
-    };
-    let runtime_path = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(_) => {
-            eprintln!("federation connect: cannot resolve the current runtime path");
-            return 70;
-        }
-    };
-    let context = crate::service::ServiceContext {
-        global_root: root.to_path_buf(),
-        instance_id: instance_id.clone(),
-        runtime_path,
-        systemd_user_dir: systemd_user_dir(),
-    };
-    let runner = crate::service::RealRunner;
-    let db_path = root.join("loam.sqlite3");
-    let now = chrono::Utc::now();
-
-    // T13 — probe against the REAL broker, not the stub. Build the session inputs
-    // from the validated descriptor plus this machine's instance id, exactly as
-    // `provisioning::resolve` builds them from the committed row, so the enrollment
-    // probe authenticates over mTLS, subscribes, publishes, and requires its own
-    // echoed event *before* the row is committed and the service activated. The
-    // transport alone learns the canonical principal from the certificate.
     let report_error = |code: &str| -> i32 {
         if json_output {
             println!(
@@ -540,6 +694,22 @@ fn orchestrate_cli(
         }
         69
     };
+    let context = match service_context(root) {
+        Ok(context) => context,
+        Err(code) => return code,
+    };
+    let instance_id = context.instance_id.clone();
+    let runner = crate::service::RealRunner;
+    let db_path = root.join("loam.sqlite3");
+    let now = chrono::Utc::now();
+
+    // Probe against the REAL broker. Build the session inputs from the
+    // validated descriptor plus this machine's certificate-derived instance id,
+    // exactly as `provisioning::resolve` builds them from the committed row, so
+    // the enrollment probe authenticates over mTLS, subscribes, publishes, and
+    // requires its own echoed event *before* the row is committed and the
+    // service activated. The transport alone learns the canonical principal
+    // from the certificate.
     let row = crate::enrollment::EnrolledRow {
         identity_key: crate::enrollment::identity_key(&enrolled.workspace),
         org_id: enrolled.org_id.clone(),
@@ -551,7 +721,6 @@ fn orchestrate_cli(
         broker_profile: enrolled.broker_profile.clone(),
         broker_endpoint: enrolled.broker_endpoint.clone(),
         tls_server_name: enrolled.tls_server_name.clone(),
-        credential_ref: enrolled.credential_ref.clone(),
         ca_ref: enrolled.ca_ref.clone(),
         commit: enrolled.commit.clone(),
         capabilities: crate::enrollment::CapabilityRecord {
@@ -649,28 +818,16 @@ fn connect_sysexit(error: &crate::connector::ConnectError) -> i32 {
     }
 }
 
-/// Parse the descriptor, then — only when a workspace path is supplied — run the
-/// full physical-identity, remote-digest, and reachability proof. Descriptor
-/// validation always runs first so a malformed descriptor is rejected before any
-/// filesystem or Git access.
-fn validate(
-    bytes: &[u8],
-    workspace: Option<&std::path::Path>,
-) -> Result<enrollment::ValidatedEnrollment, EnrollmentError> {
-    let descriptor = enrollment::parse_descriptor(bytes)?;
-    let workspace = workspace.unwrap_or_else(|| std::path::Path::new("."));
-    enrollment::validate_enrollment(descriptor, workspace)
-}
-
 /// Read stdin with a hard ceiling one byte over the descriptor limit, so an
 /// oversized document is detected as [`EnrollmentError::TooLarge`] rather than
 /// buffered unbounded.
 fn read_bounded_stdin() -> Result<Vec<u8>, i32> {
+    use std::io::Read;
     let mut buffer = Vec::new();
     let limit = (MAX_DESCRIPTOR_BYTES + 1) as u64;
     let mut handle = std::io::stdin().lock().take(limit);
     if handle.read_to_end(&mut buffer).is_err() {
-        eprintln!("federation connect: could not read descriptor from stdin");
+        eprintln!("federation: could not read the operation from stdin");
         return Err(65);
     }
     Ok(buffer)
@@ -1514,7 +1671,6 @@ mod emit_tests {
                 broker_profile: "acme-prod".into(),
                 broker_endpoint: "mqtts://h:8883".into(),
                 tls_server_name: "h".into(),
-                credential_ref: "vault://c".into(),
                 ca_ref: None,
                 commit: "0123456789abcdef0123456789abcdef01234567".into(),
                 remotes: Vec::new(),
@@ -1612,7 +1768,6 @@ mod emit_tests {
                 broker_profile: "acme-prod".into(),
                 broker_endpoint: "mqtts://h:8883".into(),
                 tls_server_name: "h".into(),
-                credential_ref: "vault://c".into(),
                 ca_ref: None,
                 commit: "0123456789abcdef0123456789abcdef01234567".into(),
                 remotes: Vec::new(),
@@ -1728,7 +1883,6 @@ mod emit_tests {
             broker_profile: "p".into(),
             broker_endpoint: "mqtts://broker.example:8883".into(),
             tls_server_name: "broker.example".into(),
-            credential_ref: "loam/test/credential".into(),
             ca_ref: None,
             commit: "84be000000000000000000000000000000000001".into(),
             capabilities: enrollment::CapabilityRecord {
@@ -1967,7 +2121,6 @@ mod emit_tests {
             broker_profile: "acme-prod".into(),
             broker_endpoint: "mqtts://h:8883".into(),
             tls_server_name: "h".into(),
-            credential_ref: "vault://c".into(),
             ca_ref: None,
             commit: "0123456789abcdef0123456789abcdef01234567".into(),
             remotes: Vec::new(),

@@ -1,9 +1,10 @@
 //! `loam federation` CLI integration tests.
 //!
 //! `cli` is a bin-only crate, so these drive the built binary through
-//! `std::process::Command` and feed the descriptor on stdin. This suite covers the
-//! `connect` descriptor-validation path (typed JSON errors, exit codes) and a
-//! full happy path against hermetic local Git repositories.
+//! `std::process::Command`. This suite covers the one-command `connect`
+//! surface (`<workspace> <broker>`, org/project inferred from the git remote,
+//! overridable with `--project`), typed JSON errors, exit codes, and a full
+//! happy path against hermetic local Git repositories.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -20,25 +21,19 @@ fn binary() -> PathBuf {
     path.join(if cfg!(windows) { "loam.exe" } else { "loam" })
 }
 
-fn run_connect(workspace: Option<&Path>, stdin: &[u8]) -> (i32, String, String) {
+fn run_connect(workspace: Option<&Path>, broker: &str, extra: &[&str]) -> (i32, String, String) {
     let mut command = Command::new(binary());
     command.arg("federation").arg("connect");
     if let Some(ws) = workspace {
         command.arg(ws);
     }
-    command.arg("--json");
+    command.arg(broker);
+    command.args(extra);
     command
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn loam");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(stdin)
-        .expect("write descriptor");
-    let output = child.wait_with_output().expect("wait");
+    let output = command.output().expect("spawn loam");
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -46,95 +41,49 @@ fn run_connect(workspace: Option<&Path>, stdin: &[u8]) -> (i32, String, String) 
     )
 }
 
-const GOLDEN: &str = include_str!("fixtures/mqtt/connector-descriptor-cases.json");
-
-fn valid_descriptor_json() -> String {
-    // Reuse the same golden case the unit tests use.
-    let start = GOLDEN.find("\"valid\":").expect("valid key") + "\"valid\":".len();
-    // Extract the balanced object after "valid":
-    extract_object(&GOLDEN[start..])
-}
-
-fn extract_object(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let open = text.find('{').expect("object start");
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, &b) in bytes.iter().enumerate().skip(open) {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return text[open..=i].to_owned();
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unbalanced object");
+#[test]
+fn connect_requires_a_workspace_and_a_broker() {
+    let (code, _stdout, stderr) = run_connect(None, "", &[]);
+    assert_eq!(code, 64, "missing positional arguments are a usage error");
+    assert!(
+        stderr.contains("<workspace> and <broker> are required"),
+        "got: {stderr}"
+    );
 }
 
 #[test]
-fn descriptor_unknown_field_is_rejected_with_typed_json() {
-    let valid = valid_descriptor_json();
-    let bad = format!("{{\"note\":\"x\",{}", &valid[1..]);
-    let (code, stdout, _stderr) = run_connect(None, bad.as_bytes());
-    assert_eq!(code, 65, "usage/input class for a descriptor violation");
+fn connect_rejects_a_plaintext_broker_endpoint() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let (code, stdout, _stderr) =
+        run_connect(Some(&workspace), "mqtt://broker.example:8883", &["--json"]);
+    assert_eq!(code, 65, "a plaintext endpoint is a usage/input violation");
     assert!(
-        stdout.contains("descriptor_unknown_field"),
+        stdout.contains("descriptor_invalid_endpoint"),
         "expected typed code, got: {stdout}"
     );
 }
 
 #[test]
-fn descriptor_secret_field_is_rejected() {
-    let valid = valid_descriptor_json();
-    let bad = format!("{{\"token\":\"x\",{}", &valid[1..]);
-    let (code, stdout, _stderr) = run_connect(None, bad.as_bytes());
+fn connect_rejects_a_malformed_project_override() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let (code, stdout, _stderr) = run_connect(
+        Some(&workspace),
+        "mqtts://broker.example:8883",
+        &["--project", "no-slash", "--json"],
+    );
     assert_eq!(code, 65);
     assert!(
-        stdout.contains("descriptor_forbidden_field"),
-        "got: {stdout}"
+        stdout.contains("descriptor_invalid_field"),
+        "expected typed code, got: {stdout}"
     );
-}
-
-#[test]
-fn descriptor_plaintext_endpoint_is_rejected() {
-    let bad = valid_descriptor_json().replace("mqtts://", "mqtt://");
-    let (code, stdout, _stderr) = run_connect(None, bad.as_bytes());
-    assert_eq!(code, 65);
-    assert!(
-        stdout.contains("descriptor_invalid_endpoint"),
-        "got: {stdout}"
-    );
-}
-
-#[test]
-fn descriptor_oversize_is_rejected() {
-    let big = vec![b' '; 64 * 1024 + 1];
-    let (code, stdout, _stderr) = run_connect(None, &big);
-    assert_eq!(code, 65);
-    assert!(stdout.contains("descriptor_too_large"), "got: {stdout}");
 }
 
 #[test]
 fn full_happy_path_validates_against_hermetic_repos() {
     // Build an origin repo with a commit on refs/heads/main, then a workspace
-    // clone whose `origin` points at it. The descriptor's commit must be proven
-    // reachable in an isolated temp repo without mutating the workspace.
+    // clone whose `origin` points at it. The connect's commit must be proven
+    // reachable in an isolated temp repo without mutating the workspace, and
+    // org/project must be inferred from the remote URL path.
     let root = temp_dir("happy");
     let origin = root.join("origin.git");
     let work = root.join("work");
@@ -182,9 +131,18 @@ fn full_happy_path_validates_against_hermetic_repos() {
         ],
         None,
     );
-    let commit = git(&["-C", seed.to_str().unwrap(), "rev-parse", "HEAD"], None)
-        .trim()
-        .to_owned();
+    // A bare repo's HEAD defaults to the unborn `master`; point it at main so
+    // the workspace clone checks out a working tree.
+    git(
+        &[
+            "-C",
+            origin.to_str().unwrap(),
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
+        None,
+    );
 
     // workspace clone with origin -> origin.git
     git(
@@ -197,14 +155,8 @@ fn full_happy_path_validates_against_hermetic_repos() {
         None,
     );
 
-    let descriptor = valid_descriptor_json()
-        .replace("0123456789abcdef0123456789abcdef01234567", &commit)
-        .replace(
-            r#""refs":["refs/heads/main","refs/heads/federation"]"#,
-            r#""refs":["refs/heads/main"]"#,
-        );
-
-    let (code, stdout, stderr) = run_connect(Some(&work), descriptor.as_bytes());
+    let (code, stdout, stderr) =
+        run_connect(Some(&work), "mqtts://broker.example:8883", &["--json"]);
     assert_eq!(
         code, 0,
         "happy path should validate. stderr: {stderr} stdout: {stdout}"
@@ -217,6 +169,98 @@ fn full_happy_path_validates_against_hermetic_repos() {
     assert!(
         !stdout.contains(origin.to_str().unwrap()),
         "raw remote URL must not leak"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn connect_infers_org_and_project_from_the_remote_url() {
+    let root = temp_dir("infer");
+    let origin = root.join("acme").join("loam.git");
+    std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+    let work = root.join("work");
+    git(
+        &["init", "--bare", "--quiet", origin.to_str().unwrap()],
+        None,
+    );
+    let seed = root.join("seed");
+    git(&["init", "--quiet", seed.to_str().unwrap()], None);
+    git(
+        &["-C", seed.to_str().unwrap(), "config", "user.email", "t@t"],
+        None,
+    );
+    git(
+        &["-C", seed.to_str().unwrap(), "config", "user.name", "t"],
+        None,
+    );
+    std::fs::write(seed.join("f.txt"), "hi").unwrap();
+    git(&["-C", seed.to_str().unwrap(), "add", "."], None);
+    git(
+        &[
+            "-C",
+            seed.to_str().unwrap(),
+            "commit",
+            "--quiet",
+            "-m",
+            "init",
+        ],
+        None,
+    );
+    git(
+        &["-C", seed.to_str().unwrap(), "branch", "-M", "main"],
+        None,
+    );
+    git(
+        &[
+            "-C",
+            seed.to_str().unwrap(),
+            "push",
+            "--quiet",
+            origin.to_str().unwrap(),
+            "main",
+        ],
+        None,
+    );
+    git(
+        &[
+            "-C",
+            origin.to_str().unwrap(),
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
+        None,
+    );
+    git(
+        &[
+            "clone",
+            "--quiet",
+            origin.to_str().unwrap(),
+            work.to_str().unwrap(),
+        ],
+        None,
+    );
+
+    let (code, stdout, _stderr) =
+        run_connect(Some(&work), "mqtts://broker.example:8883", &["--json"]);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.contains("\"org_id\":\"acme\"") && stdout.contains("\"project_id\":\"loam\""),
+        "org/project must be inferred from the remote path: {stdout}"
+    );
+
+    // The override wins over the remote inference.
+    let (code, stdout, _stderr) = run_connect(
+        Some(&work),
+        "mqtts://broker.example:8883",
+        &["--project", "other-org/other-project", "--json"],
+    );
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.contains("\"org_id\":\"other-org\"")
+            && stdout.contains("\"project_id\":\"other-project\""),
+        "the --project override must win: {stdout}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -271,6 +315,16 @@ fn unreachable_commit_is_rejected() {
     );
     git(
         &[
+            "-C",
+            origin.to_str().unwrap(),
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
+        None,
+    );
+    git(
+        &[
             "clone",
             "--quiet",
             origin.to_str().unwrap(),
@@ -279,12 +333,23 @@ fn unreachable_commit_is_rejected() {
         None,
     );
 
-    // A syntactically valid but absent commit.
-    let descriptor = valid_descriptor_json().replace(
-        r#""refs":["refs/heads/main","refs/heads/federation"]"#,
-        r#""refs":["refs/heads/main"]"#,
+    // A workspace whose HEAD is not reachable from the origin's main: the
+    // reachability proof must refuse it.
+    std::fs::write(work.join("unpushed.txt"), "not pushed").unwrap();
+    git(&["-C", work.to_str().unwrap(), "add", "."], None);
+    git(
+        &[
+            "-C",
+            work.to_str().unwrap(),
+            "commit",
+            "--quiet",
+            "-m",
+            "unpushed",
+        ],
+        None,
     );
-    let (code, stdout, _stderr) = run_connect(Some(&work), descriptor.as_bytes());
+    let (code, stdout, _stderr) =
+        run_connect(Some(&work), "mqtts://broker.example:8883", &["--json"]);
     assert_eq!(code, 65);
     assert!(stdout.contains("commit_unreachable"), "got: {stdout}");
 

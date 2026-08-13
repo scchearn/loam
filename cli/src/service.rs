@@ -1,12 +1,15 @@
-//! A stable non-secret instance identity and dormant per-user
-//! service definitions for the three native managers.
+//! Dormant per-user service definitions for the three native managers.
 //!
 //! The definitions are installed **disabled**: install renders the manager's
 //! definition and registers it, but does not start it. A per-user connector is
 //! enabled/started only after the first enrollment, and the
 //! empty state stays dormant. This module never starts the connector, never
-//! contacts a broker, and never creates the SQLite store — the instance identity
-//! lives in its own file so an unenrolled machine has no database.
+//! contacts a broker, and never creates the SQLite store.
+//!
+//! The machine's instance identity is no longer minted here: the client
+//! certificate's SAN is the single identity source (`federation-enrollment-
+//! simplification.md`). The service context carries the instance id supplied by
+//! the caller, which derives it from the resolved certificate at connect time.
 //!
 //! Manager invocation goes through a [`CommandRunner`] seam consumed by generics
 //! (no trait object, so the crate no-dispatch tripwire stays green); tests inject
@@ -94,50 +97,12 @@ impl CommandRunner for RealRunner {
 // ---------------------------------------------------------------------------
 // Stable instance identity
 // ---------------------------------------------------------------------------
-
-/// Read the stable per-install instance id, generating and persisting it once if
-/// absent. Stored in its own file under the global root so an unenrolled machine
-/// never causes `loam.sqlite3` to be created. Rejects a symlink or a malformed
-/// existing value rather than silently replacing it.
-pub fn ensure_instance_id(global_root: &Path) -> Result<String, ServiceError> {
-    let path = global_root.join("instance_id");
-    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-        if metadata.file_type().is_symlink() {
-            return Err(ServiceError::Io("instance_id is a symlink".into()));
-        }
-        let existing =
-            std::fs::read_to_string(&path).map_err(|e| ServiceError::Io(e.to_string()))?;
-        let trimmed = existing.trim();
-        if is_valid_instance_id(trimmed) {
-            return Ok(trimmed.to_owned());
-        }
-        return Err(ServiceError::Io("instance_id is malformed".into()));
-    }
-    let id = generate_instance_id();
-    std::fs::create_dir_all(global_root).map_err(|e| ServiceError::Io(e.to_string()))?;
-    std::fs::write(&path, &id).map_err(|e| ServiceError::Io(e.to_string()))?;
-    Ok(id)
-}
-
-fn is_valid_instance_id(value: &str) -> bool {
-    value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-/// A non-secret, stable-once-written instance id: 32 lowercase hex chars derived
-/// from time, pid, and the global-root path, hashed so it is opaque. Not a
-/// secret and not required to be globally unique beyond this install.
-fn generate_instance_id() -> String {
-    use crate::sha256::Sha256;
-    let mut hasher = Sha256::default();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    hasher.update(&nanos.to_le_bytes());
-    hasher.update(&std::process::id().to_le_bytes());
-    let full = hasher.finish();
-    full[..32].to_owned()
-}
+//
+// The instance id is the client certificate's SAN suffix, derived at connect
+// time by `provisioning` (`certificate_instance_id`) and carried here in the
+// [`ServiceContext`]. Nothing in this module mints, reads, or persists an
+// instance id: the certificate is the single source, so the `instance_id` file
+// and its divergence class are gone.
 
 // ---------------------------------------------------------------------------
 // Pure platform renderings (all always compiled, so every rendering is unit
@@ -194,9 +159,13 @@ pub fn render_launchagent_plist(ctx: &ServiceContext) -> Result<String, ServiceE
 /// process's environment, as `<string>` values (never `<data>`). Empty dict
 /// when none are set. launchd does not expand `$HOME`, so the values are
 /// passed through verbatim — an absolute path stays absolute.
+///
+/// `LOAM_SECRET_BACKEND` is deliberately excluded: the OS secret store is
+/// removed, and a plist carrying the dead variable would resurrect the store
+/// in the service environment (`federation-enrollment-simplification.md`).
 fn launchagent_environment() -> String {
     let mut names: Vec<String> = std::env::vars()
-        .filter(|(name, _)| name.starts_with("LOAM_"))
+        .filter(|(name, _)| name.starts_with("LOAM_") && name != "LOAM_SECRET_BACKEND")
         .map(|(name, _)| name)
         .collect();
     names.sort();
@@ -696,21 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_id_is_generated_once_and_preserved() {
-        let context = ctx("identity");
-        let first = ensure_instance_id(&context.global_root).unwrap();
-        assert_eq!(first.len(), 32);
-        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
-        let second = ensure_instance_id(&context.global_root).unwrap();
-        assert_eq!(first, second, "id must be stable across calls");
-        // A read-only reconcile of identity never creates the SQLite store.
-        assert!(!context.global_root.join("loam.sqlite3").exists());
-    }
-
-    /// launchctl receives argv, never a shell line, so an unexpanded
-    /// `gui/$(id -u)` is a "Bad request" — the domain must carry a real uid.
     #[cfg(target_os = "macos")]
-    #[test]
     fn the_launchd_domain_carries_a_real_uid_not_a_shell_substitution() {
         let domain = launchd::gui_domain();
         let uid = domain.strip_prefix("gui/").expect("gui/<uid> domain");
@@ -760,16 +715,24 @@ mod tests {
     }
 
     #[test]
-    fn launchagent_environment_renders_loam_vars_as_strings() {
+    fn launchagent_environment_renders_loam_vars_as_strings_and_drops_the_secret_backend() {
         // The renderer reads the process environment, so the test sets one
         // LOAM_* variable and asserts it appears as a <string>, never <data>.
         // The variable is removed afterwards so a parallel test never sees it.
+        // `LOAM_SECRET_BACKEND` is the dead secret-store switch: the renderer
+        // must never carry it into a service environment.
         std::env::set_var("LOAM_SECRET_BACKEND", "security");
+        std::env::set_var("LOAM_TEST_VAR", "visible");
         let block = launchagent_environment();
         std::env::remove_var("LOAM_SECRET_BACKEND");
+        std::env::remove_var("LOAM_TEST_VAR");
         assert!(
-            block.contains("<key>LOAM_SECRET_BACKEND</key><string>security</string>"),
+            block.contains("<key>LOAM_TEST_VAR</key><string>visible</string>"),
             "LOAM_* vars must render as <string> values; got: {block}"
+        );
+        assert!(
+            !block.contains("LOAM_SECRET_BACKEND"),
+            "the removed secret backend must never reach a service environment: {block}"
         );
         assert!(!block.contains("<data>"), "values must never be <data>");
     }

@@ -1156,7 +1156,6 @@ fn seed_enrollment(root: &Path, org: &str, workspace: &Path) {
         broker_profile: "profile-t8".into(),
         broker_endpoint: "mqtts://localhost:8883".into(),
         tls_server_name: "localhost".into(),
-        credential_ref: "keychain:loam-t8".into(),
         ca_ref: None,
         // A real-shaped base oid: the all-zero oid is not a valid Git object and
         // the outbound envelope carries this straight into `context.git.base_oid`.

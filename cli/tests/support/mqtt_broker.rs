@@ -557,8 +557,19 @@ fn write_certificates(openssl: &Path, root: &Path) -> Result<(), String> {
         "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n",
     )
     .map_err(|error| format!("write server certificate extensions: {error}"))?;
-    fs::write(root.join("client.ext"), "extendedKeyUsage=clientAuth\n")
-        .map_err(|error| format!("write client certificate extensions: {error}"))?;
+    // The client certificates carry the instance identity in their SAN, exactly
+    // as org-issued certs do (`urn:loam:instance:<ulid>`). The two clients are
+    // the two-machine shape: one person, one CN, two instances.
+    fs::write(
+        root.join("client.ext"),
+        "extendedKeyUsage=clientAuth\nsubjectAltName=URI:urn:loam:instance:01ARZ3NDEKTSV4RRFFQ69G5FAV\n",
+    )
+    .map_err(|error| format!("write client certificate extensions: {error}"))?;
+    fs::write(
+        root.join("client-named.ext"),
+        "extendedKeyUsage=clientAuth\nsubjectAltName=URI:urn:loam:instance:01ARZ3NDEKTSV4RRFFQ69G5FBV\n",
+    )
+    .map_err(|error| format!("write named client certificate extensions: {error}"))?;
 
     openssl_checked(
         openssl,
@@ -703,7 +714,7 @@ fn write_certificates(openssl: &Path, root: &Path) -> Result<(), String> {
             "2",
             "-sha256",
             "-extfile",
-            "client.ext",
+            "client-named.ext",
             "-out",
             "client-named.crt",
         ],

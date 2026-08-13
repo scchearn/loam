@@ -99,7 +99,6 @@ fn smoke_enrollment(root: &std::path::Path) -> loam::enrollment::ValidatedEnroll
         broker_profile: "profile-smoke".into(),
         broker_endpoint: "mqtts://broker.invalid:8883".into(),
         tls_server_name: "broker.invalid".into(),
-        credential_ref: "keychain:loam-smoke".into(),
         ca_ref: None,
         commit: "0".repeat(40),
         remotes: vec![ValidatedRemote {

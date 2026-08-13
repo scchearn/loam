@@ -2996,7 +2996,6 @@ mod service_tests {
             broker_profile: "acme-prod".into(),
             broker_endpoint: "mqtts://h:8883".into(),
             tls_server_name: "h".into(),
-            credential_ref: "vault://c".into(),
             ca_ref: None,
             commit: "0123456789abcdef0123456789abcdef01234567".into(),
             remotes: vec![ValidatedRemote {
@@ -3974,7 +3973,6 @@ mod connect_tests {
             broker_profile: "acme-prod".into(),
             broker_endpoint: "mqtts://broker:8883".into(),
             tls_server_name: "broker".into(),
-            credential_ref: "vault://c".into(),
             ca_ref: None,
             commit: commit.into(),
             remotes: vec![ValidatedRemote {
@@ -3990,16 +3988,10 @@ mod connect_tests {
     }
 
     fn setup(label: &str) -> (std::path::PathBuf, ServiceContext) {
-        let root = std::env::temp_dir().join(format!(
-            "loam-connect-{label}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        // ensure_instance_id creates the global root (via the service module),
-        // so open_writable can create the database beneath it.
-        let instance_id = crate::service::ensure_instance_id(&root).unwrap();
+        // The global root is created explicitly; the instance id is a test
+        // constant (the certificate is the identity source in production).
+        let root = crate::enrollment::temp_global_root(label);
+        let instance_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned();
         let ctx = ServiceContext {
             global_root: root.clone(),
             instance_id,
@@ -4241,7 +4233,6 @@ mod lifecycle_tests {
             broker_profile: "acme-prod".into(),
             broker_endpoint: "mqtts://h:8883".into(),
             tls_server_name: "h".into(),
-            credential_ref: "vault://c".into(),
             ca_ref: None,
             commit: "0123456789abcdef0123456789abcdef01234567".into(),
             remotes: vec![ValidatedRemote {
@@ -4257,14 +4248,10 @@ mod lifecycle_tests {
     }
 
     fn setup(label: &str) -> (PathBuf, ServiceContext) {
-        let root = std::env::temp_dir().join(format!(
-            "loam-lifecycle-{label}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let instance_id = crate::service::ensure_instance_id(&root).unwrap();
+        // The global root is created explicitly; the instance id is a test
+        // constant (the certificate is the identity source in production).
+        let root = crate::enrollment::temp_global_root(label);
+        let instance_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned();
         let ctx = ServiceContext {
             global_root: root.clone(),
             instance_id,
@@ -4836,7 +4823,6 @@ mod snapshot_tests {
             broker_profile: "p".into(),
             broker_endpoint: "mqtts://broker.example:8883".into(),
             tls_server_name: "broker.example".into(),
-            credential_ref: "loam/test/credential".into(),
             ca_ref: None,
             commit: "84be000000000000000000000000000000000001".into(),
             capabilities: crate::enrollment::CapabilityRecord {
@@ -5056,7 +5042,6 @@ mod outbound_tests {
             broker_profile: "p".into(),
             broker_endpoint: "mqtts://broker.example:8883".into(),
             tls_server_name: "broker.example".into(),
-            credential_ref: "loam/test/credential".into(),
             ca_ref: None,
             commit: "84be000000000000000000000000000000000001".into(),
             capabilities: crate::enrollment::CapabilityRecord {
