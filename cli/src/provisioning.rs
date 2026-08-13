@@ -1378,6 +1378,52 @@ mod tests {
     }
 
     #[test]
+    fn identity_divergence_is_impossible_the_row_must_match_the_certificate_san() {
+        // Write a valid identity bundle whose SAN suffix is a known ULID, then
+        // prove the seam refuses any row whose instance_id disagrees with it.
+        // This is the connector-side SAN enforcement: the certificate is the
+        // single identity source, so a stale or tampered row cannot silently
+        // open a session under a different identity.
+        let ulid = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let directory = temp_dir("identity-divergence");
+        let identity = directory.join("identity");
+        std::fs::create_dir_all(&identity).expect("identity directory is creatable");
+        let certificate = pem(&certificate_der_with_san(
+            "Loam MQTT Test CA",
+            Some("sam@example.test"),
+            None,
+            true,
+            Some(&[&format!("urn:loam:instance:{ulid}")]),
+        ));
+        std::fs::write(identity.join("client.pem"), &certificate).expect("certificate is writable");
+        std::fs::write(identity.join("key.pem"), KEY).expect("key is writable");
+        std::env::set_var("LOAM_FEDERATION_IDENTITY_DIR", &identity);
+
+        // A matching row gets past the identity gate and fails later (the roster
+        // gate, absent here) — it must NOT be refused as an identity mismatch.
+        let matching = enrolled_row(ulid, "mqtts://broker.acme.example:8883");
+        assert_eq!(
+            resolve(&matching).err(),
+            Some(ProvisionFailure::Roster(reason::ROSTER_ABSENT)),
+            "a matching row must pass the SAN gate"
+        );
+
+        // A row claiming a different instance id is refused outright: the cert
+        // says who this machine is, and the row cannot override it.
+        let divergent = enrolled_row(
+            "01ARZ3NDEKTSV4RRFFQ69G5FBX",
+            "mqtts://broker.acme.example:8883",
+        );
+        assert_eq!(
+            resolve(&divergent).err(),
+            Some(ProvisionFailure::Credentials(reason::IDENTITY_MISMATCH))
+        );
+
+        std::env::remove_var("LOAM_FEDERATION_IDENTITY_DIR");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn the_session_identity_and_client_id_come_from_the_enrolled_row() {
         // The enrolled instance id is the single source. `federation emit`
         // derives `source` from the same field, so one reader of one column is
