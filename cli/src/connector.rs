@@ -1352,6 +1352,13 @@ pub mod reason {
     pub const ROSTER_NO_PRINCIPALS: &str = "roster-no-principals";
     pub const ROSTER_WILDCARD: &str = "roster-wildcard";
     pub const ROSTER_MALFORMED: &str = "roster-malformed";
+    /// No federation profile resolved at all: no config dir, no legacy global
+    /// root. Distinct from `ROSTER_ABSENT` (profile resolved but no roster
+    /// file) so an operator can tell "no home to look in" from "nothing
+    /// written yet".
+    pub const PROFILE_ABSENT: &str = "profile-absent";
+    /// A one-time legacy→config-dir profile migration could not be performed.
+    pub const PROFILE_COPY_FAILED: &str = "profile-copy-failed";
 }
 
 /// Why provisioning refused, split by which half failed so the connector maps it

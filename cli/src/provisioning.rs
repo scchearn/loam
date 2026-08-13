@@ -689,15 +689,131 @@ pub fn match_local_identity(
 // is never half-admitted: the entry that did not parse might have been the one
 // constraining the entries that did.
 
-/// Where per-project rosters live, resolved through three rungs.
+/// Where the federation profile lives: the directory holding `identity/`,
+/// `rosters/`, `members/`, `loam.sqlite3`, and `config.json`. Rungs, first
+/// wins:
+///
+/// 1. `LOAM_CONFIG_DIR` (names the loam config dir) → `<cfg>/federation`
+/// 2. the platform config dir → `<config>/loam/federation`
+/// 3. the legacy global root (`LOAM_HOME`) → `<root>/federation`
+/// 4. the legacy default install (`HOME`) → `<home>/.agents/loam/federation`
+///
+/// Rungs 3-4 are pre-spec locations; [`migrate_legacy_profile`] copies a
+/// legacy subtree into the config dir once.
 ///
 /// The connector never resolves the home directory itself — every entry point
 /// takes an explicit global root — but `provision_session` keeps its
-/// `(&EnrolledRow)` shape and so holds no root. Rung 2 exists for that gap: an
+/// `(&EnrolledRow)` shape and so holds no root. Rung 4 exists for that gap: an
 /// install whose global root is not the default would otherwise read an empty
 /// directory forever and report `roster-absent` with nothing wrong.
+pub fn profile_root(
+    config_dir: Option<&str>,
+    xdg_config_home: Option<&str>,
+    appdata: Option<&str>,
+    loam_home: Option<&str>,
+    home: Option<&str>,
+) -> Result<std::path::PathBuf, &'static str> {
+    let present = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    };
+    if let Some(config) = present(config_dir) {
+        return Ok(config.join("federation"));
+    }
+    if let Some(config) = config_root(config_dir, xdg_config_home, appdata, home) {
+        return Ok(config.join("federation"));
+    }
+    if let Some(path) = present(loam_home) {
+        return Ok(path.join("federation"));
+    }
+    if let Some(path) = present(home) {
+        return Ok(path
+            .join(".agents")
+            .join("loam")
+            .join("federation"));
+    }
+    Err(reason::PROFILE_ABSENT)
+}
+
+/// The platform-standard loam config directory (`<config>/loam`), or `None`
+/// when no platform config basis resolves. Rung 1 of the ladder: `LOAM_CONFIG_DIR`.
+fn config_root(
+    config_dir: Option<&str>,
+    xdg_config_home: Option<&str>,
+    appdata: Option<&str>,
+    home: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    let present = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    };
+    if let Some(config) = present(config_dir) {
+        return Some(config);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = present(home) {
+            return Some(home.join("Library").join("Application Support").join("loam"));
+        }
+        let _ = xdg_config_home;
+        let _ = appdata;
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = present(appdata) {
+            return Some(appdata.join("loam"));
+        }
+        let _ = xdg_config_home;
+        let _ = home;
+        return None;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if let Some(xdg) = present(xdg_config_home) {
+            return Some(xdg.join("loam"));
+        }
+        if let Some(home) = present(home) {
+            return Some(home.join(".config").join("loam"));
+        }
+        let _ = appdata;
+        None
+    }
+}
+
+/// The federation profile root this process should use.
+pub fn configured_profile_root() -> Result<std::path::PathBuf, &'static str> {
+    profile_root(
+        std::env::var("LOAM_CONFIG_DIR").ok().as_deref(),
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("APPDATA").ok().as_deref(),
+        std::env::var("LOAM_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// The config root this process should use, when one resolves.
+pub fn configured_config_root() -> Option<std::path::PathBuf> {
+    config_root(
+        std::env::var("LOAM_CONFIG_DIR").ok().as_deref(),
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("APPDATA").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// Where per-project rosters live: `<profile>/rosters`. The explicit
+/// per-resource override (`LOAM_FEDERATION_ROSTER_DIR`) names the directory
+/// directly and wins.
 pub fn roster_root(
     explicit: Option<&str>,
+    config_dir: Option<&str>,
+    xdg_config_home: Option<&str>,
+    appdata: Option<&str>,
     loam_home: Option<&str>,
     home: Option<&str>,
 ) -> Result<std::path::PathBuf, &'static str> {
@@ -710,23 +826,17 @@ pub fn roster_root(
     if let Some(path) = present(explicit) {
         return Ok(path);
     }
-    if let Some(path) = present(loam_home) {
-        return Ok(path.join("federation").join("rosters"));
-    }
-    if let Some(path) = present(home) {
-        return Ok(path
-            .join(".agents")
-            .join("loam")
-            .join("federation")
-            .join("rosters"));
-    }
-    Err(reason::ROSTER_ABSENT)
+    profile_root(config_dir, xdg_config_home, appdata, loam_home, home)
+        .map(|profile| profile.join("rosters"))
 }
 
 /// The roster root this process should use.
 pub fn configured_roster_root() -> Result<std::path::PathBuf, &'static str> {
     roster_root(
         std::env::var("LOAM_FEDERATION_ROSTER_DIR").ok().as_deref(),
+        std::env::var("LOAM_CONFIG_DIR").ok().as_deref(),
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("APPDATA").ok().as_deref(),
         std::env::var("LOAM_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
     )
@@ -905,6 +1015,343 @@ pub fn read_roster(
 }
 
 // ---------------------------------------------------------------------------
+// Member cards and roster assembly
+// ---------------------------------------------------------------------------
+
+/// One self-announced member card. Every connector publishes its own retained
+/// card on `loam/v1/{org}/members/{instance_id}`; each project's roster is
+/// assembled locally from the cards whose `projects` includes it. A card
+/// carries no secret — no key, no credential — only the instance's identity
+/// and the projects it is enrolled in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberCard {
+    pub instance_id: String,
+    pub principal_id: String,
+    pub display_name: Option<String>,
+    pub joined_at: String,
+    pub projects: Vec<String>,
+}
+
+/// The member-card topic path: `loam/v1/{org}/members/{instance_id}`.
+pub fn member_topic(org_id: &str, instance_id: &str) -> String {
+    format!("loam/v1/{org_id}/members/{instance_id}")
+}
+
+/// The subscribe filter that captures every member card for an org.
+pub fn member_filter(org_id: &str) -> String {
+    format!("loam/v1/{org_id}/members/+")
+}
+
+/// Write one member card to the config-dir cache path:
+/// `<profile>/rosters/{org}/members/{instance_id}.json`. The write applies the
+/// same validation as the read (atomic temp-file + rename), so a malformed
+/// card is never persisted.
+pub fn write_member_card(
+    root: &std::path::Path,
+    org_id: &str,
+    card: &MemberCard,
+) -> Result<(), &'static str> {
+    if !is_path_atom(org_id) || !is_path_atom(&card.instance_id) {
+        return Err(reason::ROSTER_MALFORMED);
+    }
+    if !card
+        .projects
+        .iter()
+        .all(|project| is_valid_project_listing(project))
+    {
+        return Err(reason::ROSTER_MALFORMED);
+    }
+    let body = member_card_json(card);
+    if parse_member_card(&body).is_err() {
+        return Err(reason::ROSTER_MALFORMED);
+    }
+    let directory = root.join(org_id).join("members");
+    std::fs::create_dir_all(&directory).map_err(|_| reason::ROSTER_MALFORMED)?;
+    let path = directory.join(format!("{}.json", card.instance_id));
+    let temporary = directory.join(format!("{}.json.tmp", card.instance_id));
+    std::fs::write(&temporary, body.as_bytes()).map_err(|_| reason::ROSTER_MALFORMED)?;
+    std::fs::rename(&temporary, &path).map_err(|_| reason::ROSTER_MALFORMED)
+}
+
+/// Read one member card from the cache path. `None` means the card is absent;
+/// `Err` means a present card is malformed.
+pub fn read_member_card(
+    root: &std::path::Path,
+    org_id: &str,
+    instance_id: &str,
+) -> Result<Option<MemberCard>, &'static str> {
+    if !is_path_atom(org_id) || !is_path_atom(instance_id) {
+        return Err(reason::ROSTER_MALFORMED);
+    }
+    let path = root.join(org_id).join("members").join(format!("{instance_id}.json"));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    parse_member_card(&text).map(Some)
+}
+
+/// Reassemble one project's roster from the member-card cache: every card
+/// whose `projects` includes the project contributes its instance as an origin
+/// and its principal as a principal, deduplicated. Never written by
+/// hand-authoring and never a single aggregate; the connector builds this
+/// locally from the retained cards. A project with no matching card yields an
+/// empty roster (the `no-peer-roster` gate fires downstream).
+pub fn assemble_project_roster(
+    root: &std::path::Path,
+    org_id: &str,
+    project_id: &str,
+) -> Result<crate::connector::PeerRoster, &'static str> {
+    if !is_path_atom(org_id) || !is_path_atom(project_id) {
+        return Err(reason::ROSTER_MALFORMED);
+    }
+    let members_dir = root.join(org_id).join("members");
+    let mut principals: Vec<String> = Vec::new();
+    let mut origins: Vec<String> = Vec::new();
+    let entries = match std::fs::read_dir(&members_dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            return Ok(crate::connector::PeerRoster {
+                principals,
+                origins,
+            })
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+            continue;
+        };
+        if !is_path_atom(stem) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(card) = parse_member_card(&text) else {
+            continue;
+        };
+        if !card.projects.iter().any(|project| project == project_id) {
+            continue;
+        }
+        if !principals.contains(&card.principal_id) {
+            principals.push(card.principal_id);
+        }
+        if !origins.contains(&card.instance_id) {
+            origins.push(card.instance_id);
+        }
+    }
+    Ok(crate::connector::PeerRoster { principals, origins })
+}
+
+/// A project listing in a member card must be a single ordinary path atom
+/// (same rule as roster scopes), so it can never escape its directory.
+fn is_valid_project_listing(project: &str) -> bool {
+    is_path_atom(project)
+}
+
+/// Serialize a member card to JSON. Order is stable so a re-publish of an
+/// unchanged card writes identical bytes (retained-card idempotence).
+fn member_card_json(card: &MemberCard) -> String {
+    let value = crate::json::Value::Object(vec![
+        (
+            "instance_id".into(),
+            crate::json::Value::String(card.instance_id.clone()),
+        ),
+        (
+            "principal_id".into(),
+            crate::json::Value::String(card.principal_id.clone()),
+        ),
+        (
+            "display_name".into(),
+            match &card.display_name {
+                Some(name) => crate::json::Value::String(name.clone()),
+                None => crate::json::Value::Null,
+            },
+        ),
+        (
+            "joined_at".into(),
+            crate::json::Value::String(card.joined_at.clone()),
+        ),
+        (
+            "projects".into(),
+            crate::json::Value::Array(
+                card.projects
+                    .iter()
+                    .map(|p| crate::json::Value::String(p.clone()))
+                    .collect(),
+            ),
+        ),
+    ]);
+    value.to_json()
+}
+
+/// Parse a member-card payload with the same duck-typing the roster reader
+/// uses: required fields with the right shapes, no wildcards, no control
+/// characters, and a project list that is all path atoms. No secret-shaped
+/// field is accepted (the reader refuses unknown keys only at the roster
+/// level; a card carries no secret by construction).
+fn parse_member_card(text: &str) -> Result<MemberCard, &'static str> {
+    let document = crate::json::parse(text).map_err(|_| reason::ROSTER_MALFORMED)?;
+    let crate::json::Value::Object(fields) = &document else {
+        return Err(reason::ROSTER_MALFORMED);
+    };
+    let mut names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
+    let written = names.len();
+    names.sort_unstable();
+    names.dedup();
+    if names.len() != written {
+        return Err(reason::ROSTER_MALFORMED);
+    }
+    let get = |key: &str| {
+        fields
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+    };
+    let instance_id = get("instance_id")
+        .and_then(crate::json::Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    let principal_id = get("principal_id")
+        .and_then(crate::json::Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    let joined_at = get("joined_at")
+        .and_then(crate::json::Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    let display_name = match get("display_name") {
+        Some(crate::json::Value::Null) => None,
+        Some(crate::json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    };
+    let (Some(instance_id), Some(principal_id), Some(joined_at)) = (instance_id, principal_id, joined_at) else {
+        return Err(reason::ROSTER_MALFORMED);
+    };
+    let projects = get("projects")
+        .and_then(crate::json::Value::as_array)
+        .ok_or(reason::ROSTER_MALFORMED)?;
+    let mut project_list: Vec<String> = Vec::with_capacity(projects.len());
+    for project in projects {
+        let text = project.as_str().ok_or(reason::ROSTER_MALFORMED)?.trim();
+        if text.is_empty() || !is_valid_project_listing(text) {
+            return Err(reason::ROSTER_MALFORMED);
+        }
+        project_list.push(text.to_owned());
+    }
+    for value in [&instance_id, &principal_id, &joined_at] {
+        if value.chars().any(|c| c.is_control() || c == '+' || c == '#' || c == '*') {
+            return Err(reason::ROSTER_MALFORMED);
+        }
+    }
+    Ok(MemberCard {
+        instance_id,
+        principal_id,
+        display_name,
+        joined_at,
+        projects: project_list,
+    })
+}
+
+/// The durable `config.json` in the profile: broker defaults and
+/// org/project inference overrides, machine- and human-editable. Absent or
+/// empty is read as `None` (all defaults); a present, malformed `config.json`
+/// is an explicit error so a human edit that broke the file is surfaced, not
+/// silently ignored.
+pub fn read_config(mut root: &std::path::Path) -> Result<Option<crate::json::Value>, &'static str> {
+    // `resolve` paths point inside the profile; `config.json` sits at the
+    // profile root.
+    if root.file_name() == Some(std::ffi::OsStr::new("federation")) {
+        root = root.parent().unwrap_or(root);
+    }
+    let path = root.join("config.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    crate::json::parse(&text).map(Some).map_err(|_| reason::ROSTER_MALFORMED)
+}
+
+// ---------------------------------------------------------------------------
+// One-time legacy migration
+// ---------------------------------------------------------------------------
+
+/// One-time migration of a pre-spec profile from the legacy global root into
+/// the config dir. Copies the `federation/` subtree — identity, rosters,
+/// registry, and any member cards — when the legacy location exists and the
+/// config-dir profile does not yet hold one. The legacy files are copied, not
+/// moved, so both resolve during the transition. Returns whether a copy
+/// happened. A missing legacy profile is `Ok(false)`, never an error.
+pub fn migrate_legacy_profile() -> Result<bool, &'static str> {
+    // Destination: the config-dir profile root (rungs 1-2 of the ladder).
+    let config_dir = std::env::var("LOAM_CONFIG_DIR").ok();
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let appdata = std::env::var("APPDATA").ok();
+    let loam_home = std::env::var("LOAM_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    let Some(config_root) =
+        config_root(config_dir.as_deref(), xdg.as_deref(), appdata.as_deref(), home.as_deref())
+    else {
+        return Ok(false);
+    };
+    let target = config_root.join("federation");
+    if target.join("loam.sqlite3").exists() {
+        return Ok(false);
+    }
+    // Source: the legacy subtree (rungs 3-4) when one exists.
+    let present = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+    };
+    let legacy_root = present(loam_home.as_deref())
+        .map(|path| path.join("federation"))
+        .or_else(|| {
+            present(home.as_deref())
+                .map(|path| path.join(".agents").join("loam").join("federation"))
+        });
+    let Some(source) = legacy_root else {
+        return Ok(false);
+    };
+    if !source.is_dir() {
+        return Ok(false);
+    }
+    copy_tree(&source, &target)?;
+    Ok(true)
+}
+
+/// Recursively copy one directory tree into another. Only `std::fs`; symlinks
+/// are copied as symlinks. Used for the one-time legacy migration.
+fn copy_tree(source: &std::path::Path, target: &std::path::Path) -> Result<(), &'static str> {
+    std::fs::create_dir_all(target).map_err(|_| reason::PROFILE_COPY_FAILED)?;
+    for entry in std::fs::read_dir(source).map_err(|_| reason::PROFILE_COPY_FAILED)? {
+        let entry = entry.map_err(|_| reason::PROFILE_COPY_FAILED)?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|_| reason::PROFILE_COPY_FAILED)?;
+        if file_type.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if file_type.is_symlink() {
+            let link = std::fs::read_link(&from).map_err(|_| reason::PROFILE_COPY_FAILED)?;
+            #[cfg(unix)]
+            {
+                let _ = std::os::unix::fs::symlink(&link, &to);
+            }
+            #[cfg(windows)]
+            {
+                let _ = std::os::windows::fs::symlink_file(&link, &to);
+            }
+        } else {
+            std::fs::copy(&from, &to).map_err(|_| reason::PROFILE_COPY_FAILED)?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // The seam
 // ---------------------------------------------------------------------------
 
@@ -996,10 +1443,14 @@ pub fn resolve(
     Ok((session, roster))
 }
 
-/// Where the machine's identity bundle lives: `<global-root>/federation/
-/// identity/`, resolved through the same three rungs as the roster root.
+/// Where the machine's identity bundle lives: `<profile>/identity/`, resolved
+/// through the profile ladder. The explicit per-resource override
+/// (`LOAM_FEDERATION_IDENTITY_DIR`) names the directory directly and wins.
 pub fn identity_root(
     explicit: Option<&str>,
+    config_dir: Option<&str>,
+    xdg_config_home: Option<&str>,
+    appdata: Option<&str>,
     loam_home: Option<&str>,
     home: Option<&str>,
 ) -> Result<std::path::PathBuf, &'static str> {
@@ -1012,17 +1463,8 @@ pub fn identity_root(
     if let Some(path) = present(explicit) {
         return Ok(path);
     }
-    if let Some(path) = present(loam_home) {
-        return Ok(path.join("federation").join("identity"));
-    }
-    if let Some(path) = present(home) {
-        return Ok(path
-            .join(".agents")
-            .join("loam")
-            .join("federation")
-            .join("identity"));
-    }
-    Err(reason::CREDENTIAL_REF_UNRESOLVED)
+    profile_root(config_dir, xdg_config_home, appdata, loam_home, home)
+        .map(|profile| profile.join("identity"))
 }
 
 /// The identity root this process should use.
@@ -1031,6 +1473,9 @@ pub fn configured_identity_root() -> Result<std::path::PathBuf, &'static str> {
         std::env::var("LOAM_FEDERATION_IDENTITY_DIR")
             .ok()
             .as_deref(),
+        std::env::var("LOAM_CONFIG_DIR").ok().as_deref(),
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("APPDATA").ok().as_deref(),
         std::env::var("LOAM_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
     )
@@ -1495,32 +1940,72 @@ mod tests {
         assert!(!config.mqtt_options().client_id().starts_with("loam-"));
     }
 
+    /// The default-vs-legacy part of the ladder is platform-specific: `~/.config`
+    /// on Linux/macOS-variants, `Library/Application Support` on macOS, and
+    /// `%APPDATA%` on Windows. The rung itself is the same everywhere.
+    fn platform_roster_default_path() -> std::path::PathBuf {
+        config_root(None, None, None, Some("/home/op"))
+            .map(|config| config.join("federation").join("rosters"))
+            .expect("the default config root resolves")
+    }
+
     #[test]
-    fn the_roster_root_walks_three_rungs_in_order() {
-        // The explicit override wins.
+    fn the_roster_root_walks_the_profile_ladder_in_order() {
+        // The explicit per-resource override names the directory directly.
         assert_eq!(
-            roster_root(Some("/explicit"), Some("/loam-home"), Some("/home/op")).unwrap(),
+            roster_root(
+                Some("/explicit"),
+                None, None, None, None, Some("/home/op"),
+            )
+            .unwrap(),
             std::path::PathBuf::from("/explicit")
         );
-        // Then the global root, which is why this rung exists: the connector's
-        // root arrives as an argument and `provision_session` never sees it, so
-        // a non-default install would otherwise read an empty directory forever.
+        // Then the config-dir rungs: LOAM_CONFIG_DIR first, then the platform
+        // config dir, then the legacy global root, then the legacy default
+        // install. This is what makes the connector's `provision_session`
+        // (which never sees the deployer's root) resolve the same profile the
+        // CLI wrote to.
         assert_eq!(
-            roster_root(None, Some("/loam-home"), Some("/home/op")).unwrap(),
+            roster_root(None, Some("/cfg"), None, None, None, Some("/home/op")).unwrap(),
+            std::path::PathBuf::from("/cfg/federation/rosters")
+        );
+        assert_eq!(
+            roster_root(None, None, None, None, None, Some("/home/op")).unwrap(),
+            platform_roster_default_path()
+        );
+        // The legacy global root is a fallback for when no config basis resolves
+        // at all — `LOAM_HOME` outranks the default install, both below the
+        // config dir.
+        assert_eq!(
+            roster_root(None, None, None, None, None, None),
+            Err(reason::PROFILE_ABSENT)
+        );
+        assert_eq!(
+            roster_root(None, None, Some(""), Some(""), Some("/loam-home"), None).unwrap(),
             std::path::PathBuf::from("/loam-home/federation/rosters")
         );
-        // Then the default install location.
         assert_eq!(
-            roster_root(None, None, Some("/home/op")).unwrap(),
-            std::path::PathBuf::from("/home/op/.agents/loam/federation/rosters")
+            roster_root(None, None, None, None, None, Some("/home/op")).unwrap(),
+            platform_roster_default_path()
         );
         // Blank is not a value at any rung.
         assert_eq!(
-            roster_root(Some("  "), Some(""), Some("/home/op")).unwrap(),
-            std::path::PathBuf::from("/home/op/.agents/loam/federation/rosters")
+            roster_root(
+                Some("  "),
+                Some(""),
+                Some(""),
+                Some(""),
+                Some(""),
+                Some("/home/op"),
+            )
+            .unwrap(),
+            platform_roster_default_path()
         );
-        // Nothing at all is an absent roster, not a path built from nothing.
-        assert_eq!(roster_root(None, None, None), Err(reason::ROSTER_ABSENT));
+        // Nothing at all is an absent profile, not a path built from nothing.
+        assert_eq!(
+            roster_root(None, None, None, None, None, None),
+            Err(reason::PROFILE_ABSENT)
+        );
     }
 
     #[test]
@@ -1885,30 +2370,30 @@ mod tests {
 
     #[test]
     fn the_identity_root_walks_three_rungs_in_order() {
-        // The explicit override names the identity directory itself.
+        // The explicit per-resource override names the identity directory.
         assert_eq!(
-            identity_root(Some("/explicit"), Some("/loam-home"), Some("/home/op")).unwrap(),
+            identity_root(
+                Some("/explicit"),
+                None, None, None, None, Some("/home/op"),
+            )
+            .unwrap(),
             std::path::PathBuf::from("/explicit")
         );
-        // Then the global root.
+        // Then the config-dir rungs.
         assert_eq!(
-            identity_root(None, Some("/loam-home"), Some("/home/op")).unwrap(),
+            identity_root(None, Some("/cfg"), None, None, None, Some("/home/op")).unwrap(),
+            std::path::PathBuf::from("/cfg/federation/identity")
+        );
+        // The legacy global root is a fallback for when no config basis
+        // resolves at all.
+        assert_eq!(
+            identity_root(None, None, Some(""), Some(""), Some("/loam-home"), None).unwrap(),
             std::path::PathBuf::from("/loam-home/federation/identity")
-        );
-        // Then the default install location.
-        assert_eq!(
-            identity_root(None, None, Some("/home/op")).unwrap(),
-            std::path::PathBuf::from("/home/op/.agents/loam/federation/identity")
-        );
-        // Blank is not a value at any rung.
-        assert_eq!(
-            identity_root(Some("  "), Some(""), Some("/home/op")).unwrap(),
-            std::path::PathBuf::from("/home/op/.agents/loam/federation/identity")
         );
         // Nothing at all is an unresolved identity, not a path from nothing.
         assert_eq!(
-            identity_root(None, None, None),
-            Err(reason::CREDENTIAL_REF_UNRESOLVED)
+            identity_root(None, None, None, None, None, None),
+            Err(reason::PROFILE_ABSENT)
         );
     }
 
