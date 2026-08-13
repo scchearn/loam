@@ -469,6 +469,11 @@ pub enum ReceiveOutcome {
     ConflictingState,
     DuplicateInbox,
     Removed,
+    /// A retained broker membership payload for a project: the raw bytes the
+    /// connector writes to the local roster file. Delivered outside the
+    /// envelope validator on purpose — the membership topic is a broker-track
+    /// contract, not a loam envelope.
+    Membership(Vec<u8>),
 }
 
 pub struct DeliveryProcessor {
@@ -544,6 +549,14 @@ impl DeliveryProcessor {
             return Err(TransportError::Validation(Violation::DocumentTooLarge));
         }
         let parsed_topic = envelope::parse_topic(topic).map_err(TransportError::Validation)?;
+        // The broker-served membership topic is a broker-track contract, not a
+        // loam envelope: the payload is the roster JSON verbatim, delivered
+        // outside the envelope validator. It has no origin (the membership ACL
+        // grants read on the topic, not a per-instance origin write), so it is
+        // exempt from the origin check.
+        if matches!(parsed_topic.delivery, TopicDelivery::Membership) {
+            return Ok(ReceiveOutcome::Membership(payload.to_vec()));
+        }
         if !identity.can_use_origin(parsed_topic.delivery.origin()) {
             return Err(TransportError::OriginNotAuthorized);
         }
@@ -580,6 +593,9 @@ impl DeliveryProcessor {
             TopicDelivery::Inbox { message_id, .. } => {
                 self.receive_inbox(validated, message_id, expires_at)
             }
+            // Unreachable: the membership read-path returns before the
+            // envelope validator runs.
+            TopicDelivery::Membership => Err(TransportError::Validation(Violation::MalformedTopic)),
         }
     }
 
@@ -684,6 +700,10 @@ impl DeliveryProcessor {
                 self.inbox.retain(|tracked| tracked.id != message_id);
                 Ok(ReceiveOutcome::Removed)
             }
+            // An empty membership payload is the broker's way of clearing the
+            // roster; the connector refuses to write an empty roster rather
+            // than treating it as membership.
+            TopicDelivery::Membership => Ok(ReceiveOutcome::Removed),
         }
     }
 

@@ -1240,6 +1240,8 @@ fn accepted_key(delivery: &crate::envelope::TopicDelivery<'_>, envelope_id: &str
         TopicDelivery::Event { .. } => format!("event:{envelope_id}"),
         TopicDelivery::State { origin, key } => format!("state:{origin}/{key}"),
         TopicDelivery::Inbox { message_id, .. } => format!("inbox:{message_id}"),
+        // A membership frame never becomes a snapshot item.
+        TopicDelivery::Membership => String::new(),
     }
 }
 
@@ -1251,6 +1253,7 @@ fn tombstone_key(delivery: &crate::envelope::TopicDelivery<'_>) -> Option<String
         TopicDelivery::Event { .. } => None,
         TopicDelivery::State { origin, key } => Some(format!("state:{origin}/{key}")),
         TopicDelivery::Inbox { message_id, .. } => Some(format!("inbox:{message_id}")),
+        TopicDelivery::Membership => None,
     }
 }
 
@@ -1594,13 +1597,17 @@ impl ProjectSessions {
 /// the filters only decide what the broker sends.
 fn live_filters(org_id: &str, project_id: &str, identity: &SessionIdentity) -> Vec<String> {
     let base = format!("loam/v1/{org_id}/{project_id}");
-    vec![
+    let mut filters = vec![
         format!("{base}/event/+"),
         format!("{base}/state/+/+"),
         format!("{base}/inbox/instance/{}/+/+", identity.instance_id),
         format!("{base}/inbox/principal/{}/+/+", identity.principal_id),
         format!("{base}/inbox/agent/{}/+/+", identity.agent_id),
-    ]
+    ];
+    // The broker-served membership topic: the retained payload the connector
+    // writes to the local roster file (`federation-enrollment-simplification.md`).
+    filters.push(format!("{base}/membership"));
+    filters
 }
 
 /// Pump one project's received frames into the snapshot store until stopped. The
@@ -1669,6 +1676,25 @@ fn pump(
         }
         match transport.receive_outcome(PUMP_POLL, Utc::now(), &roster) {
             Ok(Some((topic, outcome))) => {
+                // Broker-served membership: write the roster file from the
+                // retained payload. The write validates through the same rules
+                // the session build uses, so a payload that admits nobody is
+                // never persisted.
+                if let ReceiveOutcome::Membership(payload) = &outcome {
+                    if let Ok(text) = std::str::from_utf8(payload) {
+                        if let Ok(parsed) = crate::envelope::parse_topic(&topic) {
+                            if let Ok(root) = crate::provisioning::configured_roster_root() {
+                                let _ = crate::provisioning::write_roster(
+                                    &root,
+                                    parsed.organization,
+                                    parsed.project,
+                                    text,
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // Git-first: reconcile *before* the item is readable, so a hook
                 // can never display a provisional claim as current.
                 let publication = stamp_publication(oracle.as_mut(), &outcome);

@@ -752,6 +752,61 @@ fn bare_ids(value: Option<&crate::json::Value>) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// Write the peer roster for one project, from broker-served membership.
+///
+/// The broker's retained membership payload (principals + origins) is the
+/// author; the connector only subscribes and writes the local file from it
+/// (`federation-enrollment-simplification.md`). The write applies the same
+/// validation as the read — a payload that the read would refuse is never
+/// written, so a half-admit can never be persisted. The write is atomic
+/// (temp file + rename), so a crash mid-write never leaves a partial roster.
+pub fn write_roster(
+    root: &std::path::Path,
+    org_id: &str,
+    project_id: &str,
+    body: &str,
+) -> Result<(), &'static str> {
+    // The payload is validated through the same rules the session build uses:
+    // a payload that admits nobody (or admits everyone) must not become the
+    // on-disk truth.
+    if !is_path_atom(org_id) || !is_path_atom(project_id) {
+        return Err(reason::ROSTER_MALFORMED);
+    }
+    let parsed = crate::json::parse(body).map_err(|_| reason::ROSTER_MALFORMED)?;
+    let crate::json::Value::Object(fields) = &parsed else {
+        return Err(reason::ROSTER_MALFORMED);
+    };
+    let mut names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
+    let written = names.len();
+    names.sort_unstable();
+    names.dedup();
+    if names.len() != written {
+        return Err(reason::ROSTER_MALFORMED);
+    }
+    let (Some(principals), Some(origins)) = (
+        bare_ids(parsed.get("principals")),
+        bare_ids(parsed.get("origins")),
+    ) else {
+        return Err(reason::ROSTER_MALFORMED);
+    };
+    if principals
+        .iter()
+        .chain(origins.iter())
+        .any(|e| is_wildcard(e))
+    {
+        return Err(reason::ROSTER_WILDCARD);
+    }
+    if principals.is_empty() || origins.is_empty() {
+        return Err(reason::ROSTER_EMPTY);
+    }
+    let directory = root.join(org_id);
+    std::fs::create_dir_all(&directory).map_err(|_| reason::ROSTER_MALFORMED)?;
+    let path = directory.join(format!("{project_id}.json"));
+    let temporary = directory.join(format!("{project_id}.json.tmp"));
+    std::fs::write(&temporary, body.as_bytes()).map_err(|_| reason::ROSTER_MALFORMED)?;
+    std::fs::rename(&temporary, &path).map_err(|_| reason::ROSTER_MALFORMED)
+}
+
 /// Read the peer roster for one project.
 ///
 /// Absent, empty, one-sided, wildcard, and malformed are five distinct answers
@@ -1565,6 +1620,61 @@ mod tests {
                 .principals,
             vec!["sam+loam@example.test".to_owned()]
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_broker_served_membership_payload_is_written_whole_and_validated_first() {
+        let root = temp_dir("roster-write");
+        // A usable membership payload is written and read back exactly as the
+        // session build would admit it.
+        let body =
+            r#"{"principals":["ada@example.test"],"origins":["01ARZ3NDEKTSV4RRFFQ69G5FAV"]}"#;
+        super::write_roster(&root, "acme", "loam", body).expect("a usable payload writes");
+        let roster = read_roster(&root, "acme", "loam").expect("the written roster reads");
+        assert_eq!(roster.principals, vec!["ada@example.test".to_owned()]);
+        assert_eq!(
+            roster.origins,
+            vec!["01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()]
+        );
+
+        // A payload that the read would refuse is never persisted: empty,
+        // one-sided, wildcard, and malformed JSON.
+        for (label, body) in [
+            ("empty", r#"{"principals":[],"origins":[]}"#),
+            (
+                "no-origins",
+                r#"{"principals":["ada@example.test"],"origins":[]}"#,
+            ),
+            (
+                "wildcard",
+                r#"{"principals":["*"],"origins":["01ARZ3NDEKTSV4RRFFQ69G5FAV"]}"#,
+            ),
+            ("malformed", "{not json"),
+        ] {
+            let before = read_roster(&root, "acme", label);
+            assert!(
+                super::write_roster(&root, "acme", label, body).is_err(),
+                "{label} must not be written"
+            );
+            let after = read_roster(&root, "acme", label);
+            assert_eq!(before, after, "{label} must leave no partial file");
+        }
+        // A traversal scope never escapes the roster root.
+        assert!(
+            super::write_roster(
+                &root,
+                "..",
+                "victim",
+                r#"{"principals":["a"],"origins":["b"]}"#
+            )
+            .is_err(),
+            "a traversal org must be refused"
+        );
+
+        // The write is atomic: no temp file survives a successful write.
+        assert!(!root.join("acme").join("loam.json.tmp").exists());
 
         let _ = std::fs::remove_dir_all(root);
     }

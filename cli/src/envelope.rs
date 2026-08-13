@@ -1111,6 +1111,10 @@ pub(crate) enum TopicDelivery<'a> {
         origin: &'a str,
         message_id: &'a str,
     },
+    /// The broker-served project membership topic (`membership` class): a
+    /// retained payload carrying the roster JSON. Not a loam envelope — the
+    /// connector writes it to the local roster file verbatim.
+    Membership,
 }
 
 impl TopicDelivery<'_> {
@@ -1119,6 +1123,9 @@ impl TopicDelivery<'_> {
             Self::Event { origin } | Self::State { origin, .. } | Self::Inbox { origin, .. } => {
                 origin
             }
+            // A membership frame has no origin; the membership ACL grants
+            // read on the topic, not a per-instance origin write.
+            Self::Membership => "",
         }
     }
 
@@ -1127,6 +1134,7 @@ impl TopicDelivery<'_> {
             Self::Event { .. } => "event",
             Self::State { .. } => "latest-state",
             Self::Inbox { .. } => "inbox",
+            Self::Membership => "membership",
         }
     }
 }
@@ -1182,6 +1190,9 @@ pub(crate) fn parse_topic(topic: &str) -> Result<ParsedTopic<'_>, Violation> {
                 message_id,
             }
         }
+        // The broker-served membership topic carries no further segments: the
+        // payload is the roster JSON for (org, project).
+        "membership" => TopicDelivery::Membership,
         _ => return Err(Violation::MalformedTopic),
     };
     if segments.next().is_some() {
@@ -1238,6 +1249,9 @@ fn validate_topic(value: &Value, topic: &str) -> Result<(), Violation> {
             ..
         } => Some((*recipient_kind, *recipient)),
         TopicDelivery::Event { .. } | TopicDelivery::State { .. } => None,
+        // A membership frame is never an envelope; it is refused before the
+        // envelope validator by the transport's membership read-path.
+        TopicDelivery::Membership => None,
     };
     let mut directly_addressed = false;
     for recipient in recipients {
@@ -1283,6 +1297,7 @@ fn validate_topic(value: &Value, topic: &str) -> Result<(), Violation> {
                 return Err(Violation::BindingMismatch(BindingAxis::MessageId));
             }
         }
+        TopicDelivery::Membership => {}
     }
     Ok(())
 }
