@@ -2,7 +2,8 @@
 //!
 //! Wiring the `connect` descriptor + workspace validation path only:
 //! read one bounded descriptor from stdin, validate it, and, when a workspace is
-//! given, prove physical identity, remote digests, and commit reachability. The
+//! given, prove physical identity, remote digests, and the workspace's Git
+//! binding. The
 //! enrollment probe, transactional registry commit, and service activation are
 //! added by later tasks (T10/T11); `disconnect` and `status` are stubs until
 //! then. No credential is resolved and no `AuthenticatedPrincipal` is built here.
@@ -538,8 +539,8 @@ fn connect(mut args: impl Iterator<Item = String>) -> i32 {
 
 /// Build the validated enrollment from the one-command surface: org/project
 /// inferred from the workspace's git remote URL (overridable), the broker
-/// endpoint validated, and the physical-identity + commit-reachability proof
-/// run exactly as the descriptor path did.
+/// endpoint validated, and the physical-identity + remote-digest proof run
+/// exactly as the descriptor path did. No commit is read or proven.
 fn validate_connect(
     workspace: &std::path::Path,
     broker: &str,
@@ -563,9 +564,9 @@ fn validate_connect(
         None => infer_scope(workspace)?,
     };
     let descriptor = enrollment::Descriptor {
+        repository_id: format!("{org_id}/{project_id}"),
         org_id,
         project_id,
-        repository_id: "repo".to_owned(),
         broker: enrollment::BrokerDescriptor {
             profile: "default".to_owned(),
             endpoint: broker.to_owned(),
@@ -577,7 +578,7 @@ fn validate_connect(
             ca_ref: None,
         },
         git: enrollment::GitDescriptor {
-            commit: current_commit(workspace)?,
+            commit: None,
             remotes: vec![enrollment::RemoteDescriptor {
                 name: "origin".to_owned(),
                 refs: vec!["refs/heads/main".to_owned()],
@@ -641,30 +642,6 @@ fn infer_scope(workspace: &std::path::Path) -> Result<(String, String), Enrollme
         return Err(EnrollmentError::InvalidField { field: "project" });
     }
     Ok((org.to_owned(), project.to_owned()))
-}
-
-/// The workspace's current HEAD commit, for the reachability proof.
-fn current_commit(workspace: &std::path::Path) -> Result<String, EnrollmentError> {
-    let path_str = workspace
-        .to_str()
-        .ok_or(EnrollmentError::WorkspaceNotUtf8)?;
-    let output = std::process::Command::new("git")
-        .args(["-C", path_str, "rev-parse", "HEAD"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map_err(|_| EnrollmentError::GitUnavailable)?;
-    if !output.status.success() {
-        return Err(EnrollmentError::InvalidCommit);
-    }
-    let commit = String::from_utf8(output.stdout)
-        .map_err(|_| EnrollmentError::InvalidCommit)?
-        .trim()
-        .to_owned();
-    if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(EnrollmentError::InvalidCommit);
-    }
-    Ok(commit)
 }
 
 /// Drive the transactional connect from the CLI: derive the connector's

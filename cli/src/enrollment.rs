@@ -1,15 +1,16 @@
-//! Enrollment: descriptor validation, physical Git workspace identity,
-//! remote-URL digests, and isolated commit-reachability proof.
+//! Enrollment: descriptor validation, physical Git workspace identity, and
+//! remote-URL digests.
 //!
 //! This module turns a bounded, non-secret stdin descriptor into a typed
 //! [`ValidatedEnrollment`] candidate. It performs every trust-boundary check
 //! before any registry, service-manager, credential, or transport work happens
 //! elsewhere: exact schema and field inventory, no secret- or authority-shaped
 //! field, a `mqtts://` endpoint without userinfo, a physical workspace identity
-//! that path aliases cannot duplicate, remote URLs resolved from local Git and
-//! reduced to SHA-256 digests, and proof that the declared commit is reachable
-//! from an allowed ref — proven in an isolated temporary repository that never
-//! touches the enrolled worktree.
+//! that path aliases cannot duplicate, and remote URLs resolved from local Git
+//! and reduced to SHA-256 digests (config re-checks each remote's digest before
+//! any later fetch). No commit-reachability proof is performed: the workspace's
+//! git state changes after enrollment anyway, and the remote URL is enough to
+//! prove the workspace is a git repo and infer org/project.
 //!
 //! It constructs no `AuthenticatedPrincipal` and resolves no credential; those
 //! belong to the transport adapter.
@@ -29,6 +30,13 @@ const MAX_REMOTES: usize = 8;
 const MIN_REMOTES: usize = 1;
 const MAX_REFS_PER_REMOTE: usize = 32;
 const MIN_REFS_PER_REMOTE: usize = 1;
+
+/// Git's canonical zero object ID. Used as the enrollment commit placeholder
+/// when the descriptor records none: it is a valid 40-hex OID (so the probe's
+/// git anchors and the stored `commit_oid` stay well-formed) while honestly
+/// meaning "no commit recorded". Commit reachability is not proven at
+/// enrollment, so a stored commit is descriptive, never a gate.
+const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
 /// The only keys a descriptor may carry, top level.
 const DESCRIPTOR_KEYS: &[&str] = &[
@@ -85,7 +93,6 @@ pub enum EnrollmentError {
     WorkspaceNotUtf8,
     RemoteNotConfigured { remote: String },
     CredentialBearingRemote { remote: String },
-    CommitUnreachable,
     GitUnavailable,
 }
 
@@ -114,7 +121,6 @@ impl EnrollmentError {
             EnrollmentError::WorkspaceNotUtf8 => "workspace_not_utf8",
             EnrollmentError::RemoteNotConfigured { .. } => "remote_not_configured",
             EnrollmentError::CredentialBearingRemote { .. } => "credential_bearing_remote",
-            EnrollmentError::CommitUnreachable => "commit_unreachable",
             EnrollmentError::GitUnavailable => "git_unavailable",
         }
     }
@@ -196,9 +202,6 @@ impl std::fmt::Display for EnrollmentError {
             }
             EnrollmentError::CredentialBearingRemote { remote } => {
                 write!(f, "remote `{remote}` URL embeds credentials")
-            }
-            EnrollmentError::CommitUnreachable => {
-                write!(f, "git.commit is not reachable from any allowed ref")
             }
             EnrollmentError::GitUnavailable => write!(f, "git is unavailable"),
         }
@@ -303,9 +306,13 @@ pub struct BrokerDescriptor {
     pub ca_ref: Option<String>,
 }
 
+/// The workspace Git binding: remote names + exact allowed refs for the
+/// workspace-identity check. `commit` is optional — it is descriptive
+/// provenance at best, never a reachability gate, so the descriptor need not
+/// carry one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitDescriptor {
-    pub commit: String,
+    pub commit: Option<String>,
     pub remotes: Vec<RemoteDescriptor>,
 }
 
@@ -334,8 +341,13 @@ fn parse_broker(
 
 fn parse_git(entries: &[(String, crate::json::Value)]) -> Result<GitDescriptor, EnrollmentError> {
     reject_forbidden_and_check_keys(entries, GIT_KEYS)?;
-    let commit = required_bounded_string(entries, "commit")?;
-    validate_commit(&commit)?;
+    let commit = match optional_bounded_string(entries, "commit")? {
+        Some(commit) => {
+            validate_commit(&commit)?;
+            Some(commit)
+        }
+        None => None,
+    };
 
     let remotes_value = entries
         .iter()
@@ -601,7 +613,7 @@ fn platform_identity(_canonical: &Path) -> Result<PlatformIdentity, EnrollmentEr
 }
 
 // ---------------------------------------------------------------------------
-// Remote resolution and commit reachability
+// Remote resolution
 // ---------------------------------------------------------------------------
 
 /// Resolve one configured remote's URL from local Git config. Returns the raw
@@ -651,125 +663,14 @@ fn digest_remote_url(url: &str, name: &str) -> Result<String, EnrollmentError> {
     Ok(hasher.finish())
 }
 
-/// Prove the declared commit is reachable from one of the allowed refs, in an
-/// isolated temporary bare repository. Fetches only the exact named refs from
-/// the workspace's remotes into private temp refs, then checks ancestry. Never
-/// fetches into or mutates the enrolled worktree.
-fn prove_commit_reachable(
-    workspace: &Path,
-    remotes: &[ValidatedRemote],
-    descriptor_remotes: &[RemoteDescriptor],
-    commit: &str,
-) -> Result<(), EnrollmentError> {
-    let temp = TempRepo::init()?;
-    let workspace_str = workspace
-        .to_str()
-        .ok_or(EnrollmentError::WorkspaceNotUtf8)?;
-
-    let mut any_ref = false;
-    for (validated, descriptor) in remotes.iter().zip(descriptor_remotes.iter()) {
-        // Resolve the remote's URL from the *workspace* config (already digest
-        // matched) so the isolated repo fetches from the same place the enrolled
-        // repo would, without copying credentials into the temp config.
-        let url = remote_url(workspace, &validated.name)?;
-        for (index, refspec) in descriptor.refs.iter().enumerate() {
-            let dest = format!("refs/enroll/{}/{index}", validated.name);
-            let output = Command::new("git")
-                .args([
-                    "-C",
-                    temp.path_str()?,
-                    "-c",
-                    // Never prompt for credentials; a private ref fetch must fail
-                    // closed rather than block or read the user's helper.
-                    "credential.helper=",
-                    "fetch",
-                    "--no-tags",
-                    "--no-recurse-submodules",
-                    &url,
-                    &format!("{refspec}:{dest}"),
-                ])
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .output()
-                .map_err(|_| EnrollmentError::GitUnavailable)?;
-            if output.status.success() {
-                any_ref = true;
-                if is_ancestor(&temp, commit, &dest)? {
-                    return Ok(());
-                }
-            }
-        }
-    }
-    let _ = workspace_str;
-    if any_ref {
-        Err(EnrollmentError::CommitUnreachable)
-    } else {
-        // No allowed ref could be fetched at all.
-        Err(EnrollmentError::CommitUnreachable)
-    }
-}
-
-fn is_ancestor(temp: &TempRepo, commit: &str, ref_name: &str) -> Result<bool, EnrollmentError> {
-    let output = Command::new("git")
-        .args([
-            "-C",
-            temp.path_str()?,
-            "merge-base",
-            "--is-ancestor",
-            commit,
-            ref_name,
-        ])
-        .output()
-        .map_err(|_| EnrollmentError::GitUnavailable)?;
-    Ok(output.status.success())
-}
-
-/// An isolated temporary bare repository that cleans itself up on drop.
-struct TempRepo {
-    path: PathBuf,
-}
-
-impl TempRepo {
-    fn init() -> Result<TempRepo, EnrollmentError> {
-        let path = std::env::temp_dir().join(format!(
-            "loam-enroll-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&path).map_err(|_| EnrollmentError::GitUnavailable)?;
-        let output = Command::new("git")
-            .args(["init", "--bare", "--quiet"])
-            .arg(&path)
-            .output()
-            .map_err(|_| EnrollmentError::GitUnavailable)?;
-        if !output.status.success() {
-            let _ = std::fs::remove_dir_all(&path);
-            return Err(EnrollmentError::GitUnavailable);
-        }
-        Ok(TempRepo { path })
-    }
-
-    fn path_str(&self) -> Result<&str, EnrollmentError> {
-        self.path.to_str().ok_or(EnrollmentError::WorkspaceNotUtf8)
-    }
-}
-
-impl Drop for TempRepo {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Orchestrator
 // ---------------------------------------------------------------------------
 
 /// Validate a descriptor against a physical workspace end to end: structural
-/// validation, physical identity, remote resolution + digest + userinfo
-/// rejection, and isolated commit-reachability proof. Returns the non-secret
-/// [`ValidatedEnrollment`] projection or the first typed violation.
+/// validation, physical identity, and remote resolution + digest + userinfo
+/// rejection. Returns the non-secret [`ValidatedEnrollment`] projection or the
+/// first typed violation. No commit-reachability proof is performed.
 pub fn validate_enrollment(
     descriptor: Descriptor,
     workspace_path: &Path,
@@ -788,13 +689,6 @@ pub fn validate_enrollment(
         });
     }
 
-    prove_commit_reachable(
-        &canonical,
-        &remotes,
-        &descriptor.git.remotes,
-        &descriptor.git.commit,
-    )?;
-
     Ok(ValidatedEnrollment {
         org_id: descriptor.org_id,
         project_id: descriptor.project_id,
@@ -803,7 +697,7 @@ pub fn validate_enrollment(
         broker_endpoint: descriptor.broker.endpoint,
         tls_server_name: descriptor.broker.tls_server_name,
         ca_ref: descriptor.broker.ca_ref,
-        commit: descriptor.git.commit,
+        commit: descriptor.git.commit.unwrap_or_else(|| ZERO_OID.to_owned()),
         remotes,
         workspace,
     })

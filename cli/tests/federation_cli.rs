@@ -81,9 +81,10 @@ fn connect_rejects_a_malformed_project_override() {
 #[test]
 fn full_happy_path_validates_against_hermetic_repos() {
     // Build an origin repo with a commit on refs/heads/main, then a workspace
-    // clone whose `origin` points at it. The connect's commit must be proven
-    // reachable in an isolated temp repo without mutating the workspace, and
-    // org/project must be inferred from the remote URL path.
+    // clone whose `origin` points at it. Connect resolves the workspace's git
+    // binding and infers org/project from the remote URL path without mutating
+    // the workspace. (No commit-reachability proof runs; commit_reachability_is_not_required
+    // covers that contract.)
     let root = temp_dir("happy");
     let origin = root.join("origin.git");
     let work = root.join("work");
@@ -267,9 +268,15 @@ fn connect_infers_org_and_project_from_the_remote_url() {
 }
 
 #[test]
-fn unreachable_commit_is_rejected() {
+fn commit_reachability_is_not_required() {
+    // The connect surface deliberately does not prove the HEAD commit is
+    // reachable from the origin: the workspace's git state changes after
+    // enrollment anyway, and the remote URL alone proves it is a git repo.
+    // A workspace whose HEAD is ahead of (or missing from) origin must still
+    // validate and infer org/project from the remote path.
     let root = temp_dir("unreachable");
-    let origin = root.join("origin.git");
+    let origin = root.join("acme").join("loam.git");
+    std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
     let work = root.join("work");
     git(
         &["init", "--bare", "--quiet", origin.to_str().unwrap()],
@@ -333,8 +340,9 @@ fn unreachable_commit_is_rejected() {
         None,
     );
 
-    // A workspace whose HEAD is not reachable from the origin's main: the
-    // reachability proof must refuse it.
+    // A workspace whose HEAD is NOT reachable from the origin's main and may
+    // not have been pushed: no reachability proof runs, so connect still
+    // validates and infers org/project from the remote path.
     std::fs::write(work.join("unpushed.txt"), "not pushed").unwrap();
     git(&["-C", work.to_str().unwrap(), "add", "."], None);
     git(
@@ -350,8 +358,11 @@ fn unreachable_commit_is_rejected() {
     );
     let (code, stdout, _stderr) =
         run_connect(Some(&work), "mqtts://broker.example:8883", &["--json"]);
-    assert_eq!(code, 65);
-    assert!(stdout.contains("commit_unreachable"), "got: {stdout}");
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.contains("\"org_id\":\"acme\"") && stdout.contains("\"project_id\":\"loam\""),
+        "org/project must be inferred from the remote path: {stdout}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
