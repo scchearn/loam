@@ -685,6 +685,43 @@ impl Transport for MqttTransport {
 }
 
 impl MqttTransport {
+    /// Publish a raw retained payload on a broker-track topic (a self-announced
+    /// member card). The card is not a loam envelope — it is the connector's own
+    /// retained card, so it is published verbatim and never routed through the
+    /// envelope encoder. Requires an authenticated session.
+    fn publish_raw_retained(
+        &mut self,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> Result<(), ProbeError> {
+        if self.client.is_none() {
+            return Err(ProbeError::PublishDenied);
+        }
+        let client = self.client.clone().expect("checked above");
+        let (client, connection) = (client, self.connection.as_mut().expect("checked above"));
+        client
+            .publish(
+                topic,
+                rumqttc::v5::mqttbytes::QoS::AtLeastOnce,
+                true,
+                payload,
+            )
+            .map_err(|_| ProbeError::PublishDenied)?;
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        loop {
+            match await_control(connection, &mut self.pending, deadline) {
+                Some(Packet::PubAck(ack)) => {
+                    return match ack.reason {
+                        PubAckReason::Success | PubAckReason::NoMatchingSubscribers => Ok(()),
+                        _ => Err(ProbeError::PublishDenied),
+                    };
+                }
+                Some(_) => {}
+                None => return Err(ProbeError::PublishDenied),
+            }
+        }
+    }
+
     /// Ship one already-validated outbound envelope on the live session. Unlike
     /// the probe's publish this honors the transport's retain derivation (state and
     /// inbox are retained; an event is not) and takes `now` per call, because a
@@ -1241,7 +1278,7 @@ fn accepted_key(delivery: &crate::envelope::TopicDelivery<'_>, envelope_id: &str
         TopicDelivery::State { origin, key } => format!("state:{origin}/{key}"),
         TopicDelivery::Inbox { message_id, .. } => format!("inbox:{message_id}"),
         // A membership frame never becomes a snapshot item.
-        TopicDelivery::Membership => String::new(),
+        TopicDelivery::Membership | TopicDelivery::MemberCard { .. } => String::new(),
     }
 }
 
@@ -1253,7 +1290,7 @@ fn tombstone_key(delivery: &crate::envelope::TopicDelivery<'_>) -> Option<String
         TopicDelivery::Event { .. } => None,
         TopicDelivery::State { origin, key } => Some(format!("state:{origin}/{key}")),
         TopicDelivery::Inbox { message_id, .. } => Some(format!("inbox:{message_id}")),
-        TopicDelivery::Membership => None,
+        TopicDelivery::Membership | TopicDelivery::MemberCard { .. } => None,
     }
 }
 
@@ -1529,6 +1566,29 @@ impl ProjectSessions {
             }
         }
 
+        // Self-announce: publish this machine's own retained member card on
+        // `loam/v1/{org}/members/{instance_id}`. Every connector does this on
+        // connect, so colleagues assembling their rosters from retained cards
+        // pick this machine up without an operator authoring anything. A refused
+        // self-publish is a broker/ACL fault: the machine cannot be a member, so
+        // the session does not open (the roster gate below would have nothing of
+        // its own to admit).
+        let card_topic = crate::provisioning::member_topic(&row.org_id, &identity.instance_id);
+        if let Ok(Some(card)) = own_member_card(row, &identity, now) {
+            let body = crate::provisioning::member_card_to_json(&card);
+            if transport.publish_raw_retained(&card_topic, body.into_bytes()).is_err() {
+                if roster.is_empty() {
+                    return SessionState::NoPeerRoster(reason::ROSTER_EMPTY);
+                }
+                // Peers are still known; a denied self-publish does not strand
+                // the session, but this instance is invisible to first joiners.
+            } else if let Ok(root) = crate::provisioning::configured_roster_root() {
+                // Persist the own card immediately so a restart before the pump
+                // collects the broker's redelivery still admits this machine.
+                let _ = crate::provisioning::write_member_card(&root, &row.org_id, &card);
+            }
+        }
+
         // Built before the pump starts, from the enrollment and the same roster
         // the receive path admits frames against. `None` is the fail-safe: every
         // work claim then renders as an unreconciled sender claim.
@@ -1540,9 +1600,18 @@ impl ProjectSessions {
             let stop = std::sync::Arc::clone(&stop);
             let snapshots = std::sync::Arc::clone(&self.snapshots);
             let channels = self.channels.clone();
+            let (pump_org, pump_project) = (row.org_id.clone(), row.project_id.clone());
             move || {
                 pump(
-                    transport, roster, oracle, snapshots, channels, stop, inbound,
+                    transport,
+                    roster,
+                    pump_org,
+                    pump_project,
+                    oracle,
+                    snapshots,
+                    channels,
+                    stop,
+                    inbound,
                 )
             }
         });
@@ -1618,6 +1687,11 @@ fn live_filters(org_id: &str, project_id: &str, identity: &SessionIdentity) -> V
     // The broker-served membership topic: the retained payload the connector
     // writes to the local roster file (`federation-enrollment-simplification.md`).
     filters.push(format!("{base}/membership"));
+    // The self-announced member-card feed: every member's retained card on
+    // `loam/v1/{org}/members/{instance_id}`, from which this connector assembles
+    // the per-project roster (including its own card). Org-scoped, so the same
+    // filter covers every project a machine is in.
+    filters.push(crate::provisioning::member_filter(org_id));
     filters
 }
 
@@ -1649,6 +1723,29 @@ fn receive_oracle(
     .ok()
 }
 
+/// Build this machine's own retained member card from the enrollment and the
+/// authenticated identity. `projects` lists the enrolled project(s) this
+/// instance announces for; peers assemble per-project rosters from the subset
+/// of cards listing their project. `None` means no card can be announced (an
+/// identity with no principal or no instance) — a machine that cannot even
+/// build its own card has no member presence to publish.
+fn own_member_card(
+    row: &crate::enrollment::EnrolledRow,
+    identity: &SessionIdentity,
+    now: DateTime<Utc>,
+) -> Result<Option<crate::provisioning::MemberCard>, &'static str> {
+    if row.org_id.is_empty() || identity.instance_id.is_empty() || identity.principal_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(crate::provisioning::MemberCard {
+        instance_id: identity.instance_id.clone(),
+        principal_id: identity.principal_id.clone(),
+        display_name: identity.display_name.clone(),
+        joined_at: now.to_rfc3339(),
+        projects: vec![row.project_id.clone()],
+    }))
+}
+
 /// The Git verdict for one received frame. Only an `io.loam.work.state` frame
 /// that the oracle proves published earns [`Publication::Verified`]; every other
 /// outcome, including every error, falls back to the sender-claim answer.
@@ -1668,9 +1765,12 @@ fn stamp_publication(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pump(
     mut transport: MqttTransport,
-    roster: PeerRoster,
+    mut roster: PeerRoster,
+    org_id: String,
+    project_id: String,
     mut oracle: Option<crate::transport::GitOracle>,
     snapshots: std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
     channels: ChannelRegistry,
@@ -1687,6 +1787,30 @@ fn pump(
         }
         match transport.receive_outcome(PUMP_POLL, Utc::now(), &roster) {
             Ok(Some((topic, outcome))) => {
+                // A self-announced member card: persist the card to the cache
+                // and reassemble this project's roster from every retained card
+                // listing the project. The connector is the roster author, so
+                // the assembled file is the durable truth the next session
+                // (and `provisioning::resolve`) reads.
+                if let ReceiveOutcome::MemberCard { payload, .. } = &outcome {
+                    if let Ok(text) = std::str::from_utf8(payload) {
+                        if let Ok(root) = crate::provisioning::configured_roster_root() {
+                            if let Ok(card) = crate::provisioning::parse_member_card_pub(text) {
+                                let _ = crate::provisioning::write_member_card(&root, &org_id, &card);
+                                if let Ok(assembled) = crate::provisioning::assemble_project_roster(
+                                    &root, &org_id, &project_id,
+                                ) {
+                                    let body = crate::provisioning::roster_body(&assembled);
+                                    let _ = crate::provisioning::write_roster(
+                                        &root, &org_id, &project_id, &body,
+                                    );
+                                    roster = assembled;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // Broker-served membership: write the roster file from the
                 // retained payload. The write validates through the same rules
                 // the session build uses, so a payload that admits nobody is

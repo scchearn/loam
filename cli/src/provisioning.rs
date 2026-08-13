@@ -842,6 +842,24 @@ pub fn configured_roster_root() -> Result<std::path::PathBuf, &'static str> {
     )
 }
 
+/// The federation registry (`loam.sqlite3`) path: the enrollment store moved
+/// into the config-dir profile (`<profile>/loam.sqlite3`) so it survives
+/// uninstall with the rest of the identity. `legacy_root` is the explicit
+/// `--global-root` an operator passes; it serves as the registry's legacy rung
+/// (the pre-spec location `<global-root>/loam.sqlite3`), so an install that has
+/// not migrated continues to resolve the store it already wrote, and the
+/// one-time migration copies it into the config dir once the profile exists.
+pub fn configured_registry_path(legacy_root: Option<&std::path::Path>) -> Result<std::path::PathBuf, &'static str> {
+    match configured_profile_root() {
+        Ok(profile) => Ok(profile.join("loam.sqlite3")),
+        Err(reason::PROFILE_ABSENT) => match legacy_root {
+            Some(root) => Ok(root.join("loam.sqlite3")),
+            None => Err(reason::PROFILE_ABSENT),
+        },
+        Err(other) => Err(other),
+    }
+}
+
 /// An entry that would admit everyone. `*` and `#` never occur in a principal
 /// id or an instance id; a bare `+` is the MQTT single-level wildcard, but a `+`
 /// *within* an entry is ordinary — `sam+loam@example.test` is one address, not
@@ -1149,8 +1167,43 @@ fn is_valid_project_listing(project: &str) -> bool {
     is_path_atom(project)
 }
 
-/// Serialize a member card to JSON. Order is stable so a re-publish of an
-/// unchanged card writes identical bytes (retained-card idempotence).
+/// Serialize a member card to JSON for the wire (retained publish) or the
+/// cache file. Order is stable so a re-publish of an unchanged card writes
+/// identical bytes (retained-card idempotence).
+pub fn member_card_to_json(card: &MemberCard) -> String {
+    member_card_json(card)
+}
+
+/// Parse a member-card payload from the wire (the pump's read path), exposing
+/// the private validator so `connector.rs` (which holds the broker socket and
+/// is barred from reading files) can validate + cache a received card without
+/// reimplementing the shape rules.
+pub fn parse_member_card_pub(text: &str) -> Result<MemberCard, &'static str> {
+    parse_member_card(text)
+}
+
+/// Serialize an assembled `PeerRoster` to the B.7 roster JSON body the write
+/// path validates before persisting. `PeerRoster` objects carry already-valid
+/// id lists, so this is a straight projection; the write re-validates through
+/// `write_roster` before anything is persisted.
+pub fn roster_body(roster: &crate::connector::PeerRoster) -> String {
+    let values = |ids: &[String]| {
+        crate::json::Value::Array(
+            ids.iter()
+                .map(|id| crate::json::Value::String(id.clone()))
+                .collect(),
+        )
+    };
+    crate::json::Value::Object(vec![
+        ("principals".into(), values(&roster.principals)),
+        ("origins".into(), values(&roster.origins)),
+    ])
+    .to_json()
+}
+
+/// Serialize a member card to JSON for the wire (retained publish) or the
+/// cache file. Order is stable so a re-publish of an unchanged card writes
+/// identical bytes (retained-card idempotence).
 fn member_card_json(card: &MemberCard) -> String {
     let value = crate::json::Value::Object(vec![
         (
@@ -1398,8 +1451,24 @@ pub fn resolve(
     match_local_identity(&subject, local_email.as_deref()).map_err(credentials)?;
 
     let roster_root = configured_roster_root().map_err(ProvisionFailure::Roster)?;
-    let roster = read_roster(&roster_root, &row.org_id, &row.project_id)
-        .map_err(ProvisionFailure::Roster)?;
+    let roster = match read_roster(&roster_root, &row.org_id, &row.project_id) {
+        Ok(roster) => roster,
+        // Self-announce re-scopes the roster gate: an enrolled machine always
+        // admits itself (its own retained member card), so an absent or empty
+        // assembled roster is the ordinary "first join / no colleagues yet"
+        // state, not a refusal. The machine opens a self-only live session and
+        // the pump assembles peers' cards into the file as they arrive. The
+        // typed `no-peer-roster` refusal survives only for a genuinely unusable
+        // roster — malformed or wildcard data — never for "nobody known yet".
+        Err(reason::ROSTER_ABSENT)
+        | Err(reason::ROSTER_EMPTY)
+        | Err(reason::ROSTER_NO_ORIGINS)
+        | Err(reason::ROSTER_NO_PRINCIPALS) => crate::connector::PeerRoster {
+            principals: vec![subject.common_name.clone()],
+            origins: vec![row.instance_id.clone()],
+        },
+        Err(other) => return Err(ProvisionFailure::Roster(other)),
+    };
 
     // The client id is the **bare** instance id, with nothing prefixed or
     // derived. The broker's ACL scopes origin-write on the client id rather than
@@ -1879,13 +1948,19 @@ mod tests {
         std::fs::write(identity.join("key.pem"), KEY).expect("key is writable");
         std::env::set_var("LOAM_FEDERATION_IDENTITY_DIR", &identity);
 
-        // A matching row gets past the identity gate and fails later (the roster
-        // gate, absent here) — it must NOT be refused as an identity mismatch.
+        // A matching row gets past the identity gate; with self-announce, an
+        // absent roster is the ordinary first-join state and resolves to the
+        // machine's own self-admitted roster, not a refusal. It must NOT be
+        // refused as an identity mismatch.
         let matching = enrolled_row(ulid, "mqtts://broker.acme.example:8883");
+        let (_, roster) = resolve(&matching).expect("a matching row passes the SAN gate");
         assert_eq!(
-            resolve(&matching).err(),
-            Some(ProvisionFailure::Roster(reason::ROSTER_ABSENT)),
-            "a matching row must pass the SAN gate"
+            roster,
+            crate::connector::PeerRoster {
+                principals: vec!["sam@example.test".to_owned()],
+                origins: vec![ulid.to_owned()],
+            },
+            "a matching row self-admits its own origin and principal"
         );
 
         // A row claiming a different instance id is refused outright: the cert

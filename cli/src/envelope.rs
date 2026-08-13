@@ -1097,6 +1097,7 @@ pub(crate) struct ParsedTopic<'a> {
     pub(crate) delivery: TopicDelivery<'a>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TopicDelivery<'a> {
     Event {
         origin: &'a str,
@@ -1115,6 +1116,15 @@ pub(crate) enum TopicDelivery<'a> {
     /// retained payload carrying the roster JSON. Not a loam envelope — the
     /// connector writes it to the local roster file verbatim.
     Membership,
+    /// The self-announced member-card topic
+    /// (`loam/v1/{org}/members/{instance_id}`): a retained payload carrying one
+    /// member's card JSON. Not a loam envelope — the connector writes it to the
+    /// local member-card cache and reassembles project rosters from the set.
+    /// Org-scoped, so `project` carries the literal `members` marker and
+    /// `instance_id` names which card this is.
+    MemberCard {
+        instance_id: &'a str,
+    },
 }
 
 impl TopicDelivery<'_> {
@@ -1124,8 +1134,11 @@ impl TopicDelivery<'_> {
                 origin
             }
             // A membership frame has no origin; the membership ACL grants
-            // read on the topic, not a per-instance origin write.
-            Self::Membership => "",
+            // read on the topic, not a per-instance origin write. A member
+            // card is similarly broker-served: the card's own instance id is in
+            // the topic, and read is granted by the members/+ ACL, not by an
+            // origin claim on the frame.
+            Self::Membership | Self::MemberCard { .. } => "",
         }
     }
 
@@ -1135,6 +1148,7 @@ impl TopicDelivery<'_> {
             Self::State { .. } => "latest-state",
             Self::Inbox { .. } => "inbox",
             Self::Membership => "membership",
+            Self::MemberCard { .. } => "members",
         }
     }
 }
@@ -1148,9 +1162,40 @@ pub(crate) fn parse_topic(topic: &str) -> Result<ParsedTopic<'_>, Violation> {
         return Err(Violation::MalformedTopic);
     }
     let organization = segments.next().filter(|value| valid_topic_segment(value));
+    let Some(organization) = organization else {
+        return Err(Violation::MalformedTopic);
+    };
+
+    // The self-announced member-card topic is org-scoped: the project slot is
+    // the literal `members` marker followed by the instance id, with no
+    // project and no further segments.
+    match segments.next() {
+        Some("members") => {
+            let instance_id = segments.next().filter(|value| valid_topic_segment(value));
+            let Some(instance_id) = instance_id else {
+                return Err(Violation::MalformedTopic);
+            };
+            if segments.next().is_some() {
+                return Err(Violation::MalformedTopic);
+            }
+            return Ok(ParsedTopic {
+                organization,
+                project: "members",
+                delivery: TopicDelivery::MemberCard { instance_id },
+            });
+        }
+        Some(_) => {}
+        None => return Err(Violation::MalformedTopic),
+    }
+
+    // Re-walk from the project slot for the project-scoped classes.
+    let mut segments = topic.split('/');
+    let _ = segments.next(); // loam
+    let _ = segments.next(); // v1
+    let _ = segments.next(); // organization
     let project = segments.next().filter(|value| valid_topic_segment(value));
     let class = segments.next();
-    let (Some(organization), Some(project), Some(class)) = (organization, project, class) else {
+    let (Some(project), Some(class)) = (project, class) else {
         return Err(Violation::MalformedTopic);
     };
     let delivery = match class {
@@ -1249,9 +1294,10 @@ fn validate_topic(value: &Value, topic: &str) -> Result<(), Violation> {
             ..
         } => Some((*recipient_kind, *recipient)),
         TopicDelivery::Event { .. } | TopicDelivery::State { .. } => None,
-        // A membership frame is never an envelope; it is refused before the
-        // envelope validator by the transport's membership read-path.
-        TopicDelivery::Membership => None,
+        // A membership or member-card frame is never an envelope; it is
+        // refused before the envelope validator by the transport's
+        // membership read-path.
+        TopicDelivery::Membership | TopicDelivery::MemberCard { .. } => None,
     };
     let mut directly_addressed = false;
     for recipient in recipients {
@@ -1297,7 +1343,7 @@ fn validate_topic(value: &Value, topic: &str) -> Result<(), Violation> {
                 return Err(Violation::BindingMismatch(BindingAxis::MessageId));
             }
         }
-        TopicDelivery::Membership => {}
+        TopicDelivery::Membership | TopicDelivery::MemberCard { .. } => {}
     }
     Ok(())
 }
@@ -2095,6 +2141,38 @@ mod tests {
             ),
             Err(Violation::MalformedTopic)
         );
+    }
+
+    #[test]
+    fn the_member_card_topic_is_org_scoped_with_a_members_marker() {
+        // `loam/v1/{org}/members/{instance_id}`: the project slot carries the
+        // literal `members` marker and the instance id follows, with no project
+        // segment and nothing after the instance.
+        let parsed = parse_topic("loam/v1/acme/members/01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .expect("a well-formed member-card topic parses");
+        assert_eq!(parsed.organization, "acme");
+        assert_eq!(parsed.project, "members");
+        assert_eq!(
+            parsed.delivery,
+            TopicDelivery::MemberCard {
+                instance_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            }
+        );
+
+        // A missing instance, an extra segment, and a wildcard id are all
+        // malformed.
+        for bad in [
+            "loam/v1/acme/members",
+            "loam/v1/acme/members/",
+            "loam/v1/acme/members/01ARZ3NDEKTSV4RRFFQ69G5FAV/extra",
+            "loam/v1/acme/members/+", // wildcard is not a valid card id
+        ] {
+            assert_eq!(
+                parse_topic(bad).map(|_| ()),
+                Err(Violation::MalformedTopic),
+                "topic {bad}"
+            );
+        }
     }
 
     #[test]

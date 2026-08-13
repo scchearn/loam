@@ -474,6 +474,14 @@ pub enum ReceiveOutcome {
     /// envelope validator on purpose — the membership topic is a broker-track
     /// contract, not a loam envelope.
     Membership(Vec<u8>),
+    /// A retained self-announced member card: the raw bytes the connector
+    /// writes to the local member-card cache. Like [`ReceiveOutcome::Membership`],
+    /// delivered outside the envelope validator — the members topic is a
+    /// broker-track contract, not a loam envelope.
+    MemberCard {
+        instance_id: String,
+        payload: Vec<u8>,
+    },
 }
 
 pub struct DeliveryProcessor {
@@ -549,13 +557,28 @@ impl DeliveryProcessor {
             return Err(TransportError::Validation(Violation::DocumentTooLarge));
         }
         let parsed_topic = envelope::parse_topic(topic).map_err(TransportError::Validation)?;
-        // The broker-served membership topic is a broker-track contract, not a
-        // loam envelope: the payload is the roster JSON verbatim, delivered
-        // outside the envelope validator. It has no origin (the membership ACL
-        // grants read on the topic, not a per-instance origin write), so it is
-        // exempt from the origin check.
-        if matches!(parsed_topic.delivery, TopicDelivery::Membership) {
-            return Ok(ReceiveOutcome::Membership(payload.to_vec()));
+        // The broker-served membership and member-card topics are broker-track
+        // contracts, not loam envelopes: the payload is the roster/card JSON
+        // verbatim, delivered outside the envelope validator. They have no
+        // origin (the membership/members ACL grants read on the topic, not a
+        // per-instance origin write), so they are exempt from the origin check.
+        // A member card may be a tombstone (empty payload) clearing a departed
+        // instance's card, which `remove` reports so the connector drops the
+        // cached card.
+        match parsed_topic.delivery {
+            TopicDelivery::Membership => {
+                return Ok(ReceiveOutcome::Membership(payload.to_vec()));
+            }
+            TopicDelivery::MemberCard { instance_id } => {
+                if payload.is_empty() {
+                    return Ok(ReceiveOutcome::Removed);
+                }
+                return Ok(ReceiveOutcome::MemberCard {
+                    instance_id: instance_id.to_owned(),
+                    payload: payload.to_vec(),
+                });
+            }
+            _ => {}
         }
         if !identity.can_use_origin(parsed_topic.delivery.origin()) {
             return Err(TransportError::OriginNotAuthorized);
@@ -595,7 +618,9 @@ impl DeliveryProcessor {
             }
             // Unreachable: the membership read-path returns before the
             // envelope validator runs.
-            TopicDelivery::Membership => Err(TransportError::Validation(Violation::MalformedTopic)),
+            TopicDelivery::Membership | TopicDelivery::MemberCard { .. } => {
+                Err(TransportError::Validation(Violation::MalformedTopic))
+            }
         }
     }
 
@@ -702,8 +727,12 @@ impl DeliveryProcessor {
             }
             // An empty membership payload is the broker's way of clearing the
             // roster; the connector refuses to write an empty roster rather
-            // than treating it as membership.
-            TopicDelivery::Membership => Ok(ReceiveOutcome::Removed),
+            // than treating it as membership. Member cards are handled by the
+            // read-path's own tombstone branch before `remove` (which carries
+            // no instance id), so this arm is defensive only.
+            TopicDelivery::Membership | TopicDelivery::MemberCard { .. } => {
+                Ok(ReceiveOutcome::Removed)
+            }
         }
     }
 
