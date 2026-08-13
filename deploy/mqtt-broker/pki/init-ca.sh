@@ -36,6 +36,11 @@ default_md       = sha256
 default_days     = 825
 default_crl_days = 30
 policy           = policy_anything
+# Auto-enrollment (specs/federation-auto-enrollment.md): the machine's CSR
+# carries its own SAN (urn:loam:instance:<ulid>); the signer issues it verbatim.
+# copy_extensions = copy makes `openssl ca` carry that SAN into the cert. It is
+# inert for issue-client.sh, which supplies an explicit -extfile instead.
+copy_extensions  = copy
 [ policy_anything ]
 commonName = supplied
 emailAddress = optional

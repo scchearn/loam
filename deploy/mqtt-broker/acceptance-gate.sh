@@ -32,6 +32,7 @@ dryrun() {
     resolve-credentials.sh provision-peer-roster.sh provision-instance-id.sh
     certbot-deploy-hook.sh pki/init-ca.sh pki/issue-client.sh pki/revoke-client.sh
     pki/obtain-server-cert.sh pki/selfcheck.sh
+    enroll/signer.py enroll/install-signer.sh enroll/loam-enroll-signer.service
     RESOLUTION-CONTRACT.md ROSTER-CONTRACT.md INSTANCE-ID-CONTRACT.md IDENTITY-CONTRACT.md ACCEPTANCE.md"
   local f
   for f in $need; do

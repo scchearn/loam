@@ -25,9 +25,37 @@ certbot DNS-01. Install the deploy-hook that reloads **only** mosquitto.
 
 ## 3. Org-CA + client PKI
 
-_Filled by T4._ Create the org CA; issue one client cert per node (CN = principal_id,
-SAN `urn:loam:instance:<instance_id>`). See `RESOLUTION-CONTRACT.md` and
+_Filled by T4._ Create the org CA (`pki/init-ca.sh`). The CA config now carries
+`copy_extensions = copy` so the auto-enrollment signer can issue a machine's
+CSR **verbatim** (CN + its own SAN). Manual per-node issuance remains available
+via `pki/issue-client.sh` alongside it; the auto-enrollment path (step 3.5) is
+what a new machine uses. See `RESOLUTION-CONTRACT.md` and
 `INSTANCE-ID-CONTRACT.md`.
+
+## 3.5 Auto-enrollment signer (specs/federation-auto-enrollment.md)
+
+Install the HTTPS signer that turns a machine's `{password, CSR}` into a signed
+mTLS cert — the machine mints its own keypair + CSR, nothing travels by hand:
+
+```sh
+./enroll/install-signer.sh install
+```
+
+- Creates the shared enrollment password at `${ENROLL_DIR}/password` (`0600`),
+  generated like `openssl rand -base64 24`. **Rotation** = replace that file and
+  re-share via wiki/1Password; already-issued certs are unaffected.
+- Reuses the host's Let's Encrypt server cert (same FQDN), so machines verify
+  its TLS with public roots — no custom CA on the client.
+- Binds the tailnet `100.x` interface when present (auto), else `ENROLL_BIND_ADDRESS`;
+  rate-limits per client (default 10 per 60s); verifies the password in constant
+  time; **never logs the password, CSR, or cert**.
+- Mosquitto is untouched: this service only issues org-CA-signed certs.
+
+The machine-side command, one shot (no admin ceremony):
+
+```sh
+loam federation connect <workspace> mqtts://<host>:8883 --token "$(cat /path/enroll password)"
+```
 
 ## 4. Broker config + ACL
 

@@ -24,6 +24,7 @@ Two **different** CAs, one per direction:
 | `mosquitto.conf` | TLS listener, no-anon, mTLS, persistence, quotas | T2 |
 | `acl` | `{org-id}`-rooted ACL, origin-prefix write scoping | T3 |
 | `pki/` | org CA + client-cert issue/revoke; certbot server-cert wrapper | T4 |
+| `enroll/` | auto-enrollment signer (machine ~> {password, CSR} ~> signed cert) | auto-enroll |
 | `loam-mosquitto.service` | sandboxed system service | T5 |
 | `backup-restore.sh` | persistence + org-CA backup/restore | T6 |
 | `cert-monitor.sh` + timer | org-CA client-cert expiry monitoring | T7 |

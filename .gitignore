@@ -15,3 +15,7 @@ deploy/mqtt-broker/pki/private/
 
 specs/
 plans/
+
+# Python bytecode from the deploy signer (never committed)
+__pycache__/
+*.pyc
