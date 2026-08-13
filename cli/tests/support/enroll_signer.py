@@ -7,8 +7,8 @@ password check, and signing via the deployment's own `openssl ca` with
 copy_extensions = copy. Kept here so the runtime tier is self-contained
 (needs only python3 + openssl, both already required by this tier).
 
-The deployment's signer adds tailnet binding, rate limiting, and logging
-hardening; this fixture keeps only the contract-observable behavior.
+The deployment's signer adds rate limiting and logging hardening; this fixture
+keeps only the contract-observable behavior.
 """
 
 import argparse
