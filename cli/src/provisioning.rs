@@ -729,10 +729,7 @@ pub fn profile_root(
         return Ok(path.join("federation"));
     }
     if let Some(path) = present(home) {
-        return Ok(path
-            .join(".agents")
-            .join("loam")
-            .join("federation"));
+        return Ok(path.join(".agents").join("loam").join("federation"));
     }
     Err(reason::PROFILE_ABSENT)
 }
@@ -757,7 +754,11 @@ fn config_root(
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = present(home) {
-            return Some(home.join("Library").join("Application Support").join("loam"));
+            return Some(
+                home.join("Library")
+                    .join("Application Support")
+                    .join("loam"),
+            );
         }
         let _ = xdg_config_home;
         let _ = appdata;
@@ -844,20 +845,35 @@ pub fn configured_roster_root() -> Result<std::path::PathBuf, &'static str> {
 
 /// The federation registry (`loam.sqlite3`) path: the enrollment store moved
 /// into the config-dir profile (`<profile>/loam.sqlite3`) so it survives
-/// uninstall with the rest of the identity. `legacy_root` is the explicit
-/// `--global-root` an operator passes; it serves as the registry's legacy rung
-/// (the pre-spec location `<global-root>/loam.sqlite3`), so an install that has
-/// not migrated continues to resolve the store it already wrote, and the
-/// one-time migration copies it into the config dir once the profile exists.
-pub fn configured_registry_path(legacy_root: Option<&std::path::Path>) -> Result<std::path::PathBuf, &'static str> {
-    match configured_profile_root() {
-        Ok(profile) => Ok(profile.join("loam.sqlite3")),
-        Err(reason::PROFILE_ABSENT) => match legacy_root {
-            Some(root) => Ok(root.join("loam.sqlite3")),
-            None => Err(reason::PROFILE_ABSENT),
-        },
-        Err(other) => Err(other),
+/// uninstall with the rest of the identity. Resolution, first wins:
+///
+/// 1. `LOAM_CONFIG_DIR` → `<cfg>/federation/loam.sqlite3`
+/// 2. an explicit `--global-root` (the operator's knob, and the hermetic-test
+///    Root) → `<root>/loam.sqlite3`
+/// 3. the platform config-dir profile → `<config>/loam/federation/loam.sqlite3`
+/// 4. the legacy install root → `<global-root>/loam.sqlite3`
+///
+/// Rung 2 existing as it does keeps the CLI's `--global-root` authoritative
+/// for non-default installs and tests (which would otherwise resolve the real
+/// HOME profile and clobber it), while rung 1 lets new installs point the
+/// registry at the surviving config dir explicitly.
+pub fn configured_registry_path(
+    legacy_root: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, &'static str> {
+    if let Some(cfg) = std::env::var("LOAM_CONFIG_DIR")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return Ok(std::path::PathBuf::from(cfg)
+            .join("federation")
+            .join("loam.sqlite3"));
     }
+    if let Some(root) = legacy_root {
+        return Ok(root.join("loam.sqlite3"));
+    }
+    configured_profile_root().map(|profile| profile.join("loam.sqlite3"))
 }
 
 /// An entry that would admit everyone. `*` and `#` never occur in a principal
@@ -1101,7 +1117,10 @@ pub fn read_member_card(
     if !is_path_atom(org_id) || !is_path_atom(instance_id) {
         return Err(reason::ROSTER_MALFORMED);
     }
-    let path = root.join(org_id).join("members").join(format!("{instance_id}.json"));
+    let path = root
+        .join(org_id)
+        .join("members")
+        .join(format!("{instance_id}.json"));
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Ok(None);
     };
@@ -1158,7 +1177,10 @@ pub fn assemble_project_roster(
             origins.push(card.instance_id);
         }
     }
-    Ok(crate::connector::PeerRoster { principals, origins })
+    Ok(crate::connector::PeerRoster {
+        principals,
+        origins,
+    })
 }
 
 /// A project listing in a member card must be a single ordinary path atom
@@ -1278,7 +1300,9 @@ fn parse_member_card(text: &str) -> Result<MemberCard, &'static str> {
         Some(crate::json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
         _ => None,
     };
-    let (Some(instance_id), Some(principal_id), Some(joined_at)) = (instance_id, principal_id, joined_at) else {
+    let (Some(instance_id), Some(principal_id), Some(joined_at)) =
+        (instance_id, principal_id, joined_at)
+    else {
         return Err(reason::ROSTER_MALFORMED);
     };
     let projects = get("projects")
@@ -1293,7 +1317,10 @@ fn parse_member_card(text: &str) -> Result<MemberCard, &'static str> {
         project_list.push(text.to_owned());
     }
     for value in [&instance_id, &principal_id, &joined_at] {
-        if value.chars().any(|c| c.is_control() || c == '+' || c == '#' || c == '*') {
+        if value
+            .chars()
+            .any(|c| c.is_control() || c == '+' || c == '#' || c == '*')
+        {
             return Err(reason::ROSTER_MALFORMED);
         }
     }
@@ -1324,7 +1351,9 @@ pub fn read_config(mut root: &std::path::Path) -> Result<Option<crate::json::Val
     if text.trim().is_empty() {
         return Ok(None);
     }
-    crate::json::parse(&text).map(Some).map_err(|_| reason::ROSTER_MALFORMED)
+    crate::json::parse(&text)
+        .map(Some)
+        .map_err(|_| reason::ROSTER_MALFORMED)
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,9 +1373,12 @@ pub fn migrate_legacy_profile() -> Result<bool, &'static str> {
     let appdata = std::env::var("APPDATA").ok();
     let loam_home = std::env::var("LOAM_HOME").ok();
     let home = std::env::var("HOME").ok();
-    let Some(config_root) =
-        config_root(config_dir.as_deref(), xdg.as_deref(), appdata.as_deref(), home.as_deref())
-    else {
+    let Some(config_root) = config_root(
+        config_dir.as_deref(),
+        xdg.as_deref(),
+        appdata.as_deref(),
+        home.as_deref(),
+    ) else {
         return Ok(false);
     };
     let target = config_root.join("federation");
@@ -2028,11 +2060,7 @@ mod tests {
     fn the_roster_root_walks_the_profile_ladder_in_order() {
         // The explicit per-resource override names the directory directly.
         assert_eq!(
-            roster_root(
-                Some("/explicit"),
-                None, None, None, None, Some("/home/op"),
-            )
-            .unwrap(),
+            roster_root(Some("/explicit"), None, None, None, None, Some("/home/op"),).unwrap(),
             std::path::PathBuf::from("/explicit")
         );
         // Then the config-dir rungs: LOAM_CONFIG_DIR first, then the platform
@@ -2447,11 +2475,7 @@ mod tests {
     fn the_identity_root_walks_three_rungs_in_order() {
         // The explicit per-resource override names the identity directory.
         assert_eq!(
-            identity_root(
-                Some("/explicit"),
-                None, None, None, None, Some("/home/op"),
-            )
-            .unwrap(),
+            identity_root(Some("/explicit"), None, None, None, None, Some("/home/op"),).unwrap(),
             std::path::PathBuf::from("/explicit")
         );
         // Then the config-dir rungs.

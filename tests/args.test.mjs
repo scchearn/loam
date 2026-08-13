@@ -27,11 +27,13 @@ test('setup accepts the confirmation and dry-run flags', () => {
     command: 'setup',
     dryRun: false,
     yes: false,
+    purge: false,
   });
   assert.deepEqual(parseArgs(['setup', '--yes', '--dry-run']), {
     command: 'setup',
     dryRun: true,
     yes: true,
+    purge: false,
   });
 });
 
@@ -40,11 +42,13 @@ test('install aliases setup and doctor is a supported command', () => {
     command: 'setup',
     dryRun: false,
     yes: false,
+    purge: false,
   });
   assert.deepEqual(parseArgs(['doctor']), {
     command: 'doctor',
     dryRun: false,
     yes: false,
+    purge: false,
   });
 });
 
@@ -53,11 +57,22 @@ test('update is a supported setup mode with dry-run', () => {
     command: 'update',
     dryRun: false,
     yes: false,
+    purge: false,
   });
   assert.deepEqual(parseArgs(['update', '--dry-run']), {
     command: 'update',
     dryRun: true,
     yes: false,
+    purge: false,
+  });
+});
+
+test('uninstall accepts an explicit --purge flag', () => {
+  assert.deepEqual(parseArgs(['uninstall', '--purge']), {
+    command: 'uninstall',
+    dryRun: false,
+    yes: false,
+    purge: true,
   });
 });
 

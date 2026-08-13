@@ -1,6 +1,6 @@
 import { UsageError } from './errors.mjs';
 
-const knownFlags = new Set(['--yes', '--dry-run']);
+const knownFlags = new Set(['--yes', '--dry-run', '--purge']);
 
 export function parseArgs(argv) {
   const args = [...argv];
@@ -24,13 +24,15 @@ export function parseArgs(argv) {
 
   let yes = false;
   let dryRun = false;
+  let purge = false;
   for (const flag of args.slice(1)) {
     if (!knownFlags.has(flag)) throw new UsageError(`unknown option: ${flag}`);
     if (flag === '--yes') yes = true;
     if (flag === '--dry-run') dryRun = true;
+    if (flag === '--purge') purge = true;
   }
 
-  return { command, dryRun, yes };
+  return { command, dryRun, yes, purge };
 }
 
 export { UsageError };

@@ -689,11 +689,7 @@ impl MqttTransport {
     /// member card). The card is not a loam envelope — it is the connector's own
     /// retained card, so it is published verbatim and never routed through the
     /// envelope encoder. Requires an authenticated session.
-    fn publish_raw_retained(
-        &mut self,
-        topic: &str,
-        payload: Vec<u8>,
-    ) -> Result<(), ProbeError> {
+    fn publish_raw_retained(&mut self, topic: &str, payload: Vec<u8>) -> Result<(), ProbeError> {
         if self.client.is_none() {
             return Err(ProbeError::PublishDenied);
         }
@@ -1576,7 +1572,10 @@ impl ProjectSessions {
         let card_topic = crate::provisioning::member_topic(&row.org_id, &identity.instance_id);
         if let Ok(Some(card)) = own_member_card(row, &identity, now) {
             let body = crate::provisioning::member_card_to_json(&card);
-            if transport.publish_raw_retained(&card_topic, body.into_bytes()).is_err() {
+            if transport
+                .publish_raw_retained(&card_topic, body.into_bytes())
+                .is_err()
+            {
                 if roster.is_empty() {
                     return SessionState::NoPeerRoster(reason::ROSTER_EMPTY);
                 }
@@ -1734,7 +1733,8 @@ fn own_member_card(
     identity: &SessionIdentity,
     now: DateTime<Utc>,
 ) -> Result<Option<crate::provisioning::MemberCard>, &'static str> {
-    if row.org_id.is_empty() || identity.instance_id.is_empty() || identity.principal_id.is_empty() {
+    if row.org_id.is_empty() || identity.instance_id.is_empty() || identity.principal_id.is_empty()
+    {
         return Ok(None);
     }
     Ok(Some(crate::provisioning::MemberCard {
@@ -1796,13 +1796,19 @@ fn pump(
                     if let Ok(text) = std::str::from_utf8(payload) {
                         if let Ok(root) = crate::provisioning::configured_roster_root() {
                             if let Ok(card) = crate::provisioning::parse_member_card_pub(text) {
-                                let _ = crate::provisioning::write_member_card(&root, &org_id, &card);
+                                let _ =
+                                    crate::provisioning::write_member_card(&root, &org_id, &card);
                                 if let Ok(assembled) = crate::provisioning::assemble_project_roster(
-                                    &root, &org_id, &project_id,
+                                    &root,
+                                    &org_id,
+                                    &project_id,
                                 ) {
                                     let body = crate::provisioning::roster_body(&assembled);
                                     let _ = crate::provisioning::write_roster(
-                                        &root, &org_id, &project_id, &body,
+                                        &root,
+                                        &org_id,
+                                        &project_id,
+                                        &body,
                                     );
                                     roster = assembled;
                                 }
@@ -1877,7 +1883,9 @@ fn pump(
 /// endpoint and serves.
 #[cfg(unix)]
 pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
-    let db_path = global_root.join("loam.sqlite3");
+    let Ok(db_path) = crate::provisioning::configured_registry_path(Some(global_root)) else {
+        return Ok(ServiceOutcome::Inert);
+    };
     if !registry_has_enrollments(&db_path)? {
         return Ok(ServiceOutcome::Inert);
     }
@@ -1946,7 +1954,9 @@ fn serve_connection<S: std::io::Read + std::io::Write>(
 /// inside `accept_verified` before the codec sees a byte.
 #[cfg(windows)]
 pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
-    let db_path = global_root.join("loam.sqlite3");
+    let Ok(db_path) = crate::provisioning::configured_registry_path(Some(global_root)) else {
+        return Ok(ServiceOutcome::Inert);
+    };
     if !registry_has_enrollments(&db_path)? {
         return Ok(ServiceOutcome::Inert);
     }

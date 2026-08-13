@@ -158,16 +158,17 @@ test('uninstall restores a Codex profile preserved during setup', async () => {
   assert.equal(await exists(`${profilePath}.loam-backup`), false);
 });
 
-test('uninstall with explicit confirmation destroys the identity bundle with the root (#86)', async () => {
+test('uninstall preserves the Loam config dir by default (#86)', async () => {
   const { home, globalRoot } = await readyFixture();
-  const identityDir = join(globalRoot, 'federation', 'identity');
+  // The durable profile now lives in the config root, not under the global root.
+  const configDir = join(home, '.config', 'loam');
+  const identityDir = join(configDir, 'federation', 'identity');
   await mkdir(identityDir, { recursive: true });
   await writeFile(join(identityDir, 'client.pem'), 'cert');
   await writeFile(join(identityDir, 'key.pem'), 'key');
+  await writeFile(join(configDir, 'anything-else.json'), '{}');
 
   let output = '';
-  // `yes: true` IS the explicit confirmation: no export prompt, the bundle
-  // goes with the root, and the warning still names it.
   const code = await uninstall({
     home,
     globalRoot,
@@ -176,16 +177,47 @@ test('uninstall with explicit confirmation destroys the identity bundle with the
     output: { write: (chunk) => { output += chunk; } },
   });
   assert.equal(code, 0);
-  assert.equal(await exists(globalRoot), false);
-  assert.match(output, /federation identity/);
+  assert.equal(await exists(globalRoot), false, 'the install is removed');
+  assert.equal(await exists(join(identityDir, 'client.pem')), true, 'the identity survives a default uninstall');
+  assert.equal(await exists(join(configDir, 'anything-else.json')), true, 'the whole config dir survives a default uninstall');
+  assert.match(output, /PRESERVE the Loam config dir/i);
 });
 
-test('uninstall prompts export-or-confirm and preserves the root when the operator declines both (#86)', async () => {
+test('uninstall --purge destroys the whole Loam config dir with an explicit confirm (#86)', async () => {
   const { home, globalRoot } = await readyFixture();
-  const identityDir = join(globalRoot, 'federation', 'identity');
+  const configDir = join(home, '.config', 'loam');
+  const identityDir = join(configDir, 'federation', 'identity');
   await mkdir(identityDir, { recursive: true });
   await writeFile(join(identityDir, 'client.pem'), 'cert');
   await writeFile(join(identityDir, 'key.pem'), 'key');
+  await writeFile(join(configDir, 'anything-else.json'), '{}');
+
+  let output = '';
+  // `yes: true` IS the explicit confirmation: no export prompt, the config dir
+  // goes with the install, and the warning still names the identity.
+  const code = await uninstall({
+    home,
+    globalRoot,
+    yes: true,
+    purge: true,
+    runner: skillsRunner(),
+    output: { write: (chunk) => { output += chunk; } },
+  });
+  assert.equal(code, 0);
+  assert.equal(await exists(globalRoot), false);
+  assert.equal(await exists(configDir), false, '--purge destroys the whole config dir');
+  assert.equal(await exists(join(identityDir, 'client.pem')), false, '--purge destroys the identity');
+  assert.match(output, /federation identity/);
+});
+
+test('uninstall --purge prompts export-or-confirm and preserves the install and config dir when the operator declines (#86)', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const configDir = join(home, '.config', 'loam');
+  const identityDir = join(configDir, 'federation', 'identity');
+  await mkdir(identityDir, { recursive: true });
+  await writeFile(join(identityDir, 'client.pem'), 'cert');
+  await writeFile(join(identityDir, 'key.pem'), 'key');
+  await writeFile(join(configDir, 'anything-else.json'), '{}');
 
   let output = '';
   const prompts = [];
@@ -203,14 +235,16 @@ test('uninstall prompts export-or-confirm and preserves the root when the operat
     home,
     globalRoot,
     yes: false,
+    purge: true,
     confirm: undefined,
     runner: skillsRunner(),
     output: { write: (chunk) => { output += chunk; } },
     input: readlineLike,
   });
   assert.equal(code, 130, 'declining both prompts cancels the uninstall');
-  assert.equal(await exists(globalRoot), true, 'the global root survives a declined uninstall');
-  assert.equal(await exists(join(identityDir, 'client.pem')), true, 'the identity bundle survives');
+  assert.equal(await exists(join(identityDir, 'client.pem')), true, 'the identity survives a declined purge');
+  assert.equal(await exists(configDir), true, 'the whole config dir survives a declined purge');
+  assert.equal(await exists(globalRoot), true, 'the install survives a declined purge (uninstall cancelled)');
   assert.match(output, /federation identity/);
 });
 

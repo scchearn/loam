@@ -142,7 +142,8 @@ fn disconnect(mut args: impl Iterator<Item = String>) -> i32 {
         Ok(context) => context,
         Err(code) => return code,
     };
-    let db_path = root.join("loam.sqlite3");
+    let db_path = crate::provisioning::configured_registry_path(Some(&root))
+        .unwrap_or_else(|_| root.join("loam.sqlite3"));
     let runner = crate::service::RealRunner;
 
     // The bounded broker tombstone is the real adapter's job (T13). Until then it
@@ -219,7 +220,8 @@ fn status(mut args: impl Iterator<Item = String>) -> i32 {
         Ok(context) => context,
         Err(code) => return code,
     };
-    let db_path = root.join("loam.sqlite3");
+    let db_path = crate::provisioning::configured_registry_path(Some(&root))
+        .unwrap_or_else(|_| root.join("loam.sqlite3"));
     let runner = crate::service::RealRunner;
 
     let report = crate::connector::status_report(&db_path, &runner, &context, key.as_deref());
@@ -677,7 +679,8 @@ fn orchestrate_cli(
     };
     let instance_id = context.instance_id.clone();
     let runner = crate::service::RealRunner;
-    let db_path = root.join("loam.sqlite3");
+    let db_path = crate::provisioning::configured_registry_path(Some(root))
+        .unwrap_or_else(|_| root.join("loam.sqlite3"));
     let now = chrono::Utc::now();
 
     // Probe against the REAL broker. Build the session inputs from the

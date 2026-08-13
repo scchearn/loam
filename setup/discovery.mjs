@@ -54,6 +54,16 @@ export async function discover({
   const resolvedWorkspace = resolve(workspace);
   const globalRoot = join(resolvedHome, '.agents', 'loam');
   const skillsRoot = join(resolvedHome, '.agents', 'skills');
+  // The durable federation profile root in the config dir (survives uninstall),
+  // resolved with the same ladder the runtime uses; `null` when no config basis
+  // resolves. Setup never writes it; uninstall preserves it (and `--purge`
+  // destroys it).
+  const { profileRoot } = await import('./profile.mjs');
+  const federationProfileRoot = profileRoot({
+    env: process.env,
+    home: resolvedHome,
+    platform,
+  });
   let requiredVersion = '';
   try {
     requiredVersion = await readRequiredVersion({ skillsRoot });
@@ -72,6 +82,7 @@ export async function discover({
     workspace: resolvedWorkspace,
     globalRoot,
     skillsRoot,
+    federationProfileRoot,
     target: target || detectTarget({ platform, arch }),
     platform,
     arch,

@@ -27,6 +27,7 @@ Usage:
   npx @scchearn/loam doctor
   npx @scchearn/loam uninstall
   npx @scchearn/loam uninstall --yes
+  npx @scchearn/loam uninstall --purge
   npx @scchearn/loam --help
   npx @scchearn/loam --version
 
@@ -35,11 +36,15 @@ Commands:
   install     Alias for setup.
   update      Refresh Loam skills, runtime, integrations, and marketplace plugins.
   doctor      Check the global Loam installation without changing it.
-  uninstall   Remove global Loam skills, runtime, integration, and hook entries.
+  uninstall   Remove global Loam skills, runtime, integration, and hook entries
+              (preserves the federation profile; --purge destroys it).
 
 Options:
   --yes       Accept changes without interactive confirmation.
   --dry-run   Preview setup or update changes without mutation or downloads.
+  --purge     With uninstall, also destroy the federation profile (identity,
+              rosters, enrollment, registry, member cards, config.json) in the
+              config dir. Without it the profile survives a reinstall.
   --help      Show this help without network access.
   --version   Show the setup package version without network access.
 `;
