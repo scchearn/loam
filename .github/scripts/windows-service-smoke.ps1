@@ -10,8 +10,11 @@ $Task = $null
 try {
   & $Bin federation service install --global-root $Root
   if ($LASTEXITCODE -ne 0) { throw "install exited $LASTEXITCODE" }
-  $id = (Get-Content (Join-Path $Root "instance_id")).Trim()
-  $Task = "Loam\connector-$id"
+  # The task name embeds a deterministic digest of the global root (the
+  # certificate is the identity source; no instance_id file is written anymore).
+  # Discover the created task from Task Scheduler instead of reading a file.
+  $Task = (& schtasks /Query /FO CSV /NH | Select-String "Loam\\connector-" | Select-Object -First 1).ToString().Split(",")[0].Trim('"')
+  if (-not $Task) { throw "no Loam\connector-* task found after install" }
   schtasks /Query /TN $Task | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "task not created" }
   if (Test-Path (Join-Path $Root "loam.sqlite3")) { throw "database created by install" }
