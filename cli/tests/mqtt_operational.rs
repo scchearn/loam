@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use loam::connector::{PeerRoster, ProjectSessions, SessionState, SnapshotItem};
+use loam::connector::{ChannelRegistry, PeerRoster, ProjectSessions, SessionState, SnapshotItem};
 use loam::enrollment::registry::{CapabilityRecord, EnrolledRow};
 use loam::envelope::{AuthenticatedPrincipal, ValidationConfig};
 use mqtt_broker::BrokerFixture;
@@ -379,8 +379,8 @@ fn two_provisioned_instances_hear_each_other_in_both_directions() {
 
     // Both sessions come out of the real seam: the real PEM identity path, the
     // real certificate walk, the real roster file. Nothing is hand-built.
-    let mut a = ProjectSessions::new(16);
-    let mut b = ProjectSessions::new(16);
+    let mut a = ProjectSessions::new(16, ChannelRegistry::new());
+    let mut b = ProjectSessions::new(16, ChannelRegistry::new());
     let now = Utc::now();
     fixture.use_identity(INSTANCE_A);
     assert_eq!(
@@ -510,7 +510,7 @@ fn an_origin_absent_from_the_roster_is_not_heard_and_the_same_origin_added_is() 
     // B's roster lists only itself, so A's origin is not admitted.
     fixture.write_roster(&[INSTANCE_B]);
     let row_b = fixture.row(INSTANCE_B);
-    let mut b = ProjectSessions::new(16);
+    let mut b = ProjectSessions::new(16, ChannelRegistry::new());
     fixture.use_identity(INSTANCE_B);
     assert_eq!(
         b.attach(
@@ -522,7 +522,7 @@ fn an_origin_absent_from_the_roster_is_not_heard_and_the_same_origin_added_is() 
     );
 
     let row_a = fixture.row(INSTANCE_A);
-    let mut a = ProjectSessions::new(16);
+    let mut a = ProjectSessions::new(16, ChannelRegistry::new());
     fixture.use_identity(INSTANCE_A);
     assert_eq!(
         a.attach(
@@ -552,7 +552,7 @@ fn an_origin_absent_from_the_roster_is_not_heard_and_the_same_origin_added_is() 
     // absence above would be indistinguishable from a broken subscriber.
     b.detach(PROJECT);
     fixture.write_roster(&[INSTANCE_A, INSTANCE_B]);
-    let mut b = ProjectSessions::new(16);
+    let mut b = ProjectSessions::new(16, ChannelRegistry::new());
     fixture.use_identity(INSTANCE_B);
     assert_eq!(
         b.attach(
@@ -621,7 +621,7 @@ fn a_roster_that_would_hear_nobody_opens_no_session() {
         ("{not json".to_owned(), "roster-malformed"),
     ] {
         std::fs::write(&path, &body).expect("roster is writable");
-        let mut sessions = ProjectSessions::new(4);
+        let mut sessions = ProjectSessions::new(4, ChannelRegistry::new());
         let state = sessions.attach(&row, loam::connector::provision_session(&row), Utc::now());
         assert_eq!(state.code(), "no-peer-roster", "{body}");
         assert_eq!(state.reason(), Some(expected), "{body}");
@@ -631,7 +631,7 @@ fn a_roster_that_would_hear_nobody_opens_no_session() {
     // The positive control in the same run: a usable roster does open, so every
     // refusal above is the roster and not the broker.
     fixture.write_roster(&[INSTANCE_B]);
-    let mut sessions = ProjectSessions::new(4);
+    let mut sessions = ProjectSessions::new(4, ChannelRegistry::new());
     assert_eq!(
         sessions.attach(&row, loam::connector::provision_session(&row), Utc::now()),
         SessionState::Live
@@ -646,7 +646,7 @@ fn a_roster_that_would_hear_nobody_opens_no_session() {
         "LOAM_FEDERATION_IDENTITY_DIR",
         fixture.root.join("identity").join("no-such-instance"),
     );
-    let mut sessions = ProjectSessions::new(4);
+    let mut sessions = ProjectSessions::new(4, ChannelRegistry::new());
     let state = sessions.attach(
         &absent,
         loam::connector::provision_session(&absent),

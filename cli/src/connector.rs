@@ -841,9 +841,16 @@ pub struct ConnectorState {
 
 impl ConnectorState {
     pub fn new() -> Self {
+        // ONE registry, shared by construction: `channels` is the IPC side
+        // (SessionRegisterInject writes here) and the pump side (wake_all and
+        // mailbox push read from here) must see the same registrations. A
+        // second registry inside `ProjectSessions` was the live-wake defect: IPC
+        // registrations landed in one Arc and the pump's `wake_targets`/`push`
+        // read the other, so no wake ever fired in production.
+        let channels = ChannelRegistry::new();
         ConnectorState {
-            channels: ChannelRegistry::new(),
-            sessions: ProjectSessions::new(SNAPSHOT_CAPACITY),
+            sessions: ProjectSessions::new(SNAPSHOT_CAPACITY, channels.clone()),
+            channels,
         }
     }
 }
@@ -1436,13 +1443,18 @@ pub enum EmitOutcome {
 }
 
 impl ProjectSessions {
-    pub fn new(capacity: usize) -> Self {
+    /// A shared channel registry + mailbox state, handed to each pump so the
+    /// receive path can push admitted items into registered sessions' mailboxes
+    /// and fire wakes at their targets. Taking the registry as an argument is
+    /// what keeps the IPC side (`ConnectorState::channels`) and the pump side
+    /// on ONE registry — a second instance was the live-wake defect.
+    pub fn new(capacity: usize, channels: ChannelRegistry) -> Self {
         ProjectSessions {
             snapshots: std::sync::Arc::new(std::sync::Mutex::new(
                 SnapshotStore::new(capacity).expect("snapshot capacity is a non-zero constant"),
             )),
             live: std::collections::HashMap::new(),
-            channels: ChannelRegistry::new(),
+            channels,
         }
     }
 
@@ -3715,9 +3727,14 @@ mod service_tests {
 
         let item = sample_item("inbox:wake:01", "Private summary.");
 
-        // Fan out exactly as the pump does after a changed admit.
-        state.channels.push("loam", &item, SNAPSHOT_CAPACITY);
-        wake_all(&state.channels, "loam", Some("event-id-42"));
+        // Fan out through the *pump's* registry, exactly as the receive path
+        // does after a changed admit. `ConnectorState::new` shares ONE registry
+        // between the IPC side and the pumps — the live-wake defect was a
+        // second registry inside ProjectSessions that never saw IPC
+        // registrations, so no wake ever fired in production.
+        let pump_registry = state.sessions.channels().clone();
+        pump_registry.push("loam", &item, SNAPSHOT_CAPACITY);
+        wake_all(&pump_registry, "loam", Some("event-id-42"));
 
         let frame = accept_wake_frame(&listener);
         let parsed = crate::json::parse(&frame).expect("wake frame is valid JSON");
@@ -3742,6 +3759,41 @@ mod service_tests {
         assert!(
             !frame.contains("summary") && !frame.contains("principal"),
             "no sender-content keys may ride the wake frame: {frame}"
+        );
+    }
+
+    #[test]
+    fn an_ipc_registration_is_seen_by_the_pump_registry() {
+        // The live-wake regression: `ConnectorState::new` must hand the pumps
+        // the SAME registry the IPC side writes to. Before the fix, a second
+        // registry inside `ProjectSessions` made `wake_all` fire zero connects
+        // no matter how many sessions registered.
+        let (path, key) = enrolled_db("wake-shared", 21, 210);
+        let mut state = ConnectorState::new();
+        let (listener, address) = wake_listener();
+        let wake_ref = format!("notify-tcp://{address}");
+        dispatch_for_key(
+            &wake_register_request("sess-shared", "chan-shared", &wake_ref),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register with wake_ref");
+
+        // The pump side is `state.sessions.channels()`; a registration made
+        // through the IPC side (`state.channels`) must be visible there.
+        assert!(
+            state.sessions.channels().contains("sess-shared"),
+            "an IPC registration must be visible to the pump registry"
+        );
+        assert_eq!(state.sessions.channels().len(), 1);
+
+        // And a fanout driven through the pump side must fire the connect.
+        wake_all(state.sessions.channels(), "loam", Some("event-id-43"));
+        let frame = accept_wake_frame(&listener);
+        assert!(
+            frame.contains("loam-wake"),
+            "the pump-side fanout must reach the registered wake target: {frame}"
         );
     }
 
@@ -4904,7 +4956,7 @@ mod snapshot_tests {
         // not depend on this machine's keyring, and it must never risk a
         // desktop unlock prompt inside `cargo test`. The backend's own refusals
         // are covered against an explicit failing backend in `provisioning`.
-        let mut sessions = ProjectSessions::new(4);
+        let mut sessions = ProjectSessions::new(4, ChannelRegistry::new());
         let mut row = sample_row("unix:1:1");
         row.broker_endpoint = "not-an-endpoint".into();
         assert_eq!(
@@ -4948,7 +5000,7 @@ mod snapshot_tests {
             ))
         }
 
-        let mut sessions = ProjectSessions::new(4);
+        let mut sessions = ProjectSessions::new(4, ChannelRegistry::new());
         let row = sample_row("unix:1:2");
         assert_eq!(
             sessions.attach(&row, rosterless(), base_time()),
