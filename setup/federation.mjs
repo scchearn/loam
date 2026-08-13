@@ -30,13 +30,14 @@ async function runFederationService(
   };
 }
 
-// Stage the dormant native definition + stable identity through the runtime,
-// preserving prior active/inert desired state across a runtime-path update.
-// A fresh install stays dormant (status non-zero => inert); an already-active
-// service (status exit 0) is re-enabled on the new runtime after the dormant
-// re-install. Returns a report plus a bounded rollback for a later setup
-// failure. The stable instance identity is never replaced (the runtime's
-// `ensure_instance_id` only ever generates it once).
+// Stage the dormant native definition through the runtime, preserving prior
+// active/inert desired state across a runtime-path update. A fresh install
+// stays dormant (status non-zero => inert); an already-active service (status
+// exit 0) is re-enabled on the new runtime after the dormant re-install.
+// Returns a report plus a bounded rollback for a later setup failure. No
+// identity is minted here: the instance id is the certificate's SAN suffix at
+// connect time, and a dormant definition carries a deterministic root-derived
+// scheduler label (`federation-enrollment-simplification.md`).
 export async function stageFederationService({ runtimePath, globalRoot, runner, timeoutMs } = {}) {
   const opts = { runtimePath, globalRoot, runner, timeoutMs };
 

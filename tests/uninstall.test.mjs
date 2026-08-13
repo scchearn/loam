@@ -158,6 +158,62 @@ test('uninstall restores a Codex profile preserved during setup', async () => {
   assert.equal(await exists(`${profilePath}.loam-backup`), false);
 });
 
+test('uninstall with explicit confirmation destroys the identity bundle with the root (#86)', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const identityDir = join(globalRoot, 'federation', 'identity');
+  await mkdir(identityDir, { recursive: true });
+  await writeFile(join(identityDir, 'client.pem'), 'cert');
+  await writeFile(join(identityDir, 'key.pem'), 'key');
+
+  let output = '';
+  // `yes: true` IS the explicit confirmation: no export prompt, the bundle
+  // goes with the root, and the warning still names it.
+  const code = await uninstall({
+    home,
+    globalRoot,
+    yes: true,
+    runner: skillsRunner(),
+    output: { write: (chunk) => { output += chunk; } },
+  });
+  assert.equal(code, 0);
+  assert.equal(await exists(globalRoot), false);
+  assert.match(output, /federation identity/);
+});
+
+test('uninstall prompts export-or-confirm and preserves the root when the operator declines both (#86)', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const identityDir = join(globalRoot, 'federation', 'identity');
+  await mkdir(identityDir, { recursive: true });
+  await writeFile(join(identityDir, 'client.pem'), 'cert');
+  await writeFile(join(identityDir, 'key.pem'), 'key');
+
+  let output = '';
+  const prompts = [];
+  const readlineLike = {
+    isTTY: false,
+    question: async (text) => {
+      prompts.push(text);
+      // First the export-path prompt (decline), then the destruction confirm (decline).
+      return prompts.length === 1 ? '\n' : 'n\n';
+    },
+    close: () => {},
+    on: () => {},
+  };
+  const code = await uninstall({
+    home,
+    globalRoot,
+    yes: false,
+    confirm: undefined,
+    runner: skillsRunner(),
+    output: { write: (chunk) => { output += chunk; } },
+    input: readlineLike,
+  });
+  assert.equal(code, 130, 'declining both prompts cancels the uninstall');
+  assert.equal(await exists(globalRoot), true, 'the global root survives a declined uninstall');
+  assert.equal(await exists(join(identityDir, 'client.pem')), true, 'the identity bundle survives');
+  assert.match(output, /federation identity/);
+});
+
 test('uninstall preserves a Codex profile the user replaced after setup', async () => {
   const { home, globalRoot } = await readyFixture();
   const profilePath = join(home, '.codex', 'agents', 'loam_ingestor.toml');

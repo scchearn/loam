@@ -1,5 +1,5 @@
 import { homedir } from 'node:os';
-import { readFile, readdir, rm, stat } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
 import { writeAtomicFile } from './atomic.mjs';
@@ -340,6 +340,7 @@ export async function uninstall({
     '- Remove the Loam plugin file from OpenCode, which integrates by plugin rather than hooks',
     '- Remove installed Claude and Codex marketplace plugins through their native CLIs',
     '- Remove the global Loam root (install.json, runtime, integration, plugins, local operational history)',
+    '- Destroy the federation identity bundle (client certificate + key) unless you export it first',
     `- Global root: ${root}`,
   ], { level: 'warn' });
 
@@ -414,10 +415,77 @@ export async function uninstall({
     });
   }
 
+  // The identity bundle is user credential material (the certificate IS the
+  // machine's identity — #86). Detect it, warn, and prompt export-or-confirm
+  // before the global root goes: export copies the bundle to a named path
+  // (0600, like the live files), confirm destroys it with an explicit warning.
+  const identityDir = join(root, 'federation', 'identity');
+  const identityFiles = ['client.pem', 'key.pem'];
+  const hasIdentity = (await Promise.all(
+    identityFiles.map(async (name) => exists(join(identityDir, name))),
+  )).every(Boolean);
+  if (hasIdentity) {
+    if (yes) {
+      // Explicit confirmation already given: the bundle is destroyed with the
+      // root, and the announcement above named it.
+      results.identity = { path: identityDir, action: 'destroyed' };
+    } else {
+      output.write(
+        'This machine holds a Loam federation identity (client certificate + key).\n'
+        + 'Removing the global root destroys it; there is no re-enroll path without it.\n',
+      );
+      const exported = await exportOrConfirmIdentity({ identityDir, input, output });
+      if (exported) {
+        results.identity = exported;
+      } else if (!(await confirmUninstall({ yes, confirm, input, output }))) {
+        finish(output, 'Uninstall cancelled; identity preserved.');
+        return 130;
+      }
+    }
+  }
+
   // Remove global root
   await rm(root, { recursive: true, force: true });
   results.globalRoot = { path: root, action: 'removed' };
 
   finish(output, 'Loam uninstalled.');
   return 0;
+}
+
+// Prompt: export the identity bundle to a named path, or decline (the caller
+// then asks for explicit destruction confirmation). Returns the export record,
+// or null when the operator declined the export. The exported copy is written
+// 0600 on Unix, matching the live identity files.
+async function exportOrConfirmIdentity({ identityDir, input = process.stdin, output = process.stdout }) {
+  const readline = (await import('node:readline/promises')).default;
+  const ui = await import('@clack/prompts').catch(() => null);
+  const prompt = readline.createInterface({ input, output });
+  let target = null;
+  try {
+    if (ui && input === process.stdin) {
+      const answer = await ui.text({
+        message: 'Export the identity bundle to a path, or press Enter to destroy it:',
+        placeholder: '/path/to/loam-identity-backup',
+      });
+      if (!ui.isCancel(answer) && answer && answer.trim()) target = answer.trim();
+    } else {
+      const answer = await prompt.question(
+        'Export the identity bundle to a path (Enter to skip export and destroy): ',
+      );
+      if (answer && answer.trim()) target = answer.trim();
+    }
+  } finally {
+    prompt.close();
+  }
+  if (!target) return null;
+
+  await mkdir(dirname(resolve(target)), { recursive: true });
+  await mkdir(identityDir, { recursive: true });
+  for (const name of ['client.pem', 'key.pem']) {
+    await copyFile(join(identityDir, name), join(target, name));
+  }
+  await chmod(join(target, 'client.pem'), 0o600);
+  await chmod(join(target, 'key.pem'), 0o600);
+  output.write(`Identity bundle exported to ${target} (client.pem + key.pem, 0600).\n`);
+  return { path: target, action: 'exported' };
 }

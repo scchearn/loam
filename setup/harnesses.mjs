@@ -1,4 +1,5 @@
 import { homedir } from 'node:os';
+import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -400,6 +401,41 @@ async function installCursor({ home, globalRoot, runtimePath }) {
   });
 }
 
+// A stale plugin entry in the user's opencode config pointing at a repo-local
+// `.opencode/plugins/loam.js` (the path most checkouts never shipped) would
+// leave OpenCode with a nonexistent plugin file and no adapter. OpenCode
+// auto-discovers `~/.config/opencode/plugins/*.js`, so the entry is rewritten
+// to the global stable path when it names a Loam-owned repo-local path. The
+// rewrite goes through the same atomic merge as every other harness config,
+// preserving unrelated entries. #88.
+export async function reconcileOpenCodePluginEntry(home, stablePath) {
+  const candidates = ['opencode.jsonc', 'opencode.json'].map((name) => join(home, '.config', 'opencode', name));
+  const filePath = candidates.find((candidate) => existsSync(candidate));
+  if (!filePath) return { path: null, action: 'absent' };
+  let config;
+  try {
+    config = JSON.parse(await readFile(filePath, 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { path: filePath, action: 'absent' };
+    return { path: filePath, action: 'skipped', reason: 'malformed JSON' };
+  }
+  const plugin = Array.isArray(config.plugin) ? config.plugin : [];
+  const rewritten = plugin.map((spec) => {
+    const value = Array.isArray(spec) ? spec[0] : spec;
+    if (typeof value !== 'string') return spec;
+    const owned = /(^|[/\\])\.?opencode[/\\]plugins[/\\]loam\.js$/u.test(value)
+      || /(^|[/\\])plugins[/\\]loam\.js$/u.test(value);
+    if (!owned) return spec;
+    return Array.isArray(spec) ? [stablePath, spec[1]] : stablePath;
+  });
+  if (JSON.stringify(rewritten) === JSON.stringify(plugin)) return { path: filePath, action: 'unchanged' };
+  const merged = await mergeJsonConfig({
+    filePath,
+    update: (current) => ({ ...current, plugin: rewritten }),
+  });
+  return { ...merged, path: filePath, action: 'rewritten' };
+}
+
 // Setup owns the installed plugin's hook registration because it is the only
 // party that knows the version- and target-qualified runtime path. `plugin
 // update` replaces the shipped file; setup rewrites it afterwards, exactly as
@@ -466,6 +502,9 @@ export async function installHarnesses({
         const source = await readFile(join(adapterRoot, 'opencode.mjs'), 'utf8');
         await writeAtomicFile(stablePath, renderOpenCodePlugin(source, runtimePath));
         await rm(join(dirname(stablePath), 'loam.mjs'), { force: true });
+        // #88: a stale repo-local plugin entry in opencode.json would point
+        // OpenCode at a nonexistent file; rewrite it to the stable global path.
+        await reconcileOpenCodePluginEntry(home, stablePath);
         result[id] = { ...harness, state: 'ready', path: stablePath, versionRoot: assets.versionRoot };
       } else if (id === 'claude') {
         const config = await installClaude({

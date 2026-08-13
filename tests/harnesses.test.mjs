@@ -8,7 +8,52 @@ import { test } from 'node:test';
 import { createOpenCodeAdapter } from '../adapters/opencode.mjs';
 import { main as runIngestWorker } from '../adapters/ingest-worker.mjs';
 import { dedupe, mergeJsonConfig } from '../setup/config.mjs';
-import { detectHarnesses, installHarnesses } from '../setup/harnesses.mjs';
+import {
+  detectHarnesses,
+  installHarnesses,
+  reconcileOpenCodePluginEntry,
+} from '../setup/harnesses.mjs';
+
+test('opencode config plugin entries pointing at a repo-local loam.js are rewritten to the stable global path', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-opencode-rewrite-'));
+  const stable = join(home, '.config', 'opencode', 'plugins', 'loam.js');
+  await mkdir(join(home, '.config', 'opencode', 'plugins'), { recursive: true });
+  await writeFile(
+    join(home, '.config', 'opencode', 'opencode.json'),
+    JSON.stringify({
+      plugin: [
+        '/home/sam/Nextcloud/Clients/Dikokotech/loam/.opencode/plugins/loam.js',
+        'superpowers@git+https://github.com/obra/superpowers.git',
+        ['/repo/plugins/loam.js', { enabled: true }],
+      ],
+      mcp: { exa: { type: 'remote' } },
+    }),
+  );
+
+  const result = await reconcileOpenCodePluginEntry(home, stable);
+  assert.equal(result.action, 'rewritten');
+  const config = JSON.parse(await readFile(join(home, '.config', 'opencode', 'opencode.json'), 'utf8'));
+  assert.equal(config.plugin[0], stable, 'a repo-local loam.js entry points at the stable path');
+  assert.equal(config.plugin[1], 'superpowers@git+https://github.com/obra/superpowers.git', 'unrelated entries survive');
+  assert.deepEqual(config.plugin[2], [stable, { enabled: true }], 'tuple entries are rewritten in place');
+  assert.deepEqual(config.mcp, { exa: { type: 'remote' } }, 'unrelated config sections survive');
+
+  // Idempotent: a second pass rewrites nothing.
+  const again = await reconcileOpenCodePluginEntry(home, stable);
+  assert.equal(again.action, 'unchanged');
+
+  // A config with no Loam-owned entries is left alone.
+  await writeFile(
+    join(home, '.config', 'opencode', 'opencode.json'),
+    JSON.stringify({ plugin: ['other-plugin'] }),
+  );
+  const untouched = await reconcileOpenCodePluginEntry(home, stable);
+  assert.equal(untouched.action, 'unchanged');
+  assert.deepEqual(
+    JSON.parse(await readFile(join(home, '.config', 'opencode', 'opencode.json'), 'utf8')),
+    { plugin: ['other-plugin'] },
+  );
+});
 
 test('OpenCode re-injects on every turn: full block first, federation refresh after', async () => {
   const calls = [];
