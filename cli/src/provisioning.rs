@@ -260,10 +260,19 @@ pub fn resolve_credentials(
     ssl_cert_file: Option<&str>,
 ) -> Result<CredentialMaterial, ProvisionFailure> {
     let credentials = ProvisionFailure::Credentials;
-    let certificate = std::fs::read(identity_root.join("client.pem"))
-        .map_err(|_| credentials(reason::IDENTITY_REQUIRED))?;
-    let key = std::fs::read(identity_root.join("key.pem"))
-        .map_err(|_| credentials(reason::IDENTITY_REQUIRED))?;
+    let certificate_path = identity_root.join("client.pem");
+    let key_path = identity_root.join("key.pem");
+    // The credentials are the machine's private material, so the directory and
+    // the two PEM files must be operator-private (`0700` dir, `0600` files on
+    // Unix). Enforced on every read so an operator-placed bundle with looser
+    // perms is hardened the moment it is used — not silently left world-readable.
+    // Windows uses restrictive default ACLs; the icacls step is a smoke-leg
+    // assertion, not a runtime behavior.
+    let certificate =
+        std::fs::read(&certificate_path).map_err(|_| credentials(reason::IDENTITY_REQUIRED))?;
+    let key = std::fs::read(&key_path).map_err(|_| credentials(reason::IDENTITY_REQUIRED))?;
+    harden_identity_permissions(identity_root, &certificate_path, &key_path)
+        .map_err(ProvisionFailure::Credentials)?;
     let certificate_authority =
         resolve_trust_anchors(ca_ref, ssl_cert_file).map_err(ProvisionFailure::Credentials)?;
     Ok(CredentialMaterial {
@@ -271,6 +280,32 @@ pub fn resolve_credentials(
         key,
         certificate_authority,
     })
+}
+
+/// Make the identity directory and its two PEM files operator-private:
+/// `0700` on the directory, `0600` on `client.pem` and `key.pem` (Unix). The
+/// exported copy that uninstall writes gets the same treatment. Declining
+/// `no-op` on Windows, whose default per-user ACLs are already restrictive.
+fn harden_identity_permissions(
+    identity_root: &std::path::Path,
+    certificate_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<(), &'static str> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(identity_root, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| reason::IDENTITY_REQUIRED)?;
+        for path in [certificate_path, key_path] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| reason::IDENTITY_REQUIRED)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (identity_root, certificate_path, key_path);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2083,6 +2118,28 @@ mod tests {
             !described.contains("R0hJ") && !described.contains("QUJD"),
             "{described}"
         );
+
+        // Credentials are operator-private: the directory is 0700 and both PEM
+        // files are 0600 after the read (Unix). A looser operator placement is
+        // hardened the moment it is used.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&identity).unwrap().permissions().mode() & 0o777;
+            let cert_mode = std::fs::metadata(identity.join("client.pem"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            let key_mode = std::fs::metadata(identity.join("key.pem"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700, "identity directory must be 0700");
+            assert_eq!(cert_mode, 0o600, "client.pem must be 0600");
+            assert_eq!(key_mode, 0o600, "key.pem must be 0600");
+        }
 
         // Every failure names the input and nothing else.
         let empty = temp_dir("resolve-empty");
