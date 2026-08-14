@@ -350,25 +350,15 @@ pub fn request_signed_certificate(
     url: &str,
     password: &str,
     csr_pem: &[u8],
-    ca_certificate: &[u8],
+    roots: &rustls::RootCertStore,
 ) -> Result<Vec<u8>, EnrollmentFailure> {
     let (host, port, path) = parse_url(url)?;
     let mut tcp = TcpStream::connect((host.as_str(), port))
         .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
     tcp.set_nodelay(true).ok();
 
-    let mut roots = rustls::RootCertStore::empty();
-    let der_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        crate::provisioning::pem_certificate_ders(ca_certificate)
-            .into_iter()
-            .map(rustls::pki_types::CertificateDer::from)
-            .collect();
-    roots.add_parsable_certificates(der_certs);
-    if roots.is_empty() {
-        return Err(EnrollmentFailure::SignerUnreachable);
-    }
     let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
+        .with_root_certificates(roots.clone())
         .with_no_client_auth();
 
     let server_name = rustls::pki_types::ServerName::try_from(host.clone())

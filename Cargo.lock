@@ -232,6 +232,7 @@ dependencies = [
  "rumqttc",
  "rusqlite",
  "rustls",
+ "rustls-pemfile",
  "webpki-roots",
 ]
 

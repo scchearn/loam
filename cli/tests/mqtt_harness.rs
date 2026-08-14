@@ -631,9 +631,12 @@ impl Federation {
             .expect("the session transport configuration is valid"),
             username: Some("actor-a".to_owned()),
             password: Some(broker.password().to_owned()),
-            ca_certificate: broker
-                .ca_certificate()
-                .expect("the fixture CA certificate is readable"),
+            ca_certificate: loam::provisioning::build_root_store(
+                &broker
+                    .ca_certificate()
+                    .expect("the fixture CA certificate is readable"),
+            )
+            .expect("the fixture CA certificate should parse"),
             client_authentication: None,
             claimed_identity: SessionIdentity {
                 principal_id: OUR_PRINCIPAL.to_owned(),

@@ -27,9 +27,9 @@ pub struct CredentialMaterial {
     pub certificate: Vec<u8>,
     /// The private key, PEM.
     pub key: Vec<u8>,
-    /// The trust anchors to verify the broker against: the pinned PEM file when
-    /// the enrollment names one, the bundled Mozilla roots when it does not.
-    pub certificate_authority: Vec<u8>,
+    /// The trust anchors to verify the broker against: parsed certificates from
+    /// a pinned PEM file, or the bundled Mozilla roots as DER trust anchors.
+    pub certificate_authority: rustls::RootCertStore,
 }
 
 impl std::fmt::Debug for CredentialMaterial {
@@ -41,7 +41,7 @@ impl std::fmt::Debug for CredentialMaterial {
             .field("certificate_bytes", &self.certificate.len())
             .field("key_bytes", &self.key.len())
             .field(
-                "certificate_authority_bytes",
+                "certificate_authority_roots",
                 &self.certificate_authority.len(),
             )
             .finish()
@@ -181,7 +181,7 @@ pub fn split_credential(blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'static str>
 pub fn resolve_trust_anchors(
     ca_ref: Option<&str>,
     ssl_cert_file: Option<&str>,
-) -> Result<Vec<u8>, &'static str> {
+) -> Result<rustls::RootCertStore, &'static str> {
     match ca_ref {
         // Present but blank is a malformed reference, not an absent one. Reading
         // it as "no CA pinned" would turn a typo into a silently wider trust
@@ -192,7 +192,7 @@ pub fn resolve_trust_anchors(
             if bytes.is_empty() {
                 return Err(reason::CA_UNRESOLVED);
             }
-            Ok(bytes)
+            build_root_store(&bytes)
         }
         None => bundled_trust_anchors(ssl_cert_file),
     }
@@ -201,30 +201,31 @@ pub fn resolve_trust_anchors(
 /// The no-`ca_ref` trust path: `SSL_CERT_FILE` first, then the bundled Mozilla
 /// roots. An empty override path is not an override — it must not silently
 /// become "trust nothing".
-fn bundled_trust_anchors(ssl_cert_file: Option<&str>) -> Result<Vec<u8>, &'static str> {
+fn bundled_trust_anchors(
+    ssl_cert_file: Option<&str>,
+) -> Result<rustls::RootCertStore, &'static str> {
     if let Some(path) = ssl_cert_file.map(str::trim).filter(|v| !v.is_empty()) {
         let bytes = std::fs::read(path).map_err(|_| reason::CA_UNRESOLVED)?;
         if !bytes.is_empty() {
-            return Ok(bytes);
+            return build_root_store(&bytes);
         }
     }
-    Ok(webpki_roots_pem())
+    Ok(rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    })
 }
 
-/// The bundled Mozilla roots as PEM. `webpki-roots` stores DER trust anchors;
-/// every `TrustAnchor` carries the subject certificate in DER, so each is
-/// re-wrapped in the PEM armor the transport's PEM reader expects.
-fn webpki_roots_pem() -> Vec<u8> {
-    let mut out = Vec::new();
-    for anchor in webpki_roots::TLS_SERVER_ROOTS {
-        out.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");
-        for chunk in anchor.subject.as_ref().chunks(64) {
-            out.extend_from_slice(&base64_encode_bytes(chunk));
-            out.push(b'\n');
-        }
-        out.extend_from_slice(b"-----END CERTIFICATE-----\n");
+pub fn build_root_store(pem: &[u8]) -> Result<rustls::RootCertStore, &'static str> {
+    let der_certs: Vec<rustls::pki_types::CertificateDer<'static>> = pem_certificate_ders(pem)
+        .into_iter()
+        .map(rustls::pki_types::CertificateDer::from)
+        .collect();
+    let mut store = rustls::RootCertStore::empty();
+    store.add_parsable_certificates(der_certs);
+    if store.is_empty() {
+        return Err(reason::CA_UNRESOLVED);
     }
-    out
+    Ok(store)
 }
 
 fn base64_encode_bytes(bytes: &[u8]) -> Vec<u8> {
@@ -1648,6 +1649,12 @@ mod tests {
     const INTERMEDIATE: &str = "-----BEGIN CERTIFICATE-----\nREVG\n-----END CERTIFICATE-----\n";
     const KEY: &str = "-----BEGIN PRIVATE KEY-----\nR0hJ\n-----END PRIVATE KEY-----\n";
 
+    /// A real, parseable self-signed EC (P-256) CA certificate. `CERTIFICATE`
+    /// above is a stand-in body that the split-and-armor readers accept but
+    /// `add_parsable_certificates` drops as non-DER; the trust-store rungs need
+    /// a certificate that actually parses into a root, so they use this one.
+    const REAL_ROOT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBiDCCAS2gAwIBAgIUGTdvZg7AlDyozb88b5pPmypC42YwCgYIKoZIzj0EAwIw\nGTEXMBUGA1UEAwwObG9hbS10ZXN0LXJvb3QwHhcNMjYwODE0MDgwNzM5WhcNMzYw\nODExMDgwNzM5WjAZMRcwFQYDVQQDDA5sb2FtLXRlc3Qtcm9vdDBZMBMGByqGSM49\nAgEGCCqGSM49AwEHA0IABMF4yeUlY2aKHZWzELrMiGqnSXLwHhTiLbwvxJ4O40vM\n0UhRyNlsr0aii4fctuDvY9J6m2ZVNBJK3ErSN00vQ2GjUzBRMB0GA1UdDgQWBBTr\n6cr//tZbqKvYw52gq1Hi9n8uvTAfBgNVHSMEGDAWgBTr6cr//tZbqKvYw52gq1Hi\n9n8uvTAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0kAMEYCIQDoPSdWAVKz\nl+LzXM5pHyUpN+kgi5kei08hx7zrQcPeYgIhANqPWWBYGx/qRoS32iA6sZpCawF+\nJ5oTt4GkFclCoQpE\n-----END CERTIFICATE-----\n";
+
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2667,82 +2674,83 @@ mod tests {
     fn an_absent_ca_ref_means_the_bundled_roots_and_a_present_one_means_the_pinned_file() {
         let directory = temp_dir("ca");
 
-        // Present: the pinned PEM trust file is read from disk.
+        // Absent: the bundled Mozilla roots. Both branches must produce
+        // non-empty stores — the transport builds its TLS config from this store.
+        let bundled = resolve_trust_anchors(None, None).expect("the bundle resolves");
+        assert!(!bundled.is_empty(), "bundled store must not be empty");
+        assert!(
+            bundled.roots.len() > 100,
+            "bundled store should have 100+ Mozilla roots"
+        );
+
+        // Present: a pinned `ca_ref` PEM file resolves to exactly the roots it
+        // names — one here — never the bundle. The certificate must actually
+        // parse into a root, so this rung uses a real self-signed cert.
         let pinned_path = directory.join("pinned.pem");
-        std::fs::write(
-            &pinned_path,
-            "-----BEGIN CERTIFICATE-----\npinned\n-----END CERTIFICATE-----\n",
-        )
-        .expect("pinned trust file is writable");
+        std::fs::write(&pinned_path, REAL_ROOT_PEM).expect("pinned trust file is writable");
         let pinned = resolve_trust_anchors(Some(&pinned_path.to_string_lossy()), None)
             .expect("a resolvable ca_ref pins");
-        assert!(String::from_utf8_lossy(&pinned).contains("pinned"));
+        assert_eq!(
+            pinned.roots.len(),
+            1,
+            "the pinned store holds exactly its one named root"
+        );
+        assert_ne!(
+            pinned.roots.len(),
+            bundled.roots.len(),
+            "the pinned branch is the file's roots, never the bundle"
+        );
 
-        // Absent: the bundled Mozilla roots, as PEM. Both branches must produce
-        // real bytes — the transport builds its root store from this PEM, and an
-        // empty store refuses every connection.
-        let bundled = resolve_trust_anchors(None, None).expect("the bundle resolves");
-        assert!(String::from_utf8_lossy(&bundled).contains("-----BEGIN CERTIFICATE-----"));
-        assert_ne!(pinned, bundled, "the two branches must be distinguishable");
-
-        // `SSL_CERT_FILE` is honored first when set.
+        // `SSL_CERT_FILE` is the no-`ca_ref` override: honored ahead of the
+        // bundle, and — like the pinned rung — resolves to exactly the file's
+        // roots, not the 100+ bundled ones.
         let override_path = directory.join("override.pem");
-        std::fs::write(
-            &override_path,
-            "-----BEGIN CERTIFICATE-----\noverride\n-----END CERTIFICATE-----\n",
-        )
-        .expect("override trust file is writable");
+        std::fs::write(&override_path, REAL_ROOT_PEM).expect("override trust file is writable");
         let overridden = resolve_trust_anchors(None, Some(&override_path.to_string_lossy()))
             .expect("SSL_CERT_FILE is honored first");
-        assert!(String::from_utf8_lossy(&overridden).contains("override"));
+        assert_eq!(
+            overridden.roots.len(),
+            1,
+            "the override store holds exactly its one named root"
+        );
+        assert_ne!(
+            overridden.roots.len(),
+            bundled.roots.len(),
+            "the override branch is the file's roots, never the bundle"
+        );
 
         // A named CA that resolves to nothing is a refusal, never a silent
         // downgrade to the bundle — that downgrade would turn a pinning
         // failure into a quietly wider trust decision.
-        assert_eq!(
+        assert!(matches!(
             resolve_trust_anchors(Some("/nonexistent/loam/ca.pem"), None),
             Err(reason::CA_UNRESOLVED)
-        );
+        ));
 
         // A present-but-blank reference is malformed, not absent: reading it as
         // "no CA pinned" would turn a typo into a silently wider trust decision.
-        assert_eq!(
+        assert!(matches!(
             resolve_trust_anchors(Some("   "), None),
             Err(reason::CA_UNRESOLVED)
-        );
+        ));
 
         // An empty trust file is not a trust store: it would build a root store
         // that refuses every connection, which is a broken session rather than
         // a resolved one.
         let empty = directory.join("empty.pem");
         std::fs::write(&empty, "").expect("empty trust file is writable");
-        assert_eq!(
+        assert!(matches!(
             resolve_trust_anchors(Some(&empty.to_string_lossy()), None),
             Err(reason::CA_UNRESOLVED)
-        );
+        ));
 
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn the_bundled_roots_are_pem_armored_der_anchors() {
-        // The transport's PEM reader must be able to parse the bundle: every
-        // anchor is re-wrapped in PEM armor, and the bundle is non-empty.
-        let bundled = webpki_roots_pem();
-        assert!(!bundled.is_empty());
-        let text = String::from_utf8_lossy(&bundled);
-        assert!(text.starts_with("-----BEGIN CERTIFICATE-----\n"));
-        assert!(text.contains("-----END CERTIFICATE-----"));
-        // Every line between the armor is base64 (64-byte chunks → 88 chars).
-        for line in text.lines().filter(|line| !line.starts_with("-----")) {
-            assert!(
-                line.len() <= 88
-                    && line
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
-                "a bundle line is not base64: {line:?}"
-            );
-        }
+    fn bundled_roots_resolve_to_a_non_empty_der_store_without_an_override() {
+        let bundled = resolve_trust_anchors(None, None).expect("the bundle resolves");
+        assert!(bundled.roots.len() > 100);
     }
 
     #[test]

@@ -50,6 +50,11 @@ fn enrollment_round_trip() {
     let base = format!("loam/v1/{organization}/project-a");
 
     let validation = ValidationConfig::default();
+    let ca_pem = broker
+        .ca_certificate()
+        .expect("the fixture CA certificate should be readable");
+    let ca_store =
+        loam::provisioning::build_root_store(&ca_pem).expect("fixture CA certificate should parse");
     let session = MqttSession {
         config: TransportConfig::new(
             "localhost",
@@ -62,9 +67,7 @@ fn enrollment_round_trip() {
         .expect("the probe transport configuration should be valid"),
         username: Some("actor-a".to_owned()),
         password: Some(broker.password().to_owned()),
-        ca_certificate: broker
-            .ca_certificate()
-            .expect("the fixture CA certificate should be readable"),
+        ca_certificate: ca_store,
         client_authentication: None,
         claimed_identity: SessionIdentity {
             principal_id: "employee-184".to_owned(),
@@ -175,6 +178,11 @@ fn mtls_authenticates_with_no_username_and_no_password() {
     let broker =
         BrokerFixture::provision("mtls-only").expect("the real broker fixture should provision");
     let validation = ValidationConfig::default();
+    let ca_pem = broker
+        .ca_certificate()
+        .expect("the fixture CA certificate should be readable");
+    let ca_store =
+        loam::provisioning::build_root_store(&ca_pem).expect("fixture CA certificate should parse");
     let session = MqttSession {
         config: TransportConfig::new(
             "localhost",
@@ -187,9 +195,7 @@ fn mtls_authenticates_with_no_username_and_no_password() {
         .expect("the mTLS transport configuration should be valid"),
         username: None,
         password: None,
-        ca_certificate: broker
-            .ca_certificate()
-            .expect("the fixture CA certificate should be readable"),
+        ca_certificate: ca_store,
         client_authentication: Some((
             broker
                 .client_certificate()
@@ -236,7 +242,7 @@ fn an_empty_trust_store_refuses_the_session_rather_than_trusting_anything() {
     let broker =
         BrokerFixture::provision("empty-trust").expect("the real broker fixture should provision");
     let validation = ValidationConfig::default();
-    let build = |ca: Vec<u8>| MqttSession {
+    let build = |ca: rustls::RootCertStore| MqttSession {
         config: TransportConfig::new(
             "localhost",
             broker.mtls_port(),
@@ -266,8 +272,12 @@ fn an_empty_trust_store_refuses_the_session_rather_than_trusting_anything() {
         },
     };
 
-    let mut empty = MqttTransport::new(build(Vec::new()), validation.clone(), Utc::now())
-        .expect("the adapter should build its delivery processor");
+    let mut empty = MqttTransport::new(
+        build(rustls::RootCertStore::empty()),
+        validation.clone(),
+        Utc::now(),
+    )
+    .expect("the adapter should build its delivery processor");
     assert!(
         empty.authenticate().is_err(),
         "an empty trust store must refuse the session, never accept the broker unverified"
@@ -277,10 +287,12 @@ fn an_empty_trust_store_refuses_the_session_rather_than_trusting_anything() {
     // Positive control in the same run: the identical session with the real CA
     // does authenticate, so the refusal above is the empty store and not the
     // broker being unreachable.
-    let ca = broker
+    let ca_pem = broker
         .ca_certificate()
         .expect("the fixture CA certificate should be readable");
-    let mut trusted = MqttTransport::new(build(ca), validation, Utc::now())
+    let ca_store =
+        loam::provisioning::build_root_store(&ca_pem).expect("fixture CA certificate should parse");
+    let mut trusted = MqttTransport::new(build(ca_store), validation, Utc::now())
         .expect("the adapter should build its delivery processor");
     trusted
         .authenticate()

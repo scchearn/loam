@@ -378,11 +378,13 @@ fn request_signed_certificate_happy_path_returns_the_signer_issued_certificate()
         "01ARZ3NDEKTSV4RRFFQ69G5FAV",
     )
     .expect("the runtime should generate a keypair and CSR");
+    let ca_store = loam::provisioning::build_root_store(&_signer.ca_certificate())
+        .expect("fixture CA certificate should parse");
     let cert = loam::enrollment_auto::request_signed_certificate(
         &_signer.url(),
         "shared-enroll-secret",
         &csr_pem,
-        &_signer.ca_certificate(),
+        &ca_store,
     )
     .expect("the signer should issue a certificate for a valid token");
 
@@ -412,11 +414,13 @@ fn request_signed_certificate_refuses_a_wrong_token() {
         "01ARZ3NDEKTSV4RRFFQ69G5FBV",
     )
     .expect("the runtime should generate a keypair and CSR");
+    let ca_store = loam::provisioning::build_root_store(&_signer.ca_certificate())
+        .expect("fixture CA certificate should parse");
     let error = loam::enrollment_auto::request_signed_certificate(
         &_signer.url(),
         "wrong-token",
         &csr_pem,
-        &_signer.ca_certificate(),
+        &ca_store,
     )
     .expect_err("a wrong token must be a typed bad-token refusal");
     assert_eq!(error, loam::enrollment_auto::EnrollmentFailure::BadToken);
@@ -440,11 +444,14 @@ fn request_signed_certificate_reports_an_unreachable_signer() {
         "01ARZ3NDEKTSV4RRFFQ69G5FBX",
     )
     .expect("the runtime should generate a keypair and CSR");
+    let ca_pem = fs::read(root.join("ca.crt")).unwrap();
+    let ca_store =
+        loam::provisioning::build_root_store(&ca_pem).expect("fixture CA certificate should parse");
     let error = loam::enrollment_auto::request_signed_certificate(
         &format!("https://127.0.0.1:{dead_port}/v1/enroll"),
         "shared-enroll-secret",
         &csr_pem,
-        &fs::read(root.join("ca.crt")).unwrap(),
+        &ca_store,
     )
     .expect_err("an unreachable signer must be a typed signer-unreachable refusal");
     assert_eq!(

@@ -3030,6 +3030,7 @@ mod tests {
                 // enrollment_auto.rs). `rustls` is the TLS stack; `ring` is the
                 // deterministic provider for TLS and ECDSA P-256 keygen/signing.
                 "rustls",
+                "rustls-pemfile",
                 // Bundled Mozilla trust roots: the no-`ca_ref` default trust
                 // path, replacing the per-OS trust-file search. Compiled-in
                 // data, no network code.

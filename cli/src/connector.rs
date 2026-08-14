@@ -97,6 +97,8 @@ pub enum ProbeError {
     /// The probe envelope failed its own validation before publication.
     InvalidProbe(String),
     Timeout,
+    /// TLS configuration failed (invalid cert/key or trust store).
+    ConfigurationFailure(String),
 }
 
 impl ProbeError {
@@ -110,6 +112,7 @@ impl ProbeError {
             ProbeError::RetainedProbe => "probe_retained",
             ProbeError::InvalidProbe(_) => "probe_invalid_envelope",
             ProbeError::Timeout => "probe_timeout",
+            ProbeError::ConfigurationFailure(_) => "tls_configuration_failure",
         }
     }
 }
@@ -478,12 +481,41 @@ pub struct MqttSession {
     /// and are sent only when both are present.
     pub username: Option<String>,
     pub password: Option<String>,
-    /// PEM bytes supplied by the caller: this module reads no files.
-    pub ca_certificate: Vec<u8>,
+    /// Root certificate store for verifying the broker.
+    pub ca_certificate: rustls::RootCertStore,
     pub client_authentication: Option<(Vec<u8>, Vec<u8>)>,
     /// The identity these credentials assert. It becomes authority only after
     /// the broker accepts the connection.
     pub claimed_identity: SessionIdentity,
+}
+
+fn build_tls_transport(
+    roots: &rustls::RootCertStore,
+    client_auth: &Option<(Vec<u8>, Vec<u8>)>,
+) -> Result<rumqttc::Transport, &'static str> {
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots.clone());
+    let config = if let Some((cert_pem, key_pem)) = client_auth {
+        use std::io::Cursor;
+        let mut cert_reader = Cursor::new(cert_pem.as_slice());
+        let certs = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "certificate PEM parsing failed")?;
+        let mut key_reader = Cursor::new(key_pem.as_slice());
+        let key = rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|_| "private key PEM parsing failed")?
+            .ok_or("no private key in PEM")?;
+        if certs.is_empty() {
+            return Err("empty certificate in PEM");
+        }
+        builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|_| "TLS client auth configuration failed")?
+    } else {
+        builder.with_no_client_auth()
+    };
+    Ok(rumqttc::Transport::tls_with_config(
+        rumqttc::TlsConfiguration::Rustls(std::sync::Arc::new(config)),
+    ))
 }
 
 /// The real transport: a connected rumqttc client plus the delivery
@@ -550,12 +582,13 @@ impl Transport for MqttTransport {
                 options.set_credentials(username, password);
             }
         }
+        let tls_transport = build_tls_transport(
+            &self.session.ca_certificate,
+            &self.session.client_authentication,
+        )
+        .map_err(|e| ProbeError::ConfigurationFailure(e.to_string()))?;
         options
-            .set_transport(rumqttc::Transport::tls(
-                self.session.ca_certificate.clone(),
-                self.session.client_authentication.clone(),
-                None,
-            ))
+            .set_transport(tls_transport)
             .set_keep_alive(KEEP_ALIVE)
             .set_clean_start(true);
         let (client, mut connection) = Client::new(options, REQUEST_CAPACITY);
@@ -5158,7 +5191,7 @@ mod snapshot_tests {
                     config,
                     username: None,
                     password: None,
-                    ca_certificate: Vec::new(),
+                    ca_certificate: rustls::RootCertStore::empty(),
                     client_authentication: None,
                     claimed_identity: SessionIdentity {
                         principal_id: SENDER_PRINCIPAL.into(),
