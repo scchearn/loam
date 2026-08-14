@@ -46,7 +46,9 @@ async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, 
   }
   const context = '<LOAM_IMPORTANT>\nverification context\n</LOAM_IMPORTANT>';
   if (id === 'opencode') {
-    const adapter = await module.createOpenCodeAdapter({
+    // The plugin file exports only LoamPlugin (OpenCode's loader calls every
+    // top-level export as a plugin factory); the adapter factory rides on it.
+    const adapter = await module.LoamPlugin.createOpenCodeAdapter({
       getContext: async () => context,
       // The envelope check fires the transform, which starts the notify
       // listener on its first fire; a real listener would keep the process

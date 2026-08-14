@@ -5,7 +5,24 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { buildInjectArgs, createOpenCodeAdapter, startLoamNotifyServer } from '../adapters/opencode.mjs';
+import * as adapterModule from '../adapters/opencode.mjs';
+import { LoamPlugin } from '../adapters/opencode.mjs';
+
+// The adapter file is the OpenCode plugin file; its loader calls every top-level
+// export as a plugin factory, so only LoamPlugin may be exported. The helpers
+// tests need are hung off it as properties.
+const { buildInjectArgs, createOpenCodeAdapter, startLoamNotifyServer } = LoamPlugin;
+
+test('export surface: the plugin file exports exactly one symbol (LoamPlugin)', () => {
+  // The bush-killer: OpenCode's getLegacyPlugins calls EVERY module export as a
+  // plugin factory (startLoamNotifyServer throws under such a call). Any new
+  // top-level export must fail here with this contract spelled out.
+  assert.deepEqual(
+    Object.keys(adapterModule),
+    ['LoamPlugin'],
+    'adapters/opencode.mjs must export ONLY LoamPlugin — the OpenCode loader calls every top-level export as a plugin factory. Hang helpers off LoamPlugin as properties instead.',
+  );
+});
 
 function wait(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 

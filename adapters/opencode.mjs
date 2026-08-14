@@ -113,10 +113,12 @@ async function spawnRuntime(args) {
 /**
  * Build the argv for `federation inject <register|drop>`. Workspace is a
  * POSITIONAL argument in the CLI contract, never `--workspace` (which the
- * runtime rejects as an unknown flag, exit 64). Exported so a contract test
- * fails if the shape drifts back to the flag form.
+ * runtime rejects as an unknown flag, exit 64). Module-internal; reached by a
+ * contract test via `LoamPlugin.buildInjectArgs` so the shape can't drift back
+ * to the flag form. It must NOT be a top-level export — see the note on
+ * `LoamPlugin` below.
  */
-export function buildInjectArgs({ action, workspace, globalRoot, sessionId, wakeRef = null }) {
+function buildInjectArgs({ action, workspace, globalRoot, sessionId, wakeRef = null }) {
   const args = [
     'federation', 'inject', action,
     workspace,
@@ -132,7 +134,7 @@ export function buildInjectArgs({ action, workspace, globalRoot, sessionId, wake
  * `onWake` receives the rendered body and must inject it into the session.
  * Returns a teardown that stops the listener and deregisters the session.
  */
-export async function startLoamNotifyServer({
+async function startLoamNotifyServer({
   workspace,
   sessionId,
   globalRoot,
@@ -172,7 +174,7 @@ export async function startLoamNotifyServer({
   };
 }
 
-export function createOpenCodeAdapter({
+function createOpenCodeAdapter({
   client,
   integrationPath,
   getContext = defaultContext,
@@ -506,4 +508,17 @@ export function createOpenCodeAdapter({
   };
 }
 
+// This file is copied verbatim as the OpenCode plugin file, and OpenCode's
+// legacy plugin loader (`getLegacyPlugins`) iterates ALL of a plugin file's
+// module exports and calls EVERY exported function as a plugin factory —
+// e.g. `startLoamNotifyServer` throws under a plugin-shaped call. So this file
+// must export EXACTLY ONE symbol: `LoamPlugin`. Anything tests need is hung off
+// it as a property (the loader calls `LoamPlugin(input)` and ignores
+// properties). An `export-surface` contract test pins the namespace to
+// `["LoamPlugin"]`, so a future top-level export fails CI. See AGENTS.md
+// (Federation debugging).
 export const LoamPlugin = async ({ client, directory } = {}) => createOpenCodeAdapter({ client })({ directory });
+
+LoamPlugin.buildInjectArgs = buildInjectArgs;
+LoamPlugin.startLoamNotifyServer = startLoamNotifyServer;
+LoamPlugin.createOpenCodeAdapter = createOpenCodeAdapter;

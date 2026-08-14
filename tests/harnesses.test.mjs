@@ -5,7 +5,11 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 
-import { createOpenCodeAdapter } from '../adapters/opencode.mjs';
+import { LoamPlugin } from '../adapters/opencode.mjs';
+
+// adapters/opencode.mjs exports only LoamPlugin (OpenCode's loader calls every
+// top-level export as a plugin factory); test helpers ride on it as properties.
+const { createOpenCodeAdapter } = LoamPlugin;
 import { main as runIngestWorker } from '../adapters/ingest-worker.mjs';
 import { dedupe, mergeJsonConfig } from '../setup/config.mjs';
 import {
