@@ -14,8 +14,8 @@
 //!
 //! The HTTPS client is minimal HTTP/1.1 over the already-locked `rustls`
 //! dependency (promoted to direct; it was already in the tree via rumqttc's
-//! `use-rustls`). Encryption is ECDSA P-256 via the already-locked `aws-lc-rs`
-//! (rustls's default crypto provider here), so this module adds no new crate.
+//! Rustls stack). Encryption is ECDSA P-256 via the already-locked `ring`, so
+//! this module adds no new crate.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -52,6 +52,11 @@ pub enum EnrollmentFailure {
     MalformedSignerResponse,
     /// The machine has no git identity to name the CSR subject with.
     GitIdentityRequired,
+    /// Local cryptography failed before the signer was contacted.
+    LocalCrypto {
+        operation: &'static str,
+        detail: String,
+    },
 }
 
 impl EnrollmentFailure {
@@ -61,7 +66,22 @@ impl EnrollmentFailure {
             EnrollmentFailure::SignerUnreachable => "signer-unreachable",
             EnrollmentFailure::MalformedSignerResponse => "malformed-signer-response",
             EnrollmentFailure::GitIdentityRequired => "git-identity-required",
+            EnrollmentFailure::LocalCrypto { .. } => "local-crypto-failure",
         }
+    }
+
+    pub(crate) fn debug_detail(&self) -> Option<(&'static str, &str)> {
+        match self {
+            EnrollmentFailure::LocalCrypto { operation, detail } => Some((*operation, detail)),
+            _ => None,
+        }
+    }
+}
+
+fn local_crypto_failure(operation: &'static str, error: impl std::fmt::Debug) -> EnrollmentFailure {
+    EnrollmentFailure::LocalCrypto {
+        operation,
+        detail: format!("{error:?}"),
     }
 }
 
@@ -76,13 +96,16 @@ pub fn signer_url(broker_host: &str) -> String {
 }
 
 /// Generate a fresh instance id (`urn:loam:instance:` SAN suffix) with no
-/// dependency beyond the already-locked `aws-lc-rs` RNG. The 26-character
+/// dependency beyond the already-locked `ring` RNG. The 26-character
 /// Crockford-base32 ULID form `is_valid_instance_id` accepts.
 pub fn generate_instance_id() -> Result<String, EnrollmentFailure> {
     use crate::sha256::Sha256;
+    use ring::rand::SecureRandom;
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     let mut entropy = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut entropy).map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    ring::rand::SystemRandom::new()
+        .fill(&mut entropy)
+        .map_err(|error| local_crypto_failure("instance-id-rng", error))?;
     let mut hasher = Sha256::default();
     hasher.update(&entropy);
     Ok(hasher
@@ -101,6 +124,8 @@ pub fn generate_keypair_and_csr(
     display_name: &str,
     instance_id: &str,
 ) -> Result<(Vec<u8>, Vec<u8>), EnrollmentFailure> {
+    use ring::signature::KeyPair;
+
     if email.is_empty()
         || email.len() > 1024
         || !email.contains('@')
@@ -108,19 +133,20 @@ pub fn generate_keypair_and_csr(
     {
         return Err(EnrollmentFailure::GitIdentityRequired);
     }
-    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let rng = ring::rand::SystemRandom::new();
 
-    let key_document = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
-        &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+    let key_document = ring::signature::EcdsaKeyPair::generate_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
         &rng,
     )
-    .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
-    let keypair = aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(
-        &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+    .map_err(|error| local_crypto_failure("csr-keygen", error))?;
+    let keypair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
         key_document.as_ref(),
+        &rng,
     )
-    .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
-    let spki = der_as_der_of_public_key(&keypair)?;
+    .map_err(|error| local_crypto_failure("csr-key-parse", error))?;
+    let spki = der_subject_public_key(keypair.public_key().as_ref());
 
     let csr = build_csr(&keypair, email, display_name, instance_id, &spki, &rng)?;
 
@@ -132,27 +158,26 @@ pub fn generate_keypair_and_csr(
     Ok((key_pem, csr_pem))
 }
 
-fn der_as_der_of_public_key(
-    keypair: &aws_lc_rs::signature::EcdsaKeyPair,
-) -> Result<Vec<u8>, EnrollmentFailure> {
-    use aws_lc_rs::encoding::{AsDer, PublicKeyX509Der};
-    use aws_lc_rs::signature::KeyPair;
-    keypair
-        .public_key()
-        .as_der()
-        .map(|der: PublicKeyX509Der<'_>| der.as_ref().to_vec())
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)
+fn der_subject_public_key(public_key: &[u8]) -> Vec<u8> {
+    // ring exposes the SEC1 point; PKCS#10 requires the complete SPKI wrapper.
+    const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+    const OID_PRIME256V1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+    let algorithm = der_sequence(&concat2(
+        &der_oid(OID_EC_PUBLIC_KEY),
+        &der_oid(OID_PRIME256V1),
+    ));
+    der_sequence(&concat2(&algorithm, &der_bit_string(public_key)))
 }
 
 /// Build a PKCS#10 CertificationRequest carrying the SAN as an
 /// `extensionRequest` attribute, signed by the machine's own key.
 fn build_csr(
-    keypair: &aws_lc_rs::signature::EcdsaKeyPair,
+    keypair: &ring::signature::EcdsaKeyPair,
     email: &str,
     display_name: &str,
     instance_id: &str,
     spki: &[u8],
-    rng: &aws_lc_rs::rand::SystemRandom,
+    rng: &ring::rand::SystemRandom,
 ) -> Result<Vec<u8>, EnrollmentFailure> {
     // subjectAltName GeneralNames: one URI GeneralName (`[6]` IA5String).
     let san_uri = format!("{INSTANCE_SAN_PREFIX}{instance_id}");
@@ -203,7 +228,7 @@ fn build_csr(
 
     let signature = keypair
         .sign(rng, &certification_request_info)
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+        .map_err(|error| local_crypto_failure("csr-sign", error))?;
 
     let signed = der_sequence(&concat(&[
         &certification_request_info,
@@ -528,6 +553,13 @@ mod tests {
     fn generate_keypair_and_csr_requires_a_real_email() {
         let err = generate_keypair_and_csr("", "Ada", "01XXXX").unwrap_err();
         assert_eq!(err, EnrollmentFailure::GitIdentityRequired);
+    }
+
+    #[test]
+    fn local_crypto_failure_has_a_distinct_code_and_debug_detail() {
+        let failure = local_crypto_failure("csr-sign", ring::error::Unspecified);
+        assert_eq!(failure.code(), "local-crypto-failure");
+        assert_eq!(failure.debug_detail(), Some(("csr-sign", "Unspecified")));
     }
 
     #[test]

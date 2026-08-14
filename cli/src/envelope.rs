@@ -3019,17 +3019,16 @@ mod tests {
     fn assert_allowed_dependency(name: &str) {
         assert!(
             [
-                "aws-lc-rs",
                 "chrono",
                 "pulldown-cmark",
+                "ring",
                 "rumqttc",
                 "rusqlite",
                 // Auto-enrollment's HTTPS client and keypair generation: already
                 // compiled in the tree as transitive rustls/rumqttc providers,
                 // promoted to direct for the one outbound POST (see
-                // enrollment_auto.rs). `rustls` is the TLS stack; `aws-lc-rs`
-                // is its default crypto provider here (ECDSA P-256 keygen +
-                // signing, and the RNG).
+                // enrollment_auto.rs). `rustls` is the TLS stack; `ring` is the
+                // deterministic provider for TLS and ECDSA P-256 keygen/signing.
                 "rustls",
                 // Bundled Mozilla trust roots: the no-`ca_ref` default trust
                 // path, replacing the per-OS trust-file search. Compiled-in

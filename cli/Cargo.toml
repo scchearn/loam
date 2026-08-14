@@ -9,10 +9,10 @@ repository = "https://github.com/scchearn/loam"
 dist = true
 
 [dependencies]
-aws-lc-rs = "1.18.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 pulldown-cmark = { version = "0.12", default-features = false }
-rumqttc = { version = "=0.25.1", default-features = false, features = ["use-rustls"] }
+ring = "0.17.14"
+rumqttc = { version = "=0.25.1", default-features = false, features = ["use-rustls-no-provider"] }
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
-rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1.0.9"

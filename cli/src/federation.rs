@@ -615,6 +615,10 @@ fn connect(mut args: impl Iterator<Item = String>) -> i32 {
                         } else {
                             eprintln!("federation connect: {code}");
                         }
+                        #[cfg(debug_assertions)]
+                        if let Some((operation, detail)) = failure.debug_detail() {
+                            eprintln!("federation connect: local crypto {operation}: {detail}");
+                        }
                         return 69;
                     }
                 }
