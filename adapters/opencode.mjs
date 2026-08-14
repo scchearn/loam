@@ -53,12 +53,20 @@ const {
 // The whole OpenCode context surface: run the native read path and take its
 // stdout. No shared Node integration, no IPC of our own, no broker. The event
 // flag splits the injection: SessionStart renders the full block, per-turn
-// (UserPromptSubmit) renders the federation refresh only.
-async function defaultContext({ workspace, event = 'SessionStart' }) {
+// (UserPromptSubmit) renders the federation refresh only. The Wake event drains
+// this session's mailbox and REQUIRES the session id — without it the runtime
+// refuses the drain and renders empty — so it is passed on argv as --session-id.
+function buildHookArgs({ workspace, event = 'SessionStart', sessionId = null }) {
+  const args = ['hook', 'opencode', '--workspace', workspace, '--event', event];
+  if (sessionId) args.push('--session-id', sessionId);
+  return args;
+}
+
+async function defaultContext({ workspace, event = 'SessionStart', sessionId = null }) {
   return new Promise((settle) => {
     let child;
     try {
-      child = spawn(RUNTIME_PATH, ['hook', 'opencode', '--workspace', workspace, '--event', event], {
+      child = spawn(RUNTIME_PATH, buildHookArgs({ workspace, event, sessionId }), {
         stdio: ['pipe', 'pipe', 'ignore'],
       });
     } catch {
@@ -225,21 +233,25 @@ function createOpenCodeAdapter({
   };
 
   // Render the native context for one event and breadcrumb the outcome: byte
-  // count and status (ok/empty/unavailable/threw) per event on first success and
-  // on EVERY non-ok render. Sender text is never logged — only the size and the
-  // status class. Returns the rendered context (or '' on failure).
-  const renderContext = async (event, workspace) => {
+  // count, status (ok/empty/unavailable/threw), and whether a session id was
+  // supplied — per event on first success and on EVERY non-ok render. Sender text
+  // is never logged — only the size, the status class, and the session-present
+  // bit. The session bit matters most for Wake: a drain that comes back empty
+  // because no session id was passed (session:false) must be loudly
+  // distinguishable from a genuine connector refusal (session:true).
+  const renderContext = async (event, workspace, sessionId = null) => {
     let context = '';
     try {
-      context = await getContext({ harness: 'opencode', workspace, integrationPath, event });
+      context = await getContext({ harness: 'opencode', workspace, integrationPath, event, sessionId });
     } catch {
-      await logStage('error', 'getContext threw', { event });
+      await logStage('error', 'getContext threw', { event, session: Boolean(sessionId) });
       return '';
     }
     const bytes = typeof context === 'string' ? context.length : 0;
     const status = context === UNAVAILABLE ? 'unavailable' : (!context ? 'empty' : 'ok');
-    if (status === 'ok') await logStageOnce(`getContext:${event}`, 'info', 'getContext', { event, bytes, status });
-    else await logStage('warn', 'getContext', { event, bytes, status });
+    const extra = { event, bytes, status, session: Boolean(sessionId) };
+    if (status === 'ok') await logStageOnce(`getContext:${event}`, 'info', 'getContext', extra);
+    else await logStage('warn', 'getContext', extra);
     return context;
   };
 
@@ -258,7 +270,9 @@ function createOpenCodeAdapter({
     }
     loamWake.pending = true;
     try {
-      const context = await renderContext('Wake', workspace);
+      // The Wake drain keys off the session id this instance registered — pass it
+      // through, or the runtime refuses the drain and renders empty.
+      const context = await renderContext('Wake', workspace, loamWake.sessionId);
       // The drained item count is the number of terse element tags — a structural
       // type token, never sender content. An empty drain is a no-op.
       const drained = typeof context === 'string' ? (context.match(/<io\.loam/g) || []).length : 0;
@@ -351,7 +365,14 @@ function createOpenCodeAdapter({
         })();
       }
       const event = isFirst ? 'SessionStart' : 'UserPromptSubmit';
-      const context = await renderContext(event, workspace);
+      // SessionStart renders the full history snapshot (no session id, no drain).
+      // Per-turn drains this session's mailbox like the wake path, so an item
+      // enters context exactly once across all surfaces (the one-seen-set
+      // amendment) instead of the board being re-rendered every turn — the
+      // session id it registered with is what keys that drain. Without it (an
+      // unregistered session) the runtime falls back to the full snapshot, the
+      // safety net the fallback was meant to be.
+      const context = await renderContext(event, workspace, isFirst ? null : loamWake.sessionId);
       // The context gate governs only what gets injected. An empty render skips
       // the prepend but never the registration above.
       if (!context) return;
@@ -626,6 +647,7 @@ export const LoamPlugin = async (input = {}, _options) => {
 };
 
 LoamPlugin.buildInjectArgs = buildInjectArgs;
+LoamPlugin.buildHookArgs = buildHookArgs;
 LoamPlugin.startLoamNotifyServer = startLoamNotifyServer;
 LoamPlugin.createOpenCodeAdapter = createOpenCodeAdapter;
 

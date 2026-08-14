@@ -1176,6 +1176,11 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     // so it consumes the same sanitized baseline+federation body the native hook
     // would emit, without double-wrapping the envelope.
     let mut body_only = false;
+    // The session id for the mailbox-backed events (the Wake drain and the
+    // per-turn poll both key off it). Passed on argv rather than stdin so the
+    // caller can supply it without owning the whole frame; it overrides any
+    // stdin `session_id` below.
+    let mut session_id: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--workspace" => match args.next() {
@@ -1187,6 +1192,13 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
             },
             "--event" => match args.next().as_deref().and_then(HookEvent::parse) {
                 Some(value) => event = value,
+                None => {
+                    usage();
+                    return 1;
+                }
+            },
+            "--session-id" => match args.next() {
+                Some(value) => session_id = Some(value),
                 None => {
                     usage();
                     return 1;
@@ -1216,6 +1228,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         Ok(frame) => frame,
         Err(error) => return refuse(harness, event, error.code(), body_only),
     };
+    let frame = frame_with_session_id(frame, session_id);
 
     let body = compose_body(&paths, &config, &frame, event, None);
     if body_only {
@@ -1240,8 +1253,23 @@ fn refuse(harness: Harness, event: HookEvent, code: &str, body_only: bool) -> i3
     0
 }
 
+/// Fold an argv-supplied session id into the frame, overriding any `session_id`
+/// the stdin frame carried. The mailbox events (`Wake`, per-turn) read
+/// `frame.session_id`, so this is how the caller drives the drain without owning
+/// the whole frame. A `None` id leaves the frame untouched.
+fn frame_with_session_id(frame: Value, session_id: Option<String>) -> Value {
+    match (frame, session_id) {
+        (Value::Object(mut fields), Some(id)) => {
+            fields.retain(|(key, _)| key != "session_id");
+            fields.push(("session_id".into(), Value::String(id)));
+            Value::Object(fields)
+        }
+        (frame, _) => frame,
+    }
+}
+
 fn usage() {
-    eprintln!("Usage: loam hook <opencode|claude|codex|cursor> [--workspace <absolute-path>] [--event <SessionStart|UserPromptSubmit|PreToolUse|PostToolUse>] [--body]");
+    eprintln!("Usage: loam hook <opencode|claude|codex|cursor> [--workspace <absolute-path>] [--event <SessionStart|UserPromptSubmit|PreToolUse|PostToolUse|Wake>] [--session-id <id>] [--body]");
 }
 
 #[cfg(test)]
@@ -1922,6 +1950,179 @@ mod tests {
             ),
             Federation::Degraded("connector_unreachable")
         );
+    }
+
+    #[test]
+    fn frame_with_session_id_injects_overrides_and_no_ops() {
+        // Injected into an empty stdin frame.
+        let injected = frame_with_session_id(Value::Object(Vec::new()), Some("sess-1".into()));
+        assert_eq!(
+            injected.get("session_id").and_then(Value::as_str),
+            Some("sess-1")
+        );
+        // Overrides a stdin-supplied session id, keeping the rest of the frame.
+        let base = crate::json::parse(r#"{"session_id":"stale","other":"keep"}"#).unwrap();
+        let overridden = frame_with_session_id(base, Some("sess-2".into()));
+        assert_eq!(
+            overridden.get("session_id").and_then(Value::as_str),
+            Some("sess-2")
+        );
+        assert_eq!(
+            overridden.get("other").and_then(Value::as_str),
+            Some("keep")
+        );
+        // A None id leaves the frame untouched.
+        let untouched =
+            frame_with_session_id(crate::json::parse(r#"{"session_id":"x"}"#).unwrap(), None);
+        assert_eq!(
+            untouched.get("session_id").and_then(Value::as_str),
+            Some("x")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wake_drains_the_mailbox_with_its_session_id_and_refuses_without_one() {
+        // The final-acceptance regression: the wake drain MUST carry the session
+        // id, or the connector refuses it and the wake silently renders empty.
+        let root = std::path::PathBuf::from("/tmp").join(format!(
+            "loam-wake-drain-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let run_dir = root.join("run");
+        let endpoint = ipc::unix::bind(&run_dir).expect("bind");
+        let server = std::thread::spawn(move || {
+            let mut connection = endpoint.accept_verified().expect("accept");
+            let request = ipc::read_frame(&mut connection, &IpcConfig::default()).expect("request");
+            let parsed =
+                crate::json::parse(std::str::from_utf8(&request).expect("utf8")).expect("json");
+            // A wake drains the session mailbox, keyed by the session id.
+            assert_eq!(
+                parsed.get("operation").and_then(Value::as_str),
+                Some("session.poll-inject")
+            );
+            assert_eq!(
+                parsed
+                    .get("payload")
+                    .and_then(|payload| payload.get("session_id"))
+                    .and_then(Value::as_str),
+                Some("sess-wake")
+            );
+            let response = ipc::ok_response(
+                "hook",
+                crate::json::parse(r#"{"schema":1,"project_id":"loam","items":[]}"#).unwrap(),
+            );
+            ipc::write_frame(&mut connection, &response, &IpcConfig::default()).expect("respond");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+
+        let paths = HookPaths {
+            global_root: root,
+            ..paths()
+        };
+        let federation = query_federation(
+            &paths,
+            "/w",
+            &HookConfig::default(),
+            HookEvent::Wake,
+            Some("sess-wake"),
+        );
+        assert!(
+            matches!(federation, Federation::Snapshot(_)),
+            "a wake with a session id drains the mailbox: {federation:?}"
+        );
+        server.join().expect("server thread");
+
+        // Without a session id the wake never calls the connector — it refuses
+        // rather than silently rendering an empty success.
+        assert_eq!(
+            query_federation(&paths, "/w", &HookConfig::default(), HookEvent::Wake, None),
+            Federation::Degraded("wake_no_session")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn per_turn_drains_with_a_session_id_and_falls_back_to_the_snapshot_without_one() {
+        // The one-seen-set amendment: per-turn drains the mailbox when it has the
+        // session id (an item enters context once across surfaces), and keeps the
+        // full-snapshot fallback as the safety net for an unregistered session.
+        let root = std::path::PathBuf::from("/tmp").join(format!(
+            "loam-per-turn-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let run_dir = root.join("run");
+        let endpoint = ipc::unix::bind(&run_dir).expect("bind");
+        let server = std::thread::spawn(move || {
+            let snapshot = || {
+                ipc::ok_response(
+                    "hook",
+                    crate::json::parse(r#"{"schema":1,"project_id":"loam","items":[]}"#).unwrap(),
+                )
+            };
+            // Connection 1: per-turn WITH a session id drains the mailbox.
+            let mut first = endpoint.accept_verified().expect("accept 1");
+            let request = ipc::read_frame(&mut first, &IpcConfig::default()).expect("request 1");
+            let parsed =
+                crate::json::parse(std::str::from_utf8(&request).expect("utf8")).expect("json");
+            assert_eq!(
+                parsed.get("operation").and_then(Value::as_str),
+                Some("session.poll-inject")
+            );
+            assert_eq!(
+                parsed
+                    .get("payload")
+                    .and_then(|payload| payload.get("session_id"))
+                    .and_then(Value::as_str),
+                Some("sess-turn")
+            );
+            ipc::write_frame(&mut first, &snapshot(), &IpcConfig::default()).expect("respond 1");
+            // Connection 2: per-turn WITHOUT a session id falls back to the snapshot.
+            let mut second = endpoint.accept_verified().expect("accept 2");
+            let request = ipc::read_frame(&mut second, &IpcConfig::default()).expect("request 2");
+            let parsed =
+                crate::json::parse(std::str::from_utf8(&request).expect("utf8")).expect("json");
+            assert_eq!(
+                parsed.get("operation").and_then(Value::as_str),
+                Some("federation.snapshot")
+            );
+            ipc::write_frame(&mut second, &snapshot(), &IpcConfig::default()).expect("respond 2");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+
+        let paths = HookPaths {
+            global_root: root,
+            ..paths()
+        };
+        let drained = query_federation(
+            &paths,
+            "/w",
+            &HookConfig::default(),
+            HookEvent::UserPromptSubmit,
+            Some("sess-turn"),
+        );
+        assert!(
+            matches!(drained, Federation::Snapshot(_)),
+            "per-turn with a session id drains the mailbox: {drained:?}"
+        );
+        let fallback = query_federation(
+            &paths,
+            "/w",
+            &HookConfig::default(),
+            HookEvent::UserPromptSubmit,
+            None,
+        );
+        assert!(
+            matches!(fallback, Federation::Snapshot(_)),
+            "per-turn without a session id falls back to the snapshot: {fallback:?}"
+        );
+        server.join().expect("server thread");
     }
 
     #[test]

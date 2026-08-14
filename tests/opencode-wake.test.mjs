@@ -400,3 +400,69 @@ test('the first transform registers the wake server even when the render is empt
   // The empty render still injects nothing — the context gate governs only the prepend.
   assert.equal(output.messages[0].parts.length, 1, 'an empty render prepends no context');
 });
+
+test('buildHookArgs passes --session-id for a mailbox drain and omits it without one', () => {
+  const withId = LoamPlugin.buildHookArgs({ workspace: '/w', event: 'Wake', sessionId: 'sess-1' });
+  assert.deepEqual(withId.slice(0, 6), ['hook', 'opencode', '--workspace', '/w', '--event', 'Wake']);
+  const at = withId.indexOf('--session-id');
+  assert.ok(at > -1 && withId[at + 1] === 'sess-1', 'the session id rides on the hook argv');
+  const withoutId = LoamPlugin.buildHookArgs({ workspace: '/w', event: 'SessionStart' });
+  assert.ok(!withoutId.includes('--session-id'), 'no session id, no flag');
+});
+
+test('the wake drain carries the registered session id into getContext', async () => {
+  // The final-acceptance regression: injectWake used to call getContext(Wake)
+  // WITHOUT the session id, so the runtime refused the drain and the wake
+  // rendered empty. The drain must pass the same session id the instance
+  // registered with.
+  const root = await mkdtemp(join(tmpdir(), 'loam-wake-sid-'));
+  await writeFile(join(root, 'install.json'), JSON.stringify({ integration_path: '/nonexistent' }));
+
+  const contextCalls = [];
+  let captured = null;
+  const plugin = await createOpenCodeAdapter({
+    client: { session: { promptAsync: async () => ({}) } },
+    getContext: async (opts) => {
+      contextCalls.push(opts);
+      return opts.event === 'Wake' ? WAKE_BODY : '<LOAM_IMPORTANT>\nstart\n</LOAM_IMPORTANT>';
+    },
+    wakeServer: async ({ onWake }) => {
+      captured = onWake;
+      return { wakeRef: 'notify-tcp://127.0.0.1:0', port: 0, registered: true, close: async () => {} };
+    },
+  })({ directory: '/workspace' });
+
+  const output = { messages: [{ info: { role: 'user', sessionID: 'sess-wake' }, parts: [{ type: 'text', text: 'p' }] }] };
+  await plugin['experimental.chat.messages.transform']({}, output);
+  await poll(() => captured !== null);
+
+  await captured();
+  await poll(() => contextCalls.some((call) => call.event === 'Wake'));
+  const wakeCall = contextCalls.find((call) => call.event === 'Wake');
+  assert.equal(wakeCall.sessionId, 'sess-wake', 'the wake drain must carry the registered session id, or the runtime refuses it and renders empty');
+});
+
+test('per-turn drains the mailbox with the session id; SessionStart renders the full snapshot', async () => {
+  // The one-seen-set amendment: an item enters context exactly once across every
+  // surface. SessionStart renders the full history (no session id, no drain);
+  // per-turn drains this session's mailbox (session id present) instead of
+  // re-rendering the whole board every turn.
+  const root = await mkdtemp(join(tmpdir(), 'loam-per-turn-'));
+  await writeFile(join(root, 'install.json'), JSON.stringify({ integration_path: '/nonexistent' }));
+
+  const contextCalls = [];
+  const plugin = await createOpenCodeAdapter({
+    client: { session: { promptAsync: async () => ({}) } },
+    getContext: async (opts) => { contextCalls.push(opts); return '<LOAM_IMPORTANT>\nx\n</LOAM_IMPORTANT>'; },
+    wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', port: 0, registered: true, close: async () => {} }),
+  })({ directory: '/workspace' });
+
+  const message = () => ({ messages: [{ info: { role: 'user', sessionID: 'sess-turn' }, parts: [{ type: 'text', text: 'p' }] }] });
+  await plugin['experimental.chat.messages.transform']({}, message()); // SessionStart
+  await plugin['experimental.chat.messages.transform']({}, message()); // per-turn
+
+  const start = contextCalls.find((call) => call.event === 'SessionStart');
+  const turn = contextCalls.find((call) => call.event === 'UserPromptSubmit');
+  assert.equal(start.sessionId, null, 'SessionStart renders the full snapshot, no drain');
+  assert.equal(turn.sessionId, 'sess-turn', 'per-turn drains the mailbox with the session id');
+});
