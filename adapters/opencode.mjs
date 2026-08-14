@@ -100,10 +100,31 @@ async function spawnRuntime(args) {
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => { body += chunk; });
     child.once('error', () => settle({ ok: false, body: '' }));
-    child.once('close', () => settle({ ok: true, body: body.trim() }));
+    // Honor the exit code: a nonzero runtime exit (e.g. an inject-contract
+    // rejection) is a failure, not a success with empty output. Reporting
+    // ok:true on any close hid the register bug — the connector never held the
+    // session wake_ref and no one saw it fail.
+    child.once('close', (code) => settle({ ok: code === 0, body: body.trim() }));
     child.stdin.on('error', () => {});
     child.stdin.end('{}');
   });
+}
+
+/**
+ * Build the argv for `federation inject <register|drop>`. Workspace is a
+ * POSITIONAL argument in the CLI contract, never `--workspace` (which the
+ * runtime rejects as an unknown flag, exit 64). Exported so a contract test
+ * fails if the shape drifts back to the flag form.
+ */
+export function buildInjectArgs({ action, workspace, globalRoot, sessionId, wakeRef = null }) {
+  const args = [
+    'federation', 'inject', action,
+    workspace,
+    '--global-root', globalRoot,
+    '--session-id', sessionId,
+  ];
+  if (wakeRef) args.push('--wake-ref', wakeRef);
+  return args;
 }
 
 /**
@@ -138,16 +159,8 @@ export async function startLoamNotifyServer({
   const port = typeof address === 'object' && address ? address.port : 0;
   const wakeRef = `notify-tcp://127.0.0.1:${port}`;
   const runDir = join(globalRoot, 'run');
-  const reg = register || (async (action, ref) => {
-    const args = [
-      'federation', 'inject', action,
-      '--workspace', workspace,
-      '--global-root', globalRoot,
-      '--session-id', sessionId,
-    ];
-    if (ref) args.push('--wake-ref', ref);
-    return spawnRuntime(args);
-  });
+  const reg = register || (async (action, ref) =>
+    spawnRuntime(buildInjectArgs({ action, workspace, globalRoot, sessionId, wakeRef: ref })));
   const registered = await reg('register', wakeRef).catch(() => null);
   return {
     wakeRef,
@@ -193,10 +206,20 @@ export function createOpenCodeAdapter({
     try {
       const context = await getContext({ harness: 'opencode', workspace, integrationPath, event: 'UserPromptSubmit' });
       if (context && context !== UNAVAILABLE) {
-        await sdk.session.promptAsync({
-          sessionID: loamWake.sessionId,
-          parts: [{ type: 'text', text: context }],
+        // SessionPromptAsyncData shape: { path:{id}, query:{directory}, body:{parts} } —
+        // the same shape the ingest worker below uses. The flat
+        // { sessionID, parts } form is silently a no-op against the SDK.
+        const result = await sdk.session.promptAsync({
+          path: { id: loamWake.sessionId },
+          query: { directory: workspace },
+          body: { parts: [{ type: 'text', text: context }] },
         });
+        // The SDK RESOLVES with { error, response } on an HTTP error rather than
+        // throwing, so a rejected prompt would otherwise pass as success. Treat a
+        // resolved error as a failed injection — it degrades to the next turn.
+        if (result && result.error) {
+          throw new Error('promptAsync resolved with an error');
+        }
       }
     } catch {
       // Wake is best-effort: a failed injection degrades to the next natural

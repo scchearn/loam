@@ -5,9 +5,34 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { createOpenCodeAdapter, startLoamNotifyServer } from '../adapters/opencode.mjs';
+import { buildInjectArgs, createOpenCodeAdapter, startLoamNotifyServer } from '../adapters/opencode.mjs';
 
 function wait(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+test('inject args: workspace is positional, never the --workspace flag the CLI rejects', () => {
+  const args = buildInjectArgs({
+    action: 'register',
+    workspace: '/workspace',
+    globalRoot: '/root',
+    sessionId: 'sess-1',
+    wakeRef: 'notify-tcp://127.0.0.1:9',
+  });
+  // Workspace sits positionally right after the action; the CLI contract is
+  // `inject <register|drop> [<workspace>] --global-root ... --session-id ...`.
+  assert.deepEqual(args.slice(0, 4), ['federation', 'inject', 'register', '/workspace']);
+  assert.ok(!args.includes('--workspace'), 'must not pass workspace as a flag (exit 64)');
+  // Required flags and the optional wake-ref are present in flag form.
+  for (const flag of ['--global-root', '--session-id', '--wake-ref']) {
+    assert.ok(args.includes(flag), `${flag} must be present`);
+  }
+  assert.equal(args[args.indexOf('--global-root') + 1], '/root');
+  assert.equal(args[args.indexOf('--session-id') + 1], 'sess-1');
+
+  // drop omits the wake-ref but keeps the positional workspace.
+  const dropArgs = buildInjectArgs({ action: 'drop', workspace: '/ws', globalRoot: '/r', sessionId: 's' });
+  assert.deepEqual(dropArgs.slice(0, 4), ['federation', 'inject', 'drop', '/ws']);
+  assert.ok(!dropArgs.includes('--wake-ref'), 'drop carries no wake-ref');
+});
 
 async function poll(fn, timeoutMs = 1000) {
   const deadline = Date.now() + timeoutMs;
@@ -133,4 +158,56 @@ test('a session without the runtime still starts and the wake server degrades si
   await plugin['experimental.chat.messages.transform']({}, output);
   await plugin.event({ event: { type: 'session.idle', sessionID: 'sess-x' } });
   await plugin.event({ event: { type: 'session.deleted', sessionID: 'sess-x' } });
+});
+
+test('injectWake calls promptAsync with the generated-SDK shape and treats a resolved {error} as failure', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loam-wake-shape-'));
+  await writeFile(join(root, 'install.json'), JSON.stringify({ integration_path: '/nonexistent' }));
+
+  const inputs = [];
+  let resolveWithError = false;
+  let captured = null; // the adapter's onWake, captured so the test can fire it
+
+  const plugin = await createOpenCodeAdapter({
+    client: {
+      session: {
+        promptAsync: async (input) => {
+          inputs.push(input);
+          return resolveWithError ? { error: { message: 'http 500' }, response: {} } : {};
+        },
+      },
+    },
+    getContext: async () => '<LOAM_IMPORTANT>\nwake body\n</LOAM_IMPORTANT>',
+    wakeServer: async ({ onWake }) => {
+      captured = onWake;
+      return { wakeRef: 'notify-tcp://127.0.0.1:0', registered: true, close: async () => {} };
+    },
+  })({ directory: '/workspace' });
+
+  // First transform fire is SessionStart: it sets loamWake.sessionId and starts
+  // the (injected) wake server, capturing onWake.
+  const output = { messages: [{ info: { role: 'user', sessionID: 'sess-shape' }, parts: [{ type: 'text', text: 'prompt' }] }] };
+  await plugin['experimental.chat.messages.transform']({}, output);
+  await poll(() => captured !== null);
+
+  // Fire a wake: promptAsync must receive the generated-SDK shape, not the flat
+  // { sessionID, parts } form (which is a silent no-op against the SDK).
+  await captured();
+  await poll(() => inputs.length === 1);
+  const input = inputs[0];
+  assert.deepEqual(input.path, { id: 'sess-shape' }, 'path.id carries the session id');
+  assert.deepEqual(input.query, { directory: '/workspace' }, 'query.directory carries the workspace');
+  assert.ok(Array.isArray(input.body?.parts) && input.body.parts[0]?.text?.includes('wake body'), 'body.parts carries the rendered context');
+  assert.ok(input.sessionID === undefined && input.parts === undefined, 'the flat shape must not be used');
+
+  // The SDK resolves with { error } rather than throwing on an HTTP error; the
+  // next wake must not crash and the pending guard must reset so a later wake
+  // can still fire (a resolved error is a failed injection, not a success).
+  resolveWithError = true;
+  await captured();
+  await poll(() => inputs.length === 2);
+  // A subsequent successful wake still goes through — the guard did not wedge.
+  resolveWithError = false;
+  await captured();
+  await poll(() => inputs.length === 3);
 });
