@@ -57,7 +57,7 @@ test('missing adapter in an existing clone returns setup recovery instead of a l
     const plugin = await loaded.LoamPlugin({ directory: clone });
     const output = { messages: [{ info: { role: 'user' }, parts: [{ type: 'text', text: 'hello' }] }] };
     await plugin['experimental.chat.messages.transform']({}, output);
-    assert.match(output.messages[0].parts[0].text, /npx @scchearn\/loam setup/);
+    assert.match(output.messages[0].parts[0].text, /npx @scchearn\/loam install/);
   } finally {
     await rm(clone, { recursive: true, force: true });
   }

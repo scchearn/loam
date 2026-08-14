@@ -5,7 +5,7 @@ import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import net from 'node:net';
 
-const UNAVAILABLE = '<LOAM_IMPORTANT>\nYou have loam.\nLoam is unavailable. Run: npx @scchearn/loam setup\n</LOAM_IMPORTANT>';
+const UNAVAILABLE = '<LOAM_IMPORTANT>\nYou have loam.\nLoam is unavailable. Run: npx @scchearn/loam install\n</LOAM_IMPORTANT>';
 
 // Filled in by setup when this plugin is staged. OpenCode loads the plugin
 // in-process, so the absolute private runtime is written here rather than

@@ -1,4 +1,34 @@
+import { stat } from 'node:fs/promises';
+import { join } from 'node:path';
+
 import { invokeRuntime, safeDetail } from '../integration/runtime.mjs';
+
+// Mirror of cli/src/service.rs `definition_path` / SERVICE_LABEL. The runtime
+// owns rendering; Node only needs to know WHERE the definition lives so it can
+// detect an existing definition (the #100 refresh gate) and confirm absence
+// after a disable. Windows keeps its definition inside Task Scheduler, not a
+// file, so there is no file-based definition to stat there.
+const SERVICE_LABEL = 'io.loam.connector';
+
+export function federationDefinitionPath({ globalRoot, platform = process.platform } = {}) {
+  if (!globalRoot) return null;
+  if (platform === 'linux') return join(globalRoot, 'systemd', 'loam-connector.service');
+  if (platform === 'darwin') return join(globalRoot, 'launchagents', `${SERVICE_LABEL}.plist`);
+  return null; // win32 (Task Scheduler) and any platform without a file-based unit.
+}
+
+// True only when a file-based definition is present. On win32 (no file) this is
+// always false — callers must treat `fileBased === false` as "cannot tell from a
+// file" rather than "definitely absent".
+export async function federationDefinitionExists({ globalRoot, platform = process.platform } = {}) {
+  const path = federationDefinitionPath({ globalRoot, platform });
+  if (!path) return { exists: false, fileBased: false, path: null };
+  try {
+    return { exists: (await stat(path)).isFile(), fileBased: true, path };
+  } catch {
+    return { exists: false, fileBased: true, path };
+  }
+}
 
 // Bounded delegation to the private runtime's hidden federation service
 // lifecycle commands. Node NEVER renders a service definition,
@@ -109,6 +139,65 @@ export async function removeFederationService({ runtimePath, globalRoot, runner,
   const opts = { runtimePath, globalRoot, runner, timeoutMs };
   await runFederationService('disable', opts);
   return runFederationService('uninstall', opts);
+}
+
+// setup configurator — enable federation: install the definition through the
+// runtime, then enable-start it so the connector is active. Idempotent (install
+// re-renders; enable is a no-op if already active). Returns a bounded rollback
+// that returns the machine to its prior state: a definition we newly created is
+// removed; a service that was already active is left enabled. Never mints
+// identity or contacts a broker (the runtime owns enrollment).
+export async function enableFederationService({ runtimePath, globalRoot, runner, timeoutMs } = {}) {
+  const opts = { runtimePath, globalRoot, runner, timeoutMs };
+  const prior = await runFederationService('status', opts);
+  const wasActive = prior.ok;
+
+  const installed = await runFederationService('install', opts);
+  if (!installed.ok) {
+    return { ready: false, category: 'federation_install_failed', detail: installed.stderr, wasActive, rollback: async () => {} };
+  }
+  const enabled = await runFederationService('enable', opts);
+  if (!enabled.ok) {
+    return {
+      ready: false,
+      category: 'federation_enable_failed',
+      detail: enabled.stderr,
+      wasActive,
+      rollback: async () => { if (!wasActive) await runFederationService('uninstall', opts); },
+    };
+  }
+  return {
+    ready: true,
+    wasActive,
+    rollback: async () => {
+      if (!wasActive) {
+        await runFederationService('disable', opts);
+        await runFederationService('uninstall', opts);
+      }
+    },
+  };
+}
+
+// setup configurator — verify that a disable was COMPLETE (symmetric-disable
+// contract): nothing loam-owned remains for federation. Checks the file-based
+// definition is gone AND the manager reports the service not active. Names the
+// exact leftovers so a partial disable never reports success. On win32 there is
+// no file-based definition, so absence rests on the manager status alone.
+export async function verifyFederationAbsent({ runtimePath, globalRoot, runner, timeoutMs, platform = process.platform } = {}) {
+  const leftovers = [];
+  const { exists, fileBased, path } = await federationDefinitionExists({ globalRoot, platform });
+  if (fileBased && exists) leftovers.push({ kind: 'definition_file', path });
+
+  const status = await runFederationService('status', { runtimePath, globalRoot, runner, timeoutMs });
+  // A hard invocation error (missing runtime / crash) means we could not confirm
+  // absence — surface it rather than claiming a clean disable.
+  if (status.category === 'timeout' || status.category === 'process_error') {
+    leftovers.push({ kind: 'status_unverifiable', detail: status.stderr || status.category });
+  } else if (status.ok) {
+    // Exit 0 == still active/enabled.
+    leftovers.push({ kind: 'service_active' });
+  }
+  return { ready: leftovers.length === 0, leftovers, active: status.ok, fileBased };
 }
 
 export { runFederationService, FEDERATION_TIMEOUT_MS };

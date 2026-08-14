@@ -11,7 +11,26 @@ import { installMarketplacePlugins } from './marketplace.mjs';
 import { migrateLegacyProject } from './migration.mjs';
 import { removeHarnesses } from './uninstall.mjs';
 import { verifyInstallation } from './verify.mjs';
-import { stageFederationService } from './federation.mjs';
+import { stageFederationService, federationDefinitionExists } from './federation.mjs';
+
+// #97 fix 1 — a destructive rollback decision must name its reason. Turn the
+// per-check breakdown the verifier already computes into one operator-readable
+// line instead of discarding it behind "Final readiness verification failed".
+function verifyFailureDetail(result, discovery) {
+  const failed = [];
+  if (result?.install?.plugin_version !== discovery.packageVersion) {
+    failed.push(`plugin version (${result?.install?.plugin_version ?? 'none'} != ${discovery.packageVersion})`);
+  }
+  if (result?.skills && !result.skills.ready) failed.push(`skills (${result.skills.category || result.skills.detail || 'not ready'})`);
+  if (result?.runtime && !result.runtime.ready) failed.push(`runtime (${result.runtime.category || 'not ready'})`);
+  for (const [id, harness] of Object.entries(result?.harnesses || {})) {
+    if (!harness.ready) failed.push(`harness ${id} (${harness.category || 'not ready'})`);
+  }
+  if (result?.migration && !result.migration.ready) failed.push(`legacy migration (${result.migration.category || 'not ready'})`);
+  if (result?.ingestExclusions && !result.ingestExclusions.ready) failed.push(`ingest exclusions (${result.ingestExclusions.category || 'not ready'})`);
+  if (result?.federation && result.federation.checked && !result.federation.ready) failed.push(`federation (${result.federation.category || 'not ready'})`);
+  return failed.length ? failed.join('; ') : (result?.category || 'unknown check');
+}
 
 // ponytail: trivial lockfile — no polling, no stale-PID detection.
 // Two concurrent setups on the same HOME is a near-zero event; the second
@@ -62,7 +81,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
   const refresh = parsed.command === 'update';
   const yes = parsed.yes || refresh;
   const tilde = (p) => (typeof p === 'string' && p.startsWith(discovery.home) ? `~${p.slice(discovery.home.length)}` : p);
-  await renderDiscovery(discovery, output, { action: refresh ? 'Update' : 'Setup', dryRun: parsed.dryRun });
+  await renderDiscovery(discovery, output, { action: refresh ? 'Update' : 'Install', dryRun: parsed.dryRun });
   if (parsed.dryRun) {
     finish(output, 'Dry run', 'no files, configuration, downloads, or mutating Skills CLI commands will run');
     return 0;
@@ -105,11 +124,36 @@ export async function executeSetup(parsed, discovery, options = {}) {
   const requestedDiscovery = { ...discovery, harnesses: requestedHarnesses };
 
   return withSetupLock({ globalRoot: discovery.globalRoot, ...(options.lockOptions || {}) }, async () => {
+    // #97 fix 2 — migrate BEFORE staging and BEFORE any verify. Legacy migration
+    // mutates workspace state (removes legacy project skills/markers); running it
+    // mid-transaction let it fail the very verification of the transaction that
+    // performed it, which then rolled back and wiped a working install. Doing it
+    // up front, once, and feeding its post-migration result into every later
+    // verify means migration can no longer fail its own transaction. It is
+    // workspace cleanup, independent of and outside the staged global install.
+    let migration = { ...discovery.legacy, ready: true };
+    if (discovery.legacy.needed) {
+      migration = await migrateLegacyProject({
+        workspace: discovery.workspace,
+        packageRoot: discovery.packageRoot,
+        yes,
+        prompt: options.migrationConfirm || options.confirm,
+        runner: options.runner,
+      });
+      if (!migration.ready) {
+        errorOutput.write(`Migration incomplete: ${migration.category || 'legacy project remains'}\n`);
+        return 1;
+      }
+      stepDone(output, 'Legacy project Loam migrated');
+    }
+    const migratedLegacy = { ...migration, ready: true };
+
     const alreadyReady = await verifyInstallation({
       discovery: requestedDiscovery,
       packageRoot: discovery.packageRoot,
       runner: options.runner,
       runtimeRunner: options.smokeRunner,
+      legacy: migratedLegacy,
     });
     if (alreadyReady.ready && !refresh && toRemove.length === 0) {
       finish(output, '🌱 Loam is ready', 'already ready; no replacement or network operation required');
@@ -260,22 +304,6 @@ export async function executeSetup(parsed, discovery, options = {}) {
         return 1;
       }
 
-      let migration = discovery.legacy;
-      if (discovery.legacy.needed) {
-        migration = await migrateLegacyProject({
-          workspace: discovery.workspace,
-          packageRoot: discovery.packageRoot,
-          yes,
-          prompt: options.migrationConfirm || options.confirm,
-          runner: options.runner,
-        });
-        if (!migration.ready) {
-          errorOutput.write(`Migration incomplete: ${migration.category || 'legacy project remains'}\n`);
-          return 1;
-        }
-        stepDone(output, 'Legacy project Loam migrated');
-      }
-
       const install = {
         schema_version: 1,
         plugin_version: discovery.packageVersion,
@@ -303,30 +331,38 @@ export async function executeSetup(parsed, discovery, options = {}) {
         install,
         runner: options.runner,
         runtimeRunner: options.smokeRunner,
-        legacy: { ...migration, ready: true },
+        legacy: migratedLegacy,
       });
       if (!final.ready) {
-        errorOutput.write('Final readiness verification failed.\n');
+        // #97 fix 1 — name the check(s) that failed so the rollback decision is
+        // explained, not silent.
+        errorOutput.write(`Final readiness verification failed: ${verifyFailureDetail(final, discovery)}\n`);
         return 1;
       }
       stepDone(output, 'All checks passed');
 
-      // Additive federation layer: stage the dormant native connector definition
-      // + stable identity through the just-verified runtime, preserving prior
-      // active/inert desired state across a runtime-path update. Opt-in on a
-      // supplied runner (default setup callers are unchanged), and its rollback
-      // participates in the same transaction. Node delegates entirely to the
-      // runtime here — it never renders a definition or contacts a broker.
-      if (options.federationRunner !== undefined && runtime?.path) {
+      // #100 — a runtime version bump must refresh the service definition, which
+      // embeds the versioned binary path. On `update`, and only when a definition
+      // already exists (federation was enabled on this machine — install and a
+      // never-enabled machine leave federation alone), re-render it through the
+      // just-committed runtime and preserve the prior active/inert state. The
+      // runtime owns rendering and the manager calls; its rollback joins this
+      // transaction. On win32 there is no file-based definition, so this no-ops.
+      const definition = refresh
+        ? await federationDefinitionExists({ globalRoot: discovery.globalRoot, platform: discovery.platform })
+        : { exists: false };
+      if (refresh && definition.exists && runtime?.path) {
         const federation = await stageFederationService({
           runtimePath: runtime.path,
           globalRoot: discovery.globalRoot,
           runner: options.federationRunner,
+          timeoutMs: options.federationTimeoutMs,
         });
         if (!federation.ready) {
-          errorOutput.write(`Federation service staging failed: ${federation.detail || federation.category}\n`);
+          errorOutput.write(`Federation service refresh failed: ${federation.detail || federation.category}\n`);
           return 1;
         }
+        stepDone(output, 'Service definition refreshed for the new runtime');
         federationRollback = federation.rollback;
       }
 

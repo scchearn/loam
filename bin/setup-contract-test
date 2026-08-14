@@ -22,13 +22,37 @@ EXPECTED_VERSION="$(node -p "require('$PACKED_ROOT/package.json').version")"
 }
 
 node "$PACKED_ROOT/bin/loam.mjs" --help >/dev/null
-DRY_RUN_OUTPUT="$(cd "$WORKSPACE" && node "$PACKED_ROOT/bin/loam.mjs" setup --dry-run --yes 2>&1)"
+
+# Verb split: install is the first-time/repair verb; its dry-run previews without
+# creating a global root.
+DRY_RUN_OUTPUT="$(cd "$WORKSPACE" && node "$PACKED_ROOT/bin/loam.mjs" install --dry-run --yes 2>&1)"
 printf '%s\n' "$DRY_RUN_OUTPUT" | grep -Eiq 'dry.?run' || {
-  printf 'FAIL: packed dry-run did not report preview mode\n' >&2
+  printf 'FAIL: packed install dry-run did not report preview mode\n' >&2
   exit 1
 }
 [[ ! -e "$HOME_ROOT/.agents/loam" ]] || {
-  printf 'FAIL: packed dry-run created a global Loam root\n' >&2
+  printf 'FAIL: packed install dry-run created a global Loam root\n' >&2
+  exit 1
+}
+
+# update refuses on a machine with no install and points to install.
+UPDATE_OUTPUT="$(cd "$WORKSPACE" && node "$PACKED_ROOT/bin/loam.mjs" update 2>&1)" && {
+  printf 'FAIL: update with no install should exit non-zero\n' >&2
+  exit 1
+}
+printf '%s\n' "$UPDATE_OUTPUT" | grep -Eiq 'No Loam installation found' || {
+  printf 'FAIL: update with no install did not point to install\n' >&2
+  exit 1
+}
+
+# setup is the configurator; with no install it guides to install and creates nothing.
+SETUP_OUTPUT="$(cd "$WORKSPACE" && node "$PACKED_ROOT/bin/loam.mjs" setup --federation enable --dry-run 2>&1)" || true
+printf '%s\n' "$SETUP_OUTPUT" | grep -Eiq 'install' || {
+  printf 'FAIL: packed setup with no install did not guide to install\n' >&2
+  exit 1
+}
+[[ ! -e "$HOME_ROOT/.agents/loam" ]] || {
+  printf 'FAIL: packed setup grace path created a global Loam root\n' >&2
   exit 1
 }
 

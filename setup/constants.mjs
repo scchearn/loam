@@ -17,34 +17,40 @@ export const EXIT_CODES = Object.freeze({
 
 export const HELP_TEXT = `Loam CLI
 
+Three verbs, one job each:
+  npx @scchearn/loam install     First-time install; re-run repairs a same-version install.
+  npx @scchearn/loam update      Bump an existing install to this version, and nothing else.
+  npx @scchearn/loam setup       Configure an existing install: federation, integrations, harnesses.
+
 Usage:
-  npx @scchearn/loam setup
-  npx @scchearn/loam install
-  npx @scchearn/loam setup --yes
-  npx @scchearn/loam setup --dry-run
-  npx @scchearn/loam update
-  npx @scchearn/loam update --dry-run
+  npx @scchearn/loam install [--yes] [--dry-run]
+  npx @scchearn/loam update [--yes] [--dry-run]
+  npx @scchearn/loam setup [--federation enable|disable] [--integration <id>]... [--purge] [--yes] [--dry-run]
   npx @scchearn/loam doctor
-  npx @scchearn/loam uninstall
-  npx @scchearn/loam uninstall --yes
-  npx @scchearn/loam uninstall --purge
+  npx @scchearn/loam uninstall [--yes] [--purge]
   npx @scchearn/loam --help
   npx @scchearn/loam --version
 
 Commands:
-  setup       Install or reconcile global Loam skills, runtime, and integrations.
-  install     Alias for setup.
-  update      Refresh Loam skills, runtime, integrations, and marketplace plugins.
+  install     First-time installation of global Loam skills, runtime, harness
+              adapters, and shared integration. Idempotent — re-running repairs a
+              damaged install at the same version; a healthy install is a fast no-op.
+  update      Move an existing install to this package's version: skills pin,
+              runtime binary, regenerated adapters, refreshed service definitions.
+              Refuses with a hint when no install exists; changes nothing else.
+  setup       Configure an existing install without touching versions: enable or
+              disable federation and optional integrations, and select harnesses.
   doctor      Check the global Loam installation without changing it.
   uninstall   Remove global Loam skills, runtime, integration, and hook entries
               (preserves the federation profile; --purge destroys it).
 
 Options:
-  --yes       Accept changes without interactive confirmation.
-  --dry-run   Preview setup or update changes without mutation or downloads.
-  --purge     With uninstall, also destroy the federation profile (identity,
-              rosters, enrollment, registry, member cards, config.json) in the
-              config dir. Without it the profile survives a reinstall.
-  --help      Show this help without network access.
-  --version   Show the setup package version without network access.
+  --yes           Accept changes without interactive confirmation.
+  --dry-run       Preview changes without mutation or downloads.
+  --federation    With setup, enable or disable the federation connector service.
+  --integration   With setup, select an optional integration to enable (repeatable).
+  --purge         With uninstall, destroy the federation profile in the config dir.
+                  With setup --federation disable, also remove large derived caches.
+  --help          Show this help without network access.
+  --version       Show the package version without network access.
 `;

@@ -1,4 +1,4 @@
-const RECOVERY_CONTEXT = '<LOAM_IMPORTANT>\nYou have loam.\nLoam is unavailable. Recovery: npx @scchearn/loam setup\n</LOAM_IMPORTANT>';
+const RECOVERY_CONTEXT = '<LOAM_IMPORTANT>\nYou have loam.\nLoam is unavailable. Recovery: npx @scchearn/loam install\n</LOAM_IMPORTANT>';
 
 async function loadAdapter() {
   try {

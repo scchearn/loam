@@ -22,15 +22,24 @@ sessions build on each other instead of starting from scratch.
 ## Install
 
 ```bash
-npx @scchearn/loam setup
+npx @scchearn/loam install
 ```
 
-That's it. Setup installs the skills and a small native helper globally (once,
-not per project), automatically configures detected OpenCode and Cursor
+That's it. `install` installs the skills and a small native helper globally
+(once, not per project), automatically configures detected OpenCode and Cursor
 integrations, and offers to install the Loam marketplace plugin for detected
-Claude Code and Codex installations. Setup points each harness's session hooks
+Claude Code and Codex installations. It points each harness's session hooks
 straight at the private native helper and owns that registration; it never adds
-duplicate user hooks.
+duplicate user hooks. Re-running `install` repairs a damaged install at the same
+version; on a healthy install it is a fast no-op.
+
+Loam has three verbs, one job each:
+
+| Verb | Job |
+| ---- | --- |
+| `install` | First-time installation; re-run repairs a same-version install. |
+| `update`  | Bump an existing install to this version, and nothing else. |
+| `setup`   | Configure an existing install: federation, integrations, harnesses. |
 
 ### Collaboration compatibility
 
@@ -76,8 +85,10 @@ To remove everything loam installed:
 npx @scchearn/loam uninstall
 ```
 
-`install` is an alias for `setup`; `doctor` checks the installation without
-changing it. `uninstall` also removes Loam's globally installed skills.
+`setup` configures an existing install (enable/disable federation and optional
+integrations, select harnesses) without touching versions; `doctor` checks the
+installation without changing it. `uninstall` also removes Loam's globally
+installed skills.
 
 For agent-specific setup notes, see [`.opencode/INSTALL.md`](./.opencode/INSTALL.md)
 and [`.codex/INSTALL.md`](./.codex/INSTALL.md).

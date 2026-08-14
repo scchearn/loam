@@ -52,24 +52,28 @@ function runClosedStdin(command, args, options = {}) {
   });
 }
 
-test('packed setup is offline, direct-native, and preserves the legacy entry', async () => {
+test('packed install is offline, direct-native, and preserves the legacy entry', async () => {
   const fixture = await packedRoot();
   const home = await mkdtemp(join(tmpdir(), 'loam-packaged-home-'));
   const workspace = await mkdtemp(join(tmpdir(), 'loam-packaged-workspace-'));
   try {
     const env = { ...process.env, HOME: home, USERPROFILE: home };
-    const dryRun = await execFileAsync(process.execPath, [join(fixture.root, 'bin', 'loam.mjs'), 'setup', '--dry-run', '--yes'], {
+    const dryRun = await execFileAsync(process.execPath, [join(fixture.root, 'bin', 'loam.mjs'), 'install', '--dry-run', '--yes'], {
       cwd: workspace,
       env,
     });
     assert.match(`${dryRun.stdout}${dryRun.stderr}`, /dry.?run/i);
     await assert.rejects(() => readdir(join(home, '.agents')));
 
-    const update = await execFileAsync(process.execPath, [join(fixture.root, 'bin', 'loam.mjs'), 'update', '--dry-run'], {
-      cwd: workspace,
-      env,
-    });
-    assert.match(`${update.stdout}${update.stderr}`, /Loam Update \(dry-run\)/);
+    // update on a machine with no install refuses with a hint to `install`
+    // (the verb split: update bumps an EXISTING install, never a first install).
+    const update = await execFileAsync(
+      process.execPath,
+      [join(fixture.root, 'bin', 'loam.mjs'), 'update', '--dry-run'],
+      { cwd: workspace, env },
+    ).then(() => { throw new Error('update should have refused without an install'); }, (error) => error);
+    assert.equal(update.code, 1);
+    assert.match(`${update.stdout}${update.stderr}`, /No Loam installation found/);
     await assert.rejects(() => readdir(join(home, '.agents')));
 
     const integration = await readFile(join(fixture.root, 'integration', 'loam.mjs'), 'utf8');
@@ -89,7 +93,7 @@ test('packed setup is offline, direct-native, and preserves the legacy entry', a
   }
 });
 
-test('packed setup --yes exits at a controlled Skills CLI failure with closed stdin', async () => {
+test('packed install --yes exits at a controlled Skills CLI failure with closed stdin', async () => {
   const fixture = await packedRoot();
   const home = await mkdtemp(join(tmpdir(), 'loam-closed-stdin-home-'));
   const workspace = await mkdtemp(join(tmpdir(), 'loam-closed-stdin-workspace-'));
@@ -109,7 +113,7 @@ process.exit(1);
     const started = Date.now();
     const result = await runClosedStdin(
       process.execPath,
-      [join(fixture.root, 'bin', 'loam.mjs'), 'setup', '--yes'],
+      [join(fixture.root, 'bin', 'loam.mjs'), 'install', '--yes'],
       {
         cwd: workspace,
         env: {

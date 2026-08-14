@@ -22,24 +22,42 @@ test('package exposes the scoped setup executable and pinned Skills CLI', async 
   assert.match(HELP_TEXT, /@scchearn\/loam setup/);
 });
 
-test('setup accepts the confirmation and dry-run flags', () => {
+test('setup is the configurator with federation and integration flags', () => {
   assert.deepEqual(parseArgs(['setup']), {
     command: 'setup',
     dryRun: false,
     yes: false,
     purge: false,
+    federation: null,
+    integrations: [],
   });
-  assert.deepEqual(parseArgs(['setup', '--yes', '--dry-run']), {
+  assert.deepEqual(parseArgs(['setup', '--yes', '--dry-run', '--federation', 'enable']), {
     command: 'setup',
     dryRun: true,
     yes: true,
     purge: false,
+    federation: 'enable',
+    integrations: [],
+  });
+  assert.deepEqual(parseArgs(['setup', '--federation', 'disable', '--integration', 'qmd', '--integration', 'grep', '--purge']), {
+    command: 'setup',
+    dryRun: false,
+    yes: false,
+    purge: true,
+    federation: 'disable',
+    integrations: ['qmd', 'grep'],
   });
 });
 
-test('install aliases setup and doctor is a supported command', () => {
+test('--federation rejects a value that is not enable or disable', () => {
+  assert.throws(() => parseArgs(['setup', '--federation', 'maybe']), UsageError);
+  assert.throws(() => parseArgs(['setup', '--federation']), UsageError);
+  assert.throws(() => parseArgs(['setup', '--integration']), UsageError);
+});
+
+test('install is a distinct command (not an alias) and doctor is supported', () => {
   assert.deepEqual(parseArgs(['install']), {
-    command: 'setup',
+    command: 'install',
     dryRun: false,
     yes: false,
     purge: false,
@@ -50,6 +68,9 @@ test('install aliases setup and doctor is a supported command', () => {
     yes: false,
     purge: false,
   });
+  // Configurator value flags belong to setup only.
+  assert.throws(() => parseArgs(['install', '--federation', 'enable']), UsageError);
+  assert.throws(() => parseArgs(['update', '--integration', 'qmd']), UsageError);
 });
 
 test('update is a supported setup mode with dry-run', () => {

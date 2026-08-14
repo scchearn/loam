@@ -16,6 +16,7 @@ import { discover } from '../setup/discovery.mjs';
 import { verifyInstallation } from '../setup/verify.mjs';
 import { detectTarget, runtimePath } from '../setup/target.mjs';
 import { uninstall } from '../setup/uninstall.mjs';
+import { federationDefinitionPath } from '../setup/federation.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 const target = detectTarget();
@@ -82,7 +83,7 @@ async function baseFixture() {
 test('harvest_packaging: fresh install stages every harvest module and the harvest worker', async () => {
   const fixture = await baseFixture();
   const capture = outputCapture();
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     output: capture.output,
@@ -112,9 +113,9 @@ test('harvest_packaging: fresh install stages every harvest module and the harve
 test('harvest_packaging: upgrade stages harvest modules idempotently and final verification passes', async () => {
   const fixture = await baseFixture();
   const first = outputCapture();
-  await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, output: first.output, errorOutput: first.output });
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: first.output, errorOutput: first.output });
   const second = outputCapture();
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     output: second.output,
@@ -130,7 +131,7 @@ test('harvest_packaging: upgrade stages harvest modules idempotently and final v
 test('clean --yes setup completes and publishes verified install metadata', async () => {
   const fixture = await baseFixture();
   const capture = outputCapture();
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     output: capture.output,
@@ -151,9 +152,9 @@ test('clean --yes setup completes and publishes verified install metadata', asyn
 
 test('complete ready rerun is local-only and does not call Skills CLI or download', async () => {
   const fixture = await baseFixture();
-  await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
   const capture = outputCapture();
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     releaseBaseUrl: 'file:///missing-release',
@@ -168,7 +169,7 @@ test('complete ready rerun is local-only and does not call Skills CLI or downloa
 
 test('update refreshes a ready installation without prompting', async () => {
   const fixture = await baseFixture();
-  await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
   const metadataPath = join(fixture.home, '.agents', 'loam', 'install.json');
   const previous = JSON.parse(await readFile(metadataPath, 'utf8'));
   let skillAdds = 0;
@@ -194,7 +195,7 @@ test('update refreshes a ready installation without prompting', async () => {
 
 test('setup reconciles an install from an older plugin version', async () => {
   const fixture = await baseFixture();
-  await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
   const metadataPath = join(fixture.home, '.agents', 'loam', 'install.json');
   const previous = JSON.parse(await readFile(metadataPath, 'utf8'));
   const databasePath = join(fixture.home, '.agents', 'loam', 'loam.sqlite3');
@@ -202,7 +203,7 @@ test('setup reconciles an install from an older plugin version', async () => {
   await writeFile(metadataPath, JSON.stringify({ ...previous, plugin_version: '0.0.0' }));
 
   const capture = outputCapture();
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     output: capture.output,
@@ -237,7 +238,7 @@ test('marketplace-owned Claude and Codex satisfy readiness with the Codex agent 
   await writeFile(join(codexCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
   const capture = outputCapture();
 
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     output: capture.output,
@@ -286,7 +287,7 @@ test('failed setup restores a pre-existing Codex agent profile collision', async
   await writeFile(profilePath, original);
 
   let observedManagedProfile = false;
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     beforeActivate: async () => {
@@ -315,7 +316,7 @@ test('setup verifies an updated marketplace plugin from disk instead of trusting
   }));
   const capture = outputCapture();
 
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     output: capture.output,
@@ -342,7 +343,7 @@ test('setup --yes installs a missing Codex plugin in one pass', async () => {
     return { code: 0, stdout: '', stderr: '' };
   };
 
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     runner,
@@ -387,7 +388,7 @@ test('partial marketplace failure keeps successful installs and removes legacy h
     return fixture.runner(request);
   };
 
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     runner,
@@ -405,7 +406,7 @@ test('partial marketplace failure keeps successful installs and removes legacy h
 test('dry-run is valid and byte-stable without creating roots, backups, or invoking mutators', async () => {
   const fixture = await baseFixture();
   const capture = outputCapture();
-  const code = await runSetup(parseArgs(['setup', '--dry-run']), {
+  const code = await runSetup(parseArgs(['install', '--dry-run']), {
     ...fixture,
     packageRoot,
     runner: async () => { throw new Error('dry-run invoked Skills CLI'); },
@@ -420,6 +421,9 @@ test('dry-run is valid and byte-stable without creating roots, backups, or invok
 
 test('update dry-run is valid without mutation or confirmation', async () => {
   const fixture = await baseFixture();
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  const metadataPath = join(fixture.home, '.agents', 'loam', 'install.json');
+  const before = await readFile(metadataPath, 'utf8');
   const capture = outputCapture();
   const code = await runSetup(parseArgs(['update', '--dry-run']), {
     ...fixture,
@@ -432,13 +436,31 @@ test('update dry-run is valid without mutation or confirmation', async () => {
 
   assert.equal(code, 0, capture.text());
   assert.match(capture.text(), /Loam Update \(dry-run\)/);
+  // Dry run mutates nothing: the install metadata is byte-identical afterward.
+  assert.equal(await readFile(metadataPath, 'utf8'), before);
+});
+
+test('update refuses on a machine with no install and points to install', async () => {
+  const fixture = await baseFixture();
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['update']), {
+    ...fixture,
+    packageRoot,
+    runner: async () => { throw new Error('update with no install invoked Skills CLI'); },
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+
+  assert.equal(code, 1);
+  assert.match(capture.text(), /No Loam installation found/);
+  assert.match(capture.text(), /install` first/);
   await assert.rejects(() => readdir(join(fixture.home, '.agents')));
 });
 
 test('Skills CLI failure prevents readiness and install metadata publication', async () => {
   const fixture = await baseFixture();
   const capture = outputCapture();
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     runner: async (request) => {
@@ -456,7 +478,7 @@ test('Skills CLI failure prevents readiness and install metadata publication', a
 test('closed non-interactive setup cancels before mutation without --yes', async () => {
   const fixture = await baseFixture();
   const capture = outputCapture();
-  const code = await runSetup(parseArgs(['setup']), {
+  const code = await runSetup(parseArgs(['install']), {
     ...fixture,
     packageRoot,
     confirm: async () => false,
@@ -473,7 +495,7 @@ test('managed harness failure prevents the setup transaction from claiming readi
   await mkdir(join(fixture.home, '.claude'), { recursive: true });
   await writeFile(join(fixture.home, '.claude', 'settings.json'), JSON.stringify({ managed: true }));
   const capture = outputCapture();
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     output: capture.output,
@@ -493,7 +515,7 @@ test('marketplace failure cannot mask policy-owned legacy hook cleanup', async (
     ? { code: 1, stdout: '', stderr: 'plugin failed' }
     : fixture.runner(request);
 
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     runner,
@@ -523,7 +545,7 @@ test('migration failure preserves the global installation without publishing met
     }
     return { code: 1, stdout: '', stderr: 'project remove failed' };
   };
-  const code = await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, runner, output: outputCapture().output });
+  const code = await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, runner, output: outputCapture().output });
 
   assert.equal(code, 1);
   await assert.rejects(() => readFile(join(fixture.home, '.agents', 'loam', 'install.json')));
@@ -532,7 +554,7 @@ test('migration failure preserves the global installation without publishing met
 
 test('interrupted runtime smoke cleans staging and publishes no metadata', async () => {
   const fixture = await baseFixture();
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     smokeRunner: async () => ({ code: 1, stdout: '', stderr: 'controlled smoke failure' }),
@@ -553,7 +575,7 @@ test('final verification failure restores the previous install metadata', async 
   await mkdir(globalRoot, { recursive: true });
   await writeFile(join(globalRoot, 'install.json'), previous);
 
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     finalVerify: async () => ({ ready: false, category: 'controlled-final-failure' }),
@@ -567,7 +589,7 @@ test('final verification failure restores the previous install metadata', async 
 test('candidate metadata remains inactive during the activation boundary', async () => {
   const fixture = await baseFixture();
   let observed;
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     beforeActivate: async ({ metadataPath, integrationPath }) => {
@@ -586,7 +608,7 @@ test('candidate metadata remains inactive during the activation boundary', async
 
 test('failed later setup stages preserve the active integration and metadata', async () => {
   const fixture = await baseFixture();
-  await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
   const globalRoot = join(fixture.home, '.agents', 'loam');
   const metadataPath = join(globalRoot, 'install.json');
   const previous = await readFile(metadataPath, 'utf8');
@@ -594,7 +616,7 @@ test('failed later setup stages preserve the active integration and metadata', a
   await writeFile(previousMetadata.integration_path, 'previous integration');
   await writeFile(runtimePath(globalRoot, '0.9.1', target), 'tampered runtime');
 
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     finalVerify: async () => ({ ready: false, category: 'controlled-later-failure' }),
@@ -625,7 +647,7 @@ async function readyHarnessFixture() {
     }
     return { code: 0, stdout: '', stderr: '' };
   };
-  await runSetup(parseArgs(['setup', '--yes']), { ...fixture, packageRoot, runner, output: outputCapture().output });
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, runner, output: outputCapture().output });
   const discovery = await discover({
     home: fixture.home,
     workspace: fixture.workspace,
@@ -693,7 +715,7 @@ test('failed post-harness setup restores every active harness mutation', async (
   const beforeClaudeEntries = await readdir(join(fixture.home, '.claude'));
   const beforeCursorEntries = await readdir(join(fixture.home, '.cursor'));
 
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     finalVerify: async () => ({ ready: false, category: 'controlled-post-harness-failure' }),
@@ -712,7 +734,7 @@ test('failed fresh harness setup removes originally absent harness files', async
   await mkdir(join(fixture.home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(fixture.home, '.claude'), { recursive: true });
   await mkdir(join(fixture.home, '.cursor'), { recursive: true });
-  const code = await runSetup(parseArgs(['setup', '--yes']), {
+  const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
     finalVerify: async () => ({ ready: false, category: 'controlled-fresh-harness-failure' }),
@@ -723,4 +745,148 @@ test('failed fresh harness setup removes originally absent harness files', async
   await assert.rejects(() => readFile(join(fixture.home, '.config', 'opencode', 'plugins', 'loam.js')), { code: 'ENOENT' });
   await assert.rejects(() => readFile(join(fixture.home, '.claude', 'settings.json')), { code: 'ENOENT' });
   await assert.rejects(() => readFile(join(fixture.home, '.cursor', 'hooks.json')), { code: 'ENOENT' });
+});
+
+// --- Verb-boundary contract tests: #100 (service refresh) and #97 (safe update)
+
+// A recording federation runner that models the runtime's file-based definition:
+// install writes the platform unit under the global root, uninstall removes it,
+// status reflects the enabled flag. Lets update's #100 refresh be asserted.
+function fedRunner(globalRoot, platform, { active = false } = {}) {
+  const definitionPath = federationDefinitionPath({ globalRoot, platform });
+  const state = { active };
+  const calls = [];
+  const runner = async (request) => {
+    const verb = request.args[2];
+    calls.push({ verb, runtimePath: request.runtimePath });
+    if (verb === 'install' && definitionPath) {
+      await mkdir(join(globalRoot, definitionPath.includes('launchagents') ? 'launchagents' : 'systemd'), { recursive: true });
+      await writeFile(definitionPath, 'unit');
+      return { code: 0, stdout: '', stderr: '' };
+    }
+    if (verb === 'enable') { state.active = true; return { code: 0, stdout: '', stderr: '' }; }
+    if (verb === 'status') return { code: state.active ? 0 : 1, stdout: '', stderr: '' };
+    return { code: 0, stdout: '', stderr: '' };
+  };
+  return { runner, calls, definitionPath, state };
+}
+
+test('#100: update refreshes an existing service definition against the committed runtime', async () => {
+  const fixture = await baseFixture();
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  const globalRoot = join(fixture.home, '.agents', 'loam');
+  const definitionPath = federationDefinitionPath({ globalRoot, platform: process.platform });
+  if (!definitionPath) return; // win32: no file-based definition to refresh.
+
+  // Simulate federation having been enabled (an active definition exists).
+  const fed = fedRunner(globalRoot, process.platform, { active: true });
+  await mkdir(join(globalRoot, definitionPath.includes('launchagents') ? 'launchagents' : 'systemd'), { recursive: true });
+  await writeFile(definitionPath, 'stale');
+
+  const install = JSON.parse(await readFile(join(globalRoot, 'install.json'), 'utf8'));
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['update']), {
+    ...fixture,
+    packageRoot,
+    federationRunner: fed.runner,
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+  assert.equal(code, 0, capture.text());
+  // The definition was re-rendered (status -> install) and re-enabled (was active),
+  // every verb targeting the committed runtime path.
+  const verbs = fed.calls.map((c) => c.verb);
+  assert.ok(verbs.includes('install'), 'update must re-render the definition');
+  assert.ok(verbs.includes('enable'), 'an active service is re-enabled after the refresh');
+  for (const call of fed.calls) assert.equal(call.runtimePath, install.runtime_path);
+  await assert.doesNotReject(() => readFile(definitionPath));
+});
+
+test('#100: update never CREATES federation state on a machine that never enabled it', async () => {
+  const fixture = await baseFixture();
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  const globalRoot = join(fixture.home, '.agents', 'loam');
+  const fed = fedRunner(globalRoot, process.platform);
+
+  const code = await runSetup(parseArgs(['update']), {
+    ...fixture,
+    packageRoot,
+    federationRunner: fed.runner,
+    output: outputCapture().output,
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(fed.calls, [], 'no definition present → update leaves federation entirely alone');
+});
+
+test('#97: a failed final verification names the failing check instead of a bare message', async () => {
+  const fixture = await baseFixture();
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['update']), {
+    ...fixture,
+    packageRoot,
+    finalVerify: async () => ({
+      ready: false,
+      install: { plugin_version: PACKAGE_VERSION },
+      skills: { ready: false, category: 'skills_missing' },
+      runtime: { ready: true },
+      harnesses: {},
+      ingestExclusions: { ready: true },
+      migration: { ready: true },
+    }),
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+  assert.equal(code, 1);
+  assert.match(capture.text(), /Final readiness verification failed: .*skills \(skills_missing\)/);
+});
+
+test('#97: a failed update does not destroy the install root, registry, or metadata', async () => {
+  const fixture = await baseFixture();
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  const globalRoot = join(fixture.home, '.agents', 'loam');
+  const metadataPath = join(globalRoot, 'install.json');
+  const registryPath = join(globalRoot, 'loam.sqlite3');
+  await writeFile(registryPath, 'enrollment row + federation registry');
+  const before = await readFile(metadataPath, 'utf8');
+
+  const code = await runSetup(parseArgs(['update']), {
+    ...fixture,
+    packageRoot,
+    finalVerify: async () => ({ ready: false, category: 'controlled-update-failure' }),
+    output: outputCapture().output,
+  });
+
+  assert.equal(code, 1);
+  // Rollback blast radius is contained: the install root, the registry, and the
+  // previous metadata all survive a failed update (#97).
+  await assert.doesNotReject(() => readFile(join(globalRoot, 'install.json')));
+  assert.equal(await readFile(registryPath, 'utf8'), 'enrollment row + federation registry');
+  assert.equal(await readFile(metadataPath, 'utf8'), before);
+});
+
+test('setup harness reconciliation delegates without moving versions (touches no versions)', async () => {
+  const { runConfigure } = await import('../setup/configure.mjs');
+  const fixture = await baseFixture();
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  const metadataPath = join(fixture.home, '.agents', 'loam', 'install.json');
+  const before = JSON.parse(await readFile(metadataPath, 'utf8'));
+
+  const capture = outputCapture();
+  const code = await runConfigure(
+    { command: 'setup', federation: null, integrations: [], dryRun: false, yes: false, purge: false },
+    {
+      ...fixture,
+      packageRoot,
+      select: async () => ({ harnesses: [] }),
+      output: capture.output,
+      errorOutput: capture.output,
+    },
+  );
+  assert.equal(code, 0, capture.text());
+  assert.match(capture.text(), /Harness selection reconciled/);
+  const after = JSON.parse(await readFile(metadataPath, 'utf8'));
+  // The configurator never bumps versions — the whole point of the verb split.
+  assert.equal(after.plugin_version, before.plugin_version);
+  assert.equal(after.runtime_version, before.runtime_version);
 });
