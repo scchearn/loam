@@ -232,3 +232,30 @@ test('wake pulls the drained render (delta + tip) and injects it with the SDK sh
   await captured();
   await poll(() => inputs.length === 3);
 });
+
+test('the first transform registers the wake server even when the render is empty', async () => {
+  // Registration must not be hostage to a contentful first render: a session
+  // whose first getContext returns empty (failed hook, quiet federation) must
+  // still open its wake listener, or it can never be woken for the whole session.
+  const root = await mkdtemp(join(tmpdir(), 'loam-wake-empty-'));
+  await writeFile(join(root, 'install.json'), JSON.stringify({ integration_path: '/nonexistent' }));
+
+  let registered = null;
+  const plugin = await createOpenCodeAdapter({
+    client: { session: { promptAsync: async () => ({}) } },
+    // Every render is empty — the failed-spawn / quiet-federation case.
+    getContext: async () => '',
+    wakeServer: async ({ sessionId }) => {
+      registered = { sessionId };
+      return { wakeRef: 'notify-tcp://127.0.0.1:0', registered: true, close: async () => {} };
+    },
+  })({ directory: '/workspace' });
+
+  const output = { messages: [{ info: { role: 'user', sessionID: 'sess-empty' }, parts: [{ type: 'text', text: 'prompt' }] }] };
+  await plugin['experimental.chat.messages.transform']({}, output);
+  await poll(() => registered !== null);
+
+  assert.deepEqual(registered, { sessionId: 'sess-empty' }, 'the wake server opens against the session even with an empty render');
+  // The empty render still injects nothing — the context gate governs only the prepend.
+  assert.equal(output.messages[0].parts.length, 1, 'an empty render prepends no context');
+});

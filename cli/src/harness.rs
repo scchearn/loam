@@ -1624,8 +1624,11 @@ mod tests {
             assert_eq!(body, "", "degraded/unenrolled tool boundary must be empty");
         }
 
-        // UserPromptSubmit keeps its current behavior: it always renders the
-        // federation section, even when the pool is empty.
+        // UserPromptSubmit is the dashboard, not a tool boundary: it always
+        // renders the federation section, and for an enrolled workspace it renders
+        // AT LEAST the status line even when the drain came back empty or
+        // unregistered. A fully-empty per-turn would be indistinguishable from
+        // loam being absent, so it never happens for an enrolled workspace.
         let body = compose_body(
             &paths,
             &config,
@@ -1633,7 +1636,33 @@ mod tests {
             HookEvent::UserPromptSubmit,
             Some(empty),
         );
+        assert!(
+            !body.is_empty(),
+            "an enrolled per-turn is never fully empty"
+        );
         assert!(body.contains("## Federation"), "{body}");
+        assert!(
+            body.contains("federation: live · project: loam · items: 0"),
+            "an empty drain still renders the status line:\n{body}"
+        );
+
+        // The unregistered/degraded drain also renders a non-empty section — the
+        // degraded line stands in for the status line, never nothing.
+        let degraded = compose_body(
+            &paths,
+            &config,
+            &frame,
+            HookEvent::UserPromptSubmit,
+            Some(Federation::Degraded("connector_unreachable")),
+        );
+        assert!(
+            !degraded.is_empty(),
+            "a degraded per-turn is never fully empty"
+        );
+        assert!(
+            degraded.contains("federation: degraded (connector_unreachable)"),
+            "a degraded drain still names its state:\n{degraded}"
+        );
     }
 
     #[test]

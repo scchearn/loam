@@ -260,17 +260,19 @@ export function createOpenCodeAdapter({
       if (!output?.messages?.length) return;
       const firstUser = output.messages.find((message) => message.info?.role === 'user');
       if (!firstUser?.parts?.length) return;
-      const event = sessionStarted ? 'UserPromptSubmit' : 'SessionStart';
-      const context = await getContext({ harness: 'opencode', workspace: directory || process.cwd(), integrationPath, event });
-      if (!context) return;
-      if (!sessionStarted) {
+      const workspace = directory || process.cwd();
+      const isFirst = !sessionStarted;
+      if (isFirst) {
         // First fire of this adapter instance is the SessionStart boundary.
         // OpenCode does not emit session.created for the main session, so the
         // notify listener opens here: once per plugin instance, registered
-        // against the session id carried on the first user message.
+        // against the session id carried on the first user message. This runs
+        // UNCONDITIONALLY, before the context gate below — registration must not
+        // be hostage to a contentful render, or a session whose very first
+        // render is empty (a failed hook spawn, an unregistered drain, a quiet
+        // federation) would never register and never wake, permanently.
         sessionStarted = true;
         const childId = firstUser.info?.sessionID || firstUser.info?.session_id;
-        const workspace = directory || process.cwd();
         loamWake.sessionId = typeof childId === 'string' ? childId : null;
         void (async () => {
           try {
@@ -285,6 +287,11 @@ export function createOpenCodeAdapter({
           }
         })();
       }
+      const event = isFirst ? 'SessionStart' : 'UserPromptSubmit';
+      const context = await getContext({ harness: 'opencode', workspace, integrationPath, event });
+      // The context gate governs only what gets injected. An empty render skips
+      // the prepend but never the registration above.
+      if (!context) return;
       const reference = firstUser.parts[0];
       firstUser.parts.unshift({ ...reference, type: 'text', text: context });
     },
