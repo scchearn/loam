@@ -51,7 +51,7 @@ function qmdToolRunner(globalRoot, { installCode = 0, versionCode = 0, installSt
       calls.push([command, ...args].join(' '));
       if (args.includes('install')) {
         if (installCode === 0) {
-          const bin = managedBinPath(globalRoot, 'qmd', 'linux');
+          const bin = managedBinPath(globalRoot, 'qmd', 'qmd', 'linux');
           await mkdir(join(bin, '..'), { recursive: true });
           await writeFile(bin, '#!/bin/sh\necho qmd\n');
           await chmod(bin, 0o755);
@@ -83,7 +83,7 @@ test('grep enable registers a correctly-typed remote MCP in every configured har
   assert.match(codex, /\[mcp_servers\.grep\]/);
   assert.match(codex, /url = 'https:\/\/mcp\.grep\.app'/);
   // No tool prefix created.
-  await assert.rejects(() => stat(managedToolsPrefix(fx.globalRoot)));
+  await assert.rejects(() => stat(managedToolsPrefix(fx.globalRoot, 'qmd')));
 });
 
 test('qmd enable installs into the managed prefix, verifies, then registers a local MCP with the absolute path', async () => {
@@ -96,7 +96,7 @@ test('qmd enable installs into the managed prefix, verifies, then registers a lo
   assert.ok(tool.calls.some((c) => c.includes('install') && c.includes('@tobilu/qmd')));
   assert.ok(tool.calls.some((c) => c.includes('--version')));
 
-  const bin = managedBinPath(fx.globalRoot, 'qmd', 'linux');
+  const bin = managedBinPath(fx.globalRoot, 'qmd', 'qmd', 'linux');
   const opencode = await readJson(join(fx.home, '.config', 'opencode', 'opencode.json'));
   assert.deepEqual(opencode.mcp.qmd, { type: 'local', command: [bin, 'mcp'], enabled: true });
   const claude = await readJson(join(fx.home, '.claude.json'));
@@ -118,7 +118,7 @@ test('a failed tool install is classified, registers no MCP, rolls back, and lea
   await assert.rejects(() => readFile(join(fx.home, '.claude.json')));
   await assert.rejects(() => readFile(join(fx.home, '.codex', 'config.toml')));
   // Managed prefix rolled back.
-  await assert.rejects(() => stat(managedToolsPrefix(fx.globalRoot)));
+  await assert.rejects(() => stat(managedToolsPrefix(fx.globalRoot, 'qmd')));
 });
 
 test('an existing user-owned MCP entry is neither duplicated nor overwritten', async () => {
@@ -181,7 +181,7 @@ test('disable is symmetric: deregisters everywhere, removes the managed tool, ve
   const capture = outputCapture();
   const tool = qmdToolRunner(fx.globalRoot);
   await catalogEntry('qmd').enable(ctxFor(fx, capture, { toolRunner: tool.runner }));
-  await assert.doesNotReject(() => stat(managedBinPath(fx.globalRoot, 'qmd', 'linux')));
+  await assert.doesNotReject(() => stat(managedBinPath(fx.globalRoot, 'qmd', 'qmd', 'linux')));
 
   const off = await catalogEntry('qmd').disable(ctxFor(fx, outputCapture().output ? outputCapture() : capture, { toolRunner: tool.runner }));
   assert.equal(off.ready, true);
@@ -200,7 +200,7 @@ test('disable is symmetric: deregisters everywhere, removes the managed tool, ve
       assert.equal(bucket?.qmd, undefined, `${harness} still has qmd`);
     }
   }
-  await assert.rejects(() => stat(managedToolsPrefix(fx.globalRoot)), 'managed tool removed');
+  await assert.rejects(() => stat(managedToolsPrefix(fx.globalRoot, 'qmd')), 'managed tool removed');
   const ledger = await readLedger(fx.globalRoot);
   assert.equal(ledger.integrations.qmd, undefined, 'ledger entry cleared');
 });
@@ -220,7 +220,7 @@ test('round-trip enable -> disable -> enable converges with no residue', async (
   assert.equal(on1.result.ready, true, on1.text);
   const off = await run('disable');
   assert.equal(off.result.ready, true, off.text);
-  await assert.rejects(() => stat(managedToolsPrefix(fx.globalRoot)));
+  await assert.rejects(() => stat(managedToolsPrefix(fx.globalRoot, 'qmd')));
   const on2 = await run('enable');
   assert.equal(on2.result.ready, true, on2.text);
   const opencode = await readJson(join(fx.home, '.config', 'opencode', 'opencode.json'));
@@ -262,7 +262,62 @@ test('dry-run enable writes no config and installs nothing', async () => {
   assert.equal(result.ready, true);
   assert.equal(tool.calls.length, 0, 'dry-run installs nothing');
   await assert.rejects(() => readFile(join(fx.home, '.claude.json')));
-  await assert.rejects(() => stat(managedToolsPrefix(fx.globalRoot)));
+  await assert.rejects(() => stat(managedToolsPrefix(fx.globalRoot, 'qmd')));
   const ledger = await readLedger(fx.globalRoot);
   assert.equal(ledger.integrations.qmd, undefined, 'dry-run records nothing');
+});
+
+// --- Review fixes ---------------------------------------------------------
+
+test('disable with no ledger record is a no-op and never deletes a user-owned entry', async () => {
+  const fx = await installedHome({ harnesses: ['claude'] });
+  // The user has their OWN qmd MCP; loam never enabled the integration (no ledger).
+  await writeFile(join(fx.home, '.claude.json'), JSON.stringify({
+    mcpServers: { qmd: { type: 'stdio', command: '/usr/local/bin/qmd', args: ['mcp'] } },
+  }));
+  const capture = outputCapture();
+  const result = await catalogEntry('qmd').disable(ctxFor(fx, capture, { env: { PATH: '' } }));
+  assert.equal(result.ready, true, capture.text());
+  assert.equal(result.noop, true, 'no ledger → success no-op');
+  // The user's entry survives untouched.
+  const claude = await readJson(join(fx.home, '.claude.json'));
+  assert.deepEqual(claude.mcpServers.qmd, { type: 'stdio', command: '/usr/local/bin/qmd', args: ['mcp'] });
+  assert.match(capture.text(), /user-owned|not enabled by loam/);
+});
+
+test('disabling one tool-backed integration leaves another integration\'s managed tool intact', async () => {
+  const { enableIntegration, disableIntegration } = await import('../setup/integrations/registrar.mjs');
+  const fx = await installedHome({ harnesses: ['opencode'] });
+
+  // Two synthetic tool-backed entries with distinct ids/bins. A per-id runner
+  // writes each id's own managed bin, proving prefixes are isolated.
+  const makeRunner = (id, binName) => async ({ args = [] }) => {
+    if (args.includes('install')) {
+      const bin = managedBinPath(fx.globalRoot, id, binName, 'linux');
+      await mkdir(join(bin, '..'), { recursive: true });
+      await writeFile(bin, '#!/bin/sh\necho ok\n');
+      await chmod(bin, 0o755);
+      return { code: 0, stdout: '', stderr: '' };
+    }
+    if (args.includes('--version')) return { code: 0, stdout: `${binName} 1\n`, stderr: '' };
+    return { code: 0, stdout: '', stderr: '' };
+  };
+  const entryFor = (id, binName, pkg) => ({
+    id, label: id, capability: 'x', mcpName: id,
+    tool: { pkg, binName, healthArgs: ['--version'] },
+    descriptor: (toolPath) => ({ transport: 'local', command: toolPath, args: ['mcp'] }),
+  });
+  const alpha = entryFor('alpha', 'alpha', '@x/alpha');
+  const beta = entryFor('beta', 'beta', '@x/beta');
+  const baseCtx = (extra) => ctxFor(fx, outputCapture(), { env: { PATH: '' }, ...extra });
+
+  assert.equal((await enableIntegration(alpha, baseCtx({ toolRunner: makeRunner('alpha', 'alpha') }))).ready, true);
+  assert.equal((await enableIntegration(beta, baseCtx({ toolRunner: makeRunner('beta', 'beta') }))).ready, true);
+  await assert.doesNotReject(() => stat(managedBinPath(fx.globalRoot, 'alpha', 'alpha', 'linux')));
+  await assert.doesNotReject(() => stat(managedBinPath(fx.globalRoot, 'beta', 'beta', 'linux')));
+
+  // Disable alpha — beta's tool must survive (blast radius scoped to alpha).
+  assert.equal((await disableIntegration(alpha, baseCtx({}))).ready, true);
+  await assert.rejects(() => stat(managedBinPath(fx.globalRoot, 'alpha', 'alpha', 'linux')), 'alpha tool removed');
+  await assert.doesNotReject(() => stat(managedBinPath(fx.globalRoot, 'beta', 'beta', 'linux')), 'beta tool survives');
 });

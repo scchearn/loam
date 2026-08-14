@@ -69,11 +69,11 @@ export async function enableIntegration(entry, ctx) {
   if (entry.tool) {
     if (dryRun) {
       // Preview only — no resolution spawn, no install, no download.
-      toolPath = managedBinPath(globalRoot, entry.tool.binName, discovery.platform);
+      toolPath = managedBinPath(globalRoot, entry.id, entry.tool.binName, discovery.platform);
       toolRecord = { managed: true, pkg: entry.tool.pkg, path: toolPath };
       stepDetail(output, `would install ${entry.tool.pkg} into the loam-managed prefix (or use a pre-existing ${entry.tool.binName} on PATH)`);
     } else {
-      const resolved = await resolveTool({ globalRoot, binName: entry.tool.binName, healthArgs: entry.tool.healthArgs, runner: ctx.toolRunner, platform: discovery.platform, env: ctx.env });
+      const resolved = await resolveTool({ globalRoot, id: entry.id, binName: entry.tool.binName, healthArgs: entry.tool.healthArgs, runner: ctx.toolRunner, platform: discovery.platform, env: ctx.env });
       if (resolved.present) {
         toolPath = resolved.path;
         toolRecord = { managed: resolved.managed, pkg: entry.tool.pkg, path: resolved.path };
@@ -81,6 +81,7 @@ export async function enableIntegration(entry, ctx) {
       } else {
         const installed = await installNodeTool({
           pkg: entry.tool.pkg,
+          id: entry.id,
           binName: entry.tool.binName,
           healthArgs: entry.tool.healthArgs,
           globalRoot,
@@ -88,9 +89,9 @@ export async function enableIntegration(entry, ctx) {
           platform: discovery.platform,
         });
         if (!installed.ready) {
-          // Roll back partial state and register NO MCP; the caller continues with
-          // other integrations.
-          await removeManagedTool({ globalRoot });
+          // Roll back only THIS integration's managed prefix and register NO MCP;
+          // the caller continues with other integrations.
+          await removeManagedTool({ globalRoot, id: entry.id });
           return { ready: false, category: installed.category, detail: installed.detail };
         }
         toolPath = installed.path;
@@ -149,7 +150,7 @@ export async function verifyIntegration(entry, ctx) {
   }
   let tool = { present: true, managed: false };
   if (entry.tool) {
-    tool = await resolveTool({ globalRoot: discovery.globalRoot, binName: entry.tool.binName, healthArgs: entry.tool.healthArgs, runner: ctx.toolRunner, platform: discovery.platform, env: ctx.env });
+    tool = await resolveTool({ globalRoot: discovery.globalRoot, id: entry.id, binName: entry.tool.binName, healthArgs: entry.tool.healthArgs, runner: ctx.toolRunner, platform: discovery.platform, env: ctx.env });
   }
   return { ready: true, id: entry.id, tool, registered };
 }
@@ -162,9 +163,24 @@ export async function disableIntegration(entry, ctx) {
   const home = discovery.home;
   const ledger = await readLedger(globalRoot);
   const owned = ownedRecord(ledger, entry.id);
-  // Deregister exactly the harnesses loam recorded (never a user-owned entry);
-  // fall back to the target set when there is no ledger (defensive cleanup).
-  const harnesses = owned?.mcp ? Object.keys(owned.mcp) : targetHarnesses(ctx);
+
+  // No ledger record → loam never enabled this integration, so there is nothing
+  // of loam's to reverse. Deregistering by name here would delete a user's OWN
+  // same-name MCP entry and falsely report a clean disable — exactly what the
+  // ledger-as-ownership doctrine forbids. Report a success no-op and leave every
+  // config untouched, surfacing any same-name entries as user-owned.
+  if (!owned) {
+    for (const harness of targetHarnesses(ctx)) {
+      if ((await detectMcpEntry({ harness, home, name: entry.mcpName })).present) {
+        stepDetail(output, `${harness}: an existing ${entry.mcpName} MCP is user-owned — left untouched`);
+      }
+    }
+    stepDetail(output, `${entry.id} was not enabled by loam — nothing to disable`);
+    return { ready: true, noop: true };
+  }
+
+  // Deregister exactly the harnesses loam recorded (never a user-owned entry).
+  const harnesses = Object.keys(owned.mcp || {});
 
   if (dryRun) {
     for (const harness of harnesses) stepDetail(output, `would deregister ${entry.mcpName} MCP from ${harness}`);
@@ -184,7 +200,7 @@ export async function disableIntegration(entry, ctx) {
   // Remove the tool only if loam installed it (managed); a pre-existing PATH tool
   // is never touched.
   if (owned?.tool?.managed) {
-    await removeManagedTool({ globalRoot });
+    await removeManagedTool({ globalRoot, id: entry.id });
     stepDone(output, `removed the loam-managed ${entry.tool?.binName || 'tool'}`);
   }
 
@@ -223,7 +239,7 @@ export async function disableIntegration(entry, ctx) {
     }
   }
   if (owned?.tool?.managed) {
-    try { await stat(managedBinPath(globalRoot, entry.tool.binName, discovery.platform)); leftovers.push({ kind: 'tool', path: entry.tool.binName }); }
+    try { await stat(managedBinPath(globalRoot, entry.id, entry.tool.binName, discovery.platform)); leftovers.push({ kind: 'tool', path: entry.tool.binName }); }
     catch {}
   }
 

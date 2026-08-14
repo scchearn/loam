@@ -13,17 +13,19 @@ import { delimiter, join } from 'node:path';
 
 const DEFAULT_TIMEOUT_MS = 180_000;
 
-// A loam-owned npm prefix under the global root. Tools installed here are
-// loam-owned; uninstall/disable removes this tree, a pre-existing PATH tool is
-// never touched.
-export function managedToolsPrefix(globalRoot) {
-  return join(globalRoot, 'integrations', 'tools');
+// A loam-owned npm prefix, PER INTEGRATION, under the global root. Scoping the
+// prefix to the integration id keeps blast radius exact: removing (or failing to
+// install) one tool-backed integration never touches another's binary. Tools
+// installed here are loam-owned; a pre-existing PATH tool is never installed here
+// and never removed.
+export function managedToolsPrefix(globalRoot, id) {
+  return join(globalRoot, 'integrations', 'tools', id);
 }
 
-// The absolute path to a managed bin. npm writes shims to node_modules/.bin;
-// Windows npm shims are `.cmd`.
-export function managedBinPath(globalRoot, binName, platform = process.platform) {
-  const base = join(managedToolsPrefix(globalRoot), 'node_modules', '.bin', binName);
+// The absolute path to a managed bin for an integration. npm writes shims to
+// node_modules/.bin; Windows npm shims are `.cmd`.
+export function managedBinPath(globalRoot, id, binName, platform = process.platform) {
+  const base = join(managedToolsPrefix(globalRoot, id), 'node_modules', '.bin', binName);
   return platform === 'win32' ? `${base}.cmd` : base;
 }
 
@@ -112,8 +114,8 @@ async function healthCheck({ binPath, healthArgs, runner, platform, timeoutMs })
 
 // Resolve a tool for an integration: managed copy first, then PATH. Returns
 // { present, managed, path, version } or { present:false }.
-export async function resolveTool({ globalRoot, binName, healthArgs = ['--version'], runner = defaultRunner, platform = process.platform, timeoutMs, env = process.env } = {}) {
-  const managed = managedBinPath(globalRoot, binName, platform);
+export async function resolveTool({ globalRoot, id, binName, healthArgs = ['--version'], runner = defaultRunner, platform = process.platform, timeoutMs, env = process.env } = {}) {
+  const managed = managedBinPath(globalRoot, id, binName, platform);
   if (await isExecutable(managed, platform)) {
     const health = await healthCheck({ binPath: managed, healthArgs, runner, platform, timeoutMs });
     if (health.ok) return { present: true, managed: true, path: managed, version: health.version };
@@ -131,6 +133,7 @@ export async function resolveTool({ globalRoot, binName, healthArgs = ['--versio
 // Returns { ready, managed, path, version } or { ready:false, category, detail }.
 export async function installNodeTool({
   pkg,
+  id,
   binName,
   healthArgs = ['--version'],
   globalRoot,
@@ -138,7 +141,7 @@ export async function installNodeTool({
   platform = process.platform,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 } = {}) {
-  const prefix = managedToolsPrefix(globalRoot);
+  const prefix = managedToolsPrefix(globalRoot, id);
   await mkdir(prefix, { recursive: true });
   const { command, prefixArgs } = npmInvocation(platform);
   const install = await runner({
@@ -151,7 +154,7 @@ export async function installNodeTool({
   if (!install || install.code !== 0) {
     return { ready: false, category: classifyInstallFailure(install), detail: (install?.stderr || install?.category || 'npm install failed').trim() };
   }
-  const binPath = managedBinPath(globalRoot, binName, platform);
+  const binPath = managedBinPath(globalRoot, id, binName, platform);
   if (!(await isExecutable(binPath, platform))) {
     return { ready: false, category: 'health-check-failed', detail: `installed but ${binName} binary is missing at ${binPath}` };
   }
@@ -162,10 +165,11 @@ export async function installNodeTool({
   return { ready: true, managed: true, path: binPath, version: health.version };
 }
 
-// Remove the managed tool tree (uninstall/disable). Only ever removes loam's own
-// prefix; a pre-existing PATH tool is never here. Returns { removed }.
-export async function removeManagedTool({ globalRoot } = {}) {
-  const prefix = managedToolsPrefix(globalRoot);
+// Remove ONE integration's managed tool tree (uninstall/disable). Scoped to the
+// integration id, so removing one never touches another's binary; a pre-existing
+// PATH tool is never here. Returns { removed }.
+export async function removeManagedTool({ globalRoot, id } = {}) {
+  const prefix = managedToolsPrefix(globalRoot, id);
   try {
     await stat(prefix);
   } catch {
