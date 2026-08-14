@@ -550,3 +550,31 @@ test('uninstall blocks while a background worker lease is live', async () => {
   assert.equal(code, 1);
   assert.equal(await exists(globalRoot), true);
 });
+
+test('uninstall removes loam-owned integration MCP entries and leaves user-owned ones', async () => {
+  const { home, globalRoot } = await readyFixture();
+  // A loam-owned grep MCP + a user-owned one, recorded in the ledger as ours=grep only.
+  await writeFile(join(home, '.claude.json'), JSON.stringify({
+    mcpServers: {
+      grep: { type: 'http', url: 'https://mcp.grep.app' },
+      mine: { type: 'http', url: 'https://user.example/mine' },
+    },
+  }));
+  await writeFile(join(globalRoot, 'integrations.json'), JSON.stringify({
+    integrations: { grep: { mcp: { claude: 'grep' }, tool: null } },
+  }));
+
+  const code = await uninstall({
+    home,
+    globalRoot,
+    yes: true,
+    runner: skillsRunner(),
+    output: { write: () => {} },
+  });
+  assert.equal(code, 0);
+  // .claude.json survives (it's outside the global root); loam-owned grep gone,
+  // user-owned mine preserved.
+  const claudeJson = JSON.parse(await readFile(join(home, '.claude.json'), 'utf8'));
+  assert.equal(claudeJson.mcpServers.grep, undefined, 'loam-owned grep MCP removed');
+  assert.deepEqual(claudeJson.mcpServers.mine, { type: 'http', url: 'https://user.example/mine' }, 'user-owned MCP preserved');
+});

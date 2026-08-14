@@ -255,3 +255,32 @@ test('federation enable rolls back a newly-installed service that cannot be veri
   assert.ok(calls.includes('uninstall'), 'a newly-created but unverifiable service is rolled back');
   await assert.rejects(() => stat(definitionPath));
 });
+
+test('setup --integration grep registers the MCP and --disable-integration grep removes it', async () => {
+  const fixture = await installedFixture();
+  // Give the install a set of configured harnesses to register into.
+  const metadataPath = join(fixture.globalRoot, 'install.json');
+  const install = JSON.parse(await readFile(metadataPath, 'utf8'));
+  await writeFile(metadataPath, JSON.stringify({ ...install, configured_harnesses: ['claude', 'codex', 'opencode', 'cursor'] }));
+
+  const capture = outputCapture();
+  const on = await runConfigure(
+    { command: 'setup', federation: null, integrations: ['grep'], disableIntegrations: [], dryRun: false, yes: true, purge: false },
+    { home: fixture.home, workspace: fixture.workspace, packageRoot, platform: 'linux', output: capture.output, errorOutput: capture.output },
+  );
+  assert.equal(on, 0, capture.text());
+  const claude = JSON.parse(await readFile(join(fixture.home, '.claude.json'), 'utf8'));
+  assert.deepEqual(claude.mcpServers.grep, { type: 'http', url: 'https://mcp.grep.app' });
+  const codex = await readFile(join(fixture.home, '.codex', 'config.toml'), 'utf8');
+  assert.match(codex, /\[mcp_servers\.grep\]/);
+
+  const offCapture = outputCapture();
+  const off = await runConfigure(
+    { command: 'setup', federation: null, integrations: [], disableIntegrations: ['grep'], dryRun: false, yes: true, purge: false },
+    { home: fixture.home, workspace: fixture.workspace, packageRoot, platform: 'linux', output: offCapture.output, errorOutput: offCapture.output },
+  );
+  assert.equal(off, 0, offCapture.text());
+  const claudeAfter = JSON.parse(await readFile(join(fixture.home, '.claude.json'), 'utf8'));
+  assert.equal(claudeAfter.mcpServers.grep, undefined, 'grep MCP deregistered from claude');
+  await assert.doesNotMatch(await readFile(join(fixture.home, '.codex', 'config.toml'), 'utf8').catch(() => ''), /\[mcp_servers\.grep\]/);
+});

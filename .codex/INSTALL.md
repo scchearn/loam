@@ -101,3 +101,27 @@ never runs while another worker holds it. The harvest agent's own turn ends
 are never re-harvested. Check `harvest-status --workspace <path> --json`
 through the installed integration to inspect per-session cursors, the wiki
 cache, last run, and the shared lease.
+
+## Optional integrations
+
+Loam skills are better with companion tools, but never require them (soft
+dependency — a skill degrades gracefully when a tool is absent). Enable them
+per install with the configurator, off by default:
+
+```bash
+npx @scchearn/loam setup --integration grep    # grep.app code search (remote MCP; queries egress to a public-repo index)
+npx @scchearn/loam setup --integration qmd     # QMD markdown search (local Node tool + local MCP; no egress)
+```
+
+`setup` installs any needed tool into a loam-managed prefix, verifies it, then
+registers the MCP into each configured harness using the tool's absolute path.
+Disable is symmetric and complete:
+
+```bash
+npx @scchearn/loam setup --disable-integration qmd            # deregister everywhere + remove the loam-managed tool
+npx @scchearn/loam setup --disable-integration qmd --purge    # also remove large derived caches (e.g. QMD's ~2–3GB model cache)
+```
+
+Loam never installs a tool or registers an MCP you did not select, and never
+removes a user-owned MCP entry or a tool it did not install. `doctor` reports
+per-integration state without failing.

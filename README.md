@@ -93,6 +93,26 @@ installed skills.
 For agent-specific setup notes, see [`.opencode/INSTALL.md`](./.opencode/INSTALL.md)
 and [`.codex/INSTALL.md`](./.codex/INSTALL.md).
 
+### Optional integrations
+
+Loam skills are better with companion tools — code search for API verification,
+markdown search over the wiki — but never require them (a skill degrades
+gracefully when the tool is absent). They are opt-in, off by default, and
+managed by the configurator:
+
+```bash
+npx @scchearn/loam setup --integration grep          # grep.app code search (remote MCP; queries egress to a public-repo index)
+npx @scchearn/loam setup --integration qmd           # QMD markdown search (local Node tool + local MCP; no egress)
+npx @scchearn/loam setup --disable-integration qmd   # symmetric disable: deregister everywhere + remove the loam-managed tool
+```
+
+Enabling installs any needed tool into a loam-managed prefix, verifies it, then
+registers the MCP into each configured harness (Claude Code, Codex, OpenCode,
+Cursor) using the tool's absolute path. Disable reverses every step and verifies
+absence; `--purge` also removes large derived caches (e.g. QMD's ~2–3GB model
+cache, kept by default). Loam never touches a user-owned MCP entry or a tool it
+did not install.
+
 ### Background session harvest
 
 Background session-learning harvest is enabled by default: on every turn end
@@ -224,7 +244,7 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::resuming | 376 | 77 | 142 | 1,807 |
 | loam::setting-goals | 473 | 101 | 184 | 1,850 |
 | loam::starting | 166 | 34 | 357 | 4,991 |
-| loam::writing-spec | 332 | 66 | 252 | 2,892 |
+| loam::writing-spec | 332 | 66 | 253 | 3,002 |
 <!-- END skill-metrics -->
 
 ## Documentation

@@ -13,6 +13,8 @@ import { runSkills } from './process.mjs';
 import { announce, confirmUninstall, finish } from './wizard.mjs';
 import { removeMarketplacePlugins } from './marketplace.mjs';
 import { removeFederationService } from './federation.mjs';
+import { readLedger } from './integrations/ledger.mjs';
+import { catalogEntry } from './integrations/catalog.mjs';
 
 const codexAgentMarker = '# Managed by @scchearn/loam setup.';
 
@@ -416,6 +418,26 @@ export async function uninstall({
       await rm(opencodePath, { force: true });
       results.opencode = { path: opencodePath, action: 'removed' };
     }
+  }
+
+  // Remove loam-owned optional-integration state that lives OUTSIDE the global
+  // root: MCP entries in each harness config, and large derived caches (offered
+  // by --purge). The managed tool prefix under the global root is removed with
+  // the root below. Only loam-owned entries (recorded in the ledger) are touched;
+  // user-owned MCP entries and pre-existing tools are left intact.
+  results.integrations = {};
+  const ledger = await readLedger(root);
+  for (const id of Object.keys(ledger.integrations)) {
+    const entry = catalogEntry(id);
+    if (!entry) continue;
+    results.integrations[id] = await entry.disable({
+      discovery: { globalRoot: root, home, platform: process.platform, harnesses: {} },
+      install,
+      dryRun: false,
+      purge,
+      input,
+      output,
+    });
   }
 
   // Stop/disable and remove the Loam-owned native connector definition through

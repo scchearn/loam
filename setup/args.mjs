@@ -18,8 +18,9 @@ const FLAGS_BY_COMMAND = {
 };
 
 // setup value flags (configurator): --federation enable|disable, repeatable
-// --integration <id>. Parsed positionally as `<flag> <value>`.
-const SETUP_VALUE_FLAGS = new Set(['--federation', '--integration']);
+// --integration <id> (enable) and --disable-integration <id>. Parsed positionally
+// as `<flag> <value>`.
+const SETUP_VALUE_FLAGS = new Set(['--federation', '--integration', '--disable-integration']);
 
 export function parseArgs(argv) {
   const args = [...argv];
@@ -44,7 +45,8 @@ export function parseArgs(argv) {
   const parsed = { command, dryRun: false, yes: false, purge: false };
   if (command === 'setup') {
     parsed.federation = null; // null | 'enable' | 'disable'
-    parsed.integrations = [];
+    parsed.integrations = []; // ids to enable
+    parsed.disableIntegrations = []; // ids to disable
   }
 
   const rest = args.slice(1);
@@ -61,6 +63,8 @@ export function parseArgs(argv) {
           throw new UsageError(`--federation expects enable or disable, got: ${value}`);
         }
         parsed.federation = value;
+      } else if (flag === '--disable-integration') {
+        parsed.disableIntegrations.push(value);
       } else {
         parsed.integrations.push(value);
       }

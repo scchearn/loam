@@ -1,5 +1,6 @@
 import { discover } from './discovery.mjs';
 import { verifyInstallation } from './verify.mjs';
+import { CATALOG } from './integrations/catalog.mjs';
 
 function detail(check) {
   return check?.detail || check?.message || check?.category || '';
@@ -42,6 +43,21 @@ export async function runDoctor(options = {}) {
     report(output, 'Native runtime', result.runtime);
     for (const [id, harness] of Object.entries(result.harnesses)) report(output, `${id} integration`, harness);
     report(output, 'Workspace migration', result.migration);
+
+    // Optional integrations: informational only — an absent integration is a
+    // choice, never a failure, so this section never affects the exit code.
+    if (result.install) {
+      output.write('Optional integrations (informational):\n');
+      for (const entry of CATALOG) {
+        const state = await entry.verify({ discovery, install: result.install, runner: options.runner });
+        const harnessBits = Object.entries(state.registered).map(([id, on]) => `${id}:${on ? 'yes' : 'no'}`).join(' ');
+        const toolBit = entry.tool
+          ? `tool ${state.tool?.present ? `present (${state.tool.managed ? 'loam-managed' : 'PATH'})` : 'absent'}`
+          : 'no tool';
+        output.write(`  ${entry.id} (${entry.capability}): ${toolBit}; MCP ${harnessBits || 'no harness'}\n`);
+      }
+    }
+
     output.write(`Result: ${result.ready ? 'ready' : 'not ready'}\n`);
     return result.ready ? 0 : 1;
   } catch (error) {

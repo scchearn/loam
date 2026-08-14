@@ -1,23 +1,59 @@
-// The optional-integrations catalog seam.
+import { join } from 'node:path';
+
+import { enableIntegration, disableIntegration, verifyIntegration } from './registrar.mjs';
+
+// The optional-integrations catalog (spec: loam-optional-integrations). Each
+// entry is DATA over the shared registrar engine (registrar.mjs), which owns the
+// install→verify→register / symmetric-disable / absence-verify lifecycle. Adding
+// a future entry is data-only; the configurator iterates this array unchanged.
 //
-// Unit A ships this as a declared-but-EMPTY registry. Unit B implements
-// `loam-optional-integrations` (QMD, grep.app, …) by adding entries here — the
-// configurator (setup/configure.mjs) already iterates the catalog to enable and
-// disable entries, so Unit B is additive: no configurator changes required to
-// wire a new entry, only a catalog entry that satisfies the contract below.
-//
-// Contract every entry must satisfy (pinned by tests/integrations-catalog.test.mjs):
+// Entry contract (pinned by tests/integrations-catalog.test.mjs):
 //   id         string   stable, unique, kebab-case identifier (the --integration value)
 //   label      string   human name for wizard copy
 //   capability string   the loam capability it serves (e.g. 'code-search')
-//   enable     async ({ discovery, install, dryRun, harnesses, runner, output }) => { ready, category?, detail?, rollback? }
-//   disable    async ({ discovery, install, dryRun, purge, harnesses, runner, output }) => { ready, category?, detail?, leftovers? }
-//   verify     async ({ discovery, install, harnesses, runner }) => { ready, present, registered, detail? }
+//   enable     async (ctx) => { ready, category?, detail?, registered? }
+//   disable    async (ctx) => { ready, category?, detail?, leftovers?, caches? }
+//   verify     async (ctx) => { ready, tool, registered }
 //
-// Symmetric-disable is part of the contract: `disable` must reverse everything
-// `enable` did (MCP deregistration across every harness, managed-tool removal,
-// loam-written config entries), and `verify` must be able to confirm absence.
-export const CATALOG = [];
+// Symmetric-disable is part of the contract: disable reverses everything enable
+// did (MCP deregistration across every harness, managed-tool removal), verify
+// confirms absence, and large derived caches are offered (default keep, --purge).
+
+function makeEntry(spec) {
+  return {
+    ...spec,
+    enable: (ctx) => enableIntegration(spec, ctx),
+    disable: (ctx) => disableIntegration(spec, ctx),
+    verify: (ctx) => verifyIntegration(spec, ctx),
+  };
+}
+
+export const CATALOG = [
+  makeEntry({
+    // Remote MCP, no tool. grep.app indexes public GitHub repos for fast code
+    // search. Privacy: queries egress to a third-party public-repo index — the
+    // opt-in selection is the consent boundary (wizard copy states it).
+    id: 'grep',
+    label: 'grep.app code search',
+    capability: 'code-search',
+    egress: true,
+    mcpName: 'grep',
+    descriptor: { transport: 'remote', url: 'https://mcp.grep.app' },
+  }),
+  makeEntry({
+    // Local Node tool + local stdio MCP. Fully local, no egress. First query
+    // auto-downloads ~2–3GB of GGUF models to ~/.cache/qmd/models (a large
+    // derived cache offered on disable).
+    id: 'qmd',
+    label: 'QMD markdown search',
+    capability: 'markdown-search',
+    egress: false,
+    mcpName: 'qmd',
+    tool: { pkg: '@tobilu/qmd', binName: 'qmd', healthArgs: ['--version'] },
+    descriptor: (toolPath) => ({ transport: 'local', command: toolPath, args: ['mcp'] }),
+    caches: [{ label: 'QMD model cache', path: (home) => join(home, '.cache', 'qmd', 'models') }],
+  }),
+];
 
 // Lookup by id. Returns undefined for an unknown id so callers can report a
 // precise "unknown integration" error instead of silently ignoring it.
@@ -26,7 +62,7 @@ export function catalogEntry(id) {
 }
 
 // Required shape of a catalog entry — used by the seam contract test and by the
-// configurator's defensive validation so a malformed Unit B entry fails loud.
+// configurator's defensive validation so a malformed entry fails loud.
 export const CATALOG_ENTRY_CONTRACT = Object.freeze({
   fields: Object.freeze(['id', 'label', 'capability']),
   methods: Object.freeze(['enable', 'disable', 'verify']),

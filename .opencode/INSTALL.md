@@ -87,7 +87,7 @@ cache, last run, and the shared lease.
 
 ## Troubleshooting
 
-1. Rerun `npx @scchearn/loam setup --dry-run` to inspect readiness and paths.
+1. Rerun `npx @scchearn/loam install --dry-run` to inspect readiness and paths.
 2. Confirm global skill inventory with `npx skills list --global`.
 3. Confirm the user-level OpenCode plugin path is writable and restart OpenCode.
 4. If an existing clone is incomplete, remove its registration after setup or
@@ -101,3 +101,27 @@ When skills reference Claude Code tools:
 - `Task` with subagents → `@mention` syntax
 - `Skill` tool → OpenCode's native `skill` tool
 - File operations → your native tools
+
+## Optional integrations
+
+Loam skills are better with companion tools, but never require them (soft
+dependency — a skill degrades gracefully when a tool is absent). Enable them
+per install with the configurator, off by default:
+
+```bash
+npx @scchearn/loam setup --integration grep    # grep.app code search (remote MCP; queries egress to a public-repo index)
+npx @scchearn/loam setup --integration qmd     # QMD markdown search (local Node tool + local MCP; no egress)
+```
+
+`setup` installs any needed tool into a loam-managed prefix, verifies it, then
+registers the MCP into each configured harness using the tool's absolute path.
+Disable is symmetric and complete:
+
+```bash
+npx @scchearn/loam setup --disable-integration qmd            # deregister everywhere + remove the loam-managed tool
+npx @scchearn/loam setup --disable-integration qmd --purge    # also remove large derived caches (e.g. QMD's ~2–3GB model cache)
+```
+
+Loam never installs a tool or registers an MCP you did not select, and never
+removes a user-owned MCP entry or a tool it did not install. `doctor` reports
+per-integration state without failing.

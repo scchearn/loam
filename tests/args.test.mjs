@@ -30,6 +30,7 @@ test('setup is the configurator with federation and integration flags', () => {
     purge: false,
     federation: null,
     integrations: [],
+    disableIntegrations: [],
   });
   assert.deepEqual(parseArgs(['setup', '--yes', '--dry-run', '--federation', 'enable']), {
     command: 'setup',
@@ -38,6 +39,7 @@ test('setup is the configurator with federation and integration flags', () => {
     purge: false,
     federation: 'enable',
     integrations: [],
+    disableIntegrations: [],
   });
   assert.deepEqual(parseArgs(['setup', '--federation', 'disable', '--integration', 'qmd', '--integration', 'grep', '--purge']), {
     command: 'setup',
@@ -46,6 +48,16 @@ test('setup is the configurator with federation and integration flags', () => {
     purge: true,
     federation: 'disable',
     integrations: ['qmd', 'grep'],
+    disableIntegrations: [],
+  });
+  assert.deepEqual(parseArgs(['setup', '--disable-integration', 'qmd', '--purge']), {
+    command: 'setup',
+    dryRun: false,
+    yes: false,
+    purge: true,
+    federation: null,
+    integrations: [],
+    disableIntegrations: ['qmd'],
   });
 });
 

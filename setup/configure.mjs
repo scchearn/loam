@@ -9,7 +9,7 @@ import {
   verifyFederationService,
 } from './federation.mjs';
 import { catalogEntry, CATALOG } from './integrations/catalog.mjs';
-import { announce, finish, stepStart, stepDone, confirmAction } from './wizard.mjs';
+import { announce, finish, stepStart, stepDone, stepDetail, confirmAction } from './wizard.mjs';
 
 // `setup` is the configurator for an EXISTING install: it toggles federation and
 // optional integrations, and selects harnesses. It never installs or updates
@@ -141,11 +141,21 @@ async function configureIntegration(id, mode, { discovery, install, parsed, opti
     purge: parsed.purge,
     harnesses: discovery.harnesses,
     runner: options.runner,
+    // Tool install/health spawns go through toolRunner (injected in tests, real
+    // spawn in production); the cache-removal prompt uses confirm/input.
+    toolRunner: options.toolRunner,
+    confirm: options.integrationConfirm,
+    input: options.input,
     output,
   };
+  if (mode === 'enable' && entry.egress) {
+    stepDetail(output, `${entry.label} sends queries to a third-party service (egress) — enabling is your consent.`);
+  }
   const result = mode === 'enable' ? await entry.enable(ctx) : await entry.disable(ctx);
   if (!result?.ready) {
-    const leftovers = result?.leftovers?.length ? ` — leftovers: ${result.leftovers.join(', ')}` : '';
+    const leftovers = result?.leftovers?.length
+      ? ` — leftovers: ${result.leftovers.map((l) => l.harness ? `${l.kind}:${l.harness}` : (l.path || l.kind)).join(', ')}`
+      : '';
     errorOutput.write(`Integration ${id} ${mode} failed: ${result?.detail || result?.category || 'unknown'}${leftovers}\n`);
     return { ok: false };
   }
@@ -204,25 +214,28 @@ export async function runConfigure(parsed, options = {}) {
     const install = await readInstall(discovery.globalRoot);
     if (!install) return graceNoInstall(parsed, discovery, options);
 
-    // Decide what to do. Flag-driven when any component flag is present;
-    // otherwise interactive. `--yes` alone (no component flags) is a no-op.
-    const hasComponentFlags = parsed.federation !== null || (parsed.integrations?.length > 0);
+    // The integration actions to apply, as {id, mode}. Flag-driven from
+    // --integration (enable) and --disable-integration (disable).
+    let integrationActions = [
+      ...(parsed.integrations || []).map((id) => ({ id, mode: 'enable' })),
+      ...(parsed.disableIntegrations || []).map((id) => ({ id, mode: 'disable' })),
+    ];
+
+    // Flag-driven when any component flag is present; otherwise interactive.
+    // `--yes` alone (no component flags) is a no-op.
+    const hasComponentFlags = parsed.federation !== null || integrationActions.length > 0;
     let harnessSelection = null;
     if (!hasComponentFlags) {
       if (options.select) {
         // Injected interactive selection (tests / future clack menu). Shape:
         // { federation?: 'enable'|'disable', integrations?: [{id, mode}], harnesses?: string[] }.
         const chosen = await options.select({ install, discovery });
-        parsed = {
-          ...parsed,
-          federation: chosen?.federation ?? null,
-          integrations: (chosen?.integrations || []).map((i) => i.id),
-          integrationModes: Object.fromEntries((chosen?.integrations || []).map((i) => [i.id, i.mode])),
-        };
+        parsed = { ...parsed, federation: chosen?.federation ?? null };
+        integrationActions = (chosen?.integrations || []).map((i) => ({ id: i.id, mode: i.mode || 'enable' }));
         harnessSelection = Array.isArray(chosen?.harnesses) ? chosen.harnesses : null;
       } else {
         finish(output, 'Nothing to configure',
-          'pass --federation enable|disable or --integration <id> (or run interactively)');
+          'pass --federation enable|disable, --integration <id>, or --disable-integration <id> (or run interactively)');
         return 0;
       }
     }
@@ -237,8 +250,7 @@ export async function runConfigure(parsed, options = {}) {
       const result = await configureFederation(parsed.federation, { discovery, install, parsed, options });
       ok = ok && result.ok;
     }
-    for (const id of parsed.integrations || []) {
-      const mode = parsed.integrationModes?.[id] || 'enable';
+    for (const { id, mode } of integrationActions) {
       const result = await configureIntegration(id, mode, { discovery, install, parsed, options });
       ok = ok && result.ok;
     }
