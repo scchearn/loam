@@ -68,6 +68,86 @@ test('LoamPlugin logs a loading breadcrumb through the opencode app logger and r
   assert.equal(typeof stillLoads.event, 'function', 'a failed breadcrumb still returns the hooks object');
 });
 
+function pollLogs(logs, message, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  return (async () => {
+    while (Date.now() < deadline) {
+      const hit = logs.find((entry) => entry?.body?.message === message);
+      if (hit) return hit;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`log "${message}" never arrived; saw: ${logs.map((e) => e?.body?.message).join(', ')}`);
+  })();
+}
+
+test('the wake-server open is instrumented: opened(port) on success, failed(err) on throw', async () => {
+  // Defect fix: the isFirst wake block used to swallow its failure whole, so a
+  // session that never woke gave no clue why. It now names the outcome in the log.
+  const logs = [];
+  const client = { app: { log: async (entry) => { logs.push(entry); } }, session: { promptAsync: async () => ({}) } };
+  const fire = (plugin, sessionID) => plugin['experimental.chat.messages.transform']({}, {
+    messages: [{ info: { role: 'user', sessionID }, parts: [{ type: 'text', text: 'p' }] }],
+  });
+
+  const okPlugin = await createOpenCodeAdapter({
+    client,
+    getContext: async () => '',
+    wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:7777', port: 7777, registered: true, close: async () => {} }),
+  })({ directory: '/workspace' });
+  await fire(okPlugin, 's1');
+  const opened = await pollLogs(logs, 'wake listener opened');
+  assert.equal(opened.body.extra.port, 7777);
+  assert.equal(opened.body.extra.registered, true);
+
+  logs.length = 0;
+  const failPlugin = await createOpenCodeAdapter({
+    client,
+    getContext: async () => '',
+    wakeServer: async () => { throw new Error('bind refused'); },
+  })({ directory: '/workspace' });
+  await fire(failPlugin, 's2');
+  const failed = await pollLogs(logs, 'wake listener failed');
+  assert.match(failed.body.extra.error, /bind refused/);
+  assert.equal(failed.body.level, 'error');
+});
+
+test('startLoamNotifyServer breadcrumbs the wake frame (hint only), register, and drop', async () => {
+  const logs = [];
+  const log = async (message, extra) => { logs.push({ message, extra }); };
+  const calls = [];
+  const notify = await startLoamNotifyServer({
+    workspace: '/workspace',
+    sessionId: 'sess-1',
+    globalRoot: '/root',
+    onWake: () => {},
+    register: async (action) => { calls.push(action); return { ok: action === 'register', code: action === 'register' ? 0 : 7 }; },
+    log,
+  });
+
+  const register = logs.find((e) => e.message === 'wake register');
+  assert.deepEqual(register.extra, { action: 'register', ok: true, exit: 0 });
+  const port = Number(notify.wakeRef.split(':').pop());
+
+  await new Promise((resolve, reject) => {
+    const socket = net.connect({ port, host: '127.0.0.1' });
+    socket.once('connect', () => { socket.write('{"kind":"loam-wake","project":"loam","hint":"01ABC"}'); socket.end(); });
+    socket.once('close', resolve);
+    socket.once('error', reject);
+  });
+  // The frame breadcrumb carries only the hint, never any body content.
+  const deadline = Date.now() + 1000;
+  let frameEntry;
+  while (Date.now() < deadline && !(frameEntry = logs.find((e) => e.message === 'wake frame'))) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(frameEntry, 'a wake frame is breadcrumbed');
+  assert.deepEqual(frameEntry.extra, { hint: '01ABC' });
+
+  await notify.close();
+  const drop = logs.find((e) => e.message === 'wake drop');
+  assert.deepEqual(drop.extra, { action: 'drop', ok: false, exit: 7 });
+});
+
 function wait(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 test('inject args: workspace is positional, never the --workspace flag the CLI rejects', () => {

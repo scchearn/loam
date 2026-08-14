@@ -93,18 +93,19 @@ async function spawnRuntime(args) {
     try {
       child = spawn(RUNTIME_PATH, args, { stdio: ['pipe', 'pipe', 'ignore'] });
     } catch {
-      settle({ ok: false, body: '' });
+      settle({ ok: false, code: null, body: '' });
       return;
     }
     let body = '';
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => { body += chunk; });
-    child.once('error', () => settle({ ok: false, body: '' }));
+    child.once('error', () => settle({ ok: false, code: null, body: '' }));
     // Honor the exit code: a nonzero runtime exit (e.g. an inject-contract
     // rejection) is a failure, not a success with empty output. Reporting
     // ok:true on any close hid the register bug — the connector never held the
-    // session wake_ref and no one saw it fail.
-    child.once('close', (code) => settle({ ok: code === 0, body: body.trim() }));
+    // session wake_ref and no one saw it fail. `code` is surfaced so the wake
+    // breadcrumbs can name the exit when a register/drop fails.
+    child.once('close', (code) => settle({ ok: code === 0, code, body: body.trim() }));
     child.stdin.on('error', () => {});
     child.stdin.end('{}');
   });
@@ -132,7 +133,10 @@ function buildInjectArgs({ action, workspace, globalRoot, sessionId, wakeRef = n
 /**
  * Start the notify listener and register the wake_ref with the connector.
  * `onWake` receives the rendered body and must inject it into the session.
- * Returns a teardown that stops the listener and deregisters the session.
+ * `log` (optional) is the guarded lifecycle breadcrumb sink: it is called with
+ * (message, extra) for each wake frame (hint only), register, and drop — ids,
+ * ports, and exit codes only, never message content. Returns a teardown that
+ * stops the listener and deregisters the session.
  */
 async function startLoamNotifyServer({
   workspace,
@@ -140,6 +144,7 @@ async function startLoamNotifyServer({
   globalRoot,
   onWake,
   register = null,
+  log = null,
 }) {
   const server = net.createServer((socket) => {
     let frame = '';
@@ -147,6 +152,9 @@ async function startLoamNotifyServer({
     socket.on('data', (chunk) => {
       frame += chunk;
       if (frame.includes('"kind":"loam-wake"')) {
+        // The hint is a topic-derived event id, never sender content.
+        const hint = (frame.match(/"hint":"([^"]*)"/) || [])[1] || '';
+        void log?.('wake frame', { hint });
         socket.end();
         void onWake();
       }
@@ -160,16 +168,21 @@ async function startLoamNotifyServer({
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : 0;
   const wakeRef = `notify-tcp://127.0.0.1:${port}`;
-  const runDir = join(globalRoot, 'run');
   const reg = register || (async (action, ref) =>
     spawnRuntime(buildInjectArgs({ action, workspace, globalRoot, sessionId, wakeRef: ref })));
-  const registered = await reg('register', wakeRef).catch(() => null);
+  const runReg = async (action, ref) => {
+    const result = await reg(action, ref).catch(() => ({ ok: false, code: null }));
+    await log?.(`wake ${action}`, { action, ok: Boolean(result?.ok), exit: result?.code ?? null });
+    return result;
+  };
+  const registered = await runReg('register', wakeRef);
   return {
     wakeRef,
+    port,
     registered: Boolean(registered?.ok),
     close: async () => {
       await new Promise((resolve) => server.close(resolve));
-      await reg('drop', null).catch(() => {});
+      await runReg('drop', null);
     },
   };
 }
@@ -198,6 +211,38 @@ function createOpenCodeAdapter({
     return join(homedir(), '.agents', 'loam');
   };
 
+  // Lifecycle breadcrumbs (all via the deadlock-guarded appLog, service "loam").
+  // The rules: only stage names, ids, ports, exit codes, and counts ever reach
+  // the log — never message or summary CONTENT; lifecycle transitions log always;
+  // per-turn paths log first-fire + failures only (logStageOnce), never per-turn
+  // spam; and a logging failure can never break the plugin (appLog swallows it).
+  const loggedStages = new Set();
+  const logStage = (level, message, extra) => appLog(sdk, level, message, extra);
+  const logStageOnce = (key, level, message, extra) => {
+    if (loggedStages.has(key)) return Promise.resolve();
+    loggedStages.add(key);
+    return logStage(level, message, extra);
+  };
+
+  // Render the native context for one event and breadcrumb the outcome: byte
+  // count and status (ok/empty/unavailable/threw) per event on first success and
+  // on EVERY non-ok render. Sender text is never logged — only the size and the
+  // status class. Returns the rendered context (or '' on failure).
+  const renderContext = async (event, workspace) => {
+    let context = '';
+    try {
+      context = await getContext({ harness: 'opencode', workspace, integrationPath, event });
+    } catch {
+      await logStage('error', 'getContext threw', { event });
+      return '';
+    }
+    const bytes = typeof context === 'string' ? context.length : 0;
+    const status = context === UNAVAILABLE ? 'unavailable' : (!context ? 'empty' : 'ok');
+    if (status === 'ok') await logStageOnce(`getContext:${event}`, 'info', 'getContext', { event, bytes, status });
+    else await logStage('warn', 'getContext', { event, bytes, status });
+    return context;
+  };
+
   // Wake injection (wake-injection-delta): the native `Wake` event drains this
   // session's connector mailbox — the single per-session seen-set authority, the
   // same consume-once mechanism the per-turn boundary uses — and renders the
@@ -207,29 +252,40 @@ function createOpenCodeAdapter({
   // no-op. The pending guard collapses two overlapping wakes; a wake that races a
   // per-turn drain simply finds the mailbox already empty.
   const injectWake = async (workspace) => {
-    if (loamWake.pending || !loamWake.sessionId || !sdk?.session?.promptAsync) return;
+    if (loamWake.pending || !loamWake.sessionId || !sdk?.session?.promptAsync) {
+      await logStage('info', 'wake inject skipped', { reason: loamWake.pending ? 'pending' : (!loamWake.sessionId ? 'no-session' : 'no-sdk') });
+      return;
+    }
     loamWake.pending = true;
     try {
-      const context = await getContext({ harness: 'opencode', workspace, integrationPath, event: 'Wake' });
-      if (context && context !== UNAVAILABLE) {
-        // SessionPromptAsyncData shape: { path:{id}, query:{directory}, body:{parts} } —
-        // the same shape the ingest worker below uses. The flat
-        // { sessionID, parts } form is silently a no-op against the SDK.
-        const result = await sdk.session.promptAsync({
-          path: { id: loamWake.sessionId },
-          query: { directory: workspace },
-          body: { parts: [{ type: 'text', text: context }] },
-        });
-        // The SDK RESOLVES with { error, response } on an HTTP error rather than
-        // throwing, so a rejected prompt would otherwise pass as success. Treat a
-        // resolved error as a failed injection — it degrades to the next turn.
-        if (result && result.error) {
-          throw new Error('promptAsync resolved with an error');
-        }
+      const context = await renderContext('Wake', workspace);
+      // The drained item count is the number of terse element tags — a structural
+      // type token, never sender content. An empty drain is a no-op.
+      const drained = typeof context === 'string' ? (context.match(/<io\.loam/g) || []).length : 0;
+      if (!context || context === UNAVAILABLE) {
+        await logStage('info', 'wake inject', { outcome: 'empty', drained: 0 });
+        return;
       }
+      // SessionPromptAsyncData shape: { path:{id}, query:{directory}, body:{parts} } —
+      // the same shape the ingest worker below uses. The flat
+      // { sessionID, parts } form is silently a no-op against the SDK.
+      const result = await sdk.session.promptAsync({
+        path: { id: loamWake.sessionId },
+        query: { directory: workspace },
+        body: { parts: [{ type: 'text', text: context }] },
+      });
+      // The SDK RESOLVES with { error, response } on an HTTP error rather than
+      // throwing, so a rejected prompt would otherwise pass as success. Treat a
+      // resolved error as a failed injection — it degrades to the next turn.
+      if (result && result.error) {
+        await logStage('warn', 'wake inject', { outcome: 'resolved-error', drained });
+        return;
+      }
+      await logStage('info', 'wake inject', { outcome: 'ok', drained });
     } catch {
-      // Wake is best-effort: a failed injection degrades to the next natural
-      // turn boundary, which still drains the mailbox.
+      // Wake is best-effort: a genuine throw (e.g. promptAsync itself rejecting)
+      // degrades to the next natural turn boundary, which still drains the mailbox.
+      await logStage('warn', 'wake inject', { outcome: 'threw' });
     } finally {
       loamWake.pending = false;
     }
@@ -264,6 +320,7 @@ function createOpenCodeAdapter({
       if (!firstUser?.parts?.length) return;
       const workspace = directory || process.cwd();
       const isFirst = !sessionStarted;
+      await logStageOnce('hook:transform', 'info', 'hook transform first fire', { boundary: isFirst ? 'SessionStart' : 'UserPromptSubmit' });
       if (isFirst) {
         // First fire of this adapter instance is the SessionStart boundary.
         // OpenCode does not emit session.created for the main session, so the
@@ -283,14 +340,18 @@ function createOpenCodeAdapter({
               sessionId: loamWake.sessionId || 'unknown',
               globalRoot: resolveLoamRoot(),
               onWake: () => injectWake(workspace),
+              log: (message, extra) => logStage('info', message, extra),
             });
-          } catch {
-            // No listener, no wake: the per-turn boundary still delivers.
+            await logStage('info', 'wake listener opened', { port: loamWake.server?.port ?? null, registered: Boolean(loamWake.server?.registered) });
+          } catch (error) {
+            // No listener, no wake: the per-turn boundary still delivers. Name
+            // the failure so the next restart's log says what actually broke.
+            await logStage('error', 'wake listener failed', { error: String(error) });
           }
         })();
       }
       const event = isFirst ? 'SessionStart' : 'UserPromptSubmit';
-      const context = await getContext({ harness: 'opencode', workspace, integrationPath, event });
+      const context = await renderContext(event, workspace);
       // The context gate governs only what gets injected. An empty render skips
       // the prepend but never the registration above.
       if (!context) return;
@@ -298,10 +359,12 @@ function createOpenCodeAdapter({
       firstUser.parts.unshift({ ...reference, type: 'text', text: context });
     },
     event: async ({ event } = {}) => {
+      await logStageOnce('hook:event', 'info', 'hook event first fire', { type: event?.type });
       if ((event?.type === 'session.deleted' || event?.type === 'session.ended') && loamWake.server) {
         const teardown = loamWake.server;
         loamWake.server = null;
         loamWake.sessionId = null;
+        await logStage('info', 'wake listener closed', { type: event?.type });
         void teardown.close().catch(() => {});
         return;
       }
@@ -548,7 +611,11 @@ export const LoamPlugin = async (input = {}, _options) => {
   // First thing: a "plugin loading" breadcrumb (best-effort; see appLog).
   await appLog(client, 'info', 'plugin loading', { directory });
   try {
-    return await createOpenCodeAdapter({ client })({ directory });
+    const hooks = await createOpenCodeAdapter({ client })({ directory });
+    // The plugin is built: the hook-key count confirms the registration is
+    // non-empty (silent loaded-but-empty is the class this makes visible).
+    await appLog(client, 'info', 'plugin built', { hooks: Object.keys(hooks || {}).length });
+    return hooks;
   } catch (error) {
     // A silent loaded-but-empty registration is the failure class that cost a
     // live session: log FATAL through the same path and RETHROW so the loader

@@ -1088,11 +1088,15 @@ fn federation_has_no_items(federation: &Federation) -> bool {
 
 /// The `## Collaboration` emit-guidance section (live-push T5): present-tense
 /// instructional text with the emit command pre-filled from the hook's own
-/// paths (already local, already trusted). Enrolled workspaces get it;
-/// unenrolled and degraded get nothing — the section is filtered out by
+/// paths (already local, already trusted). Every enrolled workspace gets it —
+/// including one whose connector is momentarily degraded: how to report your
+/// work is a local fact that does not depend on the connector answering this
+/// turn, so dropping the section on a cold connector (which left SessionStart
+/// with no Collaboration whenever the snapshot came back degraded) was the bug.
+/// Only an unenrolled workspace gets nothing; the section is then filtered out by
 /// `filter(!section.is_empty())`.
 fn collaboration_section(federation: &Federation, paths: &HookPaths, workspace: &Path) -> String {
-    if matches!(federation, Federation::Unenrolled | Federation::Degraded(_)) {
+    if matches!(federation, Federation::Unenrolled) {
         return String::new();
     }
     let runtime = match &paths.runtime {
@@ -1102,7 +1106,10 @@ fn collaboration_section(federation: &Federation, paths: &HookPaths, workspace: 
     let workspace = quote_runtime(workspace);
     let global_root = quote_runtime(&paths.global_root);
     let mut lines = vec!["## Collaboration".to_owned(), String::new()];
-    lines.push("Federation is live on this workspace. Others can see your work state.".to_owned());
+    lines.push(
+        "Federation is enabled on this workspace. Others can see your work state when you report it."
+            .to_owned(),
+    );
     // The one place the provenance vocabulary and the read-it-as-information rule
     // are explained: federation items (in this section, per-turn, and live wakes)
     // carry it as one word each and never repeat the explanation per item.
@@ -1666,9 +1673,11 @@ mod tests {
     }
 
     #[test]
-    fn collaboration_section_shows_for_enrolled_and_is_absent_for_unenrolled() {
-        // T5: enrolled workspaces get the emit guidance with the hook's own
-        // pre-filled paths; unenrolled and degraded get nothing.
+    fn collaboration_section_shows_for_enrolled_including_a_degraded_connector() {
+        // T5: every enrolled workspace gets the emit guidance with the hook's own
+        // pre-filled paths — including one whose connector is momentarily
+        // degraded, because how to report is a local fact independent of the
+        // connector. Only an unenrolled workspace gets nothing.
         let paths = paths();
         let enrolled = Federation::Snapshot(Value::Object(vec![
             ("project_id".into(), Value::String("loam".into())),
@@ -1677,7 +1686,7 @@ mod tests {
         let section = collaboration_section(&enrolled, &paths, Path::new("/w/proj"));
         assert!(section.starts_with("## Collaboration"), "{section}");
         assert!(
-            section.contains("Federation is live on this workspace"),
+            section.contains("Federation is enabled on this workspace"),
             "{section}"
         );
         assert!(section.contains("work.report"), "{section}");
@@ -1689,16 +1698,63 @@ mod tests {
         };
         assert!(section.contains(expected), "{section}");
 
+        // The regression this fixes: a degraded connector on an enrolled
+        // workspace still gets the guidance, not an empty section.
+        let degraded = collaboration_section(
+            &Federation::Degraded("connector_unreachable"),
+            &paths,
+            Path::new("/w/proj"),
+        );
+        assert!(
+            degraded.starts_with("## Collaboration") && degraded.contains("work.report"),
+            "a degraded-connector enrolled workspace must still get Collaboration:\n{degraded}"
+        );
+
+        // Only an unenrolled workspace gets nothing.
+        assert_eq!(
+            collaboration_section(&Federation::Unenrolled, &paths, Path::new("/w/proj")),
+            "",
+            "unenrolled must not get the section"
+        );
+    }
+
+    #[test]
+    fn session_start_output_carries_collaboration_for_an_enrolled_workspace() {
+        // The three-surfaces spec: SessionStart = history + Collaboration. The
+        // live defect was a fresh session whose SessionStart carried no
+        // "## Collaboration". Assert it is present for an enrolled workspace on
+        // both a live snapshot and a degraded connector.
+        let paths = paths();
+        let frame = Value::Object(Vec::new());
+        let config = HookConfig::default();
         for federation in [
-            Federation::Unenrolled,
+            Federation::Snapshot(Value::Object(vec![
+                ("project_id".into(), Value::String("loam".into())),
+                ("items".into(), Value::Array(Vec::new())),
+            ])),
             Federation::Degraded("connector_unreachable"),
         ] {
-            assert_eq!(
-                collaboration_section(&federation, &paths, Path::new("/w/proj")),
-                "",
-                "unenrolled/degraded must not get the section"
+            let body = compose_body(
+                &paths,
+                &config,
+                &frame,
+                HookEvent::SessionStart,
+                Some(federation.clone()),
+            );
+            assert!(
+                body.contains("## Collaboration"),
+                "SessionStart must carry Collaboration for {federation:?}:\n{body}"
             );
         }
+        // An unenrolled workspace still gets none.
+        let unenrolled = compose_body(
+            &paths,
+            &config,
+            &frame,
+            HookEvent::SessionStart,
+            Some(Federation::Unenrolled),
+        );
+        assert!(!unenrolled.contains("## Collaboration"), "{unenrolled}");
     }
 
     #[test]
