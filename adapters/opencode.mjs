@@ -508,17 +508,60 @@ function createOpenCodeAdapter({
   };
 }
 
-// This file is copied verbatim as the OpenCode plugin file, and OpenCode's
-// legacy plugin loader (`getLegacyPlugins`) iterates ALL of a plugin file's
-// module exports and calls EVERY exported function as a plugin factory —
-// e.g. `startLoamNotifyServer` throws under a plugin-shaped call. So this file
-// must export EXACTLY ONE symbol: `LoamPlugin`. Anything tests need is hung off
-// it as a property (the loader calls `LoamPlugin(input)` and ignores
-// properties). An `export-surface` contract test pins the namespace to
-// `["LoamPlugin"]`, so a future top-level export fails CI. See AGENTS.md
-// (Federation debugging).
-export const LoamPlugin = async ({ client, directory } = {}) => createOpenCodeAdapter({ client })({ directory });
+/**
+ * Best-effort breadcrumb to opencode's own app logger, so whether the plugin
+ * loaded (and why not) is answerable from the opencode log in seconds. Wrapped
+ * in try/catch because `client.app.log()` during plugin init can deadlock on
+ * some opencode versions — it can re-enter a middleware cycle before the app is
+ * ready — so the guard is load-bearing, not decorative; stderr is the fallback.
+ */
+async function appLog(client, level, message, extra) {
+  try {
+    await client?.app?.log?.({
+      body: { service: 'loam', level, message, ...(extra ? { extra } : {}) },
+    });
+  } catch {
+    const line = `[loam] ${level.toUpperCase()}: ${message}`;
+    console.error(extra ? `${line} ${JSON.stringify(extra)}` : line);
+  }
+}
+
+// This file is copied verbatim as the OpenCode plugin file. OpenCode's loader
+// prefers the V1 record shape: `readV1Plugin` detects `mod.default` as a record
+// with `id` + `server`, registers it under a real plugin identity, and never
+// reaches the legacy path. The legacy path (`getLegacyPlugins`) iterates ALL of
+// a plugin file's module exports and calls EVERY exported function as a plugin
+// factory — e.g. `startLoamNotifyServer` throws under a plugin-shaped call — so
+// even with the V1 default present, the only other export stays `LoamPlugin`,
+// and stray function exports remain banned as a legacy-path fallback hazard.
+// The `server` function is the plugin: (input, options) => plugin handlers.
+// Anything tests need is hung off `LoamPlugin` as a property (a property, not an
+// export, so no loader path can mistake it for a plugin). An `export-surface`
+// contract test pins both contracts. See the local Federation debugging notes.
+//
+// Factory-local state (childSessions, loamWake, sessionStarted, sdk) all lives
+// inside createOpenCodeAdapter and its returned closure, so an instance-disposal
+// re-run of this factory (opencode reruns it on client.config.update) rebuilds
+// that state fresh — there is no module-level per-session state to go stale.
+export const LoamPlugin = async (input = {}, _options) => {
+  const { client, directory } = input || {};
+  // First thing: a "plugin loading" breadcrumb (best-effort; see appLog).
+  await appLog(client, 'info', 'plugin loading', { directory });
+  try {
+    return await createOpenCodeAdapter({ client })({ directory });
+  } catch (error) {
+    // A silent loaded-but-empty registration is the failure class that cost a
+    // live session: log FATAL through the same path and RETHROW so the loader
+    // surfaces the failure instead of registering no hooks.
+    await appLog(client, 'error', `plugin factory failed: ${String(error)}`, { directory });
+    throw error;
+  }
+};
 
 LoamPlugin.buildInjectArgs = buildInjectArgs;
 LoamPlugin.startLoamNotifyServer = startLoamNotifyServer;
 LoamPlugin.createOpenCodeAdapter = createOpenCodeAdapter;
+
+// The V1 registration record: the preferred loader path. `id` gives the plugin
+// a stable identity; `server` is the plugin function above.
+export default { id: 'loam', server: LoamPlugin };

@@ -13,15 +13,59 @@ import { LoamPlugin } from '../adapters/opencode.mjs';
 // tests need are hung off it as properties.
 const { buildInjectArgs, createOpenCodeAdapter, startLoamNotifyServer } = LoamPlugin;
 
-test('export surface: the plugin file exports exactly one symbol (LoamPlugin)', () => {
-  // The bush-killer: OpenCode's getLegacyPlugins calls EVERY module export as a
-  // plugin factory (startLoamNotifyServer throws under such a call). Any new
-  // top-level export must fail here with this contract spelled out.
-  assert.deepEqual(
-    Object.keys(adapterModule),
-    ['LoamPlugin'],
-    'adapters/opencode.mjs must export ONLY LoamPlugin — the OpenCode loader calls every top-level export as a plugin factory. Hang helpers off LoamPlugin as properties instead.',
-  );
+test('export surface: the plugin file exposes the V1 default record and only LoamPlugin besides it', () => {
+  // Two contracts at once, both verified against the opencode plugin loader
+  // source (packages/opencode/src/plugin/shared.ts + index.ts):
+  //
+  // (1) V1 PREFERRED PATH. applyPlugin (index.ts) does:
+  //       const plugin = readV1Plugin(load.mod, load.spec, "server", "detect")
+  //       if (plugin) { await resolvePluginId(...readPluginId(plugin.id, ...));
+  //                     hooks.push(await plugin.server(input, load.options)) }
+  //     readV1Plugin (shared.ts) reads mod.default and requires isRecord(default):
+  //       const value = mod.default
+  //       if (!isRecord(value)) { if (mode === "detect") return; throw ... }
+  //       if (mode === "detect" && !("id" in value)) return
+  //       const server = "server" in value ? value.server : undefined
+  //       if (kind === "server" && server === undefined) throw ...
+  //     So the default MUST be a record { id, server } — a default FUNCTION fails
+  //     isRecord and silently falls through to the legacy path (the trap).
+  //     resolvePluginId: for source === "file", `if (id) return id; throw
+  //     "Path plugin ${spec} must export id"` — a file plugin MUST carry an id
+  //     (there is no collision handling; a unique id like "loam" is on us).
+  //     server is called (input, options) — hence LoamPlugin(input, _options).
+  //
+  // (2) LEGACY FALLBACK HAZARD. If the V1 record is ever missed, getLegacyPlugins
+  //     calls EVERY exported function as a plugin factory — startLoamNotifyServer
+  //     throws under such a call (join(undefined, run)). So besides `default`, the
+  //     ONLY export may be `LoamPlugin`; every helper stays a property, never an
+  //     export. This is why the namespace is pinned to exactly two names.
+  const contract = 'adapters/opencode.mjs must export exactly `default` (the V1 record { id: "loam", server: LoamPlugin }) and the named `LoamPlugin`, nothing else. OpenCode registers mod.default via readV1Plugin/applyPlugin (server called as server(input, options)); if it ever falls back to getLegacyPlugins it calls every top-level export as a plugin factory, so no stray function export may exist. Hang helpers off LoamPlugin as properties.';
+  // Module-namespace keys are sorted by code unit: "LoamPlugin" (0x4C) before "default" (0x64).
+  assert.deepEqual(Object.keys(adapterModule), ['LoamPlugin', 'default'], contract);
+  assert.ok(adapterModule.default && typeof adapterModule.default === 'object' && !Array.isArray(adapterModule.default), 'default must be a record (isRecord), never a function — a function default fails detection and falls through to legacy');
+  assert.equal(adapterModule.default.id, 'loam', contract);
+  assert.equal(typeof adapterModule.default.server, 'function', contract);
+  assert.equal(adapterModule.default.server, adapterModule.LoamPlugin, 'the V1 server must be the LoamPlugin function');
+});
+
+test('LoamPlugin logs a loading breadcrumb through the opencode app logger and returns hooks', async () => {
+  // Whether the plugin loaded is answerable from the opencode log: the server
+  // logs "plugin loading" before building the adapter, and still returns the
+  // hooks object. A best-effort log failure must never block loading.
+  const logs = [];
+  const client = { app: { log: async (entry) => { logs.push(entry); } } };
+  const plugin = await LoamPlugin({ client, directory: '/workspace' });
+  assert.equal(typeof plugin['experimental.chat.messages.transform'], 'function', 'the server returns the hooks object');
+
+  const loading = logs.find((entry) => entry?.body?.message === 'plugin loading');
+  assert.ok(loading, 'a plugin-loading breadcrumb is logged');
+  assert.equal(loading.body.service, 'loam');
+  assert.equal(loading.body.level, 'info');
+  assert.deepEqual(loading.body.extra, { directory: '/workspace' });
+
+  // A throwing/absent app logger must not break loading (the guard is load-bearing).
+  const stillLoads = await LoamPlugin({ client: { app: { log: async () => { throw new Error('deadlock'); } } }, directory: '/workspace' });
+  assert.equal(typeof stillLoads.event, 'function', 'a failed breadcrumb still returns the hooks object');
 });
 
 function wait(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
