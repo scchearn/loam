@@ -51,6 +51,14 @@ mTLS cert — the machine mints its own keypair + CSR, nothing travels by hand:
   renewal-hooks deploy hook that re-copies them + restarts the signer on every
   certificate rotation (~90 days) — the signer never breaks when certbot
   renews.
+- Copies the org CA's `ca.crt` + `ca.key` into `${ENROLL_DIR}/ca/` (key
+  `0640 root:loam-enroll`) because `${PKI_DIR}/private/` is root-only. The
+  signer keeps using the authoritative `${PKI_DIR}` OpenSSL database, granting
+  it ACL access only to the database paths needed for atomic issuance; manual
+  `pki/issue-client.sh` and auto-enrollment therefore share one serial/index
+  history rather than diverging. OpenSSL also needs directory write access for
+  its temporary/backup database files; the signer ACL grants that on `${PKI_DIR}`
+  while the CA private directory remains inaccessible.
 - Binds `ENROLL_BIND_ADDRESS` (default `0.0.0.0` — the port is public);
   rate-limits per client (default 10 per 60s against the spec's
   brute-force-on-public-port threat); verifies the password in constant time;

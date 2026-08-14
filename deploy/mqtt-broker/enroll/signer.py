@@ -49,6 +49,9 @@ class Config:
         self.bind_address = os.environ.get("ENROLL_BIND_ADDRESS", "0.0.0.0")
         self.cert_file = os.environ.get("ENROLL_CERT_FILE", "")
         self.key_file = os.environ.get("ENROLL_KEY_FILE", "")
+        self.openssl_config = os.environ.get(
+            "ENROLL_OPENSSL_CONFIG", os.path.join(self.pki_dir, "openssl.cnf")
+        )
         # Requests per client per window; a burst above this is 429.
         self.rate_limit = int(os.environ.get("ENROLL_RATE_LIMIT", "10"))
         self.rate_window = float(os.environ.get("ENROLL_RATE_WINDOW_SECONDS", "60"))
@@ -100,7 +103,7 @@ def sign_csr(config: Config, csr_pem: str) -> bytes:
         with open(csr_path, "w", encoding="ascii") as handle:
             handle.write(csr_pem)
 
-        openssl_cnf = os.path.join(config.pki_dir, "openssl.cnf")
+        openssl_cnf = config.openssl_config
         # The deploy's CA config signs the subject verbatim and, via
         # copy_extensions = copy, carries the CSR's SAN into the cert. The
         # config is authoritative; we never synthesize a subject.

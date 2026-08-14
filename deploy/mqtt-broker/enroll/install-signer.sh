@@ -11,6 +11,12 @@
 # (key 0640 root:loam-enroll) and a certbot renewal-hooks deploy hook re-copies
 # them + restarts the signer on certificate rotation (~90 days).
 #
+# The org CA private directory is likewise root-only. Install copies ca.crt and
+# ca.key into $ENROLL_DIR/ca/; the signer uses those copies while sharing the
+# authoritative CA database under $PKI_DIR. Only that database's index, serial,
+# and newcerts paths are made writable by loam-enroll, so manual issue-client.sh
+# and auto-enrollment share one issuance history.
+#
 # usage: install-signer.sh [install|uninstall|status]
 set -euo pipefail
 
@@ -35,6 +41,55 @@ copy_tls_material() {
   install -d -m 750 -o root -g "$ENROLL_USER" "$ENROLL_DIR/tls"
   install -m 644 -o root -g root "$CERTBOT_LIVE_DIR/fullchain.pem" "$ENROLL_DIR/tls/fullchain.pem"
   install -m 640 -o root -g "$ENROLL_USER" "$CERTBOT_LIVE_DIR/privkey.pem" "$ENROLL_DIR/tls/privkey.pem"
+}
+
+# Expose the CA key/certificate without exposing /etc/mosquitto/pki/private.
+copy_ca_material() {
+  install -d -m 750 -o root -g "$ENROLL_USER" "$ENROLL_DIR/ca"
+  install -m 644 -o root -g root "$PKI_DIR/ca.crt" "$ENROLL_DIR/ca/ca.crt"
+  install -m 640 -o root -g "$ENROLL_USER" "$PKI_DIR/private/ca.key" "$ENROLL_DIR/ca/ca.key"
+  cat > "$ENROLL_DIR/ca/openssl.cnf" <<EOF
+[ ca ]
+default_ca = CA_default
+[ CA_default ]
+dir              = $PKI_DIR
+database         = \$dir/index.txt
+new_certs_dir    = \$dir/newcerts
+certificate      = $ENROLL_DIR/ca/ca.crt
+private_key      = $ENROLL_DIR/ca/ca.key
+serial           = \$dir/serial
+crlnumber        = \$dir/crlnumber
+default_md       = sha256
+default_days     = 825
+default_crl_days = 30
+policy           = policy_anything
+copy_extensions  = copy
+[ policy_anything ]
+commonName = supplied
+emailAddress = optional
+givenName = optional
+[ v3_client ]
+basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature
+extendedKeyUsage = clientAuth
+EOF
+  chmod 644 "$ENROLL_DIR/ca/openssl.cnf"
+}
+
+# Keep auto-enrollment on the same CA database as manual issuance. OpenSSL ca
+# updates these paths; the service unit grants write access only to them.
+prepare_ca_database() {
+  command -v setfacl >/dev/null 2>&1 || {
+    echo "setfacl is required to share the CA database safely" >&2
+    exit 1
+  }
+  # OpenSSL ca writes temporary/backup database files beside index and serial,
+  # so the database directory itself must be writable. File ACLs below keep
+  # the writable set limited to the database files and new certificate store.
+  setfacl -m "u:${ENROLL_USER}:rwx" "$PKI_DIR"
+  setfacl -m "u:${ENROLL_USER}:rw" "$PKI_DIR/index.txt" "$PKI_DIR/serial"
+  setfacl -m "u:${ENROLL_USER}:rwx" "$PKI_DIR/newcerts"
+  setfacl -m "u:${ENROLL_USER}:r" "$PKI_DIR/crlnumber"
 }
 
 # Install the certbot deploy hook: whenever certbot renews the server cert
@@ -82,6 +137,8 @@ case "${1:-install}" in
     # 4. copy the LE server cert + key into the signer's readable TLS dir and
     #    install the certbot deploy hook that refreshes both on rotation.
     copy_tls_material
+    copy_ca_material
+    prepare_ca_database
     install_deploy_hook
     # 5. render + install the systemd unit (server cert = the host's LE cert,
     #    as copied into $ENROLL_DIR/tls — the certbot live dir is 0700 root).
@@ -101,6 +158,8 @@ case "${1:-install}" in
 Environment=ENROLL_CERT_FILE=${ENROLL_DIR}/tls/fullchain.pem
 Environment=ENROLL_KEY_FILE=${ENROLL_DIR}/tls/privkey.pem
 Environment=ENROLL_PASSWORD_FILE=%d/enrollment-password
+Environment=ENROLL_PKI_DIR=${PKI_DIR}
+Environment=ENROLL_OPENSSL_CONFIG=${ENROLL_DIR}/ca/openssl.cnf
 # The port is public on a broker VPS; ENROLL_BIND_ADDRESS defaults to 0.0.0.0
 # (TLS + password + rate limit are the walls). Override to an explicit private
 # interface if the operator wants one.
@@ -120,6 +179,9 @@ EOF
     systemctl disable --now loam-enroll-signer.service 2>/dev/null || true
     rm -f "$UNIT" /etc/systemd/system/loam-enroll-signer.service.d/env.conf
     rm -f "$DEPLOY_HOOK"
+    if command -v setfacl >/dev/null 2>&1; then
+      setfacl -x "u:${ENROLL_USER}" "$PKI_DIR" "$PKI_DIR/index.txt" "$PKI_DIR/serial" "$PKI_DIR/newcerts" "$PKI_DIR/crlnumber" 2>/dev/null || true
+    fi
     systemctl daemon-reload
     rm -rf "$ENROLL_DIR"
     echo "signer uninstalled (org CA, broker, and certbot deploy hooks for other services untouched)"

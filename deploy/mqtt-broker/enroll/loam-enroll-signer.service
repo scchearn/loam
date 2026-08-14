@@ -5,10 +5,9 @@
 # LIVE-HOST SAFETY: dedicated unprivileged ${ENROLL_USER} under a tight sandbox;
 # binds only ${ENROLL_PORT} (default 8443) on ${ENROLL_BIND_ADDRESS} (default
 # 0.0.0.0 — the port is public; TLS + the shared password + rate limiting are
-# the security walls). It may read the org CA (ReadOnlyPaths) and must write
-# CA-issued certs' inputs only under its own temp dir (PrivateTmp). The shared
-# enrollment password is a separate 0600 file (PrivateTmp covers runtime, and
-# ReadOnlyPaths marks the deploy dir it lives next to if needed).
+# the security walls). It reads the copied org CA under ${ENROLL_DIR}/ca and
+# writes CA-issued certs' inputs only under its own temp dir (PrivateTmp). The
+# shared enrollment password is a separate 0600 file staged by systemd.
 [Unit]
 Description=Loam Federation auto-enrollment signer
 After=network-online.target
@@ -35,9 +34,11 @@ ProtectControlGroups=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-# The org CA is read-only; systemd stages the root-only enrollment password
-# through LoadCredential before dropping privileges.
-ReadOnlyPaths=${PKI_DIR} ${ENROLL_DIR}
+# The copied CA material is read-only; only the shared CA database directory is
+# writable so auto-enrollment and manual issuance share one history. Unix ACLs
+# on the database paths restrict the service's actual write access.
+ReadOnlyPaths=${ENROLL_DIR}
+ReadWritePaths=${PKI_DIR}
 # No writable host path; PrivateTmp gives it its own scratch for CSR/cert.
 
 [Install]
