@@ -1,0 +1,38 @@
+# Loam MQTT broker — system service (T5). Install to /etc/systemd/system/,
+# `systemctl enable --now loam-mosquitto.service`. ${VARS} resolved from params.env.
+#
+# LIVE-HOST SAFETY: runs as the dedicated unprivileged ${MOSQ_USER} under a tight
+# sandbox; touches only broker-owned paths; binds only ${LISTENER_PORT} (8883).
+# This is the PRODUCTION system unit — NOT the Slice B transient `systemctl --user`
+# smoke unit (cli/tests/mqtt/tier-9-systemd-smoke.sh).
+[Unit]
+Description=Loam Federation MQTT broker (Mosquitto)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=${MOSQ_USER}
+Group=${MOSQ_USER}
+ExecStart=${MOSQ_BIN} -c ${MOSQ_ETC}/mosquitto.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# --- sandbox (holds on a shared host; matters because sensitive existing services
+#     share this box) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# broker-owned writable paths ONLY:
+ReadWritePaths=${MOSQ_PERSIST}
+# read access to certs (LE server cert + org CA) without write:
+ReadOnlyPaths=${CERTBOT_LIVE_DIR} ${PKI_DIR}
+
+[Install]
+WantedBy=multi-user.target
