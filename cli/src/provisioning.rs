@@ -1375,13 +1375,28 @@ fn parse_member_card(text: &str) -> Result<MemberCard, &'static str> {
         }
         project_list.push(text.to_owned());
     }
-    for value in [&instance_id, &principal_id, &joined_at] {
+    // instance_id and principal_id flow into MQTT topics/filesystem paths, so
+    // they must carry no wildcard or control character. principal_id is an
+    // email: a plus-addressed one (user+tag@host) trips the '+' guard and is
+    // *consciously* refused — '+' is a topic wildcard, so a plus-addressed
+    // principal could never be a safe topic atom. Broker CN policy may widen
+    // one day, but the guard stays until topics can carry it.
+    for value in [&instance_id, &principal_id] {
         if value
             .chars()
             .any(|c| c.is_control() || c == '+' || c == '#' || c == '*')
         {
             return Err(reason::ROSTER_MALFORMED);
         }
+    }
+    // joined_at never enters a topic or path — it is an RFC3339 timestamp, and
+    // chrono's to_rfc3339() emits a "+00:00" offset the wildcard guard above
+    // would reject (the connector's own cards fail their own parser otherwise).
+    // Validate it as a real timestamp instead, still refusing control chars.
+    if joined_at.chars().any(char::is_control)
+        || chrono::DateTime::parse_from_rfc3339(&joined_at).is_err()
+    {
+        return Err(reason::ROSTER_MALFORMED);
     }
     Ok(MemberCard {
         instance_id,
@@ -2415,6 +2430,52 @@ mod tests {
         assert!(!root.join("acme").join("loam.json.tmp").exists());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_card_the_writer_produces_parses_back_through_its_own_reader() {
+        // The invariant the parser broke: a card the connector itself publishes
+        // (own_member_card shape, with a REAL chrono to_rfc3339() joined_at that
+        // carries a "+00:00" offset) MUST parse back. The old guard applied the
+        // MQTT-wildcard '+' check to joined_at and rejected every self-published
+        // card, so no roster ever materialized. Use the real writer path
+        // (member_card_to_json) and a real timestamp — not a hand-fixed string —
+        // so a future divergence between writer and reader fails here.
+        let card = MemberCard {
+            instance_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            principal_id: "ada@example.test".to_owned(),
+            display_name: Some("Ada".to_owned()),
+            joined_at: chrono::Utc::now().to_rfc3339(),
+            projects: vec!["loam".to_owned()],
+        };
+        assert!(
+            card.joined_at.contains('+'),
+            "the writer's timestamp must carry the +00:00 offset this test guards"
+        );
+        let json = member_card_to_json(&card);
+        let parsed = parse_member_card(&json).expect("a writer-produced card must parse back");
+        assert_eq!(parsed.instance_id, card.instance_id);
+        assert_eq!(parsed.principal_id, card.principal_id);
+        assert_eq!(parsed.joined_at, card.joined_at);
+        assert_eq!(parsed.projects, card.projects);
+
+        // joined_at is validated as a timestamp, not by the wildcard guard: a
+        // non-timestamp there still refuses, and a control character still does.
+        let mut broken = card.clone();
+        broken.joined_at = "not-a-timestamp".to_owned();
+        assert!(
+            parse_member_card(&member_card_to_json(&broken)).is_err(),
+            "a non-RFC3339 joined_at must refuse"
+        );
+
+        // But the wildcard guard still bites instance_id/principal_id, which do
+        // enter topics and paths.
+        let mut wild = card.clone();
+        wild.instance_id = "inst+ance".to_owned();
+        assert!(
+            parse_member_card(&member_card_to_json(&wild)).is_err(),
+            "a wildcard in instance_id must still refuse"
+        );
     }
 
     #[test]

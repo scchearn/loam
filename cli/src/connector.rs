@@ -1810,6 +1810,10 @@ fn pump(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     outbound: std::sync::mpsc::Receiver<ValidatedEnvelope>,
 ) {
+    // A malformed retained member card is degrade-not-crash, but silence hid a
+    // parser bug that stranded every roster. Surface the first one per session
+    // so it is at least visible; one line, no framework.
+    let mut warned_malformed_card = false;
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         // Outbound first: an emit the user just made should not wait behind a
         // full poll interval of inbound traffic.
@@ -1828,23 +1832,33 @@ fn pump(
                 if let ReceiveOutcome::MemberCard { payload, .. } = &outcome {
                     if let Ok(text) = std::str::from_utf8(payload) {
                         if let Ok(root) = crate::provisioning::configured_roster_root() {
-                            if let Ok(card) = crate::provisioning::parse_member_card_pub(text) {
-                                let _ =
-                                    crate::provisioning::write_member_card(&root, &org_id, &card);
-                                if let Ok(assembled) = crate::provisioning::assemble_project_roster(
-                                    &root,
-                                    &org_id,
-                                    &project_id,
-                                ) {
-                                    let body = crate::provisioning::roster_body(&assembled);
-                                    let _ = crate::provisioning::write_roster(
-                                        &root,
-                                        &org_id,
-                                        &project_id,
-                                        &body,
+                            match crate::provisioning::parse_member_card_pub(text) {
+                                Ok(card) => {
+                                    let _ = crate::provisioning::write_member_card(
+                                        &root, &org_id, &card,
                                     );
-                                    roster = assembled;
+                                    if let Ok(assembled) =
+                                        crate::provisioning::assemble_project_roster(
+                                            &root,
+                                            &org_id,
+                                            &project_id,
+                                        )
+                                    {
+                                        let body = crate::provisioning::roster_body(&assembled);
+                                        let _ = crate::provisioning::write_roster(
+                                            &root,
+                                            &org_id,
+                                            &project_id,
+                                            &body,
+                                        );
+                                        roster = assembled;
+                                    }
                                 }
+                                Err(reason) if !warned_malformed_card => {
+                                    warned_malformed_card = true;
+                                    eprintln!("loam: ignoring a malformed member card ({reason}); roster may be incomplete");
+                                }
+                                Err(_) => {}
                             }
                         }
                     }
