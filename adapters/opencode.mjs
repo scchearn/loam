@@ -196,15 +196,19 @@ export function createOpenCodeAdapter({
     return join(homedir(), '.agents', 'loam');
   };
 
-  // Wake injection: render the federation refresh through the same read path
-  // the per-turn boundary uses, then push it into the live session with
-  // promptAsync. The guard prevents two overlapping injections from queuing
-  // the same wake twice; the renderer collapses duplicate items by key anyway.
+  // Wake injection (wake-injection-delta): the native `Wake` event drains this
+  // session's connector mailbox — the single per-session seen-set authority, the
+  // same consume-once mechanism the per-turn boundary uses — and renders the
+  // drained items as terse elements closed by one [tip] trailer. The mailbox did
+  // the delta selection, so an empty drain renders nothing (the runtime returns
+  // its empty sentinel) and this injects nothing: a wake with no new item is a
+  // no-op. The pending guard collapses two overlapping wakes; a wake that races a
+  // per-turn drain simply finds the mailbox already empty.
   const injectWake = async (workspace) => {
     if (loamWake.pending || !loamWake.sessionId || !sdk?.session?.promptAsync) return;
     loamWake.pending = true;
     try {
-      const context = await getContext({ harness: 'opencode', workspace, integrationPath, event: 'UserPromptSubmit' });
+      const context = await getContext({ harness: 'opencode', workspace, integrationPath, event: 'Wake' });
       if (context && context !== UNAVAILABLE) {
         // SessionPromptAsyncData shape: { path:{id}, query:{directory}, body:{parts} } —
         // the same shape the ingest worker below uses. The flat

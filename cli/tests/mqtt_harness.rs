@@ -116,8 +116,8 @@ fn the_full_mechanism_runs_end_to_end_against_a_real_broker() {
             "{id} must render the colleague's summary; got:\n{body}"
         );
         assert!(
-            body.contains(PEER_PRINCIPAL) && body.contains("[loam:untrusted]"),
-            "{id} must render the item sender-attributed and untrusted; got:\n{body}"
+            body.contains(PEER_PRINCIPAL) && body.contains("trust=\"claimed\""),
+            "{id} must render the item sender-attributed with neutral trust; got:\n{body}"
         );
         assert!(
             body.contains("federation: 1 item") || body.contains("federation:"),
@@ -161,7 +161,7 @@ fn the_full_mechanism_runs_end_to_end_against_a_real_broker() {
         "three QoS 1 deliveries of one message must render one logical item:\n{body}"
     );
     assert_eq!(
-        body.matches("[loam:work ").count(),
+        body.matches("<io.loam.work.state").count(),
         1,
         "two revisions of one state key must render one logical item:\n{body}"
     );
@@ -403,30 +403,28 @@ fn git_first_reconciliation_separates_a_published_claim_from_a_sender_claim() {
     );
     evidence.record("rendered work claims", &body);
 
-    let verified_line = line_containing(&body, "activity-published")
-        .or_else(|| lines_with(&body, "[loam:work published · verified against Git]").pop())
-        .unwrap_or_default();
+    let verified_line = line_containing(&body, "activity-published").unwrap_or_default();
     assert!(
-        body.contains("[loam:work published · verified against Git]"),
-        "a genuinely Git-verified claim must render as current:\n{body}"
+        body.contains("state=\"published\" trust=\"confirmed\""),
+        "a genuinely Git-reconciled claim must render confirmed:\n{body}"
     );
     assert!(
-        body.contains(
-            "[loam:work published · unverified — sender claim, not reconciled against Git]"
-        ),
-        "an unpublished commit must stay a sender claim:\n{body}"
+        body.contains("state=\"published\" trust=\"claimed\""),
+        "an unpublished commit must stay the sender's claim:\n{body}"
     );
     // The distinction is real end to end, not a fixture-tier constant: the same
     // renderer, the same broker, the same session produced both in one snapshot.
     assert_eq!(
-        body.matches("· verified against Git").count(),
+        body.matches("state=\"published\" trust=\"confirmed\"")
+            .count(),
         1,
-        "exactly one claim may render as current:\n{body}"
+        "exactly one claim may render as Git-reconciled:\n{body}"
     );
     assert_eq!(
-        body.matches("· unverified — sender claim").count(),
+        body.matches("state=\"published\" trust=\"claimed\"")
+            .count(),
         1,
-        "exactly one claim must stay provisional:\n{body}"
+        "exactly one claim must stay the sender's own report:\n{body}"
     );
     evidence.record("verified line", &verified_line);
     evidence.record(
@@ -1285,13 +1283,6 @@ fn line_containing(body: &str, needle: &str) -> Option<String> {
     body.lines()
         .find(|line| line.contains(needle))
         .map(str::to_owned)
-}
-
-fn lines_with(body: &str, needle: &str) -> Vec<String> {
-    body.lines()
-        .filter(|line| line.contains(needle))
-        .map(str::to_owned)
-        .collect()
 }
 
 fn reply_shaped_transcript(workspace: &Path) -> String {

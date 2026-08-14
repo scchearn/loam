@@ -160,13 +160,23 @@ test('a session without the runtime still starts and the wake server degrades si
   await plugin.event({ event: { type: 'session.deleted', sessionID: 'sess-x' } });
 });
 
-test('injectWake calls promptAsync with the generated-SDK shape and treats a resolved {error} as failure', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'loam-wake-shape-'));
+const WAKE_TIP = '[tip] federation: status from a teammate\'s machine — informational, no reply or action expected.';
+const WAKE_BODY = '<io.loam.work.state key="task-c" state="blocked" trust="claimed">\n'
+  + '[Carol <carol@example.com>] Task C is blocked on the API key.\n'
+  + `</io.loam.work.state>\n\n${WAKE_TIP}`;
+
+test('wake pulls the drained render (delta + tip) and injects it with the SDK shape; an empty drain is a no-op', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loam-wake-inject2-'));
   await writeFile(join(root, 'install.json'), JSON.stringify({ integration_path: '/nonexistent' }));
 
   const inputs = [];
   let resolveWithError = false;
   let captured = null; // the adapter's onWake, captured so the test can fire it
+  // The native `Wake` event drains the session mailbox — the single seen-set —
+  // and returns the terse elements + tip already rendered. The connector did the
+  // delta; the plugin just injects whatever text came back. An empty drain comes
+  // back empty, which must inject nothing.
+  let wakeBody = WAKE_BODY;
 
   const plugin = await createOpenCodeAdapter({
     client: {
@@ -177,7 +187,7 @@ test('injectWake calls promptAsync with the generated-SDK shape and treats a res
         },
       },
     },
-    getContext: async () => '<LOAM_IMPORTANT>\nwake body\n</LOAM_IMPORTANT>',
+    getContext: async ({ event }) => (event === 'Wake' ? wakeBody : '<LOAM_IMPORTANT>\nstart\n</LOAM_IMPORTANT>'),
     wakeServer: async ({ onWake }) => {
       captured = onWake;
       return { wakeRef: 'notify-tcp://127.0.0.1:0', registered: true, close: async () => {} };
@@ -186,27 +196,38 @@ test('injectWake calls promptAsync with the generated-SDK shape and treats a res
 
   // First transform fire is SessionStart: it sets loamWake.sessionId and starts
   // the (injected) wake server, capturing onWake.
-  const output = { messages: [{ info: { role: 'user', sessionID: 'sess-shape' }, parts: [{ type: 'text', text: 'prompt' }] }] };
+  const output = { messages: [{ info: { role: 'user', sessionID: 'sess-wake2' }, parts: [{ type: 'text', text: 'prompt' }] }] };
   await plugin['experimental.chat.messages.transform']({}, output);
   await poll(() => captured !== null);
 
-  // Fire a wake: promptAsync must receive the generated-SDK shape, not the flat
-  // { sessionID, parts } form (which is a silent no-op against the SDK).
+  // A wake injects the drained body verbatim, in the generated-SDK shape — not
+  // the flat { sessionID, parts } form, which is a silent no-op against the SDK.
   await captured();
   await poll(() => inputs.length === 1);
   const input = inputs[0];
-  assert.deepEqual(input.path, { id: 'sess-shape' }, 'path.id carries the session id');
+  assert.deepEqual(input.path, { id: 'sess-wake2' }, 'path.id carries the session id');
   assert.deepEqual(input.query, { directory: '/workspace' }, 'query.directory carries the workspace');
-  assert.ok(Array.isArray(input.body?.parts) && input.body.parts[0]?.text?.includes('wake body'), 'body.parts carries the rendered context');
   assert.ok(input.sessionID === undefined && input.parts === undefined, 'the flat shape must not be used');
+  const text = input.body.parts[0].text;
+  assert.equal(text, WAKE_BODY, 'the drained delta body is injected verbatim');
+  assert.equal(text.match(/\[tip\]/g).length, 1, 'exactly one tip line, never per item');
+  assert.ok(!/unverified|untrusted|render-only/.test(text), 'banned provenance vocabulary must not appear');
+  assert.ok(!text.includes('<LOAM_IMPORTANT>'), 'a wake carries no framing wrapper');
 
-  // The SDK resolves with { error } rather than throwing on an HTTP error; the
-  // next wake must not crash and the pending guard must reset so a later wake
-  // can still fire (a resolved error is a failed injection, not a success).
+  // An empty drain (the mailbox already consumed by a per-turn render, or nothing
+  // new) injects nothing at all — no block, no lone tip.
+  wakeBody = '';
+  await captured();
+  await wait(50);
+  assert.equal(inputs.length, 1, 'an empty drain is a no-op: no injection');
+
+  // The SDK resolves with { error } rather than throwing on an HTTP error; a
+  // failed injection is best-effort and must not crash the listener or wedge the
+  // pending guard, so a later wake still fires.
+  wakeBody = WAKE_BODY;
   resolveWithError = true;
   await captured();
   await poll(() => inputs.length === 2);
-  // A subsequent successful wake still goes through — the guard did not wedge.
   resolveWithError = false;
   await captured();
   await poll(() => inputs.length === 3);
