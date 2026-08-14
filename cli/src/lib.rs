@@ -8,7 +8,7 @@ pub mod enrollment_auto;
 pub mod envelope;
 mod federation;
 pub mod harness;
-mod hooks;
+pub(crate) mod hooks;
 pub mod ipc;
 pub mod json;
 mod lint;

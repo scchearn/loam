@@ -481,6 +481,61 @@ fn connect_with_token_but_no_certificate_fails_fast_on_an_unreachable_signer() {
 }
 
 #[test]
+fn bare_connect_with_token_uses_the_installed_global_root() {
+    let root = temp_dir("autoenroll-installed-root");
+    let target_dir = root
+        .join("bin")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("x86_64-unknown-linux-musl");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    std::fs::copy(binary(), target_dir.join("loam")).unwrap();
+    std::fs::write(root.join("install.json"), "{}\n").unwrap();
+
+    let output = Command::new(target_dir.join("loam"))
+        .args([
+            "federation",
+            "connect",
+            env!("CARGO_MANIFEST_DIR"),
+            "mqtts://broker.example:8883",
+            "--token",
+            "secret",
+            "--json",
+        ])
+        .env("LOAM_CONFIG_DIR", &root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn installed loam");
+    let code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        code, 69,
+        "bare connect must run enrollment: {stdout} {stderr}"
+    );
+    assert!(
+        stdout.contains("signer-unreachable"),
+        "the token path must contact the signer instead of validating only: {stdout}"
+    );
+    assert!(!stdout.contains("\"status\":\"validated\""), "{stdout}");
+    assert!(!root.join("loam.sqlite3").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn bare_connect_with_token_outside_an_install_requires_global_root() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let (code, _stdout, stderr) = run_connect(
+        Some(&workspace),
+        "mqtts://broker.example:8883",
+        &["--token", "secret"],
+    );
+    assert_eq!(code, 64);
+    assert!(stderr.contains("--global-root is required"), "{stderr}");
+}
+
+#[test]
 fn connect_with_token_missing_git_identity_names_the_typed_refusal() {
     // A workspace with no git user.email cannot name the CSR subject; this must
     // be a typed git-identity-required refusal, not a silent partial state. The

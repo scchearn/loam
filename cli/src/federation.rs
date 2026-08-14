@@ -27,7 +27,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         _ => {
             eprintln!(
                 "Usage:\n  \
-                 loam federation connect <workspace> <broker> [--project org/project] --global-root <path> [--token <password>|--token-file <path>] [--json]\n  \
+                 loam federation connect <workspace> <broker> [--project org/project] [--global-root <path>] [--token <password>|--token-file <path>] [--json]\n  \
                  loam federation disconnect <workspace> --global-root <path> [--json]\n  \
                  loam federation status [<workspace>] --global-root <path> [--json]\n  \
                  loam federation emit [<workspace>] --global-root <path> [--json]   (reads one operation on stdin)\n  \
@@ -559,8 +559,20 @@ fn connect(mut args: impl Iterator<Item = String>) -> i32 {
         }
     };
 
+    let global_root = match global_root {
+        Some(root) => Some(root),
+        None if token.is_some() => match crate::hooks::installed_global_root() {
+            Ok(root) => Some(root),
+            Err(_) => {
+                eprintln!("federation connect: --global-root is required");
+                return 64;
+            }
+        },
+        None => None,
+    };
+
     match global_root {
-        // No global root: validation-only (the workspace + broker proof).
+        // No global root and no token: validation-only (the workspace + broker proof).
         None => {
             if json_output {
                 println!("{}", success_json(&enrolled).to_json());

@@ -511,6 +511,7 @@ fn list_infers_only_a_valid_installed_runtime_root() {
     fs::create_dir_all(&target_dir).unwrap();
     let installed = target_dir.join(if cfg!(windows) { "loam.exe" } else { "loam" });
     fs::hard_link(source, &installed).unwrap();
+    fs::write(root.join("install.json"), "{}\n").unwrap();
 
     let inferred = Command::new(installed)
         .args(["hooks", "list"])

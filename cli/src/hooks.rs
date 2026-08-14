@@ -1178,7 +1178,7 @@ fn absolute_path(value: Option<String>, name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn installed_global_root() -> Result<PathBuf, String> {
+pub(crate) fn installed_global_root() -> Result<PathBuf, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let expected_name = if cfg!(windows) { "loam.exe" } else { "loam" };
     let target = executable.parent();
@@ -1199,7 +1199,12 @@ fn installed_global_root() -> Result<PathBuf, String> {
             .and_then(Path::file_name)
             .is_some_and(|name| name == "bin");
     if valid {
-        return root.map(Path::to_path_buf).ok_or_else(inferred_root_error);
+        let root = root
+            .map(Path::to_path_buf)
+            .ok_or_else(inferred_root_error)?;
+        if root.join("install.json").is_file() {
+            return Ok(root);
+        }
     }
     Err(inferred_root_error())
 }
