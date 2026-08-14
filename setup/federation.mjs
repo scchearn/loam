@@ -14,7 +14,15 @@ export function federationDefinitionPath({ globalRoot, platform = process.platfo
   if (!globalRoot) return null;
   if (platform === 'linux') return join(globalRoot, 'systemd', 'loam-connector.service');
   if (platform === 'darwin') return join(globalRoot, 'launchagents', `${SERVICE_LABEL}.plist`);
-  return null; // win32 (Task Scheduler) and any platform without a file-based unit.
+  // win32: the Task Scheduler holds the real definition, but the runtime also
+  // keeps a `windows-task.marker` file under the global root (see
+  // cli/src/service.rs `definition_path`). Mirroring it here lets the absence
+  // verify name a leftover marker after a disable. NOTE: the #100 update refresh
+  // gate deliberately does NOT fire on this marker — re-rendering a scheduled
+  // task on a runtime bump is Windows service parity, tracked with #100 and out
+  // of scope here (see the win32 exclusion in setup/transaction.mjs).
+  if (platform === 'win32') return join(globalRoot, 'windows-task.marker');
+  return null;
 }
 
 // True only when a file-based definition is present. On win32 (no file) this is

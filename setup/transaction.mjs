@@ -348,7 +348,12 @@ export async function executeSetup(parsed, discovery, options = {}) {
       // just-committed runtime and preserve the prior active/inert state. The
       // runtime owns rendering and the manager calls; its rollback joins this
       // transaction. On win32 there is no file-based definition, so this no-ops.
-      const definition = refresh
+      // win32 is deliberately excluded: its definition lives in Task Scheduler
+      // with only a `windows-task.marker` file (federationDefinitionPath mirrors
+      // it for the absence verify). Re-rendering a scheduled task against the new
+      // runtime on update is Windows service parity — tracked with #100, out of
+      // scope here — so the marker must NOT trip this refresh.
+      const definition = refresh && discovery.platform !== 'win32'
         ? await federationDefinitionExists({ globalRoot: discovery.globalRoot, platform: discovery.platform })
         : { exists: false };
       if (refresh && definition.exists && runtime?.path) {

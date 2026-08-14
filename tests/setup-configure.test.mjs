@@ -193,14 +193,65 @@ test('unknown integration id fails with an actionable message', async () => {
   assert.match(capture.text(), /Unknown integration: nope/);
 });
 
-test('win32 federation disable rests on manager status when there is no file-based definition', async () => {
+test('win32 federation disable is clean when the Task Scheduler marker is gone', async () => {
   const fixture = await installedFixture();
   const capture = outputCapture();
-  // status returns not-active; no definition file exists on win32 → clean disable.
+  // status returns not-active; no windows-task.marker exists → clean disable.
   const code = await runConfigure(
     { command: 'setup', federation: 'disable', integrations: [], dryRun: false, yes: true, purge: false },
     { ...baseOptions(fixture, capture), platform: 'win32' },
   );
   assert.equal(code, 0, capture.text());
   assert.match(capture.text(), /Federation disabled/);
+});
+
+test('win32 federation disable names a leftover windows-task.marker', async () => {
+  const fixture = await installedFixture();
+  const markerPath = join(fixture.globalRoot, 'windows-task.marker');
+  await writeFile(markerPath, 'task');
+  const capture = outputCapture();
+  // A runner whose uninstall does NOT remove the marker simulates a partial disable.
+  const stubborn = {
+    runner: async (request) => (request.args[2] === 'status'
+      ? { code: 1, stdout: '', stderr: 'disabled' }
+      : { code: 0, stdout: '', stderr: '' }),
+  };
+  const code = await runConfigure(
+    { command: 'setup', federation: 'disable', integrations: [], dryRun: false, yes: true, purge: false },
+    { ...baseOptions(fixture, capture, stubborn), platform: 'win32' },
+  );
+  assert.equal(code, 1);
+  assert.match(capture.text(), /Federation disable incomplete/);
+  assert.match(capture.text(), /windows-task\.marker/);
+});
+
+test('federation enable rolls back a newly-installed service that cannot be verified', async () => {
+  const fixture = await installedFixture();
+  const calls = [];
+  const definitionPath = join(fixture.home, '.agents', 'loam', 'systemd', 'loam-connector.service');
+  // install writes the unit and enable succeeds, but status is UNVERIFIABLE (a
+  // hard runtime invocation error, not a clean disabled report). enable must not
+  // leave the newly-created definition behind.
+  const runner = async (request) => {
+    const verb = request.args[2];
+    calls.push(verb);
+    if (verb === 'install') {
+      await mkdir(join(fixture.home, '.agents', 'loam', 'systemd'), { recursive: true });
+      await writeFile(definitionPath, 'unit');
+      return { code: 0, stdout: '', stderr: '' };
+    }
+    if (verb === 'uninstall') { await rm(definitionPath, { force: true }); return { code: 0, stdout: '', stderr: '' }; }
+    if (verb === 'status') return { code: null, category: 'process_error', stdout: '', stderr: 'no such runtime' };
+    return { code: 0, stdout: '', stderr: '' };
+  };
+  const capture = outputCapture();
+  const code = await runConfigure(
+    { command: 'setup', federation: 'enable', integrations: [], dryRun: false, yes: true, purge: false },
+    { ...baseOptions(fixture, capture, { runner }), platform: 'linux' },
+  );
+  assert.equal(code, 1);
+  assert.match(capture.text(), /could not be verified/);
+  // Atomic enable: the definition we created was rolled back (uninstall ran).
+  assert.ok(calls.includes('uninstall'), 'a newly-created but unverifiable service is rolled back');
+  await assert.rejects(() => stat(definitionPath));
 });

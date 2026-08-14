@@ -890,3 +890,32 @@ test('setup harness reconciliation delegates without moving versions (touches no
   assert.equal(after.plugin_version, before.plugin_version);
   assert.equal(after.runtime_version, before.runtime_version);
 });
+
+test('setup harness reconciliation refuses a version mismatch and points to update', async () => {
+  const { runConfigure } = await import('../setup/configure.mjs');
+  const fixture = await baseFixture();
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  const metadataPath = join(fixture.home, '.agents', 'loam', 'install.json');
+  const install = JSON.parse(await readFile(metadataPath, 'utf8'));
+  // Simulate a NEWER npx package touching an install pinned at an older version.
+  await writeFile(metadataPath, JSON.stringify({ ...install, plugin_version: '0.0.1' }));
+
+  const capture = outputCapture();
+  const code = await runConfigure(
+    { command: 'setup', federation: null, integrations: [], dryRun: false, yes: false, purge: false },
+    {
+      ...fixture,
+      packageRoot,
+      // A runner that fails loudly proves the transaction is never entered.
+      runner: async () => { throw new Error('version mismatch must refuse before staging'); },
+      select: async () => ({ harnesses: [] }),
+      output: capture.output,
+      errorOutput: capture.output,
+    },
+  );
+  assert.equal(code, 1);
+  assert.match(capture.text(), /never moves versions/);
+  assert.match(capture.text(), /update` first/);
+  // The install version pin is untouched by the refusal.
+  assert.equal(JSON.parse(await readFile(metadataPath, 'utf8')).plugin_version, '0.0.1');
+});

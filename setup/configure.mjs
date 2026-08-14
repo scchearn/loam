@@ -95,9 +95,12 @@ async function configureFederation(action, { discovery, install, parsed, options
       return { ok: false };
     }
     // Verify the definition is actually present/inspectable through the runtime.
+    // Keep enable atomic: a service we installed+enabled but cannot verify is
+    // rolled back rather than left running in an unverifiable state.
     const verified = await verifyFederationService(base);
     if (!verified.ready) {
       errorOutput.write(`Federation enable could not be verified: ${verified.detail || verified.category}\n`);
+      await result.rollback?.();
       return { ok: false };
     }
     stepDone(output, 'Federation enabled — connector service installed and active');
@@ -153,12 +156,25 @@ async function configureIntegration(id, mode, { discovery, install, parsed, opti
 // Harness selection reconciles WHICH harnesses are wired. The adapter + native
 // marketplace-plugin pipeline that does this lives in the install transaction;
 // re-implementing it here would duplicate the marketplace/adapter/verify/rollback
-// machinery. Instead we drive that same transaction with a FIXED selection and
-// the install's current package version — so skills and runtime are a no-op (no
-// version moves, the configurator's contract), and only the harness wiring is
-// reconciled to `desired`. Returns { ok }.
-async function configureHarnesses(desired, { parsed, options }) {
+// machinery. Instead we drive that same transaction with a FIXED selection — so
+// only the harness wiring is reconciled to `desired`.
+//
+// The transaction stages at discovery.packageVersion (the npx package's version).
+// setup MUST NOT move versions, so if the running package differs from the
+// installed one we refuse and point at `update`: reconciling harnesses through a
+// newer package would stage skills/runtime at the newer version — a version move
+// under a verb whose whole contract is "never touches versions". Same version
+// makes skills/runtime a no-op, so only harness wiring changes. Returns { ok }.
+async function configureHarnesses(desired, { discovery, install, parsed, options }) {
   const output = options.output || process.stdout;
+  const errorOutput = options.errorOutput || process.stderr;
+  if (discovery.packageVersion !== install.plugin_version) {
+    errorOutput.write(
+      `Cannot reconcile harnesses: this package is v${discovery.packageVersion} but the install is v${install.plugin_version}.\n`
+      + '`setup` never moves versions — run `npx @scchearn/loam update` first, then configure.\n',
+    );
+    return { ok: false };
+  }
   stepStart(output, 'Reconciling harness selection');
   const { runSetup } = await import('./main.mjs');
   const select = async () => desired; // stands in for the clack multiselect widget
@@ -227,7 +243,7 @@ export async function runConfigure(parsed, options = {}) {
       ok = ok && result.ok;
     }
     if (harnessSelection) {
-      const result = await configureHarnesses(harnessSelection, { parsed, options });
+      const result = await configureHarnesses(harnessSelection, { discovery, install, parsed, options });
       ok = ok && result.ok;
     }
 
