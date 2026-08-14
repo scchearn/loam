@@ -60,8 +60,18 @@ pub struct ServiceContext {
 pub enum ServiceError {
     Io(String),
     InvalidRuntimePath,
-    ManagerFailed { code: i32 },
+    ManagerFailed {
+        code: i32,
+    },
     NotUtf8,
+    /// A manager subprocess did not exit within its bound and was killed. Names
+    /// the program so a wedged `launchctl`/`systemctl` surfaces instead of
+    /// hanging the caller forever (macOS `launchctl kickstart` on a job with a
+    /// non-zero last exit is the observed case).
+    Timeout {
+        program: String,
+        seconds: u64,
+    },
 }
 
 impl std::fmt::Display for ServiceError {
@@ -71,6 +81,12 @@ impl std::fmt::Display for ServiceError {
             ServiceError::InvalidRuntimePath => write!(f, "runtime path is not absolute/UTF-8"),
             ServiceError::ManagerFailed { code } => write!(f, "service manager exited {code}"),
             ServiceError::NotUtf8 => write!(f, "path is not representable as UTF-8"),
+            ServiceError::Timeout { program, seconds } => {
+                write!(
+                    f,
+                    "service manager {program} did not exit within {seconds}s and was killed"
+                )
+            }
         }
     }
 }
@@ -80,17 +96,62 @@ pub trait CommandRunner {
     fn run(&self, command: &ManagerCommand) -> Result<i32, ServiceError>;
 }
 
+/// Every manager subprocess is bound to this wall-clock ceiling. A wedged
+/// `launchctl`/`systemctl` that never exits (launchd job with a non-zero last
+/// exit is the observed case) is killed at the bound and surfaced as a typed
+/// `Timeout`, rather than blocking service activation forever.
+const MANAGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often the bounded wait polls the child. Small enough that a fast command
+/// still returns promptly; large enough that the poll loop is free.
+const MANAGER_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Executes manager commands as argv-vector subprocesses — never through a
 /// shell, so no argument is ever word-split or interpreted.
 pub struct RealRunner;
 
 impl CommandRunner for RealRunner {
     fn run(&self, command: &ManagerCommand) -> Result<i32, ServiceError> {
-        let output = std::process::Command::new(&command.program)
-            .args(&command.args)
-            .output()
-            .map_err(|error| ServiceError::Io(error.to_string()))?;
-        Ok(output.status.code().unwrap_or(-1))
+        run_bounded(command, MANAGER_TIMEOUT)
+    }
+}
+
+/// Spawn a manager command and wait for it with a wall-clock bound. On expiry
+/// the child is killed and reaped (so no zombie accumulates, the observed
+/// launchctl leak) and a typed `Timeout` is returned. stdio is sent to null:
+/// only the exit code is consulted, and draining pipes across the poll loop is
+/// unnecessary. `std` has no `wait_timeout`, so this is a `try_wait` poll loop —
+/// no new dependency.
+fn run_bounded(
+    command: &ManagerCommand,
+    timeout: std::time::Duration,
+) -> Result<i32, ServiceError> {
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(&command.program)
+        .args(&command.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| ServiceError::Io(error.to_string()))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.code().unwrap_or(-1)),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    // Reap so the killed child does not linger as a zombie.
+                    let _ = child.wait();
+                    return Err(ServiceError::Timeout {
+                        program: command.program.clone(),
+                        seconds: timeout.as_secs(),
+                    });
+                }
+                std::thread::sleep(MANAGER_POLL);
+            }
+            Err(error) => return Err(ServiceError::Io(error.to_string())),
+        }
     }
 }
 
@@ -614,6 +675,48 @@ fn absolute_utf8(path: &Path) -> Result<String, ServiceError> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    // A subprocess that never exits on its own must be killed at the bound and
+    // surfaced as a typed Timeout naming the program — never hang the caller
+    // (the macOS `launchctl kickstart` wedge). `sleep 30` is the never-exits
+    // stub; the bound is short so the test is fast, and the elapsed assertion
+    // proves the kill actually fired rather than the sleep completing.
+    #[cfg(unix)]
+    #[test]
+    fn a_wedged_manager_subprocess_is_killed_at_the_bound_and_typed() {
+        let wedged = ManagerCommand::new("sleep", &["30"]);
+        let bound = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let result = run_bounded(&wedged, bound);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            result,
+            Err(ServiceError::Timeout {
+                program: "sleep".to_owned(),
+                seconds: 0,
+            }),
+            "a subprocess past its bound must surface a typed Timeout naming the program"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the bound must fire near its deadline, not wait for the child to exit: {elapsed:?}"
+        );
+    }
+
+    // The bound must not penalize a command that returns promptly: a fast exit
+    // inside the window resolves to its real code, not a Timeout.
+    #[cfg(unix)]
+    #[test]
+    fn a_prompt_manager_subprocess_returns_its_real_exit_code() {
+        let quick = ManagerCommand::new("sh", &["-c", "exit 3"]);
+        let result = run_bounded(&quick, std::time::Duration::from_secs(10));
+        assert_eq!(
+            result,
+            Ok(3),
+            "a command that exits within the bound must surface its real code"
+        );
+    }
 
     struct FakeRunner {
         recorded: RefCell<Vec<ManagerCommand>>,
