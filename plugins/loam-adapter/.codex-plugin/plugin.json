@@ -1,6 +1,6 @@
 {
   "name": "loam",
-  "version": "0.13.0-next.10",
+  "version": "0.13.0-next.11",
   "description": "Session adapter for canonical Loam goals, planning, memory, and checkpoint skills. Session context is served by the private native runtime; setup registers it.",
   "hooks": "./hooks/hooks.json",
   "interface": {

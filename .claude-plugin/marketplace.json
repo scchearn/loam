@@ -6,14 +6,14 @@
   },
   "metadata": {
     "description": "Workflow skills for AI coding agents: goals, planning, specs, memory, checkpoints, and agent debates",
-    "version": "0.13.0-next.10"
+    "version": "0.13.0-next.11"
   },
   "plugins": [
     {
       "name": "loam",
       "source": "./plugins/loam-adapter",
       "description": "Workflow skills for AI coding agents: goals, planning, specs, memory, checkpoints, and agent debates",
-      "version": "0.13.0-next.10",
+      "version": "0.13.0-next.11",
       "strict": true
     }
   ]
