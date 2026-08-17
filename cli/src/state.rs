@@ -98,7 +98,8 @@ pub(crate) fn aggregate(workspace: &Path, fast: bool) -> String {
         .unwrap_or_default();
 
     format!(
-        "{{\"wiki_root\":\"{}\",\"exists\":true,\"has_schema\":{},\"has_index\":{},\"has_log\":{},\"has_overview\":{},\"qmd_ready\":{},\"collection\":\"{}\",\"metadata_status\":\"{}\",\"metadata_path\":\"{}\",\"latest_checkpoint\":{},\"recent_checkpoints\":{},\"checkpoint_count\":{},\"git_status\":{},\"drift_count\":{},\"hints\":{}}}",
+        "{{\"version\":\"{}\",\"wiki_root\":\"{}\",\"exists\":true,\"has_schema\":{},\"has_index\":{},\"has_log\":{},\"has_overview\":{},\"qmd_ready\":{},\"collection\":\"{}\",\"metadata_status\":\"{}\",\"metadata_path\":\"{}\",\"latest_checkpoint\":{},\"recent_checkpoints\":{},\"checkpoint_count\":{},\"git_status\":{},\"drift_count\":{},\"hints\":{}}}",
+        runtime_version(),
         json_escape(&wiki_root.display().to_string()),
         has_schema,
         has_index,
@@ -117,8 +118,19 @@ pub(crate) fn aggregate(workspace: &Path, fast: bool) -> String {
     )
 }
 
+/// The runtime's own compiled version, from the crate's `CARGO_PKG_VERSION`.
+/// This is the self-report the config-dir ledger compares against at readiness;
+/// it can never be a stale skills-tree `CLI_VERSION`. See
+/// `plans/runtime-channel-ledger.md`.
+pub(crate) fn runtime_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 fn minimal_state() -> String {
-    "{\"wiki_root\":\"\",\"exists\":false,\"qmd_ready\":false,\"latest_checkpoint\":null,\"recent_checkpoints\":[],\"checkpoint_count\":0,\"git_status\":null,\"drift_count\":null,\"hints\":[{\"kind\":\"memory_missing\",\"group\":\"maintenance\",\"severity\":\"info\",\"message\":\"No memory substrate found; scaffold a wiki to begin.\",\"command\":\"/loam::scaffolding-wiki <goal>\",\"evidence\":{}}]}".to_owned()
+    format!(
+        "{{\"version\":\"{}\",\"wiki_root\":\"\",\"exists\":false,\"qmd_ready\":false,\"latest_checkpoint\":null,\"recent_checkpoints\":[],\"checkpoint_count\":0,\"git_status\":null,\"drift_count\":null,\"hints\":[{{\"kind\":\"memory_missing\",\"group\":\"maintenance\",\"severity\":\"info\",\"message\":\"No memory substrate found; scaffold a wiki to begin.\",\"command\":\"/loam::scaffolding-wiki <goal>\",\"evidence\":{{}}}}]}}",
+        runtime_version()
+    )
 }
 
 pub fn resolve_wiki_root(workspace: &Path) -> Option<PathBuf> {
@@ -769,7 +781,17 @@ fn json_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{days_since_unix_epoch, epoch_of, lint_age};
+    use super::{aggregate, days_since_unix_epoch, epoch_of, lint_age, minimal_state, runtime_version};
+
+    #[test]
+    fn version_is_the_compiled_crate_version() {
+        assert_eq!(runtime_version(), env!("CARGO_PKG_VERSION"));
+        let needle = format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"));
+        // Present in both the wiki-less minimal state and a full aggregate.
+        assert!(minimal_state().contains(&needle));
+        let tmp = std::env::temp_dir();
+        assert!(aggregate(&tmp, true).contains("\"version\":\""));
+    }
 
     #[test]
     fn civil_dates_convert_without_platform_tools() {
