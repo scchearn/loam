@@ -26,13 +26,14 @@ export function validateInstallMetadata(globalRoot, metadata) {
     throw new Error('install metadata must be an object');
   }
 
-  if (metadata.schema_version !== 1) throw new Error('unsupported install metadata schema');
-  const runtimeVersion = requireString(metadata.runtime_version, 'runtime_version');
-  if (!SEMVER.test(runtimeVersion)) throw new Error('install metadata runtime_version is invalid');
+  // Schema 2 drops the runtime_* fields — the config-dir ledger is the runtime
+  // authority. Schema 1 is tolerated during the migration window: its runtime_*
+  // fields are read only by the T6 migration (from the raw file), never here,
+  // and are validated only if present so garbage still fails loudly.
+  if (metadata.schema_version !== 1 && metadata.schema_version !== 2) {
+    throw new Error('unsupported install metadata schema');
+  }
   const target = requireString(metadata.target, 'target');
-  const runtimeSha256 = requireString(metadata.runtime_sha256, 'runtime_sha256');
-  if (!SHA256.test(runtimeSha256)) throw new Error('install metadata runtime_sha256 is invalid');
-  const runtimePath = containedAbsolutePath(root, requireString(metadata.runtime_path, 'runtime_path'), 'runtime_path');
   const adapterRoot = containedAbsolutePath(root, requireString(metadata.adapter_root, 'adapter_root'), 'adapter_root');
   const integrationPath = containedAbsolutePath(
     root,
@@ -46,16 +47,22 @@ export function validateInstallMetadata(globalRoot, metadata) {
   if (!Array.isArray(metadata.configured_harnesses)) {
     throw new Error('install metadata configured_harnesses is invalid');
   }
+  if (metadata.runtime_version !== undefined
+    && (typeof metadata.runtime_version !== 'string' || !SEMVER.test(metadata.runtime_version))) {
+    throw new Error('install metadata runtime_version is invalid');
+  }
+  if (metadata.runtime_sha256 !== undefined
+    && (typeof metadata.runtime_sha256 !== 'string' || !SHA256.test(metadata.runtime_sha256))) {
+    throw new Error('install metadata runtime_sha256 is invalid');
+  }
 
   return {
     ...metadata,
     plugin_version: requireString(metadata.plugin_version, 'plugin_version'),
-    runtime_version: runtimeVersion,
     target,
-    runtime_sha256: runtimeSha256.toLowerCase(),
-    runtime_path: runtimePath,
     adapter_root: adapterRoot,
     integration_path: integrationPath,
+    ...(metadata.runtime_sha256 !== undefined ? { runtime_sha256: metadata.runtime_sha256.toLowerCase() } : {}),
   };
 }
 
