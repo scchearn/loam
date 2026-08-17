@@ -9,7 +9,7 @@ import { checkReadiness, probeState } from '../integration/runtime.mjs';
 import { resolveRuntimePath } from '../integration/ledger.mjs';
 import { verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
 import { isOwnedCommand, renderOpenCodePlugin } from './harnesses.mjs';
-import { verifyFederationService } from './federation.mjs';
+import { federationDefinitionExists, verifyFederationService } from './federation.mjs';
 
 async function fileExists(path) {
   try {
@@ -255,10 +255,28 @@ export async function verifyInstallation({
   // the definition is present/inspectable and references the trusted runtime
   // without starting the connector or contacting a broker.
   let federation = { ready: true, checked: false };
-  const federationRuntimePath = federationRunner !== undefined
+  // #125: if federation was enabled here (a service definition existed at
+  // discovery time), that definition MUST still be present after setup. The
+  // enrollment-state wipe deleted the plist and verify passed anyway because it
+  // asserted zero federation state — this makes a vanished definition a hard
+  // verification failure. File-only; win32's Task Scheduler definition is out of
+  // scope (#100), and a never-enabled machine (federationEnabled false) is
+  // unaffected.
+  if (discovery.federationEnabled && discovery.platform !== 'win32') {
+    const definition = await federationDefinitionExists({ globalRoot: discovery.globalRoot, platform: discovery.platform });
+    if (!definition.exists) {
+      federation = {
+        ready: false,
+        checked: true,
+        category: 'federation_definition_missing',
+        detail: 'federation was enabled but its service definition is missing after setup',
+      };
+    }
+  }
+  const federationRuntimePath = federation.ready && federationRunner !== undefined
     ? (await resolveRuntimePath({ globalRoot: discovery.globalRoot, home: discovery.home, platform: discovery.platform })) ?? install?.runtime_path
     : undefined;
-  if (federationRunner !== undefined && federationRuntimePath) {
+  if (federation.ready && federationRunner !== undefined && federationRuntimePath) {
     federation = {
       ...(await verifyFederationService({
         runtimePath: federationRuntimePath,

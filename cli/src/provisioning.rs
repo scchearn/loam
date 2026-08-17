@@ -957,16 +957,41 @@ pub fn configured_roster_root() -> Result<std::path::PathBuf, &'static str> {
 /// into the config-dir profile (`<profile>/loam.sqlite3`) so it survives
 /// uninstall with the rest of the identity. Resolution, first wins:
 ///
-/// 1. `LOAM_CONFIG_DIR` → `<cfg>/federation/loam.sqlite3`
-/// 2. an explicit `--global-root` (the operator's knob, and the hermetic-test
-///    Root) → `<root>/loam.sqlite3`
-/// 3. the platform config-dir profile → `<config>/loam/federation/loam.sqlite3`
-/// 4. the legacy install root → `<global-root>/loam.sqlite3`
+/// 1. `LOAM_CONFIG_DIR` → `<cfg>/federation/loam.sqlite3` (explicit override).
+/// 2. the platform config-dir profile → `<config>/loam/federation/loam.sqlite3`,
+///    but ONLY once that registry can answer (has an enrollment).
+/// 3. the explicit `--global-root` legacy registry → `<root>/loam.sqlite3`, but
+///    ONLY when it can answer (has enrollment) OR no config basis resolves at
+///    all — an enrolled-but-unmigrated machine keeps reading its live legacy
+///    store; a machine with nowhere durable to go still gets an answer.
+/// 4. the platform config-dir profile as the fresh-machine default — a fresh
+///    machine's very first enrollment lands here, durable from the start.
 ///
-/// Rung 2 existing as it does keeps the CLI's `--global-root` authoritative
-/// for non-default installs and tests (which would otherwise resolve the real
-/// HOME profile and clobber it), while rung 1 lets new installs point the
-/// registry at the surviving config dir explicitly.
+/// The durable config-dir registry is preferred over the volatile legacy
+/// global-root — the global root is rebuilt by install and destroyed by
+/// uninstall, so enrollment must not live there. But the flip is gated on
+/// `has_enrollment`: an enrolled-but-unmigrated machine's config-dir registry is
+/// absent/empty, so it keeps reading its live legacy registry (rung 3) until the
+/// one-time migration copies enrollment into the config dir — the flip becomes
+/// effective per-machine only once the copy lands, so a runtime that updates
+/// before setup's migration never reports the live connector unenrolled.
+///
+/// Rung 3 is gated on the legacy registry actually holding enrollment (or on
+/// there being no durable destination at all) so a FRESH machine — including a
+/// re-enroll after the #125 wipe, whose rebuilt hook-only DB has no federation
+/// tables — does NOT resolve back onto the volatile global root, but falls to
+/// rung 4 and gets a durable first enrollment. That is the whole point of #125.
+///
+/// Because rungs 2-4 consult the ambient config dir, hermetic tests MUST pin
+/// `LOAM_CONFIG_DIR` (rung 1) rather than rely on `--global-root` alone
+/// (`run_connect_pinned` in the federation CLI tests does), or a fresh test
+/// would fall through to rung 4 = the developer's real HOME registry.
+///
+/// This is all prerelease: "legacy" is the handful of machines we control, and
+/// rung 3 exists ONLY to carry an enrolled-but-unmigrated machine across the
+/// one-time enrollment migration. Once they are migrated the legacy rung (and
+/// both `has_enrollment` gates) can be deleted outright in a follow-up — it is
+/// transition scaffolding, not a contract to keep.
 pub fn configured_registry_path(
     legacy_root: Option<&std::path::Path>,
 ) -> Result<std::path::PathBuf, &'static str> {
@@ -980,10 +1005,40 @@ pub fn configured_registry_path(
             .join("federation")
             .join("loam.sqlite3"));
     }
-    if let Some(root) = legacy_root {
-        return Ok(root.join("loam.sqlite3"));
+    let config_registry = configured_profile_root().map(|profile| profile.join("loam.sqlite3"));
+    resolve_registry(config_registry, legacy_root, |db| {
+        crate::enrollment::has_enrollment(db)
+    })
+}
+
+/// Rungs 2-4 of [`configured_registry_path`], factored out with an injected
+/// enrollment probe so the ladder is unit-tested without touching process env or
+/// a real database file.
+fn resolve_registry(
+    config_registry: Result<std::path::PathBuf, &'static str>,
+    legacy_root: Option<&std::path::Path>,
+    has_enrollment: impl Fn(&std::path::Path) -> bool,
+) -> Result<std::path::PathBuf, &'static str> {
+    // Rung 2: the durable config-dir registry, but only once it can answer
+    // (the migration has run) — otherwise an unmigrated machine would read an
+    // empty config-dir DB and report a live connector unenrolled.
+    if let Ok(ref db) = config_registry {
+        if has_enrollment(db) {
+            return Ok(db.clone());
+        }
     }
-    configured_profile_root().map(|profile| profile.join("loam.sqlite3"))
+    // Rung 3: the legacy registry, but ONLY when it can actually answer
+    // (enrolled-but-unmigrated) or when no config basis resolves at all. A fresh
+    // machine with a resolvable config dir falls through to rung 4 rather than
+    // writing its first enrollment onto the volatile global root.
+    if let Some(root) = legacy_root {
+        let legacy_db = root.join("loam.sqlite3");
+        if has_enrollment(&legacy_db) || config_registry.is_err() {
+            return Ok(legacy_db);
+        }
+    }
+    // Rung 4: the durable config-dir default — a fresh machine's first enrollment.
+    config_registry
 }
 
 /// An entry that would admit everyone. `*` and `#` never occur in a principal
@@ -2197,6 +2252,70 @@ mod tests {
         )
         .map(|config| config.join("federation").join("rosters"))
         .expect("the default config root resolves")
+    }
+
+    #[test]
+    fn registry_prefers_config_dir_once_it_holds_enrollment() {
+        // Rung 2: config-dir registry can answer → it wins over legacy.
+        let config = std::path::PathBuf::from("/cfg/federation/loam.sqlite3");
+        let legacy_root = std::path::PathBuf::from("/legacy");
+        let config_for_probe = config.clone();
+        let got = resolve_registry(Ok(config.clone()), Some(&legacy_root), move |db| {
+            db == config_for_probe
+        });
+        assert_eq!(got.unwrap(), config);
+    }
+
+    #[test]
+    fn registry_reads_legacy_while_config_is_empty_but_legacy_is_enrolled() {
+        // Rung 3: config-dir empty, legacy holds enrollment → keep reading legacy
+        // (the enrolled-but-unmigrated machine) until the migration lands.
+        let config = std::path::PathBuf::from("/cfg/federation/loam.sqlite3");
+        let legacy_root = std::path::PathBuf::from("/legacy");
+        let legacy_db = legacy_root.join("loam.sqlite3");
+        let legacy_for_probe = legacy_db.clone();
+        let got = resolve_registry(Ok(config), Some(&legacy_root), move |db| {
+            db == legacy_for_probe
+        });
+        assert_eq!(got.unwrap(), legacy_db);
+    }
+
+    #[test]
+    fn registry_sends_a_fresh_machine_to_the_durable_config_dir() {
+        // Rung 4: no enrollment anywhere yet, config basis resolves → the fresh
+        // machine's FIRST enrollment lands in the durable config dir, never back
+        // on the volatile global root (#125 / #126 review Finding 1).
+        let config = std::path::PathBuf::from("/cfg/federation/loam.sqlite3");
+        let legacy_root = std::path::PathBuf::from("/legacy");
+        let got = resolve_registry(Ok(config.clone()), Some(&legacy_root), |_| false);
+        assert_eq!(got.unwrap(), config);
+    }
+
+    #[test]
+    fn registry_still_answers_on_legacy_when_no_config_basis_resolves() {
+        // No durable destination at all → the legacy registry answers even
+        // without enrollment, so a machine is never left with no path.
+        let legacy_root = std::path::PathBuf::from("/legacy");
+        let legacy_db = legacy_root.join("loam.sqlite3");
+        let got = resolve_registry(Err("no config basis"), Some(&legacy_root), |_| false);
+        assert_eq!(got.unwrap(), legacy_db);
+    }
+
+    #[test]
+    fn registry_rung1_loam_config_dir_wins_over_everything() {
+        // Rung 1: an explicit LOAM_CONFIG_DIR resolves before HOME is read, so
+        // this touches only that one var (set + restore).
+        let previous = std::env::var("LOAM_CONFIG_DIR").ok();
+        std::env::set_var("LOAM_CONFIG_DIR", "/explicit/cfg");
+        let got = configured_registry_path(Some(std::path::Path::new("/legacy")));
+        match previous {
+            Some(value) => std::env::set_var("LOAM_CONFIG_DIR", value),
+            None => std::env::remove_var("LOAM_CONFIG_DIR"),
+        }
+        assert_eq!(
+            got.unwrap(),
+            std::path::PathBuf::from("/explicit/cfg/federation/loam.sqlite3")
+        );
     }
 
     #[test]

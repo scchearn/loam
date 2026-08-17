@@ -105,6 +105,36 @@ export async function migrateRuntimeLedger({
   return { migrated: true, version, target: selectedTarget, sha256, storePath, from: seededFrom };
 }
 
+// One-time copy of the legacy global-root enrollment registry into the durable
+// config-dir registry, so federation enrollment survives a global-root rebuild.
+// Runs up front in the install/update transaction under setup.lock, mirroring
+// migrateRuntimeLedger. Idempotent: once the config-dir registry exists it is
+// the live store and is never overwritten by the stale legacy copy. Copy-not-
+// move so a running connector's open DB handle stays valid until the transaction
+// regenerates it; a plain file copy is sufficient because the registry is
+// quiescent during setup (enrollment is written only at enroll time).
+// Prerelease transition scaffolding — removable with the legacy registry rung
+// (provisioning.rs configured_registry_path) once our machines are migrated.
+export async function migrateEnrollment({
+  globalRoot,
+  env = process.env,
+  home,
+  platform = process.platform,
+} = {}) {
+  const config = configRoot({ env, home, platform });
+  if (!config) return { migrated: false, reason: 'no_config_dir' };
+  const destination = join(config, 'federation', 'loam.sqlite3');
+  if (await fileExists(destination)) return { migrated: false, reason: 'registry_present' };
+  const legacy = join(resolve(globalRoot), 'loam.sqlite3');
+  if (!(await fileExists(legacy))) return { migrated: false, reason: 'no_legacy_registry' };
+  await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+  await copyFile(legacy, destination);
+  await chmod(destination, 0o600).catch((error) => {
+    if (platform !== 'win32') throw error;
+  });
+  return { migrated: true, from: legacy, to: destination };
+}
+
 // True when this machine has a runtime `update` can bump: a config-dir ledger,
 // or migratable legacy state (install.json, or a binary under bin/). The
 // verb-dispatch refusal uses this so a legacy machine is upgraded (its ledger
@@ -164,6 +194,11 @@ function inside(root, candidate) {
   return !relativePath.startsWith('..') && !isAbsolute(relativePath);
 }
 
+// Two paths overlap when either contains (or equals) the other.
+function overlaps(a, b) {
+  return inside(a, b) || inside(b, a);
+}
+
 async function safePath(workspace, candidate, kind, report) {
   const path = resolve(candidate);
   if (!inside(workspace, path)) {
@@ -189,7 +224,7 @@ async function markerPaths(workspace, report) {
   }
 }
 
-export async function detectLegacyProject({ workspace, packageRoot, runner } = {}) {
+export async function detectLegacyProject({ workspace, packageRoot, protectedRoots = [], runner } = {}) {
   const root = resolve(workspace);
   const report = {
     workspace: root,
@@ -200,6 +235,16 @@ export async function detectLegacyProject({ workspace, packageRoot, runner } = {
     unsafe: [],
   };
   if (root === resolve(packageRoot)) return { ...report, sourceRepository: true, ready: true };
+
+  // #125 wipe guard: setup run with cwd AT (or above/inside) the global install
+  // makes <workspace>/.agents/loam resolve ONTO the global root (or the config
+  // dir) — that is the live install, never a legacy PROJECT. Blindly sweeping it
+  // rm -rf'd federation state (enrollment DB, service plist, connector log, bin).
+  // No legitimate legacy project sits at the install root, so refuse to treat
+  // this workspace as one — a real project dir never overlaps these roots.
+  if (protectedRoots.some((protectedRoot) => protectedRoot && overlaps(root, protectedRoot))) {
+    return { ...report, protectedWorkspace: true, ready: true };
+  }
 
   const inventory = await loadSkillInventory({ packageRoot });
   const aliases = new Map(inventory.skills.flatMap((skill) => skill.aliases.map((alias) => [alias, skill])));
@@ -237,11 +282,12 @@ export async function detectLegacyProject({ workspace, packageRoot, runner } = {
 export async function migrateLegacyProject({
   workspace,
   packageRoot,
+  protectedRoots = [],
   yes = false,
   prompt = async () => false,
   runner,
 } = {}) {
-  const report = await detectLegacyProject({ workspace, packageRoot, runner });
+  const report = await detectLegacyProject({ workspace, packageRoot, protectedRoots, runner });
   if (report.category) return { ...report, ready: false, migrated: false, leftovers: report.paths };
   if (report.ready) return { ...report, migrated: false, leftovers: [] };
   if (report.unsafe.length) return { ...report, ready: false, migrated: false, category: 'unsafe_legacy_path', leftovers: report.unsafe };
@@ -258,7 +304,7 @@ export async function migrateLegacyProject({
     return { ...report, ready: false, migrated: false, category: 'migration_failed', leftovers: [...leftovers, ...report.paths, ...report.markers] };
   }
 
-  const afterSkills = await detectLegacyProject({ workspace: report.workspace, packageRoot, runner });
+  const afterSkills = await detectLegacyProject({ workspace: report.workspace, packageRoot, protectedRoots, runner });
   if (afterSkills.category || afterSkills.unsafe.length || afterSkills.listedSkillNames.length) {
     return {
       ...afterSkills,
@@ -273,7 +319,7 @@ export async function migrateLegacyProject({
     await rm(entry.path, { recursive: true, force: true });
   }
   for (const marker of report.markers) await rm(marker.path, { force: true });
-  const verification = await detectLegacyProject({ workspace: report.workspace, packageRoot, runner });
+  const verification = await detectLegacyProject({ workspace: report.workspace, packageRoot, protectedRoots, runner });
   const remaining = [...verification.unsafe, ...verification.listedSkillNames, ...verification.paths, ...verification.markers];
   return {
     ...verification,

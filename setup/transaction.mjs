@@ -10,7 +10,7 @@ import { installRuntime } from './runtime.mjs';
 import { ledgerPath, readLedger } from '../integration/ledger.mjs';
 import { detectHarnesses, installHarnesses } from './harnesses.mjs';
 import { installMarketplacePlugins } from './marketplace.mjs';
-import { migrateLegacyProject, migrateRuntimeLedger } from './migration.mjs';
+import { migrateEnrollment, migrateLegacyProject, migrateRuntimeLedger } from './migration.mjs';
 import { removeHarnesses } from './uninstall.mjs';
 import { verifyInstallation } from './verify.mjs';
 import { stageFederationService, federationDefinitionExists } from './federation.mjs';
@@ -97,10 +97,19 @@ export async function executeSetup(parsed, discovery, options = {}) {
     return 130;
   }
   let previouslyConfigured = [];
+  // An install.json means this machine already has an install — so the `install`
+  // verb must PRESERVE existing federation state (re-render the service against
+  // the new runtime), not run as first-time. This is the reciprocal of update's
+  // refuse-when-fresh guard (#125 Q1): update refuses a fresh machine; install
+  // refreshes an existing one instead of skipping the preservation the `refresh`
+  // flag gated.
+  let existingInstall = false;
   try {
     const existing = JSON.parse(await readFile(join(discovery.globalRoot, 'install.json'), 'utf8'));
+    existingInstall = true;
     if (Array.isArray(existing.configured_harnesses)) previouslyConfigured = existing.configured_harnesses;
   } catch {}
+  const preserveExisting = refresh || existingInstall;
 
   const selection = await selectHarnesses({
     yes,
@@ -130,6 +139,33 @@ export async function executeSetup(parsed, discovery, options = {}) {
   const requestedDiscovery = { ...discovery, harnesses: requestedHarnesses };
 
   return withSetupLock({ globalRoot: discovery.globalRoot, ...(options.lockOptions || {}) }, async () => {
+    // Salvage-before-destroy (#125): copy legacy global-root state into the
+    // durable config dir BEFORE the workspace legacy sweep below. That sweep is
+    // now guarded from the global root (protectedRoots in migrateLegacyProject),
+    // but copying first is an independent second layer — if the guard ever
+    // regresses, the enrollment registry and runtime binary were already copied
+    // to safety. Both are copy-not-move + idempotent, run up front under
+    // setup.lock before staging/verify (preserves the #97-fix-2 property).
+    //
+    // Enrollment registry: legacy <global-root>/loam.sqlite3 -> config-dir, so an
+    // enrolled machine's enrollment survives a global-root rebuild.
+    await migrateEnrollment({
+      globalRoot: discovery.globalRoot,
+      home: discovery.home,
+      platform: discovery.platform,
+    });
+    // Runtime ledger/store: seed the config-dir ledger from a legacy machine
+    // (install.json or a binary under bin/) with no ledger yet. Idempotent — a
+    // fresh or already-migrated machine is a no-op. Also makes the update-refusal
+    // check see a legacy machine as upgradable, not fresh.
+    await migrateRuntimeLedger({
+      globalRoot: discovery.globalRoot,
+      home: discovery.home,
+      platform: discovery.platform,
+      arch: discovery.arch,
+      target: discovery.target,
+    });
+
     // #97 fix 2 — migrate BEFORE staging and BEFORE any verify. Legacy migration
     // mutates workspace state (removes legacy project skills/markers); running it
     // mid-transaction let it fail the very verification of the transaction that
@@ -142,6 +178,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
       migration = await migrateLegacyProject({
         workspace: discovery.workspace,
         packageRoot: discovery.packageRoot,
+        protectedRoots: discovery.protectedRoots,
         yes,
         prompt: options.migrationConfirm || options.confirm,
         runner: options.runner,
@@ -153,20 +190,6 @@ export async function executeSetup(parsed, discovery, options = {}) {
       stepDone(output, 'Legacy project Loam migrated');
     }
     const migratedLegacy = { ...migration, ready: true };
-
-    // One-time runtime-ledger migration: a legacy machine (install.json or a
-    // binary under bin/) with no config-dir ledger yet is seeded here, up front,
-    // inside setup.lock — never from readiness/hook paths. Copy-not-move,
-    // idempotent, so a fresh or already-migrated machine is a no-op. This makes
-    // the update-refusal check below see a legacy machine as upgradable, not
-    // fresh.
-    await migrateRuntimeLedger({
-      globalRoot: discovery.globalRoot,
-      home: discovery.home,
-      platform: discovery.platform,
-      arch: discovery.arch,
-      target: discovery.target,
-    });
 
     const alreadyReady = await verifyInstallation({
       discovery: requestedDiscovery,
@@ -181,7 +204,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
     }
 
     stepStart(output, 'Checking environment');
-    stepDone(output, refresh ? 'Environment checked — refreshing existing install' : 'Environment checked');
+    stepDone(output, preserveExisting ? 'Environment checked — refreshing existing install' : 'Environment checked');
     const metadataPath = join(discovery.globalRoot, 'install.json');
     let candidateIntegration;
     let harnessInstall;
@@ -385,22 +408,25 @@ export async function executeSetup(parsed, discovery, options = {}) {
       }
       stepDone(output, 'All checks passed');
 
-      // #100 — a runtime version bump must refresh the service definition, which
-      // embeds the versioned binary path. On `update`, and only when a definition
-      // already exists (federation was enabled on this machine — install and a
-      // never-enabled machine leave federation alone), re-render it through the
-      // just-committed runtime and preserve the prior active/inert state. The
-      // runtime owns rendering and the manager calls; its rollback joins this
-      // transaction. On win32 there is no file-based definition, so this no-ops.
-      // win32 is deliberately excluded: its definition lives in Task Scheduler
-      // with only a `windows-task.marker` file (federationDefinitionPath mirrors
-      // it for the absence verify). Re-rendering a scheduled task against the new
-      // runtime on update is Windows service parity — tracked with #100, out of
-      // scope here — so the marker must NOT trip this refresh.
-      const definition = refresh && discovery.platform !== 'win32'
+      // #100/#125 — a runtime version bump must refresh the service definition,
+      // which embeds the versioned binary path. On `update` OR an `install` over
+      // an existing machine (preserveExisting), and only when a definition already
+      // exists (federation was enabled here — a never-enabled or truly fresh
+      // machine leaves federation alone), re-render it through the just-committed
+      // runtime and preserve the prior active/inert state. #125: gating this on
+      // `refresh` alone let an `install` on an enrolled machine skip the re-render
+      // and strand the service at the old runtime path. The runtime owns rendering
+      // and the manager calls; its rollback joins this transaction. On win32 there
+      // is no file-based definition, so this no-ops. win32 is deliberately
+      // excluded: its definition lives in Task Scheduler with only a
+      // `windows-task.marker` file (federationDefinitionPath mirrors it for the
+      // absence verify). Re-rendering a scheduled task against the new runtime is
+      // Windows service parity — tracked with #100, out of scope — so the marker
+      // must NOT trip this refresh.
+      const definition = preserveExisting && discovery.platform !== 'win32'
         ? await federationDefinitionExists({ globalRoot: discovery.globalRoot, platform: discovery.platform })
         : { exists: false };
-      if (refresh && definition.exists && runtime?.path) {
+      if (preserveExisting && definition.exists && runtime?.path) {
         const federation = await stageFederationService({
           runtimePath: runtime.path,
           globalRoot: discovery.globalRoot,
