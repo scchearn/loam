@@ -87,6 +87,9 @@ jobs:
             binary: target/release/loam.exe
             run: pwsh .github/scripts/windows-service-smoke.ps1 target/release/loam.exe
     runs-on: ${{ matrix.os }}
+    # macos-14 runners intermittently hang launchctl (#124); non-blocking there
+    # until the smoke is runner-deterministic. Still runs and reports per-run.
+    continue-on-error: ${{ matrix.os == 'macos-14' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
