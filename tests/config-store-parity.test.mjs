@@ -3,7 +3,8 @@ import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 
 import { configRoot as setupConfigRoot } from '../setup/profile.mjs';
-import { configRoot as integrationConfigRoot } from '../integration/config-store.mjs';
+import { configRoot as integrationConfigRoot, SEMVER as integrationSemver } from '../integration/config-store.mjs';
+import { SEMVER as setupSemver } from '../setup/constants.mjs';
 
 // The config-dir ladder is deliberately duplicated: setup/profile.mjs owns it for
 // the installer, integration/config-store.mjs owns a copy for the STAGED, self-
@@ -85,6 +86,13 @@ const cases = [
     expected: join('/arg/home', '.config', 'loam'),
   },
 ];
+
+// SEMVER is the other constant duplicated into the integration copy; pin it
+// identical so the ledger's target validation cannot diverge from the installer's.
+test('SEMVER parity: integration copy is identical to setup/constants', () => {
+  assert.equal(integrationSemver.source, setupSemver.source);
+  assert.equal(integrationSemver.flags, setupSemver.flags);
+});
 
 for (const { name, input, expected } of cases) {
   test(`configRoot parity: ${name}`, () => {

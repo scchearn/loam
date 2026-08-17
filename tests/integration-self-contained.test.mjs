@@ -18,19 +18,22 @@ const integrationDir = new URL('../integration/', import.meta.url);
 // that carried the broken imports. This test loads the staged modules DIRECTLY
 // from a setup-less tree, so a `../setup` import anywhere in their chain fails
 // loudly here. It closes the regression class, not just the one instance.
-test('the staged integration modules load with no setup/ tree beside them', async () => {
+test('every staged integration module loads with no setup/ tree beside them', async () => {
   const staged = await mkdtemp(join(tmpdir(), 'loam-staged-integration-'));
-  for (const name of await readdir(integrationDir)) {
-    if (name.endsWith('.mjs')) {
-      await writeFile(join(staged, name), await readFile(new URL(name, integrationDir)));
-    }
+  const names = (await readdir(integrationDir)).filter((name) => name.endsWith('.mjs'));
+  for (const name of names) {
+    await writeFile(join(staged, name), await readFile(new URL(name, integrationDir)));
   }
-  // Deliberately no `setup/` next to `staged`: `../setup/*` is unresolvable, so
-  // any integration module reaching into it throws ERR_MODULE_NOT_FOUND on load.
-  for (const entry of ['config-store.mjs', 'ledger.mjs', 'runtime.mjs', 'ingest.mjs', 'loam.mjs', 'hooks.mjs']) {
+  // Import EVERY staged module, not a curated list — a list would omit the next
+  // module the way it omitted the harvest-*/shadow/ingest-* files that the
+  // ingest/hooks chain never reaches. Deliberately no `setup/` beside `staged`:
+  // `../setup/*` is unresolvable, so a reach into it from ANY integration file
+  // throws ERR_MODULE_NOT_FOUND here instead of shipping broken.
+  assert.ok(names.length >= 6, `expected the full integration module set, got ${names.length}`);
+  for (const name of names) {
     await assert.doesNotReject(
-      () => import(pathToFileURL(join(staged, entry)).href),
-      `${entry} must load from the staged tree without importing ../setup/*`,
+      () => import(pathToFileURL(join(staged, name)).href),
+      `${name} must load from the staged tree without importing ../setup/*`,
     );
   }
 });
