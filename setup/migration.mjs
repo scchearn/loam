@@ -105,6 +105,37 @@ export async function migrateRuntimeLedger({
   return { migrated: true, version, target: selectedTarget, sha256, storePath, from: seededFrom };
 }
 
+// True when this machine has a runtime `update` can bump: a config-dir ledger,
+// or migratable legacy state (install.json, or a binary under bin/). The
+// verb-dispatch refusal uses this so a legacy machine is upgraded (its ledger
+// is seeded up front in the transaction), not refused as if it were fresh.
+export async function hasMigratableRuntime({
+  globalRoot,
+  env = process.env,
+  home,
+  platform = process.platform,
+  arch = process.arch,
+  target,
+} = {}) {
+  const config = configRoot({ env, home, platform });
+  if (config && await readLedger({ root: config })) return true;
+  const legacyRoot = resolve(globalRoot);
+  try {
+    const install = JSON.parse(await readFile(join(legacyRoot, 'install.json'), 'utf8'));
+    if (install && typeof install === 'object' && !Array.isArray(install)) return true;
+  } catch {
+    // No readable install.json.
+  }
+  const executable = platform === 'win32' ? 'loam.exe' : 'loam';
+  const selectedTarget = target || detectTarget({ platform, arch, override: env.LOAM_TARGET });
+  const binRoot = join(legacyRoot, 'bin');
+  for (const entry of await readdir(binRoot, { withFileTypes: true }).catch(() => [])) {
+    if (!entry.isDirectory() || !SEMVER.test(entry.name)) continue;
+    if (await fileExists(join(binRoot, entry.name, selectedTarget, executable))) return true;
+  }
+  return false;
+}
+
 export const LEGACY_MARKERS = Object.freeze([
   ['.opencode/plugins/loam.js', 'plugin-marker'],
   ['.claude-plugin/plugin.json', 'plugin-marker'],

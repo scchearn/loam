@@ -93,7 +93,7 @@ function nativeHookCommands(entries, runtimePath, harnessId) {
       && entry.args[1] === harnessId);
 }
 
-async function verifyHarness(id, harness, { packageRoot, globalRoot, install, workspace }) {
+async function verifyHarness(id, harness, { packageRoot, globalRoot, install, workspace, home, platform }) {
   if (harness.state === 'absent') return { ...harness, ready: true };
   if (id === 'codex') {
     const profilePath = join(harness.root, 'agents', 'loam_ingestor.toml');
@@ -117,7 +117,7 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
   // The injected hook command runs the config-dir store binary; compare against
   // the ledger's store_path (schema-1 install.json runtime_path as migration
   // fallback), never a dropped schema-2 field.
-  const runtimePath = (await resolveRuntimePath({ globalRoot })) ?? install.runtime_path;
+  const runtimePath = (await resolveRuntimePath({ globalRoot, home, platform })) ?? install.runtime_path;
   try {
     if (id === 'claude' || id === 'codex') {
       if (!harness.marketplaceReady || !harness.marketplaceRoot) return { ...harness, ready: false, category: 'plugin_incomplete' };
@@ -221,6 +221,7 @@ export async function verifyInstallation({
         target: discovery.target,
         platform: discovery.platform,
         arch: discovery.arch,
+        home: discovery.home,
         install,
       })
     : { ready: false, category: 'install_metadata_missing' };
@@ -239,6 +240,8 @@ export async function verifyInstallation({
       globalRoot: discovery.globalRoot,
       install,
       workspace: discovery.workspace,
+      home: discovery.home,
+      platform: discovery.platform,
     });
   }
   const migration = legacy || discovery.legacy;
@@ -251,10 +254,13 @@ export async function verifyInstallation({
   // the definition is present/inspectable and references the trusted runtime
   // without starting the connector or contacting a broker.
   let federation = { ready: true, checked: false };
-  if (federationRunner !== undefined && install?.runtime_path) {
+  const federationRuntimePath = federationRunner !== undefined
+    ? (await resolveRuntimePath({ globalRoot: discovery.globalRoot, home: discovery.home, platform: discovery.platform })) ?? install?.runtime_path
+    : undefined;
+  if (federationRunner !== undefined && federationRuntimePath) {
     federation = {
       ...(await verifyFederationService({
-        runtimePath: install.runtime_path,
+        runtimePath: federationRuntimePath,
         globalRoot: discovery.globalRoot,
         runner: federationRunner,
       })),

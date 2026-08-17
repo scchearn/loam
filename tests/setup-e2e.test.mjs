@@ -11,15 +11,22 @@ import { test } from 'node:test';
 import { loadSkillInventory } from '../setup/inventory.mjs';
 import { runSetup } from '../setup/main.mjs';
 import { parseArgs } from '../setup/args.mjs';
-import { PACKAGE_VERSION } from '../setup/constants.mjs';
+import { PACKAGE_VERSION, RUNTIME_VERSION } from '../setup/constants.mjs';
 import { discover } from '../setup/discovery.mjs';
 import { verifyInstallation } from '../setup/verify.mjs';
 import { detectTarget, runtimePath } from '../setup/target.mjs';
 import { uninstall } from '../setup/uninstall.mjs';
 import { federationDefinitionPath } from '../setup/federation.mjs';
+import { ledgerPath } from '../integration/ledger.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 const target = detectTarget();
+
+// The runtime ledger lives in the config dir; with no LOAM_CONFIG_DIR/XDG in the
+// test env it resolves under the temp home's ~/.config/loam.
+async function readLedgerFor(home) {
+  return JSON.parse(await readFile(ledgerPath({ root: join(home, '.config', 'loam') }), 'utf8'));
+}
 
 async function releaseFixture() {
   const release = await mkdtemp(join(tmpdir(), 'loam-setup-release-'));
@@ -28,7 +35,7 @@ async function releaseFixture() {
   await writeFile(join(release, file), bytes);
   await writeFile(
     join(release, 'loam-runtime-manifest.json'),
-    JSON.stringify({ version: '0.9.1', runtimes: [{ target, file, sha256: createHash('sha256').update(bytes).digest('hex') }] }),
+    JSON.stringify({ version: RUNTIME_VERSION, runtimes: [{ target, file, sha256: createHash('sha256').update(bytes).digest('hex') }] }),
   );
   return { url: pathToFileURL(release).href, bytes };
 }
@@ -76,7 +83,9 @@ async function baseFixture() {
       claude: { id: 'claude', state: 'absent' },
       cursor: { id: 'cursor', state: 'absent' },
     },
-    smokeRunner: async () => ({ code: 0, stdout: '{"exists":false}', stderr: '' }),
+    // The runtime self-reports its compiled version; readiness diffs it against
+    // the ledger target, so the smoke stub must echo the resolved runtime version.
+    smokeRunner: async () => ({ code: 0, stdout: JSON.stringify({ exists: false, version: RUNTIME_VERSION }), stderr: '' }),
   };
 }
 
@@ -142,12 +151,20 @@ test('clean --yes setup completes and publishes verified install metadata', asyn
   assert.match(capture.text(), /Loam is ready/);
   const globalRoot = join(fixture.home, '.agents', 'loam');
   const metadata = JSON.parse(await readFile(join(globalRoot, 'install.json'), 'utf8'));
-  assert.equal(metadata.schema_version, 1);
-  assert.equal(metadata.runtime_version, '0.9.1');
+  // Schema 2: install.json carries no runtime_* fields — the config-dir ledger
+  // is the runtime authority.
+  assert.equal(metadata.schema_version, 2);
+  assert.equal(metadata.runtime_version, undefined);
+  assert.equal(metadata.runtime_sha256, undefined);
+  assert.equal(metadata.runtime_path, undefined);
   assert.equal(metadata.target, target);
-  assert.equal(metadata.runtime_sha256, createHash('sha256').update(fixture.release.bytes).digest('hex'));
   assert.equal(metadata.skills_scope, 'global');
-  assert.equal(await readFile(runtimePath(globalRoot, '0.9.1', target), 'utf8'), fixture.release.bytes);
+  const ledger = await readLedgerFor(fixture.home);
+  assert.equal(ledger.schema_version, 1);
+  assert.equal(ledger.channel, 'next');
+  assert.equal(ledger.target, RUNTIME_VERSION);
+  assert.equal(ledger.sha256, createHash('sha256').update(fixture.release.bytes).digest('hex'));
+  assert.equal(await readFile(ledger.store_path, 'utf8'), fixture.release.bytes);
 });
 
 test('complete ready rerun is local-only and does not call Skills CLI or download', async () => {
@@ -564,8 +581,11 @@ test('interrupted runtime smoke cleans staging and publishes no metadata', async
   assert.equal(code, 1);
   const globalRoot = join(fixture.home, '.agents', 'loam');
   await assert.rejects(() => readFile(join(globalRoot, 'install.json')));
-  const entries = await readdir(join(globalRoot, 'staging'));
+  // The runtime store staging (now under the config dir) is cleaned, and the
+  // failed smoke committed no ledger — readiness stays unwritten.
+  const entries = await readdir(join(fixture.home, '.config', 'loam', 'runtime', 'staging'));
   assert.deepEqual(entries, []);
+  await assert.rejects(() => readFile(ledgerPath({ root: join(fixture.home, '.config', 'loam') })));
 });
 
 test('final verification failure restores the previous install metadata', async () => {
@@ -614,7 +634,10 @@ test('failed later setup stages preserve the active integration and metadata', a
   const previous = await readFile(metadataPath, 'utf8');
   const previousMetadata = JSON.parse(previous);
   await writeFile(previousMetadata.integration_path, 'previous integration');
-  await writeFile(runtimePath(globalRoot, '0.9.1', target), 'tampered runtime');
+  // Tamper the config-store binary so readiness fails (sha mismatch) and setup
+  // proceeds past the already-ready short-circuit into the staged final verify.
+  const ledger = await readLedgerFor(fixture.home);
+  await writeFile(ledger.store_path, 'tampered runtime');
 
   const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
@@ -783,7 +806,6 @@ test('#100: update refreshes an existing service definition against the committe
   await mkdir(join(globalRoot, definitionPath.includes('launchagents') ? 'launchagents' : 'systemd'), { recursive: true });
   await writeFile(definitionPath, 'stale');
 
-  const install = JSON.parse(await readFile(join(globalRoot, 'install.json'), 'utf8'));
   const capture = outputCapture();
   const code = await runSetup(parseArgs(['update']), {
     ...fixture,
@@ -794,11 +816,12 @@ test('#100: update refreshes an existing service definition against the committe
   });
   assert.equal(code, 0, capture.text());
   // The definition was re-rendered (status -> install) and re-enabled (was active),
-  // every verb targeting the committed runtime path.
+  // every verb targeting the committed runtime path — the config-dir store binary.
+  const ledger = await readLedgerFor(fixture.home);
   const verbs = fed.calls.map((c) => c.verb);
   assert.ok(verbs.includes('install'), 'update must re-render the definition');
   assert.ok(verbs.includes('enable'), 'an active service is re-enabled after the refresh');
-  for (const call of fed.calls) assert.equal(call.runtimePath, install.runtime_path);
+  for (const call of fed.calls) assert.equal(call.runtimePath, ledger.store_path);
   await assert.doesNotReject(() => readFile(definitionPath));
 });
 
