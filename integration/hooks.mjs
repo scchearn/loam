@@ -66,6 +66,13 @@ export async function beginHookRun({
   sessionId,
   timeoutMs = 300,
   runner,
+  // Config-dir resolution inputs, threaded to resolveRuntimePath exactly as
+  // checkReadiness/verifyHarness thread them. Production omits all three, so the
+  // ledger resolves from the real config dir (process.env); tests inject them to
+  // resolve a fixture config dir instead of leaking to the host's ~/.config.
+  home,
+  platform,
+  env,
 } = {}) {
   try {
     if (!isAbsolute(globalRoot) || !isAbsolute(workspace)) return null;
@@ -73,7 +80,7 @@ export async function beginHookRun({
     const root = resolve(globalRoot);
     const cwd = resolve(workspace);
     const install = await readInstallMetadata(root);
-    const runtimePath = await resolveRuntimePath({ globalRoot: root });
+    const runtimePath = await resolveRuntimePath({ globalRoot: root, home, platform, env });
     if (!isAbsolute(runtimePath || '')) return null;
     const args = [
       'hooks', 'begin', root,
