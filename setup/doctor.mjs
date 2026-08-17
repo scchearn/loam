@@ -37,7 +37,10 @@ export async function runDoctor(options = {}) {
     report(output, 'Install metadata', result.install ? { ready: true } : { ready: false, category: 'install_metadata_missing' });
     if (result.install) {
       output.write(`  Plugin version: ${result.install.plugin_version}\n`);
-      output.write(`  CLI version: ${result.install.runtime_version}\n`);
+      // The runtime version is the config-dir ledger target (schema-2 install.json
+      // no longer records it); the schema-1 field is a display fallback.
+      const runtimeVersion = result.runtime?.ledger?.target ?? result.install.runtime_version ?? 'unknown';
+      output.write(`  CLI version: ${runtimeVersion}\n`);
     }
     report(output, 'Global skills', result.skills);
     report(output, 'Native runtime', result.runtime);

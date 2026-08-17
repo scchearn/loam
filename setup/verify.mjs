@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { readInstallMetadata, readRequiredVersion, readSkillContent } from '../integration/metadata.mjs';
+import { readInstallMetadata, readSkillContent } from '../integration/metadata.mjs';
 import { resolveExclusions } from '../integration/ingest.mjs';
 import { checkReadiness, probeState } from '../integration/runtime.mjs';
 import { resolveRuntimePath } from '../integration/ledger.mjs';
@@ -21,9 +21,10 @@ async function fileExists(path) {
 
 async function localSkills(skillsRoot) {
   try {
-    const requiredVersion = await readRequiredVersion({ skillsRoot });
+    // Presence-only: a readable `loam-using/SKILL.md` proves the global skills
+    // are installed; the skills tree no longer carries a runtime version.
     await readSkillContent({ skillsRoot });
-    return { ready: true, requiredVersion };
+    return { ready: true };
   } catch (error) {
     return { ready: false, category: 'skills_missing', detail: error instanceof Error ? error.message : String(error) };
   }

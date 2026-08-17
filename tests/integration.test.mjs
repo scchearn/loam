@@ -10,7 +10,7 @@ import {
   beginHookRun, finishHookRun, finishHookWorker, startHookWorker,
 } from '../integration/hooks.mjs';
 import { runIntegration } from '../integration/loam.mjs';
-import { readInstallMetadata, readRequiredVersion, validateInstallMetadata } from '../integration/metadata.mjs';
+import { readInstallMetadata, validateInstallMetadata } from '../integration/metadata.mjs';
 import { detectLegacyShadow } from '../integration/shadow.mjs';
 import { detectTarget, resolveGlobalRoot, SUPPORTED_TARGETS, runtimePath } from '../integration/paths.mjs';
 import { invokeRuntime, probeState, verifyRuntimeFile } from '../integration/runtime.mjs';
@@ -136,25 +136,6 @@ test('metadata validation accepts prerelease versions and rejects build metadata
       () => validateInstallMetadata(globalRoot, { ...base, runtime_version: bad }),
       /runtime_version is invalid/,
       `runtime_version ${bad} should be rejected`,
-    );
-  }
-});
-
-test('CLI_VERSION accepts prerelease and rejects build metadata', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'loam-cliversion-'));
-  const skillsRoot = join(home, '.agents', 'skills');
-  const scripts = join(skillsRoot, 'loam-using', 'scripts');
-  await mkdir(scripts, { recursive: true });
-  for (const version of ['0.9.1-next.0', '0.9.1-next.1', '0.9.1-rc.1']) {
-    await writeFile(join(scripts, 'CLI_VERSION'), `${version}\n`);
-    assert.equal(await readRequiredVersion({ skillsRoot }), version, `CLI_VERSION ${version} should be accepted`);
-  }
-  for (const bad of ['0.9.1+build', '0.9.1-', '0.9.1-next.01', 'not-a-version']) {
-    await writeFile(join(scripts, 'CLI_VERSION'), `${bad}\n`);
-    await assert.rejects(
-      () => readRequiredVersion({ skillsRoot }),
-      /invalid CLI_VERSION/,
-      `CLI_VERSION ${bad} should be rejected`,
     );
   }
 });

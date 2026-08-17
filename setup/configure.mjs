@@ -9,6 +9,7 @@ import {
   verifyFederationService,
 } from './federation.mjs';
 import { catalogEntry, CATALOG } from './integrations/catalog.mjs';
+import { readLedger, resolveRuntimePath } from '../integration/ledger.mjs';
 import { announce, finish, stepStart, stepDone, stepDetail, confirmAction } from './wizard.mjs';
 
 // `setup` is the configurator for an EXISTING install: it toggles federation and
@@ -69,7 +70,14 @@ async function configureFederation(action, { discovery, install, parsed, options
   const output = options.output || process.stdout;
   const errorOutput = options.errorOutput || process.stderr;
   const runner = federationRunner(options);
-  const runtimePath = install.runtime_path;
+  // The runtime path is the config-dir ledger's store binary (schema-1
+  // install.runtime_path as a migration fallback); null → refuse with an
+  // `update` hint, exactly as before.
+  const runtimePath = (await resolveRuntimePath({
+    globalRoot: discovery.globalRoot,
+    home: discovery.home,
+    platform: discovery.platform,
+  })) ?? install.runtime_path;
   const platform = discovery.platform;
   const base = { runtimePath, globalRoot: discovery.globalRoot, runner, timeoutMs: options.federationTimeoutMs, platform };
 
@@ -213,6 +221,9 @@ export async function runConfigure(parsed, options = {}) {
 
     const install = await readInstall(discovery.globalRoot);
     if (!install) return graceNoInstall(parsed, discovery, options);
+    // The runtime version is the ledger target now (schema-2 install.json drops
+    // runtime_version); the schema-1 field is a display fallback only.
+    const ledger = await readLedger({ home: discovery.home, platform: discovery.platform });
 
     // The integration actions to apply, as {id, mode}. Flag-driven from
     // --integration (enable) and --disable-integration (disable).
@@ -242,7 +253,7 @@ export async function runConfigure(parsed, options = {}) {
 
     await announce(output, `🌱 Loam setup${parsed.dryRun ? ' (dry-run)' : ''}`, [
       `Global root: ${discovery.globalRoot}`,
-      `Plugin v${install.plugin_version} · runtime v${install.runtime_version}`,
+      `Plugin v${install.plugin_version} · runtime v${ledger?.target ?? install.runtime_version ?? 'unknown'}`,
     ]);
 
     let ok = true;

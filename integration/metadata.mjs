@@ -76,14 +76,6 @@ export async function readInstallMetadata(globalRoot) {
   return validateInstallMetadata(globalRoot, metadata);
 }
 
-export async function readRequiredVersion({ skillsRoot, home, env } = {}) {
-  const root = resolve(skillsRoot || resolveSkillsRoot({ home, env }));
-  const file = join(root, 'loam-using', 'scripts', 'CLI_VERSION');
-  const version = (await readFile(file, 'utf8')).trim();
-  if (!SEMVER.test(version)) throw new Error(`invalid CLI_VERSION at ${file}`);
-  return version;
-}
-
 export async function readSkillContent({ skillsRoot, home, env } = {}) {
   const root = resolve(skillsRoot || resolveSkillsRoot({ home, env }));
   const file = join(root, 'loam-using', 'SKILL.md');
