@@ -199,7 +199,9 @@ test('win32 federation disable is clean when the Task Scheduler marker is gone',
   // status returns not-active; no windows-task.marker exists → clean disable.
   const code = await runConfigure(
     { command: 'setup', federation: 'disable', integrations: [], dryRun: false, yes: true, purge: false },
-    { ...baseOptions(fixture, capture), platform: 'win32' },
+    // arch is pinned with platform so the win32 target resolves on any host
+    // runner (macOS arm64 would otherwise make detectTarget throw win32/arm64).
+    { ...baseOptions(fixture, capture), platform: 'win32', arch: 'x64' },
   );
   assert.equal(code, 0, capture.text());
   assert.match(capture.text(), /Federation disabled/);
@@ -218,7 +220,7 @@ test('win32 federation disable names a leftover windows-task.marker', async () =
   };
   const code = await runConfigure(
     { command: 'setup', federation: 'disable', integrations: [], dryRun: false, yes: true, purge: false },
-    { ...baseOptions(fixture, capture, stubborn), platform: 'win32' },
+    { ...baseOptions(fixture, capture, stubborn), platform: 'win32', arch: 'x64' },
   );
   assert.equal(code, 1);
   assert.match(capture.text(), /Federation disable incomplete/);

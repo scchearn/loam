@@ -1,9 +1,10 @@
 import { readFile } from 'node:fs/promises';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 
-import { publishJson } from '../setup/atomic.mjs';
-import { configRoot } from '../setup/profile.mjs';
-import { SEMVER } from '../setup/constants.mjs';
+// These live in the integration tree, not setup/: the published integration is
+// staged standalone, so it must not import ../setup/* (that tree is not copied
+// alongside it). See integration/config-store.mjs.
+import { configRoot, publishJson, SEMVER } from './config-store.mjs';
 
 // Durable config-dir runtime ledger. It records how the runtime target was
 // selected and what is installed — `{ schema_version, channel, target, sha256,

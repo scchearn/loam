@@ -6,7 +6,9 @@ import { join, resolve } from 'node:path';
 import { readInstallMetadata, readSkillContent, validateInstallMetadata } from './metadata.mjs';
 import { assertInside, assertPhysicalInside, detectTarget, resolveSkillsRoot } from './paths.mjs';
 import { readLedger } from './ledger.mjs';
-import { configRoot } from '../setup/profile.mjs';
+// Config-dir resolver from the integration tree — see integration/config-store.mjs;
+// the staged integration must not import ../setup/*.
+import { configRoot } from './config-store.mjs';
 
 export const MAX_DETAIL = 4096;
 const MAX_RUNTIME_BYTES = 64 * 1024 * 1024;

@@ -32,7 +32,10 @@ async function legacyRuntimeFixture({ includeRuntimeVersion = true, version = '0
   const configDir = join(home, 'config');
   const bin = join(globalRoot, 'bin', version, ledgerTarget);
   await mkdir(bin, { recursive: true });
-  const binary = join(bin, 'loam');
+  // The migration looks for the platform's executable name (loam.exe on win32);
+  // ledgerTarget is the host target, so the legacy binary must match the host or
+  // the binary-only seed can't find it on Windows.
+  const binary = join(bin, process.platform === 'win32' ? 'loam.exe' : 'loam');
   const bytes = 'legacy runtime bytes';
   await writeFile(binary, bytes);
   const sha = createHash('sha256').update(bytes).digest('hex');

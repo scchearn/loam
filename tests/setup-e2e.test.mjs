@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { fileURLToPath } from 'node:url';
-import { test } from 'node:test';
+import { test, afterEach } from 'node:test';
 
 import { loadSkillInventory } from '../setup/inventory.mjs';
 import { runSetup } from '../setup/main.mjs';
@@ -22,8 +22,26 @@ import { ledgerPath } from '../integration/ledger.mjs';
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 const target = detectTarget();
 
-// The runtime ledger lives in the config dir; with no LOAM_CONFIG_DIR/XDG in the
-// test env it resolves under the temp home's ~/.config/loam.
+// The runtime store + ledger live in the config dir, which `configRoot` derives
+// from LOAM_CONFIG_DIR -> XDG_CONFIG_HOME / platform dir -> ~/.config. These
+// tests only pass a temp `home`, so on a host with XDG_CONFIG_HOME set, or on
+// macOS/Windows, the transaction's config dir would escape the temp home and the
+// assertions (which look under the home) would miss it — the CI-red these tests
+// hit. Pin LOAM_CONFIG_DIR per test to the exact path the assertions read, so
+// config resolution is deterministic on every platform and every XDG state; the
+// afterEach restores the ambient value so nothing leaks across tests.
+const ORIGINAL_LOAM_CONFIG_DIR = process.env.LOAM_CONFIG_DIR;
+afterEach(() => {
+  if (ORIGINAL_LOAM_CONFIG_DIR === undefined) delete process.env.LOAM_CONFIG_DIR;
+  else process.env.LOAM_CONFIG_DIR = ORIGINAL_LOAM_CONFIG_DIR;
+});
+
+function pinConfigDir(home) {
+  const configDir = join(home, '.config', 'loam');
+  process.env.LOAM_CONFIG_DIR = configDir;
+  return configDir;
+}
+
 async function readLedgerFor(home) {
   return JSON.parse(await readFile(ledgerPath({ root: join(home, '.config', 'loam') }), 'utf8'));
 }
@@ -54,6 +72,7 @@ function outputCapture() {
 
 async function baseFixture() {
   const home = await mkdtemp(join(tmpdir(), 'loam-setup-home-'));
+  pinConfigDir(home);
   const workspace = await mkdtemp(join(tmpdir(), 'loam-setup-workspace-'));
   const release = await releaseFixture();
   const list = await fullList();
@@ -799,7 +818,11 @@ test('#100: update refreshes an existing service definition against the committe
   await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
   const globalRoot = join(fixture.home, '.agents', 'loam');
   const definitionPath = federationDefinitionPath({ globalRoot, platform: process.platform });
-  if (!definitionPath) return; // win32: no file-based definition to refresh.
+  // win32 is deliberately excluded from the update federation refresh (its
+  // definition lives in Task Scheduler, tracked by #100), so there is nothing to
+  // re-render there; federationDefinitionPath still returns a marker path on
+  // win32, so guard the platform explicitly, not just a null path.
+  if (!definitionPath || process.platform === 'win32') return;
 
   // Simulate federation having been enabled (an active definition exists).
   const fed = fedRunner(globalRoot, process.platform, { active: true });
