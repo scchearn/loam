@@ -1574,6 +1574,35 @@ const SESSIONLESS_EXIT_AFTER: Duration = Duration::from_secs(600);
 /// respawn a fresh process. `EX_TEMPFAIL` from sysexits.
 pub const WATCHDOG_EXIT_CODE: i32 = 75;
 
+// Test-tier tuning knobs. The spec thresholds above are the production defaults;
+// these env overrides exist ONLY so the `LOAM_MQTT_TEST` live respawn gate can
+// drive a real watchdog exit in seconds instead of ten minutes. They are additive
+// and never consulted unless set — production behavior is the consts, unchanged.
+const ENV_DIAL_SECS: &str = "LOAM_WATCHDOG_DIAL_SECS";
+const ENV_BACKOFF_CAP_SECS: &str = "LOAM_WATCHDOG_BACKOFF_CAP_SECS";
+const ENV_SESSIONLESS_SECS: &str = "LOAM_WATCHDOG_SESSIONLESS_SECS";
+
+/// Read a whole-seconds duration override from the environment, or the default.
+fn env_secs_or(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
+
+fn configured_dial_deadline() -> Duration {
+    env_secs_or(ENV_DIAL_SECS, DIAL_DEADLINE)
+}
+
+fn configured_backoff_cap() -> Duration {
+    env_secs_or(ENV_BACKOFF_CAP_SECS, BACKOFF_CAP)
+}
+
+fn configured_sessionless_budget() -> Duration {
+    env_secs_or(ENV_SESSIONLESS_SECS, SESSIONLESS_EXIT_AFTER)
+}
+
 /// The watchdog's verdict on a failed establishment cycle: keep retrying in this
 /// process, or exit so the OS supervisor respawns a fresh one. Pure and
 /// clock-injected so the ten-minute budget is unit-testable without a real wait
@@ -1586,14 +1615,21 @@ enum WatchdogVerdict {
 
 /// Whether an enrolled, provisioned-but-sessionless connector has been down long
 /// enough to hand recovery to its OS supervisor. `sessionless_since` is when the
-/// current sessionless stretch began; `now` is the current instant.
-fn watchdog_verdict(sessionless_since: Instant, now: Instant) -> WatchdogVerdict {
-    if now.saturating_duration_since(sessionless_since) >= SESSIONLESS_EXIT_AFTER {
+/// current sessionless stretch began; `now` is the current instant; `budget` is
+/// the sessionless allowance (the const default, or the test-tier override).
+fn watchdog_verdict(sessionless_since: Instant, now: Instant, budget: Duration) -> WatchdogVerdict {
+    if now.saturating_duration_since(sessionless_since) >= budget {
         WatchdogVerdict::Exit
     } else {
         WatchdogVerdict::Retry
     }
 }
+
+/// The shared authenticated identity of a supervised session: `None` until the
+/// first successful open, then set by the supervisor thread and read by the emit
+/// path. Identity is stable across reconnects (the certificate CN does not
+/// change), so it is set once and never cleared.
+type IdentitySlot = std::sync::Arc<std::sync::Mutex<Option<SessionIdentity>>>;
 
 /// A cloneable handle to one project's `ObservedSession`. Every mutation is a
 /// named state transition so the supervisor cannot record an inconsistent view.
@@ -1609,6 +1645,20 @@ impl LivenessHandle {
             since: now,
             consecutive_failures: 0,
             last_error: None,
+            refusal: None,
+        })))
+    }
+
+    /// A handle for a session whose first establishment cycle failed but is
+    /// retryable (a dial/auth/subscribe failure, not a typed refusal). The
+    /// supervisor keeps trying and the watchdog is already counting: the first
+    /// failure is seeded here so the observation is truthful from attach.
+    fn down(now: DateTime<Utc>, category: String) -> Self {
+        LivenessHandle(std::sync::Arc::new(std::sync::Mutex::new(ObservedSession {
+            established: false,
+            since: now,
+            consecutive_failures: 1,
+            last_error: Some(category),
             refusal: None,
         })))
     }
@@ -1669,10 +1719,10 @@ impl LivenessHandle {
 /// cap is a true ceiling; it is derived from the system clock's subsecond nanos —
 /// reconnect spacing needs decorrelation, not cryptographic randomness, so no new
 /// dependency is pulled in.
-fn backoff_with_jitter(failures: u32) -> Duration {
+fn backoff_with_jitter(failures: u32, cap: Duration) -> Duration {
     let shift = failures.saturating_sub(1).min(6);
     let base = BACKOFF_BASE.saturating_mul(1u32 << shift);
-    let capped = base.min(BACKOFF_CAP);
+    let capped = base.min(cap);
     let jitter_ceiling = (capped.as_millis() as u64) / 4;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1713,9 +1763,13 @@ fn supervise<A, S>(
     S: FnMut(Duration),
 {
     use std::sync::atomic::Ordering::Relaxed;
+    // Tuning read once per supervisor: the production consts, unless the test tier
+    // overrode them via the environment.
+    let backoff_cap = configured_backoff_cap();
+    let sessionless_budget = configured_sessionless_budget();
     // When the current sessionless stretch began. `None` while a session is live;
     // set on the first failed cycle after a drop, cleared when one re-establishes.
-    // The watchdog measures its ten-minute budget from here.
+    // The watchdog measures its budget from here.
     let mut sessionless_since: Option<Instant> = None;
     while !stop.load(Relaxed) {
         match attempt() {
@@ -1738,14 +1792,16 @@ fn supervise<A, S>(
                     "loam connector: establishment failed project={project_id} error={category} (attempt {failures})"
                 );
                 let since = *sessionless_since.get_or_insert_with(Instant::now);
-                if watchdog_verdict(since, Instant::now()) == WatchdogVerdict::Exit {
+                if watchdog_verdict(since, Instant::now(), sessionless_budget)
+                    == WatchdogVerdict::Exit
+                {
                     eprintln!(
                         "loam connector: watchdog exit project={project_id} — enrolled but sessionless for {}s; exiting {WATCHDOG_EXIT_CODE} for supervisor respawn",
-                        SESSIONLESS_EXIT_AFTER.as_secs()
+                        sessionless_budget.as_secs()
                     );
                     std::process::exit(WATCHDOG_EXIT_CODE);
                 }
-                sleep(backoff_with_jitter(failures));
+                sleep(backoff_with_jitter(failures, backoff_cap));
             }
             EstablishOutcome::Refused(reason) => {
                 liveness.mark_refused(reason);
@@ -1772,11 +1828,13 @@ pub struct ProjectSessions {
 struct LiveSession {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// The session's authenticated identity, captured at CONNACK. This — not
-    /// anything a caller supplies — is what binds `data.from` on an outbound
-    /// emit, which is why `federation emit` forwards a derived operation rather
-    /// than a finished envelope.
-    identity: SessionIdentity,
+    /// The session's authenticated identity, captured at CONNACK and shared with
+    /// the supervisor thread that (re)establishes it. `None` until the first
+    /// successful open — a connector that boots while the broker is down keeps
+    /// retrying with no identity yet. This — not anything a caller supplies — is
+    /// what binds `data.from` on an outbound emit, which is why `federation emit`
+    /// forwards a derived operation rather than a finished envelope.
+    identity: IdentitySlot,
     /// Outbound queue drained by the pump thread, which owns the client. The
     /// CLI never opens a broker connection; the connector owns every publish.
     outbound: std::sync::mpsc::Sender<ValidatedEnvelope>,
@@ -1846,16 +1904,41 @@ impl ProjectSessions {
         if self.live.contains_key(&row.project_id) {
             return SessionState::AlreadyLive;
         }
-        let open = match open_transport(row, provisioned, now) {
-            Ok(open) => open,
-            Err(state) => return state,
+        // The first cycle runs synchronously so `project.attach` reports honestly.
+        // A typed refusal is steady state — no supervisor, no watchdog. A live
+        // open primes the supervisor; a retryable failure (Unreachable) still
+        // arms it, because a connector that boots while the broker is down must
+        // keep trying and eventually exit for its supervisor to respawn.
+        let (primed, liveness, identity, state) = match open_transport(row, provisioned, now) {
+            Ok(open) => {
+                eprintln!("loam connector: session up project={}", row.project_id);
+                let identity: IdentitySlot =
+                    std::sync::Arc::new(std::sync::Mutex::new(Some(open.identity.clone())));
+                (
+                    Some(open),
+                    LivenessHandle::established(now),
+                    identity,
+                    SessionState::Live,
+                )
+            }
+            Err(refusal @ (SessionState::CredentialsUnresolved(_) | SessionState::NoPeerRoster(_))) => {
+                return refusal;
+            }
+            Err(SessionState::Unreachable(category)) => (
+                None,
+                LivenessHandle::down(now, category.clone()),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                SessionState::Unreachable(category),
+            ),
+            // AlreadyLive/Live are never returned by open_transport; treat any
+            // other value as a retryable failure rather than dropping the session.
+            Err(other) => (
+                None,
+                LivenessHandle::down(now, other.code().to_owned()),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                other,
+            ),
         };
-        let identity = open.identity.clone();
-        eprintln!("loam connector: session up project={}", row.project_id);
-        // The supervisor starts from an established session, so the observation is
-        // live the instant `attach` returns — never a window where a live session
-        // reads as down.
-        let liveness = LivenessHandle::established(now);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (outbound, inbound) = std::sync::mpsc::channel();
         let thread = std::thread::spawn({
@@ -1863,11 +1946,13 @@ impl ProjectSessions {
             let snapshots = std::sync::Arc::clone(&self.snapshots);
             let channels = self.channels.clone();
             let liveness = liveness.clone();
+            let identity = std::sync::Arc::clone(&identity);
             let row = row.clone();
             move || {
-                // The first cycle runs the session `attach` already opened; every
-                // cycle after it re-provisions and rebuilds from scratch.
-                let mut primed = Some(open);
+                // The first cycle runs the session `attach` already opened (when
+                // primed); every cycle after — and the first, when the first open
+                // failed — re-provisions and rebuilds from scratch.
+                let mut primed = primed;
                 let project_id = row.project_id.clone();
                 supervise(
                     &project_id,
@@ -1876,7 +1961,7 @@ impl ProjectSessions {
                             run_pump_loop(open, &snapshots, &channels, &inbound, &stop, &liveness)
                         }
                         None => establish_and_run(
-                            &row, &snapshots, &channels, &inbound, &stop, &liveness,
+                            &row, &snapshots, &channels, &inbound, &stop, &liveness, &identity,
                         ),
                     },
                     |backoff| interruptible_sleep(backoff, &stop),
@@ -1895,15 +1980,16 @@ impl ProjectSessions {
                 liveness,
             },
         );
-        SessionState::Live
+        state
     }
 
-    /// The authenticated identity of a project's live session, if one is open.
-    /// The emit path needs it to bind `data.from` before validating.
+    /// The authenticated identity of a project's live session, if one has opened.
+    /// The emit path needs it to bind `data.from` before validating. `None` while
+    /// a supervised project has not yet completed a first successful open.
     pub fn identity(&self, project_id: &str) -> Option<SessionIdentity> {
         self.live
             .get(project_id)
-            .map(|session| session.identity.clone())
+            .and_then(|session| session.identity.lock().ok().and_then(|slot| slot.clone()))
     }
 
     /// Hand one validated envelope to the project's live session for publishing.
@@ -2071,8 +2157,9 @@ fn open_transport(
     let mut transport = MqttTransport::new(session, ValidationConfig::default(), now)
         .map_err(|error| SessionState::Unreachable(error.code().to_owned()))?;
     // The live session dials with the longer deadline; the probe keeps the short
-    // default. A wedged SYN is abandoned after `DIAL_DEADLINE`, not held forever.
-    transport.set_dial_deadline(DIAL_DEADLINE);
+    // default. A wedged SYN is abandoned after the dial deadline, not held
+    // forever. The test tier may shorten it to drive the watchdog quickly.
+    transport.set_dial_deadline(configured_dial_deadline());
     let identity = transport
         .authenticate()
         .map_err(|error| SessionState::Unreachable(error.code().to_owned()))?;
@@ -2128,6 +2215,7 @@ fn establish_and_run(
     outbound: &std::sync::mpsc::Receiver<ValidatedEnvelope>,
     stop: &std::sync::atomic::AtomicBool,
     liveness: &LivenessHandle,
+    identity: &IdentitySlot,
 ) -> EstablishOutcome {
     let now = Utc::now();
     let open = match open_transport(row, provision_session(row), now) {
@@ -2137,6 +2225,14 @@ fn establish_and_run(
         Err(SessionState::Unreachable(category)) => return EstablishOutcome::Failed(category),
         Err(other) => return EstablishOutcome::Failed(other.code().to_owned()),
     };
+    // Publish the authenticated identity for the emit path. Stable across
+    // reconnects, so a set-once is enough; a session that had never opened before
+    // (broker was down at boot) becomes emittable from here.
+    if let Ok(mut slot) = identity.lock() {
+        if slot.is_none() {
+            *slot = Some(open.identity.clone());
+        }
+    }
     liveness.mark_established(now);
     eprintln!("loam connector: session up project={}", row.project_id);
     run_pump_loop(open, snapshots, channels, outbound, stop, liveness)
@@ -5584,6 +5680,60 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn a_first_dial_failure_still_arms_the_supervisor_and_watchdog() {
+        // A connector that boots while the broker is down must not give up: the
+        // first dial fails (closed local port, no broker), attach reports the
+        // honest Unreachable, but a supervised session exists and keeps retrying
+        // so the watchdog can eventually hand recovery to the OS supervisor. A
+        // typed refusal, by contrast, arms nothing (covered above).
+        fn to_a_closed_port() -> Result<(MqttSession, PeerRoster), ProvisionFailure> {
+            let config = TransportConfig::new(
+                "127.0.0.1",
+                1, // closed: connection refused is an immediate dial failure
+                "loam-connector-test",
+                8,
+                400_000,
+                ValidationConfig::default(),
+            )
+            .expect("transport config");
+            Ok((
+                MqttSession {
+                    config,
+                    username: None,
+                    password: None,
+                    ca_certificate: rustls::RootCertStore::empty(),
+                    client_authentication: None,
+                    claimed_identity: SessionIdentity {
+                        principal_id: SENDER_PRINCIPAL.into(),
+                        agent_id: "agent-72".into(),
+                        instance_id: RECIPIENT_INSTANCE.into(),
+                        display_name: None,
+                        allowed_claims: Vec::new(),
+                    },
+                },
+                PeerRoster {
+                    principals: vec![SENDER_PRINCIPAL.into()],
+                    origins: vec![RECIPIENT_INSTANCE.into()],
+                },
+            ))
+        }
+
+        let mut sessions = ProjectSessions::new(4, ChannelRegistry::new());
+        let row = sample_row("unix:1:9");
+        let state = sessions.attach(&row, to_a_closed_port(), base_time());
+        assert!(
+            matches!(state, SessionState::Unreachable(_)),
+            "a closed-port first dial reports Unreachable, got {state:?}"
+        );
+        assert!(
+            sessions.is_live(&row.project_id),
+            "an Unreachable first cycle must still arm a supervised session"
+        );
+        // Stop the retry loop so the test leaves no dialing thread behind.
+        assert!(sessions.detach(&row.project_id));
+    }
+
+    #[test]
     fn supervisor_reconnects_after_a_transient_drop_and_clears_the_failure_count() {
         // Scenario: transient drop heals without escalation. Cycle 1 fails to
         // establish; cycle 2 opens, runs, and drops. The supervisor must run the
@@ -5678,14 +5828,15 @@ mod snapshot_tests {
         // A mock clock: synthetic instants, so the ten-minute budget is proven
         // without a wait and without ever calling process::exit in a test.
         let start = std::time::Instant::now();
-        assert_eq!(watchdog_verdict(start, start), WatchdogVerdict::Retry);
+        let budget = SESSIONLESS_EXIT_AFTER;
+        assert_eq!(watchdog_verdict(start, start, budget), WatchdogVerdict::Retry);
         assert_eq!(
-            watchdog_verdict(start, start + SESSIONLESS_EXIT_AFTER - Duration::from_secs(1)),
+            watchdog_verdict(start, start + budget - Duration::from_secs(1), budget),
             WatchdogVerdict::Retry,
             "one second short of the budget keeps retrying"
         );
         assert_eq!(
-            watchdog_verdict(start, start + SESSIONLESS_EXIT_AFTER),
+            watchdog_verdict(start, start + budget, budget),
             WatchdogVerdict::Exit,
             "the budget boundary hands recovery to the supervisor"
         );
@@ -5696,9 +5847,9 @@ mod snapshot_tests {
     fn backoff_is_hard_capped_and_grows_with_failures() {
         // Jitter only ever subtracts, so the cap is a true ceiling, and more
         // consecutive failures never produce a shorter nominal backoff.
-        assert!(backoff_with_jitter(1) <= BACKOFF_BASE);
-        assert!(backoff_with_jitter(50) <= BACKOFF_CAP);
-        assert!(backoff_with_jitter(3) > backoff_with_jitter(1));
+        assert!(backoff_with_jitter(1, BACKOFF_CAP) <= BACKOFF_BASE);
+        assert!(backoff_with_jitter(50, BACKOFF_CAP) <= BACKOFF_CAP);
+        assert!(backoff_with_jitter(3, BACKOFF_CAP) > backoff_with_jitter(1, BACKOFF_CAP));
     }
 
     #[test]
