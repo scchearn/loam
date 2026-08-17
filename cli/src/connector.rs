@@ -4646,7 +4646,7 @@ mod service_tests {
     }
 
     /// Accept one wake connection on the listener and return the bytes read,
-    /// waiting at most 2 seconds so a missing wake never hangs the test.
+    /// waiting at most 10 seconds so a missing wake never hangs the test.
     fn accept_wake_frame(listener: &std::net::TcpListener) -> String {
         listener
             .set_nonblocking(true)
@@ -4658,18 +4658,28 @@ mod service_tests {
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let mut bytes = Vec::new();
-                    let mut buffer = [0u8; 4096];
-                    let read = stream
+                    // BSD/macOS makes the accepted socket INHERIT the listener's
+                    // non-blocking flag (Linux does not — the whole darwin-only
+                    // signature). Left non-blocking, read() returns EWOULDBLOCK
+                    // before the loopback frame lands; restore blocking so the
+                    // read timeout actually governs.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("accepted stream blocking");
+                    stream
                         .set_read_timeout(Some(Duration::from_secs(10)))
-                        .and_then(|_| stream.read(&mut buffer))
-                        .unwrap_or(0);
-                    bytes.extend_from_slice(&buffer[..read]);
-                    return String::from_utf8_lossy(&bytes).into_owned();
+                        .expect("set wake read timeout");
+                    let mut buffer = [0u8; 4096];
+                    // Never swallow a read error into an empty frame: the old
+                    // `.unwrap_or(0)` turned EWOULDBLOCK into a fake "0 bytes" and
+                    // hid this bug for days. A test helper must fail loudly with
+                    // the error, never fabricate data.
+                    let read = stream.read(&mut buffer).expect("read wake frame");
+                    return String::from_utf8_lossy(&buffer[..read]).into_owned();
                 }
                 Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if std::time::Instant::now() >= deadline {
-                        panic!("no wake connection arrived within 2s");
+                        panic!("no wake connection arrived within 10s");
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
