@@ -530,6 +530,10 @@ pub struct MqttTransport {
     /// Inbound publishes parked while waiting for a control packet.
     pending: Vec<Publish>,
     now: DateTime<Utc>,
+    /// How long the CONNACK wait may run before the dial is abandoned. The probe
+    /// keeps the short default; a live session sets the longer `DIAL_DEADLINE`,
+    /// so a wedged SYN cannot block one establishment cycle forever.
+    dial_deadline: Duration,
 }
 
 impl MqttTransport {
@@ -553,7 +557,14 @@ impl MqttTransport {
             processor,
             pending: Vec::new(),
             now,
+            dial_deadline: ACK_TIMEOUT,
         })
+    }
+
+    /// Extend the CONNACK wait for a live session's establishment cycle. The
+    /// probe leaves the default; a session dials with `DIAL_DEADLINE`.
+    fn set_dial_deadline(&mut self, deadline: Duration) {
+        self.dial_deadline = deadline;
     }
 
     /// Disconnect the session. Best-effort: the probe's evidence is already
@@ -592,7 +603,7 @@ impl Transport for MqttTransport {
             .set_keep_alive(KEEP_ALIVE)
             .set_clean_start(true);
         let (client, mut connection) = Client::new(options, REQUEST_CAPACITY);
-        let deadline = Instant::now() + ACK_TIMEOUT;
+        let deadline = Instant::now() + self.dial_deadline;
         let accepted = loop {
             match await_control(&mut connection, &mut self.pending, deadline) {
                 Some(Packet::ConnAck(ack)) => break ack.code == ConnectReturnCode::Success,
@@ -1490,6 +1501,210 @@ const RECONCILE_FRESHNESS: Duration = Duration::from_secs(30);
 /// this is the store's ceiling, not the render budget.
 const SNAPSHOT_CAPACITY: usize = 64;
 
+// ---------------------------------------------------------------------------
+// Self-healing establishment supervisor (connector-self-healing)
+// ---------------------------------------------------------------------------
+//
+// Each live project runs a supervisor loop that owns an explicit establishment
+// cycle — build → dial → authenticate → subscribe → run — rebuilt from scratch on
+// every attempt rather than trusting rumqttc's internal eternal redial on a stale
+// socket path. The supervisor records what it observes into a shared
+// `ObservedSession` so status can never again claim "live" for a process that
+// holds no broker session.
+
+/// Per-attempt dial deadline: the whole build → dial → CONNACK must complete
+/// inside this, so a wedged SYN never blocks an establishment cycle forever.
+const DIAL_DEADLINE: Duration = Duration::from_secs(30);
+/// Reconnect backoff floor; doubled per consecutive failure, jittered, and
+/// capped at `BACKOFF_CAP`.
+const BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Hard ceiling on the reconnect backoff, jitter included.
+const BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+/// The outcome of one supervised establishment attempt, as the control loop sees
+/// it.
+enum EstablishOutcome {
+    /// A session opened and later dropped — reconnect.
+    Ended,
+    /// An establishment step failed before any session ran; the string is the
+    /// error category for the breadcrumb and the observed status.
+    Failed(String),
+    /// A typed provisioning refusal (credentials-unresolved / no-peer-roster).
+    /// Steady state, not a wedge: the supervisor stops rather than churning.
+    Refused(&'static str),
+}
+
+/// The connector's in-process observation of one project's broker session,
+/// shared between the supervisor thread that writes it and the IPC threads that
+/// read it for a truthful status. Volatile by design: it dies with the process,
+/// like every other connector session fact.
+#[derive(Debug, Clone)]
+pub struct ObservedSession {
+    /// True only while a broker session is established and subscribed *now*.
+    pub established: bool,
+    /// When the current established/disconnected state began.
+    pub since: DateTime<Utc>,
+    /// Consecutive failed establishment cycles since the last live session.
+    pub consecutive_failures: u32,
+    /// The last establishment error category, when not established.
+    pub last_error: Option<String>,
+    /// A typed provisioning refusal, when the supervisor has disarmed on one.
+    pub refusal: Option<&'static str>,
+}
+
+impl ObservedSession {
+    /// Whether every status surface should read observed-degraded: the session is
+    /// down and `DEGRADE_AFTER` consecutive establishment cycles have failed.
+    pub fn degraded(&self) -> bool {
+        !self.established && self.consecutive_failures >= DEGRADE_AFTER
+    }
+}
+
+/// Consecutive failed establishment cycles before every status surface flips to
+/// observed-degraded.
+const DEGRADE_AFTER: u32 = 3;
+
+/// A cloneable handle to one project's `ObservedSession`. Every mutation is a
+/// named state transition so the supervisor cannot record an inconsistent view.
+#[derive(Clone)]
+pub struct LivenessHandle(std::sync::Arc<std::sync::Mutex<ObservedSession>>);
+
+impl LivenessHandle {
+    /// A handle for a session that has just been established (the synchronous
+    /// first attach succeeded).
+    fn established(now: DateTime<Utc>) -> Self {
+        LivenessHandle(std::sync::Arc::new(std::sync::Mutex::new(ObservedSession {
+            established: true,
+            since: now,
+            consecutive_failures: 0,
+            last_error: None,
+            refusal: None,
+        })))
+    }
+
+    /// A read-only snapshot of the current observation.
+    pub fn observe(&self) -> ObservedSession {
+        self.0
+            .lock()
+            .map(|inner| inner.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    /// A broker session just opened and subscribed: established, failure count
+    /// cleared, error cleared.
+    fn mark_established(&self, now: DateTime<Utc>) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.established = true;
+            inner.since = now;
+            inner.consecutive_failures = 0;
+            inner.last_error = None;
+            inner.refusal = None;
+        }
+    }
+
+    /// A running session dropped. Not a failed cycle — the count stays cleared —
+    /// but no session is established until the next cycle opens one.
+    fn mark_disconnected(&self, now: DateTime<Utc>) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.established = false;
+            inner.since = now;
+        }
+    }
+
+    /// An establishment cycle failed. Increments the consecutive count and
+    /// records the error category; returns the new count for backoff.
+    fn record_failure(&self, category: String) -> u32 {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.established = false;
+            inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
+            inner.last_error = Some(category);
+            return inner.consecutive_failures;
+        }
+        0
+    }
+
+    /// The supervisor disarmed on a typed provisioning refusal — a steady state,
+    /// never a wedge to churn against.
+    fn mark_refused(&self, reason: &'static str) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.established = false;
+            inner.refusal = Some(reason);
+        }
+    }
+}
+
+/// Exponential backoff with jitter, hard-capped at `BACKOFF_CAP`. `failures` is
+/// the consecutive count (>=1). Jitter only ever *subtracts* (up to 25%) so the
+/// cap is a true ceiling; it is derived from the system clock's subsecond nanos —
+/// reconnect spacing needs decorrelation, not cryptographic randomness, so no new
+/// dependency is pulled in.
+fn backoff_with_jitter(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(6);
+    let base = BACKOFF_BASE.saturating_mul(1u32 << shift);
+    let capped = base.min(BACKOFF_CAP);
+    let jitter_ceiling = (capped.as_millis() as u64) / 4;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    let jitter = if jitter_ceiling > 0 {
+        nanos % jitter_ceiling
+    } else {
+        0
+    };
+    capped.saturating_sub(Duration::from_millis(jitter))
+}
+
+/// Sleep up to `total`, but wake promptly if the stop flag is set so a detach or
+/// shutdown is never blocked behind a full backoff interval.
+fn interruptible_sleep(total: Duration, stop: &std::sync::atomic::AtomicBool) {
+    let step = Duration::from_millis(100);
+    let mut slept = Duration::ZERO;
+    while slept < total && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let chunk = step.min(total - slept);
+        std::thread::sleep(chunk);
+        slept += chunk;
+    }
+}
+
+/// The supervised reconnect loop. Generic over the establishment attempt and the
+/// sleeper so the control logic — reconnect on drop, backoff on failure, disarm
+/// on a typed refusal — is unit-testable with a scripted attempt sequence and no
+/// real broker or wall-clock delay.
+fn supervise<A, S>(
+    project_id: &str,
+    mut attempt: A,
+    mut sleep: S,
+    stop: &std::sync::atomic::AtomicBool,
+    liveness: &LivenessHandle,
+) where
+    A: FnMut() -> EstablishOutcome,
+    S: FnMut(Duration),
+{
+    use std::sync::atomic::Ordering::Relaxed;
+    while !stop.load(Relaxed) {
+        match attempt() {
+            // A session ran and dropped: the attempt already marked the session
+            // down. Loop straight back into a fresh establishment cycle.
+            EstablishOutcome::Ended => {}
+            EstablishOutcome::Failed(category) => {
+                let failures = liveness.record_failure(category.clone());
+                eprintln!(
+                    "loam connector: establishment failed project={project_id} error={category} (attempt {failures})"
+                );
+                sleep(backoff_with_jitter(failures));
+            }
+            EstablishOutcome::Refused(reason) => {
+                liveness.mark_refused(reason);
+                eprintln!(
+                    "loam connector: provisioning refused project={project_id} reason={reason}; supervisor disarmed"
+                );
+                return;
+            }
+        }
+    }
+}
+
 /// The live broker sessions this connector process holds — one per enrolled
 /// project, in the same process, with no second daemon. Each pumps its received
 /// frames through the `DeliveryProcessor` into the shared snapshot store.
@@ -1512,6 +1727,10 @@ struct LiveSession {
     /// Outbound queue drained by the pump thread, which owns the client. The
     /// CLI never opens a broker connection; the connector owns every publish.
     outbound: std::sync::mpsc::Sender<ValidatedEnvelope>,
+    /// The connector's own observation of this project's broker session, updated
+    /// by the supervisor thread and read by the IPC status path so "live" can
+    /// only ever come from an actually-established session.
+    liveness: LivenessHandle,
 }
 
 /// What happened to one outbound emit. `NotShipped` is observational: an
@@ -1559,9 +1778,12 @@ impl ProjectSessions {
     }
 
     /// Open (or confirm) the project's live session from an already-resolved
-    /// provisioning result. Idempotent. Taking `provisioned` as an argument is
-    /// what lets a test drive a real session without the connector holding a
-    /// swappable callable.
+    /// provisioning result. Idempotent. The first establishment cycle runs here
+    /// synchronously so `project.attach` reports honestly (a refusal is returned,
+    /// not masked); on success a supervisor thread takes over, re-establishing
+    /// from scratch on every drop so a wedged socket path is never inherited.
+    /// Taking `provisioned` as an argument is what lets a test drive the first
+    /// cycle without the connector holding a swappable callable.
     pub fn attach(
         &mut self,
         row: &crate::enrollment::EnrolledRow,
@@ -1571,80 +1793,43 @@ impl ProjectSessions {
         if self.live.contains_key(&row.project_id) {
             return SessionState::AlreadyLive;
         }
-        let (session, roster) = match provisioned {
-            Ok(pair) => pair,
-            Err(ProvisionFailure::Credentials(reason)) => {
-                return SessionState::CredentialsUnresolved(reason)
-            }
-            Err(ProvisionFailure::Roster(reason)) => return SessionState::NoPeerRoster(reason),
+        let open = match open_transport(row, provisioned, now) {
+            Ok(open) => open,
+            Err(state) => return state,
         };
-        if roster.is_empty() {
-            return SessionState::NoPeerRoster(reason::ROSTER_EMPTY);
-        }
-        let mut transport = match MqttTransport::new(session, ValidationConfig::default(), now) {
-            Ok(transport) => transport,
-            Err(error) => return SessionState::Unreachable(error.code().to_owned()),
-        };
-        let identity = match transport.authenticate() {
-            Ok(identity) => identity,
-            Err(error) => return SessionState::Unreachable(error.code().to_owned()),
-        };
-        for filter in live_filters(&row.org_id, &row.project_id, &identity) {
-            if let Err(error) = transport.subscribe(&filter, false) {
-                return SessionState::Unreachable(error.code().to_owned());
-            }
-        }
-
-        // Self-announce: publish this machine's own retained member card on
-        // `loam/v1/{org}/members/{instance_id}`. Every connector does this on
-        // connect, so colleagues assembling their rosters from retained cards
-        // pick this machine up without an operator authoring anything. A refused
-        // self-publish is a broker/ACL fault: the machine cannot be a member, so
-        // the session does not open (the roster gate below would have nothing of
-        // its own to admit).
-        let card_topic = crate::provisioning::member_topic(&row.org_id, &identity.instance_id);
-        if let Ok(Some(card)) = own_member_card(row, &identity, now) {
-            let body = crate::provisioning::member_card_to_json(&card);
-            if transport
-                .publish_raw_retained(&card_topic, body.into_bytes())
-                .is_err()
-            {
-                if roster.is_empty() {
-                    return SessionState::NoPeerRoster(reason::ROSTER_EMPTY);
-                }
-                // Peers are still known; a denied self-publish does not strand
-                // the session, but this instance is invisible to first joiners.
-            } else if let Ok(root) = crate::provisioning::configured_roster_root() {
-                // Persist the own card immediately so a restart before the pump
-                // collects the broker's redelivery still admits this machine.
-                let _ = crate::provisioning::write_member_card(&root, &row.org_id, &card);
-            }
-        }
-
-        // Built before the pump starts, from the enrollment and the same roster
-        // the receive path admits frames against. `None` is the fail-safe: every
-        // work claim then renders as an unreconciled sender claim.
-        let oracle = receive_oracle(row, &roster);
-
+        let identity = open.identity.clone();
+        eprintln!("loam connector: session up project={}", row.project_id);
+        // The supervisor starts from an established session, so the observation is
+        // live the instant `attach` returns — never a window where a live session
+        // reads as down.
+        let liveness = LivenessHandle::established(now);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (outbound, inbound) = std::sync::mpsc::channel();
         let thread = std::thread::spawn({
             let stop = std::sync::Arc::clone(&stop);
             let snapshots = std::sync::Arc::clone(&self.snapshots);
             let channels = self.channels.clone();
-            let (pump_org, pump_project) = (row.org_id.clone(), row.project_id.clone());
+            let liveness = liveness.clone();
+            let row = row.clone();
             move || {
-                pump(
-                    transport,
-                    roster,
-                    pump_org,
-                    pump_project,
-                    oracle,
-                    snapshots,
-                    channels,
-                    stop,
-                    inbound,
-                )
+                // The first cycle runs the session `attach` already opened; every
+                // cycle after it re-provisions and rebuilds from scratch.
+                let mut primed = Some(open);
+                let project_id = row.project_id.clone();
+                supervise(
+                    &project_id,
+                    || match primed.take() {
+                        Some(open) => {
+                            run_pump_loop(open, &snapshots, &channels, &inbound, &stop, &liveness)
+                        }
+                        None => establish_and_run(
+                            &row, &snapshots, &channels, &inbound, &stop, &liveness,
+                        ),
+                    },
+                    |backoff| interruptible_sleep(backoff, &stop),
+                    &stop,
+                    &liveness,
+                );
             }
         });
         self.live.insert(
@@ -1654,6 +1839,7 @@ impl ProjectSessions {
                 thread: Some(thread),
                 identity,
                 outbound,
+                liveness,
             },
         );
         SessionState::Live
@@ -1798,18 +1984,131 @@ fn stamp_publication(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn pump(
-    mut transport: MqttTransport,
-    mut roster: PeerRoster,
+/// One established broker session and everything the pump reads from it. Produced
+/// by `open_transport` and consumed by `run_pump_loop`.
+struct OpenSession {
+    transport: MqttTransport,
+    identity: SessionIdentity,
+    roster: PeerRoster,
+    oracle: Option<crate::transport::GitOracle>,
     org_id: String,
     project_id: String,
-    mut oracle: Option<crate::transport::GitOracle>,
-    snapshots: std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
-    channels: ChannelRegistry,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    outbound: std::sync::mpsc::Receiver<ValidatedEnvelope>,
-) {
+}
+
+/// Build, authenticate, subscribe, and self-announce one broker session from an
+/// already-resolved provisioning result. Every call rebuilds the transport from
+/// scratch — fresh `TransportConfig`, DNS, TLS, and rumqttc client — so a wedged
+/// socket path is never inherited across establishment cycles. Returns the open
+/// session, or the `SessionState` that explains why none opened.
+fn open_transport(
+    row: &crate::enrollment::EnrolledRow,
+    provisioned: Result<(MqttSession, PeerRoster), ProvisionFailure>,
+    now: DateTime<Utc>,
+) -> Result<OpenSession, SessionState> {
+    let (session, roster) = match provisioned {
+        Ok(pair) => pair,
+        Err(ProvisionFailure::Credentials(reason)) => {
+            return Err(SessionState::CredentialsUnresolved(reason))
+        }
+        Err(ProvisionFailure::Roster(reason)) => return Err(SessionState::NoPeerRoster(reason)),
+    };
+    if roster.is_empty() {
+        return Err(SessionState::NoPeerRoster(reason::ROSTER_EMPTY));
+    }
+    let mut transport = MqttTransport::new(session, ValidationConfig::default(), now)
+        .map_err(|error| SessionState::Unreachable(error.code().to_owned()))?;
+    // The live session dials with the longer deadline; the probe keeps the short
+    // default. A wedged SYN is abandoned after `DIAL_DEADLINE`, not held forever.
+    transport.set_dial_deadline(DIAL_DEADLINE);
+    let identity = transport
+        .authenticate()
+        .map_err(|error| SessionState::Unreachable(error.code().to_owned()))?;
+    for filter in live_filters(&row.org_id, &row.project_id, &identity) {
+        transport
+            .subscribe(&filter, false)
+            .map_err(|error| SessionState::Unreachable(error.code().to_owned()))?;
+    }
+
+    // Self-announce: publish this machine's own retained member card on
+    // `loam/v1/{org}/members/{instance_id}`. Every connector does this on connect,
+    // so colleagues assembling their rosters from retained cards pick this machine
+    // up without an operator authoring anything. A refused self-publish is a
+    // broker/ACL fault: peers are still known, but this instance is invisible to
+    // first joiners.
+    let card_topic = crate::provisioning::member_topic(&row.org_id, &identity.instance_id);
+    if let Ok(Some(card)) = own_member_card(row, &identity, now) {
+        let body = crate::provisioning::member_card_to_json(&card);
+        if transport
+            .publish_raw_retained(&card_topic, body.into_bytes())
+            .is_ok()
+        {
+            if let Ok(root) = crate::provisioning::configured_roster_root() {
+                // Persist the own card immediately so a restart before the pump
+                // collects the broker's redelivery still admits this machine.
+                let _ = crate::provisioning::write_member_card(&root, &row.org_id, &card);
+            }
+        }
+    }
+
+    // Built before the pump starts, from the enrollment and the same roster the
+    // receive path admits frames against. `None` is the fail-safe: every work
+    // claim then renders as an unreconciled sender claim.
+    let oracle = receive_oracle(row, &roster);
+    Ok(OpenSession {
+        transport,
+        identity,
+        roster,
+        oracle,
+        org_id: row.org_id.clone(),
+        project_id: row.project_id.clone(),
+    })
+}
+
+/// One full establishment cycle for the supervisor: re-provision from scratch,
+/// open a fresh session, and run it until it drops. A typed provisioning refusal
+/// returns `Refused` (the supervisor disarms); a dial/auth/subscribe failure
+/// returns `Failed` (the supervisor backs off and retries).
+fn establish_and_run(
+    row: &crate::enrollment::EnrolledRow,
+    snapshots: &std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
+    channels: &ChannelRegistry,
+    outbound: &std::sync::mpsc::Receiver<ValidatedEnvelope>,
+    stop: &std::sync::atomic::AtomicBool,
+    liveness: &LivenessHandle,
+) -> EstablishOutcome {
+    let now = Utc::now();
+    let open = match open_transport(row, provision_session(row), now) {
+        Ok(open) => open,
+        Err(SessionState::CredentialsUnresolved(reason))
+        | Err(SessionState::NoPeerRoster(reason)) => return EstablishOutcome::Refused(reason),
+        Err(SessionState::Unreachable(category)) => return EstablishOutcome::Failed(category),
+        Err(other) => return EstablishOutcome::Failed(other.code().to_owned()),
+    };
+    liveness.mark_established(now);
+    eprintln!("loam connector: session up project={}", row.project_id);
+    run_pump_loop(open, snapshots, channels, outbound, stop, liveness)
+}
+
+/// Pump one open session's received frames into the snapshot store until it drops
+/// or a stop is requested, then mark the session down and return `Ended` so the
+/// supervisor re-establishes. The pump only reads: it never publishes on its own,
+/// and a lost session simply goes quiet rather than fabricating state.
+fn run_pump_loop(
+    open: OpenSession,
+    snapshots: &std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
+    channels: &ChannelRegistry,
+    outbound: &std::sync::mpsc::Receiver<ValidatedEnvelope>,
+    stop: &std::sync::atomic::AtomicBool,
+    liveness: &LivenessHandle,
+) -> EstablishOutcome {
+    let OpenSession {
+        mut transport,
+        identity: _,
+        mut roster,
+        mut oracle,
+        org_id,
+        project_id,
+    } = open;
     // A malformed retained member card is degrade-not-crash, but silence hid a
     // parser bug that stranded every roster. Surface the first one per session
     // so it is at least visible; one line, no framework.
@@ -1912,7 +2211,7 @@ fn pump(
                                     Some(topic.split('/').next_back().unwrap_or("state").to_owned())
                                 }
                             };
-                            wake_all(&channels, parsed.project, hint.as_deref());
+                            wake_all(channels, parsed.project, hint.as_deref());
                         }
                     }
                 }
@@ -1922,6 +2221,9 @@ fn pump(
         }
     }
     transport.disconnect();
+    liveness.mark_disconnected(Utc::now());
+    eprintln!("loam connector: session down project={project_id}");
+    EstablishOutcome::Ended
 }
 
 /// Run the connector. Reconciles the registry before touching an endpoint: a
@@ -5226,6 +5528,105 @@ mod snapshot_tests {
             SessionState::NoPeerRoster(reason::ROSTER_EMPTY)
         );
         assert!(!sessions.is_live(&row.project_id));
+    }
+
+    #[test]
+    fn supervisor_reconnects_after_a_transient_drop_and_clears_the_failure_count() {
+        // Scenario: transient drop heals without escalation. Cycle 1 fails to
+        // establish; cycle 2 opens, runs, and drops. The supervisor must run the
+        // second cycle (reconnect happened) and a successful open must clear the
+        // failure count, so no status surface ever reaches observed-degraded.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        let liveness = LivenessHandle::established(base_time());
+        let mut cycle = 0u32;
+        supervise(
+            "project-7M3",
+            || {
+                let outcome = match cycle {
+                    0 => EstablishOutcome::Failed("dial-timeout".into()),
+                    _ => {
+                        // A session opened and dropped, exactly as the real
+                        // establish-and-run would record it.
+                        liveness.mark_established(base_time());
+                        liveness.mark_disconnected(base_time());
+                        EstablishOutcome::Ended
+                    }
+                };
+                cycle += 1;
+                if cycle == 2 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                outcome
+            },
+            |_backoff| {},
+            &stop,
+            &liveness,
+        );
+        assert_eq!(cycle, 2, "the supervisor must re-establish after a drop");
+        let observed = liveness.observe();
+        assert!(!observed.established);
+        assert_eq!(observed.consecutive_failures, 0, "a successful cycle clears the count");
+        assert!(!observed.degraded());
+    }
+
+    #[test]
+    fn supervisor_counts_consecutive_failures_toward_degrade() {
+        // Every cycle fails; after DEGRADE_AFTER cycles the observation is
+        // degraded and carries the last error category.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        let liveness = LivenessHandle::established(base_time());
+        let mut cycle = 0u32;
+        supervise(
+            "project-7M3",
+            || {
+                cycle += 1;
+                if cycle == DEGRADE_AFTER {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                EstablishOutcome::Failed("connection-refused".into())
+            },
+            |_backoff| {},
+            &stop,
+            &liveness,
+        );
+        assert_eq!(cycle, DEGRADE_AFTER);
+        let observed = liveness.observe();
+        assert_eq!(observed.consecutive_failures, DEGRADE_AFTER);
+        assert!(observed.degraded());
+        assert_eq!(observed.last_error.as_deref(), Some("connection-refused"));
+    }
+
+    #[test]
+    fn supervisor_disarms_on_a_typed_refusal() {
+        // A provisioning refusal is steady state, not a wedge: the supervisor
+        // stops rather than churning, and records the refusal reason.
+        use std::sync::atomic::AtomicBool;
+        let stop = AtomicBool::new(false);
+        let liveness = LivenessHandle::established(base_time());
+        let mut cycle = 0u32;
+        supervise(
+            "project-7M3",
+            || {
+                cycle += 1;
+                EstablishOutcome::Refused(reason::ROSTER_ABSENT)
+            },
+            |_backoff| panic!("a disarmed supervisor must not back off"),
+            &stop,
+            &liveness,
+        );
+        assert_eq!(cycle, 1, "the supervisor stops after one refusal");
+        assert_eq!(liveness.observe().refusal, Some(reason::ROSTER_ABSENT));
+    }
+
+    #[test]
+    fn backoff_is_hard_capped_and_grows_with_failures() {
+        // Jitter only ever subtracts, so the cap is a true ceiling, and more
+        // consecutive failures never produce a shorter nominal backoff.
+        assert!(backoff_with_jitter(1) <= BACKOFF_BASE);
+        assert!(backoff_with_jitter(50) <= BACKOFF_CAP);
+        assert!(backoff_with_jitter(3) > backoff_with_jitter(1));
     }
 
     #[test]
