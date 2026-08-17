@@ -821,7 +821,7 @@ fn config_root(
         }
         let _ = xdg_config_home;
         let _ = appdata;
-        return None;
+        None
     }
     #[cfg(target_os = "windows")]
     {
@@ -2186,7 +2186,10 @@ mod tests {
     /// on Linux/macOS-variants, `Library/Application Support` on macOS, and
     /// `%APPDATA%` on Windows. The rung itself is the same everywhere.
     fn platform_roster_default_path() -> std::path::PathBuf {
-        config_root(None, None, None, Some("/home/op"))
+        // Supply both a HOME and an APPDATA so the platform config rung resolves
+        // on every OS: Linux/macOS read HOME, Windows reads APPDATA, and
+        // config_root ignores whichever input its platform does not use.
+        config_root(None, None, Some("C:/Users/op/AppData/Roaming"), Some("/home/op"))
             .map(|config| config.join("federation").join("rosters"))
             .expect("the default config root resolves")
     }
@@ -2208,7 +2211,15 @@ mod tests {
             std::path::PathBuf::from("/cfg/federation/rosters")
         );
         assert_eq!(
-            roster_root(None, None, None, None, None, Some("/home/op")).unwrap(),
+            roster_root(
+                None,
+                None,
+                None,
+                Some("C:/Users/op/AppData/Roaming"),
+                None,
+                Some("/home/op")
+            )
+            .unwrap(),
             platform_roster_default_path()
         );
         // The legacy global root is a fallback for when no config basis resolves
@@ -2223,10 +2234,21 @@ mod tests {
             std::path::PathBuf::from("/loam-home/federation/rosters")
         );
         assert_eq!(
-            roster_root(None, None, None, None, None, Some("/home/op")).unwrap(),
+            roster_root(
+                None,
+                None,
+                None,
+                Some("C:/Users/op/AppData/Roaming"),
+                None,
+                Some("/home/op")
+            )
+            .unwrap(),
             platform_roster_default_path()
         );
-        // Blank is not a value at any rung.
+        // Blank is not a value at any rung → it falls through to the platform
+        // default. On Windows that default reads APPDATA (blank here), so
+        // blank-everything is a genuinely absent profile, not a default path.
+        #[cfg(not(windows))]
         assert_eq!(
             roster_root(
                 Some("  "),
@@ -2238,6 +2260,18 @@ mod tests {
             )
             .unwrap(),
             platform_roster_default_path()
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            roster_root(
+                Some("  "),
+                Some(""),
+                Some(""),
+                Some(""),
+                Some(""),
+                Some("/home/op"),
+            ),
+            Err(reason::PROFILE_ABSENT)
         );
         // Nothing at all is an absent profile, not a path built from nothing.
         assert_eq!(
