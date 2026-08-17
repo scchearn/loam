@@ -964,6 +964,30 @@ pub mod registry {
         Ok(Some(connection))
     }
 
+    /// True when the registry at `db_path` exists and holds at least one
+    /// enrollment. This is the "can answer" signal the config-dir vs legacy
+    /// registry fallback keys on: an unmigrated machine's config-dir DB is
+    /// absent (or present but empty), so reads stay on the legacy global-root
+    /// registry until the one-time migration copies enrollment into the config
+    /// dir — the flip becomes effective per-machine only once the copy lands, so
+    /// live federation is never dropped mid-transition. Any read error is a
+    /// conservative "cannot answer" (never fabricates an answer that could point
+    /// a write at the wrong registry).
+    pub fn has_enrollment(db_path: &Path) -> bool {
+        let Ok(Some(connection)) = open_readonly(db_path) else {
+            return false;
+        };
+        let Ok(true) = federation_tables_present(&connection) else {
+            return false;
+        };
+        connection
+            .query_row("SELECT count(*) FROM federation_enrollment", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|count| count > 0)
+            .unwrap_or(false)
+    }
+
     fn ensure_schema_marker(connection: &Connection) -> Result<(), RegistryError> {
         let count: i64 = connection
             .query_row("SELECT count(*) FROM federation_schema", [], |row| {

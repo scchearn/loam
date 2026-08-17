@@ -957,16 +957,31 @@ pub fn configured_roster_root() -> Result<std::path::PathBuf, &'static str> {
 /// into the config-dir profile (`<profile>/loam.sqlite3`) so it survives
 /// uninstall with the rest of the identity. Resolution, first wins:
 ///
-/// 1. `LOAM_CONFIG_DIR` → `<cfg>/federation/loam.sqlite3`
-/// 2. an explicit `--global-root` (the operator's knob, and the hermetic-test
-///    Root) → `<root>/loam.sqlite3`
-/// 3. the platform config-dir profile → `<config>/loam/federation/loam.sqlite3`
-/// 4. the legacy install root → `<global-root>/loam.sqlite3`
+/// 1. `LOAM_CONFIG_DIR` → `<cfg>/federation/loam.sqlite3` (explicit override).
+/// 2. the platform config-dir profile → `<config>/loam/federation/loam.sqlite3`,
+///    but ONLY once that registry can answer (has an enrollment).
+/// 3. an explicit `--global-root` (the legacy install root, and the
+///    hermetic-test Root) → `<root>/loam.sqlite3`.
+/// 4. the platform config-dir profile as the fresh-machine default.
 ///
-/// Rung 2 existing as it does keeps the CLI's `--global-root` authoritative
-/// for non-default installs and tests (which would otherwise resolve the real
-/// HOME profile and clobber it), while rung 1 lets new installs point the
-/// registry at the surviving config dir explicitly.
+/// The durable config-dir registry is preferred over the volatile legacy
+/// global-root — the global root is rebuilt by install and destroyed by
+/// uninstall, so enrollment must not live there. But the flip is gated on
+/// `has_enrollment`: an enrolled-but-unmigrated machine's config-dir registry is
+/// absent/empty, so it keeps reading its live legacy registry (rung 3) until the
+/// one-time migration copies enrollment into the config dir — the flip becomes
+/// effective per-machine only once the copy lands, so a runtime that updates
+/// before setup's migration never reports the live connector unenrolled.
+///
+/// Because rung 2 consults the ambient config dir, hermetic tests MUST pin
+/// `LOAM_CONFIG_DIR` (rung 1) rather than rely on `--global-root` alone, or they
+/// would resolve the developer's real HOME registry.
+///
+/// This is all prerelease: "legacy" is the handful of machines we control, and
+/// rung 3 exists ONLY to carry them across the one-time enrollment migration.
+/// Once they are migrated the legacy rung (and its `has_enrollment` gate) can be
+/// deleted outright in a follow-up — it is transition scaffolding, not a
+/// contract to keep.
 pub fn configured_registry_path(
     legacy_root: Option<&std::path::Path>,
 ) -> Result<std::path::PathBuf, &'static str> {
@@ -980,10 +995,21 @@ pub fn configured_registry_path(
             .join("federation")
             .join("loam.sqlite3"));
     }
+    let config_registry = configured_profile_root().map(|profile| profile.join("loam.sqlite3"));
+    // Prefer the durable config-dir registry, but only once it holds enrollment
+    // (the migration has run) — otherwise an unmigrated machine would read an
+    // empty config-dir DB and report a live connector unenrolled.
+    if let Ok(ref db) = config_registry {
+        if crate::enrollment::has_enrollment(db) {
+            return config_registry;
+        }
+    }
+    // The unmigrated machine's live legacy registry (and the hermetic-test root).
     if let Some(root) = legacy_root {
         return Ok(root.join("loam.sqlite3"));
     }
-    configured_profile_root().map(|profile| profile.join("loam.sqlite3"))
+    // A fresh machine with no legacy writes straight to the durable config dir.
+    config_registry
 }
 
 /// An entry that would admit everyone. `*` and `#` never occur in a principal
