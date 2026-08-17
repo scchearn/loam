@@ -818,7 +818,11 @@ test('#100: update refreshes an existing service definition against the committe
   await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
   const globalRoot = join(fixture.home, '.agents', 'loam');
   const definitionPath = federationDefinitionPath({ globalRoot, platform: process.platform });
-  if (!definitionPath) return; // win32: no file-based definition to refresh.
+  // win32 is deliberately excluded from the update federation refresh (its
+  // definition lives in Task Scheduler, tracked by #100), so there is nothing to
+  // re-render there; federationDefinitionPath still returns a marker path on
+  // win32, so guard the platform explicitly, not just a null path.
+  if (!definitionPath || process.platform === 'win32') return;
 
   // Simulate federation having been enabled (an active definition exists).
   const fed = fedRunner(globalRoot, process.platform, { active: true });

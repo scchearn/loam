@@ -220,7 +220,7 @@ test('win32 federation disable names a leftover windows-task.marker', async () =
   };
   const code = await runConfigure(
     { command: 'setup', federation: 'disable', integrations: [], dryRun: false, yes: true, purge: false },
-    { ...baseOptions(fixture, capture, stubborn), platform: 'win32' },
+    { ...baseOptions(fixture, capture, stubborn), platform: 'win32', arch: 'x64' },
   );
   assert.equal(code, 1);
   assert.match(capture.text(), /Federation disable incomplete/);
