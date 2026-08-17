@@ -224,7 +224,7 @@ async function markerPaths(workspace, report) {
   }
 }
 
-export async function detectLegacyProject({ workspace, packageRoot, runner } = {}) {
+export async function detectLegacyProject({ workspace, packageRoot, protectedRoots = [], runner } = {}) {
   const root = resolve(workspace);
   const report = {
     workspace: root,
@@ -235,6 +235,16 @@ export async function detectLegacyProject({ workspace, packageRoot, runner } = {
     unsafe: [],
   };
   if (root === resolve(packageRoot)) return { ...report, sourceRepository: true, ready: true };
+
+  // #125 wipe guard: setup run with cwd AT (or above/inside) the global install
+  // makes <workspace>/.agents/loam resolve ONTO the global root (or the config
+  // dir) — that is the live install, never a legacy PROJECT. Blindly sweeping it
+  // rm -rf'd federation state (enrollment DB, service plist, connector log, bin).
+  // No legitimate legacy project sits at the install root, so refuse to treat
+  // this workspace as one — a real project dir never overlaps these roots.
+  if (protectedRoots.some((protectedRoot) => protectedRoot && overlaps(root, protectedRoot))) {
+    return { ...report, protectedWorkspace: true, ready: true };
+  }
 
   const inventory = await loadSkillInventory({ packageRoot });
   const aliases = new Map(inventory.skills.flatMap((skill) => skill.aliases.map((alias) => [alias, skill])));
@@ -272,11 +282,12 @@ export async function detectLegacyProject({ workspace, packageRoot, runner } = {
 export async function migrateLegacyProject({
   workspace,
   packageRoot,
+  protectedRoots = [],
   yes = false,
   prompt = async () => false,
   runner,
 } = {}) {
-  const report = await detectLegacyProject({ workspace, packageRoot, runner });
+  const report = await detectLegacyProject({ workspace, packageRoot, protectedRoots, runner });
   if (report.category) return { ...report, ready: false, migrated: false, leftovers: report.paths };
   if (report.ready) return { ...report, migrated: false, leftovers: [] };
   if (report.unsafe.length) return { ...report, ready: false, migrated: false, category: 'unsafe_legacy_path', leftovers: report.unsafe };
@@ -293,7 +304,7 @@ export async function migrateLegacyProject({
     return { ...report, ready: false, migrated: false, category: 'migration_failed', leftovers: [...leftovers, ...report.paths, ...report.markers] };
   }
 
-  const afterSkills = await detectLegacyProject({ workspace: report.workspace, packageRoot, runner });
+  const afterSkills = await detectLegacyProject({ workspace: report.workspace, packageRoot, protectedRoots, runner });
   if (afterSkills.category || afterSkills.unsafe.length || afterSkills.listedSkillNames.length) {
     return {
       ...afterSkills,
@@ -308,7 +319,7 @@ export async function migrateLegacyProject({
     await rm(entry.path, { recursive: true, force: true });
   }
   for (const marker of report.markers) await rm(marker.path, { force: true });
-  const verification = await detectLegacyProject({ workspace: report.workspace, packageRoot, runner });
+  const verification = await detectLegacyProject({ workspace: report.workspace, packageRoot, protectedRoots, runner });
   const remaining = [...verification.unsafe, ...verification.listedSkillNames, ...verification.paths, ...verification.markers];
   return {
     ...verification,
