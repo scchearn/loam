@@ -1564,6 +1564,37 @@ impl ObservedSession {
 /// observed-degraded.
 const DEGRADE_AFTER: u32 = 3;
 
+/// How long the connector may stay enrolled-and-provisioned but sessionless
+/// before the watchdog hands recovery to the OS supervisor. The incident proved
+/// a fresh process image is the cure a wedge cannot heal in place.
+const SESSIONLESS_EXIT_AFTER: Duration = Duration::from_secs(600);
+
+/// The exit code the watchdog uses so systemd (`Restart=on-failure`) and launchd
+/// (`KeepAlive`/`SuccessfulExit=false`) treat the exit as a temporary failure and
+/// respawn a fresh process. `EX_TEMPFAIL` from sysexits.
+pub const WATCHDOG_EXIT_CODE: i32 = 75;
+
+/// The watchdog's verdict on a failed establishment cycle: keep retrying in this
+/// process, or exit so the OS supervisor respawns a fresh one. Pure and
+/// clock-injected so the ten-minute budget is unit-testable without a real wait
+/// and without ever calling `std::process::exit` inside a test.
+#[derive(Debug, PartialEq, Eq)]
+enum WatchdogVerdict {
+    Retry,
+    Exit,
+}
+
+/// Whether an enrolled, provisioned-but-sessionless connector has been down long
+/// enough to hand recovery to its OS supervisor. `sessionless_since` is when the
+/// current sessionless stretch began; `now` is the current instant.
+fn watchdog_verdict(sessionless_since: Instant, now: Instant) -> WatchdogVerdict {
+    if now.saturating_duration_since(sessionless_since) >= SESSIONLESS_EXIT_AFTER {
+        WatchdogVerdict::Exit
+    } else {
+        WatchdogVerdict::Retry
+    }
+}
+
 /// A cloneable handle to one project's `ObservedSession`. Every mutation is a
 /// named state transition so the supervisor cannot record an inconsistent view.
 #[derive(Clone)]
@@ -1682,16 +1713,38 @@ fn supervise<A, S>(
     S: FnMut(Duration),
 {
     use std::sync::atomic::Ordering::Relaxed;
+    // When the current sessionless stretch began. `None` while a session is live;
+    // set on the first failed cycle after a drop, cleared when one re-establishes.
+    // The watchdog measures its ten-minute budget from here.
+    let mut sessionless_since: Option<Instant> = None;
     while !stop.load(Relaxed) {
         match attempt() {
             // A session ran and dropped: the attempt already marked the session
-            // down. Loop straight back into a fresh establishment cycle.
-            EstablishOutcome::Ended => {}
+            // down. A session did exist, so the sessionless clock resets — the
+            // watchdog only fires on a sustained inability to establish one.
+            EstablishOutcome::Ended => {
+                sessionless_since = None;
+            }
             EstablishOutcome::Failed(category) => {
                 let failures = liveness.record_failure(category.clone());
+                // Exactly one breadcrumb when the observation first crosses into
+                // degraded, not one per cycle after it.
+                if failures == DEGRADE_AFTER {
+                    eprintln!(
+                        "loam connector: observed-degraded project={project_id} after {failures} failed cycles (last error {category})"
+                    );
+                }
                 eprintln!(
                     "loam connector: establishment failed project={project_id} error={category} (attempt {failures})"
                 );
+                let since = *sessionless_since.get_or_insert_with(Instant::now);
+                if watchdog_verdict(since, Instant::now()) == WatchdogVerdict::Exit {
+                    eprintln!(
+                        "loam connector: watchdog exit project={project_id} — enrolled but sessionless for {}s; exiting {WATCHDOG_EXIT_CODE} for supervisor respawn",
+                        SESSIONLESS_EXIT_AFTER.as_secs()
+                    );
+                    std::process::exit(WATCHDOG_EXIT_CODE);
+                }
                 sleep(backoff_with_jitter(failures));
             }
             EstablishOutcome::Refused(reason) => {
@@ -5618,6 +5671,25 @@ mod snapshot_tests {
         );
         assert_eq!(cycle, 1, "the supervisor stops after one refusal");
         assert_eq!(liveness.observe().refusal, Some(reason::ROSTER_ABSENT));
+    }
+
+    #[test]
+    fn watchdog_holds_until_the_sessionless_budget_then_exits() {
+        // A mock clock: synthetic instants, so the ten-minute budget is proven
+        // without a wait and without ever calling process::exit in a test.
+        let start = std::time::Instant::now();
+        assert_eq!(watchdog_verdict(start, start), WatchdogVerdict::Retry);
+        assert_eq!(
+            watchdog_verdict(start, start + SESSIONLESS_EXIT_AFTER - Duration::from_secs(1)),
+            WatchdogVerdict::Retry,
+            "one second short of the budget keeps retrying"
+        );
+        assert_eq!(
+            watchdog_verdict(start, start + SESSIONLESS_EXIT_AFTER),
+            WatchdogVerdict::Exit,
+            "the budget boundary hands recovery to the supervisor"
+        );
+        assert_eq!(WATCHDOG_EXIT_CODE, 75);
     }
 
     #[test]
