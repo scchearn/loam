@@ -1992,6 +1992,16 @@ impl ProjectSessions {
             .and_then(|session| session.identity.lock().ok().and_then(|slot| slot.clone()))
     }
 
+    /// The connector's own observation of a project's broker session, or `None`
+    /// when no session is supervised for it in this process. This is the single
+    /// source for every "live/degraded" status surface — enrollment records and
+    /// IPC reachability can never render "live" again.
+    pub fn observed(&self, project_id: &str) -> Option<ObservedSession> {
+        self.live
+            .get(project_id)
+            .map(|session| session.liveness.observe())
+    }
+
     /// Hand one validated envelope to the project's live session for publishing.
     /// Refuses honestly when no session is open rather than dropping it.
     pub fn ship(&self, project_id: &str, envelope: ValidatedEnvelope) -> EmitOutcome {
@@ -2537,7 +2547,7 @@ pub(crate) fn dispatch_for_key(
     drop(read);
 
     match request.operation {
-        Operation::StatusGet => Ok(status_json(&row)),
+        Operation::StatusGet => Ok(status_json(&row, state.sessions.observed(&row.project_id))),
         Operation::ProjectAttach => {
             // The enrollment already exists (looked up above). Open the live
             // subscribed broker session in this same process — no second daemon,
@@ -2631,7 +2641,8 @@ pub(crate) fn dispatch_for_key(
             // snapshot is served from memory: nothing is opened for writing,
             // nothing is persisted, and no envelope bytes leave the connector.
             let items = state.sessions.snapshot(&row.project_id, Utc::now());
-            Ok(snapshot_json(&row.project_id, &items))
+            let observed = state.sessions.observed(&row.project_id);
+            Ok(snapshot_json(&row.project_id, &items, observed))
         }
         Operation::SessionPollInject => {
             // Drain the session's mailbox (T2). The session must be registered
@@ -2650,7 +2661,8 @@ pub(crate) fn dispatch_for_key(
                 .channels
                 .poll(session_id)
                 .ok_or(ipc::IpcError::InvalidRequest)?;
-            Ok(snapshot_json(&row.project_id, &items))
+            let observed = state.sessions.observed(&row.project_id);
+            Ok(snapshot_json(&row.project_id, &items, observed))
         }
         Operation::SessionDropInject => {
             // Remove the session from the volatile channel registry (live-push
@@ -2866,7 +2878,11 @@ fn outbound_envelope(
     Some((document.to_json(), topic))
 }
 
-fn snapshot_json(project_id: &str, items: &[SnapshotItem]) -> crate::json::Value {
+fn snapshot_json(
+    project_id: &str,
+    items: &[SnapshotItem],
+    observed: Option<ObservedSession>,
+) -> crate::json::Value {
     use crate::json::Value;
     let rendered = items
         .iter()
@@ -2937,6 +2953,12 @@ fn snapshot_json(project_id: &str, items: &[SnapshotItem]) -> crate::json::Value
         ("schema".into(), Value::Number("1".into())),
         ("project_id".into(), Value::String(project_id.to_owned())),
         ("items".into(), Value::Array(rendered)),
+        // Additive: the same observed-session block the status IPC carries, so the
+        // harness renders "live" only when a session is established right now.
+        (
+            "observed_session".into(),
+            observed_session_json(observed.as_ref()),
+        ),
     ])
 }
 
@@ -3163,7 +3185,10 @@ fn compensate_after_activation<R: service::CommandRunner>(
 /// A precise, aggregate-free status projection: enrollment, historical verified
 /// capabilities, and a broker-session field that is explicitly not-live here (a
 /// real session is the adapter's, T13). No `connected`/`ready` boolean.
-fn status_json(row: &crate::enrollment::EnrolledRow) -> crate::json::Value {
+fn status_json(
+    row: &crate::enrollment::EnrolledRow,
+    observed: Option<ObservedSession>,
+) -> crate::json::Value {
     use crate::json::Value;
     Value::Object(vec![
         ("schema".into(), Value::Number("1".into())),
@@ -3198,12 +3223,48 @@ fn status_json(row: &crate::enrollment::EnrolledRow) -> crate::json::Value {
         ),
         (
             "broker".into(),
+            // Sourced from the connector's own live observation, never the
+            // enrollment row: "established" is true only while a broker session
+            // is held in this process right now.
             Value::Object(vec![(
-                "session_state".into(),
-                Value::String("not-live-in-connector".into()),
+                "observed_session".into(),
+                observed_session_json(observed.as_ref()),
             )]),
         ),
     ])
+}
+
+/// The observed-session projection shared by the status and snapshot IPC
+/// responses. Additive to both — the existing fields and reason strings are
+/// untouched. `None` means no session is supervised for the project in this
+/// process (never attached, or detached), which reads as not-established and
+/// not-degraded rather than a fabricated "live".
+fn observed_session_json(observed: Option<&ObservedSession>) -> crate::json::Value {
+    use crate::json::Value;
+    let Some(observed) = observed else {
+        return Value::Object(vec![
+            ("supervised".into(), Value::Bool(false)),
+            ("established".into(), Value::Bool(false)),
+            ("degraded".into(), Value::Bool(false)),
+        ]);
+    };
+    let mut fields = vec![
+        ("supervised".into(), Value::Bool(true)),
+        ("established".into(), Value::Bool(observed.established)),
+        ("degraded".into(), Value::Bool(observed.degraded())),
+        ("since".into(), Value::String(observed.since.to_rfc3339())),
+        (
+            "consecutive_failures".into(),
+            Value::Number(observed.consecutive_failures.to_string()),
+        ),
+    ];
+    if let Some(error) = &observed.last_error {
+        fields.push(("last_error".into(), Value::String(error.clone())));
+    }
+    if let Some(refusal) = observed.refusal {
+        fields.push(("refusal".into(), Value::String(refusal.to_owned())));
+    }
+    Value::Object(fields)
 }
 
 fn capability_names(record: &crate::enrollment::CapabilityRecord) -> Vec<crate::json::Value> {
@@ -3757,7 +3818,12 @@ mod service_tests {
         let text = result.to_json();
         assert!(text.contains("\"enrollment\""));
         assert!(text.contains("\"capabilities\""));
-        assert!(text.contains("not-live-in-connector"));
+        // The broker block is sourced from the connector's own observation. A
+        // fresh state supervises no session for this project, so the honest report
+        // is not-supervised / not-established — never a fabricated "live".
+        assert!(text.contains("\"observed_session\""));
+        assert!(text.contains("\"supervised\":false"));
+        assert!(text.contains("\"established\":false"));
         assert!(!text.contains("\"connected\"") && !text.contains("\"ready\""));
     }
 
@@ -5734,6 +5800,43 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn status_and_snapshot_report_the_observed_session_truthfully() {
+        let row = sample_row("unix:1:7");
+        // A sustained-dead session: not established, past the degrade budget,
+        // carrying its last dial error. Both IPC surfaces must say so.
+        let degraded = ObservedSession {
+            established: false,
+            since: base_time(),
+            consecutive_failures: DEGRADE_AFTER,
+            last_error: Some("connection-refused".into()),
+            refusal: None,
+        };
+        assert!(degraded.degraded());
+        let status = status_json(&row, Some(degraded.clone())).to_json();
+        assert!(status.contains("\"observed_session\""));
+        assert!(status.contains("\"established\":false"));
+        assert!(status.contains("\"degraded\":true"));
+        assert!(status.contains("connection-refused"));
+        let snapshot = snapshot_json(&row.project_id, &[], Some(degraded)).to_json();
+        assert!(snapshot.contains("\"degraded\":true"));
+        assert!(snapshot.contains("connection-refused"));
+
+        // An established session reads live — but only because it is established,
+        // not because the IPC answered.
+        let live = ObservedSession {
+            established: true,
+            since: base_time(),
+            consecutive_failures: 0,
+            last_error: None,
+            refusal: None,
+        };
+        assert!(!live.degraded());
+        let status = status_json(&row, Some(live)).to_json();
+        assert!(status.contains("\"established\":true"));
+        assert!(status.contains("\"degraded\":false"));
+    }
+
+    #[test]
     fn supervisor_reconnects_after_a_transient_drop_and_clears_the_failure_count() {
         // Scenario: transient drop heals without escalation. Cycle 1 fails to
         // establish; cycle 2 opens, runs, and drops. The supervisor must run the
@@ -5893,7 +5996,7 @@ mod snapshot_tests {
             expires_at: base_time(),
             publication: Publication::Unverified,
         };
-        let text = snapshot_json("project-7M3", std::slice::from_ref(&item)).to_json();
+        let text = snapshot_json("project-7M3", std::slice::from_ref(&item), None).to_json();
         for field in [
             "source", "type", "summary", "to", "context", "from", "payload",
         ] {
