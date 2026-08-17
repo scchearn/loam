@@ -13,6 +13,7 @@
 #
 #   --runtime <version>   cli/Cargo.toml   [package] version
 #                         Cargo.lock       [[package]] loam version
+#                         setup/constants.mjs  RUNTIME_VERSION
 #                         skills/loam-using/scripts/CLI_VERSION
 #                         -> released as tag  cli-v<version>   (only cli-v*
 #                            triggers the dist / raw-runtime build)
@@ -62,7 +63,7 @@ show_usage() {
   echo "  --plugin   package.json, package-lock.json, both marketplace fields,"
   echo "             Codex, Cursor"
   echo "             released as tag v<version>"
-  echo "  --runtime  cli/Cargo.toml, Cargo.lock, CLI_VERSION"
+  echo "  --runtime  cli/Cargo.toml, Cargo.lock, RUNTIME_VERSION, CLI_VERSION"
   echo "             released as tag cli-v<version> (triggers dist)"
   echo
   echo "Versions are MAJOR.MINOR.PATCH with an optional -PRERELEASE suffix"
@@ -118,6 +119,7 @@ if ! "$LOAM" check versions "$ROOT" "--$DOMAIN" > /dev/null 2>&1; then
 fi
 
 CLI_VERSION_FILE="skills/loam-using/scripts/CLI_VERSION"
+CONSTANTS_FILE="setup/constants.mjs"
 
 read_current() {
   if [[ "$DOMAIN" == "runtime" ]]; then
@@ -196,6 +198,10 @@ else
   # Cargo.lock is generated with one exact copy of the crate version. Refuse
   # if a dependency shares it rather than rewriting an unrelated package.
   stage_literal "Cargo.lock" 1 "version = \"$OLD\"" "version = \"$NEW\""
+  # RUNTIME_VERSION is the package-baked runtime target the channel ledger
+  # records; it must move in lockstep with cli/Cargo.toml [package] (check.rs
+  # gates the two into agreement). Same exact-string staging as Cargo.lock.
+  stage_literal "$CONSTANTS_FILE" 1 "RUNTIME_VERSION = '$OLD'" "RUNTIME_VERSION = '$NEW'"
   printf '%s\n' "$NEW" > "$STAGE/CLI_VERSION" || fail "cannot stage $CLI_VERSION_FILE"
 fi
 
@@ -220,6 +226,7 @@ if [[ "$DOMAIN" == "plugin" ]]; then
 else
   publish "$STAGE/cli_Cargo.toml"  "cli/Cargo.toml"
   publish "$STAGE/Cargo.lock"      "Cargo.lock"
+  publish "$STAGE/setup_constants.mjs" "$CONSTANTS_FILE"
   publish "$STAGE/CLI_VERSION"     "$CLI_VERSION_FILE"
   TAG="cli-v$NEW"
 fi
