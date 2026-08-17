@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { chmod, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 
 import {
@@ -14,6 +14,7 @@ import { readInstallMetadata, readRequiredVersion, validateInstallMetadata } fro
 import { detectLegacyShadow } from '../integration/shadow.mjs';
 import { detectTarget, resolveGlobalRoot, SUPPORTED_TARGETS, runtimePath } from '../integration/paths.mjs';
 import { invokeRuntime, probeState, verifyRuntimeFile } from '../integration/runtime.mjs';
+import { runtimeStorePath, writeLedger } from '../integration/ledger.mjs';
 
 const target = detectTarget();
 
@@ -50,16 +51,32 @@ async function fixture({ runtimeVersion = '0.9.1', includeRuntime = true } = {})
     join(skillsRoot, 'loam-using', 'SKILL.md'),
     '---\nname: loam::using\nmetadata:\n  version: "1.7.2"\n---\n\n# Using loam\n',
   );
+  // The config-dir store + ledger are the readiness authority. install.json's
+  // bin/ runtime_path is still written (pre-T6) but no longer consulted for the
+  // version; the ledger's store binary is.
+  const configDir = join(home, 'config');
+  const storePath = runtimeStorePath({ version: runtimeVersion, target, root: configDir });
+  const runtimeSha = createHash('sha256').update(runtimeBytes).digest('hex');
   if (includeRuntime) {
     await mkdir(join(globalRoot, 'bin', runtimeVersion, target), { recursive: true });
     await writeFile(runtimeFile, runtimeBytes);
+    await mkdir(dirname(storePath), { recursive: true });
+    await writeFile(storePath, runtimeBytes);
   }
+  await writeLedger(
+    { channel: runtimeVersion.includes('-') ? 'next' : 'latest', target: runtimeVersion, sha256: runtimeSha, store_path: storePath },
+    { root: configDir },
+  );
   await mkdir(adapterRoot, { recursive: true });
 
-  return { home, globalRoot, skillsRoot, runtimePath: runtimeFile, integrationPath, target };
+  return {
+    home, globalRoot, skillsRoot, runtimePath: runtimeFile, storePath, integrationPath, target,
+    configDir, env: { LOAM_CONFIG_DIR: configDir }, runtimeVersion,
+  };
 }
 
 const state = {
+  version: '0.9.1',
   wiki_root: '/tmp/wiki',
   exists: true,
   qmd_ready: true,
@@ -155,6 +172,7 @@ test('versioned integration path resolves the global Loam root', async () => {
     skillsRoot: fixtureData.skillsRoot,
     integrationPath: fixtureData.integrationPath,
     target,
+    env: fixtureData.env,
     runner: async () => ({ code: 0, signal: null, stdout: JSON.stringify(state), stderr: '' }),
     output: { write: (chunk) => chunks.push(String(chunk)) },
   });
@@ -198,25 +216,44 @@ test('missing runtime reports unavailable without invoking state or fabricating 
   assert.equal(calls, 0);
 });
 
-test('runtime version mismatch fails readiness before execution', async () => {
-  const fixtureData = await fixture({ runtimeVersion: '0.8.2' });
+test('a runtime self-report that differs from the ledger target is stale, not run-once', async () => {
+  const fixtureData = await fixture();
   const result = await probeState({
     ...fixtureData,
     workspace: fixtureData.home,
-    runner: async () => {
-      throw new Error('must not run');
-    },
+    // The store binary is intact; only the self-reported version disagrees.
+    runner: async () => ({ code: 0, stdout: JSON.stringify({ ...state, version: '0.8.2' }), stderr: '' }),
   });
 
   assert.equal(result.ready, false);
-  assert.equal(result.category, 'runtime_version_mismatch');
+  assert.equal(result.category, 'runtime_stale');
+  assert.equal(result.hint, 'update');
   assert.equal(result.expected, '0.9.1');
   assert.equal(result.actual, '0.8.2');
 });
 
-test('runtime readiness rejects tampered bytes before invoking native state', async () => {
+test('a stale or absent skills CLI_VERSION cannot change readiness', async () => {
   const fixtureData = await fixture();
-  await writeFile(fixtureData.runtimePath, 'tampered runtime');
+  const scripts = join(fixtureData.skillsRoot, 'loam-using', 'scripts');
+  // Poison the skills CLI_VERSION: readiness must ignore it entirely.
+  await writeFile(join(scripts, 'CLI_VERSION'), '0.0.0\n');
+  const poisoned = await probeState({
+    ...fixtureData, workspace: fixtureData.home,
+    runner: async () => ({ code: 0, stdout: JSON.stringify(state), stderr: '' }),
+  });
+  assert.equal(poisoned.ready, true);
+  // And even when the file is gone.
+  await rm(join(scripts, 'CLI_VERSION'));
+  const absent = await probeState({
+    ...fixtureData, workspace: fixtureData.home,
+    runner: async () => ({ code: 0, stdout: JSON.stringify(state), stderr: '' }),
+  });
+  assert.equal(absent.ready, true);
+});
+
+test('runtime readiness rejects a store binary whose sha differs from the ledger', async () => {
+  const fixtureData = await fixture();
+  await writeFile(fixtureData.storePath, 'tampered runtime');
   let calls = 0;
   const result = await probeState({
     ...fixtureData,
@@ -227,8 +264,10 @@ test('runtime readiness rejects tampered bytes before invoking native state', as
     },
   });
 
+  // A sha divergence from the ledger means the store binary is not the target;
+  // stale (update), caught before ever spawning the runtime.
   assert.equal(result.ready, false);
-  assert.equal(result.category, 'runtime_untrusted');
+  assert.equal(result.category, 'runtime_stale');
   assert.equal(calls, 0);
 });
 
@@ -237,8 +276,8 @@ test('runtime readiness rejects symlinked executables', async (t) => {
   const fixtureData = await fixture();
   const outside = join(fixtureData.home, 'outside-runtime');
   await writeFile(outside, 'fixture runtime');
-  await rm(fixtureData.runtimePath);
-  await symlink(outside, fixtureData.runtimePath);
+  await rm(fixtureData.storePath);
+  await symlink(outside, fixtureData.storePath);
 
   const result = await probeState({ ...fixtureData, workspace: fixtureData.home });
   assert.equal(result.ready, false);
@@ -680,6 +719,7 @@ test('the integration boundary is status-only and refuses the retired hook comma
     skillsRoot: fixtureData.skillsRoot,
     integrationPath: fixtureData.integrationPath,
     target,
+    env: fixtureData.env,
     runner: async () => ({ code: 0, signal: null, stdout: JSON.stringify(state), stderr: '' }),
     output: { write: (chunk) => statusChunks.push(String(chunk)) },
   });
@@ -709,6 +749,7 @@ test('status rejects a correctly hashed runtime that fails bounded execution', a
     skillsRoot: fixtureData.skillsRoot,
     integrationPath: fixtureData.integrationPath,
     target,
+    env: fixtureData.env,
     runner: async () => ({ code: 1, signal: null, stdout: '', stderr: 'not executable' }),
     output: { write: (chunk) => chunks.push(String(chunk)) },
   });
@@ -720,13 +761,14 @@ test('status rejects a correctly hashed runtime that fails bounded execution', a
 test('status rejects a correctly hashed non-executable runtime', async (t) => {
   if (process.platform === 'win32') return t.skip('execute permissions are not portable on Windows');
   const fixtureData = await fixture();
-  await chmod(fixtureData.runtimePath, 0o600);
+  await chmod(fixtureData.storePath, 0o600);
   const chunks = [];
   const code = await runIntegration(['status'], {
     globalRoot: fixtureData.globalRoot,
     skillsRoot: fixtureData.skillsRoot,
     integrationPath: fixtureData.integrationPath,
     target,
+    env: fixtureData.env,
     output: { write: (chunk) => chunks.push(String(chunk)) },
   });
 
