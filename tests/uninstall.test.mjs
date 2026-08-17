@@ -9,6 +9,16 @@ import { installHarnesses, detectHarnesses } from '../setup/harnesses.mjs';
 import { uninstall } from '../setup/uninstall.mjs';
 import { childIdentity } from '../integration/ingest-process.mjs';
 import { confirmUninstall } from '../setup/wizard.mjs';
+import { readLedger, runtimeStorePath, writeLedger } from '../integration/ledger.mjs';
+
+// Seed the config-dir runtime store + ledger the way an install leaves them.
+async function seedRuntimeStore(configDir, { version = '0.9.1', target = 'x86_64-unknown-linux-musl' } = {}) {
+  const store_path = runtimeStorePath({ version, target, root: configDir });
+  await mkdir(join(configDir, 'runtime', version, target), { recursive: true });
+  await writeFile(store_path, 'fake runtime\n');
+  await writeLedger({ channel: 'latest', target: version, sha256: 'a'.repeat(64), store_path }, { root: configDir });
+  return store_path;
+}
 
 function skillsRunner({ installed = true, calls = [] } = {}) {
   let active = installed;
@@ -187,6 +197,7 @@ test('uninstall preserves the Loam config dir by default (#86)', async () => {
   await writeFile(join(identityDir, 'client.pem'), 'cert');
   await writeFile(join(identityDir, 'key.pem'), 'key');
   await writeFile(join(configDir, 'anything-else.json'), '{}');
+  const storePath = await seedRuntimeStore(configDir);
 
   let output = '';
   const code = await withPinnedConfigDir(configDir, () => uninstall({
@@ -200,7 +211,12 @@ test('uninstall preserves the Loam config dir by default (#86)', async () => {
   assert.equal(await exists(globalRoot), false, 'the install is removed');
   assert.equal(await exists(join(identityDir, 'client.pem')), true, 'the identity survives a default uninstall');
   assert.equal(await exists(join(configDir, 'anything-else.json')), true, 'the whole config dir survives a default uninstall');
+  // The runtime store + ledger survive, and a later install rehydrates from them.
+  assert.equal(await exists(storePath), true, 'the runtime store binary survives a default uninstall');
+  const rehydrated = await withPinnedConfigDir(configDir, () => readLedger({ env: { LOAM_CONFIG_DIR: configDir } }));
+  assert.equal(rehydrated?.target, '0.9.1', 'the ledger survives and rehydrates on reinstall');
   assert.match(output, /PRESERVE the Loam config dir/i);
+  assert.match(output, /runtime store \+ ledger/i);
 });
 
 test('uninstall --purge destroys the whole Loam config dir with an explicit confirm (#86)', async () => {
@@ -211,6 +227,7 @@ test('uninstall --purge destroys the whole Loam config dir with an explicit conf
   await writeFile(join(identityDir, 'client.pem'), 'cert');
   await writeFile(join(identityDir, 'key.pem'), 'key');
   await writeFile(join(configDir, 'anything-else.json'), '{}');
+  const storePath = await seedRuntimeStore(configDir);
 
   let output = '';
   // `yes: true` IS the explicit confirmation: no export prompt, the config dir
@@ -227,7 +244,9 @@ test('uninstall --purge destroys the whole Loam config dir with an explicit conf
   assert.equal(await exists(globalRoot), false);
   assert.equal(await exists(configDir), false, '--purge destroys the whole config dir');
   assert.equal(await exists(join(identityDir, 'client.pem')), false, '--purge destroys the identity');
+  assert.equal(await exists(storePath), false, '--purge destroys the runtime store + ledger');
   assert.match(output, /federation identity/);
+  assert.match(output, /runtime store \+ ledger/i);
 });
 
 test('uninstall --purge prompts export-or-confirm and preserves the install and config dir when the operator declines (#86)', async () => {

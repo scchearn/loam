@@ -1,8 +1,6 @@
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
-
 import { discover } from './discovery.mjs';
 import { executeSetup } from './transaction.mjs';
+import { hasMigratableRuntime } from './migration.mjs';
 
 // install and update share the staged install transaction. The only difference
 // visible here is the refusal guard: `update` is a bump of an EXISTING install,
@@ -23,12 +21,18 @@ export async function runSetup(parsed, options = {}) {
     });
 
     if (parsed.command === 'update') {
-      let hasInstall = false;
-      try {
-        JSON.parse(await readFile(join(discovery.globalRoot, 'install.json'), 'utf8'));
-        hasInstall = true;
-      } catch {}
-      if (!hasInstall) {
+      // `update` bumps an EXISTING install. It refuses only a truly fresh
+      // machine — no config-dir ledger AND no migratable legacy state. A legacy
+      // machine is upgraded (its ledger is seeded up front in the transaction),
+      // not refused under the wrong verb.
+      const migratable = await hasMigratableRuntime({
+        globalRoot: discovery.globalRoot,
+        home: discovery.home,
+        platform: discovery.platform,
+        arch: discovery.arch,
+        target: discovery.target,
+      });
+      if (!migratable) {
         errorOutput.write(
           `No Loam installation found at ${discovery.globalRoot}.\n`
           + 'update bumps an existing install; run `npx @scchearn/loam install` first.\n',

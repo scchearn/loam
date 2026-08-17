@@ -1,10 +1,140 @@
-import { lstat, readFile, rm } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { chmod, copyFile, lstat, mkdir, readdir, readFile, rm, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
-import { assertPhysicalInside } from '../integration/paths.mjs';
+import { assertPhysicalInside, detectTarget } from '../integration/paths.mjs';
+import { readLedger, runtimeStorePath, writeLedger } from '../integration/ledger.mjs';
 import { loadSkillInventory } from './inventory.mjs';
+import { publishJson } from './atomic.mjs';
+import { configRoot } from './profile.mjs';
+import { SEMVER } from './constants.mjs';
 import { listSkills, skillEntryAliases } from './skills.mjs';
 import { runSkills } from './process.mjs';
+
+async function fileExists(path) {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// One-time seed of the config-dir runtime ledger for a machine that has a legacy
+// runtime but no ledger yet. It runs up front in the install/update transaction,
+// under setup.lock — never from readiness/hook paths (which run concurrently and
+// latency-bounded). Idempotent: an existing ledger is authoritative and is never
+// overwritten. The legacy binary is COPIED, never moved, so already-injected
+// hook paths and the federation service keep working until the same transaction
+// regenerates them. The seed target comes from install.json when present, else
+// from the legacy store-path `<version>` directory (pre-T1 runtimes emit no
+// self-report, so the binary cannot seed itself); the sha is recomputed from
+// disk as the integrity proof. See plans/runtime-channel-ledger.md.
+export async function migrateRuntimeLedger({
+  globalRoot,
+  env = process.env,
+  home,
+  platform = process.platform,
+  arch = process.arch,
+  target,
+} = {}) {
+  const config = configRoot({ env, home, platform });
+  if (!config) return { migrated: false, reason: 'no_config_dir' };
+  if (await readLedger({ root: config })) return { migrated: false, reason: 'ledger_present' };
+
+  const legacyRoot = resolve(globalRoot);
+  const executable = platform === 'win32' ? 'loam.exe' : 'loam';
+  const selectedTarget = target || detectTarget({ platform, arch, override: env.LOAM_TARGET });
+
+  let install = null;
+  try {
+    install = JSON.parse(await readFile(join(legacyRoot, 'install.json'), 'utf8'));
+  } catch {
+    install = null;
+  }
+
+  // Prefer install.json's recorded version; else discover the binary-only case
+  // from the legacy `bin/<version>/<target>/` path structure.
+  let version = typeof install?.runtime_version === 'string' && SEMVER.test(install.runtime_version)
+    ? install.runtime_version
+    : null;
+  let legacyBinary = version && typeof install?.runtime_path === 'string' ? install.runtime_path : null;
+  let seededFrom = version && legacyBinary ? 'install.json' : 'binary';
+
+  if (!version || !(await fileExists(legacyBinary))) {
+    version = null;
+    legacyBinary = null;
+    seededFrom = 'binary';
+    const binRoot = join(legacyRoot, 'bin');
+    for (const entry of await readdir(binRoot, { withFileTypes: true }).catch(() => [])) {
+      if (!entry.isDirectory() || !SEMVER.test(entry.name)) continue;
+      const candidate = join(binRoot, entry.name, selectedTarget, executable);
+      if (await fileExists(candidate)) {
+        version = entry.name;
+        legacyBinary = candidate;
+        break;
+      }
+    }
+  }
+
+  if (!version || !legacyBinary || !(await fileExists(legacyBinary))) {
+    return { migrated: false, reason: 'no_legacy_runtime' };
+  }
+
+  // Recompute the sha from the on-disk binary — the integrity proof, and the
+  // only trustworthy source for the binary-only case.
+  const sha256 = createHash('sha256').update(await readFile(legacyBinary)).digest('hex');
+  const storePath = runtimeStorePath({ version, target: selectedTarget, platform, root: config });
+  await mkdir(dirname(storePath), { recursive: true, mode: 0o700 });
+  await copyFile(legacyBinary, storePath);
+  await chmod(storePath, 0o700).catch((error) => {
+    if (platform !== 'win32') throw error;
+  });
+
+  // Channel is provenance only, derived from the version string (a migrated
+  // legacy runtime carries no pin record).
+  const channel = version.includes('-') ? 'next' : 'latest';
+  await writeLedger({ channel, target: version, sha256, store_path: storePath }, { root: config });
+
+  // Rewrite install.json as schema 2, dropping the now-non-authoritative
+  // runtime_* fields (lossless, silent conversion).
+  if (install) {
+    const { runtime_version: _v, runtime_path: _p, runtime_sha256: _s, ...rest } = install;
+    await publishJson({ filePath: join(legacyRoot, 'install.json'), value: { ...rest, schema_version: 2 } });
+  }
+
+  return { migrated: true, version, target: selectedTarget, sha256, storePath, from: seededFrom };
+}
+
+// True when this machine has a runtime `update` can bump: a config-dir ledger,
+// or migratable legacy state (install.json, or a binary under bin/). The
+// verb-dispatch refusal uses this so a legacy machine is upgraded (its ledger
+// is seeded up front in the transaction), not refused as if it were fresh.
+export async function hasMigratableRuntime({
+  globalRoot,
+  env = process.env,
+  home,
+  platform = process.platform,
+  arch = process.arch,
+  target,
+} = {}) {
+  const config = configRoot({ env, home, platform });
+  if (config && await readLedger({ root: config })) return true;
+  const legacyRoot = resolve(globalRoot);
+  try {
+    const install = JSON.parse(await readFile(join(legacyRoot, 'install.json'), 'utf8'));
+    if (install && typeof install === 'object' && !Array.isArray(install)) return true;
+  } catch {
+    // No readable install.json.
+  }
+  const executable = platform === 'win32' ? 'loam.exe' : 'loam';
+  const selectedTarget = target || detectTarget({ platform, arch, override: env.LOAM_TARGET });
+  const binRoot = join(legacyRoot, 'bin');
+  for (const entry of await readdir(binRoot, { withFileTypes: true }).catch(() => [])) {
+    if (!entry.isDirectory() || !SEMVER.test(entry.name)) continue;
+    if (await fileExists(join(binRoot, entry.name, selectedTarget, executable))) return true;
+  }
+  return false;
+}
 
 export const LEGACY_MARKERS = Object.freeze([
   ['.opencode/plugins/loam.js', 'plugin-marker'],

@@ -3,9 +3,10 @@
 //!
 //! Plugin (`package.json`, both `package-lock.json` fields, both marketplace
 //! fields, Codex, Cursor) ships as
-//! `v<version>`; runtime (`cli/Cargo.toml`, `Cargo.lock`, `CLI_VERSION`) ships as
-//! `cli-v<version>`. Agreement is asserted *within* each domain and never
-//! across them — a plugin-only change must not force a runtime release.
+//! `v<version>`; runtime (`cli/Cargo.toml`, `Cargo.lock`, `setup/constants.mjs`
+//! `RUNTIME_VERSION`) ships as `cli-v<version>`. Agreement is asserted *within*
+//! each domain and never across them — a plugin-only change must not force a
+//! runtime release.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,14 @@ fn write(path: &Path, content: &str) {
 fn cargo_lock(runtime: &str, dependency: &str) -> String {
     format!(
         "version = 4\n\n[[package]]\nname = \"dependency\"\nversion = \"{dependency}\"\n\n[[package]]\nname = \"loam\"\nversion = \"{runtime}\"\n"
+    )
+}
+
+/// The runtime source in the setup layer: the `RUNTIME_VERSION` constant, in a
+/// file shaped like the real `setup/constants.mjs` (other exports around it).
+fn constants_mjs(runtime: &str) -> String {
+    format!(
+        "export const PACKAGE_VERSION = '0.0.0';\nexport const RUNTIME_VERSION = '{runtime}';\nexport const SEMVER = /x/;\n"
     )
 }
 
@@ -71,10 +80,7 @@ fn agreeing_root(label: &str) -> PathBuf {
         &format!("[package]\nname = \"loam\"\nversion = \"{RUNTIME}\"\nedition = \"2021\"\n\n[dependencies]\nchrono = {{ version = \"0.4\" }}\n"),
     );
     write(&root.join("Cargo.lock"), &cargo_lock(RUNTIME, "0.4.0"));
-    write(
-        &root.join("skills/loam-using/scripts/CLI_VERSION"),
-        &format!("{RUNTIME}\n"),
-    );
+    write(&root.join("setup/constants.mjs"), &constants_mjs(RUNTIME));
     root
 }
 
@@ -136,10 +142,7 @@ fn each_domain_can_be_checked_alone() {
 #[test]
 fn a_plugin_version_never_has_to_equal_the_runtime_version() {
     let root = agreeing_root("cross-domain");
-    write(
-        &root.join("skills/loam-using/scripts/CLI_VERSION"),
-        "2.5.1\n",
-    );
+    write(&root.join("setup/constants.mjs"), &constants_mjs("2.5.1"));
     write(
         &root.join("cli/Cargo.toml"),
         "[package]\nname = \"loam\"\nversion = \"2.5.1\"\nedition = \"2021\"\n",
@@ -212,18 +215,15 @@ fn any_drifted_plugin_value_fails_and_names_itself() {
 }
 
 #[test]
-fn a_drifted_cli_version_fails_the_runtime_domain() {
+fn a_drifted_runtime_version_fails_the_runtime_domain() {
     let root = agreeing_root("runtime-drift");
-    write(
-        &root.join("skills/loam-using/scripts/CLI_VERSION"),
-        "0.8.2\n",
-    );
+    write(&root.join("setup/constants.mjs"), &constants_mjs("0.8.2"));
 
     let (code, _, stderr) = check(&root, &[]);
 
     assert_eq!(code, 1);
     assert!(
-        stderr.contains("skills/loam-using/scripts/CLI_VERSION is 0.8.2"),
+        stderr.contains("setup/constants.mjs RUNTIME_VERSION is 0.8.2"),
         "stderr: {stderr}"
     );
     assert!(
@@ -236,10 +236,7 @@ fn a_drifted_cli_version_fails_the_runtime_domain() {
 #[test]
 fn a_selector_scopes_the_failure() {
     let root = agreeing_root("scoped-failure");
-    write(
-        &root.join("skills/loam-using/scripts/CLI_VERSION"),
-        "0.8.2\n",
-    );
+    write(&root.join("setup/constants.mjs"), &constants_mjs("0.8.2"));
 
     let (plugin_code, _, _) = check(&root, &["--plugin"]);
     let (runtime_code, _, _) = check(&root, &["--runtime"]);
@@ -310,11 +307,11 @@ fn a_missing_root_is_reported() {
 }
 
 #[test]
-fn surrounding_whitespace_in_cli_version_is_tolerated() {
+fn surrounding_whitespace_in_runtime_version_is_tolerated() {
     let root = agreeing_root("whitespace");
     write(
-        &root.join("skills/loam-using/scripts/CLI_VERSION"),
-        &format!("  {RUNTIME}  \r\n"),
+        &root.join("setup/constants.mjs"),
+        &format!("export const RUNTIME_VERSION =   '{RUNTIME}' ;  \r\n"),
     );
 
     let (code, stdout, stderr) = check(&root, &["--runtime"]);
@@ -323,6 +320,44 @@ fn surrounding_whitespace_in_cli_version_is_tolerated() {
     assert_eq!(
         stdout,
         format!("version agreement: runtime PASS ({RUNTIME})\n")
+    );
+}
+
+/// A constants file with no `RUNTIME_VERSION` export is a hard runtime failure —
+/// the gate must name the missing source, not silently pass.
+#[test]
+fn a_missing_runtime_version_export_fails_the_runtime_domain() {
+    let root = agreeing_root("runtime-no-export");
+    write(
+        &root.join("setup/constants.mjs"),
+        "export const PACKAGE_VERSION = '0.0.0';\n",
+    );
+
+    let (code, _, stderr) = check(&root, &["--runtime"]);
+
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("setup/constants.mjs has no RUNTIME_VERSION export"),
+        "stderr: {stderr}"
+    );
+}
+
+/// An empty `RUNTIME_VERSION` value is a hard runtime failure with its own
+/// message, distinct from a missing export.
+#[test]
+fn an_empty_runtime_version_fails_the_runtime_domain() {
+    let root = agreeing_root("runtime-empty");
+    write(
+        &root.join("setup/constants.mjs"),
+        "export const RUNTIME_VERSION = '';\n",
+    );
+
+    let (code, _, stderr) = check(&root, &["--runtime"]);
+
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("setup/constants.mjs RUNTIME_VERSION is empty"),
+        "stderr: {stderr}"
     );
 }
 

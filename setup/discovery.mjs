@@ -5,7 +5,6 @@ import { PACKAGE_ROOT, PACKAGE_VERSION } from './constants.mjs';
 import { detectHarnesses } from './harnesses.mjs';
 import { detectLegacyProject, isOwnedLegacyMarker, LEGACY_MARKERS } from './migration.mjs';
 import { loadSkillInventory } from './inventory.mjs';
-import { readRequiredVersion } from '../integration/metadata.mjs';
 import { detectTarget } from './target.mjs';
 
 async function exists(path) {
@@ -64,11 +63,6 @@ export async function discover({
     home: resolvedHome,
     platform,
   });
-  let requiredVersion = '';
-  try {
-    requiredVersion = await readRequiredVersion({ skillsRoot });
-  } catch {}
-
   const sourceRepository = resolvedWorkspace === resolve(packageRoot);
   const hasEvidence = !sourceRepository && await hasLegacyEvidence(resolvedWorkspace, packageRoot);
   const legacy = hasEvidence
@@ -86,7 +80,6 @@ export async function discover({
     target: target || detectTarget({ platform, arch }),
     platform,
     arch,
-    requiredVersion,
     node: process.version,
     npm: process.env.npm_execpath || 'npx',
     harnesses: await detectHarnesses({ home: resolvedHome, pluginVersion: PACKAGE_VERSION }),

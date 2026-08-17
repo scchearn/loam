@@ -3,7 +3,7 @@ import { basename, resolve } from 'node:path';
 
 import { PACKAGE_VERSION } from './constants.mjs';
 import { loadSkillInventory } from './inventory.mjs';
-import { readRequiredVersion, readSkillContent } from '../integration/metadata.mjs';
+import { readSkillContent } from '../integration/metadata.mjs';
 import { runSkills } from './process.mjs';
 
 const defaultPackageRoot = fileURLToPath(new URL('..', import.meta.url));
@@ -99,12 +99,11 @@ export async function verifyGlobalSkills({
   agents,
 } = {}) {
   const inventory = await loadSkillInventory({ packageRoot });
-  let requiredVersion = '';
-  let skillContent = '';
   let localError = '';
   try {
-    requiredVersion = await readRequiredVersion({ skillsRoot });
-    skillContent = await readSkillContent({ skillsRoot });
+    // Presence-only: the skills tree no longer carries a runtime version. A
+    // readable `loam-using/SKILL.md` proves the global skills are installed.
+    await readSkillContent({ skillsRoot });
   } catch (error) {
     localError = error instanceof Error ? error.message : String(error);
   }
@@ -124,12 +123,11 @@ export async function verifyGlobalSkills({
       category: missing.length || localError ? 'skills_missing' : 'skills_source_missing',
       missing: missing.map((skill) => skill.frontmatterName),
       source: hasSource,
-      requiredVersion,
       detail: localError,
       inventory,
     };
   }
-  return { ready: true, changed: false, requiredVersion, inventory, listed };
+  return { ready: true, changed: false, inventory, listed };
 }
 
 export async function ensureGlobalSkills(options = {}) {

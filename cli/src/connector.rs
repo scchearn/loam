@@ -1757,13 +1757,15 @@ impl LivenessHandle {
     /// A handle for a session that has just been established (the synchronous
     /// first attach succeeded).
     fn established(now: DateTime<Utc>) -> Self {
-        LivenessHandle(std::sync::Arc::new(std::sync::Mutex::new(ObservedSession {
-            established: true,
-            since: now,
-            consecutive_failures: 0,
-            last_error: None,
-            refusal: None,
-        })))
+        LivenessHandle(std::sync::Arc::new(std::sync::Mutex::new(
+            ObservedSession {
+                established: true,
+                since: now,
+                consecutive_failures: 0,
+                last_error: None,
+                refusal: None,
+            },
+        )))
     }
 
     /// A handle for a session whose first establishment cycle failed but is
@@ -1771,13 +1773,15 @@ impl LivenessHandle {
     /// supervisor keeps trying and the watchdog is already counting: the first
     /// failure is seeded here so the observation is truthful from attach.
     fn down(now: DateTime<Utc>, category: String) -> Self {
-        LivenessHandle(std::sync::Arc::new(std::sync::Mutex::new(ObservedSession {
-            established: false,
-            since: now,
-            consecutive_failures: 1,
-            last_error: Some(category),
-            refusal: None,
-        })))
+        LivenessHandle(std::sync::Arc::new(std::sync::Mutex::new(
+            ObservedSession {
+                established: false,
+                since: now,
+                consecutive_failures: 1,
+                last_error: Some(category),
+                refusal: None,
+            },
+        )))
     }
 
     /// A read-only snapshot of the current observation.
@@ -2038,7 +2042,9 @@ impl ProjectSessions {
                     SessionState::Live,
                 )
             }
-            Err(refusal @ (SessionState::CredentialsUnresolved(_) | SessionState::NoPeerRoster(_))) => {
+            Err(
+                refusal @ (SessionState::CredentialsUnresolved(_) | SessionState::NoPeerRoster(_)),
+            ) => {
                 return refusal;
             }
             Err(SessionState::Unreachable(category)) => (
@@ -4547,7 +4553,9 @@ mod service_tests {
         {
             let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
             assert_eq!(
-                crate::enrollment::list_session_wakes(&connection).unwrap().len(),
+                crate::enrollment::list_session_wakes(&connection)
+                    .unwrap()
+                    .len(),
                 1,
                 "a wake-bearing registration persists its wake ref"
             );
@@ -4563,9 +4571,11 @@ mod service_tests {
         );
 
         // The next admitted frame both mailbox-pushes and wakes the reloaded target.
-        after
-            .channels
-            .push("loam", &sample_item("inbox:reload:1", "hi"), SNAPSHOT_CAPACITY);
+        after.channels.push(
+            "loam",
+            &sample_item("inbox:reload:1", "hi"),
+            SNAPSHOT_CAPACITY,
+        );
         wake_all(&after.channels, "loam", Some("hint-reload"));
         assert!(
             !accept_wake_frame(&listener).is_empty(),
@@ -4587,26 +4597,36 @@ mod service_tests {
         {
             let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
             assert_eq!(
-                crate::enrollment::list_session_wakes(&connection).unwrap().len(),
+                crate::enrollment::list_session_wakes(&connection)
+                    .unwrap()
+                    .len(),
                 1
             );
         }
 
         // A changed admit fires the wake; the dead port prunes the persisted row.
-        state
-            .channels
-            .push("loam", &sample_item("inbox:prune:1", "hi"), SNAPSHOT_CAPACITY);
+        state.channels.push(
+            "loam",
+            &sample_item("inbox:prune:1", "hi"),
+            SNAPSHOT_CAPACITY,
+        );
         wake_all(&state.channels, "loam", Some("hint-prune"));
 
         let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
         assert!(
-            crate::enrollment::list_session_wakes(&connection).unwrap().is_empty(),
+            crate::enrollment::list_session_wakes(&connection)
+                .unwrap()
+                .is_empty(),
             "an unreachable wake prunes its persisted row"
         );
         // The session and its mailbox survive; only the dead wake ref is gone.
         assert!(state.channels.contains("sess-dead"));
         assert_eq!(
-            state.channels.poll("sess-dead").expect("still registered").len(),
+            state
+                .channels
+                .poll("sess-dead")
+                .expect("still registered")
+                .len(),
             1,
             "the mailbox item survives a failed wake"
         );
@@ -6114,7 +6134,10 @@ mod snapshot_tests {
         assert_eq!(cycle, 2, "the supervisor must re-establish after a drop");
         let observed = liveness.observe();
         assert!(!observed.established);
-        assert_eq!(observed.consecutive_failures, 0, "a successful cycle clears the count");
+        assert_eq!(
+            observed.consecutive_failures, 0,
+            "a successful cycle clears the count"
+        );
         assert!(!observed.degraded());
     }
 
@@ -6174,7 +6197,10 @@ mod snapshot_tests {
         // without a wait and without ever calling process::exit in a test.
         let start = std::time::Instant::now();
         let budget = SESSIONLESS_EXIT_AFTER;
-        assert_eq!(watchdog_verdict(start, start, budget), WatchdogVerdict::Retry);
+        assert_eq!(
+            watchdog_verdict(start, start, budget),
+            WatchdogVerdict::Retry
+        );
         assert_eq!(
             watchdog_verdict(start, start + budget - Duration::from_secs(1), budget),
             WatchdogVerdict::Retry,

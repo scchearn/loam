@@ -8,6 +8,35 @@ export const PACKAGE_ROOT = packageRoot;
 export const PACKAGE_VERSION = packageJson.version;
 export const SKILLS_CLI_VERSION = '1.5.20';
 
+// Package-baked runtime version — the single source of the runtime target the
+// channel ledger records. `bin/bump-release.sh` stamps this in lockstep with
+// `cli/Cargo.toml [package]` (T9), and `cli/src/check.rs` gates the two into
+// agreement. It is NOT read from the skills tree — a stale skills `CLI_VERSION`
+// can never again freeze the runtime. See plans/runtime-channel-ledger.md.
+export const RUNTIME_VERSION = '0.11.0-next.15';
+
+// Core semver with optional semver-2.0.0 prerelease; build metadata (`+...`)
+// stays rejected (npm refuses it and `+` in tag-derived URLs is unsafe).
+// Canonical home for the pattern shared by the runtime resolver, ledger, and
+// install metadata validation.
+export const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?$/;
+
+// Resolve the runtime target and its provenance channel. `LOAM_RUNTIME_VERSION`
+// pins an exact `cli-v` target over the package constant. `channel` is
+// provenance only (how the target was selected) — never an input to version
+// comparison: `pinned` when the env var is set, else `next` for a prerelease
+// suffix, else `latest`. The next/latest split matches plugin-release.yml's
+// npm dist-tag routing so the ledger channel and the publish tag agree.
+export function resolveRuntimeTarget({ env = process.env } = {}) {
+  const pin = env.LOAM_RUNTIME_VERSION;
+  const target = pin || RUNTIME_VERSION;
+  if (!SEMVER.test(target)) {
+    throw new Error(`invalid runtime target: ${target || '(missing)'}`);
+  }
+  const channel = pin ? 'pinned' : target.includes('-') ? 'next' : 'latest';
+  return { target, channel };
+}
+
 export const EXIT_CODES = Object.freeze({
   OK: 0,
   FAILURE: 1,

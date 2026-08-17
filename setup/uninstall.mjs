@@ -354,10 +354,10 @@ export async function uninstall({
     '- Remove installed Claude and Codex marketplace plugins through their native CLIs',
     `- Remove the global Loam root (install.json, runtime, integration, plugins, local operational history) at: ${root}`,
     configDir
-      ? `- PRESERVE the Loam config dir (federation identity, rosters, enrollment, registry, member cards) at: ${configDir} so a reinstall resumes with the same identity`
+      ? `- PRESERVE the Loam config dir (federation identity, rosters, enrollment, registry, member cards, runtime store + ledger) at: ${configDir} so a reinstall resumes with the same identity and runtime`
       : '- PRESERVE the Loam config dir (none resolved)',
     ...(purge && configDir
-      ? [`- --purge: also destroy everything in the Loam config dir at: ${configDir} (federation identity, rosters, registry, member cards, config.json — and anything else Loam stores there)`]
+      ? [`- --purge: also destroy everything in the Loam config dir at: ${configDir} (federation identity, rosters, registry, member cards, config.json, runtime store + ledger — and anything else Loam stores there)`]
       : []),
   ], { level: 'warn' });
 

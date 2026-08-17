@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,11 +9,105 @@ import { fileURLToPath } from 'node:url';
 
 import { loadSkillInventory } from '../setup/inventory.mjs';
 import { discover } from '../setup/discovery.mjs';
-import { detectLegacyProject, migrateLegacyProject } from '../setup/migration.mjs';
+import { detectLegacyProject, migrateLegacyProject, migrateRuntimeLedger } from '../setup/migration.mjs';
 import { npxCommand, runCommand, runSkills } from '../setup/process.mjs';
 import { ensureGlobalSkills, skillsAgentsFor, skillsSourceFor } from '../setup/skills.mjs';
+import { readLedger, runtimeStorePath } from '../integration/ledger.mjs';
+import { detectTarget } from '../integration/paths.mjs';
+import { probeState } from '../integration/runtime.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
+const ledgerTarget = detectTarget();
+
+async function pathExists(path) {
+  try { await stat(path); return true; } catch { return false; }
+}
+
+// A legacy machine: a runtime under ~/.agents/loam/bin, an install.json, skills,
+// integration + adapter — but no config-dir ledger yet.
+async function legacyRuntimeFixture({ includeRuntimeVersion = true, version = '0.10.0' } = {}) {
+  const home = await mkdtemp(join(tmpdir(), 'loam-ledger-mig-'));
+  const globalRoot = join(home, '.agents', 'loam');
+  const skillsRoot = join(home, '.agents', 'skills');
+  const configDir = join(home, 'config');
+  const bin = join(globalRoot, 'bin', version, ledgerTarget);
+  await mkdir(bin, { recursive: true });
+  const binary = join(bin, 'loam');
+  const bytes = 'legacy runtime bytes';
+  await writeFile(binary, bytes);
+  const sha = createHash('sha256').update(bytes).digest('hex');
+
+  const integrationPath = join(globalRoot, 'integration', 'x', 'loam.mjs');
+  const adapterRoot = join(globalRoot, 'plugins', '0.12.0');
+  await mkdir(join(globalRoot, 'integration', 'x'), { recursive: true });
+  await writeFile(integrationPath, 'export {};\n');
+  await mkdir(adapterRoot, { recursive: true });
+  await mkdir(join(skillsRoot, 'loam-using', 'scripts'), { recursive: true });
+  await writeFile(join(skillsRoot, 'loam-using', 'SKILL.md'), '---\nname: loam::using\n---\n# using\n');
+
+  const install = {
+    schema_version: 1, plugin_version: '0.12.0', target: ledgerTarget,
+    adapter_root: adapterRoot, integration_path: integrationPath,
+    skills_scope: 'global', skills_source: 'scchearn/loam', configured_harnesses: [],
+    ...(includeRuntimeVersion ? { runtime_version: version, runtime_path: binary, runtime_sha256: sha } : {}),
+  };
+  await writeFile(join(globalRoot, 'install.json'), JSON.stringify(install));
+  return { home, globalRoot, skillsRoot, configDir, env: { LOAM_CONFIG_DIR: configDir }, version, binary, sha, target: ledgerTarget };
+}
+
+test('runtime ledger migration seeds from install.json and converts it to schema 2', async () => {
+  const f = await legacyRuntimeFixture();
+  const result = await migrateRuntimeLedger({ globalRoot: f.globalRoot, env: f.env, target: f.target });
+  assert.equal(result.migrated, true);
+  assert.equal(result.from, 'install.json');
+  const ledger = await readLedger({ root: f.configDir });
+  assert.equal(ledger.target, f.version);
+  assert.equal(ledger.sha256, f.sha);
+  assert.equal(ledger.store_path, runtimeStorePath({ version: f.version, target: f.target, root: f.configDir }));
+  // The legacy binary is copied, never moved.
+  assert.equal(await pathExists(f.binary), true);
+  const install = JSON.parse(await readFile(join(f.globalRoot, 'install.json'), 'utf8'));
+  assert.equal(install.schema_version, 2);
+  assert.equal(install.runtime_version, undefined);
+  assert.equal(install.runtime_path, undefined);
+  assert.equal(install.runtime_sha256, undefined);
+});
+
+test('runtime ledger migration seeds the binary-only case from the store path, not self-report', async () => {
+  // No runtime_version in install.json — the exact pre-T1 machine that emits no
+  // self-report; the version comes from the bin/<version>/ directory.
+  const f = await legacyRuntimeFixture({ includeRuntimeVersion: false });
+  const result = await migrateRuntimeLedger({ globalRoot: f.globalRoot, env: f.env, target: f.target });
+  assert.equal(result.migrated, true);
+  assert.equal(result.from, 'binary');
+  const ledger = await readLedger({ root: f.configDir });
+  assert.equal(ledger.target, f.version);
+  assert.equal(ledger.sha256, f.sha);
+});
+
+test('runtime ledger migration is idempotent and never overwrites an existing ledger', async () => {
+  const f = await legacyRuntimeFixture();
+  await migrateRuntimeLedger({ globalRoot: f.globalRoot, env: f.env, target: f.target });
+  const before = await readLedger({ root: f.configDir });
+  const second = await migrateRuntimeLedger({ globalRoot: f.globalRoot, env: f.env, target: f.target });
+  assert.equal(second.migrated, false);
+  assert.equal(second.reason, 'ledger_present');
+  assert.deepEqual(await readLedger({ root: f.configDir }), before);
+});
+
+test('after migration readiness is ledger-driven and passes off a schema-2 install.json', async () => {
+  const f = await legacyRuntimeFixture();
+  await migrateRuntimeLedger({ globalRoot: f.globalRoot, env: f.env, target: f.target });
+  const result = await probeState({
+    globalRoot: f.globalRoot, skillsRoot: f.skillsRoot, target: f.target, env: f.env,
+    workspace: f.home,
+    runner: async () => ({ code: 0, stdout: JSON.stringify({ version: f.version }), stderr: '' }),
+  });
+  // install.json now carries no runtime_version; readiness still passes because
+  // the version authority is the ledger + the runtime self-report.
+  assert.equal(result.ready, true);
+  assert.equal(result.ledger.target, f.version);
+});
 
 async function skillsRootFixture() {
   const root = await mkdtemp(join(tmpdir(), 'loam-skills-'));
