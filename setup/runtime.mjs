@@ -4,8 +4,10 @@ import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
 
 import { invokeRuntime, verifyRuntimeFile } from '../integration/runtime.mjs';
+import { runtimeStorePath, writeLedger } from '../integration/ledger.mjs';
 import { createStagingDirectory, cleanupStaging, publishAtomic } from './atomic.mjs';
-import { assertSupportedTarget, detectTarget, runtimePath } from './target.mjs';
+import { configRoot } from './profile.mjs';
+import { assertSupportedTarget, detectTarget } from './target.mjs';
 
 // Core semver with optional semver 2.0.0 prerelease (`-` plus dot-separated
 // identifiers). Build metadata (`+...`) stays rejected: npm refuses it and
@@ -129,7 +131,15 @@ async function readManifest(path, version, target) {
   return { ...entry, sha256: entry.sha256.toLowerCase() };
 }
 
-async function smoke({ runtimePath: executable, workspace, smokeRunner, timeoutMs }) {
+// A not-yet-published runtime (the manifest 404s, or the file:// fixture is
+// missing) is the relocated 78/75 wait-retry case, not a corruption — install
+// must signal wait/retry and never wipe or downgrade the active binary.
+function isNotPublished(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return error?.code === 'ENOENT' || /download failed \(404\)/.test(message) || /ENOENT/.test(message);
+}
+
+async function smoke({ runtimePath: executable, workspace, smokeRunner, timeoutMs, version }) {
   const result = await (smokeRunner
     ? smokeRunner({ runtimePath: executable, args: ['state', '--fast', resolve(workspace || process.cwd())], cwd: workspace || process.cwd(), timeoutMs })
     : invokeRuntime({
@@ -141,20 +151,33 @@ async function smoke({ runtimePath: executable, workspace, smokeRunner, timeoutM
   if (result?.category === 'timeout' || result?.code !== 0) {
     throw new Error(`runtime smoke failed: ${result?.stderr || `exit ${result?.code}`}`);
   }
+  let parsed;
   try {
-    const parsed = JSON.parse(result.stdout || '');
+    parsed = JSON.parse(result.stdout || '');
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('state output is not an object');
   } catch (error) {
     throw new Error(`runtime smoke failed: invalid state JSON (${error instanceof Error ? error.message : error})`);
   }
+  // Close the mis-versioned-release trap: a cli-v<X> release that ships a binary
+  // whose CARGO_PKG_VERSION is not <X> fails loudly here instead of publishing
+  // and then failing readiness as stale on every machine forever.
+  // ponytail: assert only when the binary reports a version. Post-T1 runtimes
+  // always do, so a wrong-version binary (version present, mismatched) is caught;
+  // a version-absent output is a pre-T1 stub and is skipped.
+  if (version && typeof parsed.version === 'string' && parsed.version !== version) {
+    throw new Error(`runtime smoke failed: binary reports version ${parsed.version}, expected ${version}`);
+  }
 }
 
 export async function installRuntime({
-  globalRoot,
+  configDir,
+  env = process.env,
+  home,
   version,
   target,
   platform = process.platform,
   arch = process.arch,
+  channel,
   releaseBaseUrl,
   workspace,
   timeoutMs = 120_000,
@@ -164,26 +187,48 @@ export async function installRuntime({
   force = false,
 } = {}) {
   if (!SEMVER.test(version || '')) throw new Error(`invalid runtime version: ${version || '(missing)'}`);
-  const selectedTarget = target || detectTarget({ platform, arch, override: process.env.LOAM_TARGET });
+  const selectedTarget = target || detectTarget({ platform, arch, override: env.LOAM_TARGET });
   assertSupportedTarget(selectedTarget);
-  const root = resolve(globalRoot);
-  const destination = runtimePath(root, version, selectedTarget, { platform });
-  await mkdir(root, { recursive: true, mode: 0o700 });
+  // The store lives under the durable config dir, not the volatile global root,
+  // so it survives an uninstall-preserve. `configRoot` returns null when no
+  // config basis resolves — never write to a null path.
+  const config = configDir ? resolve(configDir) : configRoot({ env, home, platform });
+  if (!config) throw new Error('cannot resolve a config dir for the runtime store');
+  const storeRoot = join(config, 'runtime');
+  const destination = runtimeStorePath({ version, target: selectedTarget, platform, root: config });
+  await mkdir(storeRoot, { recursive: true, mode: 0o700 });
+
+  // The ledger is the readiness authority; write it on every successful install
+  // (publish or verified reuse). Gated on `channel` so ledger-agnostic callers
+  // and unit fixtures can exercise the download/publish path without one; the
+  // real transaction always supplies it (T7).
+  const commitLedger = async (sha256) => {
+    if (!channel) return;
+    await writeLedger({ channel, target: version, sha256, store_path: destination }, { root: config });
+  };
 
   const install = async () => {
     if (!force && expectedSha256) {
-      const trusted = await verifyRuntimeFile({ runtimePath: destination, globalRoot: root, expectedSha256 });
+      const trusted = await verifyRuntimeFile({ runtimePath: destination, globalRoot: config, expectedSha256 });
       if (trusted.ready) {
-        await smoke({ runtimePath: destination, workspace, smokeRunner, timeoutMs });
-        return { reused: true, published: false, path: destination, sha256: trusted.sha256 };
+        await smoke({ runtimePath: destination, workspace, smokeRunner, timeoutMs, version });
+        await commitLedger(trusted.sha256);
+        return { reused: true, published: false, path: destination, sha256: trusted.sha256, storePath: destination };
       }
     }
 
-    const staging = await createStagingDirectory(root, { prefix: `runtime-${version}-${selectedTarget}` });
+    const staging = await createStagingDirectory(storeRoot, { prefix: `runtime-${version}-${selectedTarget}` });
     try {
       const base = releaseBaseUrl || `${DEFAULT_RELEASE_BASE}/cli-v${version}`;
       const manifestPath = join(staging, 'loam-runtime-manifest.json');
-      await downloadToFile(releaseUrl(base, 'loam-runtime-manifest.json'), manifestPath, { maxBytes: 1_048_576, timeoutMs });
+      try {
+        await downloadToFile(releaseUrl(base, 'loam-runtime-manifest.json'), manifestPath, { maxBytes: 1_048_576, timeoutMs });
+      } catch (error) {
+        if (isNotPublished(error)) {
+          return { pending: true, reused: false, published: false, path: destination, storePath: destination };
+        }
+        throw error;
+      }
       const manifestEntry = await readManifest(manifestPath, version, selectedTarget);
       const artifactPath = join(staging, manifestEntry.file);
       await downloadToFile(releaseUrl(base, manifestEntry.file), artifactPath, { maxBytes: maxDownloadBytes, timeoutMs });
@@ -194,12 +239,14 @@ export async function installRuntime({
       await chmod(artifactPath, 0o700).catch((error) => {
         if (platform !== 'win32') throw error;
       });
-      await smoke({ runtimePath: artifactPath, workspace, smokeRunner, timeoutMs });
+      await smoke({ runtimePath: artifactPath, workspace, smokeRunner, timeoutMs, version });
       const publication = await publishAtomic({ stagedPath: artifactPath, destination, mode: 0o700 });
+      await commitLedger(manifestEntry.sha256);
       return {
         reused: false,
         published: true,
         path: publication.destination,
+        storePath: destination,
         backupPath: publication.backupPath,
         manifest: manifestEntry,
         sha256: manifestEntry.sha256,
