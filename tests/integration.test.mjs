@@ -213,6 +213,36 @@ test('a runtime self-report that differs from the ledger target is stale, not ru
   assert.equal(result.actual, '0.8.2');
 });
 
+test('a sha-verified runtime with no self-report passes as pre-self-report, never a run-update loop', async () => {
+  const fixtureData = await fixture();
+  // A pre-T1 binary: `state --fast` has no `version` field. checkReadiness has
+  // already matched its sha against the ledger, so it is the recorded target.
+  const { version, ...noVersionState } = state;
+  const result = await probeState({
+    ...fixtureData,
+    workspace: fixtureData.home,
+    runner: async () => ({ code: 0, stdout: JSON.stringify(noVersionState), stderr: '' }),
+  });
+
+  assert.equal(result.ready, true, 'a sha-verified pre-T1 runtime is ready, not stale');
+  assert.notEqual(result.category, 'runtime_stale');
+  assert.equal(result.note, 'runtime_predates_self_report');
+  assert.equal(result.hint, undefined, 'no update hint — re-running update would loop to the same state');
+});
+
+test('a matching self-report is ready and carries no pre-self-report note', async () => {
+  const fixtureData = await fixture();
+  const result = await probeState({
+    ...fixtureData,
+    workspace: fixtureData.home,
+    // The self-report equals the ledger target — the ordinary healthy case.
+    runner: async () => ({ code: 0, stdout: JSON.stringify(state), stderr: '' }),
+  });
+
+  assert.equal(result.ready, true);
+  assert.equal(result.note, undefined, 'the transitional note must not leak onto a normal match');
+});
+
 test('a stale or absent skills CLI_VERSION cannot change readiness', async () => {
   const fixtureData = await fixture();
   const scripts = join(fixtureData.skillsRoot, 'loam-using', 'scripts');
