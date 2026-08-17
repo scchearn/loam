@@ -918,13 +918,24 @@ pub struct ConnectorState {
 
 impl ConnectorState {
     pub fn new() -> Self {
+        Self::build(ChannelRegistry::new())
+    }
+
+    /// The connector's state with wake-ref persistence bound to the registry at
+    /// `db_path` — the config-dir-resolved path the service already opened for
+    /// enrollment. The reload of persisted wakes is a separate explicit step so a
+    /// caller decides its ordering against `attach_enrolled`.
+    pub fn with_registry_path(db_path: std::path::PathBuf) -> Self {
+        Self::build(ChannelRegistry::persistent(db_path))
+    }
+
+    fn build(channels: ChannelRegistry) -> Self {
         // ONE registry, shared by construction: `channels` is the IPC side
         // (SessionRegisterInject writes here) and the pump side (wake_all and
         // mailbox push read from here) must see the same registrations. A
         // second registry inside `ProjectSessions` was the live-wake defect: IPC
         // registrations landed in one Arc and the pump's `wake_targets`/`push`
         // read the other, so no wake ever fired in production.
-        let channels = ChannelRegistry::new();
         ConnectorState {
             sessions: ProjectSessions::new(SNAPSHOT_CAPACITY, channels.clone()),
             channels,
@@ -953,15 +964,20 @@ pub enum ServiceError {
     Ipc(ipc::IpcError),
 }
 
-/// A volatile, in-memory per-session inject-channel registry (2026-08-08
-/// amendment, T18) and per-session mailbox queue (T2). Held only for the life
-/// of one connector process: a restart drops every channel and every mailbox,
-/// and nothing here is ever written to the SQLite registry. Injection over a
-/// channel is live injection; the connector only admits, holds, hands back,
-/// and drops it.
+/// A per-session inject-channel registry (2026-08-08 amendment, T18) and
+/// per-session mailbox queue (T2). The channels and mailboxes are volatile — a
+/// restart drops them and injection over a channel is live injection — but the
+/// *wake reference* of each registration is persisted to the registry sqlite
+/// (`db`) so a restart reloads it and an idle session (one that takes no turns,
+/// the #112 incident's shape) is still woken. The connector only admits, holds,
+/// hands back, and drops the channel; the wake ref is the one durable part.
 #[derive(Debug, Default, Clone)]
 pub struct ChannelRegistry {
     inner: std::sync::Arc<std::sync::Mutex<MailboxInner>>,
+    /// The registry path wake refs persist to — the *same* config-dir-resolved
+    /// path enrollment uses, never a separate resolution, so there is no
+    /// `--global-root` shadowing. `None` in tests and in a registry-less state.
+    db: Option<std::sync::Arc<std::path::PathBuf>>,
 }
 
 /// The shared mailbox state: the channel registry and the per-session bounded
@@ -992,19 +1008,107 @@ impl ChannelRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, channel: InjectChannel) {
+    /// A registry whose wake refs persist to the sqlite at `db_path`.
+    pub fn persistent(db_path: std::path::PathBuf) -> Self {
+        ChannelRegistry {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(MailboxInner::default())),
+            db: Some(std::sync::Arc::new(db_path)),
+        }
+    }
+
+    /// Register a session's inject channel in memory and, if it carries a wake
+    /// ref, persist that ref so a restart can reload it. Idempotent: a repeated
+    /// registration for the same session id upserts. `&self` throughout — the
+    /// mutation is interior, so the pump side can prune without a `&mut`.
+    pub fn register(&self, channel: InjectChannel) {
+        self.register_in_memory(channel.clone());
+        self.persist_wake(&channel);
+    }
+
+    /// The in-memory half of registration, used both by `register` and by the
+    /// startup reload (which must not re-persist what it just read back).
+    fn register_in_memory(&self, channel: InjectChannel) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.sessions.insert(channel.session_id.clone(), channel);
         }
     }
 
-    pub fn drop_session(&mut self, session_id: &str) -> bool {
-        if let Ok(mut inner) = self.inner.lock() {
+    pub fn drop_session(&self, session_id: &str) -> bool {
+        let removed = if let Ok(mut inner) = self.inner.lock() {
             let removed = inner.sessions.remove(session_id).is_some();
             inner.mailboxes.remove(session_id);
-            return removed;
+            removed
+        } else {
+            false
+        };
+        // Whether or not it was live in memory, clear any persisted wake so a
+        // restart never reloads a dead one.
+        self.persist_delete(session_id);
+        removed
+    }
+
+    /// Persist one registration's wake ref (best-effort; a persistence failure
+    /// never fails the live registration — the plugin re-registers per hook).
+    fn persist_wake(&self, channel: &InjectChannel) {
+        let (Some(db), Some(wake_ref)) = (&self.db, &channel.wake_ref) else {
+            return;
+        };
+        if let Ok(connection) = crate::enrollment::open_writable(db) {
+            let _ = crate::enrollment::upsert_session_wake(
+                &connection,
+                &channel.session_id,
+                &channel.project_id,
+                wake_ref,
+                &Utc::now().to_rfc3339(),
+            );
         }
-        false
+    }
+
+    /// Clear one session's wake ref — in memory and in its persisted row — while
+    /// keeping the session registration and its mailbox. Called when a wake proves
+    /// unreachable, so a restart never reloads a dead wake and the pump stops
+    /// re-dialing it; a live session stays pollable and re-registers per hook.
+    fn prune_wake_ref(&self, session_id: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(channel) = inner.sessions.get_mut(session_id) {
+                channel.wake_ref = None;
+            }
+        }
+        self.persist_delete(session_id);
+    }
+
+    /// Remove one session's persisted wake ref (best-effort).
+    fn persist_delete(&self, session_id: &str) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        if let Ok(connection) = crate::enrollment::open_writable(db) {
+            let _ = crate::enrollment::delete_session_wake(&connection, session_id);
+        }
+    }
+
+    /// Reload persisted wake refs into memory after a restart, so an idle session
+    /// registered before the restart is woken and mailbox-delivered again. Read
+    /// back as wake-only registrations (no live channel ref); the plugin's
+    /// per-hook re-registration re-attaches the channel for active sessions.
+    pub fn reload_persisted(&self) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        let Ok(Some(connection)) = crate::enrollment::open_readonly(db) else {
+            return;
+        };
+        let Ok(wakes) = crate::enrollment::list_session_wakes(&connection) else {
+            return;
+        };
+        for wake in wakes {
+            self.register_in_memory(InjectChannel {
+                session_id: wake.session_id,
+                project_id: wake.project_id,
+                channel_ref: None,
+                wake_ref: Some(wake.wake_ref),
+            });
+        }
     }
 
     pub fn contains(&self, session_id: &str) -> bool {
@@ -1069,10 +1173,11 @@ impl ChannelRegistry {
         )
     }
 
-    /// Collect the wake targets of every registered session for a project,
-    /// without touching the lock: the caller performs the I/O after the lock
-    /// is dropped.
-    fn wake_targets(&self, project_id: &str) -> Vec<String> {
+    /// Collect the (session id, wake target) of every registered session for a
+    /// project, without touching the lock during I/O: the caller performs the
+    /// wake after the lock is dropped, and needs the session id so a wake that
+    /// proves unreachable can prune that session's registration and persisted row.
+    fn wake_targets(&self, project_id: &str) -> Vec<(String, String)> {
         let Ok(inner) = self.inner.lock() else {
             return Vec::new();
         };
@@ -1080,7 +1185,12 @@ impl ChannelRegistry {
             .sessions
             .values()
             .filter(|channel| channel.project_id == project_id)
-            .filter_map(|channel| channel.wake_ref.clone())
+            .filter_map(|channel| {
+                channel
+                    .wake_ref
+                    .clone()
+                    .map(|wake_ref| (channel.session_id.clone(), wake_ref))
+            })
             .collect()
     }
 }
@@ -1117,8 +1227,15 @@ fn wake_all(channels: &ChannelRegistry, project_id: &str, hint: Option<&str>) {
     // blocking connect inside the lock would stall every other pump sharing
     // the mailbox mutex.
     let targets = channels.wake_targets(project_id);
-    for target in targets {
-        let _ = wake_one(&target, project_id, hint);
+    for (session_id, wake_ref) in targets {
+        if wake_one(&wake_ref, project_id, hint).is_err() {
+            // The wake target is unreachable (connection refused) or malformed.
+            // Prune only the wake ref — in memory and in the persisted row — so a
+            // restart never reloads a dead wake and the pump stops re-dialing it.
+            // The session registration and its mailbox stay: a live session is
+            // still pollable, and its per-hook re-registration restores the wake.
+            channels.prune_wake_ref(&session_id);
+        }
     }
 }
 
@@ -2399,8 +2516,11 @@ pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
     }
     let run_dir = global_root.join("run");
     let endpoint = ipc::unix::bind(&run_dir).map_err(ServiceError::Ipc)?;
-    // The channel registry lives only for this process; a restart starts empty.
-    let mut state = ConnectorState::new();
+    // Channels and mailboxes start empty each process, but persisted wake refs
+    // survive a restart: bind persistence to the same registry path, then reload
+    // so an idle session registered before the restart is woken again.
+    let mut state = ConnectorState::with_registry_path(db_path.clone());
+    state.channels.reload_persisted();
     // Bring up a live session for every already-enrolled project before serving,
     // so a hook's first snapshot read does not have to wait for an attach.
     attach_enrolled(&db_path, &mut state);
@@ -2474,7 +2594,8 @@ pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
     // sides can never agree on a name.
     let run_dir = global_root.join("run");
     let endpoint = ipc::windows::bind(&run_dir).map_err(ServiceError::Ipc)?;
-    let mut state = ConnectorState::new();
+    let mut state = ConnectorState::with_registry_path(db_path.clone());
+    state.channels.reload_persisted();
     attach_enrolled(&db_path, &mut state);
     let config = IpcConfig::default();
     // The named-pipe accept is bounded, so the loop wakes regularly instead of
@@ -4324,12 +4445,12 @@ mod service_tests {
     }
 
     #[test]
-    fn a_restart_starts_with_an_empty_registry() {
-        // Register a channel for real, against a real enrolled database, so the
-        // absence below is the *loss* of something that existed rather than a
-        // registry that was never populated.
+    fn a_channel_only_registration_persists_nothing_across_a_restart() {
+        // A registration with a channel ref but no wake ref: the channel and its
+        // mailbox are live-only and must not survive a restart, and — since only
+        // wake refs are durable — nothing is written to SQLite for it.
         let (path, key) = enrolled_db("restart", 8, 80);
-        let mut before = ConnectorState::new();
+        let mut before = ConnectorState::with_registry_path(path.clone());
         dispatch_for_key(
             &register_request("sess-restart", "chan-restart"),
             &key,
@@ -4341,25 +4462,20 @@ mod service_tests {
 
         // The restart: the process-local registry is gone, the database is not.
         drop(before);
-        let after = ConnectorState::new();
+        let after = ConnectorState::with_registry_path(path.clone());
+        after.channels.reload_persisted();
         assert!(
             after.channels.is_empty(),
-            "a restarted connector must recover no channel"
+            "a channel-only registration must not survive a restart"
         );
 
-        // And the database it re-opens still holds no channel state to recover,
-        // so nothing could repopulate the registry behind our back.
+        // The wake-ref table exists but holds no row for a wake-less registration.
         let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
-        let channel_rows: i64 = connection
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type IN ('table','view') AND (name LIKE '%channel%' OR name LIKE '%session%')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            channel_rows, 0,
-            "no channel or session state may survive a restart in SQLite"
+        assert!(
+            crate::enrollment::list_session_wakes(&connection)
+                .unwrap()
+                .is_empty(),
+            "a registration without a wake ref persists nothing"
         );
         assert_eq!(
             crate::enrollment::list_enrollments(&connection)
@@ -4367,6 +4483,106 @@ mod service_tests {
                 .len(),
             1,
             "the enrollment itself must survive the restart"
+        );
+    }
+
+    fn register_wake_request(session_id: &str, wake_ref: &str) -> Request {
+        Request {
+            request_id: "r-1".into(),
+            workspace: "/w/proj".into(),
+            operation: Operation::SessionRegisterInject,
+            payload: crate::json::Value::Object(vec![
+                (
+                    "session_id".into(),
+                    crate::json::Value::String(session_id.into()),
+                ),
+                (
+                    "wake_ref".into(),
+                    crate::json::Value::String(wake_ref.into()),
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn a_persisted_wake_reloads_after_a_restart_and_fires() {
+        // The #112 incident's shape: an idle session (takes no turns, so never
+        // re-registers) must still be woken after the connector restarts.
+        let (path, key) = enrolled_db("reload", 9, 90);
+        let (listener, address) = wake_listener();
+        let mut before = ConnectorState::with_registry_path(path.clone());
+        dispatch_for_key(
+            &register_wake_request("sess-idle", &format!("notify-tcp://{address}")),
+            &key,
+            &path,
+            &mut before,
+        )
+        .expect("register");
+        {
+            let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+            assert_eq!(
+                crate::enrollment::list_session_wakes(&connection).unwrap().len(),
+                1,
+                "a wake-bearing registration persists its wake ref"
+            );
+        }
+
+        // The restart: fresh process-local state, then reload the persisted wakes.
+        drop(before);
+        let after = ConnectorState::with_registry_path(path.clone());
+        after.channels.reload_persisted();
+        assert!(
+            after.channels.contains("sess-idle"),
+            "the persisted wake reloads as a registration"
+        );
+
+        // The next admitted frame both mailbox-pushes and wakes the reloaded target.
+        after
+            .channels
+            .push("loam", &sample_item("inbox:reload:1", "hi"), SNAPSHOT_CAPACITY);
+        wake_all(&after.channels, "loam", Some("hint-reload"));
+        assert!(
+            !accept_wake_frame(&listener).is_empty(),
+            "the reloaded idle session must be woken"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_reloaded_wake_prunes_its_persisted_row() {
+        let (path, key) = enrolled_db("prune", 11, 110);
+        let mut state = ConnectorState::with_registry_path(path.clone());
+        dispatch_for_key(
+            &register_wake_request("sess-dead", "notify-tcp://127.0.0.1:1"),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register");
+        {
+            let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+            assert_eq!(
+                crate::enrollment::list_session_wakes(&connection).unwrap().len(),
+                1
+            );
+        }
+
+        // A changed admit fires the wake; the dead port prunes the persisted row.
+        state
+            .channels
+            .push("loam", &sample_item("inbox:prune:1", "hi"), SNAPSHOT_CAPACITY);
+        wake_all(&state.channels, "loam", Some("hint-prune"));
+
+        let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+        assert!(
+            crate::enrollment::list_session_wakes(&connection).unwrap().is_empty(),
+            "an unreachable wake prunes its persisted row"
+        );
+        // The session and its mailbox survive; only the dead wake ref is gone.
+        assert!(state.channels.contains("sess-dead"));
+        assert_eq!(
+            state.channels.poll("sess-dead").expect("still registered").len(),
+            1,
+            "the mailbox item survives a failed wake"
         );
     }
 

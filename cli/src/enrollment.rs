@@ -752,6 +752,15 @@ pub mod registry {
     };
     use crate::sha256::Sha256;
 
+    // The schema marker stays at 2 across the addition of `federation_session`:
+    // every federation table is created together under one version via
+    // `CREATE TABLE IF NOT EXISTS`, and the wake-ref table is a purely additive,
+    // optional cache that both older and newer runtimes tolerate (an old binary
+    // ignores it; a new binary creates it on the next writable open and treats its
+    // absence as "no persisted wakes yet"). Bumping the marker would make the
+    // strict version check reject a v2 registry from an older runtime for no
+    // compatibility gain — the connector-self-healing reload/prune contract, not a
+    // marker, is what matters.
     const FEDERATION_SCHEMA_VERSION: i64 = 2;
     const REGISTRY_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5_000);
 
@@ -789,6 +798,12 @@ pub mod registry {
         responder_principal_id TEXT NOT NULL,
         recorded_at TEXT NOT NULL,
         PRIMARY KEY (causation_id, responder_principal_id)
+    );
+    CREATE TABLE IF NOT EXISTS federation_session (
+        session_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        wake_ref TEXT NOT NULL,
+        updated_at TEXT NOT NULL
     );";
 
     /// A backend or schema failure. Distinct from the descriptor rejections above so
@@ -1142,6 +1157,99 @@ pub mod registry {
             .map_err(RegistryError::backend)?;
         transaction.commit().map_err(RegistryError::backend)?;
         Ok(removed > 0)
+    }
+
+    /// One persisted session wake reference, reloaded after a connector restart so
+    /// an idle session (one that takes no turns and so never re-registers) is still
+    /// woken and mailbox-delivered.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PersistedWake {
+        pub session_id: String,
+        pub project_id: String,
+        pub wake_ref: String,
+    }
+
+    /// Persist (or refresh) one session's wake reference — the idempotent upsert
+    /// the connector runs on every registration, so a re-register with the same
+    /// session id updates rather than duplicates. Only wake-bearing registrations
+    /// are stored; the channel ref is live-only and never persisted.
+    pub fn upsert_session_wake(
+        connection: &Connection,
+        session_id: &str,
+        project_id: &str,
+        wake_ref: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RegistryError> {
+        connection
+            .execute(
+                "INSERT INTO federation_session (session_id, project_id, wake_ref, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     project_id = excluded.project_id,
+                     wake_ref = excluded.wake_ref,
+                     updated_at = excluded.updated_at",
+                rusqlite::params![session_id, project_id, wake_ref, now_rfc3339],
+            )
+            .map_err(RegistryError::backend)?;
+        Ok(())
+    }
+
+    /// Remove one session's persisted wake reference — on an explicit drop or when
+    /// a wake target proved unreachable, so a restart never reloads a dead wake.
+    /// A missing row (or missing table) is not an error.
+    pub fn delete_session_wake(
+        connection: &Connection,
+        session_id: &str,
+    ) -> Result<(), RegistryError> {
+        if !session_table_present(connection)? {
+            return Ok(());
+        }
+        connection
+            .execute(
+                "DELETE FROM federation_session WHERE session_id = ?1",
+                [session_id],
+            )
+            .map_err(RegistryError::backend)?;
+        Ok(())
+    }
+
+    /// Every persisted wake reference, for the startup reload. Tolerates the table
+    /// being absent (a registry last written by a runtime that predates the wake
+    /// table) by returning an empty list.
+    pub fn list_session_wakes(
+        connection: &Connection,
+    ) -> Result<Vec<PersistedWake>, RegistryError> {
+        if !session_table_present(connection)? {
+            return Ok(Vec::new());
+        }
+        let mut statement = connection
+            .prepare("SELECT session_id, project_id, wake_ref FROM federation_session")
+            .map_err(RegistryError::backend)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(PersistedWake {
+                    session_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    wake_ref: row.get(2)?,
+                })
+            })
+            .map_err(RegistryError::backend)?;
+        let mut wakes = Vec::new();
+        for wake in rows {
+            wakes.push(wake.map_err(RegistryError::backend)?);
+        }
+        Ok(wakes)
+    }
+
+    fn session_table_present(connection: &Connection) -> Result<bool, RegistryError> {
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='federation_session'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(RegistryError::backend)?;
+        Ok(count == 1)
     }
 
     fn row_to_enrolled(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, EnrolledRow)> {

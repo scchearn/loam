@@ -188,6 +188,11 @@ async function startLoamNotifyServer({
     wakeRef,
     port,
     registered: Boolean(registered?.ok),
+    // Re-assert this session's wake_ref (connector-self-healing): an idempotent
+    // upsert on the connector side, so a connector restart that dropped the live
+    // channel re-attaches this active session's mailbox at the next hook — the
+    // belt-and-braces beside the connector's own persisted-wake reload.
+    reregister: async () => runReg('register', wakeRef),
     close: async () => {
       await new Promise((resolve) => server.close(resolve));
       await runReg('drop', null);
@@ -363,6 +368,15 @@ function createOpenCodeAdapter({
             await logStage('error', 'wake listener failed', { error: String(error) });
           }
         })();
+      } else if (loamWake.server?.reregister) {
+        // Per-hook idempotent re-registration (connector-self-healing): every
+        // per-turn boundary re-asserts this session's wake_ref, so a connector
+        // that restarted since SessionStart re-attaches the mailbox for an active
+        // session even though the persisted-wake reload only covers idle ones.
+        // Best-effort and unconditional, like the SessionStart registration — it
+        // must never be hostage to a contentful render.
+        void loamWake.server.reregister().catch(() => {});
+        await logStageOnce('hook:reregister', 'info', 'wake re-register', {});
       }
       const event = isFirst ? 'SessionStart' : 'UserPromptSubmit';
       // SessionStart renders the full history snapshot (no session id, no drain).
