@@ -304,6 +304,9 @@ async function probeStateWithMode({
       // and fails below. Dissolves the moment a T1+ runtime ships.
       return {
         ...status,
+        // Explicit, though `status.ready` is already true here (the `!status.ready`
+        // guard above returned) — refactor-proof if that guard ever moves.
+        ready: true,
         state: parsed,
         note: 'runtime_predates_self_report',
         detail: `runtime ${status.expectedVersion} predates the self-report field; verified by ledger sha256`,
