@@ -3,9 +3,10 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { readInstallMetadata, readRequiredVersion, readSkillContent } from '../integration/metadata.mjs';
+import { readInstallMetadata, readSkillContent } from '../integration/metadata.mjs';
 import { resolveExclusions } from '../integration/ingest.mjs';
 import { checkReadiness, probeState } from '../integration/runtime.mjs';
+import { resolveRuntimePath } from '../integration/ledger.mjs';
 import { verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
 import { isOwnedCommand, renderOpenCodePlugin } from './harnesses.mjs';
 import { verifyFederationService } from './federation.mjs';
@@ -20,9 +21,10 @@ async function fileExists(path) {
 
 async function localSkills(skillsRoot) {
   try {
-    const requiredVersion = await readRequiredVersion({ skillsRoot });
+    // Presence-only: a readable `loam-using/SKILL.md` proves the global skills
+    // are installed; the skills tree no longer carries a runtime version.
     await readSkillContent({ skillsRoot });
-    return { ready: true, requiredVersion };
+    return { ready: true };
   } catch (error) {
     return { ready: false, category: 'skills_missing', detail: error instanceof Error ? error.message : String(error) };
   }
@@ -92,7 +94,7 @@ function nativeHookCommands(entries, runtimePath, harnessId) {
       && entry.args[1] === harnessId);
 }
 
-async function verifyHarness(id, harness, { packageRoot, globalRoot, install, workspace }) {
+async function verifyHarness(id, harness, { packageRoot, globalRoot, install, workspace, home, platform }) {
   if (harness.state === 'absent') return { ...harness, ready: true };
   if (id === 'codex') {
     const profilePath = join(harness.root, 'agents', 'loam_ingestor.toml');
@@ -113,7 +115,10 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
     if (harness.state === 'skipped') return { ...harness, ready: true, owner: 'setup' };
   } else if (harness.state === 'skipped') return { ...harness, ready: true };
   if (!install) return { ...harness, ready: false, category: 'install_metadata_missing' };
-  const runtimePath = install.runtime_path;
+  // The injected hook command runs the config-dir store binary; compare against
+  // the ledger's store_path (schema-1 install.json runtime_path as migration
+  // fallback), never a dropped schema-2 field.
+  const runtimePath = (await resolveRuntimePath({ globalRoot, home, platform })) ?? install.runtime_path;
   try {
     if (id === 'claude' || id === 'codex') {
       if (!harness.marketplaceReady || !harness.marketplaceRoot) return { ...harness, ready: false, category: 'plugin_incomplete' };
@@ -217,6 +222,7 @@ export async function verifyInstallation({
         target: discovery.target,
         platform: discovery.platform,
         arch: discovery.arch,
+        home: discovery.home,
         install,
       })
     : { ready: false, category: 'install_metadata_missing' };
@@ -235,6 +241,8 @@ export async function verifyInstallation({
       globalRoot: discovery.globalRoot,
       install,
       workspace: discovery.workspace,
+      home: discovery.home,
+      platform: discovery.platform,
     });
   }
   const migration = legacy || discovery.legacy;
@@ -247,10 +255,13 @@ export async function verifyInstallation({
   // the definition is present/inspectable and references the trusted runtime
   // without starting the connector or contacting a broker.
   let federation = { ready: true, checked: false };
-  if (federationRunner !== undefined && install?.runtime_path) {
+  const federationRuntimePath = federationRunner !== undefined
+    ? (await resolveRuntimePath({ globalRoot: discovery.globalRoot, home: discovery.home, platform: discovery.platform })) ?? install?.runtime_path
+    : undefined;
+  if (federationRunner !== undefined && federationRuntimePath) {
     federation = {
       ...(await verifyFederationService({
-        runtimePath: install.runtime_path,
+        runtimePath: federationRuntimePath,
         globalRoot: discovery.globalRoot,
         runner: federationRunner,
       })),

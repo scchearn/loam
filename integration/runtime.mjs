@@ -3,8 +3,10 @@ import { spawn } from 'node:child_process';
 import { lstat, readFile, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
-import { readInstallMetadata, readRequiredVersion, readSkillContent, validateInstallMetadata } from './metadata.mjs';
-import { assertInside, assertPhysicalInside, detectTarget, resolveSkillsRoot, runtimePath } from './paths.mjs';
+import { readInstallMetadata, readSkillContent, validateInstallMetadata } from './metadata.mjs';
+import { assertInside, assertPhysicalInside, detectTarget, resolveSkillsRoot } from './paths.mjs';
+import { readLedger } from './ledger.mjs';
+import { configRoot } from '../setup/profile.mjs';
 
 export const MAX_DETAIL = 4096;
 const MAX_RUNTIME_BYTES = 64 * 1024 * 1024;
@@ -155,6 +157,14 @@ export async function verifyRuntimeFile({ runtimePath, globalRoot, expectedSha25
   }
 }
 
+// Readiness is authoritative on the config-dir ledger + the runtime's own
+// self-report, never the skills-tree CLI_VERSION (a stale skills copy provably
+// cannot change the outcome). This function verifies the ledger's store binary
+// (existence + integrity); the self-report version diff (state.version ===
+// ledger.target) happens at the smoke in probeStateWithMode, so a hung/failed
+// spawn stays a distinct availability category, not runtime_stale. install.json
+// remains readable for its non-version fields (target, integration/adapter
+// paths) and the T6 migration only. See plans/runtime-channel-ledger.md.
 export async function checkReadiness({
   globalRoot,
   skillsRoot,
@@ -167,104 +177,59 @@ export async function checkReadiness({
 } = {}) {
   const root = resolve(globalRoot);
   const skillRoot = resolve(skillsRoot || resolveSkillsRoot({ home, env }));
-  let requiredVersion;
+  const config = configRoot({ env, home, platform });
   let skillContent;
   let install;
   let actualTarget;
+  let ledger;
   try {
     actualTarget = target || detectTarget({ platform, arch, override: env.LOAM_TARGET });
     install = suppliedInstall ? validateInstallMetadata(root, suppliedInstall) : await readInstallMetadata(root);
-    requiredVersion = await readRequiredVersion({ skillsRoot: skillRoot });
     skillContent = await readSkillContent({ skillsRoot: skillRoot });
+    ledger = await readLedger({ root: config });
   } catch (error) {
     return unavailable('metadata_invalid', safeDetail(error instanceof Error ? error.message : error));
   }
 
-  if (install.runtime_version !== requiredVersion) {
-    return unavailable('runtime_version_mismatch', 'installed runtime does not match CLI_VERSION', {
-      expected: requiredVersion,
-      actual: install.runtime_version,
-      install,
-      skillContent,
-      globalRoot: root,
-      skillsRoot: skillRoot,
-    });
+  const base = { install, skillContent, globalRoot: root, skillsRoot: skillRoot, target: actualTarget };
+
+  if (!ledger) {
+    return unavailable('runtime_missing', 'no runtime ledger found; run install', { ...base, hint: 'install' });
   }
   if (install.target !== actualTarget) {
     return unavailable('runtime_target_mismatch', 'installed runtime target does not match this host', {
       expected: actualTarget,
       actual: install.target,
-      install,
-      skillContent,
-      globalRoot: root,
-      skillsRoot: skillRoot,
+      ...base,
+      ledger,
     });
   }
 
-  const expectedRuntime = runtimePath(root, requiredVersion, actualTarget, { platform });
-  try {
-    assertInside(root, expectedRuntime, 'runtime path');
-    if (resolve(install.runtime_path) !== resolve(expectedRuntime)) {
-      return unavailable('runtime_path_mismatch', 'install metadata points to an unexpected runtime path', {
-        expected: expectedRuntime,
-        actual: install.runtime_path,
-        install,
-        skillContent,
-        globalRoot: root,
-        skillsRoot: skillRoot,
-      });
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return unavailable('runtime_missing', safeDetail(message), {
-      install,
-      skillContent,
-      globalRoot: root,
-      skillsRoot: skillRoot,
-      requiredVersion,
-      target: actualTarget,
-    });
-  }
   const integrity = await verifyRuntimeFile({
-    runtimePath: install.runtime_path,
-    globalRoot: root,
-    expectedSha256: install.runtime_sha256,
+    runtimePath: ledger.store_path,
+    globalRoot: config || root,
+    expectedSha256: ledger.sha256,
   });
   if (!integrity.ready) {
-    return unavailable(integrity.category, integrity.message, {
-      install,
-      skillContent,
-      globalRoot: root,
-      skillsRoot: skillRoot,
-      requiredVersion,
-      target: actualTarget,
-    });
+    // Missing store binary → install. A byte/sha mismatch (integrity carries
+    // expected/actual) means the store binary is not the ledger's target →
+    // stale, converge with update. Other integrity failures (symlink, size,
+    // physical escape) stay untrusted — a distinct security signal.
+    const category = integrity.category === 'runtime_missing'
+      ? 'runtime_missing'
+      : (integrity.expected || integrity.actual) ? 'runtime_stale' : integrity.category;
+    const hint = category === 'runtime_missing' ? 'install' : category === 'runtime_stale' ? 'update' : undefined;
+    return unavailable(category, integrity.message, { ...base, ledger, ...(hint ? { hint } : {}) });
   }
   try {
     await stat(install.integration_path);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return unavailable('integration_missing', safeDetail(message), {
-      install,
-      skillContent,
-      globalRoot: root,
-      skillsRoot: skillRoot,
-      requiredVersion,
-      target: actualTarget,
-    });
+    return unavailable('integration_missing', safeDetail(error instanceof Error ? error.message : error), { ...base, ledger });
   }
   try {
     if (!(await stat(install.adapter_root)).isDirectory()) throw new Error('adapter root is not a directory');
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return unavailable('adapter_missing', safeDetail(message), {
-      install,
-      skillContent,
-      globalRoot: root,
-      skillsRoot: skillRoot,
-      requiredVersion,
-      target: actualTarget,
-    });
+    return unavailable('adapter_missing', safeDetail(error instanceof Error ? error.message : error), { ...base, ledger });
   }
 
   return {
@@ -272,9 +237,10 @@ export async function checkReadiness({
     globalRoot: root,
     skillsRoot: skillRoot,
     install,
-    requiredVersion,
+    ledger,
+    expectedVersion: ledger.target,
     target: actualTarget,
-    runtimePath: install.runtime_path,
+    runtimePath: ledger.store_path,
     integrationPath: install.integration_path,
     skillContent,
   };
@@ -310,10 +276,10 @@ async function probeStateWithMode({
     };
   }
 
+  let parsed;
   try {
-    const parsed = JSON.parse(result.stdout);
+    parsed = JSON.parse(result.stdout);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('state output must be a JSON object');
-    return { ...status, state: parsed };
   } catch (error) {
     return {
       ...status,
@@ -322,6 +288,25 @@ async function probeStateWithMode({
       detail: safeDetail(error instanceof Error ? `invalid JSON: ${error.message}` : error),
     };
   }
+  // The self-report diff: the runtime's own compiled version must string-equal
+  // the ledger target. A missing/non-string version counts as a mismatch and is
+  // never thrown. String equality only — inert across the 1.0.0 rollover.
+  if (status.expectedVersion !== undefined) {
+    const reported = parsed.version;
+    if (typeof reported !== 'string' || reported !== status.expectedVersion) {
+      return {
+        ...status,
+        ready: false,
+        category: 'runtime_stale',
+        hint: 'update',
+        expected: status.expectedVersion,
+        actual: typeof reported === 'string' ? reported : null,
+        detail: `runtime self-reports ${typeof reported === 'string' ? reported : '(none)'}, ledger target is ${status.expectedVersion}`,
+        state: parsed,
+      };
+    }
+  }
+  return { ...status, state: parsed };
 }
 
 export async function probeState(options = {}) {

@@ -1,14 +1,16 @@
-import { mkdir, open, readdir, readFile, rename, rm, unlink } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, open, readdir, readFile, rename, rm, rmdir, unlink, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { cleanupStaging, createStagingDirectory, writeAtomicFile, publishJson } from './atomic.mjs';
+import { resolveRuntimeTarget } from './constants.mjs';
 import { confirmSetup, finish, harnessLabel, renderDiscovery, selectHarnesses, stepDetail, stepDone, stepSkip, stepStart, summaryNote } from './wizard.mjs';
 import { ensureGlobalSkills, verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
 import { installRuntime } from './runtime.mjs';
+import { ledgerPath, readLedger } from '../integration/ledger.mjs';
 import { detectHarnesses, installHarnesses } from './harnesses.mjs';
 import { installMarketplacePlugins } from './marketplace.mjs';
-import { migrateLegacyProject } from './migration.mjs';
+import { migrateLegacyProject, migrateRuntimeLedger } from './migration.mjs';
 import { removeHarnesses } from './uninstall.mjs';
 import { verifyInstallation } from './verify.mjs';
 import { stageFederationService, federationDefinitionExists } from './federation.mjs';
@@ -22,7 +24,11 @@ function verifyFailureDetail(result, discovery) {
     failed.push(`plugin version (${result?.install?.plugin_version ?? 'none'} != ${discovery.packageVersion})`);
   }
   if (result?.skills && !result.skills.ready) failed.push(`skills (${result.skills.category || result.skills.detail || 'not ready'})`);
-  if (result?.runtime && !result.runtime.ready) failed.push(`runtime (${result.runtime.category || 'not ready'})`);
+  if (result?.runtime && !result.runtime.ready) {
+    // The runtime check now fails on the config-dir ledger/store: name the
+    // category and, when present, the verb that converges it (install/update).
+    failed.push(`runtime (${result.runtime.category || 'not ready'}${result.runtime.hint ? `, run ${result.runtime.hint}` : ''})`);
+  }
   for (const [id, harness] of Object.entries(result?.harnesses || {})) {
     if (!harness.ready) failed.push(`harness ${id} (${harness.category || 'not ready'})`);
   }
@@ -148,6 +154,20 @@ export async function executeSetup(parsed, discovery, options = {}) {
     }
     const migratedLegacy = { ...migration, ready: true };
 
+    // One-time runtime-ledger migration: a legacy machine (install.json or a
+    // binary under bin/) with no config-dir ledger yet is seeded here, up front,
+    // inside setup.lock — never from readiness/hook paths. Copy-not-move,
+    // idempotent, so a fresh or already-migrated machine is a no-op. This makes
+    // the update-refusal check below see a legacy machine as upgradable, not
+    // fresh.
+    await migrateRuntimeLedger({
+      globalRoot: discovery.globalRoot,
+      home: discovery.home,
+      platform: discovery.platform,
+      arch: discovery.arch,
+      target: discovery.target,
+    });
+
     const alreadyReady = await verifyInstallation({
       discovery: requestedDiscovery,
       packageRoot: discovery.packageRoot,
@@ -168,6 +188,9 @@ export async function executeSetup(parsed, discovery, options = {}) {
     let federationRollback;
     let activated = false;
     let skillCount;
+    let runtime;
+    let priorLedger = null;
+    let ledgerStaged = false;
     try {
       stepStart(output, 'Installing global skills via the Skills CLI');
       const skills = await ensureGlobalSkills({
@@ -183,20 +206,40 @@ export async function executeSetup(parsed, discovery, options = {}) {
         return 1;
       }
       skillCount = skills.inventory?.skills?.length;
-      stepDone(output, `Skills ${skills.changed ? 'installed' : 'already current'}${skillCount ? ` — ${skillCount} skills` : ''} · runtime v${skills.requiredVersion}  →  ${tilde(discovery.skillsRoot)}`);
+      stepDone(output, `Skills ${skills.changed ? 'installed' : 'already current'}${skillCount ? ` — ${skillCount} skills` : ''}  →  ${tilde(discovery.skillsRoot)}`);
 
-      stepStart(output, `Preparing native runtime v${skills.requiredVersion} (${discovery.target})`);
-      const runtime = await installRuntime({
-        globalRoot: discovery.globalRoot,
-        version: skills.requiredVersion,
+      // The runtime version is resolved from the package constant / env pin —
+      // never the skills tree. A `channel: pinned` ledger keeps its target on a
+      // plain update without LOAM_RUNTIME_VERSION (locked-ref semantics), noted
+      // volta-style; the env var moves the pin.
+      priorLedger = await readLedger({ home: discovery.home, platform: discovery.platform });
+      let resolved = resolveRuntimeTarget({ env: process.env });
+      if (priorLedger?.channel === 'pinned' && !process.env.LOAM_RUNTIME_VERSION) {
+        resolved = { target: priorLedger.target, channel: 'pinned' };
+        stepDetail(output, `runtime pinned at ${resolved.target}; set LOAM_RUNTIME_VERSION to move or release the pin`);
+      }
+      stepStart(output, `Preparing native runtime v${resolved.target} (${discovery.target})`);
+      runtime = await installRuntime({
+        home: discovery.home,
+        version: resolved.target,
         target: discovery.target,
         platform: discovery.platform,
         arch: discovery.arch,
+        channel: resolved.channel,
         releaseBaseUrl: options.releaseBaseUrl,
         workspace: discovery.workspace,
         smokeRunner: options.smokeRunner,
-        expectedSha256: alreadyReady.install?.runtime_sha256,
+        expectedSha256: priorLedger?.sha256,
       });
+      if (runtime.pending) {
+        // Relocated 78/75 wait-retry: the target is not published yet. Never a
+        // wipe or downgrade — nothing was staged, so this run made no changes.
+        errorOutput.write(`Runtime ${resolved.target} is not published yet; waiting to retry (no changes made).\n`);
+        return 75;
+      }
+      // A new store/ledger was staged only when the target differs from the prior
+      // ledger's store; a same-version reuse restages nothing to roll back.
+      ledgerStaged = !priorLedger || priorLedger.store_path !== runtime.storePath;
       const shortSha = typeof runtime.sha256 === 'string' ? runtime.sha256.slice(0, 12) : '';
       if (runtime.reused) {
         stepDetail(output, `reused verified binary${shortSha ? ` (sha256 ${shortSha}…)` : ''}`);
@@ -304,13 +347,14 @@ export async function executeSetup(parsed, discovery, options = {}) {
         return 1;
       }
 
+      // Schema 2: the runtime_* fields are gone — the config-dir ledger is the
+      // runtime authority. install.json carries only the plugin/adapter/skills
+      // facts. The ledger write (inside installRuntime) already landed as the
+      // first commit; this install.json write is the second.
       const install = {
-        schema_version: 1,
+        schema_version: 2,
         plugin_version: discovery.packageVersion,
-        runtime_version: skills.requiredVersion,
         target: discovery.target,
-        runtime_path: runtime.path,
-        runtime_sha256: runtime.sha256,
         adapter_root: harnesses.versionRoot,
         integration_path: integrationPath,
         skills_scope: 'global',
@@ -375,10 +419,19 @@ export async function executeSetup(parsed, discovery, options = {}) {
       await publishJson({ filePath: metadataPath, value: install });
       activated = true;
 
+      // Old-store removal — the LAST commit, best-effort and non-fatal. Both
+      // commits (ledger, install.json) are in; now retire only a PRIOR store
+      // entry at a different version. A delete that fails (e.g. Windows EBUSY on
+      // a running connector binary) leaves a named orphan, never a failed
+      // update; the config dir and the current store are never touched.
+      if (priorLedger?.store_path && runtime?.storePath && priorLedger.store_path !== runtime.storePath) {
+        await rm(dirname(dirname(priorLedger.store_path)), { recursive: true, force: true }).catch(() => {});
+      }
+
       const configuredLabels = install.configured_harnesses.map((id) => harnessLabel(id));
       summaryNote(output, 'Installed', [
         `Plugin     v${discovery.packageVersion}`,
-        `Runtime    v${skills.requiredVersion}  (${discovery.target})`,
+        `Runtime    v${resolved.target}  (${discovery.target})`,
         `Skills     ${skillCount ?? '?'} · ${tilde(discovery.skillsRoot)}`,
         `Harnesses  ${configuredLabels.length ? configuredLabels.join(', ') : 'none'}`,
         '',
@@ -388,6 +441,30 @@ export async function executeSetup(parsed, discovery, options = {}) {
       return marketplaceFailed ? 1 : 0;
     } finally {
       if (!activated) {
+        // #97 — the rollback restores ONLY what this run staged, never a prior
+        // ledger or store. A hard crash (finally never runs) instead leaves the
+        // ledger ahead of install.json, which readiness reports as runtime_stale
+        // and a re-run converges — loud, never silent skew.
+        // ponytail: if installRuntime throws AFTER moving the binary but BEFORE
+        // returning (e.g. commitLedger fails), `runtime` is undefined and this
+        // block skips store cleanup, orphaning the new <version> dir. The ledger
+        // is unchanged (publishJson is atomic), so state stays safe/convergent —
+        // a harmless disk leak, not skew. Reclaim it here only if it ever matters.
+        if (ledgerStaged) {
+          const file = ledgerPath({ home: discovery.home, platform: discovery.platform });
+          try {
+            if (priorLedger) await writeFile(file, `${JSON.stringify(priorLedger, null, 2)}\n`, { mode: 0o600 });
+            else if (file) await rm(file, { force: true });
+          } catch {}
+          if (runtime?.storePath && (!priorLedger || priorLedger.store_path !== runtime.storePath)) {
+            // Remove ONLY this run's <version>/<target> dir. Then drop the
+            // <version> parent only when it is now empty — a sibling <target>
+            // staged by a prior same-machine LOAM_TARGET run is not ours to
+            // delete (rmdir throws ENOTEMPTY, which we swallow).
+            await rm(dirname(runtime.storePath), { recursive: true, force: true }).catch(() => {});
+            await rmdir(dirname(dirname(runtime.storePath))).catch(() => {});
+          }
+        }
         try {
           await federationRollback?.();
         } finally {

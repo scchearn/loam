@@ -29,9 +29,11 @@ make_fixture() {
   rm -rf "$fixture"
   mkdir -p "$fixture/bin" "$fixture/.claude-plugin" \
     "$fixture/plugins/loam-adapter/.codex-plugin" \
-    "$fixture/.cursor-plugin" "$fixture/cli" "$fixture/skills/loam-using/scripts"
+    "$fixture/.cursor-plugin" "$fixture/cli" "$fixture/setup"
   cp "$BUMP" "$fixture/bin/bump-release.sh"
   chmod +x "$fixture/bin/bump-release.sh"
+  cp "$SCRIPT_DIR/check-release-resolution.sh" "$fixture/bin/check-release-resolution.sh"
+  chmod +x "$fixture/bin/check-release-resolution.sh"
 
   printf '{\n  "name": "@scchearn/loam",\n  "version": "%s",\n  "type": "module"\n}\n' "$PLUGIN_VERSION" \
     > "$fixture/package.json"
@@ -47,7 +49,7 @@ make_fixture() {
     "$RUNTIME_VERSION" > "$fixture/cli/Cargo.toml"
   printf 'version = 4\n\n[[package]]\nname = "chrono"\nversion = "0.4.0"\n\n[[package]]\nname = "loam"\nversion = "%s"\n' \
     "$RUNTIME_VERSION" > "$fixture/Cargo.lock"
-  printf '%s\n' "$RUNTIME_VERSION" > "$fixture/skills/loam-using/scripts/CLI_VERSION"
+  printf "export const RUNTIME_VERSION = '%s';\n" "$RUNTIME_VERSION" > "$fixture/setup/constants.mjs"
 
   git -C "$fixture" init -q
   git -C "$fixture" config user.email "contract@example.invalid"
@@ -84,8 +86,7 @@ count_in "$fixture/.cursor-plugin/plugin.json"      '"version": "0.9.1"' 1 "curs
 # The runtime lane must be untouched — this is the whole point of the split.
 count_in "$fixture/cli/Cargo.toml" "version = \"$RUNTIME_VERSION\"" 1 "cargo version untouched by plugin bump"
 count_in "$fixture/Cargo.lock" "version = \"$RUNTIME_VERSION\"" 1 "cargo lock untouched by plugin bump"
-[[ "$(tr -d ' \t\r\n' < "$fixture/skills/loam-using/scripts/CLI_VERSION")" == "$RUNTIME_VERSION" ]] \
-  || fail "plugin bump changed CLI_VERSION"
+count_in "$fixture/setup/constants.mjs" "RUNTIME_VERSION = '$RUNTIME_VERSION'" 1 "RUNTIME_VERSION untouched by plugin bump"
 
 # --- 2. runtime lane updates exactly the three runtime values ----------------
 fixture="$tmp/runtime"
@@ -99,10 +100,14 @@ else
 fi
 count_in "$fixture/cli/Cargo.toml" 'version = "1.0.0"' 1 "cargo package version"
 count_in "$fixture/Cargo.lock" 'version = "1.0.0"' 1 "cargo lock package version"
-[[ "$(tr -d ' \t\r\n' < "$fixture/skills/loam-using/scripts/CLI_VERSION")" == "1.0.0" ]] \
-  || fail "CLI_VERSION was not updated"
+count_in "$fixture/setup/constants.mjs" "RUNTIME_VERSION = '1.0.0'" 1 "RUNTIME_VERSION stamped by runtime bump"
 grep -Fq 'chrono = { version = "0.4", default-features = false }' "$fixture/cli/Cargo.toml" \
   || fail "runtime bump rewrote a dependency version"
+# Resolution reads the package constant, not CLI_VERSION: --versions-only passes
+# agreement and extracts RUNTIME_VERSION without erroring.
+if ! LOAM_NATIVE_BIN="$LOAM" "$fixture/bin/check-release-resolution.sh" --versions-only > /dev/null 2>&1; then
+  fail "check-release-resolution.sh --versions-only failed to read the stamped RUNTIME_VERSION"
+fi
 # The plugin lane must be untouched.
 count_in "$fixture/package.json" "\"version\": \"$PLUGIN_VERSION\"" 1 "package.json untouched by runtime bump"
 count_in "$fixture/package-lock.json" "\"version\": \"$PLUGIN_VERSION\"" 2 "package-lock untouched by runtime bump"
@@ -158,8 +163,7 @@ fixture="$tmp/pre-runtime"
 make_fixture "$fixture"
 run_bump "$fixture" --runtime 0.9.1-next.0 > /dev/null
 count_in "$fixture/cli/Cargo.toml" 'version = "0.9.1-next.0"' 1 "cargo package prerelease"
-[[ "$(tr -d ' \t\r\n' < "$fixture/skills/loam-using/scripts/CLI_VERSION")" == "0.9.1-next.0" ]] \
-  || fail "CLI_VERSION was not set to the prerelease"
+count_in "$fixture/setup/constants.mjs" "RUNTIME_VERSION = '0.9.1-next.0'" 1 "RUNTIME_VERSION prerelease stamped"
 
 # --- 5. the same version is refused, per lane --------------------------------
 fixture="$tmp/same-plugin"

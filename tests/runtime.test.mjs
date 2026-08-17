@@ -8,10 +8,82 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
-import { detectTarget, runtimePath } from '../setup/target.mjs';
+import { detectTarget } from '../setup/target.mjs';
 import { installRuntime } from '../setup/runtime.mjs';
+import { RUNTIME_VERSION, resolveRuntimeTarget } from '../setup/constants.mjs';
+import { ledgerPath, readLedger, runtimeStorePath, writeLedger } from '../integration/ledger.mjs';
 
 const target = detectTarget();
+
+async function configFixture() {
+  const dir = await mkdtemp(join(tmpdir(), 'loam-config-'));
+  return { env: { LOAM_CONFIG_DIR: dir }, dir };
+}
+
+test('runtime ledger round-trips a write through read', async () => {
+  const { env, dir } = await configFixture();
+  const store_path = join(dir, 'runtime', '0.11.0-next.15', target, 'loam');
+  const written = await writeLedger(
+    { channel: 'next', target: '0.11.0-next.15', sha256: 'a'.repeat(64), store_path },
+    { env },
+  );
+  assert.equal(written.path, ledgerPath({ env }));
+  const read = await readLedger({ env });
+  assert.deepEqual(read, {
+    schema_version: 1,
+    channel: 'next',
+    target: '0.11.0-next.15',
+    sha256: 'a'.repeat(64),
+    store_path,
+  });
+});
+
+test('readLedger returns null when no ledger exists', async () => {
+  const { env } = await configFixture();
+  assert.equal(await readLedger({ env }), null);
+});
+
+test('runtime ledger rejects every malformed field', async () => {
+  const { env, dir } = await configFixture();
+  const good = { channel: 'next', target: '0.11.0-next.15', sha256: 'b'.repeat(64), store_path: join(dir, 'runtime', 'x', 'loam') };
+  await assert.rejects(() => writeLedger({ ...good, channel: 'stable' }, { env }), /channel is invalid/);
+  await assert.rejects(() => writeLedger({ ...good, target: '0.11' }, { env }), /target is not semver/);
+  await assert.rejects(() => writeLedger({ ...good, target: '0.11.0+build' }, { env }), /target is not semver/);
+  await assert.rejects(() => writeLedger({ ...good, sha256: 'xyz' }, { env }), /sha256 is invalid/);
+  await assert.rejects(() => writeLedger({ ...good, store_path: 'relative/loam' }, { env }), /absolute path/);
+  await assert.rejects(() => writeLedger({ ...good, store_path: '/etc/loam' }, { env }), /outside the config dir/);
+});
+
+test('resolveRuntimeTarget derives the target and channel from the package constant', () => {
+  const { target: resolved, channel } = resolveRuntimeTarget({ env: {} });
+  assert.equal(resolved, RUNTIME_VERSION);
+  // Provenance channel matches plugin-release.yml dist-tag routing.
+  assert.equal(channel, RUNTIME_VERSION.includes('-') ? 'next' : 'latest');
+  // Explicit both-branch coverage of the suffix rule via the resolver output.
+  assert.equal(resolveRuntimeTarget({ env: {} }).channel, 'next'); // constant is 0.11.0-next.x
+});
+
+test('LOAM_RUNTIME_VERSION pins the target and marks the channel pinned', () => {
+  assert.deepEqual(
+    resolveRuntimeTarget({ env: { LOAM_RUNTIME_VERSION: '1.2.3' } }),
+    { target: '1.2.3', channel: 'pinned' },
+  );
+  // A prerelease pin is still `pinned` provenance, never `next`.
+  assert.deepEqual(
+    resolveRuntimeTarget({ env: { LOAM_RUNTIME_VERSION: '0.9.1-rc.1' } }),
+    { target: '0.9.1-rc.1', channel: 'pinned' },
+  );
+});
+
+test('resolveRuntimeTarget rejects a malformed target', () => {
+  for (const bad of ['0.9.1+build', '0.9.1-next.0+build', '0.9.1-', 'not-a-version', '0.9.1-next.01']) {
+    assert.throws(
+      () => resolveRuntimeTarget({ env: { LOAM_RUNTIME_VERSION: bad } }),
+      /invalid runtime target/,
+      `pin ${bad} should be rejected`,
+    );
+  }
+});
 
 async function releaseFixture({ version = '0.9.1', targetName = target, bytes = 'verified runtime' } = {}) {
   const release = await mkdtemp(join(tmpdir(), 'loam-release-'));
@@ -25,9 +97,10 @@ async function releaseFixture({ version = '0.9.1', targetName = target, bytes = 
   return { release, file, bytes, url: pathToFileURL(release).href };
 }
 
+// The runtime store lives under the config dir now; the fixture is the config
+// root and installRuntime places the store at <root>/runtime/<version>/<target>.
 async function rootFixture() {
-  const home = await mkdtemp(join(tmpdir(), 'loam-runtime-'));
-  return join(home, '.agents', 'loam');
+  return mkdtemp(join(tmpdir(), 'loam-config-'));
 }
 
 test('runtime installation verifies, smoke-tests, and atomically publishes staged bytes', async () => {
@@ -35,7 +108,7 @@ test('runtime installation verifies, smoke-tests, and atomically publishes stage
   const globalRoot = await rootFixture();
   const smokeCalls = [];
   const result = await installRuntime({
-    globalRoot,
+    configDir: globalRoot,
     version: '0.9.1',
     target,
     releaseBaseUrl: release.url,
@@ -46,7 +119,7 @@ test('runtime installation verifies, smoke-tests, and atomically publishes stage
     },
   });
 
-  const destination = runtimePath(globalRoot, '0.9.1', target);
+  const destination = runtimeStorePath({ version: '0.9.1', target, root: globalRoot });
   assert.equal(result.published, true);
   assert.equal(result.path, destination);
   assert.equal(await readFile(destination, 'utf8'), release.bytes);
@@ -81,7 +154,7 @@ test('runtime downloads follow bounded HTTP redirects', async () => {
 
   try {
     const result = await installRuntime({
-      globalRoot,
+      configDir: globalRoot,
       version: '0.9.1',
       target,
       releaseBaseUrl: `http://127.0.0.1:${address.port}`,
@@ -100,7 +173,7 @@ test('HTTPS release downloads reject downgrade redirects', async () => {
   try {
     await assert.rejects(
       () => installRuntime({
-        globalRoot,
+        configDir: globalRoot,
         version: '0.9.1',
         target,
         releaseBaseUrl: 'https://github.com/scchearn/loam/releases/download/cli-v0.9.1',
@@ -120,7 +193,7 @@ test('release downloads reject redirects to an untrusted host', async () => {
   try {
     await assert.rejects(
       () => installRuntime({
-        globalRoot,
+        configDir: globalRoot,
         version: '0.9.1',
         target,
         releaseBaseUrl: 'http://127.0.0.1:9/releases/cli-v0.9.1',
@@ -138,14 +211,14 @@ test('ready runtime is reused only after digest verification and a smoke test', 
   const globalRoot = await rootFixture();
   let smokeCalls = 0;
   const first = await installRuntime({
-    globalRoot,
+    configDir: globalRoot,
     version: '0.9.1',
     target,
     releaseBaseUrl: release.url,
     smokeRunner: async () => ({ code: 0, stdout: '{}', stderr: '' }),
   });
   const result = await installRuntime({
-    globalRoot,
+    configDir: globalRoot,
     version: '0.9.1',
     target,
     releaseBaseUrl: pathToFileURL(join(tmpdir(), 'missing-release')).href,
@@ -164,14 +237,14 @@ test('replacement keeps a same-filesystem backup of the verified active runtime'
   const secondRelease = await releaseFixture({ bytes: 'second runtime' });
   const globalRoot = await rootFixture();
   await installRuntime({
-    globalRoot,
+    configDir: globalRoot,
     version: '0.9.1',
     target,
     releaseBaseUrl: firstRelease.url,
     smokeRunner: async () => ({ code: 0, stdout: '{}', stderr: '' }),
   });
   const result = await installRuntime({
-    globalRoot,
+    configDir: globalRoot,
     version: '0.9.1',
     target,
     releaseBaseUrl: secondRelease.url,
@@ -187,13 +260,13 @@ test('replacement keeps a same-filesystem backup of the verified active runtime'
 test('invalid manifest, target, checksum, truncation, and smoke preserve the active runtime', async () => {
   const release = await releaseFixture({ bytes: 'new runtime' });
   const globalRoot = await rootFixture();
-  const destination = runtimePath(globalRoot, '0.9.1', target);
-  await mkdir(join(globalRoot, 'bin', '0.9.1', target), { recursive: true });
+  const destination = runtimeStorePath({ version: '0.9.1', target, root: globalRoot });
+  await mkdir(join(globalRoot, 'runtime', '0.9.1', target), { recursive: true });
   await writeFile(destination, 'known good runtime');
 
   await assert.rejects(
     () => installRuntime({
-      globalRoot,
+      configDir: globalRoot,
       version: '0.9.1',
       target,
       releaseBaseUrl: release.url,
@@ -211,7 +284,7 @@ test('invalid manifest, target, checksum, truncation, and smoke preserve the act
   await writeFile(join(badRelease.release, 'loam-runtime-manifest.json'), JSON.stringify(badManifest));
   await assert.rejects(
     () => installRuntime({
-      globalRoot,
+      configDir: globalRoot,
       version: '0.9.1',
       target,
       releaseBaseUrl: badRelease.url,
@@ -224,7 +297,7 @@ test('invalid manifest, target, checksum, truncation, and smoke preserve the act
 
   await assert.rejects(
     () => installRuntime({
-      globalRoot,
+      configDir: globalRoot,
       version: '0.9.1',
       target,
       releaseBaseUrl: release.url,
@@ -242,7 +315,7 @@ test('malformed and target-incomplete manifests fail closed', async () => {
   const invalidRoot = await rootFixture();
   await assert.rejects(
     () => installRuntime({
-      globalRoot: invalidRoot,
+      configDir: invalidRoot,
       version: '0.9.1',
       target,
       releaseBaseUrl: pathToFileURL(release).href,
@@ -255,7 +328,7 @@ test('malformed and target-incomplete manifests fail closed', async () => {
   const missingTargetRoot = await rootFixture();
   await assert.rejects(
     () => installRuntime({
-      globalRoot: missingTargetRoot,
+      configDir: missingTargetRoot,
       version: '0.9.1',
       target: 'aarch64-unknown-linux-musl',
       releaseBaseUrl: missingTarget.url,
@@ -269,14 +342,14 @@ test('prerelease runtime versions install through the cli-v tag URL', async () =
   const release = await releaseFixture({ version: '0.9.1-next.0' });
   const globalRoot = await rootFixture();
   const result = await installRuntime({
-    globalRoot,
+    configDir: globalRoot,
     version: '0.9.1-next.0',
     target,
     releaseBaseUrl: release.url,
     smokeRunner: async () => ({ code: 0, stdout: '{}', stderr: '' }),
   });
   assert.equal(result.published, true);
-  assert.equal(result.path, runtimePath(globalRoot, '0.9.1-next.0', target));
+  assert.equal(result.path, runtimeStorePath({ version: '0.9.1-next.0', target, root: globalRoot }));
   assert.equal(await readFile(result.path, 'utf8'), release.bytes);
 });
 
@@ -285,7 +358,7 @@ test('runtime version validation accepts prerelease and rejects build metadata',
   for (const version of ['0.9.1-next.0', '0.9.1-next.1', '0.9.1-rc.1']) {
     const release = await releaseFixture({ version });
     const result = await installRuntime({
-      globalRoot,
+      configDir: globalRoot,
       version,
       target,
       releaseBaseUrl: release.url,
@@ -297,7 +370,7 @@ test('runtime version validation accepts prerelease and rejects build metadata',
   for (const version of ['0.9.1+build', '0.9.1-next.0+build', '0.9.1-', 'not-a-version', '0.9.1-next.01']) {
     await assert.rejects(
       () => installRuntime({
-        globalRoot,
+        configDir: globalRoot,
         version,
         target,
         releaseBaseUrl: release.url,
@@ -307,4 +380,63 @@ test('runtime version validation accepts prerelease and rejects build metadata',
       `version ${version} should be rejected`,
     );
   }
+});
+
+test('install publishes into the config-dir store and writes the ledger', async () => {
+  const release = await releaseFixture();
+  const globalRoot = await rootFixture();
+  const result = await installRuntime({
+    configDir: globalRoot,
+    version: '0.9.1',
+    target,
+    channel: 'latest',
+    releaseBaseUrl: release.url,
+    smokeRunner: async () => ({ code: 0, stdout: JSON.stringify({ version: '0.9.1' }), stderr: '' }),
+  });
+  const store = runtimeStorePath({ version: '0.9.1', target, root: globalRoot });
+  assert.equal(result.published, true);
+  assert.equal(result.path, store);
+  // Store is under <config>/runtime/..., not <config>/bin/...
+  assert.ok(store.startsWith(join(globalRoot, 'runtime') + '/') || store.includes(`${join(globalRoot, 'runtime')}\\`));
+  const ledger = await readLedger({ root: globalRoot });
+  assert.deepEqual(ledger, {
+    schema_version: 1,
+    channel: 'latest',
+    target: '0.9.1',
+    sha256: createHash('sha256').update(release.bytes).digest('hex'),
+    store_path: store,
+  });
+});
+
+test('an unpublished target yields a wait/retry signal, never a wipe', async () => {
+  const globalRoot = await rootFixture();
+  const result = await installRuntime({
+    configDir: globalRoot,
+    version: '0.9.1',
+    target,
+    channel: 'latest',
+    releaseBaseUrl: pathToFileURL(join(tmpdir(), 'loam-not-published-yet')).href,
+    smokeRunner: async () => ({ code: 0, stdout: '{}', stderr: '' }),
+  });
+  assert.equal(result.pending, true);
+  assert.equal(result.published, false);
+  // No ledger and no binary were written.
+  assert.equal(await readLedger({ root: globalRoot }), null);
+});
+
+test('a binary whose self-reported version differs from the target fails at smoke', async () => {
+  const release = await releaseFixture({ version: '0.9.1' });
+  const globalRoot = await rootFixture();
+  await assert.rejects(
+    () => installRuntime({
+      configDir: globalRoot,
+      version: '0.9.1',
+      target,
+      channel: 'latest',
+      releaseBaseUrl: release.url,
+      smokeRunner: async () => ({ code: 0, stdout: JSON.stringify({ version: '0.8.0' }), stderr: '' }),
+    }),
+    /binary reports version 0\.8\.0, expected 0\.9\.1/,
+  );
+  assert.equal(await readLedger({ root: globalRoot }), null);
 });

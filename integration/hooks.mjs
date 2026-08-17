@@ -1,6 +1,7 @@
 import { isAbsolute, resolve } from 'node:path';
 
 import { readInstallMetadata } from './metadata.mjs';
+import { resolveRuntimePath } from './ledger.mjs';
 import { invokeRuntime } from './runtime.mjs';
 
 const IDENTIFIER = /^[a-z][a-z0-9_-]{0,31}$/;
@@ -52,9 +53,9 @@ async function preparedRun(run) {
     workspace: resolve(run.workspace),
   };
   if (!isAbsolute(prepared.runtimePath || '')) {
-    prepared.runtimePath = (await readInstallMetadata(prepared.globalRoot)).runtime_path;
+    prepared.runtimePath = await resolveRuntimePath({ globalRoot: prepared.globalRoot });
   }
-  return isAbsolute(prepared.runtimePath) ? prepared : null;
+  return isAbsolute(prepared.runtimePath || '') ? prepared : null;
 }
 
 export async function beginHookRun({
@@ -72,6 +73,8 @@ export async function beginHookRun({
     const root = resolve(globalRoot);
     const cwd = resolve(workspace);
     const install = await readInstallMetadata(root);
+    const runtimePath = await resolveRuntimePath({ globalRoot: root });
+    if (!isAbsolute(runtimePath || '')) return null;
     const args = [
       'hooks', 'begin', root,
       '--harness', harness,
@@ -81,7 +84,7 @@ export async function beginHookRun({
     ];
     if (sessionId !== undefined) args.push('--session-id', sessionId);
     const result = await invokeRuntime({
-      runtimePath: install.runtime_path,
+      runtimePath,
       args,
       cwd,
       timeoutMs,
@@ -93,7 +96,7 @@ export async function beginHookRun({
     return {
       id,
       globalRoot: root,
-      runtimePath: install.runtime_path,
+      runtimePath,
       workspace: cwd,
     };
   } catch {
