@@ -311,6 +311,9 @@ test('hook-run logging invokes the installed private runtime with fixed validate
     workspace: fixtureData.home,
     sessionId: 'session-42',
     runner,
+    // Isolate config-dir resolution to the fixture ledger; without this the hook
+    // resolver reads the host's real ~/.config/loam and the test is non-hermetic.
+    env: fixtureData.env,
   });
   const finished = await finishHookRun({
     run,
@@ -324,12 +327,14 @@ test('hook-run logging invokes the installed private runtime with fixed validate
   assert.deepEqual(run, {
     id: 42,
     globalRoot: fixtureData.globalRoot,
-    runtimePath: fixtureData.runtimePath,
+    // The hook resolver returns the config-dir ledger's store binary (T11), not
+    // the legacy install.json bin path.
+    runtimePath: fixtureData.storePath,
     workspace: fixtureData.home,
   });
   assert.equal(finished, true);
   assert.equal(calls.length, 2);
-  assert.equal(calls[0].runtimePath, fixtureData.runtimePath);
+  assert.equal(calls[0].runtimePath, fixtureData.storePath);
   assert.deepEqual(calls[0].args, [
     'hooks', 'begin', fixtureData.globalRoot,
     '--harness', 'codex',
