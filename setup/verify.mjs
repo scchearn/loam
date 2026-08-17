@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { readInstallMetadata, readRequiredVersion, readSkillContent } from '../integration/metadata.mjs';
 import { resolveExclusions } from '../integration/ingest.mjs';
 import { checkReadiness, probeState } from '../integration/runtime.mjs';
+import { resolveRuntimePath } from '../integration/ledger.mjs';
 import { verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
 import { isOwnedCommand, renderOpenCodePlugin } from './harnesses.mjs';
 import { verifyFederationService } from './federation.mjs';
@@ -113,7 +114,10 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
     if (harness.state === 'skipped') return { ...harness, ready: true, owner: 'setup' };
   } else if (harness.state === 'skipped') return { ...harness, ready: true };
   if (!install) return { ...harness, ready: false, category: 'install_metadata_missing' };
-  const runtimePath = install.runtime_path;
+  // The injected hook command runs the config-dir store binary; compare against
+  // the ledger's store_path (schema-1 install.json runtime_path as migration
+  // fallback), never a dropped schema-2 field.
+  const runtimePath = (await resolveRuntimePath({ globalRoot })) ?? install.runtime_path;
   try {
     if (id === 'claude' || id === 'codex') {
       if (!harness.marketplaceReady || !harness.marketplaceRoot) return { ...harness, ready: false, category: 'plugin_incomplete' };

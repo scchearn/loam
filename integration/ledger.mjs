@@ -75,6 +75,24 @@ export function validateLedger(value, options = {}) {
   return { schema_version, channel, target, sha256: sha256.toLowerCase(), store_path };
 }
 
+// The absolute runtime binary path for injected hooks and internal resolvers:
+// the ledger's store_path (config-dir authority), falling back to a schema-1
+// install.json runtime_path while a machine is pending migration (T6). `null`
+// when neither resolves. Node and Rust resolve the same config-dir store.
+export async function resolveRuntimePath({ globalRoot, ...options } = {}) {
+  const ledger = await readLedger(options);
+  if (ledger?.store_path) return ledger.store_path;
+  if (globalRoot) {
+    try {
+      const raw = JSON.parse(await readFile(join(resolve(globalRoot), 'install.json'), 'utf8'));
+      if (typeof raw.runtime_path === 'string' && raw.runtime_path) return raw.runtime_path;
+    } catch {
+      // No readable install.json — nothing to fall back to.
+    }
+  }
+  return null;
+}
+
 // Read + validate the ledger; `null` when it does not exist (or no config dir).
 export async function readLedger(options = {}) {
   const path = ledgerPath(options);

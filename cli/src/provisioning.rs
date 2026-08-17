@@ -866,6 +866,53 @@ pub fn configured_config_root() -> Option<std::path::PathBuf> {
     )
 }
 
+/// The config-dir runtime store root (`<config>/loam/runtime`), the durable
+/// versioned store the channel ledger records. Mirrors the Node resolver
+/// (`integration/ledger.mjs` `runtimeStoreRoot`) so the runtime and connector
+/// resolve the same path byte-for-byte. The store is new and never lived under
+/// the legacy install root, so its ladder is `LOAM_CONFIG_DIR` → platform config
+/// dir ONLY — no legacy `LOAM_HOME`/`~/.agents` rungs. `None` when nothing
+/// resolves; callers must never write to a null path.
+pub fn runtime_store_root(
+    config_dir: Option<&str>,
+    xdg_config_home: Option<&str>,
+    appdata: Option<&str>,
+    home: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    config_root(config_dir, xdg_config_home, appdata, home).map(|config| config.join("runtime"))
+}
+
+/// The runtime store binary path
+/// `<config>/loam/runtime/<version>/<target>/loam[.exe]`.
+pub fn runtime_store_path(
+    config_dir: Option<&str>,
+    xdg_config_home: Option<&str>,
+    appdata: Option<&str>,
+    home: Option<&str>,
+    version: &str,
+    target: &str,
+) -> Option<std::path::PathBuf> {
+    let executable = if cfg!(target_os = "windows") { "loam.exe" } else { "loam" };
+    runtime_store_root(config_dir, xdg_config_home, appdata, home)
+        .map(|root| root.join(version).join(target).join(executable))
+}
+
+/// The runtime ledger path `<config>/loam/runtime/ledger.json`.
+pub fn runtime_ledger_path(
+    config_dir: Option<&str>,
+    xdg_config_home: Option<&str>,
+    appdata: Option<&str>,
+    home: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    runtime_store_root(config_dir, xdg_config_home, appdata, home)
+        .map(|root| root.join("ledger.json"))
+}
+
+/// The runtime store root this process should use, when one resolves.
+pub fn configured_runtime_store_root() -> Option<std::path::PathBuf> {
+    configured_config_root().map(|config| config.join("runtime"))
+}
+
 /// Where per-project rosters live: `<profile>/rosters`. The explicit
 /// per-resource override (`LOAM_FEDERATION_ROSTER_DIR`) names the directory
 /// directly and wins.
@@ -2193,6 +2240,29 @@ mod tests {
             roster_root(None, None, None, None, None, None),
             Err(reason::PROFILE_ABSENT)
         );
+    }
+
+    #[test]
+    fn the_runtime_store_resolves_under_the_config_dir_only() {
+        let executable = if cfg!(target_os = "windows") { "loam.exe" } else { "loam" };
+        // LOAM_CONFIG_DIR names the config root; the store is <config>/runtime.
+        assert_eq!(
+            runtime_store_path(Some("/cfg"), None, None, None, "0.11.0-next.15", "x86_64-unknown-linux-musl").unwrap(),
+            std::path::Path::new("/cfg")
+                .join("runtime")
+                .join("0.11.0-next.15")
+                .join("x86_64-unknown-linux-musl")
+                .join(executable),
+        );
+        assert_eq!(
+            runtime_ledger_path(Some("/cfg"), None, None, None).unwrap(),
+            std::path::Path::new("/cfg").join("runtime").join("ledger.json"),
+        );
+        // The store never falls back to a legacy install root: with no config
+        // basis at all it resolves to nothing (unlike the federation profile,
+        // whose ladder keeps the legacy rungs). This is the byte-identical
+        // config-dir-only ladder the Node resolver uses.
+        assert!(runtime_store_root(None, None, None, None).is_none());
     }
 
     #[test]

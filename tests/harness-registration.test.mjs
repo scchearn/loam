@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 import { detectHarnesses, installHarnesses } from '../setup/harnesses.mjs';
+import { runtimeStorePath } from '../integration/ledger.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 
@@ -84,7 +85,9 @@ async function missing(path) {
 async function harnessFixture(prefix, { pluginVersion = '0.9.10' } = {}) {
   const home = await mkdtemp(join(tmpdir(), prefix));
   const globalRoot = join(home, '.agents', 'loam');
-  const runtimePath = join(globalRoot, 'bin', '0.9.10', 'x86_64-unknown-linux-gnu', 'loam');
+  // The injected native path is the config-dir store binary, not <globalRoot>/bin.
+  const configDir = join(home, 'config');
+  const runtimePath = runtimeStorePath({ version: '0.9.10', target: 'x86_64-unknown-linux-gnu', root: configDir });
   await mkdir(join(home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(home, '.cursor'), { recursive: true });
   await mkdir(join(home, '.claude'), { recursive: true });
@@ -106,7 +109,7 @@ async function harnessFixture(prefix, { pluginVersion = '0.9.10' } = {}) {
 
   const detected = await detectHarnesses({ home, pluginVersion });
   const result = await installHarnesses({ home, globalRoot, pluginVersion, runtimePath, detected });
-  return { home, globalRoot, runtimePath, claudeCache, codexCache, result };
+  return { home, globalRoot, configDir, runtimePath, claudeCache, codexCache, result };
 }
 
 function sessionEntries(hooksConfig, key) {
@@ -115,7 +118,13 @@ function sessionEntries(hooksConfig, key) {
 }
 
 test('every harness registration invokes the absolute native runtime, not a Node shim', async () => {
-  const { home, runtimePath, claudeCache, codexCache, result } = await harnessFixture('loam-native-registration-');
+  const { home, configDir, runtimePath, claudeCache, codexCache, result } = await harnessFixture('loam-native-registration-');
+
+  // The injected path points into the config-dir runtime store.
+  assert.ok(
+    runtimePath.startsWith(join(configDir, 'runtime') + '/') || runtimePath.startsWith(join(configDir, 'runtime') + '\\'),
+    'injected runtime path is inside the config-dir store',
+  );
 
   const cursor = JSON.parse(await readFile(join(home, '.cursor', 'hooks.json'), 'utf8'));
   const cursorOwned = sessionEntries(cursor, 'sessionStart').filter((entry) => entry.command === runtimePath);
