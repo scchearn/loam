@@ -4265,7 +4265,7 @@ mod service_tests {
 
     #[test]
     fn a_channel_is_dropped_on_session_end() {
-        let mut state = ConnectorState::new();
+        let state = ConnectorState::new();
         state.channels.register(InjectChannel {
             session_id: "sess-2".into(),
             project_id: "loam".into(),
@@ -4776,7 +4776,7 @@ mod service_tests {
 
     #[test]
     fn session_without_wake_ref_produces_no_wake() {
-        let mut channels = ChannelRegistry::new();
+        let channels = ChannelRegistry::new();
         let (listener, address) = wake_listener();
         // Register without a wake_ref; a plain channel is the mailbox-only case.
         channels.register(InjectChannel {
@@ -4811,7 +4811,7 @@ mod service_tests {
 
     #[test]
     fn wake_to_a_dead_port_never_blocks_or_fails_the_push() {
-        let mut channels = ChannelRegistry::new();
+        let channels = ChannelRegistry::new();
         // An address nothing listens on: connect must fail fast, and the error
         // must be swallowed — the pump loop keeps going either way.
         channels.register(InjectChannel {
@@ -4833,7 +4833,7 @@ mod service_tests {
 
     #[test]
     fn two_sessions_with_wake_refs_both_get_woken() {
-        let mut channels = ChannelRegistry::new();
+        let channels = ChannelRegistry::new();
         let (listener_a, address_a) = wake_listener();
         let (listener_b, address_b) = wake_listener();
         channels.register(InjectChannel {
@@ -4864,7 +4864,7 @@ mod service_tests {
 
     #[test]
     fn an_unknown_wake_scheme_is_ignored_silently() {
-        let mut channels = ChannelRegistry::new();
+        let channels = ChannelRegistry::new();
         // A wake_ref the connector does not understand: skipped silently, and
         // the mailbox still holds the item for the next poll.
         channels.register(InjectChannel {
