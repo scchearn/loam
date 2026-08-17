@@ -1723,6 +1723,7 @@ mod emit_tests {
 
     /// Drive the inject CLI against a real spawned connector: register with a
     /// wake_ref, then drop, then prove the session is gone (a poll is refused).
+    #[cfg(unix)]
     #[test]
     fn inject_register_and_drop_round_trip_against_a_real_connector() {
         let (root, workspace, _instance_id) = enrolled_root("inject-roundtrip");

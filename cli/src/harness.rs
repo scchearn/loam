@@ -1812,6 +1812,7 @@ mod tests {
         assert!(!unenrolled.contains("## Collaboration"), "{unenrolled}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn session_start_registers_and_marks_current_through_the_connector() {
         // T5: on SessionStart with a session_id, the hook registers the session

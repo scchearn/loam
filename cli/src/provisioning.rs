@@ -830,7 +830,7 @@ fn config_root(
         }
         let _ = xdg_config_home;
         let _ = home;
-        return None;
+        None
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
