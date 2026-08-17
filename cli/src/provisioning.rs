@@ -2189,9 +2189,14 @@ mod tests {
         // Supply both a HOME and an APPDATA so the platform config rung resolves
         // on every OS: Linux/macOS read HOME, Windows reads APPDATA, and
         // config_root ignores whichever input its platform does not use.
-        config_root(None, None, Some("C:/Users/op/AppData/Roaming"), Some("/home/op"))
-            .map(|config| config.join("federation").join("rosters"))
-            .expect("the default config root resolves")
+        config_root(
+            None,
+            None,
+            Some("C:/Users/op/AppData/Roaming"),
+            Some("/home/op"),
+        )
+        .map(|config| config.join("federation").join("rosters"))
+        .expect("the default config root resolves")
     }
 
     #[test]
@@ -2270,8 +2275,15 @@ mod tests {
                 Some(""),
                 Some(""),
                 Some("/home/op"),
-            ),
-            Err(reason::PROFILE_ABSENT)
+            )
+            .unwrap(),
+            // Windows has no APPDATA here, so the platform config rung is skipped
+            // and the ladder falls to the legacy HOME default (~/.agents/loam).
+            std::path::PathBuf::from("/home/op")
+                .join(".agents")
+                .join("loam")
+                .join("federation")
+                .join("rosters")
         );
         // Nothing at all is an absent profile, not a path built from nothing.
         assert_eq!(
