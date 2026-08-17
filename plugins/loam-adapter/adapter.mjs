@@ -308,21 +308,35 @@ const STOP_WAKE_BUDGET_MS = 4 * 60 * 60 * 1000;
 // replaced on the next cycle (connector-self-healing seam 4's designed behavior).
 const STOP_WAKE_RENEW_MS = 4 * 60 * 1000;
 
+// Load the integration's ledger module from the install-time integration root,
+// the same dynamic-import way defaultHookModules loads hooks.mjs — never a static
+// import, because at runtime integration/ lives under <globalRoot> resolved from
+// install.json, not beside the plugin.
+async function defaultLedgerModule({ integrationPath } = {}) {
+  integrationPath ||= await defaultIntegrationPath();
+  const root = new URL('./', pathToFileURL(integrationPath));
+  return import(new URL('ledger.mjs', root).href);
+}
+
 /**
- * Resolve the private runtime binary and global root the same way stop.mjs
- * resolves the integration (install.json is the single ladder root; LOAM_HOME
- * overrides it). Returns null when nothing is installed — the caller degrades
- * softly. This is deliberately NOT a second resolution ladder: it reads the same
- * install.json the ingestion lane already reads, taking `runtime_path` from it.
+ * Resolve the private runtime binary and global root the same way the ingestion
+ * lane does. Returns null when nothing is installed — the caller degrades softly.
+ * Deliberately NOT a second resolution ladder: the runtime path comes from the
+ * integration's own resolveRuntimePath (config-dir ledger store_path, with the
+ * schema-1 install.json runtime_path fallback during the migration window) —
+ * schema-2 install.json no longer carries runtime_path. The global root (the
+ * federation --global-root, the install root, distinct from the durable config
+ * dir) still resolves from LOAM_HOME || ~/.agents/loam, exactly as the ingest
+ * lane's resolveGlobalRoot does.
  */
-async function resolveRuntimePaths(env = process.env) {
+export async function resolveRuntimePaths(env = process.env, { loadLedger = defaultLedgerModule } = {}) {
   try {
     const globalRoot = env.LOAM_HOME && isAbsolute(env.LOAM_HOME)
       ? resolve(env.LOAM_HOME)
       : join(homedir(), '.agents', 'loam');
-    const install = JSON.parse(await readFile(join(globalRoot, 'install.json'), 'utf8'));
-    const runtimePath = typeof install.runtime_path === 'string' ? install.runtime_path : null;
-    return runtimePath ? { runtimePath, globalRoot } : null;
+    const { resolveRuntimePath } = await loadLedger();
+    const runtimePath = await resolveRuntimePath({ globalRoot });
+    return (typeof runtimePath === 'string' && runtimePath) ? { runtimePath, globalRoot } : null;
   } catch {
     return null;
   }

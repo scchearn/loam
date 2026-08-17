@@ -12,6 +12,7 @@ import {
   startWakeListener,
   buildRenderArgs,
   buildInjectArgs,
+  resolveRuntimePaths,
 } from '../plugins/loam-adapter/adapter.mjs';
 
 const fixtures = fileURLToPath(new URL('./fixtures/codex/', import.meta.url));
@@ -23,6 +24,29 @@ const WAKE_BODY = '<io.loam.work.state key="task-c" state="blocked" trust="claim
   + '[Carol <carol@example.com>] Task C is blocked on the API key.\n'
   + '</io.loam.work.state>\n\n'
   + '[tip] federation: status from a teammate\'s machine — informational, no reply or action expected.';
+
+// --- runtime path resolution: config-dir ledger, not schema-2 install.json ---
+
+test('resolveRuntimePaths takes the runtime path from the integration ledger resolver', async () => {
+  // schema-2 install.json no longer carries runtime_path; the path comes from
+  // the integration's own resolveRuntimePath (ledger store_path). The adapter
+  // must delegate to that shared resolver, not read install.json itself.
+  let sawGlobalRoot = null;
+  const loadLedger = async () => ({
+    resolveRuntimePath: async ({ globalRoot }) => { sawGlobalRoot = globalRoot; return '/store/0.13.0/loam'; },
+  });
+  const paths = await resolveRuntimePaths({ LOAM_HOME: '/g' }, { loadLedger });
+  assert.deepEqual(paths, { runtimePath: '/store/0.13.0/loam', globalRoot: '/g' });
+  assert.equal(sawGlobalRoot, '/g', 'the install root threads through for the schema-1 fallback');
+});
+
+test('resolveRuntimePaths degrades to null when the ledger resolves no runtime', async () => {
+  const loadLedger = async () => ({ resolveRuntimePath: async () => null });
+  assert.equal(await resolveRuntimePaths({ LOAM_HOME: '/g' }, { loadLedger }), null);
+  // A throwing resolver (no config dir, unreadable ledger) is also a soft null.
+  const boom = async () => ({ resolveRuntimePath: async () => { throw new Error('no config dir'); } });
+  assert.equal(await resolveRuntimePaths({ LOAM_HOME: '/g' }, { loadLedger: boom }), null);
+});
 
 // --- SessionStart / UserPromptSubmit render (seam A) -------------------------
 
