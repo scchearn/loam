@@ -892,7 +892,11 @@ pub fn runtime_store_path(
     version: &str,
     target: &str,
 ) -> Option<std::path::PathBuf> {
-    let executable = if cfg!(target_os = "windows") { "loam.exe" } else { "loam" };
+    let executable = if cfg!(target_os = "windows") {
+        "loam.exe"
+    } else {
+        "loam"
+    };
     runtime_store_root(config_dir, xdg_config_home, appdata, home)
         .map(|root| root.join(version).join(target).join(executable))
 }
@@ -2244,10 +2248,22 @@ mod tests {
 
     #[test]
     fn the_runtime_store_resolves_under_the_config_dir_only() {
-        let executable = if cfg!(target_os = "windows") { "loam.exe" } else { "loam" };
+        let executable = if cfg!(target_os = "windows") {
+            "loam.exe"
+        } else {
+            "loam"
+        };
         // LOAM_CONFIG_DIR names the config root; the store is <config>/runtime.
         assert_eq!(
-            runtime_store_path(Some("/cfg"), None, None, None, "0.11.0-next.15", "x86_64-unknown-linux-musl").unwrap(),
+            runtime_store_path(
+                Some("/cfg"),
+                None,
+                None,
+                None,
+                "0.11.0-next.15",
+                "x86_64-unknown-linux-musl"
+            )
+            .unwrap(),
             std::path::Path::new("/cfg")
                 .join("runtime")
                 .join("0.11.0-next.15")
@@ -2256,7 +2272,9 @@ mod tests {
         );
         assert_eq!(
             runtime_ledger_path(Some("/cfg"), None, None, None).unwrap(),
-            std::path::Path::new("/cfg").join("runtime").join("ledger.json"),
+            std::path::Path::new("/cfg")
+                .join("runtime")
+                .join("ledger.json"),
         );
         // The store never falls back to a legacy install root: with no config
         // basis at all it resolves to nothing (unlike the federation profile,

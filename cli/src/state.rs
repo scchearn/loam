@@ -781,7 +781,9 @@ fn json_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{aggregate, days_since_unix_epoch, epoch_of, lint_age, minimal_state, runtime_version};
+    use super::{
+        aggregate, days_since_unix_epoch, epoch_of, lint_age, minimal_state, runtime_version,
+    };
 
     #[test]
     fn version_is_the_compiled_crate_version() {
