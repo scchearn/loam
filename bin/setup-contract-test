@@ -57,11 +57,23 @@ printf '%s\n' "$SETUP_OUTPUT" | grep -Eiq 'install' || {
 }
 
 # The shared Node session integration is retired: the packed tree must not ship
-# the context renderer or the session hook, and the integration must not serve a
-# `hook` command at any spelling.
-for RETIRED in integration/context.mjs hooks/session-start.mjs hooks/hooks.json plugins/loam-adapter/hooks/session-start.mjs; do
+# the context renderer or the shared session hook, and the integration must not
+# serve a `hook` command at any spelling. The plugin-scoped session hook is NOT
+# retired -- the static plugin carries self-resolving federation shims for the
+# marketplace-only install (harness-native-wake spec); see the positive check below.
+for RETIRED in integration/context.mjs hooks/session-start.mjs hooks/hooks.json; do
   [[ ! -e "$PACKED_ROOT/$RETIRED" ]] || {
     printf 'FAIL: packed tree still ships the retired %s\n' "$RETIRED" >&2
+    exit 1
+  }
+done
+
+# The static plugin ships the federation delivery lane itself so a marketplace-only
+# install (no npx/renderPluginHooks staging) still gets SessionStart restore,
+# per-turn drain, and idle wake. Guard the contract in the new direction.
+for SHIM in session-start.mjs user-prompt-submit.mjs wake.mjs; do
+  [[ -e "$PACKED_ROOT/plugins/loam-adapter/hooks/$SHIM" ]] || {
+    printf 'FAIL: packed plugin is missing the federation shim %s\n' "$SHIM" >&2
     exit 1
   }
 done

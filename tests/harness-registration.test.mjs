@@ -260,9 +260,19 @@ test('the shared Node session integration is gone from the tree', async () => {
     'hooks/hooks-cursor.json',
     'adapters/claude-session-start.mjs',
     'adapters/cursor-session-start.mjs',
-    'plugins/loam-adapter/hooks/session-start.mjs',
   ]) {
     assert.equal(await missing(join(packageRoot, relative)), true, `${relative} must be retired`);
+  }
+
+  // The plugin-scoped session hook is NOT retired: the static plugin carries the
+  // self-resolving federation shims for the marketplace-only install
+  // (harness-native-wake). Guard the contract in the new direction.
+  for (const shim of ['session-start.mjs', 'user-prompt-submit.mjs', 'wake.mjs']) {
+    assert.equal(
+      await missing(join(packageRoot, 'plugins', 'loam-adapter', 'hooks', shim)),
+      false,
+      `plugins/loam-adapter/hooks/${shim} must ship`,
+    );
   }
 
   const { runIntegration } = await import('../integration/loam.mjs');
