@@ -446,6 +446,33 @@ fn federation_section(federation: &Federation, config: &HookConfig) -> String {
                 .get("project_id")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            // "live" is sourced from the connector's own observation, not from the
+            // fact that the snapshot IPC answered. A sustained-dead session
+            // (`degraded`: the supervisor has failed to re-establish for the degrade
+            // budget) reports honestly instead of rendering "live" over stale
+            // items. A missing block means an older connector — default to live so
+            // a version skew never blanks a working session.
+            let observed = result.get("observed_session");
+            let degraded = observed
+                .and_then(|block| block.get("degraded"))
+                .map(|value| matches!(value, Value::Bool(true)))
+                .unwrap_or(false);
+            if degraded {
+                let since = observed
+                    .and_then(|block| block.get("since"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let last_error = observed
+                    .and_then(|block| block.get("last_error"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                lines.push(format!(
+                    "federation: degraded — no broker session since {} ({}); the local context above is complete and current.",
+                    clean_text(since, 64),
+                    clean_text(last_error, 64)
+                ));
+                return lines.join("\n");
+            }
             lines.push(format!(
                 "federation: live · project: {} · items: {}",
                 clean_text(project, 256),
@@ -1888,6 +1915,70 @@ mod tests {
         );
         assert!(clipped.contains("ite…"), "{clipped}");
         assert!(!clipped.contains("item-7"), "{clipped}");
+    }
+
+    #[test]
+    fn a_degraded_observed_session_renders_degraded_not_live() {
+        let config = HookConfig::default();
+        // A snapshot the connector answered while holding no broker session: the
+        // items are the last-known state, but the observation is degraded. The
+        // render must not claim "live" over them.
+        let degraded = Value::Object(vec![
+            ("project_id".into(), Value::String("loam".into())),
+            (
+                "items".into(),
+                Value::Array(vec![crate::json::parse(
+                    r#"{"source":"s","type":"io.loam.message","summary":"stale","from":{"principal_id":"e-1"}}"#,
+                )
+                .unwrap()]),
+            ),
+            (
+                "observed_session".into(),
+                crate::json::parse(
+                    r#"{"supervised":true,"established":false,"degraded":true,"since":"2026-08-17T00:00:00+00:00","consecutive_failures":3,"last_error":"connection-refused"}"#,
+                )
+                .unwrap(),
+            ),
+        ]);
+        let section = federation_section(&Federation::Snapshot(degraded), &config);
+        assert!(
+            section.contains("federation: degraded — no broker session since"),
+            "{section}"
+        );
+        assert!(section.contains("connection-refused"), "{section}");
+        assert!(!section.contains("federation: live"), "{section}");
+
+        // An established observation renders live, with items.
+        let live = Value::Object(vec![
+            ("project_id".into(), Value::String("loam".into())),
+            ("items".into(), Value::Array(vec![])),
+            (
+                "observed_session".into(),
+                crate::json::parse(r#"{"supervised":true,"established":true,"degraded":false}"#)
+                    .unwrap(),
+            ),
+        ]);
+        assert!(
+            federation_section(&Federation::Snapshot(live), &config).contains("federation: live"),
+        );
+
+        // A transient blip (down but under the degrade budget) is not degraded, so
+        // the surface does not flip — scenario 1's "no status change".
+        let transient = Value::Object(vec![
+            ("project_id".into(), Value::String("loam".into())),
+            ("items".into(), Value::Array(vec![])),
+            (
+                "observed_session".into(),
+                crate::json::parse(
+                    r#"{"supervised":true,"established":false,"degraded":false,"consecutive_failures":1}"#,
+                )
+                .unwrap(),
+            ),
+        ]);
+        assert!(
+            federation_section(&Federation::Snapshot(transient), &config)
+                .contains("federation: live"),
+        );
     }
 
     #[cfg(unix)]

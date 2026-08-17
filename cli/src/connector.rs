@@ -918,13 +918,24 @@ pub struct ConnectorState {
 
 impl ConnectorState {
     pub fn new() -> Self {
+        Self::build(ChannelRegistry::new())
+    }
+
+    /// The connector's state with wake-ref persistence bound to the registry at
+    /// `db_path` — the config-dir-resolved path the service already opened for
+    /// enrollment. The reload of persisted wakes is a separate explicit step so a
+    /// caller decides its ordering against `attach_enrolled`.
+    pub fn with_registry_path(db_path: std::path::PathBuf) -> Self {
+        Self::build(ChannelRegistry::persistent(db_path))
+    }
+
+    fn build(channels: ChannelRegistry) -> Self {
         // ONE registry, shared by construction: `channels` is the IPC side
         // (SessionRegisterInject writes here) and the pump side (wake_all and
         // mailbox push read from here) must see the same registrations. A
         // second registry inside `ProjectSessions` was the live-wake defect: IPC
         // registrations landed in one Arc and the pump's `wake_targets`/`push`
         // read the other, so no wake ever fired in production.
-        let channels = ChannelRegistry::new();
         ConnectorState {
             sessions: ProjectSessions::new(SNAPSHOT_CAPACITY, channels.clone()),
             channels,
@@ -953,15 +964,20 @@ pub enum ServiceError {
     Ipc(ipc::IpcError),
 }
 
-/// A volatile, in-memory per-session inject-channel registry (2026-08-08
-/// amendment, T18) and per-session mailbox queue (T2). Held only for the life
-/// of one connector process: a restart drops every channel and every mailbox,
-/// and nothing here is ever written to the SQLite registry. Injection over a
-/// channel is live injection; the connector only admits, holds, hands back,
-/// and drops it.
+/// A per-session inject-channel registry (2026-08-08 amendment, T18) and
+/// per-session mailbox queue (T2). The channels and mailboxes are volatile — a
+/// restart drops them and injection over a channel is live injection — but the
+/// *wake reference* of each registration is persisted to the registry sqlite
+/// (`db`) so a restart reloads it and an idle session (one that takes no turns,
+/// the #112 incident's shape) is still woken. The connector only admits, holds,
+/// hands back, and drops the channel; the wake ref is the one durable part.
 #[derive(Debug, Default, Clone)]
 pub struct ChannelRegistry {
     inner: std::sync::Arc<std::sync::Mutex<MailboxInner>>,
+    /// The registry path wake refs persist to — the *same* config-dir-resolved
+    /// path enrollment uses, never a separate resolution, so there is no
+    /// `--global-root` shadowing. `None` in tests and in a registry-less state.
+    db: Option<std::sync::Arc<std::path::PathBuf>>,
 }
 
 /// The shared mailbox state: the channel registry and the per-session bounded
@@ -992,19 +1008,107 @@ impl ChannelRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, channel: InjectChannel) {
+    /// A registry whose wake refs persist to the sqlite at `db_path`.
+    pub fn persistent(db_path: std::path::PathBuf) -> Self {
+        ChannelRegistry {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(MailboxInner::default())),
+            db: Some(std::sync::Arc::new(db_path)),
+        }
+    }
+
+    /// Register a session's inject channel in memory and, if it carries a wake
+    /// ref, persist that ref so a restart can reload it. Idempotent: a repeated
+    /// registration for the same session id upserts. `&self` throughout — the
+    /// mutation is interior, so the pump side can prune without a `&mut`.
+    pub fn register(&self, channel: InjectChannel) {
+        self.register_in_memory(channel.clone());
+        self.persist_wake(&channel);
+    }
+
+    /// The in-memory half of registration, used both by `register` and by the
+    /// startup reload (which must not re-persist what it just read back).
+    fn register_in_memory(&self, channel: InjectChannel) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.sessions.insert(channel.session_id.clone(), channel);
         }
     }
 
-    pub fn drop_session(&mut self, session_id: &str) -> bool {
-        if let Ok(mut inner) = self.inner.lock() {
+    pub fn drop_session(&self, session_id: &str) -> bool {
+        let removed = if let Ok(mut inner) = self.inner.lock() {
             let removed = inner.sessions.remove(session_id).is_some();
             inner.mailboxes.remove(session_id);
-            return removed;
+            removed
+        } else {
+            false
+        };
+        // Whether or not it was live in memory, clear any persisted wake so a
+        // restart never reloads a dead one.
+        self.persist_delete(session_id);
+        removed
+    }
+
+    /// Persist one registration's wake ref (best-effort; a persistence failure
+    /// never fails the live registration — the plugin re-registers per hook).
+    fn persist_wake(&self, channel: &InjectChannel) {
+        let (Some(db), Some(wake_ref)) = (&self.db, &channel.wake_ref) else {
+            return;
+        };
+        if let Ok(connection) = crate::enrollment::open_writable(db) {
+            let _ = crate::enrollment::upsert_session_wake(
+                &connection,
+                &channel.session_id,
+                &channel.project_id,
+                wake_ref,
+                &Utc::now().to_rfc3339(),
+            );
         }
-        false
+    }
+
+    /// Clear one session's wake ref — in memory and in its persisted row — while
+    /// keeping the session registration and its mailbox. Called when a wake proves
+    /// unreachable, so a restart never reloads a dead wake and the pump stops
+    /// re-dialing it; a live session stays pollable and re-registers per hook.
+    fn prune_wake_ref(&self, session_id: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(channel) = inner.sessions.get_mut(session_id) {
+                channel.wake_ref = None;
+            }
+        }
+        self.persist_delete(session_id);
+    }
+
+    /// Remove one session's persisted wake ref (best-effort).
+    fn persist_delete(&self, session_id: &str) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        if let Ok(connection) = crate::enrollment::open_writable(db) {
+            let _ = crate::enrollment::delete_session_wake(&connection, session_id);
+        }
+    }
+
+    /// Reload persisted wake refs into memory after a restart, so an idle session
+    /// registered before the restart is woken and mailbox-delivered again. Read
+    /// back as wake-only registrations (no live channel ref); the plugin's
+    /// per-hook re-registration re-attaches the channel for active sessions.
+    pub fn reload_persisted(&self) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        let Ok(Some(connection)) = crate::enrollment::open_readonly(db) else {
+            return;
+        };
+        let Ok(wakes) = crate::enrollment::list_session_wakes(&connection) else {
+            return;
+        };
+        for wake in wakes {
+            self.register_in_memory(InjectChannel {
+                session_id: wake.session_id,
+                project_id: wake.project_id,
+                channel_ref: None,
+                wake_ref: Some(wake.wake_ref),
+            });
+        }
     }
 
     pub fn contains(&self, session_id: &str) -> bool {
@@ -1069,10 +1173,11 @@ impl ChannelRegistry {
         )
     }
 
-    /// Collect the wake targets of every registered session for a project,
-    /// without touching the lock: the caller performs the I/O after the lock
-    /// is dropped.
-    fn wake_targets(&self, project_id: &str) -> Vec<String> {
+    /// Collect the (session id, wake target) of every registered session for a
+    /// project, without touching the lock during I/O: the caller performs the
+    /// wake after the lock is dropped, and needs the session id so a wake that
+    /// proves unreachable can prune that session's registration and persisted row.
+    fn wake_targets(&self, project_id: &str) -> Vec<(String, String)> {
         let Ok(inner) = self.inner.lock() else {
             return Vec::new();
         };
@@ -1080,7 +1185,12 @@ impl ChannelRegistry {
             .sessions
             .values()
             .filter(|channel| channel.project_id == project_id)
-            .filter_map(|channel| channel.wake_ref.clone())
+            .filter_map(|channel| {
+                channel
+                    .wake_ref
+                    .clone()
+                    .map(|wake_ref| (channel.session_id.clone(), wake_ref))
+            })
             .collect()
     }
 }
@@ -1117,8 +1227,15 @@ fn wake_all(channels: &ChannelRegistry, project_id: &str, hint: Option<&str>) {
     // blocking connect inside the lock would stall every other pump sharing
     // the mailbox mutex.
     let targets = channels.wake_targets(project_id);
-    for target in targets {
-        let _ = wake_one(&target, project_id, hint);
+    for (session_id, wake_ref) in targets {
+        if wake_one(&wake_ref, project_id, hint).is_err() {
+            // The wake target is unreachable (connection refused) or malformed.
+            // Prune only the wake ref — in memory and in the persisted row — so a
+            // restart never reloads a dead wake and the pump stops re-dialing it.
+            // The session registration and its mailbox stay: a live session is
+            // still pollable, and its per-hook re-registration restores the wake.
+            channels.prune_wake_ref(&session_id);
+        }
     }
 }
 
@@ -1564,6 +1681,73 @@ impl ObservedSession {
 /// observed-degraded.
 const DEGRADE_AFTER: u32 = 3;
 
+/// How long the connector may stay enrolled-and-provisioned but sessionless
+/// before the watchdog hands recovery to the OS supervisor. The incident proved
+/// a fresh process image is the cure a wedge cannot heal in place.
+const SESSIONLESS_EXIT_AFTER: Duration = Duration::from_secs(600);
+
+/// The exit code the watchdog uses so systemd (`Restart=on-failure`) and launchd
+/// (`KeepAlive`/`SuccessfulExit=false`) treat the exit as a temporary failure and
+/// respawn a fresh process. `EX_TEMPFAIL` from sysexits.
+pub const WATCHDOG_EXIT_CODE: i32 = 75;
+
+// Test-tier tuning knobs. The spec thresholds above are the production defaults;
+// these env overrides exist ONLY so the `LOAM_MQTT_TEST` live respawn gate can
+// drive a real watchdog exit in seconds instead of ten minutes. They are additive
+// and never consulted unless set — production behavior is the consts, unchanged.
+const ENV_DIAL_SECS: &str = "LOAM_WATCHDOG_DIAL_SECS";
+const ENV_BACKOFF_CAP_SECS: &str = "LOAM_WATCHDOG_BACKOFF_CAP_SECS";
+const ENV_SESSIONLESS_SECS: &str = "LOAM_WATCHDOG_SESSIONLESS_SECS";
+
+/// Read a whole-seconds duration override from the environment, or the default.
+fn env_secs_or(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
+
+fn configured_dial_deadline() -> Duration {
+    env_secs_or(ENV_DIAL_SECS, DIAL_DEADLINE)
+}
+
+fn configured_backoff_cap() -> Duration {
+    env_secs_or(ENV_BACKOFF_CAP_SECS, BACKOFF_CAP)
+}
+
+fn configured_sessionless_budget() -> Duration {
+    env_secs_or(ENV_SESSIONLESS_SECS, SESSIONLESS_EXIT_AFTER)
+}
+
+/// The watchdog's verdict on a failed establishment cycle: keep retrying in this
+/// process, or exit so the OS supervisor respawns a fresh one. Pure and
+/// clock-injected so the ten-minute budget is unit-testable without a real wait
+/// and without ever calling `std::process::exit` inside a test.
+#[derive(Debug, PartialEq, Eq)]
+enum WatchdogVerdict {
+    Retry,
+    Exit,
+}
+
+/// Whether an enrolled, provisioned-but-sessionless connector has been down long
+/// enough to hand recovery to its OS supervisor. `sessionless_since` is when the
+/// current sessionless stretch began; `now` is the current instant; `budget` is
+/// the sessionless allowance (the const default, or the test-tier override).
+fn watchdog_verdict(sessionless_since: Instant, now: Instant, budget: Duration) -> WatchdogVerdict {
+    if now.saturating_duration_since(sessionless_since) >= budget {
+        WatchdogVerdict::Exit
+    } else {
+        WatchdogVerdict::Retry
+    }
+}
+
+/// The shared authenticated identity of a supervised session: `None` until the
+/// first successful open, then set by the supervisor thread and read by the emit
+/// path. Identity is stable across reconnects (the certificate CN does not
+/// change), so it is set once and never cleared.
+type IdentitySlot = std::sync::Arc<std::sync::Mutex<Option<SessionIdentity>>>;
+
 /// A cloneable handle to one project's `ObservedSession`. Every mutation is a
 /// named state transition so the supervisor cannot record an inconsistent view.
 #[derive(Clone)]
@@ -1578,6 +1762,20 @@ impl LivenessHandle {
             since: now,
             consecutive_failures: 0,
             last_error: None,
+            refusal: None,
+        })))
+    }
+
+    /// A handle for a session whose first establishment cycle failed but is
+    /// retryable (a dial/auth/subscribe failure, not a typed refusal). The
+    /// supervisor keeps trying and the watchdog is already counting: the first
+    /// failure is seeded here so the observation is truthful from attach.
+    fn down(now: DateTime<Utc>, category: String) -> Self {
+        LivenessHandle(std::sync::Arc::new(std::sync::Mutex::new(ObservedSession {
+            established: false,
+            since: now,
+            consecutive_failures: 1,
+            last_error: Some(category),
             refusal: None,
         })))
     }
@@ -1638,10 +1836,10 @@ impl LivenessHandle {
 /// cap is a true ceiling; it is derived from the system clock's subsecond nanos —
 /// reconnect spacing needs decorrelation, not cryptographic randomness, so no new
 /// dependency is pulled in.
-fn backoff_with_jitter(failures: u32) -> Duration {
+fn backoff_with_jitter(failures: u32, cap: Duration) -> Duration {
     let shift = failures.saturating_sub(1).min(6);
     let base = BACKOFF_BASE.saturating_mul(1u32 << shift);
-    let capped = base.min(BACKOFF_CAP);
+    let capped = base.min(cap);
     let jitter_ceiling = (capped.as_millis() as u64) / 4;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1682,17 +1880,45 @@ fn supervise<A, S>(
     S: FnMut(Duration),
 {
     use std::sync::atomic::Ordering::Relaxed;
+    // Tuning read once per supervisor: the production consts, unless the test tier
+    // overrode them via the environment.
+    let backoff_cap = configured_backoff_cap();
+    let sessionless_budget = configured_sessionless_budget();
+    // When the current sessionless stretch began. `None` while a session is live;
+    // set on the first failed cycle after a drop, cleared when one re-establishes.
+    // The watchdog measures its budget from here.
+    let mut sessionless_since: Option<Instant> = None;
     while !stop.load(Relaxed) {
         match attempt() {
             // A session ran and dropped: the attempt already marked the session
-            // down. Loop straight back into a fresh establishment cycle.
-            EstablishOutcome::Ended => {}
+            // down. A session did exist, so the sessionless clock resets — the
+            // watchdog only fires on a sustained inability to establish one.
+            EstablishOutcome::Ended => {
+                sessionless_since = None;
+            }
             EstablishOutcome::Failed(category) => {
                 let failures = liveness.record_failure(category.clone());
+                // Exactly one breadcrumb when the observation first crosses into
+                // degraded, not one per cycle after it.
+                if failures == DEGRADE_AFTER {
+                    eprintln!(
+                        "loam connector: observed-degraded project={project_id} after {failures} failed cycles (last error {category})"
+                    );
+                }
                 eprintln!(
                     "loam connector: establishment failed project={project_id} error={category} (attempt {failures})"
                 );
-                sleep(backoff_with_jitter(failures));
+                let since = *sessionless_since.get_or_insert_with(Instant::now);
+                if watchdog_verdict(since, Instant::now(), sessionless_budget)
+                    == WatchdogVerdict::Exit
+                {
+                    eprintln!(
+                        "loam connector: watchdog exit project={project_id} — enrolled but sessionless for {}s; exiting {WATCHDOG_EXIT_CODE} for supervisor respawn",
+                        sessionless_budget.as_secs()
+                    );
+                    std::process::exit(WATCHDOG_EXIT_CODE);
+                }
+                sleep(backoff_with_jitter(failures, backoff_cap));
             }
             EstablishOutcome::Refused(reason) => {
                 liveness.mark_refused(reason);
@@ -1719,11 +1945,13 @@ pub struct ProjectSessions {
 struct LiveSession {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// The session's authenticated identity, captured at CONNACK. This — not
-    /// anything a caller supplies — is what binds `data.from` on an outbound
-    /// emit, which is why `federation emit` forwards a derived operation rather
-    /// than a finished envelope.
-    identity: SessionIdentity,
+    /// The session's authenticated identity, captured at CONNACK and shared with
+    /// the supervisor thread that (re)establishes it. `None` until the first
+    /// successful open — a connector that boots while the broker is down keeps
+    /// retrying with no identity yet. This — not anything a caller supplies — is
+    /// what binds `data.from` on an outbound emit, which is why `federation emit`
+    /// forwards a derived operation rather than a finished envelope.
+    identity: IdentitySlot,
     /// Outbound queue drained by the pump thread, which owns the client. The
     /// CLI never opens a broker connection; the connector owns every publish.
     outbound: std::sync::mpsc::Sender<ValidatedEnvelope>,
@@ -1793,16 +2021,41 @@ impl ProjectSessions {
         if self.live.contains_key(&row.project_id) {
             return SessionState::AlreadyLive;
         }
-        let open = match open_transport(row, provisioned, now) {
-            Ok(open) => open,
-            Err(state) => return state,
+        // The first cycle runs synchronously so `project.attach` reports honestly.
+        // A typed refusal is steady state — no supervisor, no watchdog. A live
+        // open primes the supervisor; a retryable failure (Unreachable) still
+        // arms it, because a connector that boots while the broker is down must
+        // keep trying and eventually exit for its supervisor to respawn.
+        let (primed, liveness, identity, state) = match open_transport(row, provisioned, now) {
+            Ok(open) => {
+                eprintln!("loam connector: session up project={}", row.project_id);
+                let identity: IdentitySlot =
+                    std::sync::Arc::new(std::sync::Mutex::new(Some(open.identity.clone())));
+                (
+                    Some(open),
+                    LivenessHandle::established(now),
+                    identity,
+                    SessionState::Live,
+                )
+            }
+            Err(refusal @ (SessionState::CredentialsUnresolved(_) | SessionState::NoPeerRoster(_))) => {
+                return refusal;
+            }
+            Err(SessionState::Unreachable(category)) => (
+                None,
+                LivenessHandle::down(now, category.clone()),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                SessionState::Unreachable(category),
+            ),
+            // AlreadyLive/Live are never returned by open_transport; treat any
+            // other value as a retryable failure rather than dropping the session.
+            Err(other) => (
+                None,
+                LivenessHandle::down(now, other.code().to_owned()),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                other,
+            ),
         };
-        let identity = open.identity.clone();
-        eprintln!("loam connector: session up project={}", row.project_id);
-        // The supervisor starts from an established session, so the observation is
-        // live the instant `attach` returns — never a window where a live session
-        // reads as down.
-        let liveness = LivenessHandle::established(now);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (outbound, inbound) = std::sync::mpsc::channel();
         let thread = std::thread::spawn({
@@ -1810,11 +2063,13 @@ impl ProjectSessions {
             let snapshots = std::sync::Arc::clone(&self.snapshots);
             let channels = self.channels.clone();
             let liveness = liveness.clone();
+            let identity = std::sync::Arc::clone(&identity);
             let row = row.clone();
             move || {
-                // The first cycle runs the session `attach` already opened; every
-                // cycle after it re-provisions and rebuilds from scratch.
-                let mut primed = Some(open);
+                // The first cycle runs the session `attach` already opened (when
+                // primed); every cycle after — and the first, when the first open
+                // failed — re-provisions and rebuilds from scratch.
+                let mut primed = primed;
                 let project_id = row.project_id.clone();
                 supervise(
                     &project_id,
@@ -1823,7 +2078,7 @@ impl ProjectSessions {
                             run_pump_loop(open, &snapshots, &channels, &inbound, &stop, &liveness)
                         }
                         None => establish_and_run(
-                            &row, &snapshots, &channels, &inbound, &stop, &liveness,
+                            &row, &snapshots, &channels, &inbound, &stop, &liveness, &identity,
                         ),
                     },
                     |backoff| interruptible_sleep(backoff, &stop),
@@ -1842,15 +2097,26 @@ impl ProjectSessions {
                 liveness,
             },
         );
-        SessionState::Live
+        state
     }
 
-    /// The authenticated identity of a project's live session, if one is open.
-    /// The emit path needs it to bind `data.from` before validating.
+    /// The authenticated identity of a project's live session, if one has opened.
+    /// The emit path needs it to bind `data.from` before validating. `None` while
+    /// a supervised project has not yet completed a first successful open.
     pub fn identity(&self, project_id: &str) -> Option<SessionIdentity> {
         self.live
             .get(project_id)
-            .map(|session| session.identity.clone())
+            .and_then(|session| session.identity.lock().ok().and_then(|slot| slot.clone()))
+    }
+
+    /// The connector's own observation of a project's broker session, or `None`
+    /// when no session is supervised for it in this process. This is the single
+    /// source for every "live/degraded" status surface — enrollment records and
+    /// IPC reachability can never render "live" again.
+    pub fn observed(&self, project_id: &str) -> Option<ObservedSession> {
+        self.live
+            .get(project_id)
+            .map(|session| session.liveness.observe())
     }
 
     /// Hand one validated envelope to the project's live session for publishing.
@@ -2018,8 +2284,9 @@ fn open_transport(
     let mut transport = MqttTransport::new(session, ValidationConfig::default(), now)
         .map_err(|error| SessionState::Unreachable(error.code().to_owned()))?;
     // The live session dials with the longer deadline; the probe keeps the short
-    // default. A wedged SYN is abandoned after `DIAL_DEADLINE`, not held forever.
-    transport.set_dial_deadline(DIAL_DEADLINE);
+    // default. A wedged SYN is abandoned after the dial deadline, not held
+    // forever. The test tier may shorten it to drive the watchdog quickly.
+    transport.set_dial_deadline(configured_dial_deadline());
     let identity = transport
         .authenticate()
         .map_err(|error| SessionState::Unreachable(error.code().to_owned()))?;
@@ -2075,6 +2342,7 @@ fn establish_and_run(
     outbound: &std::sync::mpsc::Receiver<ValidatedEnvelope>,
     stop: &std::sync::atomic::AtomicBool,
     liveness: &LivenessHandle,
+    identity: &IdentitySlot,
 ) -> EstablishOutcome {
     let now = Utc::now();
     let open = match open_transport(row, provision_session(row), now) {
@@ -2084,9 +2352,28 @@ fn establish_and_run(
         Err(SessionState::Unreachable(category)) => return EstablishOutcome::Failed(category),
         Err(other) => return EstablishOutcome::Failed(other.code().to_owned()),
     };
+    // Publish the authenticated identity for the emit path. Stable across
+    // reconnects, so a set-once is enough; a session that had never opened before
+    // (broker was down at boot) becomes emittable from here.
+    if let Ok(mut slot) = identity.lock() {
+        if slot.is_none() {
+            *slot = Some(open.identity.clone());
+        }
+    }
     liveness.mark_established(now);
     eprintln!("loam connector: session up project={}", row.project_id);
     run_pump_loop(open, snapshots, channels, outbound, stop, liveness)
+}
+
+/// Whether an admitted frame is this machine's own published echo — the #111
+/// self-receive case. Only `Accepted` frames carry an origin; every other outcome
+/// is a dedup/tombstone signal that never injects on its own.
+fn is_self_origin(outcome: &ReceiveOutcome, own_instance_id: &str) -> bool {
+    matches!(
+        outcome,
+        ReceiveOutcome::Accepted(envelope)
+            if envelope.as_envelope().data.from.instance_id == own_instance_id
+    )
 }
 
 /// Pump one open session's received frames into the snapshot store until it drops
@@ -2103,12 +2390,17 @@ fn run_pump_loop(
 ) -> EstablishOutcome {
     let OpenSession {
         mut transport,
-        identity: _,
+        identity,
         mut roster,
         mut oracle,
         org_id,
         project_id,
     } = open;
+    // This machine's own origin. `self_receive` stays enabled (the enrollment
+    // probe proves the session by hearing its own echo), so the live pump does
+    // receive this instance's own published frames back — #111. They must never
+    // be injected into a local session: they would render as if from a teammate.
+    let own_instance_id = identity.instance_id;
     // A malformed retained member card is degrade-not-crash, but silence hid a
     // parser bug that stranded every roster. Surface the first one per session
     // so it is at least visible; one line, no framework.
@@ -2182,6 +2474,16 @@ fn run_pump_loop(
                     }
                     continue;
                 }
+                // #111 self-receive echo: drop this machine's own frames before
+                // they reach the store, so no injection surface — snapshot,
+                // mailbox push, or wake — ever renders this instance's own emit as
+                // a colleague's. Machine-level: filtered for every local session on
+                // this instance. Session-level "do not deliver to the emitting
+                // session" needs a session id the emit path does not carry today
+                // (residual on #111).
+                if is_self_origin(&outcome, &own_instance_id) {
+                    continue;
+                }
                 // Git-first: reconcile *before* the item is readable, so a hook
                 // can never display a provisional claim as current.
                 let publication = stamp_publication(oracle.as_mut(), &outcome);
@@ -2240,8 +2542,11 @@ pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
     }
     let run_dir = global_root.join("run");
     let endpoint = ipc::unix::bind(&run_dir).map_err(ServiceError::Ipc)?;
-    // The channel registry lives only for this process; a restart starts empty.
-    let mut state = ConnectorState::new();
+    // Channels and mailboxes start empty each process, but persisted wake refs
+    // survive a restart: bind persistence to the same registry path, then reload
+    // so an idle session registered before the restart is woken again.
+    let mut state = ConnectorState::with_registry_path(db_path.clone());
+    state.channels.reload_persisted();
     // Bring up a live session for every already-enrolled project before serving,
     // so a hook's first snapshot read does not have to wait for an attach.
     attach_enrolled(&db_path, &mut state);
@@ -2315,7 +2620,8 @@ pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
     // sides can never agree on a name.
     let run_dir = global_root.join("run");
     let endpoint = ipc::windows::bind(&run_dir).map_err(ServiceError::Ipc)?;
-    let mut state = ConnectorState::new();
+    let mut state = ConnectorState::with_registry_path(db_path.clone());
+    state.channels.reload_persisted();
     attach_enrolled(&db_path, &mut state);
     let config = IpcConfig::default();
     // The named-pipe accept is bounded, so the loop wakes regularly instead of
@@ -2388,7 +2694,7 @@ pub(crate) fn dispatch_for_key(
     drop(read);
 
     match request.operation {
-        Operation::StatusGet => Ok(status_json(&row)),
+        Operation::StatusGet => Ok(status_json(&row, state.sessions.observed(&row.project_id))),
         Operation::ProjectAttach => {
             // The enrollment already exists (looked up above). Open the live
             // subscribed broker session in this same process — no second daemon,
@@ -2482,7 +2788,8 @@ pub(crate) fn dispatch_for_key(
             // snapshot is served from memory: nothing is opened for writing,
             // nothing is persisted, and no envelope bytes leave the connector.
             let items = state.sessions.snapshot(&row.project_id, Utc::now());
-            Ok(snapshot_json(&row.project_id, &items))
+            let observed = state.sessions.observed(&row.project_id);
+            Ok(snapshot_json(&row.project_id, &items, observed))
         }
         Operation::SessionPollInject => {
             // Drain the session's mailbox (T2). The session must be registered
@@ -2501,7 +2808,8 @@ pub(crate) fn dispatch_for_key(
                 .channels
                 .poll(session_id)
                 .ok_or(ipc::IpcError::InvalidRequest)?;
-            Ok(snapshot_json(&row.project_id, &items))
+            let observed = state.sessions.observed(&row.project_id);
+            Ok(snapshot_json(&row.project_id, &items, observed))
         }
         Operation::SessionDropInject => {
             // Remove the session from the volatile channel registry (live-push
@@ -2717,7 +3025,11 @@ fn outbound_envelope(
     Some((document.to_json(), topic))
 }
 
-fn snapshot_json(project_id: &str, items: &[SnapshotItem]) -> crate::json::Value {
+fn snapshot_json(
+    project_id: &str,
+    items: &[SnapshotItem],
+    observed: Option<ObservedSession>,
+) -> crate::json::Value {
     use crate::json::Value;
     let rendered = items
         .iter()
@@ -2788,6 +3100,12 @@ fn snapshot_json(project_id: &str, items: &[SnapshotItem]) -> crate::json::Value
         ("schema".into(), Value::Number("1".into())),
         ("project_id".into(), Value::String(project_id.to_owned())),
         ("items".into(), Value::Array(rendered)),
+        // Additive: the same observed-session block the status IPC carries, so the
+        // harness renders "live" only when a session is established right now.
+        (
+            "observed_session".into(),
+            observed_session_json(observed.as_ref()),
+        ),
     ])
 }
 
@@ -3014,7 +3332,10 @@ fn compensate_after_activation<R: service::CommandRunner>(
 /// A precise, aggregate-free status projection: enrollment, historical verified
 /// capabilities, and a broker-session field that is explicitly not-live here (a
 /// real session is the adapter's, T13). No `connected`/`ready` boolean.
-fn status_json(row: &crate::enrollment::EnrolledRow) -> crate::json::Value {
+fn status_json(
+    row: &crate::enrollment::EnrolledRow,
+    observed: Option<ObservedSession>,
+) -> crate::json::Value {
     use crate::json::Value;
     Value::Object(vec![
         ("schema".into(), Value::Number("1".into())),
@@ -3049,12 +3370,48 @@ fn status_json(row: &crate::enrollment::EnrolledRow) -> crate::json::Value {
         ),
         (
             "broker".into(),
+            // Sourced from the connector's own live observation, never the
+            // enrollment row: "established" is true only while a broker session
+            // is held in this process right now.
             Value::Object(vec![(
-                "session_state".into(),
-                Value::String("not-live-in-connector".into()),
+                "observed_session".into(),
+                observed_session_json(observed.as_ref()),
             )]),
         ),
     ])
+}
+
+/// The observed-session projection shared by the status and snapshot IPC
+/// responses. Additive to both — the existing fields and reason strings are
+/// untouched. `None` means no session is supervised for the project in this
+/// process (never attached, or detached), which reads as not-established and
+/// not-degraded rather than a fabricated "live".
+fn observed_session_json(observed: Option<&ObservedSession>) -> crate::json::Value {
+    use crate::json::Value;
+    let Some(observed) = observed else {
+        return Value::Object(vec![
+            ("supervised".into(), Value::Bool(false)),
+            ("established".into(), Value::Bool(false)),
+            ("degraded".into(), Value::Bool(false)),
+        ]);
+    };
+    let mut fields = vec![
+        ("supervised".into(), Value::Bool(true)),
+        ("established".into(), Value::Bool(observed.established)),
+        ("degraded".into(), Value::Bool(observed.degraded())),
+        ("since".into(), Value::String(observed.since.to_rfc3339())),
+        (
+            "consecutive_failures".into(),
+            Value::Number(observed.consecutive_failures.to_string()),
+        ),
+    ];
+    if let Some(error) = &observed.last_error {
+        fields.push(("last_error".into(), Value::String(error.clone())));
+    }
+    if let Some(refusal) = observed.refusal {
+        fields.push(("refusal".into(), Value::String(refusal.to_owned())));
+    }
+    Value::Object(fields)
 }
 
 fn capability_names(record: &crate::enrollment::CapabilityRecord) -> Vec<crate::json::Value> {
@@ -3608,7 +3965,12 @@ mod service_tests {
         let text = result.to_json();
         assert!(text.contains("\"enrollment\""));
         assert!(text.contains("\"capabilities\""));
-        assert!(text.contains("not-live-in-connector"));
+        // The broker block is sourced from the connector's own observation. A
+        // fresh state supervises no session for this project, so the honest report
+        // is not-supervised / not-established — never a fabricated "live".
+        assert!(text.contains("\"observed_session\""));
+        assert!(text.contains("\"supervised\":false"));
+        assert!(text.contains("\"established\":false"));
         assert!(!text.contains("\"connected\"") && !text.contains("\"ready\""));
     }
 
@@ -3903,7 +4265,7 @@ mod service_tests {
 
     #[test]
     fn a_channel_is_dropped_on_session_end() {
-        let mut state = ConnectorState::new();
+        let state = ConnectorState::new();
         state.channels.register(InjectChannel {
             session_id: "sess-2".into(),
             project_id: "loam".into(),
@@ -4109,12 +4471,12 @@ mod service_tests {
     }
 
     #[test]
-    fn a_restart_starts_with_an_empty_registry() {
-        // Register a channel for real, against a real enrolled database, so the
-        // absence below is the *loss* of something that existed rather than a
-        // registry that was never populated.
+    fn a_channel_only_registration_persists_nothing_across_a_restart() {
+        // A registration with a channel ref but no wake ref: the channel and its
+        // mailbox are live-only and must not survive a restart, and — since only
+        // wake refs are durable — nothing is written to SQLite for it.
         let (path, key) = enrolled_db("restart", 8, 80);
-        let mut before = ConnectorState::new();
+        let mut before = ConnectorState::with_registry_path(path.clone());
         dispatch_for_key(
             &register_request("sess-restart", "chan-restart"),
             &key,
@@ -4126,25 +4488,20 @@ mod service_tests {
 
         // The restart: the process-local registry is gone, the database is not.
         drop(before);
-        let after = ConnectorState::new();
+        let after = ConnectorState::with_registry_path(path.clone());
+        after.channels.reload_persisted();
         assert!(
             after.channels.is_empty(),
-            "a restarted connector must recover no channel"
+            "a channel-only registration must not survive a restart"
         );
 
-        // And the database it re-opens still holds no channel state to recover,
-        // so nothing could repopulate the registry behind our back.
+        // The wake-ref table exists but holds no row for a wake-less registration.
         let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
-        let channel_rows: i64 = connection
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type IN ('table','view') AND (name LIKE '%channel%' OR name LIKE '%session%')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            channel_rows, 0,
-            "no channel or session state may survive a restart in SQLite"
+        assert!(
+            crate::enrollment::list_session_wakes(&connection)
+                .unwrap()
+                .is_empty(),
+            "a registration without a wake ref persists nothing"
         );
         assert_eq!(
             crate::enrollment::list_enrollments(&connection)
@@ -4152,6 +4509,106 @@ mod service_tests {
                 .len(),
             1,
             "the enrollment itself must survive the restart"
+        );
+    }
+
+    fn register_wake_request(session_id: &str, wake_ref: &str) -> Request {
+        Request {
+            request_id: "r-1".into(),
+            workspace: "/w/proj".into(),
+            operation: Operation::SessionRegisterInject,
+            payload: crate::json::Value::Object(vec![
+                (
+                    "session_id".into(),
+                    crate::json::Value::String(session_id.into()),
+                ),
+                (
+                    "wake_ref".into(),
+                    crate::json::Value::String(wake_ref.into()),
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn a_persisted_wake_reloads_after_a_restart_and_fires() {
+        // The #112 incident's shape: an idle session (takes no turns, so never
+        // re-registers) must still be woken after the connector restarts.
+        let (path, key) = enrolled_db("reload", 9, 90);
+        let (listener, address) = wake_listener();
+        let mut before = ConnectorState::with_registry_path(path.clone());
+        dispatch_for_key(
+            &register_wake_request("sess-idle", &format!("notify-tcp://{address}")),
+            &key,
+            &path,
+            &mut before,
+        )
+        .expect("register");
+        {
+            let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+            assert_eq!(
+                crate::enrollment::list_session_wakes(&connection).unwrap().len(),
+                1,
+                "a wake-bearing registration persists its wake ref"
+            );
+        }
+
+        // The restart: fresh process-local state, then reload the persisted wakes.
+        drop(before);
+        let after = ConnectorState::with_registry_path(path.clone());
+        after.channels.reload_persisted();
+        assert!(
+            after.channels.contains("sess-idle"),
+            "the persisted wake reloads as a registration"
+        );
+
+        // The next admitted frame both mailbox-pushes and wakes the reloaded target.
+        after
+            .channels
+            .push("loam", &sample_item("inbox:reload:1", "hi"), SNAPSHOT_CAPACITY);
+        wake_all(&after.channels, "loam", Some("hint-reload"));
+        assert!(
+            !accept_wake_frame(&listener).is_empty(),
+            "the reloaded idle session must be woken"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_reloaded_wake_prunes_its_persisted_row() {
+        let (path, key) = enrolled_db("prune", 11, 110);
+        let mut state = ConnectorState::with_registry_path(path.clone());
+        dispatch_for_key(
+            &register_wake_request("sess-dead", "notify-tcp://127.0.0.1:1"),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register");
+        {
+            let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+            assert_eq!(
+                crate::enrollment::list_session_wakes(&connection).unwrap().len(),
+                1
+            );
+        }
+
+        // A changed admit fires the wake; the dead port prunes the persisted row.
+        state
+            .channels
+            .push("loam", &sample_item("inbox:prune:1", "hi"), SNAPSHOT_CAPACITY);
+        wake_all(&state.channels, "loam", Some("hint-prune"));
+
+        let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+        assert!(
+            crate::enrollment::list_session_wakes(&connection).unwrap().is_empty(),
+            "an unreachable wake prunes its persisted row"
+        );
+        // The session and its mailbox survive; only the dead wake ref is gone.
+        assert!(state.channels.contains("sess-dead"));
+        assert_eq!(
+            state.channels.poll("sess-dead").expect("still registered").len(),
+            1,
+            "the mailbox item survives a failed wake"
         );
     }
 
@@ -4319,7 +4776,7 @@ mod service_tests {
 
     #[test]
     fn session_without_wake_ref_produces_no_wake() {
-        let mut channels = ChannelRegistry::new();
+        let channels = ChannelRegistry::new();
         let (listener, address) = wake_listener();
         // Register without a wake_ref; a plain channel is the mailbox-only case.
         channels.register(InjectChannel {
@@ -4354,7 +4811,7 @@ mod service_tests {
 
     #[test]
     fn wake_to_a_dead_port_never_blocks_or_fails_the_push() {
-        let mut channels = ChannelRegistry::new();
+        let channels = ChannelRegistry::new();
         // An address nothing listens on: connect must fail fast, and the error
         // must be swallowed — the pump loop keeps going either way.
         channels.register(InjectChannel {
@@ -4376,7 +4833,7 @@ mod service_tests {
 
     #[test]
     fn two_sessions_with_wake_refs_both_get_woken() {
-        let mut channels = ChannelRegistry::new();
+        let channels = ChannelRegistry::new();
         let (listener_a, address_a) = wake_listener();
         let (listener_b, address_b) = wake_listener();
         channels.register(InjectChannel {
@@ -4407,7 +4864,7 @@ mod service_tests {
 
     #[test]
     fn an_unknown_wake_scheme_is_ignored_silently() {
-        let mut channels = ChannelRegistry::new();
+        let channels = ChannelRegistry::new();
         // A wake_ref the connector does not understand: skipped silently, and
         // the mailbox still holds the item for the next poll.
         channels.register(InjectChannel {
@@ -5531,6 +5988,97 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn a_first_dial_failure_still_arms_the_supervisor_and_watchdog() {
+        // A connector that boots while the broker is down must not give up: the
+        // first dial fails (closed local port, no broker), attach reports the
+        // honest Unreachable, but a supervised session exists and keeps retrying
+        // so the watchdog can eventually hand recovery to the OS supervisor. A
+        // typed refusal, by contrast, arms nothing (covered above).
+        fn to_a_closed_port() -> Result<(MqttSession, PeerRoster), ProvisionFailure> {
+            let config = TransportConfig::new(
+                "127.0.0.1",
+                1, // closed: connection refused is an immediate dial failure
+                "loam-connector-test",
+                8,
+                400_000,
+                ValidationConfig::default(),
+            )
+            .expect("transport config");
+            Ok((
+                MqttSession {
+                    config,
+                    username: None,
+                    password: None,
+                    ca_certificate: rustls::RootCertStore::empty(),
+                    client_authentication: None,
+                    claimed_identity: SessionIdentity {
+                        principal_id: SENDER_PRINCIPAL.into(),
+                        agent_id: "agent-72".into(),
+                        instance_id: RECIPIENT_INSTANCE.into(),
+                        display_name: None,
+                        allowed_claims: Vec::new(),
+                    },
+                },
+                PeerRoster {
+                    principals: vec![SENDER_PRINCIPAL.into()],
+                    origins: vec![RECIPIENT_INSTANCE.into()],
+                },
+            ))
+        }
+
+        let mut sessions = ProjectSessions::new(4, ChannelRegistry::new());
+        let row = sample_row("unix:1:9");
+        let state = sessions.attach(&row, to_a_closed_port(), base_time());
+        assert!(
+            matches!(state, SessionState::Unreachable(_)),
+            "a closed-port first dial reports Unreachable, got {state:?}"
+        );
+        assert!(
+            sessions.is_live(&row.project_id),
+            "an Unreachable first cycle must still arm a supervised session"
+        );
+        // Stop the retry loop so the test leaves no dialing thread behind.
+        assert!(sessions.detach(&row.project_id));
+    }
+
+    #[test]
+    fn status_and_snapshot_report_the_observed_session_truthfully() {
+        let row = sample_row("unix:1:7");
+        // A sustained-dead session: not established, past the degrade budget,
+        // carrying its last dial error. Both IPC surfaces must say so.
+        let degraded = ObservedSession {
+            established: false,
+            since: base_time(),
+            consecutive_failures: DEGRADE_AFTER,
+            last_error: Some("connection-refused".into()),
+            refusal: None,
+        };
+        assert!(degraded.degraded());
+        let status = status_json(&row, Some(degraded.clone())).to_json();
+        assert!(status.contains("\"observed_session\""));
+        assert!(status.contains("\"established\":false"));
+        assert!(status.contains("\"degraded\":true"));
+        assert!(status.contains("connection-refused"));
+        let snapshot = snapshot_json(&row.project_id, &[], Some(degraded)).to_json();
+        assert!(snapshot.contains("\"degraded\":true"));
+        assert!(snapshot.contains("connection-refused"));
+
+        // An established session reads live — but only because it is established,
+        // not because the IPC answered.
+        let live = ObservedSession {
+            established: true,
+            since: base_time(),
+            consecutive_failures: 0,
+            last_error: None,
+            refusal: None,
+        };
+        assert!(!live.degraded());
+        let status = status_json(&row, Some(live)).to_json();
+        assert!(status.contains("\"established\":true"));
+        assert!(status.contains("\"degraded\":false"));
+    }
+
+    #[test]
     fn supervisor_reconnects_after_a_transient_drop_and_clears_the_failure_count() {
         // Scenario: transient drop heals without escalation. Cycle 1 fails to
         // establish; cycle 2 opens, runs, and drops. The supervisor must run the
@@ -5621,12 +6169,32 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn watchdog_holds_until_the_sessionless_budget_then_exits() {
+        // A mock clock: synthetic instants, so the ten-minute budget is proven
+        // without a wait and without ever calling process::exit in a test.
+        let start = std::time::Instant::now();
+        let budget = SESSIONLESS_EXIT_AFTER;
+        assert_eq!(watchdog_verdict(start, start, budget), WatchdogVerdict::Retry);
+        assert_eq!(
+            watchdog_verdict(start, start + budget - Duration::from_secs(1), budget),
+            WatchdogVerdict::Retry,
+            "one second short of the budget keeps retrying"
+        );
+        assert_eq!(
+            watchdog_verdict(start, start + budget, budget),
+            WatchdogVerdict::Exit,
+            "the budget boundary hands recovery to the supervisor"
+        );
+        assert_eq!(WATCHDOG_EXIT_CODE, 75);
+    }
+
+    #[test]
     fn backoff_is_hard_capped_and_grows_with_failures() {
         // Jitter only ever subtracts, so the cap is a true ceiling, and more
         // consecutive failures never produce a shorter nominal backoff.
-        assert!(backoff_with_jitter(1) <= BACKOFF_BASE);
-        assert!(backoff_with_jitter(50) <= BACKOFF_CAP);
-        assert!(backoff_with_jitter(3) > backoff_with_jitter(1));
+        assert!(backoff_with_jitter(1, BACKOFF_CAP) <= BACKOFF_BASE);
+        assert!(backoff_with_jitter(50, BACKOFF_CAP) <= BACKOFF_CAP);
+        assert!(backoff_with_jitter(3, BACKOFF_CAP) > backoff_with_jitter(1, BACKOFF_CAP));
     }
 
     #[test]
@@ -5670,7 +6238,7 @@ mod snapshot_tests {
             expires_at: base_time(),
             publication: Publication::Unverified,
         };
-        let text = snapshot_json("project-7M3", std::slice::from_ref(&item)).to_json();
+        let text = snapshot_json("project-7M3", std::slice::from_ref(&item), None).to_json();
         for field in [
             "source", "type", "summary", "to", "context", "from", "payload",
         ] {
@@ -5801,6 +6369,28 @@ mod outbound_tests {
             crate::envelope::Violation::SourceInstanceMismatch,
             "a divergent session must be refused as a source mismatch, not accepted"
         );
+    }
+
+    #[test]
+    fn a_self_origin_frame_is_filtered_from_the_injection_path() {
+        // #111: this machine hears its own emit echoed back (self_receive stays on
+        // for the enrollment probe). The pump must drop it before the store, so no
+        // local session renders its own frame as a colleague's.
+        let operation = r#"{"type":"work.report","state_key":"task-9","revision":"3","summary":"s","payload":{"state":"ready"}}"#;
+        let envelope =
+            round_trip_with(operation, &identity()).expect("the enrolled instance validates");
+        let own = identity().instance_id;
+        let echo = crate::transport::ReceiveOutcome::Accepted(Box::new(envelope));
+
+        // This machine's own frame is self-origin — filtered.
+        assert!(is_self_origin(&echo, &own));
+        // A colleague on another instance is not.
+        assert!(!is_self_origin(&echo, "instance-a-teammates-machine"));
+        // A non-Accepted outcome carries no origin and is never self-filtered.
+        assert!(!is_self_origin(
+            &crate::transport::ReceiveOutcome::DuplicateEvent,
+            &own
+        ));
     }
 
     #[test]

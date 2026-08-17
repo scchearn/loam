@@ -111,6 +111,41 @@ test('the wake-server open is instrumented: opened(port) on success, failed(err)
   assert.equal(failed.body.level, 'error');
 });
 
+test('per-hook re-registration: every per-turn boundary re-asserts the wake_ref, empty render or not', async () => {
+  // connector-self-healing seam 4: a connector restart drops the live channel;
+  // an active session must re-attach its mailbox at the next hook. The re-register
+  // is idempotent on the connector side and must not be hostage to a contentful
+  // render (getContext returns '' here), exactly like the SessionStart register.
+  const logs = [];
+  const client = { app: { log: async (entry) => { logs.push(entry); } }, session: { promptAsync: async () => ({}) } };
+  const fire = (plugin, sessionID) => plugin['experimental.chat.messages.transform']({}, {
+    messages: [{ info: { role: 'user', sessionID }, parts: [{ type: 'text', text: 'p' }] }],
+  });
+  let reregisters = 0;
+  const plugin = await createOpenCodeAdapter({
+    client,
+    getContext: async () => '',
+    wakeServer: async () => ({
+      wakeRef: 'notify-tcp://127.0.0.1:7777',
+      port: 7777,
+      registered: true,
+      reregister: async () => { reregisters += 1; return { ok: true }; },
+      close: async () => {},
+    }),
+  })({ directory: '/workspace' });
+
+  // SessionStart opens the server (registration happens in the open), not a reregister.
+  await fire(plugin, 's1');
+  await pollLogs(logs, 'wake listener opened');
+  assert.equal(reregisters, 0, 'SessionStart registers via the server open, never reregister');
+
+  // Every subsequent per-turn boundary re-asserts the wake_ref.
+  await fire(plugin, 's1');
+  await fire(plugin, 's1');
+  assert.ok(reregisters >= 2, `each per-turn boundary re-registers (got ${reregisters})`);
+  assert.ok(await pollLogs(logs, 'wake re-register'), 'the re-register is breadcrumbed');
+});
+
 test('startLoamNotifyServer breadcrumbs the wake frame (hint only), register, and drop', async () => {
   const logs = [];
   const log = async (message, extra) => { logs.push({ message, extra }); };

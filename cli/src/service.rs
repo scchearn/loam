@@ -172,8 +172,13 @@ fn run_bounded(
 
 const SERVICE_LABEL: &str = "io.loam.connector";
 
-/// The disabled systemd `--user` unit. `Restart=on-failure`, no lingering, not
-/// `WantedBy` any target so it stays dormant until explicitly enabled.
+/// The disabled systemd `--user` unit. `Restart=on-failure` respawns the
+/// connector when its liveness watchdog exits nonzero (code 75) — an inert
+/// connector exits 0 and is deliberately not respawned. `RestartSec` spaces the
+/// respawns so a fast-exit loop cannot trip systemd's start-limit, and stderr is
+/// routed to the journal so the connection-state breadcrumbs are captured. Not
+/// `WantedBy` any target beyond `[Install]`, so it stays dormant until enabled;
+/// `disable --now` stops it, which wins over `Restart=`.
 pub fn render_systemd_unit(ctx: &ServiceContext) -> Result<String, ServiceError> {
     let runtime = absolute_utf8(&ctx.runtime_path)?;
     Ok(format!(
@@ -183,21 +188,29 @@ pub fn render_systemd_unit(ctx: &ServiceContext) -> Result<String, ServiceError>
          [Service]\n\
          Type=simple\n\
          ExecStart={runtime} federation service run --global-root {root}\n\
-         Restart=on-failure\n\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         StandardError=journal\n\n\
          [Install]\n\
          WantedBy=default.target\n",
         root = absolute_utf8(&ctx.global_root)?,
     ))
 }
 
-/// The disabled macOS LaunchAgent plist. No `RunAtLoad`, no `KeepAlive` until
-/// enabled — install writes it and `launchctl` bootstraps it only after first
-/// enrollment. An `EnvironmentVariables` dict carries the `LOAM_*` overrides
-/// the connector needs (launchd does not expand `$HOME`, so values are absolute
-/// or literal).
+/// The macOS LaunchAgent plist. `RunAtLoad` is `false` so bootstrapping only
+/// *loads* the job — it stays dormant until first enrollment kickstarts it, and
+/// `bootout` (disable) removes it entirely, which wins over `KeepAlive`.
+/// `KeepAlive` is `{SuccessfulExit = false}` so once running, launchd respawns
+/// the connector when its liveness watchdog exits nonzero (code 75) — the
+/// self-heal the incident proved on this platform — while an inert connector that
+/// exits 0 is left down. `StandardErrorPath` captures the connection-state
+/// breadcrumbs. An `EnvironmentVariables` dict carries the `LOAM_*` overrides the
+/// connector needs (launchd does not expand `$HOME`, so values are absolute or
+/// literal).
 pub fn render_launchagent_plist(ctx: &ServiceContext) -> Result<String, ServiceError> {
     let runtime = absolute_utf8(&ctx.runtime_path)?;
     let root = absolute_utf8(&ctx.global_root)?;
+    let stderr_path = launchagent_stderr_path(&ctx.global_root)?;
     let environment = launchagent_environment();
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -210,10 +223,21 @@ pub fn render_launchagent_plist(ctx: &ServiceContext) -> Result<String, ServiceE
          \t\t<string>--global-root</string>\n\t\t<string>{root}</string>\n\
          \t</array>\n\
          \t<key>RunAtLoad</key><false/>\n\
-         \t<key>KeepAlive</key><false/>\n\
+         \t<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key><false/>\n\t</dict>\n\
+         \t<key>StandardErrorPath</key><string>{stderr_path}</string>\n\
          {environment}\
          </dict>\n</plist>\n"
     ))
+}
+
+/// The absolute stderr capture path for the LaunchAgent, under the global root
+/// (which install has already created). launchd creates the file itself, so only
+/// the parent needs to exist.
+fn launchagent_stderr_path(global_root: &Path) -> Result<String, ServiceError> {
+    let path = global_root.join("connector.stderr.log");
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| ServiceError::Io("global root path is not valid UTF-8".into()))
 }
 
 /// The `EnvironmentVariables` plist block: every `LOAM_*` variable set in this
@@ -782,25 +806,39 @@ mod tests {
     }
 
     #[test]
-    fn systemd_unit_is_dormant_and_references_the_absolute_runtime() {
+    fn systemd_unit_is_dormant_and_respawns_the_watchdog_exit() {
         let context = ctx("systemd");
         let runtime = runtime_string(&context);
         let unit = render_systemd_unit(&context).unwrap();
         assert!(unit.contains(&format!(
             "ExecStart={runtime} federation service run --global-root"
         )));
+        // Respawn on the watchdog's nonzero exit; an inert exit(0) is left down.
         assert!(unit.contains("Restart=on-failure"));
+        // Spacing so a fast-exit loop cannot trip the start-limit, and stderr
+        // breadcrumbs are captured in the journal.
+        assert!(unit.contains("RestartSec="));
+        assert!(unit.contains("StandardError=journal"));
         // No socket activation, no auto-start beyond an explicit enable.
         assert!(!unit.contains("RunAtLoad"));
     }
 
     #[test]
-    fn launchagent_plist_is_dormant() {
+    fn launchagent_plist_is_dormant_and_respawns_only_a_nonzero_exit() {
         let context = ctx("launchd");
         let runtime = runtime_string(&context);
         let plist = render_launchagent_plist(&context).unwrap();
+        // Dormant until kickstarted; bootout (disable) removes it entirely.
         assert!(plist.contains("<key>RunAtLoad</key><false/>"));
-        assert!(plist.contains("<key>KeepAlive</key><false/>"));
+        // KeepAlive with SuccessfulExit=false: respawn a nonzero (watchdog) exit,
+        // leave a clean inert exit(0) down. This is the macOS half of the
+        // incident's self-heal, absent before.
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
+        assert!(!plist.contains("<key>KeepAlive</key><false/>"));
+        // stderr breadcrumbs are captured to a file under the global root.
+        assert!(plist.contains("<key>StandardErrorPath</key>"));
+        assert!(plist.contains("connector.stderr.log"));
         assert!(plist.contains(&format!("<string>{runtime}</string>")));
         assert!(plist.contains(SERVICE_LABEL));
     }
