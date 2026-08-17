@@ -105,6 +105,36 @@ export async function migrateRuntimeLedger({
   return { migrated: true, version, target: selectedTarget, sha256, storePath, from: seededFrom };
 }
 
+// One-time copy of the legacy global-root enrollment registry into the durable
+// config-dir registry, so federation enrollment survives a global-root rebuild.
+// Runs up front in the install/update transaction under setup.lock, mirroring
+// migrateRuntimeLedger. Idempotent: once the config-dir registry exists it is
+// the live store and is never overwritten by the stale legacy copy. Copy-not-
+// move so a running connector's open DB handle stays valid until the transaction
+// regenerates it; a plain file copy is sufficient because the registry is
+// quiescent during setup (enrollment is written only at enroll time).
+// Prerelease transition scaffolding — removable with the legacy registry rung
+// (provisioning.rs configured_registry_path) once our machines are migrated.
+export async function migrateEnrollment({
+  globalRoot,
+  env = process.env,
+  home,
+  platform = process.platform,
+} = {}) {
+  const config = configRoot({ env, home, platform });
+  if (!config) return { migrated: false, reason: 'no_config_dir' };
+  const destination = join(config, 'federation', 'loam.sqlite3');
+  if (await fileExists(destination)) return { migrated: false, reason: 'registry_present' };
+  const legacy = join(resolve(globalRoot), 'loam.sqlite3');
+  if (!(await fileExists(legacy))) return { migrated: false, reason: 'no_legacy_registry' };
+  await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+  await copyFile(legacy, destination);
+  await chmod(destination, 0o600).catch((error) => {
+    if (platform !== 'win32') throw error;
+  });
+  return { migrated: true, from: legacy, to: destination };
+}
+
 // True when this machine has a runtime `update` can bump: a config-dir ledger,
 // or migratable legacy state (install.json, or a binary under bin/). The
 // verb-dispatch refusal uses this so a legacy machine is upgraded (its ledger
@@ -162,6 +192,11 @@ export async function isOwnedLegacyMarker(path, relativePath) {
 function inside(root, candidate) {
   const relativePath = relative(resolve(root), resolve(candidate));
   return !relativePath.startsWith('..') && !isAbsolute(relativePath);
+}
+
+// Two paths overlap when either contains (or equals) the other.
+function overlaps(a, b) {
+  return inside(a, b) || inside(b, a);
 }
 
 async function safePath(workspace, candidate, kind, report) {
