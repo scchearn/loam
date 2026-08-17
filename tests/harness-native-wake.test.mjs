@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 
 import {
@@ -35,9 +35,12 @@ test('resolveRuntimePaths takes the runtime path from the integration ledger res
   const loadLedger = async () => ({
     resolveRuntimePath: async ({ globalRoot }) => { sawGlobalRoot = globalRoot; return '/store/0.13.0/loam'; },
   });
+  // LOAM_HOME is resolve()'d, so on win32 a leading-slash path gains a drive
+  // letter -- assert against what the product produces, not a POSIX literal.
+  const globalRoot = resolve('/g');
   const paths = await resolveRuntimePaths({ LOAM_HOME: '/g' }, { loadLedger });
-  assert.deepEqual(paths, { runtimePath: '/store/0.13.0/loam', globalRoot: '/g' });
-  assert.equal(sawGlobalRoot, '/g', 'the install root threads through for the schema-1 fallback');
+  assert.deepEqual(paths, { runtimePath: '/store/0.13.0/loam', globalRoot });
+  assert.equal(sawGlobalRoot, globalRoot, 'the install root threads through for the schema-1 fallback');
 });
 
 test('resolveRuntimePaths degrades to null when the ledger resolves no runtime', async () => {
@@ -88,7 +91,9 @@ test('SessionStart forwards the runtime envelope verbatim and passes the boundar
   );
   assert.equal(out, envelope, 'the runtime already built the harness envelope — forward it, never re-wrap');
   assert.equal(calls[0].event, 'SessionStart');
-  assert.equal(calls[0].workspace, '/workspace');
+  // workspaceFromPayload resolve()s cwd, so the boundary value is drive-qualified
+  // on win32 -- assert against the resolved form, not the POSIX literal.
+  assert.equal(calls[0].workspace, resolve('/workspace'));
   assert.equal(calls[0].sessionId, 'sess-1');
 });
 
