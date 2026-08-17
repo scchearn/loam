@@ -821,6 +821,22 @@ fn quote_runtime(path: &Path) -> String {
     }
 }
 
+/// Quote a command ARGUMENT for a shown emit command: the same value-escaping as
+/// `quote_runtime`, but without the PowerShell call operator `&`. On Windows `&`
+/// prefixes only the executable being invoked — prefixing an argument with it is
+/// invalid. On non-Windows this is identical to `quote_runtime`.
+fn quote_arg(path: &Path) -> String {
+    let value = clean_text(&path.display().to_string(), CONTEXT_LIMIT);
+    if value.is_empty() {
+        return String::new();
+    }
+    if cfg!(windows) {
+        format!("'{}'", value.replace('\'', "''"))
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 fn plugin_version(global_root: &Path) -> String {
     let Ok(text) = std::fs::read_to_string(global_root.join("install.json")) else {
         return String::new();
@@ -1130,8 +1146,8 @@ fn collaboration_section(federation: &Federation, paths: &HookPaths, workspace: 
         Some(path) => quote_runtime(path),
         None => return String::new(),
     };
-    let workspace = quote_runtime(workspace);
-    let global_root = quote_runtime(&paths.global_root);
+    let workspace = quote_arg(workspace);
+    let global_root = quote_arg(&paths.global_root);
     let mut lines = vec!["## Collaboration".to_owned(), String::new()];
     lines.push(
         "Federation is enabled on this workspace. Others can see your work state when you report it."
@@ -1812,6 +1828,7 @@ mod tests {
         assert!(!unenrolled.contains("## Collaboration"), "{unenrolled}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn session_start_registers_and_marks_current_through_the_connector() {
         // T5: on SessionStart with a session_id, the hook registers the session

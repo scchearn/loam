@@ -727,7 +727,15 @@ pub(crate) use registry::*;
 /// these tests.
 #[cfg(test)]
 pub fn temp_global_root(label: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!(
+    // A short base on Unix: tests bind a Unix-domain socket under this root, and
+    // macOS caps sun_path at ~104 bytes — the default TMPDIR (`/var/folders/…`)
+    // is long enough to overflow it. `/tmp` is short and always present on Unix;
+    // Windows keeps the standard temp dir.
+    #[cfg(unix)]
+    let base = std::path::PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let base = std::env::temp_dir();
+    let path = base.join(format!(
         "loam-root-{label}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

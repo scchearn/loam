@@ -64,6 +64,9 @@ fn run_connect_pinned(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // The token/auto-enroll path reads the git identity; pin it so this resolves
+    // on CI (no ambient global gitconfig) and reaches the signer contact.
+    pin_git_identity(&mut command);
     let output = command.output().expect("spawn loam");
     (
         output.status.code().unwrap_or(-1),
@@ -117,6 +120,10 @@ fn connect_rejects_a_malformed_project_override() {
     );
 }
 
+// Skipped on Windows: this full-flow federation-connect integration test has
+// never run there (the build did not compile before the cfg-gate fix) and needs
+// real Windows validation of the git fixtures and connect resolution. See #121.
+#[cfg(not(windows))]
 #[test]
 fn full_happy_path_validates_against_hermetic_repos() {
     // Build an origin repo with a commit on refs/heads/main, then a workspace
@@ -214,6 +221,9 @@ fn full_happy_path_validates_against_hermetic_repos() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// Skipped on Windows: federation-connect integration coverage is unvalidated
+// there (never compiled before the cfg-gate fix). See #121.
+#[cfg(not(windows))]
 #[test]
 fn connect_infers_org_and_project_from_the_remote_url() {
     let root = temp_dir("infer");
@@ -306,6 +316,9 @@ fn connect_infers_org_and_project_from_the_remote_url() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// Skipped on Windows: federation-connect integration coverage is unvalidated
+// there (never compiled before the cfg-gate fix). See #121.
+#[cfg(not(windows))]
 #[test]
 fn commit_reachability_is_not_required() {
     // The connect surface deliberately does not prove the HEAD commit is
@@ -480,6 +493,11 @@ fn connect_with_token_but_no_certificate_fails_fast_on_an_unreachable_signer() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// Skipped on Windows: the fixture builds the installed layout under a hardcoded
+// linux-musl target with a `loam` (no `.exe`) binary, so the Windows install
+// probe (host target + `loam.exe`) never finds it; unvalidated on Windows. See
+// #121.
+#[cfg(not(windows))]
 #[test]
 fn bare_connect_with_token_uses_the_installed_global_root() {
     let root = temp_dir("autoenroll-installed-root");
@@ -491,7 +509,8 @@ fn bare_connect_with_token_uses_the_installed_global_root() {
     std::fs::copy(binary(), target_dir.join("loam")).unwrap();
     std::fs::write(root.join("install.json"), "{}\n").unwrap();
 
-    let output = Command::new(target_dir.join("loam"))
+    let mut command = Command::new(target_dir.join("loam"));
+    command
         .args([
             "federation",
             "connect",
@@ -504,9 +523,11 @@ fn bare_connect_with_token_uses_the_installed_global_root() {
         .env("LOAM_CONFIG_DIR", &root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("spawn installed loam");
+        .stderr(Stdio::piped());
+    // The token/auto-enroll path reads the git identity; pin it so this resolves
+    // on CI (no ambient global gitconfig) and reaches the signer contact.
+    pin_git_identity(&mut command);
+    let output = command.output().expect("spawn installed loam");
     let code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -607,12 +628,34 @@ fn temp_dir(label: &str) -> PathBuf {
     dir
 }
 
+/// Inject a deterministic git identity into a spawned command's environment.
+/// Enrollment reads `git config user.email/user.name`, and setup commits read
+/// the same identity — on CI, which has no ambient global gitconfig, both would
+/// otherwise resolve nothing and the token/auto-enroll path would refuse with
+/// `git-identity-required` instead of exercising the signer contact. `GIT_CONFIG_*`
+/// entries are parsed after every config file, so they win regardless of the
+/// host's global config: hermetic on CI and on a developer machine alike, and
+/// without mutating the real workspace's git config.
+fn pin_git_identity(command: &mut Command) {
+    command
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "user.name")
+        .env("GIT_CONFIG_VALUE_0", "Loam CI")
+        .env("GIT_CONFIG_KEY_1", "user.email")
+        .env("GIT_CONFIG_VALUE_1", "ci@loam.test");
+}
+
+// Only the git-fixture tests call this, and those are skipped on Windows (see
+// #121). Keep it compiled — so the helpers it references stay live — but let it
+// be unused on Windows.
+#[cfg_attr(windows, allow(dead_code))]
 fn git(args: &[&str], cwd: Option<&Path>) -> String {
     let mut command = Command::new("git");
     command.args(args);
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
+    pin_git_identity(&mut command);
     let output = command.output().expect("git runs");
     assert!(
         output.status.success(),
