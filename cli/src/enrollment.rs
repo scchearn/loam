@@ -1727,6 +1727,40 @@ mod registry_tests {
     }
 
     #[test]
+    fn has_enrollment_answers_only_for_a_populated_registry() {
+        // Missing DB: cannot answer — an unmigrated machine falls back to legacy.
+        let missing = temp_db("has-enroll-missing");
+        assert!(!has_enrollment(&missing));
+
+        // Present but empty (schema only, no enrollment): still cannot answer,
+        // so the fresh-but-uninitialized config-dir registry never strands a
+        // still-legacy machine on an empty store.
+        let empty = temp_db("has-enroll-empty");
+        drop(open_writable(&empty).unwrap());
+        assert!(!has_enrollment(&empty));
+
+        // One enrollment present: can answer — the migrated machine's config-dir
+        // registry becomes authoritative.
+        let populated = temp_db("has-enroll-populated");
+        let mut connection = open_writable(&populated).unwrap();
+        let enrolled = sample(1, 10, "0123456789abcdef0123456789abcdef01234567");
+        insert_enrollment(
+            &mut connection,
+            &enrolled,
+            "instance-under-test",
+            &caps(),
+            "2026-08-08T10:00:00Z",
+        )
+        .unwrap();
+        drop(connection);
+        assert!(has_enrollment(&populated));
+
+        for path in [missing, empty, populated] {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
     fn the_read_projection_carries_the_provisioning_fields() {
         let path = temp_db("provisioning-projection");
         let mut connection = open_writable(&path).unwrap();
