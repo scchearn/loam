@@ -1,4 +1,4 @@
-import { mkdir, open, readdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, open, readdir, readFile, rename, rm, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -445,6 +445,11 @@ export async function executeSetup(parsed, discovery, options = {}) {
         // ledger or store. A hard crash (finally never runs) instead leaves the
         // ledger ahead of install.json, which readiness reports as runtime_stale
         // and a re-run converges — loud, never silent skew.
+        // ponytail: if installRuntime throws AFTER moving the binary but BEFORE
+        // returning (e.g. commitLedger fails), `runtime` is undefined and this
+        // block skips store cleanup, orphaning the new <version> dir. The ledger
+        // is unchanged (publishJson is atomic), so state stays safe/convergent —
+        // a harmless disk leak, not skew. Reclaim it here only if it ever matters.
         if (ledgerStaged) {
           const file = ledgerPath({ home: discovery.home, platform: discovery.platform });
           try {
@@ -452,7 +457,12 @@ export async function executeSetup(parsed, discovery, options = {}) {
             else if (file) await rm(file, { force: true });
           } catch {}
           if (runtime?.storePath && (!priorLedger || priorLedger.store_path !== runtime.storePath)) {
-            await rm(dirname(dirname(runtime.storePath)), { recursive: true, force: true }).catch(() => {});
+            // Remove ONLY this run's <version>/<target> dir. Then drop the
+            // <version> parent only when it is now empty — a sibling <target>
+            // staged by a prior same-machine LOAM_TARGET run is not ours to
+            // delete (rmdir throws ENOTEMPTY, which we swallow).
+            await rm(dirname(runtime.storePath), { recursive: true, force: true }).catch(() => {});
+            await rmdir(dirname(dirname(runtime.storePath))).catch(() => {});
           }
         }
         try {
