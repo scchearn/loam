@@ -323,6 +323,44 @@ fn surrounding_whitespace_in_runtime_version_is_tolerated() {
     );
 }
 
+/// A constants file with no `RUNTIME_VERSION` export is a hard runtime failure —
+/// the gate must name the missing source, not silently pass.
+#[test]
+fn a_missing_runtime_version_export_fails_the_runtime_domain() {
+    let root = agreeing_root("runtime-no-export");
+    write(
+        &root.join("setup/constants.mjs"),
+        "export const PACKAGE_VERSION = '0.0.0';\n",
+    );
+
+    let (code, _, stderr) = check(&root, &["--runtime"]);
+
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("setup/constants.mjs has no RUNTIME_VERSION export"),
+        "stderr: {stderr}"
+    );
+}
+
+/// An empty `RUNTIME_VERSION` value is a hard runtime failure with its own
+/// message, distinct from a missing export.
+#[test]
+fn an_empty_runtime_version_fails_the_runtime_domain() {
+    let root = agreeing_root("runtime-empty");
+    write(
+        &root.join("setup/constants.mjs"),
+        "export const RUNTIME_VERSION = '';\n",
+    );
+
+    let (code, _, stderr) = check(&root, &["--runtime"]);
+
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("setup/constants.mjs RUNTIME_VERSION is empty"),
+        "stderr: {stderr}"
+    );
+}
+
 #[test]
 fn conflicting_selectors_are_rejected() {
     let root = agreeing_root("both-selectors");
