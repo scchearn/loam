@@ -289,19 +289,35 @@ async function probeStateWithMode({
     };
   }
   // The self-report diff: the runtime's own compiled version must string-equal
-  // the ledger target. A missing/non-string version counts as a mismatch and is
-  // never thrown. String equality only — inert across the 1.0.0 rollover.
+  // the ledger target. String equality only — inert across the 1.0.0 rollover.
   if (status.expectedVersion !== undefined) {
     const reported = parsed.version;
-    if (typeof reported !== 'string' || reported !== status.expectedVersion) {
+    if (typeof reported !== 'string') {
+      // No self-report at all → a pre-T1 runtime that predates the compiled
+      // `version` field. checkReadiness has ALREADY verified the store binary's
+      // sha against the ledger, so this IS the recorded target binary; it just
+      // cannot self-report. Transitional PASS (the sha is the proof) with a
+      // distinct note — never runtime_stale/`update`, which would loop because
+      // the target constant still names this same pre-self-report build. Self-
+      // limiting: env!(CARGO_PKG_VERSION) is never empty, so only a pre-T1
+      // binary reaches here; a post-T1 mis-build reports a (mismatched) version
+      // and fails below. Dissolves the moment a T1+ runtime ships.
+      return {
+        ...status,
+        state: parsed,
+        note: 'runtime_predates_self_report',
+        detail: `runtime ${status.expectedVersion} predates the self-report field; verified by ledger sha256`,
+      };
+    }
+    if (reported !== status.expectedVersion) {
       return {
         ...status,
         ready: false,
         category: 'runtime_stale',
         hint: 'update',
         expected: status.expectedVersion,
-        actual: typeof reported === 'string' ? reported : null,
-        detail: `runtime self-reports ${typeof reported === 'string' ? reported : '(none)'}, ledger target is ${status.expectedVersion}`,
+        actual: reported,
+        detail: `runtime self-reports ${reported}, ledger target is ${status.expectedVersion}`,
         state: parsed,
       };
     }
