@@ -2365,6 +2365,17 @@ fn establish_and_run(
     run_pump_loop(open, snapshots, channels, outbound, stop, liveness)
 }
 
+/// Whether an admitted frame is this machine's own published echo — the #111
+/// self-receive case. Only `Accepted` frames carry an origin; every other outcome
+/// is a dedup/tombstone signal that never injects on its own.
+fn is_self_origin(outcome: &ReceiveOutcome, own_instance_id: &str) -> bool {
+    matches!(
+        outcome,
+        ReceiveOutcome::Accepted(envelope)
+            if envelope.as_envelope().data.from.instance_id == own_instance_id
+    )
+}
+
 /// Pump one open session's received frames into the snapshot store until it drops
 /// or a stop is requested, then mark the session down and return `Ended` so the
 /// supervisor re-establishes. The pump only reads: it never publishes on its own,
@@ -2379,12 +2390,17 @@ fn run_pump_loop(
 ) -> EstablishOutcome {
     let OpenSession {
         mut transport,
-        identity: _,
+        identity,
         mut roster,
         mut oracle,
         org_id,
         project_id,
     } = open;
+    // This machine's own origin. `self_receive` stays enabled (the enrollment
+    // probe proves the session by hearing its own echo), so the live pump does
+    // receive this instance's own published frames back — #111. They must never
+    // be injected into a local session: they would render as if from a teammate.
+    let own_instance_id = identity.instance_id;
     // A malformed retained member card is degrade-not-crash, but silence hid a
     // parser bug that stranded every roster. Surface the first one per session
     // so it is at least visible; one line, no framework.
@@ -2456,6 +2472,16 @@ fn run_pump_loop(
                             }
                         }
                     }
+                    continue;
+                }
+                // #111 self-receive echo: drop this machine's own frames before
+                // they reach the store, so no injection surface — snapshot,
+                // mailbox push, or wake — ever renders this instance's own emit as
+                // a colleague's. Machine-level: filtered for every local session on
+                // this instance. Session-level "do not deliver to the emitting
+                // session" needs a session id the emit path does not carry today
+                // (residual on #111).
+                if is_self_origin(&outcome, &own_instance_id) {
                     continue;
                 }
                 // Git-first: reconcile *before* the item is readable, so a hook
@@ -6343,6 +6369,28 @@ mod outbound_tests {
             crate::envelope::Violation::SourceInstanceMismatch,
             "a divergent session must be refused as a source mismatch, not accepted"
         );
+    }
+
+    #[test]
+    fn a_self_origin_frame_is_filtered_from_the_injection_path() {
+        // #111: this machine hears its own emit echoed back (self_receive stays on
+        // for the enrollment probe). The pump must drop it before the store, so no
+        // local session renders its own frame as a colleague's.
+        let operation = r#"{"type":"work.report","state_key":"task-9","revision":"3","summary":"s","payload":{"state":"ready"}}"#;
+        let envelope =
+            round_trip_with(operation, &identity()).expect("the enrolled instance validates");
+        let own = identity().instance_id;
+        let echo = crate::transport::ReceiveOutcome::Accepted(Box::new(envelope));
+
+        // This machine's own frame is self-origin — filtered.
+        assert!(is_self_origin(&echo, &own));
+        // A colleague on another instance is not.
+        assert!(!is_self_origin(&echo, "instance-a-teammates-machine"));
+        // A non-Accepted outcome carries no origin and is never self-filtered.
+        assert!(!is_self_origin(
+            &crate::transport::ReceiveOutcome::DuplicateEvent,
+            &own
+        ));
     }
 
     #[test]
