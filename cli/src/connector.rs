@@ -98,7 +98,24 @@ macro_rules! breadcrumb {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeError {
+    /// A broker that answered and rejected this identity: a CONNACK with a
+    /// non-success return code. Reachability is proven by the answer, so this
+    /// category points an operator at credentials — and nothing that failed
+    /// before the answer may borrow it (#115).
     AuthenticationFailed,
+    /// The TCP dial was refused or reset. Nothing is listening, or something
+    /// closed the connection immediately: a closed port, a stopped broker, a
+    /// firewall that rejects rather than drops.
+    DialRefused,
+    /// The dial never completed and never failed outright: a timeout, an
+    /// unresolvable name, an unreachable network. A dropped packet looks like
+    /// this, which is why it is separate from a refusal.
+    TransportUnreachable,
+    /// TLS failed during the handshake, after the socket connected. Distinct
+    /// from `ConfigurationFailure` (this machine's own cert/key/trust material
+    /// could not even be loaded) and from `AuthenticationFailed` (the broker
+    /// spoke MQTT and refused the identity).
+    TlsHandshakeFailed,
     SubscribeDenied {
         filter: String,
     },
@@ -120,6 +137,12 @@ impl ProbeError {
     pub fn code(&self) -> &'static str {
         match self {
             ProbeError::AuthenticationFailed => "probe_authentication_failed",
+            // Transport-stage categories carry no `probe_` prefix: they happen
+            // before any probe step runs, on the live establishment path as much
+            // as on the enrollment probe.
+            ProbeError::DialRefused => "dial_refused",
+            ProbeError::TransportUnreachable => "transport_unreachable",
+            ProbeError::TlsHandshakeFailed => "tls_handshake_failed",
             ProbeError::SubscribeDenied { .. } => "probe_subscribe_denied",
             ProbeError::PublishDenied => "probe_publish_denied",
             ProbeError::NoSelfReceive => "probe_no_self_receive",
@@ -561,8 +584,8 @@ pub struct MqttTransport {
 /// How many refused frames one session logs individually before it switches to
 /// counting them.
 ///
-/// Same bound as [`CARD_REJECTION_LOG_LIMIT`] and for the same reason, but the
-/// case is stronger: frames are far more frequent than member cards, and the
+/// Twice [`CARD_REJECTION_LOG_LIMIT`], for a related reason but a stronger
+/// case: frames are far more frequent than member cards, and the
 /// motivating incident — a roster that assembled to nothing, so every peer frame
 /// refuses as `OriginNotAuthorized` — produces one refusal per inbound frame for
 /// the life of the session, on a daemon built to respawn and with no rotation on
@@ -649,16 +672,12 @@ impl Transport for MqttTransport {
             .set_clean_start(true);
         let (client, mut connection) = Client::new(options, REQUEST_CAPACITY);
         let deadline = Instant::now() + self.dial_deadline;
-        let accepted = loop {
-            match await_control(&mut connection, &mut self.pending, deadline) {
-                Some(Packet::ConnAck(ack)) => break ack.code == ConnectReturnCode::Success,
-                Some(_) => {}
-                None => break false,
-            }
-        };
-        if !accepted {
-            return Err(ProbeError::AuthenticationFailed);
-        }
+        // Every way this can fail keeps its own stage (#115). The loop used to
+        // reduce all of them — a refused dial, a DNS failure, a TLS handshake
+        // error, a timeout with no answer at all — to `false`, and `false` to
+        // `probe_authentication_failed`, which sent an operator to the
+        // certificates for what was a closed port.
+        dial_for_connack(&mut connection, &mut self.pending, deadline)?;
         // Authority starts here and nowhere else.
         self.client = Some(client);
         self.connection = Some(connection);
@@ -918,6 +937,82 @@ impl MqttTransport {
                 _ => continue,
             }
         }
+    }
+}
+
+/// Wait for the CONNACK, keeping the reason the dial failed instead of reducing
+/// it to "not accepted" (#115).
+///
+/// This is the one place a connection error carries stage information: after the
+/// CONNACK every failure is a broker decision on a proven-reachable session
+/// (subscribe denied, publish denied), and those already have their own
+/// categories. An inbound publish that races the CONNACK is parked for `receive`,
+/// exactly as [`await_control`] does.
+fn dial_for_connack(
+    connection: &mut Connection,
+    pending: &mut Vec<Publish>,
+    deadline: Instant,
+) -> Result<(), ProbeError> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // Nothing arrived and nothing failed: the far side is not answering.
+            return Err(ProbeError::TransportUnreachable);
+        }
+        match connection.recv_timeout(remaining) {
+            Ok(Ok(Event::Incoming(Packet::ConnAck(ack)))) => {
+                // The only failure that is genuinely an authentication verdict:
+                // the broker spoke MQTT back and refused this identity.
+                return if ack.code == ConnectReturnCode::Success {
+                    Ok(())
+                } else {
+                    Err(ProbeError::AuthenticationFailed)
+                };
+            }
+            Ok(Ok(Event::Incoming(Packet::Publish(publish)))) => pending.push(publish),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return Err(classify_dial_failure(&error)),
+            // The event loop ended or the wait ran out with no verdict either
+            // way. Unreachable is the honest answer: no authentication exchange
+            // took place, so it cannot have failed.
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                return Err(ProbeError::TransportUnreachable)
+            }
+        }
+    }
+}
+
+/// Which stage a failed dial failed at. Nothing from the error's text is kept —
+/// an OS error string carries the broker address — only its class.
+fn classify_dial_failure(error: &rumqttc::v5::ConnectionError) -> ProbeError {
+    use rumqttc::v5::ConnectionError;
+    match error {
+        // A CONNACK the client library rejected for us: the broker answered, so
+        // this is a real authentication/protocol verdict.
+        ConnectionError::ConnectionRefused(_) => ProbeError::AuthenticationFailed,
+        ConnectionError::Io(io) => classify_dial_io(io.kind()),
+        // Inside the TLS layer, an IO error is still the socket failing under
+        // the handshake, so it keeps the socket's classification rather than
+        // reading as a certificate problem.
+        ConnectionError::Tls(rumqttc::TlsError::Io(io)) => classify_dial_io(io.kind()),
+        ConnectionError::Tls(_) => ProbeError::TlsHandshakeFailed,
+        // Timeouts, MQTT state faults, and a client whose request stream ended:
+        // no answer arrived, and none of them is an identity verdict.
+        _ => ProbeError::TransportUnreachable,
+    }
+}
+
+fn classify_dial_io(kind: std::io::ErrorKind) -> ProbeError {
+    use std::io::ErrorKind;
+    match kind {
+        // Something answered the SYN with a refusal, or dropped the connection
+        // as it came up: a closed port, a stopped broker, a rejecting firewall.
+        ErrorKind::ConnectionRefused
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted => ProbeError::DialRefused,
+        // Everything else that stopped the dial is reachability: a name that
+        // does not resolve, a route that does not exist, a packet that vanished.
+        _ => ProbeError::TransportUnreachable,
     }
 }
 
@@ -1451,6 +1546,10 @@ pub struct SnapshotItem {
     /// same message share it, so the snapshot holds exactly one entry per
     /// message; a later state revision replaces the earlier one in place.
     pub key: String,
+    /// The work-state key from the envelope's `data.delivery.key` — the
+    /// validated, topic-bound one, not a copy a sender happened to put in its
+    /// payload (#99). `None` for anything that is not a latest-state frame.
+    pub state_key: Option<String>,
     pub source: String,
     pub item_type: String,
     pub summary: String,
@@ -1604,6 +1703,7 @@ fn snapshot_item(
         .with_timezone(&Utc);
     Some(SnapshotItem {
         key,
+        state_key: envelope.data.delivery.key.clone(),
         source: envelope.source.clone(),
         item_type: envelope.message_type.clone(),
         summary: envelope.data.summary.clone(),
@@ -3101,23 +3201,7 @@ pub(crate) fn dispatch_for_key(
             let Some(identity) = state.sessions.identity(&row.project_id) else {
                 return Ok(emit_json(&row, "not-shipped", "no-live-session", ""));
             };
-            let (document, topic) = outbound_envelope(&request.payload, &row, &identity)
-                .ok_or(ipc::IpcError::InvalidRequest)?;
-            let owned_claims: Vec<String> = if identity.allowed_claims.is_empty() {
-                vec![identity.principal_id.clone()]
-            } else {
-                identity.allowed_claims.clone()
-            };
-            let claims: Vec<&str> = owned_claims.iter().map(String::as_str).collect();
-            let principal = AuthenticatedPrincipal::new(&identity.principal_id, &claims);
-            let validated = crate::envelope::validate(
-                document.as_bytes(),
-                &topic,
-                &principal,
-                &ValidationConfig::default(),
-                Utc::now(),
-            )
-            .map_err(|_| ipc::IpcError::InvalidRequest)?;
+            let validated = validated_emit(&request.payload, &row, &identity, Utc::now())?;
             let event_id = validated.as_envelope().id.clone();
             match state.sessions.ship(&row.project_id, validated) {
                 EmitOutcome::Queued => Ok(emit_json(&row, "queued", "queued", &event_id)),
@@ -3218,15 +3302,59 @@ fn emit_json(
     ])
 }
 
+/// Build the outbound envelope for one derived operation and validate it as the
+/// session's authenticated principal — the whole refusable part of an emit, with
+/// no live session in it, so every refusal it can produce is reachable from a
+/// test that owns nothing but an identity.
+///
+/// Both refusals keep their reason (#102). Before this the builder's `None` and
+/// the validator's `Violation` collapsed into the same bare `invalid_request`,
+/// and the CLI collapsed that into `connector_refused`: a missing plan anchor, an
+/// unaddressable recipient, and an expired envelope were one indistinguishable
+/// error, diagnosable only by capturing the socket and replaying the envelope
+/// through the validator out of process.
+fn validated_emit(
+    operation: &crate::json::Value,
+    row: &crate::enrollment::EnrolledRow,
+    identity: &SessionIdentity,
+    now: DateTime<Utc>,
+) -> Result<crate::envelope::ValidatedEnvelope, ipc::IpcError> {
+    let (document, topic) = outbound_envelope(operation, row, identity)
+        .map_err(|reason| ipc::IpcError::InvalidRequestBecause(reason.to_owned()))?;
+    // An empty claim set means the session claims only its own principal; it is
+    // never read as "claims anything".
+    let owned_claims: Vec<String> = if identity.allowed_claims.is_empty() {
+        vec![identity.principal_id.clone()]
+    } else {
+        identity.allowed_claims.clone()
+    };
+    let claims: Vec<&str> = owned_claims.iter().map(String::as_str).collect();
+    let principal = AuthenticatedPrincipal::new(&identity.principal_id, &claims);
+    crate::envelope::validate(
+        document.as_bytes(),
+        &topic,
+        &principal,
+        &ValidationConfig::default(),
+        now,
+    )
+    .map_err(|violation| ipc::IpcError::InvalidRequestBecause(violation.code()))
+}
+
 /// Build the outbound CloudEvents document and its topic from the CLI's derived
-/// operation plus the live session's authenticated identity. Returns `None` for
-/// a structurally impossible operation; everything else is the envelope module's job to
-/// refuse when the document is validated.
+/// operation plus the live session's authenticated identity. A structurally
+/// impossible operation is refused *by name* — a bare `None` here was one half of
+/// the double flattening #102 was filed for, and these shape refusals are exactly
+/// the ones the envelope validator never gets to explain because the document
+/// cannot be built at all. Everything else is the envelope module's job to refuse
+/// when the document is validated.
+///
+/// Every reason is a fixed literal, so nothing from the caller's operation can
+/// reach the IPC diagnostic through it.
 fn outbound_envelope(
     operation: &crate::json::Value,
     row: &crate::enrollment::EnrolledRow,
     identity: &SessionIdentity,
-) -> Option<(String, String)> {
+) -> Result<(String, String), &'static str> {
     use crate::json::Value;
     let string = |key: &str| operation.get(key).and_then(Value::as_str).unwrap_or("");
     let owned = |key: &str| operation.get(key).cloned().unwrap_or(Value::Null);
@@ -3250,21 +3378,33 @@ fn outbound_envelope(
             "latest-state",
             "inform",
         ),
-        _ => return None,
+        _ => return Err("unsupported_operation_type"),
     };
 
     let event_id = string("id");
     let prefix = format!("loam/v1/{}/{}", row.org_id, row.project_id);
     let (delivery, to, topic) = if class == "inbox" {
-        let recipients = operation.get("to").and_then(Value::as_array)?;
-        let first = recipients.iter().find(|recipient| {
-            matches!(
-                recipient.get("kind").and_then(Value::as_str),
-                Some("agent" | "principal" | "instance")
-            )
-        })?;
-        let kind = first.get("kind").and_then(Value::as_str)?;
-        let id = first.get("id").and_then(Value::as_str)?;
+        let recipients = operation
+            .get("to")
+            .and_then(Value::as_array)
+            .ok_or("missing_recipients")?;
+        let first = recipients
+            .iter()
+            .find(|recipient| {
+                matches!(
+                    recipient.get("kind").and_then(Value::as_str),
+                    Some("agent" | "principal" | "instance")
+                )
+            })
+            .ok_or("no_addressable_recipient")?;
+        let kind = first
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or("no_addressable_recipient")?;
+        let id = first
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("missing_recipient_id")?;
         (
             Value::Object(vec![("class".into(), Value::String("inbox".into()))]),
             Value::Array(recipients.to_vec()),
@@ -3274,8 +3414,14 @@ fn outbound_envelope(
             ),
         )
     } else {
-        let key = operation.get("state_key").and_then(Value::as_str)?;
-        let revision = operation.get("revision").and_then(Value::as_str)?;
+        let key = operation
+            .get("state_key")
+            .and_then(Value::as_str)
+            .ok_or("missing_state_key")?;
+        let revision = operation
+            .get("revision")
+            .and_then(Value::as_str)
+            .ok_or("missing_state_revision")?;
         (
             Value::Object(vec![
                 ("class".into(), Value::String("latest-state".into())),
@@ -3290,6 +3436,18 @@ fn outbound_envelope(
         )
     };
 
+    // `base_oid` is the enrolled commit — derived, never a caller's. `plan_oid`
+    // is the caller's plan anchor when it supplied one (#98): provenance, not
+    // authority, and the only part of `context` an emit caller contributes. The
+    // shape is not re-checked here on purpose — `envelope::validate` refuses a
+    // malformed one as `InvalidPlanOid` and an absent one on a claim-bearing
+    // report as `MissingPlanOid`, and both now reach the caller by name.
+    let mut git = vec![("base_oid".into(), Value::String(row.commit.clone()))];
+    if let Some(plan_oid) = operation.get("plan_oid").and_then(Value::as_str) {
+        if !plan_oid.is_empty() {
+            git.push(("plan_oid".into(), Value::String(plan_oid.to_owned())));
+        }
+    }
     let mut context = vec![
         ("org_id".into(), Value::String(row.org_id.clone())),
         ("project_id".into(), Value::String(row.project_id.clone())),
@@ -3297,10 +3455,7 @@ fn outbound_envelope(
             "repository_id".into(),
             Value::String(row.repository_id.clone()),
         ),
-        (
-            "git".into(),
-            Value::Object(vec![("base_oid".into(), Value::String(row.commit.clone()))]),
-        ),
+        ("git".into(), Value::Object(git)),
     ];
     context.push((
         "artifacts".into(),
@@ -3364,7 +3519,7 @@ fn outbound_envelope(
             ]),
         ),
     ]);
-    Some((document.to_json(), topic))
+    Ok((document.to_json(), topic))
 }
 
 fn snapshot_json(
@@ -3376,7 +3531,7 @@ fn snapshot_json(
     let rendered = items
         .iter()
         .map(|item| {
-            Value::Object(vec![
+            let mut fields = vec![
                 ("source".into(), Value::String(item.source.clone())),
                 ("type".into(), Value::String(item.item_type.clone())),
                 ("summary".into(), Value::String(item.summary.clone())),
@@ -3435,7 +3590,13 @@ fn snapshot_json(
                     "publication".into(),
                     Value::String(item.publication.code().to_owned()),
                 ),
-            ])
+            ];
+            // Only latest-state frames have one, and an inbox item carrying an
+            // empty `state_key` would render an empty `key=` attribute (#99).
+            if let Some(state_key) = &item.state_key {
+                fields.push(("state_key".into(), Value::String(state_key.clone())));
+            }
+            Value::Object(fields)
         })
         .collect();
     Value::Object(vec![
@@ -4474,6 +4635,7 @@ mod service_tests {
                 "loam",
                 SnapshotItem {
                     key: "state:instance-01/work-SB-42".into(),
+                    state_key: Some("work-SB-42".into()),
                     source: "urn:loam:instance:instance-01".into(),
                     item_type: "io.loam.work.state".into(),
                     summary: "Work is active.".into(),
@@ -4639,6 +4801,7 @@ mod service_tests {
     fn sample_item(key: &str, summary: &str) -> SnapshotItem {
         SnapshotItem {
             key: key.into(),
+            state_key: None,
             source: "urn:loam:instance:instance-01".into(),
             item_type: "io.loam.message".into(),
             summary: summary.into(),
@@ -6377,6 +6540,93 @@ mod snapshot_tests {
         assert!(!sessions.is_live(&row.project_id));
     }
 
+    /// #115: a failure before the authentication exchange is never reported as an
+    /// authentication failure.
+    ///
+    /// The observed symptom was an operator sent to certificates and identity for
+    /// a closed port: `establishment failed error=probe_authentication_failed`,
+    /// inherited by `observed-degraded` and by the degraded status render, for a
+    /// broker endpoint where no TLS and no auth exchange was even possible. The
+    /// two faults have opposite remediations.
+    #[test]
+    fn a_dial_that_never_reached_an_auth_exchange_is_categorized_by_its_stage() {
+        use rumqttc::v5::ConnectionError;
+        use std::io::{Error, ErrorKind};
+
+        // Nothing listening, or the connection cut as it came up: a network fault.
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+        ] {
+            let classified = classify_dial_failure(&ConnectionError::Io(Error::from(kind)));
+            assert_eq!(
+                classified,
+                ProbeError::DialRefused,
+                "{kind:?} is a refused dial"
+            );
+            assert_eq!(classified.code(), "dial_refused");
+        }
+
+        // No answer either way: a dropped packet, an unresolvable name, a route
+        // that does not exist. Still a network fault, but not a refusal.
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::NotFound,
+            ErrorKind::AddrNotAvailable,
+        ] {
+            assert_eq!(
+                classify_dial_failure(&ConnectionError::Io(Error::from(kind))),
+                ProbeError::TransportUnreachable,
+                "{kind:?} is unreachable, not refused"
+            );
+        }
+        assert_eq!(
+            ProbeError::TransportUnreachable.code(),
+            "transport_unreachable"
+        );
+
+        // A socket that failed under the TLS layer keeps the socket's answer: it
+        // is not a certificate problem.
+        assert_eq!(
+            classify_dial_failure(&ConnectionError::Tls(rumqttc::TlsError::Io(Error::from(
+                ErrorKind::ConnectionRefused
+            )))),
+            ProbeError::DialRefused
+        );
+
+        // The one failure that *is* an identity verdict: the broker answered MQTT
+        // and refused. This is the positive control that keeps
+        // `probe_authentication_failed` meaningful rather than merely rarer.
+        assert_eq!(
+            classify_dial_failure(&ConnectionError::ConnectionRefused(
+                ConnectReturnCode::NotAuthorized
+            )),
+            ProbeError::AuthenticationFailed
+        );
+        assert_eq!(
+            ProbeError::AuthenticationFailed.code(),
+            "probe_authentication_failed"
+        );
+
+        // Every stage code is a distinct grep token — a category that collided
+        // with another would be the same defect wearing a new name.
+        let codes = [
+            ProbeError::AuthenticationFailed.code(),
+            ProbeError::DialRefused.code(),
+            ProbeError::TransportUnreachable.code(),
+            ProbeError::TlsHandshakeFailed.code(),
+            ProbeError::ConfigurationFailure(String::new()).code(),
+        ];
+        for (index, code) in codes.iter().enumerate() {
+            assert!(!code.is_empty() && !code.contains(' '), "{code}");
+            assert!(
+                !codes[..index].contains(code),
+                "two stages share the code `{code}`"
+            );
+        }
+    }
+
     #[test]
     fn a_first_dial_failure_still_arms_the_supervisor_and_watchdog() {
         // A connector that boots while the broker is down must not give up: the
@@ -6419,9 +6669,10 @@ mod snapshot_tests {
         let mut sessions = ProjectSessions::new(4, ChannelRegistry::new());
         let row = sample_row("unix:1:9");
         let state = sessions.attach(&row, to_a_closed_port(), base_time());
-        assert!(
-            matches!(state, SessionState::Unreachable(_)),
-            "a closed-port first dial reports Unreachable, got {state:?}"
+        assert_eq!(
+            state,
+            SessionState::Unreachable("dial_refused".into()),
+            "a closed-port dial is a refused dial, not a rejected identity (#115)"
         );
         assert!(
             sessions.is_live(&row.project_id),
@@ -6619,6 +6870,7 @@ mod snapshot_tests {
     fn the_snapshot_projection_carries_no_envelope_bytes_or_credential() {
         let item = SnapshotItem {
             key: "inbox:01K6Q6ESWMT48TPD".into(),
+            state_key: None,
             source: format!("urn:loam:instance:{SENDER_INSTANCE}"),
             item_type: "io.loam.message".into(),
             summary: "Held.".into(),
@@ -6707,9 +6959,25 @@ mod outbound_tests {
             .with_timezone(&Utc)
     }
 
+    /// Replace (or add) one field on an operation object. Used to build the
+    /// operations a non-CLI IPC caller could send, which the connector has to
+    /// refuse on its own terms rather than assuming its caller pre-checked them.
+    fn with_field(operation: &Value, name: &str, value: Value) -> Value {
+        let Value::Object(entries) = operation else {
+            panic!("an operation is an object");
+        };
+        let mut fields: Vec<(String, Value)> = entries
+            .iter()
+            .filter(|(key, _)| key != name)
+            .cloned()
+            .collect();
+        fields.push((name.to_owned(), value));
+        Value::Object(fields)
+    }
+
     /// Derive through the real CLI path, then build through the real connector
     /// path — the round trip neither half tested on its own.
-    fn round_trip(operation: &str) -> Option<(String, String)> {
+    fn round_trip(operation: &str) -> Result<(String, String), &'static str> {
         let parsed = crate::json::parse(operation).expect("operation parses");
         let derived =
             crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
@@ -6813,6 +7081,214 @@ mod outbound_tests {
             "the second emit on the same key must be admitted too, not dropped as \
              stale or duplicate: {:?}",
             admitted[1]
+        );
+    }
+
+    /// #102: every way an emit can be refused says which rule refused it.
+    ///
+    /// Both layers, in one test, because the bug was that they produced the same
+    /// answer: the builder cannot even construct a document for some operations
+    /// (so the validator never gets to explain them), and the validator refuses
+    /// others. Before this each one arrived as a bare `invalid_request`.
+    #[test]
+    fn every_emit_refusal_names_the_rule_that_refused_it() {
+        // Shape refusals, from the builder. Each of these returned a bare `None`.
+        for (operation, expected) in [
+            (
+                r#"{"type":"work.report","summary":"s","revision":"1","payload":{"state":"ready"}}"#,
+                "missing_state_key",
+            ),
+            (
+                r#"{"type":"message.ack","causation_id":"c-1","summary":"s","to":[],"payload":{}}"#,
+                "no_addressable_recipient",
+            ),
+        ] {
+            let parsed = crate::json::parse(operation).expect("operation parses");
+            // Derivation is not the subject here: `to: []` is derived happily and
+            // refused at build time, which is exactly the gap being closed.
+            let derived = crate::federation::derive_emit(&parsed, &row(), now())
+                .map(|derived| derived.operation)
+                .unwrap_or(parsed);
+            let refusal = validated_emit(&derived, &row(), &identity(), now())
+                .expect_err("a structurally impossible operation must be refused");
+            assert_eq!(
+                refusal.code(),
+                "invalid_request",
+                "the IPC code stays stable: {refusal:?}"
+            );
+            assert_eq!(
+                refusal.diagnostic(),
+                expected,
+                "the refusal must name its own reason"
+            );
+        }
+
+        // A validation refusal, from the envelope module. The claim is injected
+        // *after* derivation on purpose: `derive_emit` now refuses an unanchored
+        // claim itself (#98), so the operation an IPC caller other than this CLI
+        // could still send is the one that reaches the validator — and the
+        // connector must name that refusal too rather than trusting its callers.
+        let claimless = r#"{"type":"work.report","state_key":"task-7","revision":"1","summary":"s","payload":{"state":"ready"}}"#;
+        let parsed = crate::json::parse(claimless).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+        let unanchored_claim = with_field(
+            &derived.operation,
+            "artifacts",
+            crate::json::parse(r#"[{"kind":"task","id":"T-1"}]"#).expect("artifacts parse"),
+        );
+        let refusal = validated_emit(&unanchored_claim, &row(), &identity(), now())
+            .expect_err("a claim-bearing report with no plan anchor is refused");
+        assert_eq!(refusal.code(), "invalid_request");
+        assert_eq!(
+            refusal.diagnostic(),
+            crate::envelope::Violation::MissingPlanOid.code(),
+            "the violation the validator raised must be the reason reported"
+        );
+
+        // The same claim, anchored: it validates, so the refusal above is the
+        // anchor rule and not the artifact. And the anchor has to land in
+        // `context.git` beside the derived `base_oid` — accepting it at the CLI
+        // and dropping it at envelope build would leave #98 exactly where it was.
+        let plan_oid = "61af000000000000000000000000000000000001";
+        let anchored = with_field(
+            &unanchored_claim,
+            "plan_oid",
+            Value::String(plan_oid.into()),
+        );
+        let validated = validated_emit(&anchored, &row(), &identity(), now())
+            .expect("an anchored claim must ship");
+        let git = validated
+            .as_envelope()
+            .data
+            .context
+            .git
+            .as_ref()
+            .expect("the envelope carries a git context");
+        assert_eq!(git.plan_oid.as_deref(), Some(plan_oid));
+        assert_eq!(
+            git.base_oid.as_deref(),
+            Some(row().commit.as_str()),
+            "the caller's plan anchor must not disturb the derived base anchor"
+        );
+
+        // The positive control in the same run: a claimless report still ships,
+        // so the refusals above are the rules firing and not a broken fixture.
+        let claimless = r#"{"type":"work.report","state_key":"task-7","revision":"1","summary":"s","payload":{"state":"ready"}}"#;
+        let parsed = crate::json::parse(claimless).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+        assert!(
+            validated_emit(&derived.operation, &row(), &identity(), now()).is_ok(),
+            "a claimless report must still validate"
+        );
+    }
+
+    /// #99: an emitted work.report, carried all the way to the shared renderer,
+    /// must render its `key`.
+    ///
+    /// The mismatch this closes was invisible to both sides' own tests: the emit
+    /// path put `state_key` at the operation top level (consumed for the topic and
+    /// `delivery.key`), the renderer read `payload.state_key`, and the renderer's
+    /// fixture built the key inside the payload — so each half passed while no
+    /// emitted report ever rendered a key, and cross-revision correlation was lost
+    /// for every consumer. Nothing but a test that spans derive -> build ->
+    /// validate -> project -> render can catch that, which is why this one does.
+    #[test]
+    fn an_emitted_work_report_renders_its_key_through_the_shared_renderer() {
+        let rendered = |operation: &str| {
+            let parsed = crate::json::parse(operation).expect("operation parses");
+            let derived =
+                crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+            let validated = validated_emit(&derived.operation, &row(), &identity(), now())
+                .expect("the connector builds and validates");
+            let topic = format!(
+                "loam/v1/{}/{}/state/{}/{}",
+                row().org_id,
+                row().project_id,
+                identity().instance_id,
+                derived
+                    .operation
+                    .get("state_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            );
+            let delivery = crate::envelope::parse_topic(&topic)
+                .expect("the topic the connector just published on parses")
+                .delivery;
+            let item = snapshot_item(
+                accepted_key(&delivery, &validated.as_envelope().id),
+                &validated,
+                Publication::Unverified,
+            )
+            .expect("the accepted frame projects to a snapshot item");
+            let served = snapshot_json(&row().project_id, std::slice::from_ref(&item), None);
+            let first = served
+                .get("items")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .cloned()
+                .expect("the snapshot serves the item");
+            crate::harness::render_terse_item(&first, 4096)
+        };
+
+        let element = rendered(
+            r#"{"type":"work.report","state_key":"task-7","revision":"4","summary":"ready","payload":{"state":"ready"}}"#,
+        );
+        assert!(
+            element.contains("key=\"task-7\""),
+            "an emitted report must render the key it was published under:\n{element}"
+        );
+        assert!(element.contains("state=\"ready\""), "{element}");
+
+        // The key is the envelope's, not a copy in the payload: an emitter that
+        // puts nothing in the payload but the state still renders a key, and the
+        // payload is forwarded verbatim (no `state_key` is merged into it).
+        assert!(
+            !element.contains("\"state_key\""),
+            "the payload must not be rewritten to carry the key:\n{element}"
+        );
+    }
+
+    #[test]
+    fn an_inbox_item_renders_no_key_because_it_has_none() {
+        // The control for the projection's optional field: only latest-state
+        // frames have a delivery key, and an empty `key=""` on a message would be
+        // a fabricated correlation handle.
+        let operation = r#"{"type":"message.ack","causation_id":"cause-9","summary":"Received.","to":[{"kind":"instance","id":"instance-02"}],"payload":{"action":"collaboration.note","params":{}}}"#;
+        let parsed = crate::json::parse(operation).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+        let validated = validated_emit(&derived.operation, &row(), &identity(), now())
+            .expect("the connector builds and validates");
+        let event_id = validated.as_envelope().id.clone();
+        let topic = format!(
+            "loam/v1/{}/{}/inbox/instance/instance-02/{}/{event_id}",
+            row().org_id,
+            row().project_id,
+            identity().instance_id
+        );
+        let delivery = crate::envelope::parse_topic(&topic)
+            .expect("the inbox topic parses")
+            .delivery;
+        let item = snapshot_item(
+            accepted_key(&delivery, &event_id),
+            &validated,
+            Publication::Unverified,
+        )
+        .expect("the accepted frame projects");
+        assert_eq!(item.state_key, None);
+        let served = snapshot_json(&row().project_id, std::slice::from_ref(&item), None);
+        let first = served
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .cloned()
+            .expect("the snapshot serves the item");
+        let element = crate::harness::render_terse_item(&first, 4096);
+        assert!(
+            !element.contains("key=\""),
+            "a message has no state key to render:\n{element}"
         );
     }
 
@@ -7082,7 +7558,9 @@ mod breadcrumb_tests {
         );
 
         // A validation violation keeps its own name: "validation" alone would
-        // not separate the #143 near-miss spelling from an expired frame.
+        // not separate the #143 near-miss spelling from an expired frame. The
+        // name is `Violation::code`, the same token `federation emit` reports
+        // for the same rule (#102) — one refusal vocabulary, not two spellings.
         let violation = refusal_breadcrumb(
             STATE_TOPIC,
             &crate::transport::TransportError::Validation(
@@ -7090,7 +7568,7 @@ mod breadcrumb_tests {
             ),
         );
         assert!(
-            violation.contains("reason=validation:MissingLatestStateRevision"),
+            violation.contains("reason=validation:missing_latest_state_revision"),
             "{violation}"
         );
     }
@@ -7103,7 +7581,7 @@ mod breadcrumb_tests {
         for error in [
             crate::transport::TransportError::OriginNotAuthorized,
             crate::transport::TransportError::InvalidStateRevision,
-            crate::transport::TransportError::ConflictingWorkRevision,
+            crate::transport::TransportError::EventTombstone,
             crate::transport::TransportError::Expired,
             // The payload-carrying variant, and specifically the axis whose
             // name is a state key: this is the arm that invites frame content
@@ -7164,7 +7642,7 @@ mod breadcrumb_tests {
                 ),
             )
             .code(),
-            "validation:BindingMismatch(StateKey)"
+            "validation:binding_mismatch:state_key"
         );
     }
 

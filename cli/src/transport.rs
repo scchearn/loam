@@ -40,14 +40,7 @@ pub enum TransportError {
     InvalidStateRevision,
     EventTombstone,
     SemanticReplyMismatch,
-    InvalidWorkEnvelope,
-    InvalidWorkTransition,
-    TerminalWorkState,
-    PublicationUnverified,
-    WorkRevisionNotNewer,
-    ConflictingWorkRevision,
     InvalidLifecycleDuration,
-    InvalidRenewalInterval,
     OriginNotAuthorized,
     ClientQueue,
     Validation(Violation),
@@ -83,21 +76,16 @@ impl TransportError {
             Self::InvalidStateRevision => "invalid_state_revision",
             Self::EventTombstone => "event_tombstone",
             Self::SemanticReplyMismatch => "semantic_reply_mismatch",
-            Self::InvalidWorkEnvelope => "invalid_work_envelope",
-            Self::InvalidWorkTransition => "invalid_work_transition",
-            Self::TerminalWorkState => "terminal_work_state",
-            Self::PublicationUnverified => "publication_unverified",
-            Self::WorkRevisionNotNewer => "work_revision_not_newer",
-            Self::ConflictingWorkRevision => "conflicting_work_revision",
             Self::InvalidLifecycleDuration => "invalid_lifecycle_duration",
-            Self::InvalidRenewalInterval => "invalid_renewal_interval",
             Self::OriginNotAuthorized => "origin_not_authorized",
             Self::ClientQueue => "client_queue",
             // The violation is the whole diagnostic value here: "validation"
             // alone would not distinguish the #143 near-miss (a numeric
             // revision, refused as `MissingLatestStateRevision`) from a expired
-            // frame.
-            Self::Validation(violation) => return format!("validation:{violation:?}"),
+            // frame. `Violation::code` rather than its `Debug` name so a
+            // breadcrumb and the `federation emit` refusal an operator reads
+            // next to it name the same rule the same way (#102).
+            Self::Validation(violation) => return format!("validation:{}", violation.code()),
         };
         name.to_owned()
     }
@@ -124,16 +112,7 @@ impl std::fmt::Display for TransportError {
             Self::SemanticReplyMismatch => {
                 "inbox clearing requires a correlated semantic response or acknowledgement"
             }
-            Self::InvalidWorkEnvelope => "validated envelope is not a usable work-state claim",
-            Self::InvalidWorkTransition => "work-state transition is not allowed",
-            Self::TerminalWorkState => "terminal work state cannot transition",
-            Self::PublicationUnverified => "published work state requires Git reachability proof",
-            Self::WorkRevisionNotNewer => "work-state revision must increase",
-            Self::ConflictingWorkRevision => "work-state revision repeats with different content",
             Self::InvalidLifecycleDuration => "lifecycle durations must be positive and bounded",
-            Self::InvalidRenewalInterval => {
-                "renewal interval must be shorter than the lease duration"
-            }
             Self::OriginNotAuthorized => "authenticated transport identity cannot use topic origin",
             Self::ClientQueue => "MQTT client request queue is unavailable",
             Self::Validation(violation) => {
@@ -146,10 +125,18 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
+/// The durations the delivery path applies to a frame: how long a class of
+/// message stays valid, and how much clock disagreement between two machines is
+/// tolerated before a frame is treated as expired.
+///
+/// A `renewal_interval` lived here until #148. Nothing renewed anything: it was
+/// read only by the unwired `WorkTracker`, so it was a knob for a behavior the
+/// running system did not have.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifecycleConfig {
+    /// Caps the published message-expiry of a non-terminal work state, so a
+    /// producer that stops reporting stops being current on its own.
     lease_duration: chrono::Duration,
-    renewal_interval: chrono::Duration,
     event_expiry: chrono::Duration,
     inbox_expiry: chrono::Duration,
     clock_skew_tolerance: chrono::Duration,
@@ -158,12 +145,11 @@ pub struct LifecycleConfig {
 impl LifecycleConfig {
     pub fn new(
         lease_duration: chrono::Duration,
-        renewal_interval: chrono::Duration,
         event_expiry: chrono::Duration,
         inbox_expiry: chrono::Duration,
         clock_skew_tolerance: chrono::Duration,
     ) -> Result<Self, TransportError> {
-        if [lease_duration, renewal_interval, event_expiry, inbox_expiry]
+        if [lease_duration, event_expiry, inbox_expiry]
             .into_iter()
             .any(|duration| duration.num_seconds() <= 0)
             || clock_skew_tolerance < chrono::Duration::zero()
@@ -171,12 +157,8 @@ impl LifecycleConfig {
         {
             return Err(TransportError::InvalidLifecycleDuration);
         }
-        if renewal_interval >= lease_duration {
-            return Err(TransportError::InvalidRenewalInterval);
-        }
         Ok(Self {
             lease_duration,
-            renewal_interval,
             event_expiry,
             inbox_expiry,
             clock_skew_tolerance,
@@ -188,7 +170,6 @@ impl Default for LifecycleConfig {
     fn default() -> Self {
         Self {
             lease_duration: chrono::Duration::minutes(30),
-            renewal_interval: chrono::Duration::minutes(10),
             event_expiry: chrono::Duration::minutes(5),
             inbox_expiry: chrono::Duration::hours(24),
             clock_skew_tolerance: chrono::Duration::seconds(30),
@@ -829,30 +810,9 @@ fn digest(payload: &[u8]) -> String {
     sha256.finish()
 }
 
-/// Content identity for a work-state frame.
-///
-/// The latest-state admission digests the retained bytes it was handed; this
-/// layer is handed a parsed envelope and no bytes, so identity is taken over the
-/// fields that carry the work *statement*: the payload (which holds the state),
-/// the human summary, and the claimed artifacts. Envelope id and timestamps are
-/// deliberately excluded — a retained frame redelivered with fresh clock
-/// metadata restates the same work and must not read as a contradiction. The
-/// unit separators keep field boundaries unambiguous, so no rearrangement of
-/// content across fields can collide.
-fn work_content_digest(envelope: &crate::envelope::Envelope) -> String {
-    let mut canonical = String::new();
-    canonical.push_str(&envelope.data.summary);
-    canonical.push('\u{1e}');
-    canonical.push_str(&envelope.data.payload.to_json());
-    for artifact in &envelope.data.context.artifacts {
-        canonical.push('\u{1e}');
-        canonical.push_str(&artifact.kind);
-        canonical.push('\u{1f}');
-        canonical.push_str(&artifact.id);
-    }
-    digest(canonical.as_bytes())
-}
-
+/// The work states a `latest-state` payload may report. Read on the publish
+/// path, which caps a non-terminal state's message expiry at the lease duration
+/// so a producer that goes quiet stops being current.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkStatus {
     Active,
@@ -876,314 +836,6 @@ impl WorkStatus {
 
     fn is_terminal(self) -> bool {
         matches!(self, Self::Published | Self::Abandoned)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OverlapWarning {
-    pub artifact_kind: String,
-    pub artifact_id: String,
-    pub activity_origin: String,
-    pub activity_key: String,
-    pub conflicting_origin: String,
-    pub conflicting_key: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkObservation {
-    pub status: WorkStatus,
-    pub warnings: Vec<OverlapWarning>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkClassification {
-    Current(WorkStatus),
-    StaleInterrupted,
-}
-
-pub struct WorkTracker {
-    capacity: usize,
-    lifecycle: LifecycleConfig,
-    activities: VecDeque<TrackedWork>,
-}
-
-struct TrackedWork {
-    origin: String,
-    key: String,
-    revision: u64,
-    content: String,
-    status: WorkStatus,
-    artifacts: Vec<(String, String)>,
-    lease_expires_at: DateTime<Utc>,
-    renewal_due_at: DateTime<Utc>,
-}
-
-impl WorkTracker {
-    pub fn new(capacity: usize) -> Result<Self, TransportError> {
-        Self::with_lifecycle(capacity, LifecycleConfig::default())
-    }
-
-    pub fn with_lifecycle(
-        capacity: usize,
-        lifecycle: LifecycleConfig,
-    ) -> Result<Self, TransportError> {
-        if capacity == 0 {
-            return Err(TransportError::ZeroTrackingCapacity);
-        }
-        Ok(Self {
-            capacity,
-            lifecycle,
-            activities: VecDeque::with_capacity(capacity),
-        })
-    }
-
-    pub fn observe(
-        &mut self,
-        envelope: &ValidatedEnvelope,
-    ) -> Result<WorkObservation, TransportError> {
-        self.observe_with_proof(envelope, None)
-    }
-
-    pub fn observe_verified(
-        &mut self,
-        envelope: &ValidatedEnvelope,
-        proof: &PublicationProof,
-    ) -> Result<WorkObservation, TransportError> {
-        self.observe_with_proof(envelope, Some(proof))
-    }
-
-    fn observe_with_proof(
-        &mut self,
-        envelope: &ValidatedEnvelope,
-        proof: Option<&PublicationProof>,
-    ) -> Result<WorkObservation, TransportError> {
-        let envelope = envelope.as_envelope();
-        if envelope.message_type != "io.loam.work.state"
-            || envelope.data.delivery.class != "latest-state"
-        {
-            return Err(TransportError::InvalidWorkEnvelope);
-        }
-        let status = envelope
-            .data
-            .payload
-            .get("state")
-            .and_then(crate::json::Value::as_str)
-            .and_then(WorkStatus::from_wire)
-            .ok_or(TransportError::InvalidWorkEnvelope)?;
-        if status == WorkStatus::Published
-            && proof.is_none_or(|proof| {
-                let context = &envelope.data.context;
-                context.git.as_ref().and_then(|git| git.commit.as_deref())
-                    != Some(proof.commit.as_str())
-                    || context.org_id != proof.scope.organization_id
-                    || context.project_id != proof.scope.project_id
-                    || context.repository_id != proof.scope.repository_id
-            })
-        {
-            return Err(TransportError::PublicationUnverified);
-        }
-        let key = envelope
-            .data
-            .delivery
-            .key
-            .as_deref()
-            .ok_or(TransportError::InvalidWorkEnvelope)?;
-        let revision = envelope
-            .data
-            .delivery
-            .revision
-            .as_deref()
-            .and_then(|value| value.parse::<u64>().ok())
-            .ok_or(TransportError::InvalidWorkEnvelope)?;
-        let origin = &envelope.data.from.instance_id;
-        let observed_at = DateTime::parse_from_rfc3339(&envelope.time)
-            .map_err(|_| TransportError::InvalidWorkEnvelope)?
-            .with_timezone(&Utc);
-        let claimed_expiry = DateTime::parse_from_rfc3339(&envelope.data.expires_at)
-            .map_err(|_| TransportError::InvalidWorkEnvelope)?
-            .with_timezone(&Utc);
-        let maximum_lease = observed_at
-            .checked_add_signed(self.lifecycle.lease_duration)
-            .ok_or(TransportError::InvalidWorkEnvelope)?;
-        let lease_expires_at = claimed_expiry.min(maximum_lease);
-        if lease_expires_at <= observed_at {
-            return Err(TransportError::InvalidWorkEnvelope);
-        }
-        let renewal_due_at = observed_at
-            .checked_add_signed(self.lifecycle.renewal_interval)
-            .ok_or(TransportError::InvalidWorkEnvelope)?;
-        let content = work_content_digest(envelope);
-        let previous = self
-            .activities
-            .iter()
-            .position(|activity| activity.origin == *origin && activity.key == key);
-        if let Some(index) = previous {
-            if revision < self.activities[index].revision {
-                return Err(TransportError::WorkRevisionNotNewer);
-            }
-            // Equal revision, different content is a distinct fault from a stale
-            // frame, and the latest-state admission already separates the two
-            // (`DuplicateState` vs `ConflictingState`). This layer used to fold
-            // both into "not newer" and drop the collision without a word (#144).
-            //
-            // Status, so the comment above is not read as a claim about the
-            // running system: `WorkTracker` has no production caller. The live
-            // receiving path is `DeliveryProcessor::receive` -> `receive_state`,
-            // which never consults this type; it is exercised only by tests. So
-            // this closes the asymmetry *in the layer*, and nothing stands
-            // between a misbehaving producer and a swallowed contradiction on
-            // the delivery path today, wired or otherwise. Wiring it in — or
-            // deleting it — is tracked separately.
-            if revision == self.activities[index].revision {
-                return if content == self.activities[index].content {
-                    Err(TransportError::WorkRevisionNotNewer)
-                } else {
-                    Err(TransportError::ConflictingWorkRevision)
-                };
-            }
-            let current = self.activities[index].status;
-            if current.is_terminal() {
-                return Err(TransportError::TerminalWorkState);
-            }
-            if !valid_work_transition(current, status) {
-                return Err(TransportError::InvalidWorkTransition);
-            }
-            self.activities.remove(index);
-        }
-        let artifacts = envelope
-            .data
-            .context
-            .artifacts
-            .iter()
-            .map(|artifact| (artifact.kind.clone(), artifact.id.clone()))
-            .collect();
-        push_bounded(
-            &mut self.activities,
-            self.capacity,
-            TrackedWork {
-                origin: origin.clone(),
-                key: key.to_owned(),
-                revision,
-                content,
-                status,
-                artifacts,
-                lease_expires_at,
-                renewal_due_at,
-            },
-        );
-        Ok(WorkObservation {
-            status,
-            warnings: self.overlap_warnings(origin, key),
-        })
-    }
-
-    pub fn status(&self, origin: &str, key: &str) -> Option<WorkStatus> {
-        self.activities
-            .iter()
-            .find(|activity| activity.origin == origin && activity.key == key)
-            .map(|activity| activity.status)
-    }
-
-    pub fn classification(
-        &self,
-        origin: &str,
-        key: &str,
-        now: DateTime<Utc>,
-    ) -> Option<WorkClassification> {
-        let activity = self
-            .activities
-            .iter()
-            .find(|activity| activity.origin == origin && activity.key == key)?;
-        let stale_after = activity
-            .lease_expires_at
-            .checked_add_signed(self.lifecycle.clock_skew_tolerance)?;
-        if !activity.status.is_terminal() && now > stale_after {
-            Some(WorkClassification::StaleInterrupted)
-        } else {
-            Some(WorkClassification::Current(activity.status))
-        }
-    }
-
-    pub fn renewal_due(&self, origin: &str, key: &str, now: DateTime<Utc>) -> bool {
-        self.activities
-            .iter()
-            .find(|activity| activity.origin == origin && activity.key == key)
-            .is_some_and(|activity| {
-                !activity.status.is_terminal()
-                    && now >= activity.renewal_due_at
-                    && self.classification(origin, key, now)
-                        != Some(WorkClassification::StaleInterrupted)
-            })
-    }
-
-    pub fn len(&self) -> usize {
-        self.activities.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.activities.is_empty()
-    }
-
-    fn overlap_warnings(&self, origin: &str, key: &str) -> Vec<OverlapWarning> {
-        let Some(activity) = self
-            .activities
-            .iter()
-            .find(|activity| activity.origin == origin && activity.key == key)
-        else {
-            return Vec::new();
-        };
-        if activity.status.is_terminal() {
-            return Vec::new();
-        }
-        let mut warnings = Vec::new();
-        for other in self.activities.iter().filter(|other| {
-            (other.origin != activity.origin || other.key != activity.key)
-                && !other.status.is_terminal()
-        }) {
-            for (kind, id) in activity
-                .artifacts
-                .iter()
-                .filter(|artifact| other.artifacts.contains(artifact))
-            {
-                warnings.push(overlap_warning(activity, other, kind, id));
-                warnings.push(overlap_warning(other, activity, kind, id));
-            }
-        }
-        warnings
-    }
-}
-
-fn valid_work_transition(current: WorkStatus, next: WorkStatus) -> bool {
-    match current {
-        WorkStatus::Active => matches!(
-            next,
-            WorkStatus::Active | WorkStatus::Blocked | WorkStatus::Ready | WorkStatus::Abandoned
-        ),
-        WorkStatus::Blocked => matches!(
-            next,
-            WorkStatus::Active | WorkStatus::Blocked | WorkStatus::Ready | WorkStatus::Abandoned
-        ),
-        WorkStatus::Ready => matches!(
-            next,
-            WorkStatus::Ready | WorkStatus::Published | WorkStatus::Abandoned
-        ),
-        WorkStatus::Published | WorkStatus::Abandoned => false,
-    }
-}
-
-fn overlap_warning(
-    activity: &TrackedWork,
-    other: &TrackedWork,
-    artifact_kind: &str,
-    artifact_id: &str,
-) -> OverlapWarning {
-    OverlapWarning {
-        artifact_kind: artifact_kind.to_owned(),
-        artifact_id: artifact_id.to_owned(),
-        activity_origin: activity.origin.clone(),
-        activity_key: activity.key.clone(),
-        conflicting_origin: other.origin.clone(),
-        conflicting_key: other.key.clone(),
     }
 }
 
@@ -1794,7 +1446,6 @@ mod tests {
         let now = test_time("2026-07-24T14:21:00Z");
         let lifecycle = LifecycleConfig::new(
             chrono::Duration::minutes(3),
-            chrono::Duration::minutes(1),
             chrono::Duration::seconds(45),
             chrono::Duration::seconds(90),
             chrono::Duration::seconds(10),
@@ -1856,15 +1507,17 @@ mod tests {
             ),
             Ok(ReceiveOutcome::Accepted(_))
         ));
+        // The remaining bound worth pinning: a skew tolerance larger than the
+        // lease it is tolerated against is not a configuration, it is an expiry
+        // that can never fire.
         assert_eq!(
             LifecycleConfig::new(
                 chrono::Duration::minutes(3),
-                chrono::Duration::minutes(3),
                 chrono::Duration::seconds(45),
                 chrono::Duration::seconds(90),
-                chrono::Duration::seconds(10),
+                chrono::Duration::minutes(4),
             ),
-            Err(TransportError::InvalidRenewalInterval)
+            Err(TransportError::InvalidLifecycleDuration)
         );
     }
 
@@ -1945,134 +1598,6 @@ mod tests {
             validate_semantic_clear(&request, &request),
             Err(TransportError::SemanticReplyMismatch)
         );
-    }
-
-    #[test]
-    fn collaboration_fixture_enforces_state_machine_and_overlap() {
-        let cases = json::parse(include_str!(
-            "../tests/fixtures/mqtt/collaboration-cases.json"
-        ))
-        .expect("collaboration cases should parse");
-        for case in cases
-            .as_array()
-            .expect("collaboration cases should be an array")
-        {
-            let name = case
-                .get("name")
-                .and_then(Value::as_str)
-                .expect("collaboration case should have a name");
-            let expected = case
-                .get("expected")
-                .and_then(Value::as_str)
-                .expect("collaboration case should have an expected result");
-            assert_eq!(
-                exercise_collaboration_case(name, case),
-                expected,
-                "case {name}"
-            );
-        }
-    }
-
-    fn exercise_collaboration_case(name: &str, case: &Value) -> &'static str {
-        let now = test_time("2026-07-24T14:21:00Z");
-        let mut tracker = WorkTracker::new(8).expect("bounded work tracker should configure");
-        if name == "stable_artifact_overlap" {
-            let first =
-                validated_work_state("instance-01", "employee-184", 1, "active", "SB-42", now);
-            let second =
-                validated_work_state("instance-02", "employee-191", 1, "active", "SB-42", now);
-            tracker
-                .observe(&first)
-                .expect("first activity should be accepted");
-            let observed = tracker
-                .observe(&second)
-                .expect("overlap should warn, not reject");
-            return if observed.warnings.len() == 2 && tracker.len() == 2 {
-                "two_warnings"
-            } else {
-                "wrong_overlap"
-            };
-        }
-        if name == "non_increasing_revision" {
-            let first =
-                validated_work_state("instance-01", "employee-184", 2, "active", "SB-42", now);
-            let stale =
-                validated_work_state("instance-01", "employee-184", 1, "blocked", "SB-42", now);
-            tracker
-                .observe(&first)
-                .expect("first activity should be accepted");
-            return match tracker.observe(&stale) {
-                Err(TransportError::WorkRevisionNotNewer) => "revision_not_newer",
-                other => panic!("unexpected stale work revision outcome: {other:?}"),
-            };
-        }
-        // The two halves of the equal-revision split (#144). A redelivered frame
-        // is a duplicate and stays a plain "not newer"; the same revision
-        // carrying *different* work is the collision this layer used to swallow.
-        if name == "equal_revision_duplicate" {
-            let first =
-                validated_work_state("instance-01", "employee-184", 2, "active", "SB-42", now);
-            let again =
-                validated_work_state("instance-01", "employee-184", 2, "active", "SB-42", now);
-            tracker
-                .observe(&first)
-                .expect("first activity should be accepted");
-            return match tracker.observe(&again) {
-                Err(TransportError::WorkRevisionNotNewer) => "revision_not_newer",
-                other => panic!("unexpected duplicate work revision outcome: {other:?}"),
-            };
-        }
-        if name == "equal_revision_conflict" {
-            let first =
-                validated_work_state("instance-01", "employee-184", 2, "active", "SB-42", now);
-            let conflict =
-                validated_work_state("instance-01", "employee-184", 2, "blocked", "SB-42", now);
-            tracker
-                .observe(&first)
-                .expect("first activity should be accepted");
-            let outcome = match tracker.observe(&conflict) {
-                Err(TransportError::ConflictingWorkRevision) => "conflicting_revision",
-                other => panic!("unexpected conflicting work revision outcome: {other:?}"),
-            };
-            // The refused frame must not have displaced the stored activity: a
-            // conflict is a signal, not an admission.
-            assert_eq!(
-                tracker.status("instance-01", "activity-01K6Q5"),
-                Some(WorkStatus::Active),
-                "a refused conflicting frame must leave the tracked activity intact"
-            );
-            return outcome;
-        }
-
-        for (index, state) in case
-            .get("states")
-            .and_then(Value::as_array)
-            .expect("transition case should have states")
-            .iter()
-            .enumerate()
-        {
-            let state = state.as_str().expect("state should be a string");
-            let envelope = validated_work_state(
-                "instance-01",
-                "employee-184",
-                index as u64 + 1,
-                state,
-                "SB-42",
-                now,
-            );
-            if let Err(error) = tracker.observe(&envelope) {
-                return match error {
-                    TransportError::TerminalWorkState => "terminal_transition",
-                    TransportError::InvalidWorkTransition => "invalid_transition",
-                    other => panic!("unexpected work transition error: {other:?}"),
-                };
-            }
-        }
-        match tracker.status("instance-01", "activity-01K6Q5") {
-            Some(WorkStatus::Ready) => "ready",
-            Some(WorkStatus::Abandoned) => "abandoned",
-            other => panic!("unexpected final work state: {other:?}"),
-        }
     }
 
     #[test]
@@ -2254,45 +1779,6 @@ mod tests {
             now,
         )
         .expect("fixture should validate")
-    }
-
-    fn validated_work_state(
-        origin: &str,
-        principal_id: &str,
-        revision: u64,
-        state: &str,
-        artifact_id: &str,
-        now: DateTime<Utc>,
-    ) -> ValidatedEnvelope {
-        let topic = format!("loam/v1/org-3A1/project-7M3/state/{origin}/activity-01K6Q5");
-        let frame =
-            String::from_utf8(include_bytes!("../tests/fixtures/mqtt/work-state.json").to_vec())
-                .expect("work-state fixture should be UTF-8")
-                .replace(
-                    "urn:loam:instance:instance-01",
-                    &format!("urn:loam:instance:{origin}"),
-                )
-                .replace(
-                    "\"principal_id\": \"employee-184\"",
-                    &format!("\"principal_id\": \"{principal_id}\""),
-                )
-                .replace(
-                    "\"instance_id\": \"instance-01\"",
-                    &format!("\"instance_id\": \"{origin}\""),
-                )
-                .replace("01K6Q6ESWMT48TPB", &format!("work-{origin}-{revision}"))
-                .replace("\"revision\": 7", &format!("\"revision\": {revision}"))
-                .replace("\"state\": \"ready\"", &format!("\"state\": \"{state}\""))
-                .replace("SB-42", artifact_id);
-        let principal = AuthenticatedPrincipal::new(principal_id, &[]);
-        crate::envelope::validate(
-            frame.as_bytes(),
-            &topic,
-            &principal,
-            &ValidationConfig::default(),
-            now,
-        )
-        .expect("generated work-state fixture should validate")
     }
 
     fn state_frame(revision: u64, id: &str, summary: &str) -> String {

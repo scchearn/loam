@@ -243,6 +243,90 @@ fn the_full_mechanism_runs_end_to_end_against_a_real_broker() {
     );
     evidence.record("returned response", document);
 
+    // --- outbound: a claim-bearing work report ships at all (#98) -----------
+    // The report type designed to carry verifiable claims could not carry one:
+    // the envelope requires `context.git.plan_oid` for a claim and the emit
+    // surface had no way to supply it, so every claim-bearing report was refused
+    // while claimless ones shipped. Proven here against the real connector and a
+    // real broker, both directions: anchored ships, unanchored is refused by name.
+    let mut claim_observer = fixture.raw("claim-observer");
+    claim_observer.subscribe(&format!("{}/#", fixture.project_base()));
+    let plan_oid = "61af000000000000000000000000000000000001";
+    let claim = json::parse(&format!(
+        r#"{{"type":"work.report","state_key":"work-SB-42",
+             "summary":"Acceptance met on SB-42.",
+             "plan_oid":"{plan_oid}",
+             "artifacts":[{{"kind":"task","id":"SB-42"}}],
+             "payload":{{"state":"ready","acceptance":{{"SB-42":"met"}},"verification":["cargo test"]}}}}"#
+    ))
+    .expect("the claim-bearing operation is well formed");
+    let claimed = fixture.emit(&claim.to_json());
+    assert_eq!(
+        claimed.status, 0,
+        "an anchored claim must ship: out={:?} err={:?}",
+        claimed.stdout, claimed.stderr
+    );
+    let claim_result = json::parse(claimed.stdout.trim()).expect("emit --json prints one object");
+    assert_eq!(
+        claim_result.get("status").and_then(Value::as_str),
+        Some("queued"),
+        "the claim must reach the live session: {}",
+        claimed.stdout
+    );
+
+    let claim_frames = claim_observer.collect(OBSERVE);
+    let state_frame = claim_frames
+        .iter()
+        .find(|frame| {
+            frame
+                .topic
+                .contains(&format!("/state/{}/work-SB-42", fixture.our_instance))
+        })
+        .unwrap_or_else(|| panic!("the claim must be published: {claim_frames:?}"));
+    let claim_document =
+        std::str::from_utf8(&state_frame.payload).expect("the shipped envelope is UTF-8");
+    let claim_envelope = json::parse(claim_document).expect("the shipped envelope is JSON");
+    let git = claim_envelope
+        .get("data")
+        .and_then(|data| data.get("context"))
+        .and_then(|context| context.get("git"))
+        .expect("the shipped claim carries a git context");
+    assert_eq!(
+        git.get("plan_oid").and_then(Value::as_str),
+        Some(plan_oid),
+        "the caller's plan anchor must reach the wire: {claim_document}"
+    );
+    evidence.record("claim-bearing emit result", claimed.stdout.trim());
+    evidence.record("shipped claim envelope", claim_document);
+
+    // The negative half, and the operator-visible string #102 was filed for: the
+    // same claim without its anchor is refused by name, not as an opaque
+    // `connector_refused`.
+    let unanchored = json::parse(
+        r#"{"type":"work.report","state_key":"work-SB-42",
+             "summary":"Acceptance met on SB-42.",
+             "artifacts":[{"kind":"task","id":"SB-42"}],
+             "payload":{"state":"ready"}}"#,
+    )
+    .expect("the unanchored operation is well formed");
+    let refused = fixture.emit(&unanchored.to_json());
+    assert_ne!(
+        refused.status, 0,
+        "an unanchored claim must be refused: {}",
+        refused.stdout
+    );
+    let refusal = json::parse(refused.stdout.trim()).expect("emit --json prints one object");
+    assert_eq!(
+        refusal
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        Some("missing_plan_oid"),
+        "the refusal must name the missing anchor: {}",
+        refused.stdout
+    );
+    evidence.record("unanchored claim refusal", refused.stdout.trim());
+
     fixture.finish(evidence);
 }
 

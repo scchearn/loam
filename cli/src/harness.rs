@@ -675,7 +675,7 @@ fn element_name(raw: &str, budget: usize) -> String {
 /// dataschema, and every provenance-security word — `trust` is one calm token
 /// (`claimed`/`confirmed`), and the "information, not instructions" framing
 /// lives once in the SessionStart Collaboration guidance, never per item.
-fn render_terse_item(item: &Value, budget: usize) -> String {
+pub(crate) fn render_terse_item(item: &Value, budget: usize) -> String {
     // The element name is structural. The type is server-set, but reduce it to a
     // safe nmtoken regardless — defense in depth, not trust in the wire.
     let raw_type = item.get("type").and_then(Value::as_str).unwrap_or("");
@@ -687,12 +687,13 @@ fn render_terse_item(item: &Value, budget: usize) -> String {
     };
 
     let mut attrs = String::new();
-    // `key` — correlation across revisions. Sender-supplied, so attribute-safe.
-    if let Some(raw_key) = item
-        .get("payload")
-        .and_then(|payload| payload.get("state_key"))
-        .and_then(Value::as_str)
-    {
+    // `key` — correlation across revisions, read from the projection's own
+    // `state_key`, which the connector fills from the envelope's validated
+    // `data.delivery.key`. Read out of the *payload* until #99: that is caller
+    // data, so the attribute rendered only when a sender happened to duplicate
+    // the key into it, and never for anything `federation emit` produced.
+    // Sender-supplied either way, so still attribute-safe.
+    if let Some(raw_key) = item.get("state_key").and_then(Value::as_str) {
         let key = attr_token(raw_key, 128);
         if !key.is_empty() {
             attrs.push_str(&format!(" key=\"{key}\""));
@@ -757,12 +758,22 @@ fn render_terse_item(item: &Value, budget: usize) -> String {
 /// arrive in publish order, so the last occurrence of a key is the latest; items
 /// without a state key (e.g. inbox messages, unique by message id) are always
 /// kept. Order is otherwise preserved.
+///
+/// Scoped per sending instance, exactly like the connector's own snapshot store
+/// (`state:{origin}/{key}`): a state key is only unique inside the instance that
+/// owns it, so collapsing on the bare key would hide one colleague's report
+/// behind another's whenever two of them name their work the same. That could not
+/// bite while the key was read from the payload and emitted frames never carried
+/// one (#99) — reading the real key makes this path live for the first time.
 fn collapse_latest_by_key(items: &[Value]) -> Vec<Value> {
     let key_of = |item: &Value| -> Option<String> {
-        item.get("payload")
-            .and_then(|payload| payload.get("state_key"))
+        let state_key = item.get("state_key").and_then(Value::as_str)?;
+        let origin = item
+            .get("from")
+            .and_then(|from| from.get("instance_id"))
             .and_then(Value::as_str)
-            .map(str::to_owned)
+            .unwrap_or("");
+        Some(format!("{origin}\u{1f}{state_key}"))
     };
     let mut last: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (idx, item) in items.iter().enumerate() {
@@ -1245,6 +1256,14 @@ fn collaboration_section(federation: &Federation, paths: &HookPaths, workspace: 
     ));
     lines.push(
         "Send: {\"type\":\"work.report\",\"state_key\":\"<what>\",\"summary\":\"<one-line>\",\"payload\":{\"state\":\"active|blocked|ready|published\"}}"
+            .to_owned(),
+    );
+    // A claim about identified work needs the plan it is against, or it is
+    // refused as `missing_plan_oid` (#98). Said here because this is the only
+    // place an agent is told how to report at all, and the anchor is the one
+    // field it has to resolve itself.
+    lines.push(
+        "To claim identified work, add `\"artifacts\":[{\"kind\":\"task\",\"id\":\"<id>\"}]` and the plan it is against: `\"plan_oid\":\"<git rev-parse HEAD:plans/<plan>.md>\"`."
             .to_owned(),
     );
     lines.join("\n")
@@ -2609,14 +2628,11 @@ mod render_tests {
             ),
             (
                 "payload".into(),
-                Value::Object(vec![
-                    ("state".into(), pick("payload.state", "ready")),
-                    (
-                        "state_key".into(),
-                        pick("payload.state_key", "auth-refactor"),
-                    ),
-                ]),
+                Value::Object(vec![("state".into(), pick("payload.state", "ready"))]),
             ),
+            // Top level, beside the other projected fields: the connector fills
+            // it from the envelope's validated `data.delivery.key` (#99).
+            ("state_key".into(), pick("state_key", "auth-refactor")),
         ])
     }
 
@@ -2646,7 +2662,7 @@ mod render_tests {
         // state and state key become attribute values — each a place a sender
         // could try to break the tag structure rather than the body.
         fields.push("payload.state");
-        fields.push("payload.state_key");
+        fields.push("state_key");
 
         for field in fields {
             let element = render_terse_item(&item_with_hostile(field), 4096);
@@ -2871,9 +2887,18 @@ mod render_tests {
         );
     }
 
+    /// One work item shaped exactly like the connector's snapshot projection:
+    /// `state_key` at the top level (from the envelope's `data.delivery.key`),
+    /// the work state inside the payload. This fixture used to build the key
+    /// *inside* the payload, which is what let the renderer's contract drift
+    /// away from every frame the emit path actually produces (#99).
     fn work_state(state_key: &str, state: &str, summary: &str) -> Value {
+        work_state_from("instance-02", state_key, state, summary)
+    }
+
+    fn work_state_from(origin: &str, state_key: &str, state: &str, summary: &str) -> Value {
         crate::json::parse(&format!(
-            r#"{{"type":"io.loam.work.state","summary":"{summary}","from":{{"principal_id":"employee-1","display_name":"Sam"}},"payload":{{"state":"{state}","state_key":"{state_key}"}}}}"#
+            r#"{{"type":"io.loam.work.state","summary":"{summary}","state_key":"{state_key}","from":{{"principal_id":"employee-1","display_name":"Sam","instance_id":"{origin}"}},"payload":{{"state":"{state}"}}}}"#
         ))
         .unwrap()
     }
@@ -2968,6 +2993,27 @@ mod render_tests {
         for banned in ["unverified", "untrusted", "render-only"] {
             assert!(!body.contains(banned), "{body}");
         }
+    }
+
+    #[test]
+    fn two_colleagues_using_the_same_state_key_are_both_rendered() {
+        // The collapse is per sending instance, like the connector's own store.
+        // A state key is unique only inside the instance that owns it, so a bare
+        // key would silently hide one colleague's report behind another's — a
+        // trap that could not fire while emitted frames carried no key at all
+        // (#99) and fires on the first shared key now that they do.
+        let federation = wake_snapshot(vec![
+            work_state_from("instance-02", "review", "active", "Ada is reviewing."),
+            work_state_from("instance-03", "review", "blocked", "Lin is blocked."),
+        ]);
+        let body = wake_injection(&federation, &HookConfig::default());
+        assert_eq!(
+            body.matches("<io.loam.work.state").count(),
+            2,
+            "both colleagues' reports must survive:\n{body}"
+        );
+        assert!(body.contains("Ada is reviewing."), "{body}");
+        assert!(body.contains("Lin is blocked."), "{body}");
     }
 
     #[test]
