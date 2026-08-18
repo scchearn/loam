@@ -853,8 +853,18 @@ impl MqttTransport {
         {
             Ok(outcome) => Ok(Some((topic, outcome))),
             // A rejected frame is a sender's problem, not a session failure: the
-            // pump keeps running and the snapshot simply never sees it.
-            Err(_) => Ok(None),
+            // pump keeps running and the snapshot simply never sees it. The
+            // breadcrumb is emitted here rather than in the pump because the
+            // refusal is swallowed here — the pump sees the same `Ok(None)` a
+            // poll timeout produces and cannot tell the two apart. This is the
+            // motivating incident's downstream symptom: a peer missing from the
+            // roster refuses every one of its frames as `OriginNotAuthorized`,
+            // which is exactly the "every peer frame refused, zero external
+            // signal" this logging exists to end (#103).
+            Err(error) => {
+                breadcrumb!("{}", refusal_breadcrumb(&topic, &error));
+                Ok(None)
+            }
         }
     }
 
@@ -1147,37 +1157,43 @@ impl ChannelRegistry {
             .unwrap_or(true)
     }
 
-    /// Enqueue one admitted item into every registered session's mailbox for
-    /// the given project. Non-blocking: a full queue drops the oldest item
+    /// Enqueue a batch of admitted items into every registered session's mailbox
+    /// for the given project. Non-blocking: a full queue drops the oldest item
     /// (same eviction as the snapshot store). Never blocks the receive loop.
     ///
-    /// Returns how many sessions the item was enqueued into, so the caller can
-    /// say whether an admitted item actually reached anyone (#103). Zero is a
-    /// normal state — no local session is registered — not a failure.
-    pub fn push(&self, project_id: &str, item: &SnapshotItem, capacity: usize) -> usize {
-        let Ok(mut inner) = self.inner.lock() else {
-            return 0;
-        };
-        {
-            // Collect the matching session ids first: the mailboxes map is
-            // borrowed mutably per entry, so the sessions map cannot stay
-            // borrowed across it.
-            let session_ids: Vec<String> = inner
-                .sessions
-                .values()
-                .filter(|channel| channel.project_id == project_id)
-                .map(|channel| channel.session_id.clone())
-                .collect();
-            let delivered = session_ids.len();
-            for session_id in session_ids {
-                let queue = inner.mailboxes.entry(session_id).or_default();
+    /// The batch is the unit because the caller's batch is the unit: the pump
+    /// pushes a whole snapshot per admitted change, and every item in it targets
+    /// the same project and therefore the same session set. Taking the lock once
+    /// and resolving that set once means the fanout is a single fact rather than
+    /// one derived per item and reported from whichever happened to be last.
+    ///
+    /// Returns how many sessions the batch was enqueued into, so the caller can
+    /// say whether an admitted item actually reached anyone (#103). `Some(0)` is
+    /// a normal state — no local session is registered. `None` means the registry
+    /// lock is poisoned and nothing was enqueued, which is a fault and must not
+    /// be reported as "reached nobody".
+    pub fn push(&self, project_id: &str, items: &[SnapshotItem], capacity: usize) -> Option<usize> {
+        let mut inner = self.inner.lock().ok()?;
+        // Collect the matching session ids first: the mailboxes map is
+        // borrowed mutably per entry, so the sessions map cannot stay
+        // borrowed across it.
+        let session_ids: Vec<String> = inner
+            .sessions
+            .values()
+            .filter(|channel| channel.project_id == project_id)
+            .map(|channel| channel.session_id.clone())
+            .collect();
+        let delivered = session_ids.len();
+        for session_id in session_ids {
+            let queue = inner.mailboxes.entry(session_id).or_default();
+            for item in items {
                 if queue.len() == capacity {
                     queue.pop_front();
                 }
                 queue.push_back(item.clone());
             }
-            delivered
         }
+        Some(delivered)
     }
 
     /// Drain one session's mailbox, oldest first, consuming every item that
@@ -1265,6 +1281,18 @@ struct WakeFailure {
     port: Option<String>,
     reason: &'static str,
 }
+
+/// How many malformed member cards one established session logs individually
+/// before it switches to counting them.
+///
+/// Retained cards replay on every subscribe and the connector re-subscribes on
+/// every re-establishment — which this design deliberately makes frequent, via
+/// the watchdog's exit-75 plus supervisor respawn. A systemic parser bug, which
+/// is the incident this logging exists for, therefore costs cards x reconnects
+/// lines and grows without bound in time on a long-lived daemon. Logging the
+/// first few per session still shows how widespread the failure is (the thing a
+/// once-per-session latch hid); the tail only repeats it.
+const CARD_REJECTION_LOG_LIMIT: usize = 8;
 
 fn wake_all(channels: &ChannelRegistry, project_id: &str, hint: Option<&str>) {
     // Collect targets under the lock, then do the I/O after it is dropped: a
@@ -2477,24 +2505,84 @@ fn log_admission(project_id: &str, topic: &str, outcome: &ReceiveOutcome) {
 /// The admission line itself, split out so the content rules above are pinned by
 /// a test rather than by review alone.
 fn admission_breadcrumb(project_id: &str, topic: &str, outcome: &ReceiveOutcome) -> String {
-    let (class, origin) = match crate::envelope::parse_topic(topic) {
-        Ok(parsed) => (
-            parsed.delivery.envelope_class().to_owned(),
-            parsed.delivery.origin().to_owned(),
-        ),
+    let (class, origin) = topic_projection(topic);
+    format!(
+        "admission project={project_id} class={class} origin={origin} outcome={} event={}",
+        outcome.code(),
+        logged_event_id(outcome)
+    )
+}
+
+/// The breadcrumb for a frame the delivery processor refused outright.
+///
+/// Same content rules and same vocabulary source as the admission line: the
+/// typed violation's own code, never the frame. The project comes from the
+/// topic because the refusal is logged where it happens, one layer below the
+/// pump that knows the session's project.
+fn refusal_breadcrumb(topic: &str, error: &crate::transport::TransportError) -> String {
+    let (class, origin) = topic_projection(topic);
+    let project = crate::envelope::parse_topic(topic)
+        .map(|parsed| parsed.project.to_owned())
+        .unwrap_or_else(|_| "-".to_owned());
+    format!(
+        "admission project={project} class={class} origin={origin} outcome=refused reason={}",
+        error.code()
+    )
+}
+
+/// The mailbox-push breadcrumb.
+///
+/// `fanout` is `None` when the channel registry's lock is poisoned: nothing was
+/// enqueued, and saying `sessions=0` there would report a fault as the ordinary
+/// "no local session is registered".
+fn mailbox_breadcrumb(
+    project_id: &str,
+    outcome: &ReceiveOutcome,
+    items: usize,
+    fanout: Option<usize>,
+) -> String {
+    let sessions = match fanout {
+        Some(sessions) => sessions.to_string(),
+        None => "unavailable".to_owned(),
+    };
+    format!(
+        "mailbox push project={project_id} event={} items={items} sessions={sessions}",
+        logged_event_id(outcome)
+    )
+}
+
+/// The content-free half of a topic: its delivery class and origin instance.
+/// Deliberately drops the state key and the message id, which are the parts a
+/// caller chooses.
+fn topic_projection(topic: &str) -> (String, String) {
+    match crate::envelope::parse_topic(topic) {
+        Ok(parsed) => {
+            let origin = parsed.delivery.origin();
+            (
+                parsed.delivery.envelope_class().to_owned(),
+                if origin.is_empty() { "-" } else { origin }.to_owned(),
+            )
+        }
         // A topic the parser refuses never reaches the store; say so rather
         // than dropping the frame from the record entirely.
-        Err(violation) => (format!("unparsed({violation:?})"), String::new()),
-    };
-    let event = match outcome {
+        Err(violation) => (format!("unparsed({violation:?})"), "-".to_owned()),
+    }
+}
+
+/// The event id a breadcrumb may carry: an admitted envelope's own id, and
+/// otherwise nothing.
+///
+/// Only `Accepted` carries an envelope, and therefore an id. Every other
+/// outcome must log `-` rather than a substitute scraped from the topic: the
+/// last topic segment is the caller-chosen state key on a state topic, so a
+/// tombstone would publish that key into the log. The wake path derives its own
+/// hint separately and may use the topic segment — it travels over loopback IPC
+/// to a local session, not into a durable log file.
+fn logged_event_id(outcome: &ReceiveOutcome) -> String {
+    match outcome {
         ReceiveOutcome::Accepted(validated) => validated.as_envelope().id.clone(),
         _ => "-".to_owned(),
-    };
-    let origin = if origin.is_empty() { "-" } else { &origin };
-    format!(
-        "admission project={project_id} class={class} origin={origin} outcome={} event={event}",
-        outcome.code()
-    )
+    }
 }
 
 /// Whether an admitted frame is this machine's own published echo — the #111
@@ -2533,6 +2621,9 @@ fn run_pump_loop(
     // receive this instance's own published frames back — #111. They must never
     // be injected into a local session: they would render as if from a teammate.
     let own_instance_id = identity.instance_id;
+    // Rejected member cards this session, logged individually up to
+    // CARD_REJECTION_LOG_LIMIT and counted after that.
+    let mut rejected_cards = 0usize;
     // The roster is what every received frame is admitted against, and a roster
     // that assembled to nothing is the failure that starved delivery with no
     // external signal at all. Logged here rather than at establishment because
@@ -2603,15 +2694,23 @@ fn run_pump_loop(
                                         roster = assembled;
                                     }
                                 }
-                                // Every rejection, not the first per session: a
-                                // parser bug refusing every peer card is exactly
-                                // the incident this logging exists for, and the
-                                // volume is bounded by the number of retained
-                                // cards the broker replays on connect. The reason
-                                // is a typed parse verdict, never card content.
-                                Err(reason) => breadcrumb!(
-                                    "member card rejected org={org_id} reason={reason}; roster may be incomplete"
-                                ),
+                                // Every rejection up to the per-session limit,
+                                // not just the first: a parser bug refusing one
+                                // peer card and one refusing every peer card are
+                                // the same single line otherwise, and breadth is
+                                // the diagnostic. Past the limit they are counted
+                                // and reported once at session down, so a
+                                // systemic failure on a respawning daemon cannot
+                                // grow the log without bound. The reason is a
+                                // typed parse verdict, never card content.
+                                Err(reason) => {
+                                    rejected_cards += 1;
+                                    if rejected_cards <= CARD_REJECTION_LOG_LIMIT {
+                                        breadcrumb!(
+                                            "member card rejected org={org_id} reason={reason}; roster may be incomplete"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -2658,12 +2757,16 @@ fn run_pump_loop(
                     // receive loop.
                     if changed {
                         if let Ok(parsed) = crate::envelope::parse_topic(&topic) {
-                            // The hint is the admitted envelope's event id when
-                            // the outcome carries one, else the topic class. It
-                            // is computed before the push so the same id labels
-                            // the admission, the mailbox, and the wake lines —
-                            // one grep on an event id then tells the whole story
-                            // of what happened to it (#103).
+                            // Two different values, deliberately not shared.
+                            //
+                            // The wake hint travels over loopback IPC to a local
+                            // session and may fall back to the topic's last
+                            // segment. The logged id may not: on a state topic
+                            // that segment is the caller-chosen state key, and a
+                            // tombstone (`Removed`, which `admit` reports as a
+                            // change) would then write that key into a durable
+                            // log file. Only an `Accepted` frame carries an id
+                            // that is ours to log.
                             let hint = match &outcome {
                                 ReceiveOutcome::Accepted(validated) => {
                                     Some(validated.as_envelope().id.clone())
@@ -2673,18 +2776,13 @@ fn run_pump_loop(
                                 }
                             };
                             let items = store.snapshot(parsed.project, Utc::now());
-                            let mut sessions = 0;
-                            for item in &items {
-                                sessions = channels.push(parsed.project, item, SNAPSHOT_CAPACITY);
-                            }
-                            // An admitted item with nowhere to land (sessions=0)
-                            // and one that fanned out look identical from
-                            // outside without this line.
+                            let fanout = channels.push(parsed.project, &items, SNAPSHOT_CAPACITY);
+                            // An admitted item with nowhere to land and one that
+                            // fanned out look identical from outside without this
+                            // line; a poisoned registry looks like neither.
                             breadcrumb!(
-                                "mailbox push project={} event={} items={} sessions={sessions}",
-                                parsed.project,
-                                hint.as_deref().unwrap_or("-"),
-                                items.len()
+                                "{}",
+                                mailbox_breadcrumb(parsed.project, &outcome, items.len(), fanout)
                             );
                             // Wake fanout (live-push T1): after the mailbox push,
                             // fire a best-effort metadata-only wake to every
@@ -2701,6 +2799,11 @@ fn run_pump_loop(
     }
     transport.disconnect();
     liveness.mark_disconnected(Utc::now());
+    if rejected_cards > CARD_REJECTION_LOG_LIMIT {
+        breadcrumb!(
+            "member card rejections suppressed project={project_id} logged={CARD_REJECTION_LOG_LIMIT} total={rejected_cards}"
+        );
+    }
     breadcrumb!("session down project={project_id}");
     EstablishOutcome::Ended
 }
@@ -4504,9 +4607,11 @@ mod service_tests {
         .expect("register");
 
         // The pump pushes after admit; drive the same push the pump performs.
-        state
-            .channels
-            .push("loam", &sample_item("inbox:01", "Held."), SNAPSHOT_CAPACITY);
+        state.channels.push(
+            "loam",
+            &[sample_item("inbox:01", "Held.")],
+            SNAPSHOT_CAPACITY,
+        );
 
         let first =
             dispatch_for_key(&poll_request("sess-poll"), &key, &path, &mut state).expect("poll");
@@ -4539,14 +4644,19 @@ mod service_tests {
             .expect("register");
         }
 
-        let delivered =
-            state
-                .channels
-                .push("loam", &sample_item("inbox:02", "Both."), SNAPSHOT_CAPACITY);
+        let delivered = state.channels.push(
+            "loam",
+            &[sample_item("inbox:02", "Both.")],
+            SNAPSHOT_CAPACITY,
+        );
         // The fanout count the mailbox breadcrumb reports (#103): a push that
         // reached nobody and one that reached every session are otherwise
         // indistinguishable from outside the registry.
-        assert_eq!(delivered, 2, "the item lands in both registered mailboxes");
+        assert_eq!(
+            delivered,
+            Some(2),
+            "the item lands in both registered mailboxes"
+        );
 
         for session in ["sess-a", "sess-b"] {
             let polled =
@@ -4575,10 +4685,14 @@ mod service_tests {
         // project must not reach it.
         let delivered = state.channels.push(
             "other-project",
-            &sample_item("inbox:03", "Not yours."),
+            &[sample_item("inbox:03", "Not yours.")],
             SNAPSHOT_CAPACITY,
         );
-        assert_eq!(delivered, 0, "a cross-project push reaches no mailbox");
+        assert_eq!(
+            delivered,
+            Some(0),
+            "a cross-project push reaches no mailbox"
+        );
 
         let polled =
             dispatch_for_key(&poll_request("sess-other"), &key, &path, &mut state).expect("poll");
@@ -4602,7 +4716,7 @@ mod service_tests {
         .expect("register");
         state.channels.push(
             "loam",
-            &sample_item("inbox:04", "Dropped."),
+            &[sample_item("inbox:04", "Dropped.")],
             SNAPSHOT_CAPACITY,
         );
 
@@ -4641,7 +4755,7 @@ mod service_tests {
         .expect("register");
         before.channels.push(
             "loam",
-            &sample_item("inbox:05", "Volatile."),
+            &[sample_item("inbox:05", "Volatile.")],
             SNAPSHOT_CAPACITY,
         );
 
@@ -4752,7 +4866,7 @@ mod service_tests {
         // The next admitted frame both mailbox-pushes and wakes the reloaded target.
         after.channels.push(
             "loam",
-            &sample_item("inbox:reload:1", "hi"),
+            &[sample_item("inbox:reload:1", "hi")],
             SNAPSHOT_CAPACITY,
         );
         wake_all(&after.channels, "loam", Some("hint-reload"));
@@ -4786,7 +4900,7 @@ mod service_tests {
         // A changed admit fires the wake; the dead port prunes the persisted row.
         state.channels.push(
             "loam",
-            &sample_item("inbox:prune:1", "hi"),
+            &[sample_item("inbox:prune:1", "hi")],
             SNAPSHOT_CAPACITY,
         );
         wake_all(&state.channels, "loam", Some("hint-prune"));
@@ -4922,7 +5036,7 @@ mod service_tests {
         // second registry inside ProjectSessions that never saw IPC
         // registrations, so no wake ever fired in production.
         let pump_registry = state.sessions.channels().clone();
-        pump_registry.push("loam", &item, SNAPSHOT_CAPACITY);
+        pump_registry.push("loam", std::slice::from_ref(&item), SNAPSHOT_CAPACITY);
         wake_all(&pump_registry, "loam", Some("event-id-42"));
 
         let frame = accept_wake_frame(&listener);
@@ -5008,7 +5122,7 @@ mod service_tests {
 
         channels.push(
             "loam",
-            &sample_item("inbox:wake:02", "Plain."),
+            &[sample_item("inbox:wake:02", "Plain.")],
             SNAPSHOT_CAPACITY,
         );
         wake_all(&channels, "loam", None);
@@ -5034,7 +5148,7 @@ mod service_tests {
         });
 
         let item = sample_item("inbox:wake:03", "Still stored.");
-        channels.push("loam", &item, SNAPSHOT_CAPACITY);
+        channels.push("loam", std::slice::from_ref(&item), SNAPSHOT_CAPACITY);
         // No panic, no hang: wake_all returns normally.
         wake_all(&channels, "loam", Some("hint-dead"));
 
@@ -5063,7 +5177,7 @@ mod service_tests {
 
         channels.push(
             "loam",
-            &sample_item("inbox:wake:04", "Both woken."),
+            &[sample_item("inbox:wake:04", "Both woken.")],
             SNAPSHOT_CAPACITY,
         );
         wake_all(&channels, "loam", Some("hint-both"));
@@ -5087,7 +5201,7 @@ mod service_tests {
         });
         channels.push(
             "loam",
-            &sample_item("inbox:wake:05", "Odd."),
+            &[sample_item("inbox:wake:05", "Odd.")],
             SNAPSHOT_CAPACITY,
         );
         // Must not panic, must not hang, must not propagate an error.
@@ -5118,7 +5232,7 @@ mod service_tests {
         // items.
         state.channels.push(
             "loam",
-            &sample_item("inbox:wake:07", "Mailbox."),
+            &[sample_item("inbox:wake:07", "Mailbox.")],
             SNAPSHOT_CAPACITY,
         );
         let drained = state.channels.poll("sess-mb").expect("registered");
@@ -6851,6 +6965,92 @@ mod breadcrumb_tests {
         assert!(line.contains("class=unparsed"), "{line}");
         assert!(line.contains("outcome=removed"), "{line}");
         assert!(line.contains("origin=-"), "{line}");
+    }
+
+    #[test]
+    fn the_mailbox_breadcrumb_never_carries_the_state_key_a_tombstone_rides_in_on() {
+        // The live leak, not a hypothetical one. `SnapshotStore::admit` reports
+        // a change for `Removed`, so a state tombstone reaches this line, and
+        // the topic's last segment on a state topic is the caller-chosen state
+        // key. Asserting over `Accepted` would pass vacuously: that arm carries
+        // a real envelope id and was never the leak.
+        let line = mailbox_breadcrumb("project-7M3", &ReceiveOutcome::Removed, 0, Some(3));
+        assert!(
+            !line.contains("activity-01K6Q5"),
+            "a tombstone must not write the state key into the log: {line}"
+        );
+        assert!(line.contains("event=-"), "{line}");
+        assert!(line.contains("items=0"), "{line}");
+        assert!(line.contains("sessions=3"), "{line}");
+
+        // An admitted frame does carry an id of ours to log.
+        let admitted = mailbox_breadcrumb("project-7M3", &accepted_work_frame(), 2, Some(1));
+        assert!(admitted.contains("event=01K6Q6ESWMT48TPB"), "{admitted}");
+    }
+
+    #[test]
+    fn a_poisoned_registry_is_not_reported_as_reaching_nobody() {
+        let unavailable = mailbox_breadcrumb("project-7M3", &ReceiveOutcome::Removed, 1, None);
+        assert!(
+            unavailable.contains("sessions=unavailable"),
+            "{unavailable}"
+        );
+        let nobody = mailbox_breadcrumb("project-7M3", &ReceiveOutcome::Removed, 1, Some(0));
+        assert!(nobody.contains("sessions=0"), "{nobody}");
+    }
+
+    #[test]
+    fn a_refused_frame_is_named_by_its_typed_reason() {
+        // The failure class #103 was filed for: a peer missing from the roster
+        // refuses every one of its frames as `OriginNotAuthorized`, and the
+        // delivery processor's refusals are swallowed one layer below the pump,
+        // so without this line they are indistinguishable from an idle poll.
+        let line = refusal_breadcrumb(
+            STATE_TOPIC,
+            &crate::transport::TransportError::OriginNotAuthorized,
+        );
+        assert!(line.contains("outcome=refused"), "{line}");
+        assert!(line.contains("reason=origin_not_authorized"), "{line}");
+        assert!(line.contains("class=latest-state"), "{line}");
+        assert!(line.contains("origin=instance-01"), "{line}");
+        assert!(line.contains("project=project-7M3"), "{line}");
+        assert!(
+            !line.contains("activity-01K6Q5"),
+            "the state key must not reach a refusal line either: {line}"
+        );
+
+        // A validation violation keeps its own name: "validation" alone would
+        // not separate the #143 near-miss spelling from an expired frame.
+        let violation = refusal_breadcrumb(
+            STATE_TOPIC,
+            &crate::transport::TransportError::Validation(
+                crate::envelope::Violation::MissingLatestStateRevision,
+            ),
+        );
+        assert!(
+            violation.contains("reason=validation:MissingLatestStateRevision"),
+            "{violation}"
+        );
+    }
+
+    #[test]
+    fn every_transport_refusal_has_a_content_free_code() {
+        // TransportError is Copy, so no variant can hold a piece of a frame —
+        // this pins that the code derived from it stays a bare token rather
+        // than growing prose or interpolated values.
+        for error in [
+            crate::transport::TransportError::OriginNotAuthorized,
+            crate::transport::TransportError::InvalidStateRevision,
+            crate::transport::TransportError::ConflictingWorkRevision,
+            crate::transport::TransportError::Expired,
+        ] {
+            let code = error.code();
+            assert!(!code.is_empty(), "{error:?} has no code");
+            assert!(
+                !code.contains(' '),
+                "a code is a grep token, not prose: {code}"
+            );
+        }
     }
 
     #[test]
