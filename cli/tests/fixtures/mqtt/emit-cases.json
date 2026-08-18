@@ -42,6 +42,20 @@
         "payload": { "state": "ready", "acceptance": {}, "verification": [] }
       },
       "expect_causation": null
+    },
+    {
+      "name": "work-report-anchored-in-a-sha256-repository",
+      "why": "A Git object id is 40 hex or 64, and this repo supports both object formats. A CLI anchor check stricter than the envelope's would refuse a SHA-256 repository's claims — #98's symptom restored for that class of repo.",
+      "operation": {
+        "type": "work.report",
+        "state_key": "work-SB-42",
+        "revision": "2",
+        "summary": "Ready for review.",
+        "plan_oid": "61af0000000000000000000000000000000000000000000000000000000000ab",
+        "artifacts": [{ "kind": "task", "id": "SB-42" }],
+        "payload": { "state": "ready", "acceptance": {}, "verification": [] }
+      },
+      "expect_causation": null
     }
   ],
   "overrides": [

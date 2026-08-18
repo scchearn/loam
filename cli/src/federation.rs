@@ -1319,7 +1319,11 @@ pub fn derive_emit(
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty());
         if let Some(plan_oid) = plan_oid {
-            if !is_git_oid(plan_oid) {
+            // The validator's own predicate, not a copy of it: this refusal
+            // exists only to say "the envelope would reject this" one layer
+            // earlier, so any disagreement is this layer refusing anchors that
+            // would have shipped.
+            if !crate::envelope::valid_git_oid(plan_oid) {
                 return Err(EmitError::InvalidPlanOid);
             }
             derived.push(("plan_oid".into(), Value::String(plan_oid.to_owned())));
@@ -1378,16 +1382,6 @@ fn bears_claim(artifacts: &Value, payload: Option<&Value>) -> bool {
             _ => false,
         });
     claiming_artifact || claiming_acceptance
-}
-
-/// A full-length Git object id, lowercase hex. The same shape the envelope
-/// validator enforces on `context.git.plan_oid`; checked here so a typo is
-/// refused by name at the CLI instead of surfacing from the connector.
-fn is_git_oid(value: &str) -> bool {
-    value.len() == 40
-        && value
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
 }
 
 /// `loam federation emit [<workspace>] --global-root <path> [--json]`.
@@ -2550,13 +2544,38 @@ mod emit_tests {
         );
 
         // A malformed anchor is a typo, not provenance.
-        for malformed in ["61af00", "61AF000000000000000000000000000000000001", "zz"] {
+        for malformed in ["61af00", "zz", &"61af".repeat(20)] {
             assert_eq!(
                 derive(&format!(
                     r#"{{"type":"work.report","state_key":"k","revision":"1","summary":"s","plan_oid":"{malformed}","payload":{{"state":"ready"}}}}"#
                 )),
                 Err(EmitError::InvalidPlanOid),
                 "`{malformed}` is not a Git object id"
+            );
+        }
+
+        // Every anchor the envelope would accept, this layer accepts. The refusal
+        // above exists only to say "the envelope would reject this" one layer
+        // earlier, so anything stricter here refuses claims that would have
+        // shipped — which is the defect #98 is about, re-created at a new layer.
+        // A 64-hex id is a SHA-256 repository's object id, and `git rev-parse
+        // HEAD:plans/<plan>.md` — the call the collaboration guidance tells an
+        // agent to make — returns one there.
+        for accepted in [
+            "61af000000000000000000000000000000000001",
+            "61AF000000000000000000000000000000000001",
+            "61af0000000000000000000000000000000000000000000000000000000000ab",
+        ] {
+            assert!(
+                crate::envelope::valid_git_oid(accepted),
+                "fixture `{accepted}` must be an anchor the envelope accepts"
+            );
+            assert!(
+                derive(&format!(
+                    r#"{{"type":"work.report","state_key":"k","revision":"1","summary":"s","plan_oid":"{accepted}","artifacts":[{{"kind":"task","id":"T-1"}}],"payload":{{"state":"ready"}}}}"#
+                ))
+                .is_ok(),
+                "`{accepted}` is an anchor the envelope accepts, so a claim carrying it must ship"
             );
         }
 

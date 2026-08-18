@@ -1709,7 +1709,11 @@ fn validate_message_payload(
     Ok(())
 }
 
-fn valid_git_oid(value: &str) -> bool {
+/// A Git object id in either object format: 40 hex for SHA-1, 64 for SHA-256,
+/// case-insensitive. The rule the envelope enforces on every `context.git`
+/// anchor, and the one any layer that wants to refuse a bad anchor earlier has
+/// to ask — a stricter copy elsewhere refuses envelopes this would have shipped.
+pub(crate) fn valid_git_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
