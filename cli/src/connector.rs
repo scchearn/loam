@@ -6386,6 +6386,83 @@ mod outbound_tests {
         )
     }
 
+    /// The composed path #143 broke on, walked end to end in one test: two
+    /// `federation emit` calls on one state key, each stamped from the real
+    /// registry, built into a real envelope by the real connector path, and fed
+    /// to the real receiving admission.
+    ///
+    /// Each half of this was already covered — the counter strictly increases,
+    /// the stamp reaches the frame, the admission accepts a strictly-greater
+    /// revision — and the bug still shipped, because nothing joined them. A
+    /// revision that advances in the ledger but never reaches the wire, or
+    /// reaches it in a spelling the admission cannot parse, passes every one of
+    /// those tests and still freezes the key at its first emit on every
+    /// receiver.
+    #[test]
+    fn two_emits_on_one_key_are_both_admitted_by_the_receiving_side() {
+        let registry = crate::enrollment::temp_global_root("emit-admission").join("loam.sqlite3");
+        let identity = identity();
+        let claims: Vec<&str> = identity.allowed_claims.iter().map(String::as_str).collect();
+        let principal =
+            crate::envelope::AuthenticatedPrincipal::new(&identity.principal_id, &claims);
+        let origins = [identity.instance_id.as_str()];
+        let authenticated =
+            crate::transport::AuthenticatedTransportPrincipal::new(principal, &origins);
+        let mut processor =
+            crate::transport::DeliveryProcessor::new(ValidationConfig::default(), 8, 8, 8)
+                .expect("bounded processor should configure");
+
+        let mut admitted = Vec::new();
+        let mut shipped = Vec::new();
+        for summary in ["blocked on review", "ready to land"] {
+            let operation = format!(
+                r#"{{"type":"work.report","state_key":"task-7","revision":"1","summary":"{summary}","payload":{{"state":"ready"}}}}"#
+            );
+            let parsed = crate::json::parse(&operation).expect("operation parses");
+            let mut derived =
+                crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+            crate::federation::stamp_work_revision(
+                &mut derived.operation,
+                &row(),
+                &registry,
+                now(),
+            )
+            .expect("the registry stamps a revision");
+            shipped.push(
+                derived
+                    .operation
+                    .get("revision")
+                    .and_then(Value::as_str)
+                    .expect("the stamped revision is a string on the wire")
+                    .to_owned(),
+            );
+            let (document, topic) = outbound_envelope(&derived.operation, &row(), &identity)
+                .expect("the connector builds an envelope");
+            admitted.push(
+                processor
+                    .receive(&topic, document.as_bytes(), &authenticated, now())
+                    .expect("a well-formed work frame is not refused"),
+            );
+        }
+
+        assert_eq!(
+            shipped,
+            vec!["1".to_owned(), "2".to_owned()],
+            "successive emits on one key must ship strictly increasing revisions"
+        );
+        assert!(
+            matches!(admitted[0], crate::transport::ReceiveOutcome::Accepted(_)),
+            "the first emit on a key is admitted: {:?}",
+            admitted[0]
+        );
+        assert!(
+            matches!(admitted[1], crate::transport::ReceiveOutcome::Accepted(_)),
+            "the second emit on the same key must be admitted too, not dropped as \
+             stale or duplicate: {:?}",
+            admitted[1]
+        );
+    }
+
     #[test]
     fn a_session_claiming_another_instance_is_refused_and_ships_nothing() {
         // The negative control that makes the instance-id unification
