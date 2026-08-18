@@ -98,7 +98,24 @@ macro_rules! breadcrumb {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeError {
+    /// A broker that answered and rejected this identity: a CONNACK with a
+    /// non-success return code. Reachability is proven by the answer, so this
+    /// category points an operator at credentials — and nothing that failed
+    /// before the answer may borrow it (#115).
     AuthenticationFailed,
+    /// The TCP dial was refused or reset. Nothing is listening, or something
+    /// closed the connection immediately: a closed port, a stopped broker, a
+    /// firewall that rejects rather than drops.
+    DialRefused,
+    /// The dial never completed and never failed outright: a timeout, an
+    /// unresolvable name, an unreachable network. A dropped packet looks like
+    /// this, which is why it is separate from a refusal.
+    TransportUnreachable,
+    /// TLS failed during the handshake, after the socket connected. Distinct
+    /// from `ConfigurationFailure` (this machine's own cert/key/trust material
+    /// could not even be loaded) and from `AuthenticationFailed` (the broker
+    /// spoke MQTT and refused the identity).
+    TlsHandshakeFailed,
     SubscribeDenied {
         filter: String,
     },
@@ -120,6 +137,12 @@ impl ProbeError {
     pub fn code(&self) -> &'static str {
         match self {
             ProbeError::AuthenticationFailed => "probe_authentication_failed",
+            // Transport-stage categories carry no `probe_` prefix: they happen
+            // before any probe step runs, on the live establishment path as much
+            // as on the enrollment probe.
+            ProbeError::DialRefused => "dial_refused",
+            ProbeError::TransportUnreachable => "transport_unreachable",
+            ProbeError::TlsHandshakeFailed => "tls_handshake_failed",
             ProbeError::SubscribeDenied { .. } => "probe_subscribe_denied",
             ProbeError::PublishDenied => "probe_publish_denied",
             ProbeError::NoSelfReceive => "probe_no_self_receive",
@@ -649,16 +672,12 @@ impl Transport for MqttTransport {
             .set_clean_start(true);
         let (client, mut connection) = Client::new(options, REQUEST_CAPACITY);
         let deadline = Instant::now() + self.dial_deadline;
-        let accepted = loop {
-            match await_control(&mut connection, &mut self.pending, deadline) {
-                Some(Packet::ConnAck(ack)) => break ack.code == ConnectReturnCode::Success,
-                Some(_) => {}
-                None => break false,
-            }
-        };
-        if !accepted {
-            return Err(ProbeError::AuthenticationFailed);
-        }
+        // Every way this can fail keeps its own stage (#115). The loop used to
+        // reduce all of them — a refused dial, a DNS failure, a TLS handshake
+        // error, a timeout with no answer at all — to `false`, and `false` to
+        // `probe_authentication_failed`, which sent an operator to the
+        // certificates for what was a closed port.
+        dial_for_connack(&mut connection, &mut self.pending, deadline)?;
         // Authority starts here and nowhere else.
         self.client = Some(client);
         self.connection = Some(connection);
@@ -918,6 +937,82 @@ impl MqttTransport {
                 _ => continue,
             }
         }
+    }
+}
+
+/// Wait for the CONNACK, keeping the reason the dial failed instead of reducing
+/// it to "not accepted" (#115).
+///
+/// This is the one place a connection error carries stage information: after the
+/// CONNACK every failure is a broker decision on a proven-reachable session
+/// (subscribe denied, publish denied), and those already have their own
+/// categories. An inbound publish that races the CONNACK is parked for `receive`,
+/// exactly as [`await_control`] does.
+fn dial_for_connack(
+    connection: &mut Connection,
+    pending: &mut Vec<Publish>,
+    deadline: Instant,
+) -> Result<(), ProbeError> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // Nothing arrived and nothing failed: the far side is not answering.
+            return Err(ProbeError::TransportUnreachable);
+        }
+        match connection.recv_timeout(remaining) {
+            Ok(Ok(Event::Incoming(Packet::ConnAck(ack)))) => {
+                // The only failure that is genuinely an authentication verdict:
+                // the broker spoke MQTT back and refused this identity.
+                return if ack.code == ConnectReturnCode::Success {
+                    Ok(())
+                } else {
+                    Err(ProbeError::AuthenticationFailed)
+                };
+            }
+            Ok(Ok(Event::Incoming(Packet::Publish(publish)))) => pending.push(publish),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return Err(classify_dial_failure(&error)),
+            // The event loop ended or the wait ran out with no verdict either
+            // way. Unreachable is the honest answer: no authentication exchange
+            // took place, so it cannot have failed.
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                return Err(ProbeError::TransportUnreachable)
+            }
+        }
+    }
+}
+
+/// Which stage a failed dial failed at. Nothing from the error's text is kept —
+/// an OS error string carries the broker address — only its class.
+fn classify_dial_failure(error: &rumqttc::v5::ConnectionError) -> ProbeError {
+    use rumqttc::v5::ConnectionError;
+    match error {
+        // A CONNACK the client library rejected for us: the broker answered, so
+        // this is a real authentication/protocol verdict.
+        ConnectionError::ConnectionRefused(_) => ProbeError::AuthenticationFailed,
+        ConnectionError::Io(io) => classify_dial_io(io.kind()),
+        // Inside the TLS layer, an IO error is still the socket failing under
+        // the handshake, so it keeps the socket's classification rather than
+        // reading as a certificate problem.
+        ConnectionError::Tls(rumqttc::TlsError::Io(io)) => classify_dial_io(io.kind()),
+        ConnectionError::Tls(_) => ProbeError::TlsHandshakeFailed,
+        // Timeouts, MQTT state faults, and a client whose request stream ended:
+        // no answer arrived, and none of them is an identity verdict.
+        _ => ProbeError::TransportUnreachable,
+    }
+}
+
+fn classify_dial_io(kind: std::io::ErrorKind) -> ProbeError {
+    use std::io::ErrorKind;
+    match kind {
+        // Something answered the SYN with a refusal, or dropped the connection
+        // as it came up: a closed port, a stopped broker, a rejecting firewall.
+        ErrorKind::ConnectionRefused
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted => ProbeError::DialRefused,
+        // Everything else that stopped the dial is reachability: a name that
+        // does not resolve, a route that does not exist, a packet that vanished.
+        _ => ProbeError::TransportUnreachable,
     }
 }
 
@@ -6445,6 +6540,93 @@ mod snapshot_tests {
         assert!(!sessions.is_live(&row.project_id));
     }
 
+    /// #115: a failure before the authentication exchange is never reported as an
+    /// authentication failure.
+    ///
+    /// The observed symptom was an operator sent to certificates and identity for
+    /// a closed port: `establishment failed error=probe_authentication_failed`,
+    /// inherited by `observed-degraded` and by the degraded status render, for a
+    /// broker endpoint where no TLS and no auth exchange was even possible. The
+    /// two faults have opposite remediations.
+    #[test]
+    fn a_dial_that_never_reached_an_auth_exchange_is_categorized_by_its_stage() {
+        use rumqttc::v5::ConnectionError;
+        use std::io::{Error, ErrorKind};
+
+        // Nothing listening, or the connection cut as it came up: a network fault.
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+        ] {
+            let classified = classify_dial_failure(&ConnectionError::Io(Error::from(kind)));
+            assert_eq!(
+                classified,
+                ProbeError::DialRefused,
+                "{kind:?} is a refused dial"
+            );
+            assert_eq!(classified.code(), "dial_refused");
+        }
+
+        // No answer either way: a dropped packet, an unresolvable name, a route
+        // that does not exist. Still a network fault, but not a refusal.
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::NotFound,
+            ErrorKind::AddrNotAvailable,
+        ] {
+            assert_eq!(
+                classify_dial_failure(&ConnectionError::Io(Error::from(kind))),
+                ProbeError::TransportUnreachable,
+                "{kind:?} is unreachable, not refused"
+            );
+        }
+        assert_eq!(
+            ProbeError::TransportUnreachable.code(),
+            "transport_unreachable"
+        );
+
+        // A socket that failed under the TLS layer keeps the socket's answer: it
+        // is not a certificate problem.
+        assert_eq!(
+            classify_dial_failure(&ConnectionError::Tls(rumqttc::TlsError::Io(Error::from(
+                ErrorKind::ConnectionRefused
+            )))),
+            ProbeError::DialRefused
+        );
+
+        // The one failure that *is* an identity verdict: the broker answered MQTT
+        // and refused. This is the positive control that keeps
+        // `probe_authentication_failed` meaningful rather than merely rarer.
+        assert_eq!(
+            classify_dial_failure(&ConnectionError::ConnectionRefused(
+                ConnectReturnCode::NotAuthorized
+            )),
+            ProbeError::AuthenticationFailed
+        );
+        assert_eq!(
+            ProbeError::AuthenticationFailed.code(),
+            "probe_authentication_failed"
+        );
+
+        // Every stage code is a distinct grep token — a category that collided
+        // with another would be the same defect wearing a new name.
+        let codes = [
+            ProbeError::AuthenticationFailed.code(),
+            ProbeError::DialRefused.code(),
+            ProbeError::TransportUnreachable.code(),
+            ProbeError::TlsHandshakeFailed.code(),
+            ProbeError::ConfigurationFailure(String::new()).code(),
+        ];
+        for (index, code) in codes.iter().enumerate() {
+            assert!(!code.is_empty() && !code.contains(' '), "{code}");
+            assert!(
+                !codes[..index].contains(code),
+                "two stages share the code `{code}`"
+            );
+        }
+    }
+
     #[test]
     fn a_first_dial_failure_still_arms_the_supervisor_and_watchdog() {
         // A connector that boots while the broker is down must not give up: the
@@ -6487,9 +6669,10 @@ mod snapshot_tests {
         let mut sessions = ProjectSessions::new(4, ChannelRegistry::new());
         let row = sample_row("unix:1:9");
         let state = sessions.attach(&row, to_a_closed_port(), base_time());
-        assert!(
-            matches!(state, SessionState::Unreachable(_)),
-            "a closed-port first dial reports Unreachable, got {state:?}"
+        assert_eq!(
+            state,
+            SessionState::Unreachable("dial_refused".into()),
+            "a closed-port dial is a refused dial, not a rejected identity (#115)"
         );
         assert!(
             sessions.is_live(&row.project_id),
