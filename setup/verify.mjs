@@ -1,6 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { readInstallMetadata, readSkillContent } from '../integration/metadata.mjs';
@@ -81,22 +81,38 @@ async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, 
   return result?.additional_context === context;
 }
 
-// One registration is correct only when it runs the staged private runtime as a
-// `hook <id>` read. Anything else — a Node shim, a stale asset path, a runtime
-// from a previous install — is a mismatch, not a variant.
+// Cursor's own hooks.json still registers the runtime directly (args-array form
+// into ~/.cursor/hooks.json). One registration is correct only when it runs the
+// staged private runtime as a `hook <id>` read; anything else — a Node shim, a
+// stale asset path, a runtime from a previous install — is a mismatch.
 function nativeHookCommands(entries, runtimePath, harnessId) {
-  // The marketplace plugin now emits a single-string command (#133); cursor
-  // still emits the args-array form. Own either shape so verify recognizes the
-  // rendered registration instead of reporting it missing.
-  const singleStringPrefix = `"${resolve(runtimePath)}" hook ${harnessId}`;
   return entries
     .flatMap((entry) => (Array.isArray(entry?.hooks) ? entry.hooks : [entry]))
-    .filter((entry) => entry?.type === 'command' && typeof entry.command === 'string' && (
-      entry.command.startsWith(singleStringPrefix)
-      || (entry.command === runtimePath
-        && Array.isArray(entry.args)
-        && entry.args[0] === 'hook'
-        && entry.args[1] === harnessId)));
+    .filter((entry) => entry?.type === 'command'
+      && entry.command === runtimePath
+      && Array.isArray(entry.args)
+      && entry.args[0] === 'hook'
+      && entry.args[1] === harnessId);
+}
+
+// #137: claude/codex load their hooks from the marketplace SOURCE hooks.json,
+// which carries self-resolving node shims (landed with #114), not a setup-staged
+// runtime path. Verify asserts what the harness actually loads: one shim per
+// native read surface. The three-surfaces contract is SessionStart (baseline)
+// and UserPromptSubmit (per-turn drain); the Stop long-poll wake is a Stop entry
+// verified through its own shim, not here.
+const NATIVE_SHIMS = {
+  SessionStart: 'session-start.mjs',
+  UserPromptSubmit: 'user-prompt-submit.mjs',
+};
+
+function pluginShimCommands(entries, shimFile) {
+  return entries
+    .flatMap((entry) => (Array.isArray(entry?.hooks) ? entry.hooks : [entry]))
+    .filter((entry) => entry?.type === 'command'
+      && typeof entry.command === 'string'
+      && entry.command.startsWith('node ')
+      && entry.command.includes(`hooks/${shimFile}`));
 }
 
 async function verifyHarness(id, harness, { packageRoot, globalRoot, install, workspace, home, platform }) {
@@ -138,12 +154,10 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
         return { ...harness, ready: false, category: 'registration_duplicate' };
       }
       const plugin = JSON.parse(await readFile(join(harness.marketplaceRoot, 'hooks', 'hooks.json'), 'utf8'));
-      const start = nativeHookCommands(Array.isArray(plugin.hooks?.SessionStart) ? plugin.hooks.SessionStart : [], runtimePath, id);
-      const refresh = nativeHookCommands(Array.isArray(plugin.hooks?.UserPromptSubmit) ? plugin.hooks.UserPromptSubmit : [], runtimePath, id);
-      const preTool = nativeHookCommands(Array.isArray(plugin.hooks?.PreToolUse) ? plugin.hooks.PreToolUse : [], runtimePath, id);
-      const postTool = nativeHookCommands(Array.isArray(plugin.hooks?.PostToolUse) ? plugin.hooks.PostToolUse : [], runtimePath, id);
-      if (start.length !== 1 || refresh.length !== 1 || preTool.length !== 1 || postTool.length !== 1) {
-        return { ...harness, ready: false, category: start.length || refresh.length || preTool.length || postTool.length ? 'registration_duplicate' : 'registration_missing' };
+      const counts = Object.entries(NATIVE_SHIMS).map(([event, shimFile]) =>
+        pluginShimCommands(Array.isArray(plugin.hooks?.[event]) ? plugin.hooks[event] : [], shimFile).length);
+      if (counts.some((n) => n !== 1)) {
+        return { ...harness, ready: false, category: counts.some((n) => n > 1) ? 'registration_duplicate' : 'registration_missing' };
       }
       return { ...harness, ready: true, owner: 'marketplace' };
     }

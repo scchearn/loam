@@ -117,7 +117,7 @@ function sessionEntries(hooksConfig, key) {
   return groups.flatMap((group) => (Array.isArray(group?.hooks) ? group.hooks : [group]));
 }
 
-test('every harness registration invokes the absolute native runtime, not a Node shim', async () => {
+test('claude and codex carry self-resolving hook shims; cursor invokes the runtime directly', async () => {
   const { home, configDir, runtimePath, claudeCache, codexCache, result } = await harnessFixture('loam-native-registration-');
 
   // The injected path points into the config-dir runtime store.
@@ -131,31 +131,28 @@ test('every harness registration invokes the absolute native runtime, not a Node
   assert.equal(cursorOwned.length, 1);
   assert.deepEqual(cursorOwned[0].args, ['hook', 'cursor', '--event', 'sessionStart']);
 
+  // #137: claude/codex load hooks from the marketplace SOURCE hooks.json, which
+  // setup no longer rewrites — the installed cache copy is the shipped file
+  // unchanged, carrying one self-resolving node shim per native read surface
+  // (SessionStart baseline + UserPromptSubmit drain; #114).
+  const NATIVE_SHIMS = [
+    ['SessionStart', 'session-start.mjs'],
+    ['UserPromptSubmit', 'user-prompt-submit.mjs'],
+  ];
   for (const [id, cache] of [['claude', claudeCache], ['codex', codexCache]]) {
     const hooks = JSON.parse(await readFile(join(cache, 'hooks', 'hooks.json'), 'utf8'));
-    const start = sessionEntries(hooks, 'SessionStart');
-    const refresh = sessionEntries(hooks, 'UserPromptSubmit');
-    const preTool = sessionEntries(hooks, 'PreToolUse');
-    const postTool = sessionEntries(hooks, 'PostToolUse');
-    assert.equal(start.length, 1, `${id} SessionStart`);
-    assert.equal(refresh.length, 1, `${id} UserPromptSubmit`);
-    assert.equal(preTool.length, 1, `${id} PreToolUse`);
-    assert.equal(postTool.length, 1, `${id} PostToolUse`);
-    // #133: the plugin schema takes `command` as ONE shell string and drops
-    // `args`, so each native event is a single quoted command, no args field.
-    assert.equal(start[0].command, `"${runtimePath}" hook ${id} --event SessionStart`);
-    assert.equal(refresh[0].command, `"${runtimePath}" hook ${id} --event UserPromptSubmit`);
-    assert.equal(preTool[0].command, `"${runtimePath}" hook ${id} --event PreToolUse`);
-    assert.equal(postTool[0].command, `"${runtimePath}" hook ${id} --event PostToolUse`);
-    assert.equal(start[0].args, undefined, `${id} native entry must carry no args`);
-    // PreToolUse is restricted to the chatty tool names; PostToolUse runs after any tool.
-    const preToolGroup = hooks.hooks.PreToolUse[0];
-    const postToolGroup = hooks.hooks.PostToolUse[0];
-    assert.match(preToolGroup.matcher, /Bash\|Task\|Write\|Edit\|MultiEdit\|Glob\|Grep\|Read/);
-    assert.equal(postToolGroup.matcher, undefined);
-    // Stop stays Node: it is the ingestion boundary, not the read path.
-    assert.match(JSON.stringify(sessionEntries(hooks, 'Stop')), /stop\.mjs/);
-    // #132: the shipped subagent hooks must survive the rewrite, not be dropped.
+    for (const [event, file] of NATIVE_SHIMS) {
+      const entries = sessionEntries(hooks, event);
+      assert.equal(entries.length, 1, `${id} ${event}`);
+      assert.equal(entries[0].command, `node "\${CLAUDE_PLUGIN_ROOT}/hooks/${file}"`);
+      assert.equal(entries[0].args, undefined, `${id} ${event} shim carries no args`);
+    }
+    // SessionStart must also match a forked session (#137 doc-verify).
+    assert.match(hooks.hooks.SessionStart[0].matcher, /(^|\|)fork(\||$)/);
+    // Stop carries the ingestion boundary AND the wake long-poll (#114).
+    const stopJson = JSON.stringify(sessionEntries(hooks, 'Stop'));
+    assert.match(stopJson, /stop\.mjs/);
+    assert.match(stopJson, /wake\.mjs/);
     assert.ok(Array.isArray(hooks.hooks.SubagentStart), `${id} keeps SubagentStart`);
     assert.ok(Array.isArray(hooks.hooks.SubagentStop), `${id} keeps SubagentStop`);
   }
