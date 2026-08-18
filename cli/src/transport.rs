@@ -45,6 +45,7 @@ pub enum TransportError {
     TerminalWorkState,
     PublicationUnverified,
     WorkRevisionNotNewer,
+    ConflictingWorkRevision,
     InvalidLifecycleDuration,
     InvalidRenewalInterval,
     OriginNotAuthorized,
@@ -78,6 +79,7 @@ impl std::fmt::Display for TransportError {
             Self::TerminalWorkState => "terminal work state cannot transition",
             Self::PublicationUnverified => "published work state requires Git reachability proof",
             Self::WorkRevisionNotNewer => "work-state revision must increase",
+            Self::ConflictingWorkRevision => "work-state revision repeats with different content",
             Self::InvalidLifecycleDuration => "lifecycle durations must be positive and bounded",
             Self::InvalidRenewalInterval => {
                 "renewal interval must be shorter than the lease duration"
@@ -756,6 +758,30 @@ fn digest(payload: &[u8]) -> String {
     sha256.finish()
 }
 
+/// Content identity for a work-state frame.
+///
+/// The latest-state admission digests the retained bytes it was handed; this
+/// layer is handed a parsed envelope and no bytes, so identity is taken over the
+/// fields that carry the work *statement*: the payload (which holds the state),
+/// the human summary, and the claimed artifacts. Envelope id and timestamps are
+/// deliberately excluded — a retained frame redelivered with fresh clock
+/// metadata restates the same work and must not read as a contradiction. The
+/// unit separators keep field boundaries unambiguous, so no rearrangement of
+/// content across fields can collide.
+fn work_content_digest(envelope: &crate::envelope::Envelope) -> String {
+    let mut canonical = String::new();
+    canonical.push_str(&envelope.data.summary);
+    canonical.push('\u{1e}');
+    canonical.push_str(&envelope.data.payload.to_json());
+    for artifact in &envelope.data.context.artifacts {
+        canonical.push('\u{1e}');
+        canonical.push_str(&artifact.kind);
+        canonical.push('\u{1f}');
+        canonical.push_str(&artifact.id);
+    }
+    digest(canonical.as_bytes())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkStatus {
     Active,
@@ -814,6 +840,7 @@ struct TrackedWork {
     origin: String,
     key: String,
     revision: u64,
+    content: String,
     status: WorkStatus,
     artifacts: Vec<(String, String)>,
     lease_expires_at: DateTime<Utc>,
@@ -914,13 +941,30 @@ impl WorkTracker {
         let renewal_due_at = observed_at
             .checked_add_signed(self.lifecycle.renewal_interval)
             .ok_or(TransportError::InvalidWorkEnvelope)?;
+        let content = work_content_digest(envelope);
         let previous = self
             .activities
             .iter()
             .position(|activity| activity.origin == *origin && activity.key == key);
         if let Some(index) = previous {
-            if revision <= self.activities[index].revision {
+            if revision < self.activities[index].revision {
                 return Err(TransportError::WorkRevisionNotNewer);
+            }
+            // Equal revision, different content is a distinct fault from a stale
+            // frame, and the latest-state admission already separates the two
+            // (`DuplicateState` vs `ConflictingState`). This layer used to fold
+            // both into "not newer" and drop the collision without a word (#144).
+            // Well-behaved emitters cannot produce one — the emit path reserves a
+            // strictly increasing per-key revision (#143) — so this is the
+            // defense-in-depth that stops that guarantee from being the only
+            // thing standing between a buggy or replaying producer and a silently
+            // swallowed contradiction.
+            if revision == self.activities[index].revision {
+                return if content == self.activities[index].content {
+                    Err(TransportError::WorkRevisionNotNewer)
+                } else {
+                    Err(TransportError::ConflictingWorkRevision)
+                };
             }
             let current = self.activities[index].status;
             if current.is_terminal() {
@@ -945,6 +989,7 @@ impl WorkTracker {
                 origin: origin.clone(),
                 key: key.to_owned(),
                 revision,
+                content,
                 status,
                 artifacts,
                 lease_expires_at,
@@ -1885,6 +1930,43 @@ mod tests {
                 Err(TransportError::WorkRevisionNotNewer) => "revision_not_newer",
                 other => panic!("unexpected stale work revision outcome: {other:?}"),
             };
+        }
+        // The two halves of the equal-revision split (#144). A redelivered frame
+        // is a duplicate and stays a plain "not newer"; the same revision
+        // carrying *different* work is the collision this layer used to swallow.
+        if name == "equal_revision_duplicate" {
+            let first =
+                validated_work_state("instance-01", "employee-184", 2, "active", "SB-42", now);
+            let again =
+                validated_work_state("instance-01", "employee-184", 2, "active", "SB-42", now);
+            tracker
+                .observe(&first)
+                .expect("first activity should be accepted");
+            return match tracker.observe(&again) {
+                Err(TransportError::WorkRevisionNotNewer) => "revision_not_newer",
+                other => panic!("unexpected duplicate work revision outcome: {other:?}"),
+            };
+        }
+        if name == "equal_revision_conflict" {
+            let first =
+                validated_work_state("instance-01", "employee-184", 2, "active", "SB-42", now);
+            let conflict =
+                validated_work_state("instance-01", "employee-184", 2, "blocked", "SB-42", now);
+            tracker
+                .observe(&first)
+                .expect("first activity should be accepted");
+            let outcome = match tracker.observe(&conflict) {
+                Err(TransportError::ConflictingWorkRevision) => "conflicting_revision",
+                other => panic!("unexpected conflicting work revision outcome: {other:?}"),
+            };
+            // The refused frame must not have displaced the stored activity: a
+            // conflict is a signal, not an admission.
+            assert_eq!(
+                tracker.status("instance-01", "activity-01K6Q5"),
+                Some(WorkStatus::Active),
+                "a refused conflicting frame must leave the tracked activity intact"
+            );
+            return outcome;
         }
 
         for (index, state) in case

@@ -6,5 +6,7 @@
   {"name": "terminal_rejects_active", "states": ["active", "abandoned", "active"], "expected": "terminal_transition"},
   {"name": "ready_rejects_active", "states": ["ready", "active"], "expected": "invalid_transition"},
   {"name": "non_increasing_revision", "states": ["active"], "expected": "revision_not_newer"},
+  {"name": "equal_revision_duplicate", "states": ["active"], "expected": "revision_not_newer"},
+  {"name": "equal_revision_conflict", "states": ["active"], "expected": "conflicting_revision"},
   {"name": "stable_artifact_overlap", "states": ["overlap"], "expected": "two_warnings"}
 ]
