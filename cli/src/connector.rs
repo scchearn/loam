@@ -81,6 +81,21 @@ pub struct CapabilityEvidence {
     pub verified_at: DateTime<Utc>,
 }
 
+/// One-line runtime breadcrumbs for the delivery pipeline, on stderr, under a
+/// single grep-able prefix (#103). The connector is a background daemon whose
+/// output the staged service definitions capture, so this is the only place its
+/// pipeline is observable: without it, a parser bug that refuses every peer
+/// frame or a wake that never lands leaves no external signal at all, and the
+/// answer costs broker-side packet capture.
+///
+/// Content rules, enforced by review at every call site: ids, counts, ports,
+/// reasons. Never a summary, a payload, a state key, or a wake address.
+macro_rules! breadcrumb {
+    ($($arg:tt)*) => {
+        eprintln!("loam connector: {}", format_args!($($arg)*))
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeError {
     AuthenticationFailed,
@@ -1135,8 +1150,15 @@ impl ChannelRegistry {
     /// Enqueue one admitted item into every registered session's mailbox for
     /// the given project. Non-blocking: a full queue drops the oldest item
     /// (same eviction as the snapshot store). Never blocks the receive loop.
-    pub fn push(&self, project_id: &str, item: &SnapshotItem, capacity: usize) {
-        if let Ok(mut inner) = self.inner.lock() {
+    ///
+    /// Returns how many sessions the item was enqueued into, so the caller can
+    /// say whether an admitted item actually reached anyone (#103). Zero is a
+    /// normal state — no local session is registered — not a failure.
+    pub fn push(&self, project_id: &str, item: &SnapshotItem, capacity: usize) -> usize {
+        let Ok(mut inner) = self.inner.lock() else {
+            return 0;
+        };
+        {
             // Collect the matching session ids first: the mailboxes map is
             // borrowed mutably per entry, so the sessions map cannot stay
             // borrowed across it.
@@ -1146,6 +1168,7 @@ impl ChannelRegistry {
                 .filter(|channel| channel.project_id == project_id)
                 .map(|channel| channel.session_id.clone())
                 .collect();
+            let delivered = session_ids.len();
             for session_id in session_ids {
                 let queue = inner.mailboxes.entry(session_id).or_default();
                 if queue.len() == capacity {
@@ -1153,6 +1176,7 @@ impl ChannelRegistry {
                 }
                 queue.push_back(item.clone());
             }
+            delivered
         }
     }
 
@@ -1222,45 +1246,97 @@ fn wake_frame(project_id: &str, hint: Option<&str>) -> String {
 /// escape: connect failures and unknown schemes are all eaten silently per the
 /// degrade rule. Cross-platform std APIs only — no unix-only syscalls, so the
 /// windows-2022 CI legs exercise the same wake path.
+/// A wake attempt that did not fail.
+#[derive(Debug, PartialEq, Eq)]
+enum WakeAttempt {
+    Delivered,
+    /// The wake_ref names a scheme this connector does not speak. Not an error:
+    /// a wake it cannot make is a wake it does not attempt, and the ref is left
+    /// in place rather than pruned.
+    SchemeSkipped,
+}
+
+/// Why a wake attempt failed. Carries the target's port and a typed reason but
+/// never its address: a breadcrumb must localize the fault without recording
+/// where a colleague's session listens (#103). The port alone distinguishes a
+/// stale wake ref from a firewall or a wedged listener.
+#[derive(Debug, PartialEq, Eq)]
+struct WakeFailure {
+    port: Option<String>,
+    reason: &'static str,
+}
+
 fn wake_all(channels: &ChannelRegistry, project_id: &str, hint: Option<&str>) {
     // Collect targets under the lock, then do the I/O after it is dropped: a
     // blocking connect inside the lock would stall every other pump sharing
     // the mailbox mutex.
     let targets = channels.wake_targets(project_id);
+    // No registered wake is the idle steady state, and logging it on every
+    // admitted item would bury the fanouts that did happen.
+    if targets.is_empty() {
+        return;
+    }
+    let attempted = targets.len();
+    let (mut delivered, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     for (session_id, wake_ref) in targets {
-        if wake_one(&wake_ref, project_id, hint).is_err() {
-            // The wake target is unreachable (connection refused) or malformed.
-            // Prune only the wake ref — in memory and in the persisted row — so a
-            // restart never reloads a dead wake and the pump stops re-dialing it.
-            // The session registration and its mailbox stay: a live session is
-            // still pollable, and its per-hook re-registration restores the wake.
-            channels.prune_wake_ref(&session_id);
+        match wake_one(&wake_ref, project_id, hint) {
+            Ok(WakeAttempt::Delivered) => delivered += 1,
+            Ok(WakeAttempt::SchemeSkipped) => skipped += 1,
+            Err(failure) => {
+                failed += 1;
+                breadcrumb!(
+                    "wake failed project={project_id} port={} reason={}",
+                    failure.port.as_deref().unwrap_or("-"),
+                    failure.reason
+                );
+                // The wake target is unreachable (connection refused) or
+                // malformed. Prune only the wake ref — in memory and in the
+                // persisted row — so a restart never reloads a dead wake and the
+                // pump stops re-dialing it. The session registration and its
+                // mailbox stay: a live session is still pollable, and its
+                // per-hook re-registration restores the wake.
+                channels.prune_wake_ref(&session_id);
+            }
         }
     }
+    breadcrumb!(
+        "wake fanout project={project_id} targets={attempted} delivered={delivered} skipped={skipped} failed={failed}"
+    );
 }
 
-fn wake_one(target: &str, project_id: &str, hint: Option<&str>) -> Result<(), String> {
+fn wake_one(
+    target: &str,
+    project_id: &str,
+    hint: Option<&str>,
+) -> Result<WakeAttempt, WakeFailure> {
     let Some(rest) = target.strip_prefix("notify-tcp://") else {
-        // Unknown scheme: skip silently — a wake target a connector does not
-        // understand is a wake it does not attempt, and a malformed wake_ref
-        // never blocks the pump or fails the mailbox.
-        return Ok(());
+        return Ok(WakeAttempt::SchemeSkipped);
     };
-    let (host, port) = rest
-        .rsplit_once(':')
-        .ok_or_else(|| format!("malformed notify-tcp wake_ref: {target}"))?;
-    let address = format!("{host}:{port}");
-    let mut stream = std::net::TcpStream::connect_timeout(
-        &address
-            .parse()
-            .map_err(|_| format!("bad address {address}"))?,
-        Duration::from_secs(1),
-    )
-    .map_err(|error| format!("wake connect to {address}: {error}"))?;
+    let Some((host, port)) = rest.rsplit_once(':') else {
+        return Err(WakeFailure {
+            port: None,
+            reason: "malformed_ref",
+        });
+    };
+    let Ok(address) = format!("{host}:{port}").parse() else {
+        return Err(WakeFailure {
+            port: Some(port.to_owned()),
+            reason: "unresolvable_address",
+        });
+    };
+    let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1))
+        .map_err(|_| WakeFailure {
+            port: Some(port.to_owned()),
+            reason: "connect_failed",
+        })?;
     let frame = wake_frame(project_id, hint);
     stream
         .write_all(frame.as_bytes())
-        .map_err(|error| format!("wake write to {address}: {error}"))
+        .map_err(|_| WakeFailure {
+            port: Some(port.to_owned()),
+            reason: "write_failed",
+        })?;
+    Ok(WakeAttempt::Delivered)
 }
 
 // ---------------------------------------------------------------------------
@@ -1905,19 +1981,19 @@ fn supervise<A, S>(
                 // Exactly one breadcrumb when the observation first crosses into
                 // degraded, not one per cycle after it.
                 if failures == DEGRADE_AFTER {
-                    eprintln!(
-                        "loam connector: observed-degraded project={project_id} after {failures} failed cycles (last error {category})"
+                    breadcrumb!(
+                        "observed-degraded project={project_id} after {failures} failed cycles (last error {category})"
                     );
                 }
-                eprintln!(
-                    "loam connector: establishment failed project={project_id} error={category} (attempt {failures})"
+                breadcrumb!(
+                    "establishment failed project={project_id} error={category} (attempt {failures})"
                 );
                 let since = *sessionless_since.get_or_insert_with(Instant::now);
                 if watchdog_verdict(since, Instant::now(), sessionless_budget)
                     == WatchdogVerdict::Exit
                 {
-                    eprintln!(
-                        "loam connector: watchdog exit project={project_id} — enrolled but sessionless for {}s; exiting {WATCHDOG_EXIT_CODE} for supervisor respawn",
+                    breadcrumb!(
+                        "watchdog exit project={project_id} — enrolled but sessionless for {}s; exiting {WATCHDOG_EXIT_CODE} for supervisor respawn",
                         sessionless_budget.as_secs()
                     );
                     std::process::exit(WATCHDOG_EXIT_CODE);
@@ -1926,8 +2002,8 @@ fn supervise<A, S>(
             }
             EstablishOutcome::Refused(reason) => {
                 liveness.mark_refused(reason);
-                eprintln!(
-                    "loam connector: provisioning refused project={project_id} reason={reason}; supervisor disarmed"
+                breadcrumb!(
+                    "provisioning refused project={project_id} reason={reason}; supervisor disarmed"
                 );
                 return;
             }
@@ -2032,7 +2108,7 @@ impl ProjectSessions {
         // keep trying and eventually exit for its supervisor to respawn.
         let (primed, liveness, identity, state) = match open_transport(row, provisioned, now) {
             Ok(open) => {
-                eprintln!("loam connector: session up project={}", row.project_id);
+                breadcrumb!("session up project={}", row.project_id);
                 let identity: IdentitySlot =
                     std::sync::Arc::new(std::sync::Mutex::new(Some(open.identity.clone())));
                 (
@@ -2296,11 +2372,26 @@ fn open_transport(
     let identity = transport
         .authenticate()
         .map_err(|error| SessionState::Unreachable(error.code().to_owned()))?;
-    for filter in live_filters(&row.org_id, &row.project_id, &identity) {
-        transport
-            .subscribe(&filter, false)
-            .map_err(|error| SessionState::Unreachable(error.code().to_owned()))?;
+    let filters = live_filters(&row.org_id, &row.project_id, &identity);
+    for filter in &filters {
+        if let Err(error) = transport.subscribe(filter, false) {
+            // The filter itself is not logged: it embeds this machine's
+            // principal and agent ids. The count and the typed reason localize
+            // a broker ACL fault without publishing who this instance is.
+            breadcrumb!(
+                "subscribe denied project={} filters={} reason={}",
+                row.project_id,
+                filters.len(),
+                error.code()
+            );
+            return Err(SessionState::Unreachable(error.code().to_owned()));
+        }
     }
+    breadcrumb!(
+        "subscribed project={} filters={}",
+        row.project_id,
+        filters.len()
+    );
 
     // Self-announce: publish this machine's own retained member card on
     // `loam/v1/{org}/members/{instance_id}`. Every connector does this on connect,
@@ -2367,8 +2458,43 @@ fn establish_and_run(
         }
     }
     liveness.mark_established(now);
-    eprintln!("loam connector: session up project={}", row.project_id);
+    breadcrumb!("session up project={}", row.project_id);
     run_pump_loop(open, snapshots, channels, outbound, stop, liveness)
+}
+
+/// One breadcrumb per received frame: the delivery class, the origin instance,
+/// the admission verdict, and the event id when the frame carried one.
+///
+/// Deliberately content-free. The state key is *not* logged even though it sits
+/// in the topic — it is caller-chosen text, and the class plus the origin
+/// already localize a delivery without it. Summary and payload never appear.
+/// This is the line that answers "did the frame arrive and was it admitted",
+/// which previously cost broker-side packet capture to establish.
+fn log_admission(project_id: &str, topic: &str, outcome: &ReceiveOutcome) {
+    breadcrumb!("{}", admission_breadcrumb(project_id, topic, outcome));
+}
+
+/// The admission line itself, split out so the content rules above are pinned by
+/// a test rather than by review alone.
+fn admission_breadcrumb(project_id: &str, topic: &str, outcome: &ReceiveOutcome) -> String {
+    let (class, origin) = match crate::envelope::parse_topic(topic) {
+        Ok(parsed) => (
+            parsed.delivery.envelope_class().to_owned(),
+            parsed.delivery.origin().to_owned(),
+        ),
+        // A topic the parser refuses never reaches the store; say so rather
+        // than dropping the frame from the record entirely.
+        Err(violation) => (format!("unparsed({violation:?})"), String::new()),
+    };
+    let event = match outcome {
+        ReceiveOutcome::Accepted(validated) => validated.as_envelope().id.clone(),
+        _ => "-".to_owned(),
+    };
+    let origin = if origin.is_empty() { "-" } else { &origin };
+    format!(
+        "admission project={project_id} class={class} origin={origin} outcome={} event={event}",
+        outcome.code()
+    )
 }
 
 /// Whether an admitted frame is this machine's own published echo — the #111
@@ -2407,20 +2533,37 @@ fn run_pump_loop(
     // receive this instance's own published frames back — #111. They must never
     // be injected into a local session: they would render as if from a teammate.
     let own_instance_id = identity.instance_id;
-    // A malformed retained member card is degrade-not-crash, but silence hid a
-    // parser bug that stranded every roster. Surface the first one per session
-    // so it is at least visible; one line, no framework.
-    let mut warned_malformed_card = false;
+    // The roster is what every received frame is admitted against, and a roster
+    // that assembled to nothing is the failure that starved delivery with no
+    // external signal at all. Logged here rather than at establishment because
+    // both entries into the pump — a freshly established session and the one
+    // `attach` primed — pass through this function. Counts only, never a peer's
+    // id.
+    breadcrumb!(
+        "roster loaded project={project_id} principals={} origins={}",
+        roster.principals.len(),
+        roster.origins.len()
+    );
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         // Outbound first: an emit the user just made should not wait behind a
         // full poll interval of inbound traffic.
         while let Ok(envelope) = outbound.try_recv() {
             // A refused publish is the connector's problem, not the session's:
-            // one rejected envelope never takes the pump down.
-            let _ = transport.publish_outbound(&envelope, Utc::now());
+            // one rejected envelope never takes the pump down. It is also the
+            // point where a user's emit silently disappears, so both outcomes
+            // are logged by event id — the id the caller already holds.
+            let event_id = envelope.as_envelope().id.clone();
+            match transport.publish_outbound(&envelope, Utc::now()) {
+                Ok(()) => breadcrumb!("publish queued project={project_id} event={event_id}"),
+                Err(error) => breadcrumb!(
+                    "publish denied project={project_id} event={event_id} reason={}",
+                    error.code()
+                ),
+            }
         }
         match transport.receive_outcome(PUMP_POLL, Utc::now(), &roster) {
             Ok(Some((topic, outcome))) => {
+                log_admission(&project_id, &topic, &outcome);
                 // A self-announced member card: persist the card to the cache
                 // and reassemble this project's roster from every retained card
                 // listing the project. The connector is the roster author, so
@@ -2431,6 +2574,10 @@ fn run_pump_loop(
                         if let Ok(root) = crate::provisioning::configured_roster_root() {
                             match crate::provisioning::parse_member_card_pub(text) {
                                 Ok(card) => {
+                                    breadcrumb!(
+                                        "member card accepted org={org_id} instance={}",
+                                        card.instance_id
+                                    );
                                     let _ = crate::provisioning::write_member_card(
                                         &root, &org_id, &card,
                                     );
@@ -2448,14 +2595,23 @@ fn run_pump_loop(
                                             &project_id,
                                             &body,
                                         );
+                                        breadcrumb!(
+                                            "roster assembled project={project_id} principals={} origins={}",
+                                            assembled.principals.len(),
+                                            assembled.origins.len()
+                                        );
                                         roster = assembled;
                                     }
                                 }
-                                Err(reason) if !warned_malformed_card => {
-                                    warned_malformed_card = true;
-                                    eprintln!("loam: ignoring a malformed member card ({reason}); roster may be incomplete");
-                                }
-                                Err(_) => {}
+                                // Every rejection, not the first per session: a
+                                // parser bug refusing every peer card is exactly
+                                // the incident this logging exists for, and the
+                                // volume is bounded by the number of retained
+                                // cards the broker replays on connect. The reason
+                                // is a typed parse verdict, never card content.
+                                Err(reason) => breadcrumb!(
+                                    "member card rejected org={org_id} reason={reason}; roster may be incomplete"
+                                ),
                             }
                         }
                     }
@@ -2502,15 +2658,12 @@ fn run_pump_loop(
                     // receive loop.
                     if changed {
                         if let Ok(parsed) = crate::envelope::parse_topic(&topic) {
-                            let items = store.snapshot(parsed.project, Utc::now());
-                            for item in items {
-                                channels.push(parsed.project, &item, SNAPSHOT_CAPACITY);
-                            }
-                            // Wake fanout (live-push T1): after the mailbox push,
-                            // fire a best-effort metadata-only wake to every
-                            // registered session on this project that asked for
-                            // one. The hint is the admitted envelope's event id
-                            // when the outcome carries one, else the topic class.
+                            // The hint is the admitted envelope's event id when
+                            // the outcome carries one, else the topic class. It
+                            // is computed before the push so the same id labels
+                            // the admission, the mailbox, and the wake lines —
+                            // one grep on an event id then tells the whole story
+                            // of what happened to it (#103).
                             let hint = match &outcome {
                                 ReceiveOutcome::Accepted(validated) => {
                                     Some(validated.as_envelope().id.clone())
@@ -2519,6 +2672,24 @@ fn run_pump_loop(
                                     Some(topic.split('/').next_back().unwrap_or("state").to_owned())
                                 }
                             };
+                            let items = store.snapshot(parsed.project, Utc::now());
+                            let mut sessions = 0;
+                            for item in &items {
+                                sessions = channels.push(parsed.project, item, SNAPSHOT_CAPACITY);
+                            }
+                            // An admitted item with nowhere to land (sessions=0)
+                            // and one that fanned out look identical from
+                            // outside without this line.
+                            breadcrumb!(
+                                "mailbox push project={} event={} items={} sessions={sessions}",
+                                parsed.project,
+                                hint.as_deref().unwrap_or("-"),
+                                items.len()
+                            );
+                            // Wake fanout (live-push T1): after the mailbox push,
+                            // fire a best-effort metadata-only wake to every
+                            // registered session on this project that asked for
+                            // one.
                             wake_all(channels, parsed.project, hint.as_deref());
                         }
                     }
@@ -2530,7 +2701,7 @@ fn run_pump_loop(
     }
     transport.disconnect();
     liveness.mark_disconnected(Utc::now());
-    eprintln!("loam connector: session down project={project_id}");
+    breadcrumb!("session down project={project_id}");
     EstablishOutcome::Ended
 }
 
@@ -4368,9 +4539,14 @@ mod service_tests {
             .expect("register");
         }
 
-        state
-            .channels
-            .push("loam", &sample_item("inbox:02", "Both."), SNAPSHOT_CAPACITY);
+        let delivered =
+            state
+                .channels
+                .push("loam", &sample_item("inbox:02", "Both."), SNAPSHOT_CAPACITY);
+        // The fanout count the mailbox breadcrumb reports (#103): a push that
+        // reached nobody and one that reached every session are otherwise
+        // indistinguishable from outside the registry.
+        assert_eq!(delivered, 2, "the item lands in both registered mailboxes");
 
         for session in ["sess-a", "sess-b"] {
             let polled =
@@ -4397,11 +4573,12 @@ mod service_tests {
 
         // The registered session is bound to "loam"; pushing for another
         // project must not reach it.
-        state.channels.push(
+        let delivered = state.channels.push(
             "other-project",
             &sample_item("inbox:03", "Not yours."),
             SNAPSHOT_CAPACITY,
         );
+        assert_eq!(delivered, 0, "a cross-project push reaches no mailbox");
 
         let polled =
             dispatch_for_key(&poll_request("sess-other"), &key, &path, &mut state).expect("poll");
@@ -6593,5 +6770,114 @@ mod outbound_tests {
             "{topic}"
         );
         assert!(document.contains("\"intent\":\"response\""), "{document}");
+    }
+}
+
+#[cfg(test)]
+mod breadcrumb_tests {
+    //! The runtime breadcrumbs (#103) are the connector's only external signal,
+    //! and they run on a path that carries colleagues' message content. Two
+    //! things therefore need pinning rather than reviewing: that a line says
+    //! enough to localize a fault, and that it says nothing more than ids,
+    //! counts, ports, and reasons.
+
+    use super::*;
+
+    const STATE_TOPIC: &str = "loam/v1/org-3A1/project-7M3/state/instance-01/activity-01K6Q5";
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-24T14:20:00Z")
+            .expect("fixture time parses")
+            .with_timezone(&Utc)
+    }
+
+    fn accepted_work_frame() -> ReceiveOutcome {
+        let frame = include_bytes!("../tests/fixtures/mqtt/work-state.json");
+        let principal = crate::envelope::AuthenticatedPrincipal::new("employee-184", &[]);
+        let validated = crate::envelope::validate(
+            frame,
+            STATE_TOPIC,
+            &principal,
+            &ValidationConfig::default(),
+            now(),
+        )
+        .expect("the work-state fixture validates");
+        ReceiveOutcome::Accepted(Box::new(validated))
+    }
+
+    #[test]
+    fn the_admission_breadcrumb_localizes_a_frame_without_carrying_its_content() {
+        let line = admission_breadcrumb("project-7M3", STATE_TOPIC, &accepted_work_frame());
+
+        // Enough to answer "did it arrive, from whom, and was it admitted".
+        assert!(line.contains("project=project-7M3"), "{line}");
+        assert!(line.contains("class=latest-state"), "{line}");
+        assert!(line.contains("origin=instance-01"), "{line}");
+        assert!(line.contains("outcome=accepted"), "{line}");
+        assert!(line.contains("event=01K6Q6ESWMT48TPB"), "{line}");
+
+        // And nothing more. The summary and payload are a colleague's words; the
+        // state key is caller-chosen text that rides in the topic and would be
+        // the easy accident, since the topic is right there in the same call.
+        assert!(
+            !line.contains("Implementation is ready locally"),
+            "the summary must never reach the log: {line}"
+        );
+        assert!(
+            !line.contains("acceptance") && !line.contains("cargo test"),
+            "the payload must never reach the log: {line}"
+        );
+        assert!(
+            !line.contains("activity-01K6Q5"),
+            "the caller-chosen state key must never reach the log: {line}"
+        );
+    }
+
+    #[test]
+    fn a_refused_frame_is_still_named_by_class_and_outcome() {
+        // The stale/duplicate verdicts are the ones that made delivery look like
+        // a black box: the frame reached the connector and went nowhere, with
+        // nothing said. They carry no envelope, so the event id is absent.
+        let line = admission_breadcrumb("project-7M3", STATE_TOPIC, &ReceiveOutcome::StaleState);
+        assert!(line.contains("outcome=stale_state"), "{line}");
+        assert!(line.contains("class=latest-state"), "{line}");
+        assert!(line.contains("event=-"), "{line}");
+    }
+
+    #[test]
+    fn an_unparsable_topic_is_recorded_rather_than_dropped_from_the_record() {
+        let line =
+            admission_breadcrumb("project-7M3", "not/a/loam/topic", &ReceiveOutcome::Removed);
+        assert!(line.contains("class=unparsed"), "{line}");
+        assert!(line.contains("outcome=removed"), "{line}");
+        assert!(line.contains("origin=-"), "{line}");
+    }
+
+    #[test]
+    fn a_wake_failure_carries_the_port_and_a_reason_but_never_the_address() {
+        // Port 1 on loopback: nothing listens there, so the connect is refused
+        // immediately rather than waiting out the one-second timeout.
+        let failure = wake_one("notify-tcp://127.0.0.1:1", "project-7M3", None)
+            .expect_err("a wake to a closed port must fail");
+        assert_eq!(failure.port.as_deref(), Some("1"));
+        assert_eq!(failure.reason, "connect_failed");
+        // The reason is a fixed vocabulary, so no OS error string carrying the
+        // address can reach the log through it.
+        assert!(!failure.reason.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn a_malformed_wake_ref_is_typed_and_a_foreign_scheme_is_skipped_not_failed() {
+        let failure = wake_one("notify-tcp://no-port-here", "project-7M3", None)
+            .expect_err("a wake_ref without a port must fail");
+        assert_eq!(failure.port, None);
+        assert_eq!(failure.reason, "malformed_ref");
+
+        // A scheme this connector does not speak is not a failure: pruning the
+        // ref would silently disarm a wake target a future runtime understands.
+        assert_eq!(
+            wake_one("notify-carrier-pigeon://roost", "project-7M3", None),
+            Ok(WakeAttempt::SchemeSkipped)
+        );
     }
 }

@@ -486,6 +486,27 @@ pub enum ReceiveOutcome {
     },
 }
 
+impl ReceiveOutcome {
+    /// A stable, content-free name for the outcome. Breadcrumbs and diagnostics
+    /// need to say what happened to a frame without carrying any part of it, so
+    /// this returns the vocabulary and nothing else (#103). The delivery fixture
+    /// corpus pins these names, which makes the corpus the single definition of
+    /// the admission vocabulary the runtime logs.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Accepted(_) => "accepted",
+            Self::DuplicateEvent => "duplicate_event",
+            Self::DuplicateState => "duplicate_state",
+            Self::StaleState => "stale_state",
+            Self::ConflictingState => "conflicting_state",
+            Self::DuplicateInbox => "duplicate_inbox",
+            Self::Removed => "removed",
+            Self::Membership(_) => "membership",
+            Self::MemberCard { .. } => "member_card",
+        }
+    }
+}
+
 pub struct DeliveryProcessor {
     validation: ValidationConfig,
     lifecycle: LifecycleConfig,
@@ -2233,13 +2254,10 @@ mod tests {
 
     fn outcome_name(outcome: Result<ReceiveOutcome, TransportError>) -> &'static str {
         match outcome {
-            Ok(ReceiveOutcome::Accepted(_)) => "accepted",
-            Ok(ReceiveOutcome::DuplicateEvent) => "duplicate_event",
-            Ok(ReceiveOutcome::DuplicateState) => "duplicate_state",
-            Ok(ReceiveOutcome::StaleState) => "stale_state",
-            Ok(ReceiveOutcome::ConflictingState) => "conflicting_state",
-            Ok(ReceiveOutcome::DuplicateInbox) => "duplicate_inbox",
-            Ok(ReceiveOutcome::Removed) => "removed",
+            // Through the production accessor on purpose: the fixture's expected
+            // names then pin the exact vocabulary the connector's breadcrumbs
+            // emit, so the two can never drift apart unnoticed.
+            Ok(outcome) => outcome.code(),
             Err(TransportError::OriginNotAuthorized) => "origin_not_authorized",
             Err(TransportError::Validation(Violation::Expired)) => "expired",
             Err(TransportError::Validation(Violation::BindingMismatch(
