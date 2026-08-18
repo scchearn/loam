@@ -53,6 +53,51 @@ pub enum TransportError {
     Validation(Violation),
 }
 
+impl TransportError {
+    /// A stable, content-free name for the refusal, for breadcrumbs and
+    /// diagnostics (#103).
+    ///
+    /// Content-freeness is structural rather than careful: `TransportError` is
+    /// `Copy`, so no variant can carry a borrowed or owned piece of a frame, and
+    /// the one variant with a payload carries a `Violation`, which is `Copy` for
+    /// the same reason. The `Display` text is prose for a human reading one
+    /// error; this is the token a log is grepped by.
+    pub fn code(&self) -> String {
+        let name = match self {
+            Self::EmptyBroker => "empty_broker",
+            Self::ZeroPort => "zero_port",
+            Self::EmptyClientId => "empty_client_id",
+            Self::ZeroRequestCapacity => "zero_request_capacity",
+            Self::ZeroMaxPacketBytes => "zero_max_packet_bytes",
+            Self::EnvelopeExceedsPacketLimit => "envelope_exceeds_packet_limit",
+            Self::ZeroTrackingCapacity => "zero_tracking_capacity",
+            Self::InvalidExpiry => "invalid_expiry",
+            Self::Expired => "expired",
+            Self::MissingInboxRecipient => "missing_inbox_recipient",
+            Self::MissingStateKey => "missing_state_key",
+            Self::InvalidStateRevision => "invalid_state_revision",
+            Self::EventTombstone => "event_tombstone",
+            Self::SemanticReplyMismatch => "semantic_reply_mismatch",
+            Self::InvalidWorkEnvelope => "invalid_work_envelope",
+            Self::InvalidWorkTransition => "invalid_work_transition",
+            Self::TerminalWorkState => "terminal_work_state",
+            Self::PublicationUnverified => "publication_unverified",
+            Self::WorkRevisionNotNewer => "work_revision_not_newer",
+            Self::ConflictingWorkRevision => "conflicting_work_revision",
+            Self::InvalidLifecycleDuration => "invalid_lifecycle_duration",
+            Self::InvalidRenewalInterval => "invalid_renewal_interval",
+            Self::OriginNotAuthorized => "origin_not_authorized",
+            Self::ClientQueue => "client_queue",
+            // The violation is the whole diagnostic value here: "validation"
+            // alone would not distinguish the #143 near-miss (a numeric
+            // revision, refused as `MissingLatestStateRevision`) from a expired
+            // frame.
+            Self::Validation(violation) => return format!("validation:{violation:?}"),
+        };
+        name.to_owned()
+    }
+}
+
 impl std::fmt::Display for TransportError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
@@ -975,11 +1020,15 @@ impl WorkTracker {
             // frame, and the latest-state admission already separates the two
             // (`DuplicateState` vs `ConflictingState`). This layer used to fold
             // both into "not newer" and drop the collision without a word (#144).
-            // Well-behaved emitters cannot produce one — the emit path reserves a
-            // strictly increasing per-key revision (#143) — so this is the
-            // defense-in-depth that stops that guarantee from being the only
-            // thing standing between a buggy or replaying producer and a silently
-            // swallowed contradiction.
+            //
+            // Status, so the comment above is not read as a claim about the
+            // running system: `WorkTracker` has no production caller. The live
+            // receiving path is `DeliveryProcessor::receive` -> `receive_state`,
+            // which never consults this type; it is exercised only by tests. So
+            // this closes the asymmetry *in the layer*, and nothing stands
+            // between a misbehaving producer and a swallowed contradiction on
+            // the delivery path today, wired or otherwise. Wiring it in — or
+            // deleting it — is tracked separately.
             if revision == self.activities[index].revision {
                 return if content == self.activities[index].content {
                     Err(TransportError::WorkRevisionNotNewer)
