@@ -161,7 +161,9 @@ test('marketplace plugin ships the harness-native federation hooks plus the inge
   // hooks" spinner. The timeout is the deliberate 1h idle-wake window / harness
   // ceiling, not the old 14520s dev-era arming value.
   assert.equal(wakeEntry.asyncRewake, true, 'the wake entry runs asyncRewake, not a synchronous hold');
-  assert.equal(wakeEntry.timeout, 3600, 'the wake window is a deliberate 1h');
+  // The harness ceiling is STRICTLY above the internal 1h wake budget (3600s) so
+  // the poller's own deadline fires first and drops its wake_ref before the reaper.
+  assert.equal(wakeEntry.timeout, 3660, 'the harness timeout sits a margin above the 1h budget');
   assert.equal(typeof wakeEntry.rewakeMessage, 'string');
   assert.equal(typeof wakeEntry.rewakeSummary, 'string');
 

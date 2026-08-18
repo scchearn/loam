@@ -303,8 +303,12 @@ const UNAVAILABLE_HINT = 'You have loam.\nLoam is unavailable. Run: npx @scchear
 // hooks" spinner (#141) — and a frame wakes it via exit 2. Tradeoff of a bounded
 // window: after it expires, that idle period is wake-dark until the next Stop
 // re-arms the poller; 1h covers a normal away-stretch without an unbounded hold.
-// Keep the hooks.json Stop `timeout` (seconds) at or above this / 1000 — it is
-// the harness ceiling that reaps a killed connector or a quiet idle.
+// Invariant: keep the hooks.json Stop `timeout` (seconds) STRICTLY above this /
+// 1000. The harness ceiling reaps a killed connector or a quiet idle, but if it
+// fires at or before the internal budget the reaper can win the race and skip the
+// `finally{}` that drops the wake_ref — leaving a stale ref until seam-4 self-heal
+// prunes it. A margin (budget 3600s, timeout 3660s) guarantees the poller's own
+// deadline fires first and deregisters cleanly before the ceiling.
 const STOP_WAKE_BUDGET_MS = 60 * 60 * 1000;
 // Re-arm cadence: every window the poller re-registers the wake_ref so a connector
 // restart mid-idle re-establishes it (#112 self-heal), and — because the poller's
