@@ -22,6 +22,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         Some("service") => service(args),
         Some("disconnect") => disconnect(args),
         Some("status") => status(args),
+        Some("list") => list(args),
         Some("emit") => emit(args),
         Some("inject") => inject(args),
         _ => {
@@ -30,6 +31,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
                  loam federation connect <workspace> <broker> [--project org/project] [--global-root <path>] [--token <password>|--token-file <path>] [--json]\n  \
                  loam federation disconnect <workspace> --global-root <path> [--json]\n  \
                  loam federation status [<workspace>] --global-root <path> [--json]\n  \
+                 loam federation list [--json]\n  \
                  loam federation emit [<workspace>] --global-root <path> [--json]   (reads one operation on stdin)\n  \
                  loam federation inject <register|drop> [<workspace>] --global-root <path> --session-id <id> [--channel-ref <ref>] [--wake-ref <ref>] [--json]"
             );
@@ -255,6 +257,87 @@ fn status_summary(report: &Value) -> String {
         "status: {count} enrolled project(s); definition {}; manager {manager}; live broker session not observed",
         if definition { "present" } else { "absent" }
     )
+}
+
+/// Read-only inventory of the configured enrollment registry.
+///
+/// Unlike status, this command does not need a legacy global root or query a
+/// service manager: it resolves the durable config-dir registry and lists its
+/// rows directly.
+fn list(mut args: impl Iterator<Item = String>) -> i32 {
+    let mut json_output = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => json_output = true,
+            other => {
+                eprintln!("federation list: unknown argument {other}");
+                return 64;
+            }
+        }
+    }
+
+    let db_path = match crate::provisioning::configured_registry_path(None) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("federation list: {error}");
+            return 69;
+        }
+    };
+    let enrollments = match crate::enrollment::open_readonly(&db_path) {
+        Ok(Some(connection)) => match crate::enrollment::list_enrollments(&connection) {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!("federation list: {error}");
+                return 70;
+            }
+        },
+        Ok(None) => Vec::new(),
+        Err(error) => {
+            eprintln!("federation list: {error}");
+            return 70;
+        }
+    };
+
+    if json_output {
+        println!(
+            "{}",
+            crate::connector::enrollment_values(&enrollments).to_json()
+        );
+    } else {
+        println!("{}", list_summary(&enrollments));
+    }
+    0
+}
+
+fn list_summary(enrollments: &[crate::enrollment::EnrolledRow]) -> String {
+    if enrollments.is_empty() {
+        return "No federation enrollments.".to_owned();
+    }
+
+    let mut output = String::from("PROJECT\tWORKSPACE\tBROKER ENDPOINT\tLAST VERIFIED\n");
+    for row in enrollments {
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            table_cell(&format!("{}/{}", row.org_id, row.project_id)),
+            table_cell(&row.display_path),
+            table_cell(&row.broker_endpoint),
+            table_cell(&row.capabilities.verified_at),
+        ));
+    }
+    output.trim_end_matches('\n').to_owned()
+}
+
+fn table_cell(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn disconnect_summary(report: &crate::connector::DisconnectReport) -> String {

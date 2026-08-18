@@ -4102,42 +4102,6 @@ pub fn status_report<R: service::CommandRunner>(
             _ => Vec::new(),
         };
 
-    let enrollment_values = enrollments
-        .iter()
-        .map(|row| {
-            Value::Object(vec![
-                ("org_id".into(), Value::String(row.org_id.clone())),
-                ("project_id".into(), Value::String(row.project_id.clone())),
-                (
-                    "repository_id".into(),
-                    Value::String(row.repository_id.clone()),
-                ),
-                (
-                    "display_path".into(),
-                    Value::String(row.display_path.clone()),
-                ),
-                // Per-project historical verification, kept beside the enrollment
-                // and never collapsed into a readiness claim.
-                (
-                    "verification".into(),
-                    Value::Object(vec![
-                        (
-                            "capabilities".into(),
-                            Value::Array(capability_names(&row.capabilities)),
-                        ),
-                        (
-                            "verified_at".into(),
-                            Value::String(row.capabilities.verified_at.clone()),
-                        ),
-                    ]),
-                ),
-                // Per-project health is the enrollment's own state, separate from
-                // any live-session claim.
-                ("health".into(), Value::String("enrolled".into())),
-            ])
-        })
-        .collect();
-
     // Definition presence is a filesystem fact; the process/enabled state is a
     // read-only manager query. Neither starts anything.
     let definition_present = service::definition_path(service_ctx).exists();
@@ -4149,7 +4113,7 @@ pub fn status_report<R: service::CommandRunner>(
 
     Value::Object(vec![
         ("schema".into(), Value::Number("1".into())),
-        ("enrollments".into(), Value::Array(enrollment_values)),
+        ("enrollments".into(), enrollment_values(&enrollments)),
         (
             "definition".into(),
             Value::Object(vec![("present".into(), Value::Bool(definition_present))]),
@@ -4174,6 +4138,45 @@ pub fn status_report<R: service::CommandRunner>(
             ]),
         ),
     ])
+}
+
+/// Serialize enrollment rows for the read-only user-facing projections. This
+/// is shared by federation status JSON and federation list JSON so both
+/// commands expose the same per-enrollment shape.
+pub fn enrollment_values(enrollments: &[crate::enrollment::EnrolledRow]) -> Value {
+    Value::Array(
+        enrollments
+            .iter()
+            .map(|row| {
+                Value::Object(vec![
+                    ("org_id".into(), Value::String(row.org_id.clone())),
+                    ("project_id".into(), Value::String(row.project_id.clone())),
+                    (
+                        "repository_id".into(),
+                        Value::String(row.repository_id.clone()),
+                    ),
+                    (
+                        "display_path".into(),
+                        Value::String(row.display_path.clone()),
+                    ),
+                    (
+                        "verification".into(),
+                        Value::Object(vec![
+                            (
+                                "capabilities".into(),
+                                Value::Array(capability_names(&row.capabilities)),
+                            ),
+                            (
+                                "verified_at".into(),
+                                Value::String(row.capabilities.verified_at.clone()),
+                            ),
+                        ]),
+                    ),
+                    ("health".into(), Value::String("enrolled".into())),
+                ])
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]

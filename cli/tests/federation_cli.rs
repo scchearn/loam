@@ -10,6 +10,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use rusqlite::params;
+
 fn binary() -> PathBuf {
     // Cargo exposes the built test binary's own path; the `loam` binary sits in
     // the same target directory.
@@ -73,6 +75,108 @@ fn run_connect_pinned(
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+fn run_list(root: &Path, extra: &[&str]) -> (i32, String, String) {
+    let mut command = Command::new(binary());
+    command
+        .args(["federation", "list"])
+        .args(extra)
+        .env("LOAM_CONFIG_DIR", root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = command.output().expect("spawn loam");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn seed_list_registry(root: &Path) {
+    let db = root.join("federation").join("loam.sqlite3");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let connection = loam::enrollment::open_writable(&db).expect("open test registry");
+    connection
+        .execute(
+            "INSERT INTO federation_enrollment (
+                identity_key, org_id, project_id, repository_id, descriptor_digest,
+                display_path, instance_id, broker_profile, broker_endpoint,
+                tls_server_name, ca_ref, commit_oid,
+                cap_authentication, cap_publish, cap_subscribe, cap_self_receive,
+                verified_at, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                      ?13, ?14, ?15, ?16, ?17, ?18)",
+            params![
+                "unix:1:2",
+                "acme",
+                "loam",
+                "repo-1",
+                "digest-1",
+                "/workspaces/loam",
+                "instance-1",
+                "default",
+                "mqtts://broker.example:8883",
+                "broker.example",
+                Option::<String>::None,
+                "commit-1",
+                1,
+                1,
+                1,
+                1,
+                "2026-08-19T10:00:00Z",
+                "2026-08-19T09:00:00Z",
+            ],
+        )
+        .expect("seed test enrollment");
+}
+
+#[test]
+fn list_defaults_to_config_dir_and_does_not_create_a_registry() {
+    let root = temp_dir("list-empty");
+    let (code, stdout, stderr) = run_list(&root, &["--json"]);
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert_eq!(stdout.trim(), "[]");
+    assert!(
+        !root.join("federation").join("loam.sqlite3").exists(),
+        "read-only list must not create the registry"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn list_renders_the_enrollment_inventory_as_table_or_status_json() {
+    let root = temp_dir("list-populated");
+    seed_list_registry(&root);
+
+    let (code, table, stderr) = run_list(&root, &[]);
+    assert_eq!(code, 0, "{table} {stderr}");
+    assert!(table.contains("PROJECT\tWORKSPACE\tBROKER ENDPOINT\tLAST VERIFIED"));
+    assert!(table.contains(
+        "acme/loam\t/workspaces/loam\tmqtts://broker.example:8883\t2026-08-19T10:00:00Z"
+    ));
+
+    let (code, json, stderr) = run_list(&root, &["--json"]);
+    assert_eq!(code, 0, "{json} {stderr}");
+    let value = loam::json::parse(json.trim()).expect("valid list JSON");
+    let row = value.at(0).expect("one enrollment");
+    assert_eq!(
+        row.get("org_id").and_then(loam::json::Value::as_str),
+        Some("acme")
+    );
+    assert_eq!(
+        row.get("project_id").and_then(loam::json::Value::as_str),
+        Some("loam")
+    );
+    assert_eq!(
+        row.get("verification")
+            .and_then(|value| value.get("verified_at"))
+            .and_then(loam::json::Value::as_str),
+        Some("2026-08-19T10:00:00Z")
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// An empty HOME directory, so `git config` finds no global user.email/name and
