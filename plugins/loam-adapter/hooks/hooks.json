@@ -38,7 +38,10 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/wake.mjs\"",
-            "timeout": 14520
+            "asyncRewake": true,
+            "timeout": 3600,
+            "rewakeMessage": "Loam federation — activity arrived in this workspace while you were idle. Read it below, then continue with the user's request or keep waiting for their reply:",
+            "rewakeSummary": "Loam federation wake"
           }
         ]
       }
