@@ -1451,6 +1451,10 @@ pub struct SnapshotItem {
     /// same message share it, so the snapshot holds exactly one entry per
     /// message; a later state revision replaces the earlier one in place.
     pub key: String,
+    /// The work-state key from the envelope's `data.delivery.key` — the
+    /// validated, topic-bound one, not a copy a sender happened to put in its
+    /// payload (#99). `None` for anything that is not a latest-state frame.
+    pub state_key: Option<String>,
     pub source: String,
     pub item_type: String,
     pub summary: String,
@@ -1604,6 +1608,7 @@ fn snapshot_item(
         .with_timezone(&Utc);
     Some(SnapshotItem {
         key,
+        state_key: envelope.data.delivery.key.clone(),
         source: envelope.source.clone(),
         item_type: envelope.message_type.clone(),
         summary: envelope.data.summary.clone(),
@@ -3422,7 +3427,7 @@ fn snapshot_json(
     let rendered = items
         .iter()
         .map(|item| {
-            Value::Object(vec![
+            let mut fields = vec![
                 ("source".into(), Value::String(item.source.clone())),
                 ("type".into(), Value::String(item.item_type.clone())),
                 ("summary".into(), Value::String(item.summary.clone())),
@@ -3481,7 +3486,13 @@ fn snapshot_json(
                     "publication".into(),
                     Value::String(item.publication.code().to_owned()),
                 ),
-            ])
+            ];
+            // Only latest-state frames have one, and an inbox item carrying an
+            // empty `state_key` would render an empty `key=` attribute (#99).
+            if let Some(state_key) = &item.state_key {
+                fields.push(("state_key".into(), Value::String(state_key.clone())));
+            }
+            Value::Object(fields)
         })
         .collect();
     Value::Object(vec![
@@ -4520,6 +4531,7 @@ mod service_tests {
                 "loam",
                 SnapshotItem {
                     key: "state:instance-01/work-SB-42".into(),
+                    state_key: Some("work-SB-42".into()),
                     source: "urn:loam:instance:instance-01".into(),
                     item_type: "io.loam.work.state".into(),
                     summary: "Work is active.".into(),
@@ -4685,6 +4697,7 @@ mod service_tests {
     fn sample_item(key: &str, summary: &str) -> SnapshotItem {
         SnapshotItem {
             key: key.into(),
+            state_key: None,
             source: "urn:loam:instance:instance-01".into(),
             item_type: "io.loam.message".into(),
             summary: summary.into(),
@@ -6665,6 +6678,7 @@ mod snapshot_tests {
     fn the_snapshot_projection_carries_no_envelope_bytes_or_credential() {
         let item = SnapshotItem {
             key: "inbox:01K6Q6ESWMT48TPD".into(),
+            state_key: None,
             source: format!("urn:loam:instance:{SENDER_INSTANCE}"),
             item_type: "io.loam.message".into(),
             summary: "Held.".into(),
@@ -6925,6 +6939,114 @@ mod outbound_tests {
         assert!(
             validated_emit(&derived.operation, &row(), &identity(), now()).is_ok(),
             "a claimless report must still validate"
+        );
+    }
+
+    /// #99: an emitted work.report, carried all the way to the shared renderer,
+    /// must render its `key`.
+    ///
+    /// The mismatch this closes was invisible to both sides' own tests: the emit
+    /// path put `state_key` at the operation top level (consumed for the topic and
+    /// `delivery.key`), the renderer read `payload.state_key`, and the renderer's
+    /// fixture built the key inside the payload — so each half passed while no
+    /// emitted report ever rendered a key, and cross-revision correlation was lost
+    /// for every consumer. Nothing but a test that spans derive -> build ->
+    /// validate -> project -> render can catch that, which is why this one does.
+    #[test]
+    fn an_emitted_work_report_renders_its_key_through_the_shared_renderer() {
+        let rendered = |operation: &str| {
+            let parsed = crate::json::parse(operation).expect("operation parses");
+            let derived =
+                crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+            let validated = validated_emit(&derived.operation, &row(), &identity(), now())
+                .expect("the connector builds and validates");
+            let topic = format!(
+                "loam/v1/{}/{}/state/{}/{}",
+                row().org_id,
+                row().project_id,
+                identity().instance_id,
+                derived
+                    .operation
+                    .get("state_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            );
+            let delivery = crate::envelope::parse_topic(&topic)
+                .expect("the topic the connector just published on parses")
+                .delivery;
+            let item = snapshot_item(
+                accepted_key(&delivery, &validated.as_envelope().id),
+                &validated,
+                Publication::Unverified,
+            )
+            .expect("the accepted frame projects to a snapshot item");
+            let served = snapshot_json(&row().project_id, std::slice::from_ref(&item), None);
+            let first = served
+                .get("items")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .cloned()
+                .expect("the snapshot serves the item");
+            crate::harness::render_terse_item(&first, 4096)
+        };
+
+        let element = rendered(
+            r#"{"type":"work.report","state_key":"task-7","revision":"4","summary":"ready","payload":{"state":"ready"}}"#,
+        );
+        assert!(
+            element.contains("key=\"task-7\""),
+            "an emitted report must render the key it was published under:\n{element}"
+        );
+        assert!(element.contains("state=\"ready\""), "{element}");
+
+        // The key is the envelope's, not a copy in the payload: an emitter that
+        // puts nothing in the payload but the state still renders a key, and the
+        // payload is forwarded verbatim (no `state_key` is merged into it).
+        assert!(
+            !element.contains("\"state_key\""),
+            "the payload must not be rewritten to carry the key:\n{element}"
+        );
+    }
+
+    #[test]
+    fn an_inbox_item_renders_no_key_because_it_has_none() {
+        // The control for the projection's optional field: only latest-state
+        // frames have a delivery key, and an empty `key=""` on a message would be
+        // a fabricated correlation handle.
+        let operation = r#"{"type":"message.ack","causation_id":"cause-9","summary":"Received.","to":[{"kind":"instance","id":"instance-02"}],"payload":{"action":"collaboration.note","params":{}}}"#;
+        let parsed = crate::json::parse(operation).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+        let validated = validated_emit(&derived.operation, &row(), &identity(), now())
+            .expect("the connector builds and validates");
+        let event_id = validated.as_envelope().id.clone();
+        let topic = format!(
+            "loam/v1/{}/{}/inbox/instance/instance-02/{}/{event_id}",
+            row().org_id,
+            row().project_id,
+            identity().instance_id
+        );
+        let delivery = crate::envelope::parse_topic(&topic)
+            .expect("the inbox topic parses")
+            .delivery;
+        let item = snapshot_item(
+            accepted_key(&delivery, &event_id),
+            &validated,
+            Publication::Unverified,
+        )
+        .expect("the accepted frame projects");
+        assert_eq!(item.state_key, None);
+        let served = snapshot_json(&row().project_id, std::slice::from_ref(&item), None);
+        let first = served
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .cloned()
+            .expect("the snapshot serves the item");
+        let element = crate::harness::render_terse_item(&first, 4096);
+        assert!(
+            !element.contains("key=\""),
+            "a message has no state key to render:\n{element}"
         );
     }
 
