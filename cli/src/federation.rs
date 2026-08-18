@@ -1579,7 +1579,38 @@ fn run_emit(
             .ok_or(EmitError::Unenrolled)?
     };
 
-    let derived = derive_emit(&operation, &row, now)?;
+    let mut derived = derive_emit(&operation, &row, now)?;
+
+    // #143: stamp the authoritative next revision for work.report from the
+    // registry, overriding whatever the caller supplied (or derive_emit's "1"
+    // placeholder). The receiving connector's latest-state admission drops any
+    // frame whose revision is not newer, so a constant revision froze every key
+    // at its first emit. `next_work_revision` reserves under BEGIN IMMEDIATE, so
+    // concurrent emits on one key get strictly increasing values; the same DB and
+    // discipline as the response-dedup ledger this path already owns. A revision
+    // burned by a forward that ships nothing leaves a harmless gap (the receiver
+    // needs strictly-increasing, not gapless), so it never rolls back.
+    if operation.get("type").and_then(Value::as_str) == Some("work.report") {
+        let state_key = derived
+            .operation
+            .get("state_key")
+            .and_then(Value::as_str)
+            .ok_or(EmitError::MissingStateKey)?
+            .to_owned();
+        let mut write = enrollment::open_writable(&db_path).map_err(|_| EmitError::Unenrolled)?;
+        let revision = enrollment::next_work_revision(
+            &mut write,
+            &row.instance_id,
+            &state_key,
+            &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .map_err(|_| EmitError::Unenrolled)?;
+        if let Value::Object(entries) = &mut derived.operation {
+            if let Some((_, slot)) = entries.iter_mut().find(|(key, _)| key == "revision") {
+                *slot = Value::String(revision.to_string());
+            }
+        }
+    }
 
     // Before the publish, never after. First-write-wins under BEGIN IMMEDIATE.
     // The responder identity is this machine's enrolled instance: the ledger is
@@ -2355,6 +2386,41 @@ mod emit_tests {
         )
         .expect_err("held slot");
         assert_eq!(held, EmitError::AlreadyResponded);
+    }
+
+    #[test]
+    fn emit_reserves_a_strictly_increasing_revision_per_state_key() {
+        // #143: emit always shipped revision 1, so receivers froze each key at
+        // its first update. run_emit now derives the next revision from the
+        // registry per (instance, state_key). No connector here, so each emit
+        // fails at the forward — but the reservation commits before the forward,
+        // so the counter still advances per emit on the key.
+        let (root, workspace, instance_id, registry, _pin) = enrolled_root("emit-revision");
+        let op = br#"{"type":"work.report","state_key":"work-SB-42","summary":"blocked","artifacts":[],"payload":{"state":"blocked"}}"#;
+        assert_eq!(
+            run_emit(op, &workspace, &root, now()).unwrap_err(),
+            EmitError::ConnectorUnreachable
+        );
+        assert_eq!(
+            run_emit(op, &workspace, &root, now()).unwrap_err(),
+            EmitError::ConnectorUnreachable
+        );
+        // The two emits consumed revisions 1 and 2 for this key, so the next
+        // reservation is strictly greater — the counter only moves forward, so a
+        // genuinely stale revision can never be re-minted.
+        let mut connection = enrollment::open_writable(&registry).expect("registry opens");
+        assert_eq!(
+            enrollment::next_work_revision(&mut connection, &instance_id, "work-SB-42", "t")
+                .unwrap(),
+            3,
+            "each emit on one key must reserve a strictly greater revision"
+        );
+        // A different key is independent: its first emit is revision 1.
+        assert_eq!(
+            enrollment::next_work_revision(&mut connection, &instance_id, "work-OTHER", "t")
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
