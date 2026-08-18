@@ -296,12 +296,20 @@ const WAKE_KIND = 'loam-wake';
 // staged install): the SessionStart surface shows a repair hint; the per-turn and
 // wake surfaces stay silent rather than spam. Mirrors the OpenCode UNAVAILABLE hint.
 const UNAVAILABLE_HINT = 'You have loam.\nLoam is unavailable. Run: npx @scchearn/loam install';
-// The Stop poller holds the session at most this long, then returns allow-stop.
-// The harness hook `timeout` is the hard ceiling; this bound keeps a killed
-// connector or a quiet idle from living forever as a node process. Named consts,
-// tuned here rather than hardcoded inline. Ceiling: keep hooks.json Stop timeout
-// (seconds) at or above STOP_WAKE_BUDGET_MS/1000.
-const STOP_WAKE_BUDGET_MS = 4 * 60 * 60 * 1000;
+// The wake window: the poller waits at most this long for a frame, then returns
+// allow-stop. Deliberate 1h (not the old 14520s dev-era arming value). On Claude
+// the Stop hook is registered `asyncRewake`, so this window runs OFF the visible
+// pipeline — an idle session shows a free composer, not a held "running stop
+// hooks" spinner (#141) — and a frame wakes it via exit 2. Tradeoff of a bounded
+// window: after it expires, that idle period is wake-dark until the next Stop
+// re-arms the poller; 1h covers a normal away-stretch without an unbounded hold.
+// Invariant: keep the hooks.json Stop `timeout` (seconds) STRICTLY above this /
+// 1000. The harness ceiling reaps a killed connector or a quiet idle, but if it
+// fires at or before the internal budget the reaper can win the race and skip the
+// `finally{}` that drops the wake_ref — leaving a stale ref until seam-4 self-heal
+// prunes it. A margin (budget 3600s, timeout 3660s) guarantees the poller's own
+// deadline fires first and deregisters cleanly before the ceiling.
+const STOP_WAKE_BUDGET_MS = 60 * 60 * 1000;
 // Re-arm cadence: every window the poller re-registers the wake_ref so a connector
 // restart mid-idle re-establishes it (#112 self-heal), and — because the poller's
 // notify port is ephemeral — a stale persisted ref pruned on a failed wake is

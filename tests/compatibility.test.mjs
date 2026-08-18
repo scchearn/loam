@@ -154,8 +154,18 @@ test('marketplace plugin ships the harness-native federation hooks plus the inge
   // and Codex run every matching Stop hook, so they coexist without either
   // suppressing the other.
   assert.match(hooks.hooks.Stop[0].hooks[0].command, /stop\.mjs/);
-  assert.match(hooks.hooks.Stop[1].hooks[0].command, /wake\.mjs/);
-  assert.ok(hooks.hooks.Stop[1].hooks[0].timeout >= 14400, 'the wake entry long-polls: its timeout is the hard ceiling');
+  const wakeEntry = hooks.hooks.Stop[1].hooks[0];
+  assert.match(wakeEntry.command, /wake\.mjs/);
+  // wake-async (#141): on Claude the wake runs asyncRewake — off the visible Stop
+  // pipeline, waking on exit 2 — so an idle session shows no held "running stop
+  // hooks" spinner. The timeout is the deliberate 1h idle-wake window / harness
+  // ceiling, not the old 14520s dev-era arming value.
+  assert.equal(wakeEntry.asyncRewake, true, 'the wake entry runs asyncRewake, not a synchronous hold');
+  // The harness ceiling is STRICTLY above the internal 1h wake budget (3600s) so
+  // the poller's own deadline fires first and drops its wake_ref before the reaper.
+  assert.equal(wakeEntry.timeout, 3660, 'the harness timeout sits a margin above the 1h budget');
+  assert.equal(typeof wakeEntry.rewakeMessage, 'string');
+  assert.equal(typeof wakeEntry.rewakeSummary, 'string');
 
   const stop = await import(pathToFileURL(marketplaceStopPath).href);
   const calls = [];
