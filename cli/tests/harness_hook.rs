@@ -72,10 +72,32 @@ struct Run {
 }
 
 fn run_hook(harness: &str, stdin: &[u8], global_root: &Path, skills_root: &Path) -> Run {
-    let mut child = Command::new(binary())
+    run_hook_env(harness, stdin, global_root, skills_root, None)
+}
+
+/// [`run_hook`] with an optional isolated `LOAM_CONFIG_DIR`. The federation
+/// registry resolves through the config-dir ladder, so a test that asserts on
+/// the recorded outcome must pin an empty config root — otherwise it reads the
+/// running machine's live federation config (the #130 hermeticity class) and a
+/// developer's enrolled laptop flips the outcome from `succeeded` to
+/// `continued`. An empty config dir resolves as unenrolled: baseline renders,
+/// the run records `succeeded`.
+fn run_hook_env(
+    harness: &str,
+    stdin: &[u8],
+    global_root: &Path,
+    skills_root: &Path,
+    config_dir: Option<&Path>,
+) -> Run {
+    let mut command = Command::new(binary());
+    command
         .args(["hook", harness])
         .env("LOAM_HOME", global_root)
-        .env("LOAM_SKILLS_ROOT", skills_root)
+        .env("LOAM_SKILLS_ROOT", skills_root);
+    if let Some(config_dir) = config_dir {
+        command.env("LOAM_CONFIG_DIR", config_dir);
+    }
+    let mut child = command
         .current_dir(workspace())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -305,9 +327,14 @@ fn a_workspace_with_no_connector_still_gets_its_baseline_and_says_federation_is_
         !global_root.join("run").exists(),
         "the hook opened an endpoint"
     );
+    // #136: the read path now records itself in the hook_run ledger at
+    // <global-root>/loam.sqlite3 — the hook-event DB, not the enrollment
+    // registry (which lives in the config dir). This one diagnostic write is
+    // the whole point of the ledger; the "federation: unenrolled" line above
+    // already proves no enrollment was fabricated.
     assert!(
-        !global_root.join("loam.sqlite3").exists(),
-        "the hook created a registry"
+        global_root.join("loam.sqlite3").exists(),
+        "the hook recorded its run in the ledger"
     );
 }
 
@@ -324,4 +351,147 @@ fn a_non_git_workspace_degrades_without_failing_the_session() {
     );
     assert!(body.contains("SKILL-BODY-MARKER"), "{body}");
     assert!(body.contains("federation: unenrolled"), "{body}");
+}
+
+/// Query the run ledger the way an operator diagnosing a lane would: shell
+/// `loam hooks list <global-root>` with the given filters, return its stdout
+/// (one JSON object per matching row).
+fn hooks_list(global_root: &Path, filters: &[&str]) -> String {
+    let output = Command::new(binary())
+        .args(["hooks", "list"])
+        .arg(global_root)
+        .args(filters)
+        .output()
+        .expect("hooks list runs");
+    assert!(
+        output.status.success(),
+        "hooks list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// An isolated empty config root, so the federation ladder resolves unenrolled
+/// instead of reading the running machine's live config (the #130 class).
+fn isolated_config(label: &str) -> PathBuf {
+    temp_root(&format!("{label}-cfg"))
+}
+
+#[test]
+fn a_rendered_invocation_records_a_succeeded_run() {
+    // #136 acceptance: after a session where the hook fired, the ledger shows a
+    // row — so a later absence is meaningful. A normal (unenrolled) workspace
+    // renders the baseline and records `succeeded`, with the session id, event,
+    // and runtime version the diagnosis needs.
+    let (global_root, skills_root) = installation("ledger-rendered");
+    let config = isolated_config("ledger-rendered");
+    let stdin = format!(
+        r#"{{"cwd":"{}","session_id":"sess-rendered"}}"#,
+        json_path(&workspace())
+    );
+    let run = run_hook_env(
+        "claude",
+        stdin.as_bytes(),
+        &global_root,
+        &skills_root,
+        Some(&config),
+    );
+    assert_eq!(run.status, 0, "{}", run.stderr);
+
+    let rows = hooks_list(
+        &global_root,
+        &[
+            "--harness",
+            "claude",
+            "--hook",
+            "session_start",
+            "--status",
+            "succeeded",
+        ],
+    );
+    let line = rows
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("no succeeded run recorded:\n{rows}"));
+    let row = loam::json::parse(line).expect("row is json");
+    assert_eq!(row.get("harness").and_then(Value::as_str), Some("claude"));
+    assert_eq!(
+        row.get("hook").and_then(Value::as_str),
+        Some("session_start")
+    );
+    assert_eq!(row.get("status").and_then(Value::as_str), Some("succeeded"));
+    assert_eq!(
+        row.get("session_id").and_then(Value::as_str),
+        Some("sess-rendered")
+    );
+    assert_eq!(
+        row.get("runtime_version").and_then(Value::as_str),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    // Duration is recorded (finished - started), never null.
+    assert!(
+        line.contains("\"duration_ms\":") && !line.contains("\"duration_ms\":null"),
+        "the run duration is recorded: {line}"
+    );
+}
+
+#[test]
+fn an_unparseable_frame_records_a_failed_run() {
+    // #136: the error paths are the ones that matter for diagnosis. A frame the
+    // hook cannot parse still exits 0 (fail-open render) and records a `failed`
+    // row carrying the refuse code.
+    let (global_root, skills_root) = installation("ledger-error");
+    let config = isolated_config("ledger-error");
+    let run = run_hook_env(
+        "claude",
+        b"this is not json",
+        &global_root,
+        &skills_root,
+        Some(&config),
+    );
+    assert_eq!(
+        run.status, 0,
+        "a refused frame still exits 0: {}",
+        run.stderr
+    );
+
+    let rows = hooks_list(&global_root, &["--harness", "claude", "--status", "failed"]);
+    let line = rows
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("no failed run recorded:\n{rows}"));
+    let row = loam::json::parse(line).expect("row is json");
+    assert_eq!(row.get("status").and_then(Value::as_str), Some("failed"));
+    assert!(
+        row.get("detail").and_then(Value::as_str).is_some(),
+        "the failed row carries the refuse code: {line}"
+    );
+}
+
+#[test]
+fn an_unwritable_ledger_never_fails_the_hook() {
+    // #136 fail-open, end to end: a ledger the hook cannot write must not fail
+    // or block the render. A directory where the DB file must be makes every
+    // ledger open fail; the hook still returns its baseline envelope, exit 0.
+    let (global_root, skills_root) = installation("ledger-failopen");
+    let config = isolated_config("ledger-failopen");
+    std::fs::create_dir_all(global_root.join("loam.sqlite3")).unwrap();
+    let stdin = format!(r#"{{"cwd":"{}"}}"#, json_path(&workspace()));
+    let run = run_hook_env(
+        "claude",
+        stdin.as_bytes(),
+        &global_root,
+        &skills_root,
+        Some(&config),
+    );
+    assert_eq!(
+        run.status, 0,
+        "an unwritable ledger must not fail the hook: {}",
+        run.stderr
+    );
+    assert!(
+        run.stdout.contains("SKILL-BODY-MARKER"),
+        "the hook still renders the baseline: {}",
+        run.stdout
+    );
 }

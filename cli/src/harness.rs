@@ -22,6 +22,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use chrono::Utc;
+
 use crate::ipc::{self, IpcConfig, IpcError, Operation};
 use crate::json::Value;
 
@@ -129,6 +131,53 @@ impl HookEvent {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
             HookEvent::Wake => "Wake",
+        }
+    }
+
+    /// The lowercase identifier for the `hook_run.hook` column (#136). The Node
+    /// hooks store lowercase ids (`stop`), and `loam hooks list --hook` only
+    /// accepts a lowercase identifier, so native events use the same convention:
+    /// a native row filters exactly like a Node one.
+    fn ledger_hook_id(&self) -> &'static str {
+        match self {
+            HookEvent::SessionStart => "session_start",
+            HookEvent::UserPromptSubmit => "user_prompt_submit",
+            HookEvent::PreToolUse => "pre_tool_use",
+            HookEvent::PostToolUse => "post_tool_use",
+            HookEvent::Wake => "wake",
+        }
+    }
+}
+
+/// The outcome class recorded for one native hook invocation (#136). The hook
+/// always exits 0, so this is the diagnostic distinction the ledger carries:
+/// whether the read path rendered, soft-degraded to baseline-only because the
+/// collaboration read could not fully answer, or refused an unparseable frame.
+/// Maps onto the shared `hook_run.status` vocabulary so `loam hooks list` shows
+/// native and Node runs side by side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookRunStatus {
+    Rendered,
+    SoftDegraded,
+    Error,
+}
+
+impl HookRunStatus {
+    /// A degraded connector is the only soft-degrade: the baseline still renders
+    /// but the federation section could not be filled. An unenrolled or
+    /// snapshot workspace both rendered everything they were meant to.
+    fn from_federation(federation: &Federation) -> HookRunStatus {
+        match federation {
+            Federation::Degraded(_) => HookRunStatus::SoftDegraded,
+            Federation::Snapshot(_) | Federation::Unenrolled => HookRunStatus::Rendered,
+        }
+    }
+
+    fn as_status(self) -> &'static str {
+        match self {
+            HookRunStatus::Rendered => "succeeded",
+            HookRunStatus::SoftDegraded => "continued",
+            HookRunStatus::Error => "failed",
         }
     }
 }
@@ -1000,6 +1049,22 @@ pub fn compose_body(
     event: HookEvent,
     federation_override: Option<Federation>,
 ) -> String {
+    compose_body_reporting(paths, config, frame, event, federation_override, None)
+}
+
+/// [`compose_body`] with an out-slot for the native run outcome (#136). The
+/// outcome is classified once, at the single point every render path passes —
+/// right after the federation is resolved — so the ledger record reflects what
+/// the read path actually produced without re-resolving (which would double the
+/// registry read and the connector round trip).
+fn compose_body_reporting(
+    paths: &HookPaths,
+    config: &HookConfig,
+    frame: &Value,
+    event: HookEvent,
+    federation_override: Option<Federation>,
+    outcome: Option<&mut HookRunStatus>,
+) -> String {
     let workspace = workspace_from_frame(frame, &paths.cwd);
     let session_id = frame.get("session_id").and_then(Value::as_str).or_else(|| {
         frame
@@ -1020,6 +1085,9 @@ pub fn compose_body(
     let federation = federation_override.unwrap_or_else(|| {
         resolve_federation(paths, config, workspace.as_path(), event, session_id)
     });
+    if let Some(slot) = outcome {
+        *slot = HookRunStatus::from_federation(&federation);
+    }
     // Mark-current: after the snapshot render, drain-and-discard the mailbox
     // so a later wake/per-turn drain does not re-render the items this
     // snapshot already showed. An unregistered session (post-restart) is
@@ -1219,6 +1287,10 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         usage();
         return 1;
     };
+    // #136: time the whole invocation for the run record. A usage error above
+    // (bad harness id) is an argv fault, not a hook execution, so it is not
+    // recorded; from here on every exit path appends one ledger row.
+    let started_at_ms = Utc::now().timestamp_millis();
     let mut paths = HookPaths::from_env();
     let mut event = HookEvent::SessionStart;
     // `--body` emits the composed context body only, without the harness-native
@@ -1270,23 +1342,92 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         use std::io::Read;
         let mut reader = std::io::stdin().take((config.max_frame_bytes + 1) as u64);
         if reader.read_to_end(&mut input).is_err() {
-            return refuse(harness, event, "frame_unreadable", body_only);
+            let code = refuse(harness, event, "frame_unreadable", body_only);
+            record_native(
+                &paths,
+                harness,
+                event,
+                session_id.as_deref(),
+                &paths.cwd,
+                HookRunStatus::Error,
+                Some("frame_unreadable"),
+                started_at_ms,
+            );
+            return code;
         }
     }
 
     let frame = match parse_frame(&input, &config) {
         Ok(frame) => frame,
-        Err(error) => return refuse(harness, event, error.code(), body_only),
+        Err(error) => {
+            let code = refuse(harness, event, error.code(), body_only);
+            record_native(
+                &paths,
+                harness,
+                event,
+                session_id.as_deref(),
+                &paths.cwd,
+                HookRunStatus::Error,
+                Some(error.code()),
+                started_at_ms,
+            );
+            return code;
+        }
     };
     let frame = frame_with_session_id(frame, session_id);
 
-    let body = compose_body(&paths, &config, &frame, event, None);
+    let mut outcome = HookRunStatus::Rendered;
+    let body = compose_body_reporting(&paths, &config, &frame, event, None, Some(&mut outcome));
     if body_only {
         println!("{body}");
     } else {
         println!("{}", harness.envelope(&body, event));
     }
+    // Record after stdout: the harness already has its envelope, so a slow or
+    // locked ledger cannot delay the response. Fail-open inside record_native.
+    let workspace = workspace_from_frame(&frame, &paths.cwd);
+    record_native(
+        &paths,
+        harness,
+        event,
+        frame.get("session_id").and_then(Value::as_str),
+        &workspace,
+        outcome,
+        None,
+        started_at_ms,
+    );
     0
+}
+
+/// Append this native hook invocation to the shared `hook_run` ledger (#136).
+/// Strictly fail-open: any ledger error is swallowed here so bookkeeping never
+/// fails the hook, and `record_native_run` uses a short busy timeout so it never
+/// slows it either.
+#[allow(clippy::too_many_arguments)]
+fn record_native(
+    paths: &HookPaths,
+    harness: Harness,
+    event: HookEvent,
+    session_id: Option<&str>,
+    workspace: &Path,
+    outcome: HookRunStatus,
+    detail: Option<&str>,
+    started_at_ms: i64,
+) {
+    let plugin_version = plugin_version(&paths.global_root);
+    let workspace = workspace.to_string_lossy();
+    let _ = crate::hooks::record_native_run(crate::hooks::NativeRun {
+        root: &paths.global_root,
+        harness: harness.as_str(),
+        event: event.ledger_hook_id(),
+        session_id,
+        workspace: &workspace,
+        status: outcome.as_status(),
+        detail,
+        plugin_version: &plugin_version,
+        started_at_ms,
+        finished_at_ms: Utc::now().timestamp_millis(),
+    });
 }
 
 /// A refused frame renders no payload and mutates nothing: the diagnostic is a
@@ -1333,6 +1474,28 @@ mod tests {
             runtime: Some(PathBuf::from("/opt/loam/bin/loam")),
             cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
         }
+    }
+
+    #[test]
+    fn native_run_status_classifies_each_federation_outcome() {
+        // #136: a degraded connector is the only soft-degrade; a snapshot and an
+        // unenrolled workspace both rendered what they were meant to. Error is
+        // set by the refuse path, never derived from a federation value.
+        assert_eq!(
+            HookRunStatus::from_federation(&Federation::Snapshot(Value::Object(Vec::new()))),
+            HookRunStatus::Rendered
+        );
+        assert_eq!(
+            HookRunStatus::from_federation(&Federation::Unenrolled),
+            HookRunStatus::Rendered
+        );
+        assert_eq!(
+            HookRunStatus::from_federation(&Federation::Degraded("connector_unreachable")),
+            HookRunStatus::SoftDegraded
+        );
+        assert_eq!(HookRunStatus::Rendered.as_status(), "succeeded");
+        assert_eq!(HookRunStatus::SoftDegraded.as_status(), "continued");
+        assert_eq!(HookRunStatus::Error.as_status(), "failed");
     }
 
     #[test]
