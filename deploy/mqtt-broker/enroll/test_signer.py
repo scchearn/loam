@@ -15,6 +15,7 @@ the `openssl` the deploy already manages. Run it directly:
 import http.client
 import json
 import os
+import select
 import socket
 import ssl
 import subprocess
@@ -53,7 +54,7 @@ def free_port():
         return probe.getsockname()[1]
 
 
-def start_signer(work, port):
+def start_signer(work, port, timeouts=None):
     cert, key = make_self_signed(work)
     password_file = os.path.join(work, "enroll-password")
     with open(password_file, "w", encoding="ascii") as handle:
@@ -66,12 +67,16 @@ def start_signer(work, port):
         ENROLL_KEY_FILE=key,
         ENROLL_PORT=str(port),
         ENROLL_BIND_ADDRESS="127.0.0.1",
-        # The stall must be resolved by the accept loop staying free, not by
-        # the stalled client timing out first.
+        # By default the stall must be resolved by the accept loop staying
+        # free, not by the stalled client timing out first — so the bounds are
+        # pushed out of the way. The bounds get their own case below, which
+        # passes its own values.
         ENROLL_CONNECTION_TIMEOUT_SECONDS="60",
+        ENROLL_CONNECTION_MAX_SECONDS="120",
         # High enough that the test's own requests never trip the limiter.
         ENROLL_RATE_LIMIT="100",
     )
+    env.update(timeouts or {})
     child = subprocess.Popen([sys.executable, SIGNER], env=env)
     deadline = time.monotonic() + 20.0
     while time.monotonic() < deadline:
@@ -105,6 +110,116 @@ def post_enroll(port, password, timeout):
         return connection.getresponse().status
     finally:
         connection.close()
+
+
+def assert_dropped_within(port, limit, what):
+    """Connect, say nothing, and require the signer to hang up within `limit`.
+
+    `recv` returning b"" is the server having closed or shut down the
+    connection. A socket read timeout here means the signer did not.
+    """
+    client = socket.create_connection(("127.0.0.1", port), timeout=limit)
+    try:
+        started = time.monotonic()
+        try:
+            assert client.recv(1) == b"", f"{what}: expected the signer to hang up"
+        except socket.timeout:
+            raise AssertionError(
+                f"{what}: the signer held the connection past {limit:.0f}s; "
+                "an unbounded connection is one worker thread and one fd a "
+                "silent client can hold for free"
+            ) from None
+        return time.monotonic() - started
+    finally:
+        client.close()
+
+
+def check_bounds_drop_a_silent_client():
+    """The other half of the fix: a connection that goes nowhere is dropped.
+
+    The accept-loop case above deliberately disables the bounds, so without
+    this the timeout half of the fix has no coverage at all.
+    """
+    # A client that never starts the TLS handshake trips the idle timeout.
+    port = free_port()
+    with tempfile.TemporaryDirectory(prefix="loam-signer-idle-") as work:
+        child = start_signer(
+            work,
+            port,
+            {"ENROLL_CONNECTION_TIMEOUT_SECONDS": "2", "ENROLL_CONNECTION_MAX_SECONDS": "60"},
+        )
+        try:
+            elapsed = assert_dropped_within(port, 20.0, "idle timeout")
+            print(f"ok: idle client dropped after {elapsed:.2f}s")
+        finally:
+            child.terminate()
+            child.wait(timeout=10)
+
+    # And a slowloris — a client that completes the handshake and then dribbles
+    # a request header one byte at a time, faster than the idle timeout. Every
+    # byte rearms that timeout, so only the ceiling can end this. The TLS
+    # handshake must be a real one: garbage bytes would be refused by the
+    # record parser in about a second and prove nothing about the ceiling.
+    port = free_port()
+    with tempfile.TemporaryDirectory(prefix="loam-signer-drip-") as work:
+        child = start_signer(
+            work,
+            port,
+            {
+                "ENROLL_CONNECTION_TIMEOUT_SECONDS": "30",
+                "ENROLL_CONNECTION_MAX_SECONDS": "3",
+            },
+        )
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            client = context.wrap_socket(
+                socket.create_connection(("127.0.0.1", port), timeout=30.0)
+            )
+            # Never terminated with a blank line, so the server stays in its
+            # header read for as long as the bytes keep coming.
+            header = b"POST /v1/enroll HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Drip: "
+            header += b"a" * 200
+            started = time.monotonic()
+            dropped = False
+            try:
+                for byte in header:
+                    try:
+                        client.send(bytes([byte]))
+                    except OSError:
+                        dropped = True
+                        break
+                    # Idle rather than sleeping, so the drop is noticed when it
+                    # happens instead of one tick later.
+                    if select.select([client], [], [], 0.25)[0]:
+                        try:
+                            if client.recv(1) == b"":
+                                dropped = True
+                                break
+                        except OSError:
+                            dropped = True
+                            break
+                    if time.monotonic() - started > 25.0:
+                        break
+            finally:
+                client.close()
+            elapsed = time.monotonic() - started
+            assert dropped, (
+                f"the signer held a dripping client for {elapsed:.1f}s against "
+                "a 3s ceiling: the idle timeout is rearmed by every byte, so "
+                "only the ceiling bounds this"
+            )
+            # Dropped eventually is not dropped by the ceiling: with the
+            # ceiling gone this lands near the 30s idle timeout instead.
+            assert elapsed < 20.0, (
+                f"dropped, but only after {elapsed:.1f}s against a 3s ceiling "
+                "— that is the idle timeout, not the ceiling"
+            )
+            print(f"ok: dripping client dropped after {elapsed:.2f}s")
+        finally:
+            child.terminate()
+            child.wait(timeout=10)
 
 
 def main():
@@ -143,6 +258,7 @@ def main():
                 stalled.close()
             child.terminate()
             child.wait(timeout=10)
+    check_bounds_drop_a_silent_client()
     return 0
 
 

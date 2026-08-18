@@ -56,12 +56,23 @@ class Config:
         # Requests per client per window; a burst above this is 429.
         self.rate_limit = int(os.environ.get("ENROLL_RATE_LIMIT", "10"))
         self.rate_window = float(os.environ.get("ENROLL_RATE_WINDOW_SECONDS", "60"))
-        # Per-connection deadline covering the TLS handshake and every
-        # subsequent read/write. A client that connects and then says nothing
-        # must not hold a worker thread — or, before the accept-loop fix
-        # below, the whole service — open forever.
+        # Idle timeout: the longest one socket operation may block — the TLS
+        # handshake, or any single read or write. A client that connects and
+        # then says nothing must not hold a worker thread — or, before the
+        # accept-loop fix below, the whole service — open forever.
         self.connection_timeout = float(
             os.environ.get("ENROLL_CONNECTION_TIMEOUT_SECONDS", "10")
+        )
+        # Whole-connection ceiling. The idle timeout alone is not a bound:
+        # every byte that does arrive rearms it, so a client dripping one byte
+        # per nine seconds holds a worker thread and an fd for as long as it
+        # likes. On a public port with daemon threads that is a slowloris
+        # against the service that already wedged once, so the connection gets
+        # a hard deadline as well.
+        self.connection_max = float(
+            os.environ.get(
+                "ENROLL_CONNECTION_MAX_SECONDS", str(self.connection_timeout * 3)
+            )
         )
         self.openssl = os.environ.get("ENROLL_OPENSSL", "openssl")
 
@@ -232,6 +243,61 @@ def _load_password(server: http.server.HTTPServer) -> str:
     return value
 
 
+def _shutdown_quietly(sock: socket.socket) -> None:
+    """Unblock a worker stuck on a connection that ran out of time.
+
+    Called from the reaper, so the socket may already be closed by the worker
+    finishing normally — that race is the expected case, not an error.
+    """
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+class ConnectionReaper:
+    """Shuts down connections that outlive the whole-connection ceiling.
+
+    The worker cannot enforce its own ceiling: it is blocked inside a `recv`,
+    and nothing short of shutting the socket down returns it. A timer per
+    connection would do it, but that doubles the thread count on exactly the
+    public port being hardened — one thread each for the worker and its own
+    watchdog, both driven by whoever is connecting. So every connection shares
+    one reaper thread and a deadline registry instead.
+    """
+
+    def __init__(self, poll_interval: float = 0.5) -> None:
+        self.poll_interval = poll_interval
+        self.lock = threading.Lock()
+        self.deadlines: dict[socket.socket, float] = {}
+        thread = threading.Thread(target=self._run, name="loam-enroll-reaper")
+        thread.daemon = True
+        thread.start()
+
+    def register(self, sock: socket.socket, seconds: float) -> None:
+        with self.lock:
+            self.deadlines[sock] = time.monotonic() + seconds
+
+    def release(self, sock: socket.socket) -> None:
+        with self.lock:
+            self.deadlines.pop(sock, None)
+
+    def _run(self) -> None:
+        while True:
+            time.sleep(self.poll_interval)
+            now = time.monotonic()
+            with self.lock:
+                expired = [
+                    sock for sock, deadline in self.deadlines.items() if deadline <= now
+                ]
+                for sock in expired:
+                    del self.deadlines[sock]
+            # Outside the lock: shutdown can block briefly and must never hold
+            # up the registry every worker thread touches.
+            for sock in expired:
+                _shutdown_quietly(sock)
+
+
 class ThreadingEnrollServer(http.server.ThreadingHTTPServer):
     """Threaded HTTPS whose TLS handshake never runs on the accept loop.
 
@@ -248,20 +314,36 @@ class ThreadingEnrollServer(http.server.ThreadingHTTPServer):
     then returns a handshake-pending SSLSocket immediately, and the
     per-connection worker thread completes the handshake under
     `connection_timeout`. A stalled client now only ever costs one thread,
-    and only until its deadline expires.
+    and only until its bounds expire.
+
+    Two bounds, because one is not enough. `connection_timeout` is an *idle*
+    timeout — the longest a single socket operation may block — and every byte
+    that arrives rearms it, so it alone does not bound a slow drip.
+    `connection_max` is the ceiling on the whole connection, enforced by the
+    shared `ConnectionReaper`: it shuts the socket down, which unblocks
+    whatever read or write the worker is sitting in.
     """
 
     daemon_threads = True
-    # Replaced from Config in main(); the class default keeps a directly
+    # Replaced from Config in main(); the class defaults keep a directly
     # constructed server bounded too.
     connection_timeout = 10.0
+    connection_max = 30.0
+    reaper: "ConnectionReaper | None" = None
 
     def finish_request(self, request, client_address) -> None:
-        # Runs on the worker thread. The deadline is armed before the
+        # Runs on the worker thread. The idle timeout is armed before the
         # handshake, so it covers the handshake and every later read/write.
         request.settimeout(self.connection_timeout)
-        request.do_handshake()
-        super().finish_request(request, client_address)
+        reaper = self.reaper
+        if reaper is not None:
+            reaper.register(request, self.connection_max)
+        try:
+            request.do_handshake()
+            super().finish_request(request, client_address)
+        finally:
+            if reaper is not None:
+                reaper.release(request)
 
     def handle_error(self, request, client_address) -> None:
         error = sys.exc_info()[1]
@@ -296,6 +378,7 @@ def main(argv: list[str]) -> int:
         print(f"password_file={config.password_file}")
         print(f"listen={config.bind_address}:{config.listen_port}")
         print(f"connection_timeout={config.connection_timeout}")
+        print(f"connection_max={config.connection_max}")
         return 0
 
     # The port is public on a broker VPS; ENROLL_BIND_ADDRESS (default
@@ -325,6 +408,10 @@ def main(argv: list[str]) -> int:
     server.limiter = RateLimiter(config.rate_limit, config.rate_window)  # type: ignore[attr-defined]
     server.config = config  # type: ignore[attr-defined]
     server.connection_timeout = config.connection_timeout
+    server.connection_max = config.connection_max
+    # One reaper for the whole server; see ConnectionReaper for why it is not
+    # a timer per connection.
+    server.reaper = ConnectionReaper()
     # do_handshake_on_connect=False is load-bearing, not a micro-optimisation:
     # accept() propagates this flag to each accepted socket, which is what
     # keeps the handshake off the accept loop. See ThreadingEnrollServer.
