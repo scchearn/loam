@@ -812,6 +812,13 @@ pub mod registry {
         project_id TEXT NOT NULL,
         wake_ref TEXT NOT NULL,
         updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS federation_work_revision (
+        instance_id TEXT NOT NULL,
+        state_key TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (instance_id, state_key)
     );";
 
     /// A backend or schema failure. Distinct from the descriptor rejections above so
@@ -1415,6 +1422,52 @@ pub mod registry {
             )
             .map_err(RegistryError::backend)?;
         Ok(())
+    }
+
+    // Work-state revision counter (#143)
+    // -------------------------------------------------------------------------
+    //
+    // The emit path derives the next `delivery.revision` per work state key from
+    // this ledger instead of shipping a constant `1`, so the receiving connector's
+    // latest-state admission (which drops any frame whose revision is not newer)
+    // admits every update after a key's first emit. Keyed by
+    // `(instance_id, state_key)` — the same dimension the receiver dedups on
+    // (origin instance_id + key). `BEGIN IMMEDIATE` serializes concurrent emits so
+    // two emits on one key get strictly increasing revisions; a revision burned by
+    // a forward that ships nothing leaves a gap, which is fine — the receiver
+    // requires strictly-increasing, not gapless — so this never rolls back.
+
+    /// Reserve and return the next revision for `(instance_id, state_key)`,
+    /// monotonically increasing from 1. Concurrent-safe under `BEGIN IMMEDIATE`.
+    pub fn next_work_revision(
+        connection: &mut Connection,
+        instance_id: &str,
+        state_key: &str,
+        now_rfc3339: &str,
+    ) -> Result<u64, RegistryError> {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(RegistryError::backend)?;
+        let previous: Option<i64> = transaction
+            .query_row(
+                "SELECT revision FROM federation_work_revision
+                 WHERE instance_id = ?1 AND state_key = ?2",
+                rusqlite::params![instance_id, state_key],
+                |row| row.get(0),
+            )
+            .ok();
+        let next = previous.unwrap_or(0).saturating_add(1);
+        transaction
+            .execute(
+                "INSERT INTO federation_work_revision (instance_id, state_key, revision, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(instance_id, state_key)
+                 DO UPDATE SET revision = ?3, updated_at = ?4",
+                rusqlite::params![instance_id, state_key, next, now_rfc3339],
+            )
+            .map_err(RegistryError::backend)?;
+        transaction.commit().map_err(RegistryError::backend)?;
+        Ok(next as u64)
     }
 } // mod registry
 
@@ -2075,6 +2128,80 @@ mod registry_tests {
                 .count(),
             workers - 1
         );
+        let _ = std::fs::remove_file(&*path);
+    }
+
+    // --- #143 work-state revision counter ---
+
+    #[test]
+    fn work_revision_strictly_increases_per_key() {
+        let path = temp_db("work-rev-basic");
+        let mut c = open_writable(&path).unwrap();
+        assert_eq!(
+            next_work_revision(&mut c, "instance-01", "work-1", "t1").unwrap(),
+            1
+        );
+        assert_eq!(
+            next_work_revision(&mut c, "instance-01", "work-1", "t2").unwrap(),
+            2
+        );
+        assert_eq!(
+            next_work_revision(&mut c, "instance-01", "work-1", "t3").unwrap(),
+            3
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn work_revision_is_independent_per_key_and_instance() {
+        let path = temp_db("work-rev-independent");
+        let mut c = open_writable(&path).unwrap();
+        assert_eq!(
+            next_work_revision(&mut c, "instance-01", "work-a", "t").unwrap(),
+            1
+        );
+        assert_eq!(
+            next_work_revision(&mut c, "instance-01", "work-a", "t").unwrap(),
+            2
+        );
+        // A different key on the same instance starts fresh.
+        assert_eq!(
+            next_work_revision(&mut c, "instance-01", "work-b", "t").unwrap(),
+            1
+        );
+        // A different instance for the same key starts fresh — matching the
+        // receiver's per-(origin instance, key) dedup dimension.
+        assert_eq!(
+            next_work_revision(&mut c, "instance-02", "work-a", "t").unwrap(),
+            1
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn concurrent_emits_for_one_key_get_strictly_increasing_revisions() {
+        use std::sync::{Arc, Barrier};
+        let path = Arc::new(temp_db("work-rev-race"));
+        // Create the schema up front so every worker opens an existing DB.
+        drop(open_writable(&path).unwrap());
+
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut c = open_writable(&path).unwrap();
+                barrier.wait();
+                next_work_revision(&mut c, "instance-01", "work-race", "t").unwrap()
+            }));
+        }
+        let mut revisions: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        revisions.sort_unstable();
+        // BEGIN IMMEDIATE serializes every reservation: eight concurrent emits
+        // yield 1..=8 with no duplicate — strictly increasing, never a repeat.
+        assert_eq!(revisions, (1..=workers as u64).collect::<Vec<_>>());
         let _ = std::fs::remove_file(&*path);
     }
 }

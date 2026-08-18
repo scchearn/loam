@@ -1534,6 +1534,47 @@ fn emit_error_json(error: &EmitError) -> Value {
 /// Resolve, derive, dedup, forward. The dedup ledger is consulted *before* the
 /// forward, never after: two terminals of one principal answering the same
 /// request must ship exactly one response.
+/// Stamp the authoritative next revision onto a work.report operation (#143),
+/// overriding whatever the caller supplied (or `derive_emit`'s "1" placeholder).
+/// The receiving connector's latest-state admission drops any frame whose revision
+/// is not newer, so a constant revision froze every key at its first emit.
+/// `next_work_revision` reserves under BEGIN IMMEDIATE — the same DB and discipline
+/// as the response-dedup ledger this path already owns — so concurrent emits on one
+/// key get strictly increasing values. A revision burned by a forward that ships
+/// nothing leaves a harmless gap (the receiver needs strictly-increasing, not
+/// gapless), so it never rolls back. The value is written as a `Value::String`: the
+/// connector reads it via `as_str` before re-wrapping it as a number, so a numeric
+/// stamp here would silently drop the delivery. Non-work operations are untouched.
+fn stamp_work_revision(
+    operation: &mut Value,
+    row: &enrollment::EnrolledRow,
+    db_path: &std::path::Path,
+    now: DateTime<Utc>,
+) -> Result<(), EmitError> {
+    if operation.get("type").and_then(Value::as_str) != Some("work.report") {
+        return Ok(());
+    }
+    let state_key = operation
+        .get("state_key")
+        .and_then(Value::as_str)
+        .ok_or(EmitError::MissingStateKey)?
+        .to_owned();
+    let mut write = enrollment::open_writable(db_path).map_err(|_| EmitError::Unenrolled)?;
+    let revision = enrollment::next_work_revision(
+        &mut write,
+        &row.instance_id,
+        &state_key,
+        &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+    .map_err(|_| EmitError::Unenrolled)?;
+    if let Value::Object(entries) = operation {
+        if let Some((_, slot)) = entries.iter_mut().find(|(key, _)| key == "revision") {
+            *slot = Value::String(revision.to_string());
+        }
+    }
+    Ok(())
+}
+
 fn run_emit(
     bytes: &[u8],
     workspace: &std::path::Path,
@@ -1579,7 +1620,8 @@ fn run_emit(
             .ok_or(EmitError::Unenrolled)?
     };
 
-    let derived = derive_emit(&operation, &row, now)?;
+    let mut derived = derive_emit(&operation, &row, now)?;
+    stamp_work_revision(&mut derived.operation, &row, &db_path, now)?;
 
     // Before the publish, never after. First-write-wins under BEGIN IMMEDIATE.
     // The responder identity is this machine's enrolled instance: the ledger is
@@ -2355,6 +2397,82 @@ mod emit_tests {
         )
         .expect_err("held slot");
         assert_eq!(held, EmitError::AlreadyResponded);
+    }
+
+    #[test]
+    fn emit_reserves_a_strictly_increasing_revision_per_state_key() {
+        // #143: emit always shipped revision 1, so receivers froze each key at
+        // its first update. run_emit now derives the next revision from the
+        // registry per (instance, state_key). No connector here, so each emit
+        // fails at the forward — but the reservation commits before the forward,
+        // so the counter still advances per emit on the key.
+        let (root, workspace, instance_id, registry, _pin) = enrolled_root("emit-revision");
+        let op = br#"{"type":"work.report","state_key":"work-SB-42","summary":"blocked","artifacts":[],"payload":{"state":"blocked"}}"#;
+        assert_eq!(
+            run_emit(op, &workspace, &root, now()).unwrap_err(),
+            EmitError::ConnectorUnreachable
+        );
+        assert_eq!(
+            run_emit(op, &workspace, &root, now()).unwrap_err(),
+            EmitError::ConnectorUnreachable
+        );
+        // The two emits consumed revisions 1 and 2 for this key, so the next
+        // reservation is strictly greater — the counter only moves forward, so a
+        // genuinely stale revision can never be re-minted.
+        let mut connection = enrollment::open_writable(&registry).expect("registry opens");
+        assert_eq!(
+            enrollment::next_work_revision(&mut connection, &instance_id, "work-SB-42", "t")
+                .unwrap(),
+            3,
+            "each emit on one key must reserve a strictly greater revision"
+        );
+        // A different key is independent: its first emit is revision 1.
+        assert_eq!(
+            enrollment::next_work_revision(&mut connection, &instance_id, "work-OTHER", "t")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn emit_stamps_the_frame_with_a_strictly_increasing_revision() {
+        // #143: advancing the reservation counter is not the payoff — the stamp
+        // must reach the frame. Pin `operation["revision"]` (the exact value
+        // run_emit forwards, via the same `stamp_work_revision` it calls) across
+        // two emits on one key: "1" then "2", as Strings. The connector reads the
+        // revision with `as_str` before re-wrapping it numeric, so a Number stamp
+        // would silently drop the delivery — assert the String type, not just the
+        // digits. A regression that broke the stamp (dropped/renamed key, or a
+        // String→Number "cleanup") fails here even though the counter still moves.
+        let (_root, workspace, _instance_id, registry, _pin) = enrolled_root("emit-frame-revision");
+        let physical = enrollment::PhysicalWorkspace::resolve(&workspace).expect("resolves");
+        let read = enrollment::open_readonly(&registry)
+            .expect("registry opens")
+            .expect("registry exists");
+        let row = enrollment::lookup(&read, &enrollment::identity_key(&physical))
+            .expect("lookup")
+            .expect("enrolled row");
+        drop(read);
+        let op = crate::json::parse(
+            r#"{"type":"work.report","state_key":"work-SB-42","summary":"blocked","artifacts":[],"payload":{"state":"blocked"}}"#,
+        )
+        .expect("operation parses");
+
+        let mut first = derive_emit(&op, &row, now()).expect("derives");
+        stamp_work_revision(&mut first.operation, &row, &registry, now()).expect("stamps");
+        assert_eq!(
+            first.operation.get("revision"),
+            Some(&Value::String("1".into())),
+            "the first emit must stamp revision \"1\" as a String"
+        );
+
+        let mut second = derive_emit(&op, &row, now()).expect("derives");
+        stamp_work_revision(&mut second.operation, &row, &registry, now()).expect("stamps");
+        assert_eq!(
+            second.operation.get("revision"),
+            Some(&Value::String("2".into())),
+            "the second emit on the same key must stamp \"2\", not the frozen placeholder"
+        );
     }
 
     #[test]
