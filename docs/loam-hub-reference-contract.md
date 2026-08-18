@@ -1,16 +1,21 @@
 # Design note: loam hub reference contract
 
-Status: proposal for v1.1.0 view integration  
-Source prototype: `_hub`'s offline `bin/loam.ps1`, `LoamOverlay.ps1`, and `DriftGit.ps1`  
-Scope: a local, read-only portfolio view over independent loam workspaces
+Status: proposal for v1.1.0 view integration
+Source prototype: the behavior of `_hub`'s offline `view/loam.md` projection
+Scope: a cross-platform, read-only portfolio view over independent loam workspaces
 
 ## Summary
 
 This note proposes the behavioral contract for a future `loam hub` (or equivalent
-view subcommand). It is a one-shot local projection, not a server and not a new
-memory store. It lets a user see where their loam workspaces are and which local
-git work is waiting, while every workspace remains authoritative for its own
-memory, goals, plans, and source files.
+view subcommand). It is a one-shot projection of workspace roots supplied by the
+caller, not a server and not a new memory store. It lets a user see where their
+loam workspaces are and which local git work is waiting, while every workspace
+remains authoritative for its own memory, goals, plans, and source files.
+
+The `_hub` PowerShell scripts are a reference implementation of behavior only.
+They are not part of this contribution and are not assumed to run on Linux,
+macOS, or any other loam-supported platform. The upstream implementation MUST
+use platform-neutral Rust filesystem, path, timestamp, and git abstractions.
 
 The contract deliberately separates two meanings of federation:
 
@@ -48,15 +53,17 @@ The implementation MUST satisfy these constraints:
 
 ### 2.1 Inputs
 
-The command accepts a scan root and, optionally, an explicit enrollment file.
-Discovery finds local loam workspaces under the root. Enrollment adds named
-locations that are outside the root or otherwise not discoverable. An enrolled
-location that no longer exists remains visible as `missing` so disappearance is
-not silently mistaken for completion.
+The command accepts one or more caller-supplied scan roots and, optionally, an
+explicit enrollment file. Discovery finds local loam workspaces under those
+roots. Enrollment adds named locations that are outside the roots or otherwise
+not discoverable. An enrolled location that no longer exists remains visible as
+`missing` so disappearance is not silently mistaken for completion. The command
+MUST NOT assume `~/Repos`, a Windows drive letter, a PowerShell provider, or any
+other host-specific directory layout.
 
 The implementation may recognize a workspace through its loam layout, but layout
-recognition MUST be a local filesystem check. It MUST NOT call a remote API to
-decide whether a workspace exists.
+recognition MUST be a local filesystem check using platform-neutral APIs. It MUST
+NOT call a remote API to decide whether a workspace exists.
 
 ### 2.2 Row identity and states
 
@@ -71,10 +78,12 @@ source: tracked # tracked | scan
 ```
 
 `path_key` is the normalized canonical path used for joins, deduplication, and
-stable sorting. `path` is the display/link target. On a case-insensitive
-filesystem, normalization MUST use the filesystem's canonical case behavior; on
-case-sensitive systems, distinct paths MUST remain distinct. Separators MUST be
-rendered consistently for the selected output format.
+stable sorting. `path` is the display/link target. Canonicalization MUST use the
+host filesystem's native semantics; on a case-insensitive filesystem, equivalent
+spellings MUST converge, while on a case-sensitive filesystem distinct paths
+MUST remain distinct. The implementation MUST use Rust path APIs rather than
+string hacks or shell-specific path rules. Separators MUST be rendered
+consistently for the selected output format.
 
 State has this meaning:
 
@@ -230,10 +239,13 @@ by the presence of a `needs-upstream` or `unpushed-age` signal.
 
 ## 4. Ownership and integration boundary
 
-The proposed Rust command should own local discovery, canonical-path identity,
-bounded metadata reads, git drift calculation, and structured output. A Markdown
-skill may explain how to invoke it and how to interpret `next_action`; it should
-not become a second scanner.
+The proposed Rust command should own discovery beneath caller-supplied roots,
+canonical-path identity, bounded metadata reads, git drift calculation, and
+structured output. Filesystem and git access MUST be implemented with
+cross-platform Rust APIs or a narrowly bounded, platform-neutral git adapter;
+PowerShell, shell-specific path parsing, and hard-coded local layouts are out of
+scope. A Markdown skill may explain how to invoke it and how to interpret
+`next_action`; it should not become a second scanner.
 
 The live federation mesh remains independent. A future integration MAY add a
 read-only peer/workspace source, but the base hub command MUST continue to work
@@ -262,9 +274,12 @@ A conforming implementation must satisfy these cases:
    `needs-upstream` with the literal `git push -u origin <branch>` action.
 7. A stash, stale unmerged branch, dirty old tracked file, or churned file emits
    its corresponding literal action without changing the repository.
-8. Removing MQTT/network access does not prevent the command from producing the
+8. Running on Linux, macOS, and Windows with equivalent fixture trees produces
+   the same logical rows and states, subject only to each host's native path
+   spelling.
+9. Removing MQTT/network access does not prevent the command from producing the
    local index and local drift signals.
-9. Re-running with the same filesystem/git state and `generated_at` produces
+10. Re-running with the same filesystem/git state and `generated_at` produces
    byte-identical structured and Markdown output.
 
 ## 6. Suggested implementation sequence
@@ -280,6 +295,7 @@ A conforming implementation must satisfy these cases:
    contract, then retire duplicate scanning rather than maintaining two hubs.
 
 This proposal contributes the semantics proven by `_hub`, not its PowerShell
-implementation. It gives loam a small local view that complements the live mesh
-while preserving loam's central promise: memory stays distributed, portable,
-plain, and owned by the repository where it lives.
+implementation or its host-specific path assumptions. It gives loam a small
+cross-platform view that complements the live mesh while preserving loam's
+central promise: memory stays distributed, portable, plain, and owned by the
+repository where it lives.
