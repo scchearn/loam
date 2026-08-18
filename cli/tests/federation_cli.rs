@@ -537,6 +537,103 @@ fn connect_rejects_an_unreadable_token_file() {
     assert!(stderr.contains("cannot read --token-file"), "got: {stderr}");
 }
 
+/// #94: auto-enrollment failing *before* the network as `signer-unreachable`.
+///
+/// The pre-network steps are local file and environment work, and folding them
+/// into the network refusal sent the investigation to DNS, firewalls, and the
+/// broker host while the signer's journal stayed empty. Each must now name
+/// itself. These run on every platform, macos-14 included — the one the report
+/// came from.
+fn connect_with_token(root: &Path, env: &[(&str, &str)], extra: &[&str]) -> (i32, String, String) {
+    let mut command = Command::new(binary());
+    command
+        .arg("federation")
+        .arg("connect")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg("mqtts://broker.example:8883")
+        .arg("--global-root")
+        .arg(root)
+        .arg("--token")
+        .arg("secret")
+        .arg("--json")
+        .args(extra)
+        .env("LOAM_CONFIG_DIR", root)
+        .env("LOAM_FEDERATION_ORG", "acme")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    pin_git_identity(&mut command);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("spawn loam");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn an_unusable_ssl_cert_file_names_the_trust_store_not_the_signer() {
+    // The most likely shape of #94: a shell that exports SSL_CERT_FILE (a
+    // Homebrew or certifi setup does, and macOS is where those are common)
+    // pointing at a file that is gone. Trust anchors are built before anything
+    // is dialled, so the signer never sees the attempt — which is exactly the
+    // reported symptom, an empty signer journal.
+    let root = temp_dir("autoenroll-trust");
+    let missing = root.join("no-such-bundle.pem");
+    let (code, stdout, stderr) =
+        connect_with_token(&root, &[("SSL_CERT_FILE", missing.to_str().unwrap())], &[]);
+    assert_eq!(code, 69, "{stdout} {stderr}");
+    assert!(
+        stdout.contains("trust-anchors-unresolved"),
+        "an unresolvable trust store must name itself: {stdout}"
+    );
+    assert!(
+        !stdout.contains("signer-unreachable"),
+        "a local trust-store failure must not read as a network one: {stdout}"
+    );
+    // The detail says which rung answered, which is the whole fix instruction.
+    assert!(
+        stdout.contains("ssl-cert-file") && stdout.contains("ca-unresolved"),
+        "the detail must name the rung and the reason: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_signer_url_that_cannot_be_dialled_is_not_an_unreachable_signer() {
+    // A typo in LOAM_FEDERATION_SIGNER is a local mistake with a local fix.
+    let root = temp_dir("autoenroll-url");
+    let (code, stdout, stderr) = connect_with_token(
+        &root,
+        &[("LOAM_FEDERATION_SIGNER", "http://signer.example/v1/enroll")],
+        &[],
+    );
+    assert_eq!(code, 69, "{stdout} {stderr}");
+    assert!(
+        stdout.contains("signer-url-invalid") && stdout.contains("not-https"),
+        "a non-HTTPS signer URL must name itself: {stdout}"
+    );
+    assert!(!stdout.contains("signer-unreachable"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_genuinely_unreachable_signer_still_reads_as_unreachable() {
+    // The control for the two above: splitting the local failures out must not
+    // have taken the network refusal with it.
+    let root = temp_dir("autoenroll-still-unreachable");
+    let (code, stdout, stderr) = connect_with_token(&root, &[], &[]);
+    assert_eq!(code, 69, "{stdout} {stderr}");
+    assert!(
+        stdout.contains("signer-unreachable") || stdout.contains("signer-timeout"),
+        "a broker host that does not resolve is still a network refusal: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn connect_with_token_but_no_certificate_fails_fast_on_an_unreachable_signer() {
     // A fresh machine: no identity bundle, but the operator supplies a token.

@@ -597,28 +597,35 @@ fn connect(mut args: impl Iterator<Item = String>) -> i32 {
                 if identity_root.is_none() {
                     if let Err(failure) = auto_enroll(&enrolled, &token, &root) {
                         let code = format!("enrollment: {}", failure.code());
+                        // The detail is what turns `signer-unreachable` from a
+                        // dead end into a diagnosis. Printed in release too:
+                        // the report this exists for came from an operator
+                        // running the published binary.
+                        let detail = failure
+                            .detail()
+                            .map(|(operation, detail)| format!("{operation}: {detail}"));
                         if json_output {
+                            let mut error_fields =
+                                vec![("code".into(), Value::String(code.clone()))];
+                            if let Some(detail) = &detail {
+                                error_fields.push(("detail".into(), Value::String(detail.clone())));
+                            }
                             println!(
                                 "{}",
                                 Value::Object(vec![
                                     ("schema".into(), Value::Number("1".into())),
                                     ("status".into(), Value::String("error".into())),
-                                    (
-                                        "error".into(),
-                                        Value::Object(vec![(
-                                            "code".into(),
-                                            Value::String(code.clone())
-                                        )]),
-                                    ),
+                                    ("error".into(), Value::Object(error_fields)),
                                 ])
                                 .to_json()
                             );
                         } else {
-                            eprintln!("federation connect: {code}");
-                        }
-                        #[cfg(debug_assertions)]
-                        if let Some((operation, detail)) = failure.debug_detail() {
-                            eprintln!("federation connect: local crypto {operation}: {detail}");
+                            match &detail {
+                                Some(detail) => {
+                                    eprintln!("federation connect: {code} ({detail})")
+                                }
+                                None => eprintln!("federation connect: {code}"),
+                            }
                         }
                         return 69;
                     }
@@ -659,18 +666,48 @@ fn auto_enroll(
         })
         .unwrap_or_default();
     let url = crate::enrollment_auto::signer_url(host);
+    let ssl_cert_file = std::env::var("SSL_CERT_FILE").ok();
+    // Which rung is answering decides what the operator has to go and fix, and
+    // it is the fact that was missing when this failed on a laptop: an
+    // `SSL_CERT_FILE` the shell had exported and the file no longer existed is
+    // indistinguishable, from the outside, from a broker that is down.
+    let trust_source = match (
+        enrolled.ca_ref.as_deref(),
+        ssl_cert_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    ) {
+        (Some(_), _) => "ca-ref",
+        (None, Some(_)) => "ssl-cert-file",
+        (None, None) => "bundled-roots",
+    };
     let trust = crate::provisioning::resolve_trust_anchors(
         enrolled.ca_ref.as_deref(),
-        std::env::var("SSL_CERT_FILE").ok().as_deref(),
+        ssl_cert_file.as_deref(),
     )
-    .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    .map_err(|reason| EnrollmentFailure::TrustAnchorsUnresolved {
+        source: trust_source,
+        reason,
+    })?;
     let certificate =
         crate::enrollment_auto::request_signed_certificate(&url, token, &csr_pem, &trust)?;
 
-    let identity_root = crate::provisioning::configured_identity_root()
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
-    crate::provisioning::store_identity_bundle(&identity_root, &certificate, &key_pem)
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    // Past this point the signer has already issued a certificate. A failure
+    // here loses it, so it must never read as "the signer could not be
+    // reached" — it is the local disk, and the fix is local.
+    let identity_root = crate::provisioning::configured_identity_root().map_err(|reason| {
+        EnrollmentFailure::IdentityStoreFailed {
+            operation: "identity-root",
+            detail: reason.to_owned(),
+        }
+    })?;
+    crate::provisioning::store_identity_bundle(&identity_root, &certificate, &key_pem).map_err(
+        |reason| EnrollmentFailure::IdentityStoreFailed {
+            operation: "store-bundle",
+            detail: reason.to_owned(),
+        },
+    )?;
 
     let _ = root;
     Ok(())

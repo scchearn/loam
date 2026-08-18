@@ -65,6 +65,32 @@ pub enum EnrollmentFailure {
         operation: &'static str,
         detail: String,
     },
+    /// The trust anchors for verifying the *signer's* certificate could not be
+    /// built. Nothing has been dialled: this is a local file or environment
+    /// problem, and reporting it as an unreachable signer sent operators to
+    /// look at DNS, firewalls, and the broker host instead of at
+    /// `SSL_CERT_FILE`. `source` names the rung that was in play.
+    TrustAnchorsUnresolved {
+        source: &'static str,
+        reason: &'static str,
+    },
+    /// The signer URL is not one this client can dial — not HTTPS, no host, or
+    /// a host TLS cannot name. A typo in `LOAM_FEDERATION_SIGNER` or in the
+    /// broker endpoint, never a network condition.
+    SignerUrlInvalid { detail: &'static str },
+    /// The local TLS client could not be built, or a socket option was
+    /// refused. A platform or build problem on *this* machine.
+    TlsSetupFailed {
+        operation: &'static str,
+        detail: String,
+    },
+    /// The machine's identity directory could not be resolved, or the issued
+    /// bundle could not be written to it. The certificate may already have
+    /// been signed: the signer did its job and the local disk did not.
+    IdentityStoreFailed {
+        operation: &'static str,
+        detail: String,
+    },
 }
 
 impl EnrollmentFailure {
@@ -76,14 +102,33 @@ impl EnrollmentFailure {
             EnrollmentFailure::MalformedSignerResponse => "malformed-signer-response",
             EnrollmentFailure::GitIdentityRequired => "git-identity-required",
             EnrollmentFailure::LocalCrypto { .. } => "local-crypto-failure",
+            EnrollmentFailure::TrustAnchorsUnresolved { .. } => "trust-anchors-unresolved",
+            EnrollmentFailure::SignerUrlInvalid { .. } => "signer-url-invalid",
+            EnrollmentFailure::TlsSetupFailed { .. } => "tls-setup-failed",
+            EnrollmentFailure::IdentityStoreFailed { .. } => "identity-store-failed",
         }
     }
 
-    pub(crate) fn debug_detail(&self) -> Option<(&'static str, &str)> {
+    /// The one extra fact behind a code: which local step failed and what it
+    /// said. Printed in release builds, not only under `debug_assertions` —
+    /// the whole point is diagnosing the shipped binary an operator ran, which
+    /// is exactly the situation #94 was reported from. Every value here is one
+    /// of this module's own strings or a `Debug` of a crypto/IO error; no
+    /// token, key, or certificate byte reaches it.
+    pub fn detail(&self) -> Option<(&'static str, &str)> {
         match self {
-            EnrollmentFailure::LocalCrypto { operation, detail } => Some((*operation, detail)),
+            EnrollmentFailure::LocalCrypto { operation, detail }
+            | EnrollmentFailure::TlsSetupFailed { operation, detail }
+            | EnrollmentFailure::IdentityStoreFailed { operation, detail } => {
+                Some((*operation, detail))
+            }
+            EnrollmentFailure::TrustAnchorsUnresolved { source, reason } => Some((*source, reason)),
+            EnrollmentFailure::SignerUrlInvalid { detail } => Some(("signer-url", detail)),
             EnrollmentFailure::SignerTimeout { stage } => Some(("timeout-stage", stage)),
-            _ => None,
+            EnrollmentFailure::BadToken
+            | EnrollmentFailure::SignerUnreachable
+            | EnrollmentFailure::MalformedSignerResponse
+            | EnrollmentFailure::GitIdentityRequired => None,
         }
     }
 }
@@ -446,16 +491,25 @@ pub fn request_signed_certificate(
     let timeout = enroll_timeout();
     tcp.set_read_timeout(Some(timeout))
         .and_then(|()| tcp.set_write_timeout(Some(timeout)))
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+        .map_err(|error| EnrollmentFailure::TlsSetupFailed {
+            operation: "socket-deadlines",
+            detail: format!("{error}"),
+        })?;
 
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots.clone())
         .with_no_client_auth();
 
-    let server_name = rustls::pki_types::ServerName::try_from(host.clone())
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    let server_name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| {
+        EnrollmentFailure::SignerUrlInvalid {
+            detail: "host-not-a-tls-server-name",
+        }
+    })?;
     let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+        .map_err(|error| EnrollmentFailure::TlsSetupFailed {
+            operation: "tls-client",
+            detail: format!("{error}"),
+        })?;
     let mut stream = rustls::Stream::new(&mut conn, &mut tcp); // needs tcp: &mut
 
     let request_body = format!(
@@ -572,7 +626,9 @@ pub fn request_signed_certificate(
 fn parse_url(url: &str) -> Result<(String, u16, String), EnrollmentFailure> {
     let rest = url
         .strip_prefix("https://")
-        .ok_or(EnrollmentFailure::SignerUnreachable)?;
+        .ok_or(EnrollmentFailure::SignerUrlInvalid {
+            detail: "not-https",
+        })?;
     let (authority, path) = match rest.split_once('/') {
         Some((auth, path)) => (auth, format!("/{path}")),
         None => (rest, "/v1/enroll".to_owned()),
@@ -584,7 +640,9 @@ fn parse_url(url: &str) -> Result<(String, u16, String), EnrollmentFailure> {
         _ => (authority.to_owned(), 8443),
     };
     if host.is_empty() {
-        return Err(EnrollmentFailure::SignerUnreachable);
+        return Err(EnrollmentFailure::SignerUrlInvalid {
+            detail: "empty-host",
+        });
     }
     Ok((host, port, path))
 }
@@ -650,10 +708,60 @@ mod tests {
     }
 
     #[test]
-    fn local_crypto_failure_has_a_distinct_code_and_debug_detail() {
+    fn local_crypto_failure_has_a_distinct_code_and_detail() {
         let failure = local_crypto_failure("csr-sign", ring::error::Unspecified);
         assert_eq!(failure.code(), "local-crypto-failure");
-        assert_eq!(failure.debug_detail(), Some(("csr-sign", "Unspecified")));
+        assert_eq!(failure.detail(), Some(("csr-sign", "Unspecified")));
+    }
+
+    /// #94: the pre-network failures used to share `signer-unreachable` with
+    /// the network ones, so a local file or environment problem sent the
+    /// operator to look at the broker host. Each must be its own code, and
+    /// each must carry the fact that names the fix.
+    #[test]
+    fn every_local_failure_has_its_own_code_and_says_which_step_failed() {
+        let failures = [
+            EnrollmentFailure::TrustAnchorsUnresolved {
+                source: "ssl-cert-file",
+                reason: "ca-unresolved",
+            },
+            EnrollmentFailure::SignerUrlInvalid {
+                detail: "not-https",
+            },
+            EnrollmentFailure::TlsSetupFailed {
+                operation: "tls-client",
+                detail: "no provider".to_owned(),
+            },
+            EnrollmentFailure::IdentityStoreFailed {
+                operation: "store-bundle",
+                detail: "identity-required".to_owned(),
+            },
+            local_crypto_failure("csr-sign", ring::error::Unspecified),
+            EnrollmentFailure::SignerTimeout { stage: "connect" },
+        ];
+        let mut codes: Vec<&str> = failures.iter().map(EnrollmentFailure::code).collect();
+        let total = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(
+            codes.len(),
+            total,
+            "two local failures sharing a code is the #94 defect itself"
+        );
+        for failure in &failures {
+            assert_ne!(
+                failure.code(),
+                "signer-unreachable",
+                "a local failure must never claim the signer was unreachable: {failure:?}"
+            );
+            assert!(
+                failure.detail().is_some(),
+                "a code with no detail is the dead end #94 reported: {failure:?}"
+            );
+        }
+        // The network refusals stay as they are; they have nothing to add.
+        assert_eq!(EnrollmentFailure::SignerUnreachable.detail(), None);
+        assert_eq!(EnrollmentFailure::BadToken.detail(), None);
     }
 
     #[test]
