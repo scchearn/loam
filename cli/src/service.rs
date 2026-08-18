@@ -175,8 +175,10 @@ const SERVICE_LABEL: &str = "io.loam.connector";
 /// The disabled systemd `--user` unit. `Restart=on-failure` respawns the
 /// connector when its liveness watchdog exits nonzero (code 75) — an inert
 /// connector exits 0 and is deliberately not respawned. `RestartSec` spaces the
-/// respawns so a fast-exit loop cannot trip systemd's start-limit, and stderr is
-/// routed to the journal so the connection-state breadcrumbs are captured. Not
+/// respawns so a fast-exit loop cannot trip systemd's start-limit, and both
+/// streams are routed to the journal so the runtime breadcrumbs are captured —
+/// stderr carries them, and stdout is captured too so a stray write or a
+/// library's own output is not the one thing that vanishes (#103). Not
 /// `WantedBy` any target beyond `[Install]`, so it stays dormant until enabled;
 /// `disable --now` stops it, which wins over `Restart=`.
 pub fn render_systemd_unit(ctx: &ServiceContext) -> Result<String, ServiceError> {
@@ -190,6 +192,7 @@ pub fn render_systemd_unit(ctx: &ServiceContext) -> Result<String, ServiceError>
          ExecStart={runtime} federation service run --global-root {root}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
+         StandardOutput=journal\n\
          StandardError=journal\n\n\
          [Install]\n\
          WantedBy=default.target\n",
@@ -203,14 +206,17 @@ pub fn render_systemd_unit(ctx: &ServiceContext) -> Result<String, ServiceError>
 /// `KeepAlive` is `{SuccessfulExit = false}` so once running, launchd respawns
 /// the connector when its liveness watchdog exits nonzero (code 75) — the
 /// self-heal the incident proved on this platform — while an inert connector that
-/// exits 0 is left down. `StandardErrorPath` captures the connection-state
-/// breadcrumbs. An `EnvironmentVariables` dict carries the `LOAM_*` overrides the
+/// exits 0 is left down. `StandardErrorPath` captures the runtime breadcrumbs and
+/// `StandardOutPath` captures stdout, so a stray write or a library's own output
+/// is not the one thing that vanishes (#103); launchd writes neither stream
+/// anywhere unless the plist names a path. An `EnvironmentVariables` dict carries the `LOAM_*` overrides the
 /// connector needs (launchd does not expand `$HOME`, so values are absolute or
 /// literal).
 pub fn render_launchagent_plist(ctx: &ServiceContext) -> Result<String, ServiceError> {
     let runtime = absolute_utf8(&ctx.runtime_path)?;
     let root = absolute_utf8(&ctx.global_root)?;
-    let stderr_path = launchagent_stderr_path(&ctx.global_root)?;
+    let stdout_path = launchagent_capture_path(&ctx.global_root, "connector.stdout.log")?;
+    let stderr_path = launchagent_capture_path(&ctx.global_root, "connector.stderr.log")?;
     let environment = launchagent_environment();
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -224,17 +230,18 @@ pub fn render_launchagent_plist(ctx: &ServiceContext) -> Result<String, ServiceE
          \t</array>\n\
          \t<key>RunAtLoad</key><false/>\n\
          \t<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key><false/>\n\t</dict>\n\
+         \t<key>StandardOutPath</key><string>{stdout_path}</string>\n\
          \t<key>StandardErrorPath</key><string>{stderr_path}</string>\n\
          {environment}\
          </dict>\n</plist>\n"
     ))
 }
 
-/// The absolute stderr capture path for the LaunchAgent, under the global root
+/// An absolute output-capture path for the LaunchAgent, under the global root
 /// (which install has already created). launchd creates the file itself, so only
 /// the parent needs to exist.
-fn launchagent_stderr_path(global_root: &Path) -> Result<String, ServiceError> {
-    let path = global_root.join("connector.stderr.log");
+fn launchagent_capture_path(global_root: &Path, name: &str) -> Result<String, ServiceError> {
+    let path = global_root.join(name);
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| ServiceError::Io("global root path is not valid UTF-8".into()))
@@ -819,6 +826,9 @@ mod tests {
         // breadcrumbs are captured in the journal.
         assert!(unit.contains("RestartSec="));
         assert!(unit.contains("StandardError=journal"));
+        // Both streams, not just stderr: an unexpected stdout write is captured
+        // rather than discarded (#103).
+        assert!(unit.contains("StandardOutput=journal"));
         // No socket activation, no auto-start beyond an explicit enable.
         assert!(!unit.contains("RunAtLoad"));
     }
@@ -836,9 +846,13 @@ mod tests {
         assert!(plist.contains("<key>KeepAlive</key>"));
         assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
         assert!(!plist.contains("<key>KeepAlive</key><false/>"));
-        // stderr breadcrumbs are captured to a file under the global root.
+        // Runtime breadcrumbs are captured to files under the global root.
+        // launchd discards a stream the plist does not name, so both are named
+        // (#103) — stderr carries the breadcrumbs, stdout catches strays.
         assert!(plist.contains("<key>StandardErrorPath</key>"));
         assert!(plist.contains("connector.stderr.log"));
+        assert!(plist.contains("<key>StandardOutPath</key>"));
+        assert!(plist.contains("connector.stdout.log"));
         assert!(plist.contains(&format!("<string>{runtime}</string>")));
         assert!(plist.contains(SERVICE_LABEL));
     }

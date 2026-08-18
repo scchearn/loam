@@ -38,10 +38,42 @@ fn temp_root(label: &str) -> PathBuf {
     dir
 }
 
+/// An isolated Loam config dir under a test's own temp root.
+///
+/// The registry-resolution ladder puts `LOAM_CONFIG_DIR` above the passed
+/// `--global-root`, so a child that inherits the developer machine's
+/// environment reads that machine's live config-dir registry: a test meaning to
+/// describe an unenrolled machine describes an enrolled one instead (#130).
+/// Pinning is per-spawn on the child's environment, never on the test process's,
+/// so it needs no lock under `cargo test`'s threads.
+fn temp_config_dir(root: &std::path::Path) -> PathBuf {
+    let dir = root.join("config");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// The registry a pinned child resolves. Rung 1 of the ladder returns
+/// `<config dir>/federation/loam.sqlite3` unconditionally, so this — not the
+/// `--global-root` database — is the store those runs create or refuse to
+/// create.
+fn pinned_registry(config_dir: &std::path::Path) -> PathBuf {
+    config_dir.join("federation").join("loam.sqlite3")
+}
+
+/// The binary with its config dir pinned. Every spawn in this file goes through
+/// here so no test can reach the live config-dir registry of the machine
+/// running it.
+fn loam(config_dir: &std::path::Path) -> Command {
+    let mut command = Command::new(binary());
+    command.env("LOAM_CONFIG_DIR", config_dir);
+    command
+}
+
 #[test]
 fn service_run_on_an_unenrolled_machine_is_inert() {
     let root = temp_root("inert");
-    let output = Command::new(binary())
+    let config = temp_config_dir(&root);
+    let output = loam(&config)
         .args(["federation", "service", "run"])
         .arg("--global-root")
         .arg(&root)
@@ -62,6 +94,10 @@ fn service_run_on_an_unenrolled_machine_is_inert() {
     assert!(
         !root.join("loam.sqlite3").exists(),
         "a reconciliation read must not create the database"
+    );
+    assert!(
+        !pinned_registry(&config).exists(),
+        "a reconciliation read must not create the resolved config-dir database"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -113,9 +149,16 @@ fn smoke_enrollment(root: &std::path::Path) -> loam::enrollment::ValidatedEnroll
     }
 }
 
-fn seed_enrollment(root: &std::path::Path) {
+/// Seed one enrollment into `registry`. The registry path is explicit because
+/// the two callers resolve it differently: the hosted smokes run an unpinned
+/// binary that falls back to the `--global-root` database, while the in-process
+/// tests pin `LOAM_CONFIG_DIR` and must seed the rung-1 path the child will read.
+fn seed_enrollment(root: &std::path::Path, registry: &std::path::Path) {
     use loam::enrollment::registry::{insert_enrollment, open_writable, CapabilityRecord};
-    let mut connection = open_writable(&root.join("loam.sqlite3")).expect("open the registry");
+    if let Some(parent) = registry.parent() {
+        std::fs::create_dir_all(parent).expect("registry directory");
+    }
+    let mut connection = open_writable(registry).expect("open the registry");
     let capabilities = CapabilityRecord {
         authentication: true,
         publish: true,
@@ -143,16 +186,17 @@ fn seed_one_enrollment_for_the_service_smoke() {
         std::env::var("LOAM_SMOKE_ROOT").expect("LOAM_SMOKE_ROOT names the smoke's global root"),
     );
     std::fs::create_dir_all(&root).expect("global root");
-    seed_enrollment(&root);
+    seed_enrollment(&root, &root.join("loam.sqlite3"));
     assert!(root.join("loam.sqlite3").is_file(), "registry was written");
 }
 
 #[test]
 fn an_enrolled_machine_starts_and_serves_instead_of_exiting() {
     let root = temp_root("enrolled-start");
-    seed_enrollment(&root);
+    let config = temp_config_dir(&root);
+    seed_enrollment(&root, &pinned_registry(&config));
 
-    let mut child = Command::new(binary())
+    let mut child = loam(&config)
         .args(["federation", "service", "run", "--global-root"])
         .arg(&root)
         .spawn()
@@ -202,10 +246,13 @@ fn an_enrolled_machine_starts_and_serves_instead_of_exiting() {
 
 #[test]
 fn service_run_requires_a_global_root() {
-    let output = Command::new(binary())
+    let root = temp_root("usage");
+    let config = temp_config_dir(&root);
+    let output = loam(&config)
         .args(["federation", "service", "run"])
         .output()
         .expect("spawn service");
+    let _ = std::fs::remove_dir_all(&root);
     assert_eq!(
         output.status.code(),
         Some(64),
@@ -224,7 +271,8 @@ fn service_run_requires_a_global_root() {
 #[cfg(unix)]
 fn lifecycle_status_on_a_missing_registry_creates_no_database() {
     let root = temp_root("lifecycle-status");
-    let output = Command::new(binary())
+    let config = temp_config_dir(&root);
+    let output = loam(&config)
         .args(["federation", "status", "--global-root"])
         .arg(&root)
         .output()
@@ -245,6 +293,10 @@ fn lifecycle_status_on_a_missing_registry_creates_no_database() {
         !root.join("loam.sqlite3").exists(),
         "status must not create the database"
     );
+    assert!(
+        !pinned_registry(&config).exists(),
+        "status must not create the resolved config-dir database"
+    );
     assert!(!root.join("run").join("connector.sock").exists());
 
     let _ = std::fs::remove_dir_all(&root);
@@ -254,10 +306,11 @@ fn lifecycle_status_on_a_missing_registry_creates_no_database() {
 #[cfg(unix)]
 fn lifecycle_disconnect_on_a_dormant_machine_is_inert() {
     let root = temp_root("lifecycle-disconnect");
+    let config = temp_config_dir(&root);
     // "." resolves to this git workspace, but no enrollment exists under the
     // fresh global root, so the machine is dormant: nothing to remove, no manager
     // call, and no database created.
-    let output = Command::new(binary())
+    let output = loam(&config)
         .args(["federation", "disconnect", ".", "--global-root"])
         .arg(&root)
         .output()
@@ -276,6 +329,10 @@ fn lifecycle_disconnect_on_a_dormant_machine_is_inert() {
     assert!(
         !root.join("loam.sqlite3").exists(),
         "disconnect must not create the database"
+    );
+    assert!(
+        !pinned_registry(&config).exists(),
+        "disconnect must not create the resolved config-dir database"
     );
 
     let _ = std::fs::remove_dir_all(&root);

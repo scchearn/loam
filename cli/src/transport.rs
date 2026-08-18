@@ -45,11 +45,62 @@ pub enum TransportError {
     TerminalWorkState,
     PublicationUnverified,
     WorkRevisionNotNewer,
+    ConflictingWorkRevision,
     InvalidLifecycleDuration,
     InvalidRenewalInterval,
     OriginNotAuthorized,
     ClientQueue,
     Validation(Violation),
+}
+
+impl TransportError {
+    /// A stable, content-free name for the refusal, for breadcrumbs and
+    /// diagnostics (#103).
+    ///
+    /// The guard that keeps this content-free, stated precisely because an
+    /// earlier version of this comment stated it wrongly: it is *not* that
+    /// `TransportError` is `Copy`. `&'static str` is `Copy` and so is any
+    /// `&str`, so a `Copy` enum can hold borrowed frame content perfectly well.
+    /// What actually holds is that every arm below returns a literal, and the
+    /// one arm that interpolates formats a `Violation` whose only payload is a
+    /// fieldless `BindingAxis`. Adding a variant that carries a string — or
+    /// giving `BindingAxis` a payload — is what would break this, and neither is
+    /// prevented by the type system. The `Display` text is prose for a human
+    /// reading one error; this is the token a log is grepped by.
+    pub fn code(&self) -> String {
+        let name = match self {
+            Self::EmptyBroker => "empty_broker",
+            Self::ZeroPort => "zero_port",
+            Self::EmptyClientId => "empty_client_id",
+            Self::ZeroRequestCapacity => "zero_request_capacity",
+            Self::ZeroMaxPacketBytes => "zero_max_packet_bytes",
+            Self::EnvelopeExceedsPacketLimit => "envelope_exceeds_packet_limit",
+            Self::ZeroTrackingCapacity => "zero_tracking_capacity",
+            Self::InvalidExpiry => "invalid_expiry",
+            Self::Expired => "expired",
+            Self::MissingInboxRecipient => "missing_inbox_recipient",
+            Self::MissingStateKey => "missing_state_key",
+            Self::InvalidStateRevision => "invalid_state_revision",
+            Self::EventTombstone => "event_tombstone",
+            Self::SemanticReplyMismatch => "semantic_reply_mismatch",
+            Self::InvalidWorkEnvelope => "invalid_work_envelope",
+            Self::InvalidWorkTransition => "invalid_work_transition",
+            Self::TerminalWorkState => "terminal_work_state",
+            Self::PublicationUnverified => "publication_unverified",
+            Self::WorkRevisionNotNewer => "work_revision_not_newer",
+            Self::ConflictingWorkRevision => "conflicting_work_revision",
+            Self::InvalidLifecycleDuration => "invalid_lifecycle_duration",
+            Self::InvalidRenewalInterval => "invalid_renewal_interval",
+            Self::OriginNotAuthorized => "origin_not_authorized",
+            Self::ClientQueue => "client_queue",
+            // The violation is the whole diagnostic value here: "validation"
+            // alone would not distinguish the #143 near-miss (a numeric
+            // revision, refused as `MissingLatestStateRevision`) from a expired
+            // frame.
+            Self::Validation(violation) => return format!("validation:{violation:?}"),
+        };
+        name.to_owned()
+    }
 }
 
 impl std::fmt::Display for TransportError {
@@ -78,6 +129,7 @@ impl std::fmt::Display for TransportError {
             Self::TerminalWorkState => "terminal work state cannot transition",
             Self::PublicationUnverified => "published work state requires Git reachability proof",
             Self::WorkRevisionNotNewer => "work-state revision must increase",
+            Self::ConflictingWorkRevision => "work-state revision repeats with different content",
             Self::InvalidLifecycleDuration => "lifecycle durations must be positive and bounded",
             Self::InvalidRenewalInterval => {
                 "renewal interval must be shorter than the lease duration"
@@ -484,6 +536,27 @@ pub enum ReceiveOutcome {
     },
 }
 
+impl ReceiveOutcome {
+    /// A stable, content-free name for the outcome. Breadcrumbs and diagnostics
+    /// need to say what happened to a frame without carrying any part of it, so
+    /// this returns the vocabulary and nothing else (#103). The delivery fixture
+    /// corpus pins these names, which makes the corpus the single definition of
+    /// the admission vocabulary the runtime logs.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Accepted(_) => "accepted",
+            Self::DuplicateEvent => "duplicate_event",
+            Self::DuplicateState => "duplicate_state",
+            Self::StaleState => "stale_state",
+            Self::ConflictingState => "conflicting_state",
+            Self::DuplicateInbox => "duplicate_inbox",
+            Self::Removed => "removed",
+            Self::Membership(_) => "membership",
+            Self::MemberCard { .. } => "member_card",
+        }
+    }
+}
+
 pub struct DeliveryProcessor {
     validation: ValidationConfig,
     lifecycle: LifecycleConfig,
@@ -756,6 +829,30 @@ fn digest(payload: &[u8]) -> String {
     sha256.finish()
 }
 
+/// Content identity for a work-state frame.
+///
+/// The latest-state admission digests the retained bytes it was handed; this
+/// layer is handed a parsed envelope and no bytes, so identity is taken over the
+/// fields that carry the work *statement*: the payload (which holds the state),
+/// the human summary, and the claimed artifacts. Envelope id and timestamps are
+/// deliberately excluded — a retained frame redelivered with fresh clock
+/// metadata restates the same work and must not read as a contradiction. The
+/// unit separators keep field boundaries unambiguous, so no rearrangement of
+/// content across fields can collide.
+fn work_content_digest(envelope: &crate::envelope::Envelope) -> String {
+    let mut canonical = String::new();
+    canonical.push_str(&envelope.data.summary);
+    canonical.push('\u{1e}');
+    canonical.push_str(&envelope.data.payload.to_json());
+    for artifact in &envelope.data.context.artifacts {
+        canonical.push('\u{1e}');
+        canonical.push_str(&artifact.kind);
+        canonical.push('\u{1f}');
+        canonical.push_str(&artifact.id);
+    }
+    digest(canonical.as_bytes())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkStatus {
     Active,
@@ -814,6 +911,7 @@ struct TrackedWork {
     origin: String,
     key: String,
     revision: u64,
+    content: String,
     status: WorkStatus,
     artifacts: Vec<(String, String)>,
     lease_expires_at: DateTime<Utc>,
@@ -914,13 +1012,34 @@ impl WorkTracker {
         let renewal_due_at = observed_at
             .checked_add_signed(self.lifecycle.renewal_interval)
             .ok_or(TransportError::InvalidWorkEnvelope)?;
+        let content = work_content_digest(envelope);
         let previous = self
             .activities
             .iter()
             .position(|activity| activity.origin == *origin && activity.key == key);
         if let Some(index) = previous {
-            if revision <= self.activities[index].revision {
+            if revision < self.activities[index].revision {
                 return Err(TransportError::WorkRevisionNotNewer);
+            }
+            // Equal revision, different content is a distinct fault from a stale
+            // frame, and the latest-state admission already separates the two
+            // (`DuplicateState` vs `ConflictingState`). This layer used to fold
+            // both into "not newer" and drop the collision without a word (#144).
+            //
+            // Status, so the comment above is not read as a claim about the
+            // running system: `WorkTracker` has no production caller. The live
+            // receiving path is `DeliveryProcessor::receive` -> `receive_state`,
+            // which never consults this type; it is exercised only by tests. So
+            // this closes the asymmetry *in the layer*, and nothing stands
+            // between a misbehaving producer and a swallowed contradiction on
+            // the delivery path today, wired or otherwise. Wiring it in — or
+            // deleting it — is tracked separately.
+            if revision == self.activities[index].revision {
+                return if content == self.activities[index].content {
+                    Err(TransportError::WorkRevisionNotNewer)
+                } else {
+                    Err(TransportError::ConflictingWorkRevision)
+                };
             }
             let current = self.activities[index].status;
             if current.is_terminal() {
@@ -945,6 +1064,7 @@ impl WorkTracker {
                 origin: origin.clone(),
                 key: key.to_owned(),
                 revision,
+                content,
                 status,
                 artifacts,
                 lease_expires_at,
@@ -1886,6 +2006,43 @@ mod tests {
                 other => panic!("unexpected stale work revision outcome: {other:?}"),
             };
         }
+        // The two halves of the equal-revision split (#144). A redelivered frame
+        // is a duplicate and stays a plain "not newer"; the same revision
+        // carrying *different* work is the collision this layer used to swallow.
+        if name == "equal_revision_duplicate" {
+            let first =
+                validated_work_state("instance-01", "employee-184", 2, "active", "SB-42", now);
+            let again =
+                validated_work_state("instance-01", "employee-184", 2, "active", "SB-42", now);
+            tracker
+                .observe(&first)
+                .expect("first activity should be accepted");
+            return match tracker.observe(&again) {
+                Err(TransportError::WorkRevisionNotNewer) => "revision_not_newer",
+                other => panic!("unexpected duplicate work revision outcome: {other:?}"),
+            };
+        }
+        if name == "equal_revision_conflict" {
+            let first =
+                validated_work_state("instance-01", "employee-184", 2, "active", "SB-42", now);
+            let conflict =
+                validated_work_state("instance-01", "employee-184", 2, "blocked", "SB-42", now);
+            tracker
+                .observe(&first)
+                .expect("first activity should be accepted");
+            let outcome = match tracker.observe(&conflict) {
+                Err(TransportError::ConflictingWorkRevision) => "conflicting_revision",
+                other => panic!("unexpected conflicting work revision outcome: {other:?}"),
+            };
+            // The refused frame must not have displaced the stored activity: a
+            // conflict is a signal, not an admission.
+            assert_eq!(
+                tracker.status("instance-01", "activity-01K6Q5"),
+                Some(WorkStatus::Active),
+                "a refused conflicting frame must leave the tracked activity intact"
+            );
+            return outcome;
+        }
 
         for (index, state) in case
             .get("states")
@@ -2151,13 +2308,10 @@ mod tests {
 
     fn outcome_name(outcome: Result<ReceiveOutcome, TransportError>) -> &'static str {
         match outcome {
-            Ok(ReceiveOutcome::Accepted(_)) => "accepted",
-            Ok(ReceiveOutcome::DuplicateEvent) => "duplicate_event",
-            Ok(ReceiveOutcome::DuplicateState) => "duplicate_state",
-            Ok(ReceiveOutcome::StaleState) => "stale_state",
-            Ok(ReceiveOutcome::ConflictingState) => "conflicting_state",
-            Ok(ReceiveOutcome::DuplicateInbox) => "duplicate_inbox",
-            Ok(ReceiveOutcome::Removed) => "removed",
+            // Through the production accessor on purpose: the fixture's expected
+            // names then pin the exact vocabulary the connector's breadcrumbs
+            // emit, so the two can never drift apart unnoticed.
+            Ok(outcome) => outcome.code(),
             Err(TransportError::OriginNotAuthorized) => "origin_not_authorized",
             Err(TransportError::Validation(Violation::Expired)) => "expired",
             Err(TransportError::Validation(Violation::BindingMismatch(

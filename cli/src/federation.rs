@@ -1545,7 +1545,7 @@ fn emit_error_json(error: &EmitError) -> Value {
 /// gapless), so it never rolls back. The value is written as a `Value::String`: the
 /// connector reads it via `as_str` before re-wrapping it as a number, so a numeric
 /// stamp here would silently drop the delivery. Non-work operations are untouched.
-fn stamp_work_revision(
+pub(crate) fn stamp_work_revision(
     operation: &mut Value,
     row: &enrollment::EnrolledRow,
     db_path: &std::path::Path,
