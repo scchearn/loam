@@ -56,21 +56,66 @@ pub struct ServiceContext {
     pub systemd_user_dir: Option<PathBuf>,
 }
 
+/// What one manager subprocess reported: its exit status plus a bounded capture
+/// of everything it wrote. The text is the manager's own diagnosis —
+/// `Bootstrap failed: 5: Input/output error`, `Load failed: 133: …` — and it is
+/// what turns an opaque `connect_activation_failed` into a 30-second diagnosis
+/// (#128). Both streams are captured because launchctl splits its reporting
+/// across them inconsistently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerOutput {
+    pub code: i32,
+    pub detail: String,
+}
+
+impl ManagerOutput {
+    /// A silent success — the shape a fake runner returns when it has nothing to
+    /// say and the shape most manager commands really produce.
+    pub fn ok() -> Self {
+        ManagerOutput {
+            code: 0,
+            detail: String::new(),
+        }
+    }
+
+    pub fn with_code(code: i32) -> Self {
+        ManagerOutput {
+            code,
+            detail: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceError {
     Io(String),
     InvalidRuntimePath,
+    /// A manager step reported a nonzero status where the lifecycle required
+    /// success. Names the exact command and the manager's own message, so the
+    /// failure is diagnosable without re-running it by hand (#128).
     ManagerFailed {
+        command: String,
         code: i32,
+        detail: String,
     },
     NotUtf8,
     /// A manager subprocess did not exit within its bound and was killed. Names
-    /// the program so a wedged `launchctl`/`systemctl` surfaces instead of
-    /// hanging the caller forever (macOS `launchctl kickstart` on a job with a
-    /// non-zero last exit is the observed case).
+    /// the full command — not just the program — because "launchctl hung" does
+    /// not say *which* launchctl invocation hung, and the three steps of an
+    /// activation wedge for entirely different reasons (#124).
     Timeout {
-        program: String,
+        command: String,
         seconds: u64,
+    },
+    /// The start step ran, but the service was observably dead afterwards: the
+    /// manager never loaded it, or it is cycling on a nonzero exit. Carries the
+    /// start command, the status the start step itself reported, and what the
+    /// manager observed — the dead-service-behind-a-connected-outcome case
+    /// (#101).
+    StartRefused {
+        command: String,
+        code: i32,
+        observed: String,
     },
 }
 
@@ -79,12 +124,32 @@ impl std::fmt::Display for ServiceError {
         match self {
             ServiceError::Io(why) => write!(f, "service io error: {why}"),
             ServiceError::InvalidRuntimePath => write!(f, "runtime path is not absolute/UTF-8"),
-            ServiceError::ManagerFailed { code } => write!(f, "service manager exited {code}"),
+            ServiceError::ManagerFailed {
+                command,
+                code,
+                detail,
+            } => {
+                write!(f, "service manager exited {code}: `{command}`")?;
+                if !detail.is_empty() {
+                    write!(f, " — {detail}")?;
+                }
+                Ok(())
+            }
             ServiceError::NotUtf8 => write!(f, "path is not representable as UTF-8"),
-            ServiceError::Timeout { program, seconds } => {
+            ServiceError::Timeout { command, seconds } => {
                 write!(
                     f,
-                    "service manager {program} did not exit within {seconds}s and was killed"
+                    "service manager did not exit within {seconds}s and was killed: `{command}`"
+                )
+            }
+            ServiceError::StartRefused {
+                command,
+                code,
+                observed,
+            } => {
+                write!(
+                    f,
+                    "the service did not start: `{command}` exited {code} and the manager reports {observed}"
                 )
             }
         }
@@ -93,7 +158,7 @@ impl std::fmt::Display for ServiceError {
 
 /// The manager runner seam. `RealRunner` shells out; tests inject a fake.
 pub trait CommandRunner {
-    fn run(&self, command: &ManagerCommand) -> Result<i32, ServiceError>;
+    fn run(&self, command: &ManagerCommand) -> Result<ManagerOutput, ServiceError>;
 }
 
 /// Every manager subprocess is bound to this wall-clock ceiling. A wedged
@@ -111,40 +176,60 @@ const MANAGER_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 pub struct RealRunner;
 
 impl CommandRunner for RealRunner {
-    fn run(&self, command: &ManagerCommand) -> Result<i32, ServiceError> {
+    fn run(&self, command: &ManagerCommand) -> Result<ManagerOutput, ServiceError> {
         run_bounded(command, MANAGER_TIMEOUT)
     }
 }
 
+/// How much of a manager's own reporting is kept. Enough for launchctl's
+/// multi-line "Bootstrap failed" block or a `launchctl print` job dump's opening
+/// state lines; small enough that no error message is ever a log dump.
+const MAX_MANAGER_DETAIL: usize = 4096;
+
 /// Spawn a manager command and wait for it with a wall-clock bound. On expiry
 /// the child is killed and reaped (so no zombie accumulates, the observed
-/// launchctl leak) and a typed `Timeout` is returned. stdio is sent to null:
-/// only the exit code is consulted, and draining pipes across the poll loop is
-/// unnecessary. `std` has no `wait_timeout`, so this is a `try_wait` poll loop —
-/// no new dependency.
+/// launchctl leak) and a typed `Timeout` naming the command is returned. `std`
+/// has no `wait_timeout`, so this is a `try_wait` poll loop — no new dependency.
+///
+/// Both output streams are redirected to one scratch file rather than to pipes:
+/// a pipe that fills while the poll loop is not draining it would block the
+/// child and turn a chatty command (`launchctl print` dumps a whole job) into a
+/// false timeout. A file cannot fill. If the scratch file cannot be created the
+/// command still runs, just without a captured detail — losing the diagnosis is
+/// never a reason to lose the lifecycle step.
 fn run_bounded(
     command: &ManagerCommand,
     timeout: std::time::Duration,
-) -> Result<i32, ServiceError> {
+) -> Result<ManagerOutput, ServiceError> {
     use std::process::Stdio;
+    let mut capture = ScratchCapture::create();
+    let (out, err) = match capture.as_ref().and_then(ScratchCapture::stdio_pair) {
+        Some((out, err)) => (Stdio::from(out), Stdio::from(err)),
+        None => (Stdio::null(), Stdio::null()),
+    };
     let mut child = std::process::Command::new(&command.program)
         .args(&command.args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(out)
+        .stderr(err)
         .spawn()
         .map_err(|error| ServiceError::Io(error.to_string()))?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status.code().unwrap_or(-1)),
+            Ok(Some(status)) => {
+                return Ok(ManagerOutput {
+                    code: status.code().unwrap_or(-1),
+                    detail: capture.take().map(ScratchCapture::read).unwrap_or_default(),
+                })
+            }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     // Reap so the killed child does not linger as a zombie.
                     let _ = child.wait();
                     return Err(ServiceError::Timeout {
-                        program: command.program.clone(),
+                        command: command_line(command),
                         seconds: timeout.as_secs(),
                     });
                 }
@@ -152,6 +237,71 @@ fn run_bounded(
             }
             Err(error) => return Err(ServiceError::Io(error.to_string())),
         }
+    }
+}
+
+/// A private scratch file that collects one manager subprocess's two output
+/// streams, read back once the child has exited and removed on drop.
+///
+/// `create_new` is the whole trust story: the temp dir is world-writable, so the
+/// file is only ever created fresh — an attacker-planted path (a symlink at the
+/// name we picked) makes the create fail and capture degrade to none, never an
+/// append into someone else's file.
+struct ScratchCapture {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl ScratchCapture {
+    fn create() -> Option<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "loam-manager-{}-{nanos}-{}.log",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .ok()?;
+        Some(ScratchCapture { path, file })
+    }
+
+    /// Two independent handles onto the same file, so stdout and stderr both
+    /// land in it in the order the child wrote them.
+    fn stdio_pair(&self) -> Option<(std::fs::File, std::fs::File)> {
+        Some((self.file.try_clone().ok()?, self.file.try_clone().ok()?))
+    }
+
+    /// The captured text, bounded and whitespace-trimmed. Invalid UTF-8 is
+    /// replaced rather than refused: a mangled byte must not cost the diagnosis.
+    fn read(self) -> String {
+        let bytes = std::fs::read(&self.path).unwrap_or_default();
+        let end = bytes.len().min(MAX_MANAGER_DETAIL);
+        String::from_utf8_lossy(&bytes[..end]).trim().to_owned()
+    }
+}
+
+impl Drop for ScratchCapture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The command as an operator would retype it. Used in every typed error, so a
+/// wedged or refused step names itself.
+fn command_line(command: &ManagerCommand) -> String {
+    if command.args.is_empty() {
+        command.program.clone()
+    } else {
+        format!("{} {}", command.program, command.args.join(" "))
     }
 }
 
@@ -564,7 +714,36 @@ pub fn uninstall<R: CommandRunner>(runner: &R, ctx: &ServiceContext) -> Result<(
 
 /// Query the manager for the definition's state without starting anything.
 pub fn status<R: CommandRunner>(runner: &R, ctx: &ServiceContext) -> Result<i32, ServiceError> {
-    runner.run(&status_command(ctx))
+    runner.run(&status_command(ctx)).map(|output| output.code)
+}
+
+/// One manager command plus what the lifecycle expects of it.
+///
+/// Only the step that actually *starts* the connector is held to an
+/// expectation. Every other step stays exit-code-tolerant on purpose, and that
+/// tolerance is load-bearing: `launchctl bootout` reports nonzero on a machine
+/// where nothing is loaded yet, `launchctl bootstrap` reports nonzero on an
+/// idempotent re-activation, and `systemctl --user disable` reports nonzero on a
+/// fresh machine. A blanket strict check would break documented idempotency
+/// (#101).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagerStep {
+    command: ManagerCommand,
+    start: bool,
+}
+
+fn step(command: ManagerCommand) -> ManagerStep {
+    ManagerStep {
+        command,
+        start: false,
+    }
+}
+
+fn start_step(command: ManagerCommand) -> ManagerStep {
+    ManagerStep {
+        command,
+        start: true,
+    }
 }
 
 /// Enable and start the connector after the first enrollment (T10 activation).
@@ -572,6 +751,13 @@ pub fn status<R: CommandRunner>(runner: &R, ctx: &ServiceContext) -> Result<i32,
 /// discoverability symlink must be in place first: `enable --now` on a unit
 /// systemd cannot see silently no-ops, so a missing symlink is refused with a
 /// clear error instead.
+///
+/// The start step is followed by a bounded confirmation: a start command that
+/// exits nonzero and leaves the service dead used to be reported as a successful
+/// activation, so `connect` printed a connected outcome over a connector that
+/// never ran (#101). The exit status of the start step alone cannot decide it —
+/// an inert connector legitimately exits 0 and stays down — so the manager is
+/// asked what it observed instead.
 pub fn enable_start<R: CommandRunner>(
     runner: &R,
     ctx: &ServiceContext,
@@ -582,7 +768,18 @@ pub fn enable_start<R: CommandRunner>(
             return Err(systemd_symlink_missing_error());
         }
     }
-    run_all(runner, &enable_start_commands(ctx))
+    let mut started: Option<(String, i32)> = None;
+    for step in enable_start_commands(ctx) {
+        let output = runner.run(&step.command)?;
+        if step.start {
+            started = Some((command_line(&step.command), output.code));
+        }
+    }
+    match started {
+        Some((command, code)) => confirm_started(runner, ctx, &command, code),
+        // A platform with no distinguishable start step has nothing to confirm.
+        None => Ok(()),
+    }
 }
 
 /// Disable and stop the connector after the final disconnect (T11). Idempotent.
@@ -593,16 +790,127 @@ pub fn disable_stop<R: CommandRunner>(
     run_all(runner, &disable_stop_commands(ctx))
 }
 
+/// How long the start confirmation watches the manager. Long enough for launchd
+/// to record a job that dies on spawn (the exit-78 respawn cycle), short enough
+/// that it is invisible next to connect's own broker probe.
+const START_CONFIRM_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the confirmation asks the manager. Coarse on purpose: every probe
+/// is a real manager subprocess, and a tight loop of them is exactly the kind of
+/// launchctl traffic the runners are unhappy about (#124).
+const START_CONFIRM_POLL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// What the manager observed about the service after the start step.
+enum StartVerdict {
+    /// Observably alive. Ends the watch early — there is nothing left to catch.
+    Alive,
+    /// Observably dead — the manager does not have the service, or it is cycling
+    /// on a nonzero exit. Carries what to put in the error.
+    Dead(String),
+    /// Nothing says it failed, and nothing says it is up either. Not a failure:
+    /// an inert connector exits 0 by design, and calling that dead would refuse
+    /// every activation on a machine with an empty registry.
+    NoFailure,
+}
+
+/// Watch the manager for the confirmation budget and refuse the activation the
+/// moment the service is observably dead. A probe the runner cannot even execute
+/// is not evidence of death — the start itself succeeded — so a hard runner
+/// error ends the watch quietly rather than failing an activation on it.
+fn confirm_started<R: CommandRunner>(
+    runner: &R,
+    ctx: &ServiceContext,
+    command: &str,
+    code: i32,
+) -> Result<(), ServiceError> {
+    let deadline = std::time::Instant::now() + START_CONFIRM_BUDGET;
+    let probe = start_probe_command(ctx);
+    loop {
+        let Ok(output) = runner.run(&probe) else {
+            return Ok(());
+        };
+        match start_verdict(&output) {
+            StartVerdict::Alive => return Ok(()),
+            StartVerdict::Dead(observed) => {
+                return Err(ServiceError::StartRefused {
+                    command: command.to_owned(),
+                    code,
+                    observed,
+                })
+            }
+            StartVerdict::NoFailure => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep(START_CONFIRM_POLL);
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn enable_start_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
+fn enable_start_commands(_ctx: &ServiceContext) -> Vec<ManagerStep> {
     vec![
         // Reload so the freshly-symlinked unit is visible to the manager.
-        ManagerCommand::new("systemctl", &["--user", "daemon-reload"]),
-        ManagerCommand::new(
+        step(ManagerCommand::new(
+            "systemctl",
+            &["--user", "daemon-reload"],
+        )),
+        start_step(ManagerCommand::new(
             "systemctl",
             &["--user", "enable", "--now", "loam-connector.service"],
-        ),
+        )),
     ]
+}
+
+/// systemd's own record of how the unit last finished. `show` always exits 0, so
+/// the evidence is the property, not the status — and asking for the result
+/// rather than for `is-active` is what keeps an inert connector out of the
+/// failure class: it exits 0 by design, leaving the unit inactive with
+/// `Result=success`.
+#[cfg(target_os = "linux")]
+fn start_probe_command(_ctx: &ServiceContext) -> ManagerCommand {
+    ManagerCommand::new(
+        "systemctl",
+        &[
+            "--user",
+            "show",
+            "-p",
+            "Result",
+            "-p",
+            "ActiveState",
+            "loam-connector.service",
+        ],
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn start_verdict(output: &ManagerOutput) -> StartVerdict {
+    if let Some(result) = unit_result(&output.detail) {
+        if result != "success" {
+            return StartVerdict::Dead(format!("the unit's result is {result}"));
+        }
+    }
+    if unit_property(&output.detail, "ActiveState") == Some("active") {
+        return StartVerdict::Alive;
+    }
+    StartVerdict::NoFailure
+}
+
+/// The `Result=` value out of `systemctl show`, or `None` when systemd did not
+/// report one — which is not evidence of a failure.
+fn unit_result(properties: &str) -> Option<&str> {
+    unit_property(properties, "Result")
+}
+
+/// One `systemctl show` property value, or `None` when systemd did not report
+/// it — which is not evidence of anything.
+fn unit_property<'a>(properties: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}=");
+    properties
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(target_os = "linux")]
@@ -613,18 +921,101 @@ fn disable_stop_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
     )]
 }
 
-#[cfg(target_os = "macos")]
-fn enable_start_commands(ctx: &ServiceContext) -> Vec<ManagerCommand> {
-    let plist = definition_path(ctx).to_string_lossy().into_owned();
+/// launchd respawns from its **in-memory** job spec, so a rewritten plist is
+/// invisible to it until the job is reloaded: after a runtime update the
+/// definition, the ledger and verification all named the new version while the
+/// process was still executing the old binary (#131). `bootout` is the only way
+/// to drop that spec, so activation is a real reload — bootout, then bootstrap
+/// of the definition on disk — not a respawn of whatever launchd already holds.
+/// The same sequence is what loads a definition on a machine where no job exists
+/// at all, which is the first-run dead end connect hit on fresh darwin (#128).
+///
+/// The cost is that re-activating an already-healthy connector bounces it. That
+/// is deliberate: the callers of this function (first activation, the installer's
+/// post-update refresh, drift repair) all want the running process to match the
+/// definition on disk, and only a reload can promise that.
+/// Always compiled, and taking the domain/service targets as arguments, so the
+/// ordering is unit-testable on any host — the same rule the plist renderer
+/// follows. Only the *selection* below is cfg-gated.
+fn launchagent_enable_start_steps(plist: &str, domain: &str, service: &str) -> Vec<ManagerStep> {
     vec![
-        ManagerCommand::new("launchctl", &["bootstrap", &launchd::gui_domain(), &plist]),
-        ManagerCommand::new("launchctl", &["enable", &launchd::gui_service()]),
-        // The plist is dormant (`RunAtLoad`/`KeepAlive` false), so bootstrapping
-        // it only *loads* the job. Activation after the first enrollment has to
-        // start it explicitly — systemd gets that from `enable --now` and
-        // schtasks from `/Run`.
-        ManagerCommand::new("launchctl", &["kickstart", "-k", &launchd::gui_service()]),
+        step(ManagerCommand::new("launchctl", &["bootout", service])),
+        // `disable` writes a persistent override that makes a later `bootstrap`
+        // fail outright, so clearing it has to precede the load, not follow it.
+        step(ManagerCommand::new("launchctl", &["enable", service])),
+        step(ManagerCommand::new(
+            "launchctl",
+            &["bootstrap", domain, plist],
+        )),
+        // The plist is dormant (`RunAtLoad` false), so bootstrapping it only
+        // *loads* the job; the start is explicit, as it is for systemd's
+        // `enable --now` and schtasks' `/Run`.
+        //
+        // Deliberately NOT `kickstart -k`: `-k` kills the current instance and
+        // forces its respawn through launchd's ThrottleInterval (10s by
+        // default), and kickstart blocks for that whole window — which is
+        // exactly the 10s "launchctl did not exit and was killed" wedge the
+        // hosted macos runners hit (#124). After the bootout above there is no
+        // instance left to kill, so `-k` bought nothing but the wedge.
+        start_step(ManagerCommand::new("launchctl", &["kickstart", service])),
     ]
+}
+
+#[cfg(target_os = "macos")]
+fn enable_start_commands(ctx: &ServiceContext) -> Vec<ManagerStep> {
+    launchagent_enable_start_steps(
+        &definition_path(ctx).to_string_lossy(),
+        &launchd::gui_domain(),
+        &launchd::gui_service(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn start_probe_command(_ctx: &ServiceContext) -> ManagerCommand {
+    ManagerCommand::new("launchctl", &["print", &launchd::gui_service()])
+}
+
+/// launchd's own job dump is the evidence. A print that fails means the job is
+/// not in the domain at all — the start could not have worked. A print that
+/// reports a nonzero last exit means the job ran and died, which with
+/// `KeepAlive`/`SuccessfulExit=false` is the respawn cycle that reported a
+/// connected outcome over a dead connector (#101, observed last exit 78).
+#[cfg(target_os = "macos")]
+fn start_verdict(output: &ManagerOutput) -> StartVerdict {
+    if output.code != 0 {
+        return StartVerdict::Dead("the job is not loaded in the domain".to_owned());
+    }
+    if let Some(status) = last_exit_status(&output.detail) {
+        if status != 0 {
+            return StartVerdict::Dead(format!("the job's last exit status is {status}"));
+        }
+    }
+    if output
+        .detail
+        .lines()
+        .any(|line| line.trim() == "state = running")
+    {
+        return StartVerdict::Alive;
+    }
+    StartVerdict::NoFailure
+}
+
+/// The last exit status out of a `launchctl print` dump, or `None` when the job
+/// has not exited yet or launchd words it in a way this does not recognise.
+/// launchd has spelled the key both `last exit code` and `last exit status`
+/// across releases and writes non-numeric values (`(never exited)`) too, so both
+/// spellings are read and anything non-numeric is simply not evidence.
+fn last_exit_status(dump: &str) -> Option<i32> {
+    dump.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            if key != "last exit code" && key != "last exit status" {
+                return None;
+            }
+            value.trim().parse::<i32>().ok()
+        })
+        .next_back()
 }
 
 #[cfg(target_os = "macos")]
@@ -636,12 +1027,34 @@ fn disable_stop_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn enable_start_commands(ctx: &ServiceContext) -> Vec<ManagerCommand> {
+fn enable_start_commands(ctx: &ServiceContext) -> Vec<ManagerStep> {
     let name = task_name(&ctx.instance_id);
     vec![
-        ManagerCommand::new("schtasks", &["/Change", "/TN", &name, "/ENABLE"]),
-        ManagerCommand::new("schtasks", &["/Run", "/TN", &name]),
+        step(ManagerCommand::new(
+            "schtasks",
+            &["/Change", "/TN", &name, "/ENABLE"],
+        )),
+        start_step(ManagerCommand::new("schtasks", &["/Run", "/TN", &name])),
     ]
+}
+
+/// Task Scheduler's own registration check. It proves the task the `/Run` step
+/// addressed exists and is queryable; the task's *last result* is only in
+/// `/Query /V` output, which reading needs the Windows service parity work
+/// tracked separately with #100 — so the verdict here is deliberately the weaker
+/// one rather than a parse this platform has no coverage for.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn start_probe_command(ctx: &ServiceContext) -> ManagerCommand {
+    ManagerCommand::new("schtasks", &["/Query", "/TN", &task_name(&ctx.instance_id)])
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn start_verdict(output: &ManagerOutput) -> StartVerdict {
+    if output.code != 0 {
+        StartVerdict::Dead("the task is not registered".to_owned())
+    } else {
+        StartVerdict::NoFailure
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -688,6 +1101,8 @@ fn run_all<R: CommandRunner>(runner: &R, commands: &[ManagerCommand]) -> Result<
         // A best-effort disable/reload may report non-zero on a fresh machine
         // (nothing to disable yet); only a hard runner error propagates. The
         // hosted smoke asserts the real observable state, not each exit code.
+        // The one step that IS held to an expectation is the start, and it is
+        // checked against the manager's observation in `enable_start`.
         let _ = runner.run(command)?;
     }
     Ok(())
@@ -708,13 +1123,15 @@ mod tests {
     use std::cell::RefCell;
 
     // A subprocess that never exits on its own must be killed at the bound and
-    // surfaced as a typed Timeout naming the program — never hang the caller
-    // (the macOS `launchctl kickstart` wedge). `sleep 30` is the never-exits
-    // stub; the bound is short so the test is fast, and the elapsed assertion
-    // proves the kill actually fired rather than the sleep completing.
+    // surfaced as a typed Timeout naming the whole command — never hang the
+    // caller (the macOS `launchctl kickstart` wedge). "launchctl hung" does not
+    // say WHICH launchctl invocation hung, which is the whole diagnostic value
+    // of the message (#124), so the argv has to be in it. `sleep 30` is the
+    // never-exits stub; the bound is short so the test is fast, and the elapsed
+    // assertion proves the kill actually fired rather than the sleep completing.
     #[cfg(unix)]
     #[test]
-    fn a_wedged_manager_subprocess_is_killed_at_the_bound_and_typed() {
+    fn a_wedged_manager_subprocess_is_killed_at_the_bound_and_named_in_full() {
         let wedged = ManagerCommand::new("sleep", &["30"]);
         let bound = std::time::Duration::from_millis(200);
         let started = std::time::Instant::now();
@@ -724,10 +1141,14 @@ mod tests {
         assert_eq!(
             result,
             Err(ServiceError::Timeout {
-                program: "sleep".to_owned(),
+                command: "sleep 30".to_owned(),
                 seconds: 0,
             }),
-            "a subprocess past its bound must surface a typed Timeout naming the program"
+            "a subprocess past its bound must surface a typed Timeout naming the whole command"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("sleep 30"),
+            "the rendered message must carry the argv, not just the program"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(5),
@@ -743,9 +1164,57 @@ mod tests {
         let quick = ManagerCommand::new("sh", &["-c", "exit 3"]);
         let result = run_bounded(&quick, std::time::Duration::from_secs(10));
         assert_eq!(
-            result,
+            result.map(|output| output.code),
             Ok(3),
             "a command that exits within the bound must surface its real code"
+        );
+    }
+
+    // The manager's own words are the diagnosis an opaque activation failure was
+    // missing (#128): both streams are captured, in write order, so launchctl's
+    // "Bootstrap failed: …" is never the thing that vanishes.
+    #[cfg(unix)]
+    #[test]
+    fn a_manager_subprocess_captures_both_of_its_output_streams() {
+        let chatty = ManagerCommand::new("sh", &["-c", "echo to-stdout; echo to-stderr 1>&2"]);
+        let output = run_bounded(&chatty, std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(output.code, 0);
+        assert!(
+            output.detail.contains("to-stdout") && output.detail.contains("to-stderr"),
+            "both streams must reach the captured detail; got: {}",
+            output.detail
+        );
+    }
+
+    // A command that writes far more than a pipe buffer would hold must still
+    // exit and be captured: the capture goes to a file precisely so a chatty
+    // `launchctl print` cannot deadlock into a false timeout. The stored detail
+    // is bounded so no error message is ever a log dump.
+    #[cfg(unix)]
+    #[test]
+    fn a_chatty_manager_subprocess_neither_wedges_nor_dumps_its_whole_output() {
+        let flood = ManagerCommand::new("sh", &["-c", "i=0; while [ $i -lt 20000 ]; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; i=$((i+1)); done"]);
+        let output = run_bounded(&flood, std::time::Duration::from_secs(10))
+            .expect("a command writing past a pipe buffer must still complete");
+        assert_eq!(output.code, 0, "the flood must exit cleanly, not be killed");
+        assert!(
+            output.detail.len() <= MAX_MANAGER_DETAIL,
+            "the captured detail must stay bounded; got {} bytes",
+            output.detail.len()
+        );
+    }
+
+    // The scratch file is an implementation detail, not litter: one per manager
+    // command, in a shared temp dir, would accumulate forever.
+    #[test]
+    fn a_capture_file_is_removed_when_its_capture_is_dropped() {
+        let capture = ScratchCapture::create().expect("a scratch capture in the temp dir");
+        let path = capture.path.clone();
+        assert!(path.exists(), "the capture file exists while it is held");
+        drop(capture);
+        assert!(
+            !path.exists(),
+            "the capture file must not survive its owner"
         );
     }
 
@@ -762,10 +1231,198 @@ mod tests {
     }
 
     impl CommandRunner for FakeRunner {
-        fn run(&self, command: &ManagerCommand) -> Result<i32, ServiceError> {
+        fn run(&self, command: &ManagerCommand) -> Result<ManagerOutput, ServiceError> {
             self.recorded.borrow_mut().push(command.clone());
-            Ok(0)
+            Ok(ManagerOutput::ok())
         }
+    }
+
+    // --- #131/#128: the darwin activation is a real reload ---
+
+    /// The steps as an operator would read them, for the always-compiled
+    /// launchd builder. Domain and service are literals so this runs on any
+    /// host: only the *selection* of this builder is macOS-only.
+    fn launchagent_lines() -> Vec<String> {
+        launchagent_enable_start_steps(
+            "/root/launchagents/io.loam.connector.plist",
+            "gui/501",
+            "gui/501/io.loam.connector",
+        )
+        .iter()
+        .map(|step| command_line(&step.command))
+        .collect()
+    }
+
+    #[test]
+    fn the_launchd_activation_boots_the_old_job_out_before_bootstrapping_the_new_definition() {
+        let lines = launchagent_lines();
+        let position = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no `{needle}` step in {lines:?}"))
+        };
+        // launchd respawns from its in-memory job spec: without the bootout the
+        // rewritten plist is never read and the old runtime keeps executing
+        // (#131). Bootstrapping the definition is also what loads it on a
+        // machine where no job exists at all (#128).
+        assert!(
+            position("bootout") < position("bootstrap"),
+            "the load must follow a bootout, or launchd keeps the stale job spec: {lines:?}"
+        );
+        // A persistent `disable` override makes bootstrap fail outright, so the
+        // enable has to clear it first.
+        assert!(
+            position("enable") < position("bootstrap"),
+            "the enable must precede the bootstrap: {lines:?}"
+        );
+        assert!(
+            position("bootstrap") < position("kickstart"),
+            "the job must be loaded before it is started: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("bootstrap gui/501 /root/launchagents/")),
+            "the bootstrap must name the rendered definition on disk: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_launchd_start_never_uses_the_kill_flag_that_wedges_on_the_respawn_throttle() {
+        let lines = launchagent_lines();
+        // `kickstart -k` kills the running instance and forces its respawn
+        // through launchd's ThrottleInterval; kickstart blocks for that whole
+        // window, which is the 10s "launchctl did not exit" wedge (#124). After
+        // the bootout there is no instance to kill anyway.
+        assert!(
+            !lines.iter().any(|line| line.contains("kickstart -k")),
+            "the start step must not pass -k: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "launchctl kickstart gui/501/io.loam.connector"),
+            "the start step must still start the dormant job: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_start_step_carries_an_expectation() {
+        let steps = launchagent_enable_start_steps("/p.plist", "gui/501", "gui/501/label");
+        let started: Vec<&ManagerStep> = steps.iter().filter(|step| step.start).collect();
+        assert_eq!(
+            started.len(),
+            1,
+            "exactly one step is the start; bootout/enable/bootstrap stay \
+             exit-code-tolerant because they report nonzero on idempotent \
+             re-activation and on fresh machines (#101)"
+        );
+        assert!(started[0].command.args.contains(&"kickstart".to_owned()));
+    }
+
+    // --- #101: a start that leaves the service dead is not a success ---
+
+    #[test]
+    fn a_nonzero_last_exit_in_a_launchd_dump_is_a_dead_service() {
+        // The observed shape: kickstart cycling with last-exit 78 while the job
+        // never ran, which used to be reported as a successful activation.
+        let dump = "state = not running\n\tlast exit code = 78\n";
+        assert_eq!(last_exit_status(dump), Some(78));
+        // A clean inert exit is NOT a failure: the connector exits 0 by design
+        // when the registry is empty.
+        assert_eq!(last_exit_status("\tlast exit code = 0\n"), Some(0));
+        // launchd's older spelling, and its non-numeric value, both handled.
+        assert_eq!(last_exit_status("\tlast exit status = 75\n"), Some(75));
+        assert_eq!(
+            last_exit_status("\tlast exit code = (never exited)\n"),
+            None
+        );
+        assert_eq!(last_exit_status("state = running\n"), None);
+    }
+
+    #[test]
+    fn a_failed_unit_result_is_a_dead_service_but_a_clean_one_is_not() {
+        assert_eq!(unit_result("Result=exit-code\n"), Some("exit-code"));
+        assert_eq!(unit_result("Result=success\n"), Some("success"));
+        // No property reported is not evidence of a failure.
+        assert_eq!(unit_result(""), None);
+        assert_eq!(unit_result("Result=\n"), None);
+    }
+
+    /// A runner that reports every lifecycle command as a clean success but
+    /// answers the start probe with the current platform's "the service is
+    /// dead" evidence.
+    struct DeadServiceRunner {
+        probe: ManagerCommand,
+    }
+
+    impl CommandRunner for DeadServiceRunner {
+        fn run(&self, command: &ManagerCommand) -> Result<ManagerOutput, ServiceError> {
+            if command == &self.probe {
+                return Ok(dead_probe_output());
+            }
+            Ok(ManagerOutput::ok())
+        }
+    }
+
+    /// What each manager says when the service it was asked to start is dead.
+    #[cfg(target_os = "linux")]
+    fn dead_probe_output() -> ManagerOutput {
+        ManagerOutput {
+            code: 0,
+            detail: "Result=exit-code".into(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dead_probe_output() -> ManagerOutput {
+        ManagerOutput {
+            code: 0,
+            detail: "\tlast exit code = 78".into(),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn dead_probe_output() -> ManagerOutput {
+        ManagerOutput::with_code(1)
+    }
+
+    #[test]
+    fn a_start_that_leaves_the_service_dead_is_refused_not_reported_as_activated() {
+        let context = ctx("dead-probe");
+        let runner = DeadServiceRunner {
+            probe: start_probe_command(&context),
+        };
+        #[cfg(target_os = "linux")]
+        install(&FakeRunner::new(), &context).unwrap();
+        let error = enable_start(&runner, &context)
+            .expect_err("a dead service behind a successful start must not report activated");
+        let rendered = error.to_string();
+        assert!(
+            matches!(error, ServiceError::StartRefused { .. }),
+            "the refusal must be typed, not a bare io error: {rendered}"
+        );
+        // The message has to carry both halves of the diagnosis: which command
+        // was the start, and what the manager observed afterwards.
+        assert!(
+            rendered.contains("did not start"),
+            "the refusal must say the service did not start: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&context.global_root);
+        let _ = std::fs::remove_dir_all(context.systemd_user_dir.as_ref().unwrap());
+    }
+
+    #[test]
+    fn a_healthy_start_is_confirmed_without_a_manager_query_failing_it() {
+        let context = ctx("live-probe");
+        let runner = FakeRunner::new();
+        install(&runner, &context).unwrap();
+        // The all-clean runner is the inert connector: nothing reports a
+        // failure, so activation succeeds and the probe never invents one.
+        enable_start(&runner, &context).expect("a clean manager must confirm the start");
+        let _ = std::fs::remove_dir_all(&context.global_root);
+        let _ = std::fs::remove_dir_all(context.systemd_user_dir.as_ref().unwrap());
     }
 
     fn ctx(label: &str) -> ServiceContext {
@@ -1112,12 +1769,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     impl CommandRunner for DisableRemovesSymlinkRunner {
-        fn run(&self, command: &ManagerCommand) -> Result<i32, ServiceError> {
+        fn run(&self, command: &ManagerCommand) -> Result<ManagerOutput, ServiceError> {
             if command.args.iter().any(|arg| arg == "disable") {
                 let target = systemd_symlink_target(&self.dir);
                 let _ = std::fs::remove_file(target);
             }
-            Ok(0)
+            Ok(ManagerOutput::ok())
         }
     }
 
