@@ -1,6 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { readInstallMetadata, readSkillContent } from '../integration/metadata.mjs';
@@ -85,13 +85,18 @@ async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, 
 // `hook <id>` read. Anything else — a Node shim, a stale asset path, a runtime
 // from a previous install — is a mismatch, not a variant.
 function nativeHookCommands(entries, runtimePath, harnessId) {
+  // The marketplace plugin now emits a single-string command (#133); cursor
+  // still emits the args-array form. Own either shape so verify recognizes the
+  // rendered registration instead of reporting it missing.
+  const singleStringPrefix = `"${resolve(runtimePath)}" hook ${harnessId}`;
   return entries
     .flatMap((entry) => (Array.isArray(entry?.hooks) ? entry.hooks : [entry]))
-    .filter((entry) => entry?.type === 'command'
-      && entry.command === runtimePath
-      && Array.isArray(entry.args)
-      && entry.args[0] === 'hook'
-      && entry.args[1] === harnessId);
+    .filter((entry) => entry?.type === 'command' && typeof entry.command === 'string' && (
+      entry.command.startsWith(singleStringPrefix)
+      || (entry.command === runtimePath
+        && Array.isArray(entry.args)
+        && entry.args[0] === 'hook'
+        && entry.args[1] === harnessId)));
 }
 
 async function verifyHarness(id, harness, { packageRoot, globalRoot, install, workspace, home, platform }) {

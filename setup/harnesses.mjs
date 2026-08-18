@@ -182,25 +182,44 @@ export function nativeHookEntry(runtimePath, harness, event, { async: isAsync = 
   };
 }
 
+// A native event entry for the marketplace plugin's hooks.json. Claude Code
+// (and Codex, which shares the plugin hook schema) takes `command` as ONE shell
+// string and ignores `args`/`async`: an args-array entry runs the bare binary
+// with no subcommand, so `loam` prints usage, exits 1, emits nothing, and the
+// session silently loses federation (#133). The command is a single string with
+// the runtime path double-quoted so a darwin store under "Application Support"
+// survives the shell split — the same quoting the shipped Stop hook already runs
+// with a spaced ${CLAUDE_PLUGIN_ROOT}.
+function nativeCommandEntry(runtimePath, harness, event) {
+  // ponytail: double quotes cover the real case (a path with spaces); install
+  // paths do not contain embedded quotes, and the shipped hooks make the same
+  // bet. Escape the upgrade path if a quoted path ever appears in the wild.
+  return { type: 'command', command: `"${resolve(runtimePath)}" hook ${harness} --event ${event}` };
+}
+
 // The plugin hooks file setup writes into the installed marketplace plugin.
-// SessionStart and UserPromptSubmit are native; Stop stays Node because it is
-// the ingestion boundary, not the collaboration read path. PreToolUse is
-// restricted to the chatty tool names to keep fire frequency sane; PostToolUse
-// runs after any tool.
-export function renderPluginHooks(runtimePath, harness) {
+// SessionStart, UserPromptSubmit, PreToolUse and PostToolUse are native reads
+// through the private runtime; PreToolUse is restricted to the chatty tool names
+// to keep fire frequency sane. The staged file must stay a SUPERSET of the
+// shipped hooks — a prior wholesale replace dropped SubagentStart/SubagentStop
+// and forked Stop's timeout (#132) — so the shipped hooks are the base and the
+// native events overlay onto them. Stop, SubagentStart and SubagentStop pass
+// through verbatim (Stop keeps the shipped ingestion-budget timeout, the single
+// authoritative value; the renderer no longer forks it).
+export function renderPluginHooks(runtimePath, harness, shipped) {
   return {
     hooks: {
+      ...shipped.hooks,
       SessionStart: [{
         matcher: 'startup|resume|clear|compact',
-        hooks: [nativeHookEntry(runtimePath, harness, 'SessionStart')],
+        hooks: [nativeCommandEntry(runtimePath, harness, 'SessionStart')],
       }],
-      UserPromptSubmit: [{ hooks: [nativeHookEntry(runtimePath, harness, 'UserPromptSubmit')] }],
+      UserPromptSubmit: [{ hooks: [nativeCommandEntry(runtimePath, harness, 'UserPromptSubmit')] }],
       PreToolUse: [{
         matcher: 'Bash|Task|Write|Edit|MultiEdit|Glob|Grep|Read',
-        hooks: [nativeHookEntry(runtimePath, harness, 'PreToolUse')],
+        hooks: [nativeCommandEntry(runtimePath, harness, 'PreToolUse')],
       }],
-      PostToolUse: [{ hooks: [nativeHookEntry(runtimePath, harness, 'PostToolUse')] }],
-      Stop: [{ hooks: [{ type: 'command', command: 'node "${CLAUDE_PLUGIN_ROOT}/hooks/stop.mjs"', timeout: 5 }] }],
+      PostToolUse: [{ hooks: [nativeCommandEntry(runtimePath, harness, 'PostToolUse')] }],
     },
   };
 }
@@ -443,8 +462,13 @@ export async function reconcileOpenCodePluginEntry(home, stablePath) {
 async function stagePluginHooks({ pluginRoot, runtimePath, harness }) {
   if (!pluginRoot) throw new Error(`${harness} marketplace plugin root is unresolved`);
   const filePath = join(pluginRoot, 'hooks', 'hooks.json');
-  await mkdir(dirname(filePath), { recursive: true });
-  await writeAtomicFile(filePath, `${JSON.stringify(renderPluginHooks(runtimePath, harness), null, 2)}\n`);
+  // The shipped hooks are the base the native events overlay onto, so
+  // SubagentStart/SubagentStop and Stop's shipped timeout survive the rewrite
+  // (#132). `plugin update` refreshes this file to the shipped content before
+  // setup runs; re-reading it is idempotent because the natives are always
+  // regenerated on top.
+  const shipped = JSON.parse(await readFile(filePath, 'utf8'));
+  await writeAtomicFile(filePath, `${JSON.stringify(renderPluginHooks(runtimePath, harness, shipped), null, 2)}\n`);
   return filePath;
 }
 
