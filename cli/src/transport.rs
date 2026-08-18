@@ -57,11 +57,16 @@ impl TransportError {
     /// A stable, content-free name for the refusal, for breadcrumbs and
     /// diagnostics (#103).
     ///
-    /// Content-freeness is structural rather than careful: `TransportError` is
-    /// `Copy`, so no variant can carry a borrowed or owned piece of a frame, and
-    /// the one variant with a payload carries a `Violation`, which is `Copy` for
-    /// the same reason. The `Display` text is prose for a human reading one
-    /// error; this is the token a log is grepped by.
+    /// The guard that keeps this content-free, stated precisely because an
+    /// earlier version of this comment stated it wrongly: it is *not* that
+    /// `TransportError` is `Copy`. `&'static str` is `Copy` and so is any
+    /// `&str`, so a `Copy` enum can hold borrowed frame content perfectly well.
+    /// What actually holds is that every arm below returns a literal, and the
+    /// one arm that interpolates formats a `Violation` whose only payload is a
+    /// fieldless `BindingAxis`. Adding a variant that carries a string — or
+    /// giving `BindingAxis` a payload — is what would break this, and neither is
+    /// prevented by the type system. The `Display` text is prose for a human
+    /// reading one error; this is the token a log is grepped by.
     pub fn code(&self) -> String {
         let name = match self {
             Self::EmptyBroker => "empty_broker",

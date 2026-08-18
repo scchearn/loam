@@ -549,7 +549,27 @@ pub struct MqttTransport {
     /// keeps the short default; a live session sets the longer `DIAL_DEADLINE`,
     /// so a wedged SYN cannot block one establishment cycle forever.
     dial_deadline: Duration,
+    /// Frames this session refused, logged individually up to
+    /// [`REFUSAL_LOG_LIMIT`] and counted after that, with the project the
+    /// refusals arrived on so the tail line can name it. The counter lives here
+    /// rather than in the pump because the refusal is swallowed here — the pump
+    /// never learns one happened.
+    refused_frames: usize,
+    refused_project: Option<String>,
 }
+
+/// How many refused frames one session logs individually before it switches to
+/// counting them.
+///
+/// Same bound as [`CARD_REJECTION_LOG_LIMIT`] and for the same reason, but the
+/// case is stronger: frames are far more frequent than member cards, and the
+/// motivating incident — a roster that assembled to nothing, so every peer frame
+/// refuses as `OriginNotAuthorized` — produces one refusal per inbound frame for
+/// the life of the session, on a daemon built to respawn and with no rotation on
+/// macOS (#149). The diagnostic content of a refusal storm is the set of
+/// (class, origin, reason) triples it contains, and that saturates within a few
+/// lines; the rest is the same line again.
+const REFUSAL_LOG_LIMIT: usize = 16;
 
 impl MqttTransport {
     pub fn new(
@@ -572,6 +592,8 @@ impl MqttTransport {
             processor,
             pending: Vec::new(),
             now,
+            refused_frames: 0,
+            refused_project: None,
             dial_deadline: ACK_TIMEOUT,
         })
     }
@@ -585,6 +607,14 @@ impl MqttTransport {
     /// Disconnect the session. Best-effort: the probe's evidence is already
     /// recorded, and a broker that drops us first is not a probe failure.
     pub fn disconnect(&mut self) {
+        if let Some(line) = suppression_breadcrumb(
+            "refused frames",
+            self.refused_project.as_deref().unwrap_or("-"),
+            REFUSAL_LOG_LIMIT,
+            self.refused_frames,
+        ) {
+            breadcrumb!("{line}");
+        }
         if let Some(client) = self.client.take() {
             let _ = client.disconnect();
         }
@@ -862,7 +892,15 @@ impl MqttTransport {
             // which is exactly the "every peer frame refused, zero external
             // signal" this logging exists to end (#103).
             Err(error) => {
-                breadcrumb!("{}", refusal_breadcrumb(&topic, &error));
+                self.refused_frames += 1;
+                if self.refused_project.is_none() {
+                    self.refused_project = crate::envelope::parse_topic(&topic)
+                        .ok()
+                        .map(|parsed| parsed.project.to_owned());
+                }
+                if self.refused_frames <= REFUSAL_LOG_LIMIT {
+                    breadcrumb!("{}", refusal_breadcrumb(&topic, &error));
+                }
                 Ok(None)
             }
         }
@@ -2530,6 +2568,27 @@ fn refusal_breadcrumb(topic: &str, error: &crate::transport::TransportError) -> 
     )
 }
 
+/// The tail line for a capped breadcrumb: what a session stopped logging
+/// individually, and how much of it there was.
+///
+/// `None` below the cap, so the caller cannot accidentally announce a
+/// suppression that never happened. Shared by the two capped classes — refused
+/// frames and rejected member cards — because they are the same rule, and a
+/// second copy is where the two would drift.
+fn suppression_breadcrumb(
+    what: &str,
+    project_id: &str,
+    logged: usize,
+    total: usize,
+) -> Option<String> {
+    if total <= logged {
+        return None;
+    }
+    Some(format!(
+        "{what} suppressed project={project_id} logged={logged} total={total}"
+    ))
+}
+
 /// The mailbox-push breadcrumb.
 ///
 /// `fanout` is `None` when the channel registry's lock is poisoned: nothing was
@@ -2799,10 +2858,13 @@ fn run_pump_loop(
     }
     transport.disconnect();
     liveness.mark_disconnected(Utc::now());
-    if rejected_cards > CARD_REJECTION_LOG_LIMIT {
-        breadcrumb!(
-            "member card rejections suppressed project={project_id} logged={CARD_REJECTION_LOG_LIMIT} total={rejected_cards}"
-        );
+    if let Some(line) = suppression_breadcrumb(
+        "member card rejections",
+        &project_id,
+        CARD_REJECTION_LOG_LIMIT,
+        rejected_cards,
+    ) {
+        breadcrumb!("{line}");
     }
     breadcrumb!("session down project={project_id}");
     EstablishOutcome::Ended
@@ -7043,6 +7105,12 @@ mod breadcrumb_tests {
             crate::transport::TransportError::InvalidStateRevision,
             crate::transport::TransportError::ConflictingWorkRevision,
             crate::transport::TransportError::Expired,
+            // The payload-carrying variant, and specifically the axis whose
+            // name is a state key: this is the arm that invites frame content
+            // into a code, so a hand-picked list without it proves little.
+            crate::transport::TransportError::Validation(
+                crate::envelope::Violation::BindingMismatch(crate::envelope::BindingAxis::StateKey),
+            ),
         ] {
             let code = error.code();
             assert!(!code.is_empty(), "{error:?} has no code");
@@ -7051,6 +7119,53 @@ mod breadcrumb_tests {
                 "a code is a grep token, not prose: {code}"
             );
         }
+    }
+
+    #[test]
+    fn a_suppression_line_exists_only_past_the_cap() {
+        // The rule both capped classes share: below the cap every occurrence was
+        // logged individually, so announcing a suppression would be a lie.
+        assert_eq!(
+            suppression_breadcrumb("refused frames", "project-7M3", 16, 16),
+            None,
+            "a session exactly at the cap suppressed nothing"
+        );
+        assert_eq!(
+            suppression_breadcrumb("refused frames", "project-7M3", 16, 3),
+            None
+        );
+
+        let line = suppression_breadcrumb("refused frames", "project-7M3", 16, 4_000)
+            .expect("past the cap the tail is reported");
+        assert!(line.contains("logged=16"), "{line}");
+        assert!(line.contains("total=4000"), "{line}");
+        assert!(line.contains("project=project-7M3"), "{line}");
+
+        // Counts and a project id, nothing else — the refusals themselves are
+        // gone by now and must not be reconstructed here.
+        let cards = suppression_breadcrumb("member card rejections", "-", 8, 9)
+            .expect("past the cap the tail is reported");
+        assert!(
+            cards.starts_with("member card rejections suppressed"),
+            "{cards}"
+        );
+    }
+
+    #[test]
+    fn the_payload_carrying_refusal_keeps_its_axis_and_nothing_else() {
+        // `Validation` is the arm that could carry frame content into a code,
+        // and `StateKey` is the axis whose name is itself a caller-chosen key.
+        // Pinned exactly, not just "has no spaces": a `Violation` variant that
+        // grew a `String` payload would still pass a shape check.
+        assert_eq!(
+            crate::transport::TransportError::Validation(
+                crate::envelope::Violation::BindingMismatch(
+                    crate::envelope::BindingAxis::StateKey,
+                ),
+            )
+            .code(),
+            "validation:BindingMismatch(StateKey)"
+        );
     }
 
     #[test]
