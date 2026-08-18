@@ -10,7 +10,6 @@ use loam::envelope::{
 use loam::transport::{
     self, AuthenticatedTransportPrincipal, DeliveryProcessor, GitOracle, GitOracleError, GitScope,
     LifecycleConfig, PublicationStatus, ReceiveOutcome, RestartInspection, TransportError,
-    WorkClassification, WorkStatus, WorkTracker,
 };
 use mqtt_broker::BrokerFixture;
 use rumqttc::v5::mqttbytes::{
@@ -510,8 +509,6 @@ fn lease_tombstone() {
 
     let cases = include_str!("fixtures/mqtt/lease-cases.json");
     for name in [
-        "active_lease_current",
-        "renewal_interval_elapsed",
         "expired_within_skew",
         "expired_beyond_skew",
         "origin_tombstone",
@@ -525,7 +522,6 @@ fn lease_tombstone() {
 
     let lifecycle = LifecycleConfig::new(
         chrono::Duration::minutes(30),
-        chrono::Duration::minutes(10),
         chrono::Duration::minutes(5),
         chrono::Duration::hours(24),
         chrono::Duration::seconds(30),
@@ -574,46 +570,19 @@ fn lease_tombstone() {
     let mut processor =
         DeliveryProcessor::with_lifecycle(ValidationConfig::default(), 8, 8, 8, lifecycle.clone())
             .expect("bounded lease processor should configure");
-    let received =
-        accepted(processor.receive(&state_topic, &active_publish.payload, &identity, now));
-    let mut tracker = WorkTracker::with_lifecycle(8, lifecycle.clone())
-        .expect("bounded lease tracker should configure");
-    tracker
-        .observe(&received)
-        .expect("active lease should be observed");
-    assert_eq!(
-        tracker.classification(
-            "instance-01",
-            "activity-01K6Q5",
-            test_time("2026-07-24T14:29:59Z")
-        ),
-        Some(WorkClassification::Current(WorkStatus::Active))
-    );
-    assert!(tracker.renewal_due(
-        "instance-01",
-        "activity-01K6Q5",
-        test_time("2026-07-24T14:30:00Z")
+    // The lease lives on the wire and in the delivery path, not in a second
+    // admission layer: the publish path caps a non-terminal work state's message
+    // expiry at the lease duration, and this path decides what is admitted — the
+    // same frame again is a duplicate, and expiry is decided either side of the
+    // skew tolerance below.
+    assert!(matches!(
+        processor.receive(&state_topic, &active_publish.payload, &identity, now),
+        Ok(ReceiveOutcome::Accepted(_))
     ));
     assert_eq!(
-        tracker.classification(
-            "instance-01",
-            "activity-01K6Q5",
-            test_time("2026-07-24T14:50:29Z")
-        ),
-        Some(WorkClassification::Current(WorkStatus::Active))
-    );
-    assert_eq!(
-        tracker.classification(
-            "instance-01",
-            "activity-01K6Q5",
-            test_time("2026-07-24T14:50:31Z")
-        ),
-        Some(WorkClassification::StaleInterrupted)
-    );
-    assert_eq!(
-        tracker.status("instance-01", "activity-01K6Q5"),
-        Some(WorkStatus::Active),
-        "lease expiry must not manufacture a terminal transition"
+        processor.receive(&state_topic, &active_publish.payload, &identity, now),
+        Ok(ReceiveOutcome::DuplicateState),
+        "the retained lease redelivered is one logical item, not a second claim"
     );
 
     let mut within_skew =
@@ -856,32 +825,29 @@ fn git_oracle() {
     );
     let mut processor = DeliveryProcessor::new(ValidationConfig::default(), 8, 8, 8)
         .expect("bounded Git oracle processor should configure");
-    let mut tracker = WorkTracker::new(8).expect("bounded work tracker should configure");
     publish_validated(&mut publisher, ready, now);
     let ready_publish = observer
         .receive(&state_topic, Duration::from_secs(3))
         .expect("ready claim should cross the broker");
     let received_ready =
         accepted(processor.receive(&state_topic, &ready_publish.payload, &identity, now));
-    tracker
-        .observe(&received_ready)
-        .expect("ready claim should remain provisional");
+    assert_eq!(
+        oracle.evaluate_work_state(&received_ready),
+        Ok(PublicationStatus::Provisional),
+        "a ready claim is provisional until Git says otherwise"
+    );
     publish_validated(&mut publisher, published.clone(), now);
     let published_frame = observer
         .receive(&state_topic, Duration::from_secs(3))
         .expect("published claim should cross the broker");
     let received_published =
         accepted(processor.receive(&state_topic, &published_frame.payload, &identity, now));
+    // The published claim is verified against Git and nothing else: the oracle's
+    // proof is what the connector stamps onto the item, and it is the only thing
+    // that turns a sender's claim into `trust="confirmed"`.
     assert_eq!(
-        tracker.observe(&received_published),
-        Err(TransportError::PublicationUnverified)
-    );
-    tracker
-        .observe_verified(&received_published, &proof)
-        .expect("Git proof should admit ready to published");
-    assert_eq!(
-        tracker.status("instance-01", "activity-01K6Q5"),
-        Some(WorkStatus::Published)
+        oracle.evaluate_work_state(&received_published),
+        Ok(PublicationStatus::Verified(proof.clone()))
     );
 
     let refs_changed = scoped_refs_changed(
@@ -1092,7 +1058,6 @@ fn collaboration_semantics() {
             .expect("observed terminal ack should be cleaned from the test namespace"),
     );
 
-    let mut tracker = WorkTracker::new(16).expect("bounded work tracker should configure");
     let mut final_first = None;
     for (revision, status) in [(1, "active"), (2, "blocked"), (3, "active"), (4, "ready")] {
         let (topic, state) = scoped_work_state(
@@ -1108,16 +1073,15 @@ fn collaboration_semantics() {
         let publish = peer
             .receive(&topic, Duration::from_secs(3))
             .expect("work-state transition should cross the broker");
-        let received = accepted(processor.receive(&topic, &publish.payload, &identity, now));
-        tracker
-            .observe(&received)
-            .expect("legal work-state transition should be accepted");
+        assert!(
+            matches!(
+                processor.receive(&topic, &publish.payload, &identity, now),
+                Ok(ReceiveOutcome::Accepted(_))
+            ),
+            "each newer revision of one key is admitted in turn"
+        );
         final_first = Some((topic, state));
     }
-    assert_eq!(
-        tracker.status("instance-01", "activity-01K6Q5"),
-        Some(WorkStatus::Ready)
-    );
 
     let (second_topic, second_active) = scoped_work_state(
         &broker,
@@ -1132,13 +1096,15 @@ fn collaboration_semantics() {
     let second_publish = peer
         .receive(&second_topic, Duration::from_secs(3))
         .expect("overlapping activity should cross the broker");
-    let second_received =
-        accepted(processor.receive(&second_topic, &second_publish.payload, &identity, now));
-    let overlap = tracker
-        .observe(&second_received)
-        .expect("overlap should warn without rejecting either activity");
-    assert_eq!(overlap.warnings.len(), 2);
-    assert_eq!(tracker.len(), 2);
+    // Two instances working the same artifact are two independent state keys,
+    // scoped by origin: neither displaces the other.
+    assert!(
+        matches!(
+            processor.receive(&second_topic, &second_publish.payload, &identity, now),
+            Ok(ReceiveOutcome::Accepted(_))
+        ),
+        "a second origin's activity on the same artifact is admitted alongside"
+    );
 
     let (_, second_abandoned) = scoped_work_state(
         &broker,
@@ -1155,14 +1121,15 @@ fn collaboration_semantics() {
         .expect("explicit abandonment should cross the broker");
     let abandoned =
         accepted(processor.receive(&second_topic, &abandoned_publish.payload, &identity, now));
-    assert!(tracker
-        .observe(&abandoned)
-        .expect("explicit abandonment should be accepted")
-        .warnings
-        .is_empty());
     assert_eq!(
-        tracker.status("instance-02", "activity-01K6Q5"),
-        Some(WorkStatus::Abandoned)
+        abandoned
+            .as_envelope()
+            .data
+            .payload
+            .get("state")
+            .and_then(loam::json::Value::as_str),
+        Some("abandoned"),
+        "the terminal state reaches the reader as the sender reported it"
     );
 
     let offline_id = "01K6Q6ESWMT48TPX";
@@ -1785,7 +1752,6 @@ fn failure_matrix() {
     // it, using the same envelope over the real broker.
     let lifecycle = LifecycleConfig::new(
         chrono::Duration::minutes(30),
-        chrono::Duration::minutes(10),
         chrono::Duration::minutes(5),
         chrono::Duration::hours(24),
         chrono::Duration::seconds(30),

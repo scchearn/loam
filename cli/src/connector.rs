@@ -584,8 +584,8 @@ pub struct MqttTransport {
 /// How many refused frames one session logs individually before it switches to
 /// counting them.
 ///
-/// Same bound as [`CARD_REJECTION_LOG_LIMIT`] and for the same reason, but the
-/// case is stronger: frames are far more frequent than member cards, and the
+/// Twice [`CARD_REJECTION_LOG_LIMIT`], for a related reason but a stronger
+/// case: frames are far more frequent than member cards, and the
 /// motivating incident — a roster that assembled to nothing, so every peer frame
 /// refuses as `OriginNotAuthorized` — produces one refusal per inbound frame for
 /// the life of the session, on a daemon built to respawn and with no rotation on
@@ -7581,7 +7581,7 @@ mod breadcrumb_tests {
         for error in [
             crate::transport::TransportError::OriginNotAuthorized,
             crate::transport::TransportError::InvalidStateRevision,
-            crate::transport::TransportError::ConflictingWorkRevision,
+            crate::transport::TransportError::EventTombstone,
             crate::transport::TransportError::Expired,
             // The payload-carrying variant, and specifically the axis whose
             // name is a state key: this is the arm that invites frame content
