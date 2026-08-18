@@ -96,8 +96,10 @@ impl TransportError {
             // The violation is the whole diagnostic value here: "validation"
             // alone would not distinguish the #143 near-miss (a numeric
             // revision, refused as `MissingLatestStateRevision`) from a expired
-            // frame.
-            Self::Validation(violation) => return format!("validation:{violation:?}"),
+            // frame. `Violation::code` rather than its `Debug` name so a
+            // breadcrumb and the `federation emit` refusal an operator reads
+            // next to it name the same rule the same way (#102).
+            Self::Validation(violation) => return format!("validation:{}", violation.code()),
         };
         name.to_owned()
     }

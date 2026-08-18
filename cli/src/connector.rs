@@ -3101,23 +3101,7 @@ pub(crate) fn dispatch_for_key(
             let Some(identity) = state.sessions.identity(&row.project_id) else {
                 return Ok(emit_json(&row, "not-shipped", "no-live-session", ""));
             };
-            let (document, topic) = outbound_envelope(&request.payload, &row, &identity)
-                .ok_or(ipc::IpcError::InvalidRequest)?;
-            let owned_claims: Vec<String> = if identity.allowed_claims.is_empty() {
-                vec![identity.principal_id.clone()]
-            } else {
-                identity.allowed_claims.clone()
-            };
-            let claims: Vec<&str> = owned_claims.iter().map(String::as_str).collect();
-            let principal = AuthenticatedPrincipal::new(&identity.principal_id, &claims);
-            let validated = crate::envelope::validate(
-                document.as_bytes(),
-                &topic,
-                &principal,
-                &ValidationConfig::default(),
-                Utc::now(),
-            )
-            .map_err(|_| ipc::IpcError::InvalidRequest)?;
+            let validated = validated_emit(&request.payload, &row, &identity, Utc::now())?;
             let event_id = validated.as_envelope().id.clone();
             match state.sessions.ship(&row.project_id, validated) {
                 EmitOutcome::Queued => Ok(emit_json(&row, "queued", "queued", &event_id)),
@@ -3218,15 +3202,59 @@ fn emit_json(
     ])
 }
 
+/// Build the outbound envelope for one derived operation and validate it as the
+/// session's authenticated principal — the whole refusable part of an emit, with
+/// no live session in it, so every refusal it can produce is reachable from a
+/// test that owns nothing but an identity.
+///
+/// Both refusals keep their reason (#102). Before this the builder's `None` and
+/// the validator's `Violation` collapsed into the same bare `invalid_request`,
+/// and the CLI collapsed that into `connector_refused`: a missing plan anchor, an
+/// unaddressable recipient, and an expired envelope were one indistinguishable
+/// error, diagnosable only by capturing the socket and replaying the envelope
+/// through the validator out of process.
+fn validated_emit(
+    operation: &crate::json::Value,
+    row: &crate::enrollment::EnrolledRow,
+    identity: &SessionIdentity,
+    now: DateTime<Utc>,
+) -> Result<crate::envelope::ValidatedEnvelope, ipc::IpcError> {
+    let (document, topic) = outbound_envelope(operation, row, identity)
+        .map_err(|reason| ipc::IpcError::InvalidRequestBecause(reason.to_owned()))?;
+    // An empty claim set means the session claims only its own principal; it is
+    // never read as "claims anything".
+    let owned_claims: Vec<String> = if identity.allowed_claims.is_empty() {
+        vec![identity.principal_id.clone()]
+    } else {
+        identity.allowed_claims.clone()
+    };
+    let claims: Vec<&str> = owned_claims.iter().map(String::as_str).collect();
+    let principal = AuthenticatedPrincipal::new(&identity.principal_id, &claims);
+    crate::envelope::validate(
+        document.as_bytes(),
+        &topic,
+        &principal,
+        &ValidationConfig::default(),
+        now,
+    )
+    .map_err(|violation| ipc::IpcError::InvalidRequestBecause(violation.code()))
+}
+
 /// Build the outbound CloudEvents document and its topic from the CLI's derived
-/// operation plus the live session's authenticated identity. Returns `None` for
-/// a structurally impossible operation; everything else is the envelope module's job to
-/// refuse when the document is validated.
+/// operation plus the live session's authenticated identity. A structurally
+/// impossible operation is refused *by name* — a bare `None` here was one half of
+/// the double flattening #102 was filed for, and these shape refusals are exactly
+/// the ones the envelope validator never gets to explain because the document
+/// cannot be built at all. Everything else is the envelope module's job to refuse
+/// when the document is validated.
+///
+/// Every reason is a fixed literal, so nothing from the caller's operation can
+/// reach the IPC diagnostic through it.
 fn outbound_envelope(
     operation: &crate::json::Value,
     row: &crate::enrollment::EnrolledRow,
     identity: &SessionIdentity,
-) -> Option<(String, String)> {
+) -> Result<(String, String), &'static str> {
     use crate::json::Value;
     let string = |key: &str| operation.get(key).and_then(Value::as_str).unwrap_or("");
     let owned = |key: &str| operation.get(key).cloned().unwrap_or(Value::Null);
@@ -3250,21 +3278,33 @@ fn outbound_envelope(
             "latest-state",
             "inform",
         ),
-        _ => return None,
+        _ => return Err("unsupported_operation_type"),
     };
 
     let event_id = string("id");
     let prefix = format!("loam/v1/{}/{}", row.org_id, row.project_id);
     let (delivery, to, topic) = if class == "inbox" {
-        let recipients = operation.get("to").and_then(Value::as_array)?;
-        let first = recipients.iter().find(|recipient| {
-            matches!(
-                recipient.get("kind").and_then(Value::as_str),
-                Some("agent" | "principal" | "instance")
-            )
-        })?;
-        let kind = first.get("kind").and_then(Value::as_str)?;
-        let id = first.get("id").and_then(Value::as_str)?;
+        let recipients = operation
+            .get("to")
+            .and_then(Value::as_array)
+            .ok_or("missing_recipients")?;
+        let first = recipients
+            .iter()
+            .find(|recipient| {
+                matches!(
+                    recipient.get("kind").and_then(Value::as_str),
+                    Some("agent" | "principal" | "instance")
+                )
+            })
+            .ok_or("no_addressable_recipient")?;
+        let kind = first
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or("no_addressable_recipient")?;
+        let id = first
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("missing_recipient_id")?;
         (
             Value::Object(vec![("class".into(), Value::String("inbox".into()))]),
             Value::Array(recipients.to_vec()),
@@ -3274,8 +3314,14 @@ fn outbound_envelope(
             ),
         )
     } else {
-        let key = operation.get("state_key").and_then(Value::as_str)?;
-        let revision = operation.get("revision").and_then(Value::as_str)?;
+        let key = operation
+            .get("state_key")
+            .and_then(Value::as_str)
+            .ok_or("missing_state_key")?;
+        let revision = operation
+            .get("revision")
+            .and_then(Value::as_str)
+            .ok_or("missing_state_revision")?;
         (
             Value::Object(vec![
                 ("class".into(), Value::String("latest-state".into())),
@@ -3364,7 +3410,7 @@ fn outbound_envelope(
             ]),
         ),
     ]);
-    Some((document.to_json(), topic))
+    Ok((document.to_json(), topic))
 }
 
 fn snapshot_json(
@@ -6709,7 +6755,7 @@ mod outbound_tests {
 
     /// Derive through the real CLI path, then build through the real connector
     /// path — the round trip neither half tested on its own.
-    fn round_trip(operation: &str) -> Option<(String, String)> {
+    fn round_trip(operation: &str) -> Result<(String, String), &'static str> {
         let parsed = crate::json::parse(operation).expect("operation parses");
         let derived =
             crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
@@ -6813,6 +6859,72 @@ mod outbound_tests {
             "the second emit on the same key must be admitted too, not dropped as \
              stale or duplicate: {:?}",
             admitted[1]
+        );
+    }
+
+    /// #102: every way an emit can be refused says which rule refused it.
+    ///
+    /// Both layers, in one test, because the bug was that they produced the same
+    /// answer: the builder cannot even construct a document for some operations
+    /// (so the validator never gets to explain them), and the validator refuses
+    /// others. Before this each one arrived as a bare `invalid_request`.
+    #[test]
+    fn every_emit_refusal_names_the_rule_that_refused_it() {
+        // Shape refusals, from the builder. Each of these returned a bare `None`.
+        for (operation, expected) in [
+            (
+                r#"{"type":"work.report","summary":"s","revision":"1","payload":{"state":"ready"}}"#,
+                "missing_state_key",
+            ),
+            (
+                r#"{"type":"message.ack","causation_id":"c-1","summary":"s","to":[],"payload":{}}"#,
+                "no_addressable_recipient",
+            ),
+        ] {
+            let parsed = crate::json::parse(operation).expect("operation parses");
+            // Derivation is not the subject here: `to: []` is derived happily and
+            // refused at build time, which is exactly the gap being closed.
+            let derived = crate::federation::derive_emit(&parsed, &row(), now())
+                .map(|derived| derived.operation)
+                .unwrap_or(parsed);
+            let refusal = validated_emit(&derived, &row(), &identity(), now())
+                .expect_err("a structurally impossible operation must be refused");
+            assert_eq!(
+                refusal.code(),
+                "invalid_request",
+                "the IPC code stays stable: {refusal:?}"
+            );
+            assert_eq!(
+                refusal.diagnostic(),
+                expected,
+                "the refusal must name its own reason"
+            );
+        }
+
+        // A validation refusal, from the envelope module: the same operation the
+        // enrolled row cannot anchor, whose only symptom was `connector_refused`.
+        let claim_bearing = r#"{"type":"work.report","state_key":"task-7","revision":"1","summary":"s","artifacts":[{"kind":"task","id":"T-1"}],"payload":{"state":"ready","acceptance":{},"verification":[]}}"#;
+        let parsed = crate::json::parse(claim_bearing).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+        let refusal = validated_emit(&derived.operation, &row(), &identity(), now())
+            .expect_err("a claim-bearing report with no plan anchor is refused");
+        assert_eq!(refusal.code(), "invalid_request");
+        assert_eq!(
+            refusal.diagnostic(),
+            crate::envelope::Violation::MissingPlanOid.code(),
+            "the violation the validator raised must be the reason reported"
+        );
+
+        // The positive control in the same run: a claimless report still ships,
+        // so the refusals above are the rules firing and not a broken fixture.
+        let claimless = r#"{"type":"work.report","state_key":"task-7","revision":"1","summary":"s","payload":{"state":"ready"}}"#;
+        let parsed = crate::json::parse(claimless).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+        assert!(
+            validated_emit(&derived.operation, &row(), &identity(), now()).is_ok(),
+            "a claimless report must still validate"
         );
     }
 
@@ -7082,7 +7194,9 @@ mod breadcrumb_tests {
         );
 
         // A validation violation keeps its own name: "validation" alone would
-        // not separate the #143 near-miss spelling from an expired frame.
+        // not separate the #143 near-miss spelling from an expired frame. The
+        // name is `Violation::code`, the same token `federation emit` reports
+        // for the same rule (#102) — one refusal vocabulary, not two spellings.
         let violation = refusal_breadcrumb(
             STATE_TOPIC,
             &crate::transport::TransportError::Validation(
@@ -7090,7 +7204,7 @@ mod breadcrumb_tests {
             ),
         );
         assert!(
-            violation.contains("reason=validation:MissingLatestStateRevision"),
+            violation.contains("reason=validation:missing_latest_state_revision"),
             "{violation}"
         );
     }
@@ -7164,7 +7278,7 @@ mod breadcrumb_tests {
                 ),
             )
             .code(),
-            "validation:BindingMismatch(StateKey)"
+            "validation:binding_mismatch:state_key"
         );
     }
 

@@ -120,6 +120,104 @@ pub enum Violation {
     DataschemaMismatch,
 }
 
+impl Violation {
+    /// A stable, content-free token naming the rule that refused the envelope.
+    ///
+    /// The observable half of "stable variants let callers reject or audit one
+    /// rule without parsing human diagnostics": the variant is only reachable
+    /// in-process, so every surface that has to *report* a refusal — the
+    /// connector's IPC reply, the delivery breadcrumbs, `federation emit` — needs
+    /// one spelling of it that survives leaving the process (#102). Written out
+    /// arm by arm rather than derived from the `Debug` name: a variant rename is
+    /// then a deliberate change to the operator-facing vocabulary instead of a
+    /// silent one, and the exhaustive match makes a new variant a compile error
+    /// until it is named here.
+    ///
+    /// Content-free is a real guarantee, not a hope: every arm is a literal and
+    /// the one payload-carrying variant composes a literal axis token, so no
+    /// part of a caller's envelope can reach a log or a terminal through this.
+    pub fn code(&self) -> String {
+        let name = match self {
+            Violation::InvalidUtf8 => "invalid_utf8",
+            Violation::InvalidJson => "invalid_json",
+            Violation::DuplicateJsonKey => "duplicate_json_key",
+            Violation::MissingSpecversion => "missing_specversion",
+            Violation::WrongSpecversion => "wrong_specversion",
+            Violation::MissingId => "missing_id",
+            Violation::MissingType => "missing_type",
+            Violation::MissingDatacontenttype => "missing_datacontenttype",
+            Violation::WrongDatacontenttype => "wrong_datacontenttype",
+            Violation::InvalidIntent => "invalid_intent",
+            Violation::InvalidDeliveryClass => "invalid_delivery_class",
+            Violation::MissingLatestStateKey => "missing_latest_state_key",
+            Violation::MissingLatestStateRevision => "missing_latest_state_revision",
+            Violation::DuplicateEnvelopeField => "duplicate_envelope_field",
+            Violation::PayloadTooLarge => "payload_too_large",
+            Violation::InvalidExpiry => "invalid_expiry",
+            Violation::Expired => "expired",
+            Violation::ExpiryTooFar => "expiry_too_far",
+            Violation::InvalidEnvelopeShape => "invalid_envelope_shape",
+            Violation::MissingRequestThread => "missing_request_thread",
+            Violation::InvalidRequestCorrelation => "invalid_request_correlation",
+            Violation::MissingResponseThread => "missing_response_thread",
+            Violation::MissingResponseCausation => "missing_response_causation",
+            Violation::UnknownContextField => "unknown_context_field",
+            Violation::InvalidSourceScheme => "invalid_source_scheme",
+            Violation::SourceInstanceMismatch => "source_instance_mismatch",
+            Violation::UnauthorizedPrincipal => "unauthorized_principal",
+            Violation::MissingStructuredIdentity => "missing_structured_identity",
+            Violation::PayloadDeclaredIdentity => "payload_declared_identity",
+            Violation::PlanLocalSubject => "plan_local_subject",
+            Violation::DocumentTooLarge => "document_too_large",
+            Violation::MalformedTopic => "malformed_topic",
+            Violation::BindingMismatch(axis) => return format!("binding_mismatch:{}", axis.code()),
+            Violation::UnknownRecipientKind => "unknown_recipient_kind",
+            Violation::MissingRepositoryId => "missing_repository_id",
+            Violation::InvalidGitRefsPayload => "invalid_git_refs_payload",
+            Violation::MissingOldOid => "missing_old_oid",
+            Violation::InvalidOldOid => "invalid_old_oid",
+            Violation::MissingNewOid => "missing_new_oid",
+            Violation::InvalidNewOid => "invalid_new_oid",
+            Violation::InvalidWorkStatePayload => "invalid_work_state_payload",
+            Violation::InvalidWorkState => "invalid_work_state",
+            Violation::MissingBaseOid => "missing_base_oid",
+            Violation::InvalidBaseOid => "invalid_base_oid",
+            Violation::MissingPlanOid => "missing_plan_oid",
+            Violation::InvalidPlanOid => "invalid_plan_oid",
+            Violation::MissingStableArtifactId => "missing_stable_artifact_id",
+            Violation::InvalidMessagePayload => "invalid_message_payload",
+            Violation::MissingMessageAction => "missing_message_action",
+            Violation::InvalidMessageParams => "invalid_message_params",
+            Violation::InvalidResponseStatus => "invalid_response_status",
+            Violation::MissingReviewAnchor => "missing_review_anchor",
+            Violation::InvalidReviewCommit => "invalid_review_commit",
+            Violation::ReservedType => "reserved_type",
+            Violation::UnnamespacedType => "unnamespaced_type",
+            Violation::MissingSchemaMajor => "missing_schema_major",
+            Violation::DataschemaMismatch => "dataschema_mismatch",
+        };
+        name.to_owned()
+    }
+}
+
+impl BindingAxis {
+    /// The axis half of a `binding_mismatch:` code. A fieldless enum, so this is
+    /// a literal per arm and can carry nothing from the envelope.
+    pub fn code(&self) -> &'static str {
+        match self {
+            BindingAxis::Organization => "organization",
+            BindingAxis::Project => "project",
+            BindingAxis::Origin => "origin",
+            BindingAxis::DeliveryClass => "delivery_class",
+            BindingAxis::StateKey => "state_key",
+            BindingAxis::Audience => "audience",
+            BindingAxis::RecipientKind => "recipient_kind",
+            BindingAxis::Recipient => "recipient",
+            BindingAxis::MessageId => "message_id",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingAxis {
     Organization,
@@ -1699,6 +1797,68 @@ mod tests {
         include_str!("../tests/fixtures/mqtt/work-state.json"),
         include_str!("../tests/fixtures/mqtt/message.json"),
     ];
+
+    #[test]
+    fn a_violation_names_itself_in_a_stable_grep_token() {
+        // The token is what reaches an operator: an IPC `diagnostic`, a delivery
+        // breadcrumb, `federation emit`'s refusal line (#102). Pinned by value,
+        // because the point of the code is that it does not move under a caller
+        // who greps for it.
+        assert_eq!(Violation::MissingPlanOid.code(), "missing_plan_oid");
+        assert_eq!(Violation::Expired.code(), "expired");
+        assert_eq!(Violation::InvalidUtf8.code(), "invalid_utf8");
+        assert_eq!(
+            Violation::MissingLatestStateRevision.code(),
+            "missing_latest_state_revision"
+        );
+
+        // The one payload-carrying variant keeps its axis, and the axis whose
+        // name is a caller-chosen state key still contributes only a literal.
+        assert_eq!(
+            Violation::BindingMismatch(BindingAxis::StateKey).code(),
+            "binding_mismatch:state_key"
+        );
+        assert_eq!(
+            Violation::BindingMismatch(BindingAxis::DeliveryClass).code(),
+            "binding_mismatch:delivery_class"
+        );
+    }
+
+    /// Every violation this crate can produce has a token-shaped code — a
+    /// refusal that reached a log as an empty string or a sentence would be
+    /// worse than the flattened `invalid_request` it replaced.
+    #[test]
+    fn every_violation_a_real_envelope_can_hit_has_a_token_shaped_code() {
+        // Driven through the real validator rather than a hand-listed enum:
+        // whatever these malformed documents refuse, the code for it must be a
+        // token. `id` and `type` cover the parse-level rules, the work-state
+        // fixtures the payload-level ones.
+        let malformed: [&[u8]; 5] = [
+            b"not json at all",
+            b"{}",
+            br#"{"specversion":"1.0"}"#,
+            &[0xff, 0xfe, 0xfd],
+            br#"{"specversion":"1.0","id":"e-1","type":"io.loam.work.state"}"#,
+        ];
+        let principal = AuthenticatedPrincipal::new("employee-42", &["employee-42"]);
+        for document in malformed {
+            let violation = validate(
+                document,
+                "loam/v1/acme/loam/state/instance-01/task-7",
+                &principal,
+                &ValidationConfig::default(),
+                Utc::now(),
+            )
+            .expect_err("a malformed document must be refused");
+            let code = violation.code();
+            assert!(!code.is_empty(), "{violation:?} has no code");
+            assert!(
+                code.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == ':'),
+                "a code is a grep token, not prose: {code}"
+            );
+        }
+    }
 
     #[test]
     fn core_fixtures_round_trip_without_loss() {

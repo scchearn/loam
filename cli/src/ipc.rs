@@ -141,6 +141,14 @@ pub enum IpcError {
     MalformedFrame,
     FrameTooLarge,
     InvalidRequest,
+    /// `invalid_request`, plus the one stable token naming *which* rule refused
+    /// it (#102). The code on the wire is unchanged — this is not a second
+    /// error surface, it is the `diagnostic` field finally carrying something a
+    /// caller could not already read off the code. Only content-free tokens go
+    /// in it (an envelope `Violation::code`, a fixed shape reason); it is still
+    /// bounded by `max_diagnostic` on the way out, and it must never be built
+    /// from request content.
+    InvalidRequestBecause(String),
     UnknownOperation,
     WorkspaceUnenrolled,
     ProjectBindingMismatch,
@@ -157,13 +165,25 @@ impl IpcError {
             IpcError::UnsupportedVersion => "unsupported_version",
             IpcError::MalformedFrame => "malformed_frame",
             IpcError::FrameTooLarge => "frame_too_large",
-            IpcError::InvalidRequest => "invalid_request",
+            IpcError::InvalidRequest | IpcError::InvalidRequestBecause(_) => "invalid_request",
             IpcError::UnknownOperation => "unknown_operation",
             IpcError::WorkspaceUnenrolled => "workspace_unenrolled",
             IpcError::ProjectBindingMismatch => "project_binding_mismatch",
             IpcError::Busy => "busy",
             IpcError::Timeout => "timeout",
             IpcError::Internal => "internal",
+        }
+    }
+
+    /// The bounded diagnostic that rides beside the code. For most errors the
+    /// code is the whole story and the two fields agree; a refusal that knows
+    /// *which* rule it broke reports that token here instead of repeating
+    /// itself, which is the only way the reason survives the hop to a caller
+    /// (#102).
+    pub fn diagnostic(&self) -> &str {
+        match self {
+            IpcError::InvalidRequestBecause(reason) => reason,
+            other => other.code(),
         }
     }
 }
@@ -209,6 +229,20 @@ pub fn write_frame<W: Write>(
         .write_all(body)
         .map_err(|_| IpcError::MalformedFrame)?;
     Ok(())
+}
+
+/// Truncate to at most `max` bytes without splitting a UTF-8 character.
+/// `String::truncate` panics on a non-boundary index, and a diagnostic is no
+/// longer only a fixed ASCII token now that a refusal reason can ride in one.
+fn truncate_on_char_boundary(text: &mut String, max: usize) {
+    if text.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
 }
 
 fn read_exact<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<(), IpcError> {
@@ -324,8 +358,8 @@ pub fn ok_response(request_id: &str, result: Value) -> Vec<u8> {
 /// bounded diagnostic that never includes untrusted input. `request_id` may be
 /// empty when the frame could not be parsed far enough to recover it.
 pub fn error_response(request_id: &str, error: &IpcError, config: &IpcConfig) -> Vec<u8> {
-    let mut diagnostic = error.code().to_owned();
-    diagnostic.truncate(config.max_diagnostic);
+    let mut diagnostic = error.diagnostic().to_owned();
+    truncate_on_char_boundary(&mut diagnostic, config.max_diagnostic);
     Value::Object(vec![
         (
             "version".into(),
@@ -479,6 +513,60 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap();
         assert!(diag.len() <= 8);
+    }
+
+    #[test]
+    fn a_refusal_that_knows_its_reason_reports_it_beside_the_stable_code() {
+        // #102: the code is what a caller matches on and must not move; the
+        // diagnostic is where the reason lives. Before this the two fields were
+        // always the same string, so a refused envelope told the operator only
+        // that *something* was invalid.
+        let config = IpcConfig::default();
+        let error = IpcError::InvalidRequestBecause("missing_plan_oid".into());
+        assert_eq!(error.code(), "invalid_request");
+        assert_eq!(error.diagnostic(), "missing_plan_oid");
+
+        let parsed = crate::json::parse(
+            &String::from_utf8(error_response("r-1", &error, &config)).expect("utf-8"),
+        )
+        .expect("the error response parses");
+        let reported = parsed.get("error").expect("an error object");
+        assert_eq!(
+            reported.get("code").and_then(Value::as_str),
+            Some("invalid_request"),
+            "the wire code stays the existing one: this is not a new error surface"
+        );
+        assert_eq!(
+            reported.get("diagnostic").and_then(Value::as_str),
+            Some("missing_plan_oid")
+        );
+
+        // A refusal with nothing extra to say still answers with its code, so no
+        // consumer has to special-case an empty diagnostic.
+        assert_eq!(IpcError::Busy.diagnostic(), "busy");
+    }
+
+    #[test]
+    fn a_reason_longer_than_the_bound_is_cut_without_panicking() {
+        // The diagnostic used to be a fixed ASCII token, so `String::truncate`
+        // could never land mid-character. A reason-carrying refusal makes that a
+        // real edge, and `truncate` *panics* on a non-boundary index — inside the
+        // connector's error path, where a panic is the whole request.
+        let config = IpcConfig {
+            max_diagnostic: 5,
+            ..IpcConfig::default()
+        };
+        let error = IpcError::InvalidRequestBecause("aa\u{00e9}\u{00e9}bb".into());
+        let text = String::from_utf8(error_response("r-1", &error, &config)).expect("utf-8");
+        let diagnostic = crate::json::parse(&text)
+            .expect("parses")
+            .get("error")
+            .and_then(|error| error.get("diagnostic"))
+            .and_then(Value::as_str)
+            .expect("a diagnostic")
+            .to_owned();
+        assert!(diagnostic.len() <= 5, "{diagnostic}");
+        assert_eq!(diagnostic, "aa\u{00e9}");
     }
 
     #[test]

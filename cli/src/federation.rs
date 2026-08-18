@@ -1052,7 +1052,13 @@ pub enum EmitError {
     Unenrolled,
     AlreadyResponded,
     ConnectorUnreachable,
-    ConnectorRefused,
+    /// The connector answered, and refused. The payload is the refusal it
+    /// reported — its IPC code, plus the rule that rejected the envelope when it
+    /// knew one. Without it every refusal reads the same (#102): a missing plan
+    /// anchor, an unaddressable recipient, and a project-binding mismatch all
+    /// arrived as a bare `connector_refused`. `None` is for a reply this side
+    /// could not read at all, where there is genuinely nothing to name.
+    ConnectorRefused(Option<String>),
 }
 
 impl EmitError {
@@ -1068,7 +1074,17 @@ impl EmitError {
             EmitError::Unenrolled => "workspace_unenrolled",
             EmitError::AlreadyResponded => "already_responded",
             EmitError::ConnectorUnreachable => "connector_unreachable",
-            EmitError::ConnectorRefused => "connector_refused",
+            EmitError::ConnectorRefused(_) => "connector_refused",
+        }
+    }
+
+    /// The refusal detail behind the code, when the connector named one. Kept
+    /// separate from `code`, which stays a stable, matchable vocabulary: this is
+    /// the part that says which rule fired.
+    pub fn diagnostic(&self) -> Option<&str> {
+        match self {
+            EmitError::ConnectorRefused(detail) => detail.as_deref(),
+            _ => None,
         }
     }
 
@@ -1078,7 +1094,7 @@ impl EmitError {
             // failure: exactly one terminal ships and the others say so.
             EmitError::AlreadyResponded => 0,
             EmitError::Unenrolled => 78,
-            EmitError::ConnectorUnreachable | EmitError::ConnectorRefused => 69,
+            EmitError::ConnectorUnreachable | EmitError::ConnectorRefused(_) => 69,
             _ => 65,
         }
     }
@@ -1367,7 +1383,12 @@ fn emit(mut args: impl Iterator<Item = String>) -> i32 {
             if json_output {
                 println!("{}", emit_error_json(&error).to_json());
             } else {
-                eprintln!("federation emit: {}", error.code());
+                match error.diagnostic() {
+                    Some(diagnostic) => {
+                        eprintln!("federation emit: {} ({diagnostic})", error.code())
+                    }
+                    None => eprintln!("federation emit: {}", error.code()),
+                }
             }
             error.sysexit()
         }
@@ -1521,13 +1542,16 @@ fn inject(mut args: impl Iterator<Item = String>) -> i32 {
 }
 
 fn emit_error_json(error: &EmitError) -> Value {
+    let mut reported = vec![("code".into(), Value::String(error.code().into()))];
+    // Present only when there is something to say. An absent key is honest about
+    // a refusal nobody could name; a `null` one invites a consumer to print it.
+    if let Some(diagnostic) = error.diagnostic() {
+        reported.push(("diagnostic".into(), Value::String(diagnostic.to_owned())));
+    }
     Value::Object(vec![
         ("schema".into(), Value::Number("1".into())),
         ("status".into(), Value::String("error".into())),
-        (
-            "error".into(),
-            Value::Object(vec![("code".into(), Value::String(error.code().into()))]),
-        ),
+        ("error".into(), Value::Object(reported)),
     ])
 }
 
@@ -1691,7 +1715,7 @@ fn run_emit(
 /// the at-most-once guarantee survives.
 fn forward_queued_nothing(forwarded: &Result<Value, EmitError>) -> bool {
     match forwarded {
-        Err(EmitError::ConnectorUnreachable | EmitError::ConnectorRefused) => true,
+        Err(EmitError::ConnectorUnreachable | EmitError::ConnectorRefused(_)) => true,
         Ok(response) => {
             response.get("status").and_then(Value::as_str) == Some("not-shipped")
                 && response.get("reason").and_then(Value::as_str) == Some("no-live-session")
@@ -1721,16 +1745,59 @@ fn forward_emit(
     let config = crate::ipc::IpcConfig::default();
     let body = emit_round_trip(&global_root.join("run"), request.as_bytes(), &config)
         .map_err(|_| EmitError::ConnectorUnreachable)?;
-    let text = std::str::from_utf8(&body).map_err(|_| EmitError::ConnectorRefused)?;
-    let value = crate::json::parse(text).map_err(|_| EmitError::ConnectorRefused)?;
+    let text = std::str::from_utf8(&body).map_err(|_| EmitError::ConnectorRefused(None))?;
+    let value = crate::json::parse(text).map_err(|_| EmitError::ConnectorRefused(None))?;
     match value.get("status").and_then(Value::as_str) {
         Some("ok") => value
             .get("result")
             .cloned()
-            .ok_or(EmitError::ConnectorRefused),
-        _ => Err(EmitError::ConnectorRefused),
+            .ok_or(EmitError::ConnectorRefused(Some("missing_result".into()))),
+        _ => Err(EmitError::ConnectorRefused(refusal_detail(&value))),
     }
 }
+
+/// Name the connector's refusal from its error reply: the IPC code, and the
+/// typed reason beside it when the connector reported one the code does not
+/// already say. Both halves matter — the code separates a refused envelope from
+/// a binding mismatch or a busy connector, and the reason is the rule that
+/// actually fired (#102).
+fn refusal_detail(reply: &Value) -> Option<String> {
+    let error = reply.get("error")?;
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .map(sanitize_token);
+    let diagnostic = error
+        .get("diagnostic")
+        .and_then(Value::as_str)
+        .map(sanitize_token);
+    let detail = match (code, diagnostic) {
+        (Some(code), Some(diagnostic)) if !code.is_empty() && diagnostic != code => {
+            format!("{code}:{diagnostic}")
+        }
+        (Some(code), _) if !code.is_empty() => code,
+        (_, Some(diagnostic)) if !diagnostic.is_empty() => diagnostic,
+        _ => return None,
+    };
+    // The bound applies to what is printed, not to each half of it: two capped
+    // halves compose to twice the cap.
+    Some(detail.chars().take(MAX_REFUSAL_DETAIL_CHARS).collect())
+}
+
+/// The refusal detail is printed to a terminal and echoed in `--json`, so it is
+/// reduced to a grep token before either: the connector only ever puts a
+/// content-free code here, but this side is what would leak a control sequence
+/// or an unbounded string if that ever stopped being true.
+fn sanitize_token(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))
+        .take(MAX_REFUSAL_DETAIL_CHARS)
+        .collect()
+}
+
+/// Long enough for the longest `invalid_request:<violation>` pair the connector
+/// can send, short enough that a hostile reply cannot fill a terminal line.
+const MAX_REFUSAL_DETAIL_CHARS: usize = 96;
 
 #[cfg(unix)]
 fn emit_round_trip(
@@ -2360,6 +2427,97 @@ mod emit_tests {
         (root, workspace, instance_id, registry, pin)
     }
 
+    /// #102's second flattening: the CLI mapped *any* non-ok reply to a bare
+    /// `connector_refused`, so even the code the connector did send was thrown
+    /// away. Driven through the real connector-side encoder, so the two sides
+    /// cannot agree in the test and disagree on the wire.
+    #[test]
+    fn a_refused_reply_keeps_the_connectors_own_reason() {
+        let config = crate::ipc::IpcConfig::default();
+        let encoded = |error: &crate::ipc::IpcError| {
+            let body = crate::ipc::error_response("emit", error, &config);
+            crate::json::parse(&String::from_utf8(body).expect("utf-8")).expect("parses")
+        };
+
+        // A refused envelope: both halves survive — which IPC rule refused it,
+        // and which envelope rule it broke.
+        let refused = encoded(&crate::ipc::IpcError::InvalidRequestBecause(
+            crate::envelope::Violation::MissingPlanOid.code(),
+        ));
+        assert_eq!(
+            refusal_detail(&refused).as_deref(),
+            Some("invalid_request:missing_plan_oid")
+        );
+
+        // A refusal whose code is the whole story is not padded with a repeat of
+        // itself — but it is no longer erased either.
+        let mismatch = encoded(&crate::ipc::IpcError::ProjectBindingMismatch);
+        assert_eq!(
+            refusal_detail(&mismatch).as_deref(),
+            Some("project_binding_mismatch")
+        );
+
+        // A reply with no error object at all names nothing rather than
+        // inventing something.
+        assert_eq!(
+            refusal_detail(&crate::json::parse(r#"{"status":"error"}"#).expect("parses")),
+            None
+        );
+
+        // The operator-facing surfaces: the code stays matchable, the reason is
+        // reported beside it, and `--json` carries it as its own field.
+        let error = EmitError::ConnectorRefused(refusal_detail(&refused));
+        assert_eq!(error.code(), "connector_refused");
+        assert_eq!(
+            error.diagnostic(),
+            Some("invalid_request:missing_plan_oid"),
+            "the reason must reach the operator, not just the socket"
+        );
+        let reported = emit_error_json(&error).to_json();
+        assert!(
+            reported.contains("\"code\":\"connector_refused\""),
+            "{reported}"
+        );
+        assert!(
+            reported.contains("\"diagnostic\":\"invalid_request:missing_plan_oid\""),
+            "{reported}"
+        );
+
+        // A refusal nobody could name reports no diagnostic key at all, so a
+        // consumer never prints an empty parenthetical.
+        assert!(
+            !emit_error_json(&EmitError::ConnectorRefused(None))
+                .to_json()
+                .contains("diagnostic"),
+            "an unnamed refusal must not claim a reason"
+        );
+    }
+
+    /// The detail is printed to a terminal and echoed in `--json`. The connector
+    /// only ever sends a content-free token, and this is the side that would leak
+    /// it if that ever stopped being true.
+    #[test]
+    fn a_hostile_refusal_detail_is_reduced_to_a_token() {
+        let hostile = format!(
+            r#"{{"status":"error","error":{{"code":"invalid_request","diagnostic":"oops {}[2Jsecret path \"quoted\""}}}}"#,
+            "\\u001b"
+        );
+        let hostile = crate::json::parse(&hostile).expect("parses");
+        let detail = refusal_detail(&hostile).expect("a detail");
+        assert!(
+            !detail.contains('\u{1b}') && !detail.contains(' ') && !detail.contains('"'),
+            "{detail}"
+        );
+        assert!(detail.len() <= MAX_REFUSAL_DETAIL_CHARS, "{detail}");
+
+        let long = format!(
+            r#"{{"status":"error","error":{{"code":"invalid_request","diagnostic":"{}"}}}}"#,
+            "a".repeat(4096)
+        );
+        let detail = refusal_detail(&crate::json::parse(&long).expect("parses")).expect("a detail");
+        assert!(detail.len() <= MAX_REFUSAL_DETAIL_CHARS, "{}", detail.len());
+    }
+
     #[test]
     fn a_forward_that_never_reached_the_connector_does_not_burn_the_response() {
         // The defect this closes: the slot was taken before the forward and kept
@@ -2483,7 +2641,9 @@ mod emit_tests {
         assert!(forward_queued_nothing(&Err(
             EmitError::ConnectorUnreachable
         )));
-        assert!(forward_queued_nothing(&Err(EmitError::ConnectorRefused)));
+        assert!(forward_queued_nothing(&Err(EmitError::ConnectorRefused(
+            Some("invalid_request:missing_plan_oid".into())
+        ))));
         assert!(forward_queued_nothing(&response(
             r#"{"status":"not-shipped","reason":"no-live-session"}"#
         )));
