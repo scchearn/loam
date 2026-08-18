@@ -1258,6 +1258,14 @@ fn collaboration_section(federation: &Federation, paths: &HookPaths, workspace: 
         "Send: {\"type\":\"work.report\",\"state_key\":\"<what>\",\"summary\":\"<one-line>\",\"payload\":{\"state\":\"active|blocked|ready|published\"}}"
             .to_owned(),
     );
+    // A claim about identified work needs the plan it is against, or it is
+    // refused as `missing_plan_oid` (#98). Said here because this is the only
+    // place an agent is told how to report at all, and the anchor is the one
+    // field it has to resolve itself.
+    lines.push(
+        "To claim identified work, add `\"artifacts\":[{\"kind\":\"task\",\"id\":\"<id>\"}]` and the plan it is against: `\"plan_oid\":\"<git rev-parse HEAD:plans/<plan>.md>\"`."
+            .to_owned(),
+    );
     lines.join("\n")
 }
 

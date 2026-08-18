@@ -3341,6 +3341,18 @@ fn outbound_envelope(
         )
     };
 
+    // `base_oid` is the enrolled commit — derived, never a caller's. `plan_oid`
+    // is the caller's plan anchor when it supplied one (#98): provenance, not
+    // authority, and the only part of `context` an emit caller contributes. The
+    // shape is not re-checked here on purpose — `envelope::validate` refuses a
+    // malformed one as `InvalidPlanOid` and an absent one on a claim-bearing
+    // report as `MissingPlanOid`, and both now reach the caller by name.
+    let mut git = vec![("base_oid".into(), Value::String(row.commit.clone()))];
+    if let Some(plan_oid) = operation.get("plan_oid").and_then(Value::as_str) {
+        if !plan_oid.is_empty() {
+            git.push(("plan_oid".into(), Value::String(plan_oid.to_owned())));
+        }
+    }
     let mut context = vec![
         ("org_id".into(), Value::String(row.org_id.clone())),
         ("project_id".into(), Value::String(row.project_id.clone())),
@@ -3348,10 +3360,7 @@ fn outbound_envelope(
             "repository_id".into(),
             Value::String(row.repository_id.clone()),
         ),
-        (
-            "git".into(),
-            Value::Object(vec![("base_oid".into(), Value::String(row.commit.clone()))]),
-        ),
+        ("git".into(), Value::Object(git)),
     ];
     context.push((
         "artifacts".into(),
@@ -6767,6 +6776,22 @@ mod outbound_tests {
             .with_timezone(&Utc)
     }
 
+    /// Replace (or add) one field on an operation object. Used to build the
+    /// operations a non-CLI IPC caller could send, which the connector has to
+    /// refuse on its own terms rather than assuming its caller pre-checked them.
+    fn with_field(operation: &Value, name: &str, value: Value) -> Value {
+        let Value::Object(entries) = operation else {
+            panic!("an operation is an object");
+        };
+        let mut fields: Vec<(String, Value)> = entries
+            .iter()
+            .filter(|(key, _)| key != name)
+            .cloned()
+            .collect();
+        fields.push((name.to_owned(), value));
+        Value::Object(fields)
+    }
+
     /// Derive through the real CLI path, then build through the real connector
     /// path — the round trip neither half tested on its own.
     fn round_trip(operation: &str) -> Result<(String, String), &'static str> {
@@ -6915,19 +6940,53 @@ mod outbound_tests {
             );
         }
 
-        // A validation refusal, from the envelope module: the same operation the
-        // enrolled row cannot anchor, whose only symptom was `connector_refused`.
-        let claim_bearing = r#"{"type":"work.report","state_key":"task-7","revision":"1","summary":"s","artifacts":[{"kind":"task","id":"T-1"}],"payload":{"state":"ready","acceptance":{},"verification":[]}}"#;
-        let parsed = crate::json::parse(claim_bearing).expect("operation parses");
+        // A validation refusal, from the envelope module. The claim is injected
+        // *after* derivation on purpose: `derive_emit` now refuses an unanchored
+        // claim itself (#98), so the operation an IPC caller other than this CLI
+        // could still send is the one that reaches the validator — and the
+        // connector must name that refusal too rather than trusting its callers.
+        let claimless = r#"{"type":"work.report","state_key":"task-7","revision":"1","summary":"s","payload":{"state":"ready"}}"#;
+        let parsed = crate::json::parse(claimless).expect("operation parses");
         let derived =
             crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
-        let refusal = validated_emit(&derived.operation, &row(), &identity(), now())
+        let unanchored_claim = with_field(
+            &derived.operation,
+            "artifacts",
+            crate::json::parse(r#"[{"kind":"task","id":"T-1"}]"#).expect("artifacts parse"),
+        );
+        let refusal = validated_emit(&unanchored_claim, &row(), &identity(), now())
             .expect_err("a claim-bearing report with no plan anchor is refused");
         assert_eq!(refusal.code(), "invalid_request");
         assert_eq!(
             refusal.diagnostic(),
             crate::envelope::Violation::MissingPlanOid.code(),
             "the violation the validator raised must be the reason reported"
+        );
+
+        // The same claim, anchored: it validates, so the refusal above is the
+        // anchor rule and not the artifact. And the anchor has to land in
+        // `context.git` beside the derived `base_oid` — accepting it at the CLI
+        // and dropping it at envelope build would leave #98 exactly where it was.
+        let plan_oid = "61af000000000000000000000000000000000001";
+        let anchored = with_field(
+            &unanchored_claim,
+            "plan_oid",
+            Value::String(plan_oid.into()),
+        );
+        let validated = validated_emit(&anchored, &row(), &identity(), now())
+            .expect("an anchored claim must ship");
+        let git = validated
+            .as_envelope()
+            .data
+            .context
+            .git
+            .as_ref()
+            .expect("the envelope carries a git context");
+        assert_eq!(git.plan_oid.as_deref(), Some(plan_oid));
+        assert_eq!(
+            git.base_oid.as_deref(),
+            Some(row().commit.as_str()),
+            "the caller's plan anchor must not disturb the derived base anchor"
         );
 
         // The positive control in the same run: a claimless report still ships,

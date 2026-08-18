@@ -1049,6 +1049,11 @@ pub enum EmitError {
     MissingRecipient,
     MissingStateKey,
     InvalidWorkState,
+    /// A claim-bearing work report with no plan anchor (#98). The envelope
+    /// validator refuses these too; refusing here means the caller is told which
+    /// field is missing without spending a round trip to learn it.
+    MissingPlanOid,
+    InvalidPlanOid,
     Unenrolled,
     AlreadyResponded,
     ConnectorUnreachable,
@@ -1071,6 +1076,10 @@ impl EmitError {
             EmitError::MissingRecipient => "missing_recipient",
             EmitError::MissingStateKey => "missing_state_key",
             EmitError::InvalidWorkState => "invalid_work_state",
+            // The same tokens the envelope validator reports for the same two
+            // rules, so a refusal reads identically whichever layer caught it.
+            EmitError::MissingPlanOid => "missing_plan_oid",
+            EmitError::InvalidPlanOid => "invalid_plan_oid",
             EmitError::Unenrolled => "workspace_unenrolled",
             EmitError::AlreadyResponded => "already_responded",
             EmitError::ConnectorUnreachable => "connector_unreachable",
@@ -1291,13 +1300,33 @@ pub fn derive_emit(
                     .unwrap_or_else(|| "1".to_owned()),
             ),
         ));
-        derived.push((
-            "artifacts".into(),
-            match operation.get("artifacts") {
-                Some(artifacts @ Value::Array(_)) => artifacts.clone(),
-                _ => Value::Array(Vec::new()),
-            },
-        ));
+        let artifacts = match operation.get("artifacts") {
+            Some(artifacts @ Value::Array(_)) => artifacts.clone(),
+            _ => Value::Array(Vec::new()),
+        };
+        // The plan anchor (#98). Caller-supplied on purpose: it is a provenance
+        // assertion, not an authority claim — org, project, repository, instance
+        // and principal stay derived, and a false anchor grants nothing and is
+        // checkable against Git by any receiver. That is what lets it cross the
+        // authority refusal list that keeps `context` out of a caller's hands.
+        //
+        // Required exactly where the envelope requires it: a report that carries a
+        // claim. Refusing here rather than only at the validator means the caller
+        // is told which field is missing instead of spending a round trip to be
+        // told something was invalid.
+        let plan_oid = operation
+            .get("plan_oid")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        if let Some(plan_oid) = plan_oid {
+            if !is_git_oid(plan_oid) {
+                return Err(EmitError::InvalidPlanOid);
+            }
+            derived.push(("plan_oid".into(), Value::String(plan_oid.to_owned())));
+        } else if bears_claim(&artifacts, operation.get("payload")) {
+            return Err(EmitError::MissingPlanOid);
+        }
+        derived.push(("artifacts".into(), artifacts));
     } else {
         let recipients = operation
             .get("to")
@@ -1323,6 +1352,42 @@ pub fn derive_emit(
         causation_id,
         event_id,
     })
+}
+
+/// Does this work report make a claim about identified work? The rule is the
+/// envelope validator's, deliberately: a `task` or `acceptance` artifact, or a
+/// non-empty acceptance map in the payload. Kept in step with `envelope.rs`'s
+/// claim-bearing test — a report refused here for a missing anchor must be one
+/// the validator would refuse for the same reason, or this layer starts refusing
+/// reports that would have shipped.
+fn bears_claim(artifacts: &Value, payload: Option<&Value>) -> bool {
+    let claiming_artifact = artifacts
+        .as_array()
+        .unwrap_or_default()
+        .iter()
+        .any(|artifact| {
+            matches!(
+                artifact.get("kind").and_then(Value::as_str),
+                Some("task" | "acceptance")
+            )
+        });
+    let claiming_acceptance = payload
+        .and_then(|payload| payload.get("acceptance"))
+        .is_some_and(|acceptance| match acceptance {
+            Value::Object(entries) => !entries.is_empty(),
+            _ => false,
+        });
+    claiming_artifact || claiming_acceptance
+}
+
+/// A full-length Git object id, lowercase hex. The same shape the envelope
+/// validator enforces on `context.git.plan_oid`; checked here so a typo is
+/// refused by name at the CLI instead of surfacing from the connector.
+fn is_git_oid(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
 }
 
 /// `loam federation emit [<workspace>] --global-root <path> [--json]`.
@@ -2425,6 +2490,88 @@ mod emit_tests {
                 .expect("enrolled row")
                 .instance_id;
         (root, workspace, instance_id, registry, pin)
+    }
+
+    /// #98: a claim-bearing work report can be shipped at all.
+    ///
+    /// The envelope requires `context.git.plan_oid` for any report carrying a task
+    /// or acceptance claim, and the emit surface gave callers no way to supply one:
+    /// `context` is refused as an authority override and the connector rebuilds it
+    /// from the enrolled row, which knows only `base_oid`. So every claim-bearing
+    /// report was refused and only claimless ones shipped — the report type
+    /// designed to carry verifiable claims could not carry them.
+    #[test]
+    fn a_claim_bearing_work_report_can_supply_its_plan_anchor() {
+        let row = row();
+        let anchor = "61af000000000000000000000000000000000001";
+        let derive = |operation: &str| {
+            derive_emit(
+                &crate::json::parse(operation).expect("operation parses"),
+                &row,
+                now(),
+            )
+        };
+
+        // The issue's repro, plus the anchor: it derives, and the anchor reaches
+        // the operation the connector merges into `context.git`.
+        let derived = derive(&format!(
+            r#"{{"type":"work.report","state_key":"k","revision":"1","summary":"s","plan_oid":"{anchor}","artifacts":[{{"kind":"task","id":"T-1"}}],"payload":{{"state":"ready","acceptance":{{}},"verification":[]}}}}"#
+        ))
+        .expect("an anchored claim derives");
+        assert_eq!(
+            derived.operation.get("plan_oid").and_then(Value::as_str),
+            Some(anchor)
+        );
+        // The anchor is provenance, not an authority claim: it is forwarded, never
+        // reported as a refused override the way `context` or `source` would be.
+        assert!(
+            derived.refused.is_empty(),
+            "the plan anchor must not read as an authority override: {:?}",
+            derived.refused
+        );
+
+        // Unanchored, the same claim is refused by name before any socket is
+        // opened — the round trip could only ever answer "invalid".
+        assert_eq!(
+            derive(
+                r#"{"type":"work.report","state_key":"k","revision":"1","summary":"s","artifacts":[{"kind":"task","id":"T-1"}],"payload":{"state":"ready"}}"#
+            ),
+            Err(EmitError::MissingPlanOid)
+        );
+
+        // A claim can also be made by the acceptance map alone, and the CLI's
+        // claim test has to agree with the validator's on that or it starts
+        // refusing reports that would have shipped.
+        assert_eq!(
+            derive(
+                r#"{"type":"work.report","state_key":"k","revision":"1","summary":"s","payload":{"state":"ready","acceptance":{"T-1":"met"}}}"#
+            ),
+            Err(EmitError::MissingPlanOid)
+        );
+
+        // A malformed anchor is a typo, not provenance.
+        for malformed in ["61af00", "61AF000000000000000000000000000000000001", "zz"] {
+            assert_eq!(
+                derive(&format!(
+                    r#"{{"type":"work.report","state_key":"k","revision":"1","summary":"s","plan_oid":"{malformed}","payload":{{"state":"ready"}}}}"#
+                )),
+                Err(EmitError::InvalidPlanOid),
+                "`{malformed}` is not a Git object id"
+            );
+        }
+
+        // The controls: a claimless report still needs no anchor (nothing that
+        // shipped before stops shipping), and an empty artifact list with an empty
+        // acceptance map is claimless — that is the shape the issue reports as the
+        // only one that worked.
+        assert!(derive(
+            r#"{"type":"work.report","state_key":"k","revision":"1","summary":"s","payload":{"state":"ready"}}"#
+        )
+        .is_ok());
+        assert!(derive(
+            r#"{"type":"work.report","state_key":"k","revision":"1","summary":"s","artifacts":[],"payload":{"state":"ready","acceptance":{},"verification":[]}}"#
+        )
+        .is_ok());
     }
 
     /// #102's second flattening: the CLI mapped *any* non-ok reply to a bare
