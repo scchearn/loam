@@ -105,7 +105,7 @@ test('publication guard rejects a package fixture missing the shared integration
   }
 });
 
-test('thin marketplace adapter contains no skills and no session-context surface', async () => {
+test('thin marketplace adapter carries no skills and the harness-native federation surface', async () => {
   const claude = JSON.parse(await readFile(join(marketplaceRoot, '.claude-plugin', 'plugin.json'), 'utf8'));
   const codex = JSON.parse(await readFile(join(marketplaceRoot, '.codex-plugin', 'plugin.json'), 'utf8'));
   const adapter = await import(pathToFileURL(join(marketplaceRoot, 'adapter.mjs')).href);
@@ -117,9 +117,15 @@ test('thin marketplace adapter contains no skills and no session-context surface
   assert.equal('hooks' in claude, false);
   assert.equal(codex.hooks, './hooks/hooks.json');
 
-  // The adapter keeps the Stop/ingestion half only. Session context is served
-  // by the native `loam hook <harness>` command setup registers directly.
+  // harness-native-wake: the shipped plugin now carries the federation surface
+  // itself (SessionStart render+register, per-turn drain, Stop-hook wake) so a
+  // marketplace-only install — no `npx install` staging native hooks — still
+  // gets it. The bodies still come only from the runtime's `hook <harness>`
+  // renderer; the adapter just spawns it and wraps the wake body.
   assert.equal(typeof adapter.handleMarketplaceStop, 'function');
+  assert.equal(typeof adapter.handleMarketplaceSessionStart, 'function');
+  assert.equal(typeof adapter.handleMarketplaceUserPromptSubmit, 'function');
+  assert.equal(typeof adapter.pollWake, 'function');
   for (const retired of ['createMarketplaceAdapter', 'createClaudeAdapter', 'handleMarketplaceHook', 'handleClaudeHook']) {
     assert.equal(retired in adapter, false, `${retired} must be retired`);
   }
@@ -137,11 +143,19 @@ test('plugin manifests carry skills only and register no Node hook entry', async
   await assert.rejects(() => readFile(join(packageRoot, 'hooks', 'hooks.json'), 'utf8'));
 });
 
-test('marketplace plugin ships Stop only and leaves the session boundary to setup', async () => {
+test('marketplace plugin ships the harness-native federation hooks plus the ingestion Stop', async () => {
   const hooks = JSON.parse(await readFile(join(marketplaceRoot, 'hooks', 'hooks.json'), 'utf8'));
-  assert.equal('SessionStart' in hooks.hooks, false);
-  assert.equal('UserPromptSubmit' in hooks.hooks, false);
+  // harness-native-wake: the shipped plugin carries the three federation hooks
+  // itself as self-resolving node shims (the runtime path is unknown at
+  // marketplace-install time, so a native baked-path entry is impossible here).
+  assert.match(hooks.hooks.SessionStart[0].hooks[0].command, /session-start\.mjs/);
+  assert.match(hooks.hooks.UserPromptSubmit[0].hooks[0].command, /user-prompt-submit\.mjs/);
+  // Two Stop entries: the fast ingestion boundary and the long-poll wake. Claude
+  // and Codex run every matching Stop hook, so they coexist without either
+  // suppressing the other.
   assert.match(hooks.hooks.Stop[0].hooks[0].command, /stop\.mjs/);
+  assert.match(hooks.hooks.Stop[1].hooks[0].command, /wake\.mjs/);
+  assert.ok(hooks.hooks.Stop[1].hooks[0].timeout >= 14400, 'the wake entry long-polls: its timeout is the hard ceiling');
 
   const stop = await import(pathToFileURL(marketplaceStopPath).href);
   const calls = [];
