@@ -182,47 +182,13 @@ export function nativeHookEntry(runtimePath, harness, event, { async: isAsync = 
   };
 }
 
-// A native event entry for the marketplace plugin's hooks.json. Claude Code
-// (and Codex, which shares the plugin hook schema) takes `command` as ONE shell
-// string and ignores `args`/`async`: an args-array entry runs the bare binary
-// with no subcommand, so `loam` prints usage, exits 1, emits nothing, and the
-// session silently loses federation (#133). The command is a single string with
-// the runtime path double-quoted so a darwin store under "Application Support"
-// survives the shell split — the same quoting the shipped Stop hook already runs
-// with a spaced ${CLAUDE_PLUGIN_ROOT}.
-function nativeCommandEntry(runtimePath, harness, event) {
-  // ponytail: double quotes cover the real case (a path with spaces); install
-  // paths do not contain embedded quotes, and the shipped hooks make the same
-  // bet. Escape the upgrade path if a quoted path ever appears in the wild.
-  return { type: 'command', command: `"${resolve(runtimePath)}" hook ${harness} --event ${event}` };
-}
-
-// The plugin hooks file setup writes into the installed marketplace plugin.
-// SessionStart, UserPromptSubmit, PreToolUse and PostToolUse are native reads
-// through the private runtime; PreToolUse is restricted to the chatty tool names
-// to keep fire frequency sane. The staged file must stay a SUPERSET of the
-// shipped hooks — a prior wholesale replace dropped SubagentStart/SubagentStop
-// and forked Stop's timeout (#132) — so the shipped hooks are the base and the
-// native events overlay onto them. Stop, SubagentStart and SubagentStop pass
-// through verbatim (Stop keeps the shipped ingestion-budget timeout, the single
-// authoritative value; the renderer no longer forks it).
-export function renderPluginHooks(runtimePath, harness, shipped) {
-  return {
-    hooks: {
-      ...shipped.hooks,
-      SessionStart: [{
-        matcher: 'startup|resume|clear|compact',
-        hooks: [nativeCommandEntry(runtimePath, harness, 'SessionStart')],
-      }],
-      UserPromptSubmit: [{ hooks: [nativeCommandEntry(runtimePath, harness, 'UserPromptSubmit')] }],
-      PreToolUse: [{
-        matcher: 'Bash|Task|Write|Edit|MultiEdit|Glob|Grep|Read',
-        hooks: [nativeCommandEntry(runtimePath, harness, 'PreToolUse')],
-      }],
-      PostToolUse: [{ hooks: [nativeCommandEntry(runtimePath, harness, 'PostToolUse')] }],
-    },
-  };
-}
+// #137: the marketplace plugin CARRIES its native-event hooks (self-resolving
+// node shims in plugins/loam-adapter/hooks/, landed with #114) because Claude
+// Code and Codex load hooks from the marketplace SOURCE directory, never the
+// installed cache copy setup could write — a staged hooks.json is a file the
+// harness ignores. Setup no longer renders or stages a hooks.json for claude or
+// codex; it only installs and enables the plugin. The prior renderPluginHooks/
+// stagePluginHooks path is retired.
 
 async function publishAssets(globalRoot, pluginVersion, runtimePath) {
   const versionRoot = join(resolve(globalRoot), 'plugins', `${pluginVersion}-${randomUUID()}`);
@@ -455,23 +421,6 @@ export async function reconcileOpenCodePluginEntry(home, stablePath) {
   return { ...merged, path: filePath, action: 'rewritten' };
 }
 
-// Setup owns the installed plugin's hook registration because it is the only
-// party that knows the version- and target-qualified runtime path. `plugin
-// update` replaces the shipped file; setup rewrites it afterwards, exactly as
-// an active service is re-enabled on a new runtime.
-async function stagePluginHooks({ pluginRoot, runtimePath, harness }) {
-  if (!pluginRoot) throw new Error(`${harness} marketplace plugin root is unresolved`);
-  const filePath = join(pluginRoot, 'hooks', 'hooks.json');
-  // The shipped hooks are the base the native events overlay onto, so
-  // SubagentStart/SubagentStop and Stop's shipped timeout survive the rewrite
-  // (#132). `plugin update` refreshes this file to the shipped content before
-  // setup runs; re-reading it is idempotent because the natives are always
-  // regenerated on top.
-  const shipped = JSON.parse(await readFile(filePath, 'utf8'));
-  await writeAtomicFile(filePath, `${JSON.stringify(renderPluginHooks(runtimePath, harness, shipped), null, 2)}\n`);
-  return filePath;
-}
-
 export async function installHarnesses({
   home = homedir(),
   globalRoot,
@@ -537,15 +486,13 @@ export async function installHarnesses({
           marketplaceOwned: harness.marketplaceOwned,
         });
         if (config.backupPath) backupPaths.push(config.backupPath);
-        const hooksPath = harness.marketplaceReady
-          ? await stagePluginHooks({ pluginRoot: harness.marketplaceRoot, runtimePath, harness: id })
-          : null;
+        // #137: the plugin carries its own hooks (self-resolving shims); setup
+        // no longer stages a hooks.json. Readiness is the marketplace install.
         result[id] = {
           ...harness,
           state: harness.marketplaceReady ? 'ready' : 'skipped',
           owner: harness.marketplaceReady ? 'marketplace' : null,
           path: assets.assets['claude-stop'],
-          sessionPath: hooksPath,
           stopPath: assets.assets['claude-stop'],
           backupPath: config.backupPath,
         };
@@ -557,15 +504,12 @@ export async function installHarnesses({
         });
         const profile = await installCodexAgent({ home });
         if (config.backupPath) backupPaths.push(config.backupPath);
-        const hooksPath = harness.marketplaceReady
-          ? await stagePluginHooks({ pluginRoot: harness.marketplaceRoot, runtimePath, harness: id })
-          : null;
+        // #137: plugin-carried hooks — no staging; readiness is the install.
         result[id] = {
           ...harness,
           state: harness.marketplaceReady ? 'ready' : 'skipped',
           owner: harness.marketplaceReady ? 'marketplace' : null,
           path: assets.assets['codex-stop'],
-          sessionPath: hooksPath,
           stopPath: assets.assets['codex-stop'],
           backupPath: config.backupPath,
           ...profile,

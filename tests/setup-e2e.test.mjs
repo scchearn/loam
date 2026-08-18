@@ -20,6 +20,10 @@ import { federationDefinitionPath } from '../setup/federation.mjs';
 import { ledgerPath } from '../integration/ledger.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
+// #137: an installed marketplace plugin carries the shipped hooks.json (with the
+// self-resolving native shims) — verify asserts that shape, so fixtures use the
+// real file rather than a Stop-only stub.
+const shippedPluginHooks = join(packageRoot, 'plugins', 'loam-adapter', 'hooks', 'hooks.json');
 const target = detectTarget();
 
 // The runtime store + ledger live in the config dir, which `configRoot` derives
@@ -264,14 +268,14 @@ test('marketplace-owned Claude and Codex satisfy readiness with the Codex agent 
   await writeFile(join(fixture.home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
   const claudeCache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
   await mkdir(join(claudeCache, 'hooks'), { recursive: true });
-  await writeFile(join(claudeCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
+  await writeFile(join(claudeCache, 'hooks', 'hooks.json'), await readFile(shippedPluginHooks, 'utf8'));
   await writeFile(join(fixture.home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
     version: 2,
     plugins: { 'loam@loam': [{ scope: 'user', installPath: claudeCache, version: PACKAGE_VERSION }] },
   }));
   const codexCache = join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
   await mkdir(join(codexCache, 'hooks'), { recursive: true });
-  await writeFile(join(codexCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
+  await writeFile(join(codexCache, 'hooks', 'hooks.json'), await readFile(shippedPluginHooks, 'utf8'));
   const capture = outputCapture();
 
   const code = await runSetup(parseArgs(['install', '--yes']), {
@@ -344,7 +348,7 @@ test('setup verifies an updated marketplace plugin from disk instead of trusting
   const fixture = await baseFixture();
   const cache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
   await mkdir(join(cache, 'hooks'), { recursive: true });
-  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
+  await writeFile(join(cache, 'hooks', 'hooks.json'), await readFile(shippedPluginHooks, 'utf8'));
   await writeFile(join(fixture.home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
   await writeFile(join(fixture.home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
     version: 2,
@@ -374,7 +378,7 @@ test('setup --yes installs a missing Codex plugin in one pass', async () => {
       await writeFile(join(fixture.home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
       const cache = join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
       await mkdir(join(cache, 'hooks'), { recursive: true });
-      await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
+      await writeFile(join(cache, 'hooks', 'hooks.json'), await readFile(shippedPluginHooks, 'utf8'));
     }
     return { code: 0, stdout: '', stderr: '' };
   };
@@ -417,7 +421,7 @@ test('partial marketplace failure keeps successful installs and removes legacy h
         await writeFile(join(fixture.home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
         const cache = join(fixture.home, '.codex', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
         await mkdir(join(cache, 'hooks'), { recursive: true });
-        await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
+        await writeFile(join(cache, 'hooks', 'hooks.json'), await readFile(shippedPluginHooks, 'utf8'));
       }
       return { code: 0, stdout: '', stderr: '' };
     }
@@ -680,7 +684,7 @@ async function readyHarnessFixture() {
     if (request.args.includes('install')) {
       const cache = join(fixture.home, '.claude', 'plugins', 'cache', 'loam', 'loam', PACKAGE_VERSION);
       await mkdir(join(cache, 'hooks'), { recursive: true });
-      await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
+      await writeFile(join(cache, 'hooks', 'hooks.json'), await readFile(shippedPluginHooks, 'utf8'));
       await writeFile(join(fixture.home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
       await writeFile(join(fixture.home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
         version: 2,
