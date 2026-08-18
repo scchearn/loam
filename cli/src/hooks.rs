@@ -13,6 +13,12 @@ const EVENT_BATCH_MAX_BYTES: usize = 16 * 1024;
 const EVENT_BATCH_MAX_EVENTS: usize = 16;
 // This is a wait ceiling under contention, not a delay on uncontended operations.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
+// The native read hook's own bookkeeping is best-effort and must never slow the
+// hook: PreToolUse/PostToolUse fire on every tool boundary, so a native run
+// record that waited the full BUSY_TIMEOUT on a locked ledger would stall the
+// session. ponytail: short ceiling, dropped on contention — raise only if
+// records are provably lost under normal load, never toward the 5s write budget.
+const NATIVE_RECORD_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const SCHEMA_VERSION: i64 = 2;
 const LEGACY_SCHEMA_VERSION: i64 = 1;
 const RETENTION: i64 = 10_000;
@@ -1410,6 +1416,85 @@ fn begin(args: BeginArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// One execution record for a native `loam hook <harness>` invocation, written
+/// into the same `hook_run` ledger the Node hooks use. Diagnostic-only: a caller
+/// swallows the error so a ledger failure never fails the hook (mirrors the Node
+/// bookkeeping contract), and the short busy timeout keeps a locked ledger from
+/// slowing it. A single complete row (started + finished + terminal status),
+/// unlike the Node begin/finish two-phase, because the native read path has no
+/// worker phase to interleave.
+pub(crate) struct NativeRun<'a> {
+    pub root: &'a Path,
+    pub harness: &'a str,
+    pub event: &'a str,
+    pub session_id: Option<&'a str>,
+    pub workspace: &'a str,
+    pub status: &'a str,
+    pub detail: Option<&'a str>,
+    pub plugin_version: &'a str,
+    pub started_at_ms: i64,
+    pub finished_at_ms: i64,
+}
+
+pub(crate) fn record_native_run(run: NativeRun) -> Result<(), String> {
+    let root_is_new = !run.root.exists();
+    fs::create_dir_all(run.root).map_err(|error| error.to_string())?;
+    if root_is_new {
+        private_permissions(run.root, 0o700)?;
+    }
+    let database = run.root.join(DATABASE_NAME);
+    let database_is_new = !database.exists();
+    let mut connection = Connection::open(&database).map_err(|error| error.to_string())?;
+    if database_is_new {
+        private_permissions(&database, 0o600)?;
+    }
+    connection
+        .busy_timeout(NATIVE_RECORD_BUSY_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    ensure_write_schema(&transaction)?;
+    transaction
+        .execute(
+            "INSERT INTO hook_run (started_at_ms, finished_at_ms, harness, hook, status, detail, session_id, workspace, plugin_version, runtime_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                run.started_at_ms,
+                run.finished_at_ms,
+                run.harness,
+                run.event,
+                run.status,
+                run.detail,
+                run.session_id,
+                run.workspace,
+                run.plugin_version,
+                env!("CARGO_PKG_VERSION")
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    // Same retention prune as begin(): the per-turn events fire on every tool
+    // boundary, so an unpruned native ledger would grow without bound.
+    transaction
+        .execute(
+            "DELETE FROM hook_event WHERE hook_run_id IN (
+                SELECT id FROM hook_run ORDER BY id DESC LIMIT -1 OFFSET ?1
+            )",
+            params![RETENTION],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM hook_run WHERE id IN (
+                SELECT id FROM hook_run ORDER BY id DESC LIMIT -1 OFFSET ?1
+            )",
+            params![RETENTION],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn finish(args: FinishArgs) -> Result<(), String> {
     let database = args.root.join(DATABASE_NAME);
     if !database.is_file() {
@@ -2255,6 +2340,111 @@ fn private_permissions(_path: &Path, _mode: u32) -> Result<(), String> {
 
 fn usage() -> String {
     "usage: loam hooks begin <global-root> --harness <id> --hook <id> --workspace <absolute-path> --plugin-version <semver> [--session-id <id>]\n       loam hooks finish <global-root> --id <positive-integer> --status <succeeded|failed|continued> [--action <spawn_worker|skip|request_worker>] [--reason <id>] [--detail <diagnostic>]\n       loam hooks event <global-root> --id <positive-integer> --event <type> [--phase <phase>] --outcome <outcome> [typed event fields]\n       loam hooks worker-start <global-root> --id <positive-integer> [--origin <external|fallback>] [--session-id <id>]\n       loam hooks worker-finish <global-root> --id <positive-integer> --status <succeeded|skipped|failed> --reason <id> [--origin <external|fallback>] [--session-id <id>] [--detail <diagnostic>]\n       loam hooks list [<global-root>] [--harness <id>] [--hook <id>] [--status <started|succeeded|failed|continued>] [--session-id <id>] [--limit <1..1000>]".to_owned()
+}
+
+#[cfg(test)]
+mod native_run_tests {
+    use super::{record_native_run, NativeRun, DATABASE_NAME};
+    use rusqlite::Connection;
+    use std::path::PathBuf;
+
+    fn temp_root(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "loam-native-run-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // #136 soft-degrade outcome class, at the ledger level: a `continued` run
+    // round-trips every field the diagnosis needs, and the duration is the
+    // recorded window (finished - started).
+    #[test]
+    fn a_soft_degraded_invocation_writes_one_complete_continued_row() {
+        let root = temp_root("continued");
+        record_native_run(NativeRun {
+            root: &root,
+            harness: "claude",
+            event: "user_prompt_submit",
+            session_id: Some("sess-1"),
+            workspace: "/w/proj",
+            status: "continued",
+            detail: Some("connector_unreachable"),
+            plugin_version: "9.9.9",
+            started_at_ms: 1_000,
+            finished_at_ms: 1_250,
+        })
+        .expect("the record writes");
+
+        let connection = Connection::open(root.join(DATABASE_NAME)).unwrap();
+        #[allow(clippy::type_complexity)]
+        let (harness, hook, status, detail, session, workspace, started, finished, runtime): (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            i64,
+            i64,
+            String,
+        ) = connection
+            .query_row(
+                "SELECT harness, hook, status, detail, session_id, workspace, started_at_ms, finished_at_ms, runtime_version FROM hook_run",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(harness, "claude");
+        assert_eq!(hook, "user_prompt_submit");
+        assert_eq!(status, "continued");
+        assert_eq!(detail.as_deref(), Some("connector_unreachable"));
+        assert_eq!(session.as_deref(), Some("sess-1"));
+        assert_eq!(workspace, "/w/proj");
+        assert_eq!(finished - started, 250, "duration is the recorded window");
+        assert_eq!(runtime, env!("CARGO_PKG_VERSION"));
+    }
+
+    // #136 fail-open: a store the record cannot open surfaces an error (which
+    // the hook caller swallows) rather than panicking or hanging.
+    #[test]
+    fn an_unwritable_store_surfaces_an_error_the_caller_swallows() {
+        let root = temp_root("unwritable");
+        // A directory where the DB file must be: every Connection::open fails.
+        std::fs::create_dir_all(root.join(DATABASE_NAME)).unwrap();
+        let result = record_native_run(NativeRun {
+            root: &root,
+            harness: "claude",
+            event: "SessionStart",
+            session_id: None,
+            workspace: "/w",
+            status: "succeeded",
+            detail: None,
+            plugin_version: "9.9.9",
+            started_at_ms: 1,
+            finished_at_ms: 2,
+        });
+        assert!(
+            result.is_err(),
+            "an unwritable store must surface an error, not panic"
+        );
+    }
 }
 
 #[cfg(test)]
