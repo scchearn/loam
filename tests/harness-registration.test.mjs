@@ -141,11 +141,13 @@ test('every harness registration invokes the absolute native runtime, not a Node
     assert.equal(refresh.length, 1, `${id} UserPromptSubmit`);
     assert.equal(preTool.length, 1, `${id} PreToolUse`);
     assert.equal(postTool.length, 1, `${id} PostToolUse`);
-    assert.equal(start[0].command, runtimePath);
-    assert.deepEqual(start[0].args, ['hook', id, '--event', 'SessionStart']);
-    assert.deepEqual(refresh[0].args, ['hook', id, '--event', 'UserPromptSubmit']);
-    assert.deepEqual(preTool[0].args, ['hook', id, '--event', 'PreToolUse']);
-    assert.deepEqual(postTool[0].args, ['hook', id, '--event', 'PostToolUse']);
+    // #133: the plugin schema takes `command` as ONE shell string and drops
+    // `args`, so each native event is a single quoted command, no args field.
+    assert.equal(start[0].command, `"${runtimePath}" hook ${id} --event SessionStart`);
+    assert.equal(refresh[0].command, `"${runtimePath}" hook ${id} --event UserPromptSubmit`);
+    assert.equal(preTool[0].command, `"${runtimePath}" hook ${id} --event PreToolUse`);
+    assert.equal(postTool[0].command, `"${runtimePath}" hook ${id} --event PostToolUse`);
+    assert.equal(start[0].args, undefined, `${id} native entry must carry no args`);
     // PreToolUse is restricted to the chatty tool names; PostToolUse runs after any tool.
     const preToolGroup = hooks.hooks.PreToolUse[0];
     const postToolGroup = hooks.hooks.PostToolUse[0];
@@ -153,6 +155,9 @@ test('every harness registration invokes the absolute native runtime, not a Node
     assert.equal(postToolGroup.matcher, undefined);
     // Stop stays Node: it is the ingestion boundary, not the read path.
     assert.match(JSON.stringify(sessionEntries(hooks, 'Stop')), /stop\.mjs/);
+    // #132: the shipped subagent hooks must survive the rewrite, not be dropped.
+    assert.ok(Array.isArray(hooks.hooks.SubagentStart), `${id} keeps SubagentStart`);
+    assert.ok(Array.isArray(hooks.hooks.SubagentStop), `${id} keeps SubagentStop`);
   }
 
   const openCode = await readFile(join(home, '.config', 'opencode', 'plugins', 'loam.js'), 'utf8');
