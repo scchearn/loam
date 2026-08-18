@@ -136,6 +136,153 @@ jobs:
       - name: Unix socket owner smoke (cross-user denial)
         run: bash .github/scripts/unix-ipc-owner-smoke.sh
 
+  # TEMPORARY diagnostic for #124 — removed before this branch is reviewed.
+  # Measures what the hosted macos-14 runner's launchd actually does (which
+  # domains answer, whether bootstrap/kickstart/load return or wedge, whether a
+  # job spawns there at all) so the smoke is designed against the environment
+  # instead of a guess. Dispatch-only: never runs on a push or a pull request.
+  launchd-probe:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    steps:
+      - name: Probe launchd
+        shell: bash
+        run: |
+          # `shell: bash` runs with -eo pipefail; every probe here is EXPECTED to
+          # report nonzero (a bootout with nothing loaded is exit 3), so the
+          # script opts out rather than dying on its own measurements.
+          set +e +o pipefail
+          set -u
+          U=$(id -u)
+          echo "uid=$U console_owner=$(stat -f%Su /dev/console) managername=$(launchctl managername 2>&1)"
+
+          # Bounded runner: report the elapsed seconds and the status, and never
+          # let a wedged launchctl hold the job.
+          bounded() {
+            limit=$1; shift
+            label=$1; shift
+            start=$(date +%s)
+            "$@" >/tmp/probe.out 2>&1 &
+            pid=$!
+            ( sleep "$limit"; kill -9 "$pid" 2>/dev/null ) &
+            watch=$!
+            wait "$pid"; rc=$?
+            kill "$watch" 2>/dev/null
+            wait "$watch" 2>/dev/null
+            echo "--- $label: rc=$rc elapsed=$(( $(date +%s) - start ))s"
+            head -6 /tmp/probe.out | sed 's/^/    /'
+          }
+
+          plist() { # plist <path> <label> <runatload true|false> <sentinel>
+            cat >"$1" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>Label</key><string>$2</string>
+            <key>ProgramArguments</key><array>
+              <string>/bin/sh</string><string>-c</string>
+              <string>echo ran >> $4; sleep 3</string>
+            </array>
+            <key>RunAtLoad</key><$3/>
+            <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+          </dict></plist>
+          PLIST
+          }
+
+          # The hypothesis under test: the connector exits within milliseconds of
+          # spawn when the registry is empty (inert by design), and `kickstart`
+          # waits for a spawn it may race. The probe jobs above sleep 3s, so F/G
+          # repeat the same two shapes with a program that exits immediately.
+          fastplist() { # fastplist <path> <label> <runatload> <sentinel>
+            cat >"$1" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>Label</key><string>$2</string>
+            <key>ProgramArguments</key><array>
+              <string>/bin/sh</string><string>-c</string>
+              <string>echo ran >> $4</string>
+            </array>
+            <key>RunAtLoad</key><$3/>
+            <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+          </dict></plist>
+          PLIST
+          }
+
+          echo "=================== F: instant-exit job, bootstrap then kickstart, x8"
+          F=io.loam.probe.f
+          fastplist /tmp/f.plist "$F" false /tmp/f.ran
+          for i in 1 2 3 4 5 6 7 8; do
+            launchctl bootout "gui/$U/$F" >/dev/null 2>&1
+            rm -f /tmp/f.ran
+            bounded 20 "F$i bootstrap" launchctl bootstrap "gui/$U" /tmp/f.plist
+            bounded 20 "F$i kickstart" launchctl kickstart "gui/$U/$F"
+            echo "F$i ran? $(cat /tmp/f.ran 2>/dev/null || echo NO)"
+          done
+          launchctl bootout "gui/$U/$F" >/dev/null 2>&1
+
+          echo "=================== G: instant-exit job, RunAtLoad=true, bootstrap only, x8"
+          G=io.loam.probe.g
+          fastplist /tmp/g.plist "$G" true /tmp/g.ran
+          for i in 1 2 3 4 5 6 7 8; do
+            launchctl bootout "gui/$U/$G" >/dev/null 2>&1
+            rm -f /tmp/g.ran
+            bounded 20 "G$i bootstrap" launchctl bootstrap "gui/$U" /tmp/g.plist
+            sleep 1
+            echo "G$i ran? $(cat /tmp/g.ran 2>/dev/null || echo NO)"
+          done
+          launchctl bootout "gui/$U/$G" >/dev/null 2>&1
+
+          echo "=================== A: RunAtLoad=false, bootstrap then kickstart (today's shape), x5"
+          A=io.loam.probe.a
+          plist /tmp/a.plist "$A" false /tmp/a.ran
+          for i in 1 2 3 4 5; do
+            launchctl bootout "gui/$U/$A" >/dev/null 2>&1
+            rm -f /tmp/a.ran
+            bounded 20 "A$i bootstrap" launchctl bootstrap "gui/$U" /tmp/a.plist
+            bounded 20 "A$i kickstart" launchctl kickstart "gui/$U/$A"
+            sleep 1
+            echo "A$i ran? $(cat /tmp/a.ran 2>/dev/null || echo NO)"
+          done
+          bounded 20 "A print" launchctl print "gui/$U/$A"
+          launchctl bootout "gui/$U/$A" >/dev/null 2>&1
+
+          echo "=================== B: RunAtLoad=true, bootstrap only, x5"
+          B=io.loam.probe.b
+          plist /tmp/b.plist "$B" true /tmp/b.ran
+          for i in 1 2 3 4 5; do
+            launchctl bootout "gui/$U/$B" >/dev/null 2>&1
+            rm -f /tmp/b.ran
+            bounded 20 "B$i bootstrap" launchctl bootstrap "gui/$U" /tmp/b.plist
+            sleep 2
+            echo "B$i ran? $(cat /tmp/b.ran 2>/dev/null || echo NO)"
+          done
+          bounded 20 "B print" launchctl print "gui/$U/$B"
+          launchctl bootout "gui/$U/$B" >/dev/null 2>&1
+
+          echo "=================== C: user domain, RunAtLoad=true"
+          C=io.loam.probe.c
+          plist /tmp/c.plist "$C" true /tmp/c.ran
+          bounded 20 "C bootstrap user" launchctl bootstrap "user/$U" /tmp/c.plist
+          sleep 2
+          echo "C ran? $(cat /tmp/c.ran 2>/dev/null || echo NO)"
+          bounded 20 "C print" launchctl print "user/$U/$C"
+          launchctl bootout "user/$U/$C" >/dev/null 2>&1
+
+          echo "=================== D: RunAtLoad=false + kickstart -p"
+          D=io.loam.probe.d
+          plist /tmp/d.plist "$D" false /tmp/d.ran
+          bounded 20 "D bootstrap" launchctl bootstrap "gui/$U" /tmp/d.plist
+          bounded 20 "D kickstart -p" launchctl kickstart -p "gui/$U/$D"
+          sleep 1
+          echo "D ran? $(cat /tmp/d.ran 2>/dev/null || echo NO)"
+          launchctl bootout "gui/$U/$D" >/dev/null 2>&1
+
+          echo "=================== E: domain print (killed the step last time under -e)"
+          bounded 20 "print gui/$U (head only)" launchctl print "gui/$U"
+
+          echo "=================== done"
+
   dist-plan:
     runs-on: ubuntu-22.04
     steps:

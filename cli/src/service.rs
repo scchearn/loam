@@ -1464,8 +1464,8 @@ mod tests {
         assert!(!domain.contains('$') && !domain.contains('('));
         assert_eq!(launchd::gui_service(), format!("{domain}/{SERVICE_LABEL}"));
         // The commands the real manager runs carry the same expanded domain.
-        for command in enable_start_commands(&ctx("launchd-domain")) {
-            assert!(command.args.iter().all(|a| !a.contains('$')));
+        for step in enable_start_commands(&ctx("launchd-domain")) {
+            assert!(step.command.args.iter().all(|a| !a.contains('$')));
         }
     }
 
