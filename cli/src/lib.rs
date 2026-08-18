@@ -44,6 +44,17 @@ fn usage() {
     );
 }
 
+/// Serializes tests that mutate process-global env vars read by the config-dir
+/// resolution ladder (`LOAM_CONFIG_DIR`). cargo runs the test binary
+/// multi-threaded, so two tests setting the same var otherwise race. Hold the
+/// returned guard for the set → call → restore window. Poison-tolerant: a test
+/// that panics under the lock still hands the next test a usable guard.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

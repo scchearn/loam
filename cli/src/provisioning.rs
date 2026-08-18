@@ -2305,6 +2305,7 @@ mod tests {
     fn registry_rung1_loam_config_dir_wins_over_everything() {
         // Rung 1: an explicit LOAM_CONFIG_DIR resolves before HOME is read, so
         // this touches only that one var (set + restore).
+        let _env = crate::env_lock();
         let previous = std::env::var("LOAM_CONFIG_DIR").ok();
         std::env::set_var("LOAM_CONFIG_DIR", "/explicit/cfg");
         let got = configured_registry_path(Some(std::path::Path::new("/legacy")));

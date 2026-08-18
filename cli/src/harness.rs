@@ -182,7 +182,14 @@ impl HookPaths {
     }
 
     fn registry(&self) -> PathBuf {
-        self.global_root.join("loam.sqlite3")
+        // The hook must read the SAME registry the connect/installer/service
+        // surfaces write. Delegate to the resolution ladder so a rung-4 machine
+        // (fresh enrollment in the config-dir registry, legacy DB empty) renders
+        // enrolled instead of reading the hook-only legacy path and reporting a
+        // live connector unenrolled. The legacy join is the ladder's own rung-3
+        // fallback, reached only when no config dir resolves at all.
+        crate::provisioning::configured_registry_path(Some(&self.global_root))
+            .unwrap_or_else(|_| self.global_root.join("loam.sqlite3"))
     }
 
     fn run_dir(&self) -> PathBuf {
@@ -1826,6 +1833,102 @@ mod tests {
             Some(Federation::Unenrolled),
         );
         assert!(!unenrolled.contains("## Collaboration"), "{unenrolled}");
+    }
+
+    #[test]
+    fn resolve_federation_reads_the_config_dir_registry_not_the_hook_legacy_db() {
+        // #127 regression, production behavior: on a rung-4 machine the fresh
+        // enrollment lives in the config-dir registry while the hook's legacy
+        // global_root DB holds hook tables but no enrollment. Before registry()
+        // delegated to the resolution ladder the hook read the raw legacy path
+        // and rendered a LIVE connector `federation: unenrolled` — no
+        // SessionStart section, no snapshot, no wake registration. Pin the fix:
+        // the config-dir row must make resolve_federation see the workspace as
+        // enrolled (then merely Degraded, with no connector up), never
+        // Unenrolled. Env-gated via LOAM_CONFIG_DIR (rung 1); serialized against
+        // the other config-dir env test by the shared lock.
+        let _env = crate::env_lock();
+
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let physical =
+            crate::enrollment::PhysicalWorkspace::resolve(&workspace).expect("workspace resolves");
+
+        // Config-dir registry (rung 1): holds the enrollment.
+        let cfg_root = crate::enrollment::temp_global_root("hook-ladder-cfg");
+        let cfg_registry = cfg_root.join("federation").join("loam.sqlite3");
+        std::fs::create_dir_all(cfg_registry.parent().unwrap()).expect("config federation dir");
+        {
+            let mut connection =
+                crate::enrollment::open_writable(&cfg_registry).expect("config registry opens");
+            let enrolled = crate::enrollment::ValidatedEnrollment {
+                org_id: "acme".into(),
+                project_id: "loam".into(),
+                repository_id: "repo".into(),
+                broker_profile: "acme-prod".into(),
+                broker_endpoint: "mqtts://h:8883".into(),
+                tls_server_name: "h".into(),
+                ca_ref: None,
+                commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                remotes: Vec::new(),
+                workspace: physical.clone(),
+            };
+            crate::enrollment::insert_enrollment(
+                &mut connection,
+                &enrolled,
+                "test-instance",
+                &crate::enrollment::CapabilityRecord {
+                    authentication: true,
+                    publish: true,
+                    subscribe: true,
+                    self_receive: true,
+                    verified_at: "2026-07-24T14:20:00Z".into(),
+                },
+                "2026-07-24T14:20:00Z",
+            )
+            .expect("enrollment inserts");
+        }
+
+        // Legacy hook DB: exists with schema but NO enrollment row — the rung-4
+        // machine's hook-only legacy store.
+        let legacy_root = crate::enrollment::temp_global_root("hook-ladder-legacy");
+        crate::enrollment::open_writable(&legacy_root.join("loam.sqlite3"))
+            .expect("legacy registry opens");
+
+        // Guard the test's own premise: the legacy DB alone answers Unenrolled,
+        // so a passing assertion below can only mean the ladder reached the
+        // config-dir row (not that the row was universally visible).
+        let key = crate::enrollment::identity_key(&physical);
+        let via_legacy = matches!(
+            crate::enrollment::open_readonly(&legacy_root.join("loam.sqlite3")).expect("legacy opens"),
+            Some(connection) if matches!(crate::enrollment::lookup(&connection, &key), Ok(Some(_)))
+        );
+        assert!(
+            !via_legacy,
+            "legacy DB must hold no enrollment for this regression to mean anything"
+        );
+
+        let previous = std::env::var("LOAM_CONFIG_DIR").ok();
+        std::env::set_var("LOAM_CONFIG_DIR", &cfg_root);
+        let paths = HookPaths {
+            global_root: legacy_root.clone(),
+            ..paths()
+        };
+        let federation = resolve_federation(
+            &paths,
+            &HookConfig::default(),
+            &workspace,
+            HookEvent::SessionStart,
+            None,
+        );
+        match previous {
+            Some(value) => std::env::set_var("LOAM_CONFIG_DIR", value),
+            None => std::env::remove_var("LOAM_CONFIG_DIR"),
+        }
+
+        assert!(
+            !matches!(federation, Federation::Unenrolled),
+            "config-dir enrollment must make the hook see the workspace enrolled, got {federation:?}"
+        );
     }
 
     #[cfg(unix)]
