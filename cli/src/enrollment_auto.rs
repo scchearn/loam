@@ -19,6 +19,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 /// OID 2.5.4.3 `id-at-commonName`, as DER content bytes. Mirrors the reader.
 const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
@@ -48,6 +49,13 @@ pub enum EnrollmentFailure {
     BadToken,
     /// The signer could not be reached (DNS, connect, TLS, or empty reply).
     SignerUnreachable,
+    /// The signer was reachable but the exchange exceeded its deadline: the
+    /// connect, the TLS handshake, or a read/write stalled. Distinct from
+    /// [`EnrollmentFailure::SignerUnreachable`] because the operator response
+    /// differs — a wedged or overloaded signer is not a missing one — and
+    /// because the alternative is the silent hang this class of bug keeps
+    /// producing. `stage` names where the deadline expired.
+    SignerTimeout { stage: &'static str },
     /// The signer replied 2xx but the body is not one parseable certificate.
     MalformedSignerResponse,
     /// The machine has no git identity to name the CSR subject with.
@@ -64,6 +72,7 @@ impl EnrollmentFailure {
         match self {
             EnrollmentFailure::BadToken => "bad-token",
             EnrollmentFailure::SignerUnreachable => "signer-unreachable",
+            EnrollmentFailure::SignerTimeout { .. } => "signer-timeout",
             EnrollmentFailure::MalformedSignerResponse => "malformed-signer-response",
             EnrollmentFailure::GitIdentityRequired => "git-identity-required",
             EnrollmentFailure::LocalCrypto { .. } => "local-crypto-failure",
@@ -73,6 +82,7 @@ impl EnrollmentFailure {
     pub(crate) fn debug_detail(&self) -> Option<(&'static str, &str)> {
         match self {
             EnrollmentFailure::LocalCrypto { operation, detail } => Some((*operation, detail)),
+            EnrollmentFailure::SignerTimeout { stage } => Some(("timeout-stage", stage)),
             _ => None,
         }
     }
@@ -339,6 +349,81 @@ fn pem_armor(label: &str, der: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Per-operation network deadline for the enrollment exchange: the TCP
+/// connect, and every read and write once connected. Ten seconds by default;
+/// `LOAM_ENROLL_TIMEOUT_SECONDS` (1..=300) raises it for a genuinely slow link
+/// and lets the regression tests prove the bound without waiting for it.
+///
+/// Without these the exchange had no bound at all: a signer that accepts the
+/// connection and then stalls — exactly the production wedge in #93 — hung
+/// enrollment forever with no output.
+fn enroll_timeout() -> Duration {
+    const DEFAULT_SECONDS: u64 = 10;
+    let seconds = std::env::var("LOAM_ENROLL_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| (1..=300).contains(seconds))
+        .unwrap_or(DEFAULT_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+/// A read/write deadline alone still admits a slow drip: each successful byte
+/// rearms it. This ceiling bounds the whole exchange, so the worst case is a
+/// small multiple of the per-operation deadline rather than the header and
+/// body size caps divided by one byte per timeout.
+fn exchange_deadline() -> Instant {
+    Instant::now() + enroll_timeout() * 3
+}
+
+fn is_timeout(error: &std::io::Error) -> bool {
+    // A socket read/write deadline surfaces as WouldBlock on Unix and TimedOut
+    // on Windows; `connect_timeout` reports TimedOut everywhere.
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Map a transport error to a refusal that says which of the two happened: a
+/// signer that is not there, or a signer that is there and not answering.
+fn transport_failure(stage: &'static str, error: &std::io::Error) -> EnrollmentFailure {
+    if is_timeout(error) {
+        EnrollmentFailure::SignerTimeout { stage }
+    } else {
+        EnrollmentFailure::SignerUnreachable
+    }
+}
+
+/// Connect to the signer under a bounded deadline, trying every resolved
+/// address. Resolution failure is genuinely "no such signer", so it stays
+/// `SignerUnreachable`; a connect that runs out of time is a timeout.
+///
+/// `getaddrinfo` itself has no deadline in `std`, so the resolver's own is the
+/// only bound available here. That is a smaller exposure than an unbounded
+/// connect: a black-holed route hangs the connect indefinitely, whereas a
+/// resolver that never answers is already bounded by its own configuration.
+fn connect_to_signer(host: &str, port: u16) -> Result<TcpStream, EnrollmentFailure> {
+    use std::net::ToSocketAddrs;
+
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    let timeout = enroll_timeout();
+    let mut timed_out = false;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) if is_timeout(&error) => timed_out = true,
+            Err(_) => {}
+        }
+    }
+    Err(if timed_out {
+        EnrollmentFailure::SignerTimeout { stage: "connect" }
+    } else {
+        EnrollmentFailure::SignerUnreachable
+    })
+}
+
 /// POST `{password, csr}` to the signer and return the signed certificate PEM
 /// on success. A 401 is a [`EnrollmentFailure::BadToken`]; any transport
 /// failure is [`EnrollmentFailure::SignerUnreachable`]; a 2xx whose body is
@@ -353,9 +438,15 @@ pub fn request_signed_certificate(
     roots: &rustls::RootCertStore,
 ) -> Result<Vec<u8>, EnrollmentFailure> {
     let (host, port, path) = parse_url(url)?;
-    let mut tcp = TcpStream::connect((host.as_str(), port))
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    let deadline = exchange_deadline();
+    let mut tcp = connect_to_signer(&host, port)?;
     tcp.set_nodelay(true).ok();
+    // Armed before the TLS handshake, which `rustls::Stream` performs lazily
+    // on the first write, so the handshake is bounded too.
+    let timeout = enroll_timeout();
+    tcp.set_read_timeout(Some(timeout))
+        .and_then(|()| tcp.set_write_timeout(Some(timeout)))
+        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
 
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots.clone())
@@ -376,12 +467,15 @@ pub fn request_signed_certificate(
         "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{request_body}",
         request_body.len()
     );
+    // The TLS handshake happens here, on the first write, so a signer that
+    // accepts the connection and never completes the handshake fails as a
+    // `request` timeout rather than hanging.
     stream
         .write_all(request.as_bytes())
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+        .map_err(|error| transport_failure("request", &error))?;
     stream
         .flush()
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+        .map_err(|error| transport_failure("request", &error))?;
 
     let mut response = Vec::new();
     // Read until the header/body separator is present. The body is read once we
@@ -395,11 +489,16 @@ pub fn request_signed_certificate(
         if response.len() > 1 << 16 {
             return Err(EnrollmentFailure::MalformedSignerResponse);
         }
+        if Instant::now() >= deadline {
+            return Err(EnrollmentFailure::SignerTimeout {
+                stage: "response-headers",
+            });
+        }
         let mut chunk = [0u8; 2048];
         let read = match stream.read(&mut chunk) {
             Ok(0) => break response.len(), // EOF before any separator
             Ok(read) => read,
-            Err(_) => return Err(EnrollmentFailure::SignerUnreachable),
+            Err(error) => return Err(transport_failure("response-headers", &error)),
         };
         response.extend_from_slice(&chunk[..read]);
     };
@@ -442,11 +541,16 @@ pub fn request_signed_certificate(
     }
     let mut response_body: Vec<u8> = response[body_start..].to_vec();
     while response_body.len() < content_length {
+        if Instant::now() >= deadline {
+            return Err(EnrollmentFailure::SignerTimeout {
+                stage: "response-body",
+            });
+        }
         let mut chunk = [0u8; 2048];
         let read = match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => read,
-            Err(_) => return Err(EnrollmentFailure::SignerUnreachable),
+            Err(error) => return Err(transport_failure("response-body", &error)),
         };
         response_body.extend_from_slice(&chunk[..read]);
     }
