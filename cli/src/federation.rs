@@ -1564,7 +1564,12 @@ fn run_emit(
     let physical =
         enrollment::PhysicalWorkspace::resolve(workspace).map_err(|_| EmitError::Unenrolled)?;
     let key = enrollment::identity_key(&physical);
-    let db_path = global_root.join("loam.sqlite3");
+    // Same ladder as the hook and the connect/service surfaces: on a rung-4
+    // machine the enrolled row and the dedup ledger live in the config-dir
+    // registry, not the legacy global root. Reading/writing the raw legacy path
+    // here would fail emit as unenrolled while the connector is live.
+    let db_path = crate::provisioning::configured_registry_path(Some(global_root))
+        .unwrap_or_else(|_| global_root.join("loam.sqlite3"));
     let row = {
         let read = enrollment::open_readonly(&db_path)
             .map_err(|_| EmitError::Unenrolled)?
@@ -1726,12 +1731,13 @@ mod emit_tests {
     #[cfg(unix)]
     #[test]
     fn inject_register_and_drop_round_trip_against_a_real_connector() {
-        let (root, workspace, _instance_id) = enrolled_root("inject-roundtrip");
-        // A real connector process bound to the same global root.
+        let (root, workspace, _instance_id, registry, _pin) = enrolled_root("inject-roundtrip");
+        // A real connector process bound to the same global root, serving the
+        // ladder-resolved registry where the enrollment now lives.
         let run_dir = root.join("run");
         let endpoint = crate::ipc::unix::bind(&run_dir).expect("bind");
         let mut state = crate::connector::ConnectorState::new();
-        let db_path = root.join("loam.sqlite3");
+        let db_path = registry.clone();
         let server = std::thread::spawn(move || {
             let _ = crate::connector::serve_one(
                 &endpoint,
@@ -2220,17 +2226,64 @@ mod emit_tests {
         assert_eq!(error.code(), "workspace_unenrolled");
     }
 
+    /// Pins `LOAM_CONFIG_DIR` at a temp config root for a test's lifetime and
+    /// restores the prior value on drop, holding the shared env lock the whole
+    /// time. `run_emit` (and the inject connector's db path) then resolve the
+    /// registry through the config-dir ladder to *this* temp root instead of
+    /// reading the developer's live `~/.config/loam` — the hermeticity the
+    /// ladder delegation would otherwise cost the emit tests.
+    struct ConfigDirPin {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl ConfigDirPin {
+        fn at(dir: &std::path::Path) -> ConfigDirPin {
+            let lock = crate::env_lock();
+            let previous = std::env::var("LOAM_CONFIG_DIR").ok();
+            std::env::set_var("LOAM_CONFIG_DIR", dir);
+            ConfigDirPin {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for ConfigDirPin {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("LOAM_CONFIG_DIR", value),
+                None => std::env::remove_var("LOAM_CONFIG_DIR"),
+            }
+        }
+    }
+
     /// An enrolled global root bound to a real workspace path, so `run_emit`
     /// gets past workspace resolution and actually reaches the ledger and the
     /// forward. The workspace is this crate's own directory: real, existing, and
-    /// never written to.
-    fn enrolled_root(label: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+    /// never written to. Enrollment lands in the ladder-resolved registry (the
+    /// config-dir path under the returned pin), which is where `run_emit` now
+    /// reads it; callers use the returned registry path for any direct ledger
+    /// read and must hold the pin for the whole test.
+    fn enrolled_root(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        String,
+        std::path::PathBuf,
+        ConfigDirPin,
+    ) {
         let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let physical =
             enrollment::PhysicalWorkspace::resolve(&workspace).expect("workspace resolves");
         let root = enrollment::temp_global_root(label);
-        let mut connection =
-            enrollment::open_writable(&root.join("loam.sqlite3")).expect("registry opens");
+        let pin = ConfigDirPin::at(&root);
+        let registry = crate::provisioning::configured_registry_path(Some(&root))
+            .expect("registry path resolves");
+        std::fs::create_dir_all(registry.parent().expect("registry has a parent"))
+            .expect("registry dir");
+        let mut connection = enrollment::open_writable(&registry).expect("registry opens");
         let enrolled = enrollment::ValidatedEnrollment {
             org_id: "acme".into(),
             project_id: "loam".into(),
@@ -2262,7 +2315,7 @@ mod emit_tests {
                 .expect("lookup")
                 .expect("enrolled row")
                 .instance_id;
-        (root, workspace, instance_id)
+        (root, workspace, instance_id, registry, pin)
     }
 
     #[test]
@@ -2270,7 +2323,7 @@ mod emit_tests {
         // The defect this closes: the slot was taken before the forward and kept
         // even when the forward provably queued nothing, so one transient outage
         // made a reply permanently un-emittable.
-        let (root, workspace, instance_id) = enrolled_root("emit-rollback");
+        let (root, workspace, instance_id, registry, _pin) = enrolled_root("emit-rollback");
         let operation = br#"{"type":"message.ack","causation_id":"cause-77","summary":"Received.","to":[{"kind":"instance","id":"instance-02"}],"payload":{}}"#;
 
         // No endpoint under `root/run`: the forward cannot have queued anything.
@@ -2289,8 +2342,7 @@ mod emit_tests {
         // Positive control: the ledger is not inert. A slot that *is* held stops
         // the very next attempt at the same causation, so the retry above got
         // through because the slot was released — not because dedup does nothing.
-        let mut connection =
-            enrollment::open_writable(&root.join("loam.sqlite3")).expect("registry opens");
+        let mut connection = enrollment::open_writable(&registry).expect("registry opens");
         assert_eq!(
             enrollment::record_response(&mut connection, "cause-88", &instance_id, "t").unwrap(),
             enrollment::DedupOutcome::Recorded
