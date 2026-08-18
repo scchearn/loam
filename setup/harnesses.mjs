@@ -468,7 +468,6 @@ async function stagePluginHooks({ pluginRoot, runtimePath, harness }) {
   // setup runs; re-reading it is idempotent because the natives are always
   // regenerated on top.
   const shipped = JSON.parse(await readFile(filePath, 'utf8'));
-  await mkdir(dirname(filePath), { recursive: true });
   await writeAtomicFile(filePath, `${JSON.stringify(renderPluginHooks(runtimePath, harness, shipped), null, 2)}\n`);
   return filePath;
 }

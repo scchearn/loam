@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
 import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
@@ -56,13 +56,19 @@ test('#133 the rendered command quotes a runtime path containing spaces', async 
   const spaced = '/Users/x/Library/Application Support/loam/runtime/bin/loam';
   const rendered = renderPluginHooks(spaced, 'codex', await shippedHooks());
   const [entry] = nativeEntries(rendered);
-  assert.equal(entry.command, `"${spaced}" hook codex --event SessionStart`);
+  // The renderer resolve()s the path, so build the expected the same way — on
+  // windows resolve() drive-prefixes and backslashes it; a literal POSIX string
+  // would only match on POSIX.
+  assert.equal(entry.command, `"${resolve(spaced)}" hook codex --event SessionStart`);
 });
 
 // (d) The verify blind spot kula found: verify only checked its own JSON. Prove
 // the rendered command STRING actually executes the runtime with the subcommand
 // — through a real shell, against a runtime at a spaced path. Pre-fix (bare
 // command, args dropped) the runtime would see no args and this fails.
+// POSIX-only: the fake runtime is a `#!/bin/sh` script made executable via
+// chmod, neither of which is meaningful on windows; the quoting/schema the
+// exec proves is covered cross-platform by tests (a)-(c) above.
 test('#133 the rendered command runs the runtime with its subcommand through a shell', { skip: process.platform === 'win32' }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'loam hook schema ')); // a space in the path on purpose
   const fakeRuntime = join(dir, 'loam');
