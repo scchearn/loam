@@ -30,6 +30,12 @@ fn run_connect(workspace: Option<&Path>, broker: &str, extra: &[&str]) -> (i32, 
     command.arg(broker);
     command.args(extra);
     command
+        // The org is configuration, never inferred from the remote. These
+        // tests are about everything downstream of that, so they pin the org
+        // rung explicitly: it keeps a developer's real config.json out of the
+        // run and makes each test state which org it federates under.
+        // `scope_resolution` below owns the ladder itself.
+        .env("LOAM_FEDERATION_ORG", "acme")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -61,6 +67,8 @@ fn run_connect_pinned(
     command.args(extra);
     command
         .env("LOAM_CONFIG_DIR", root)
+        // See `run_connect`: the org rung is pinned, not inferred.
+        .env("LOAM_FEDERATION_ORG", "acme")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -225,8 +233,8 @@ fn full_happy_path_validates_against_hermetic_repos() {
 // there (never compiled before the cfg-gate fix). See #121.
 #[cfg(not(windows))]
 #[test]
-fn connect_infers_org_and_project_from_the_remote_url() {
-    let root = temp_dir("infer");
+fn the_org_comes_from_configuration_and_the_project_from_the_remote() {
+    let root = temp_dir("scope-ladder");
     let origin = root.join("acme").join("loam.git");
     std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
     let work = root.join("work");
@@ -292,25 +300,100 @@ fn connect_infers_org_and_project_from_the_remote_url() {
         None,
     );
 
-    let (code, stdout, _stderr) =
-        run_connect(Some(&work), "mqtts://broker.example:8883", &["--json"]);
-    assert_eq!(code, 0, "{stdout}");
+    // The remote is `<root>/acme/loam.git`, so the old inference would have
+    // read org `acme` from it. It must not: on a real laptop that yielded the
+    // repository host's account for every workspace, which is an org the
+    // broker's ACL denies — silently, as denied subscribes long after connect.
+    let profile = root.join("profile");
+    let connect = |env: &[(&str, &str)], extra: &[&str]| -> (i32, String, String) {
+        let mut command = Command::new(binary());
+        command
+            .arg("federation")
+            .arg("connect")
+            .arg(&work)
+            .arg("mqtts://broker.example:8883")
+            .args(extra)
+            .arg("--json")
+            // Pinned so the ladder under test is the only source of an org and
+            // the developer's real config.json cannot answer for it.
+            .env("LOAM_CONFIG_DIR", &profile)
+            .env_remove("LOAM_FEDERATION_ORG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let output = command.output().expect("spawn loam");
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+
+    // Rung 4: nothing configured. A refusal, not a guess — and a recipe.
+    let (code, stdout, stderr) = connect(&[], &[]);
+    assert_eq!(
+        code, 64,
+        "an unconfigured org must refuse: {stdout} {stderr}"
+    );
     assert!(
-        stdout.contains("\"org_id\":\"acme\"") && stdout.contains("\"project_id\":\"loam\""),
-        "org/project must be inferred from the remote path: {stdout}"
+        stdout.contains("\"code\":\"federation_org_unconfigured\""),
+        "the refusal must be typed: {stdout}"
+    );
+    let config_path = profile.join("config.json");
+    let config_path = config_path.to_str().unwrap();
+    for expected in [config_path, "LOAM_FEDERATION_ORG", "--project"] {
+        assert!(
+            stdout.contains(expected),
+            "the refusal must name every way to fix it, missing {expected}: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("\"org_id\":\"acme\""),
+        "the remote's path must never become the org: {stdout}"
     );
 
-    // The override wins over the remote inference.
-    let (code, stdout, _stderr) = run_connect(
-        Some(&work),
-        "mqtts://broker.example:8883",
-        &["--project", "other-org/other-project", "--json"],
+    // Rung 3: the durable machine setting. The project still comes from the
+    // remote, which is the whole point of keeping that half inferred.
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(config_path, "{\"org\": \"real-org\"}\n").unwrap();
+    let (code, stdout, stderr) = connect(&[], &[]);
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert!(
+        stdout.contains("\"org_id\":\"real-org\"") && stdout.contains("\"project_id\":\"loam\""),
+        "org from config.json, project from the remote: {stdout}"
+    );
+
+    // Rung 2: the environment beats the file.
+    let (code, stdout, _stderr) = connect(&[("LOAM_FEDERATION_ORG", "env-org")], &[]);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.contains("\"org_id\":\"env-org\"") && stdout.contains("\"project_id\":\"loam\""),
+        "LOAM_FEDERATION_ORG must outrank config.json: {stdout}"
+    );
+
+    // Rung 1: `--project` beats both, and supplies the project too.
+    let (code, stdout, _stderr) = connect(
+        &[("LOAM_FEDERATION_ORG", "env-org")],
+        &["--project", "other-org/other-project"],
     );
     assert_eq!(code, 0, "{stdout}");
     assert!(
         stdout.contains("\"org_id\":\"other-org\"")
             && stdout.contains("\"project_id\":\"other-project\""),
-        "the --project override must win: {stdout}"
+        "the --project override must win over both: {stdout}"
+    );
+
+    // A blank setting is not a setting: it must fall through, not become an
+    // empty org that publishes to `loam/v1//<project>`.
+    std::fs::write(config_path, "{\"org\": \"   \"}\n").unwrap();
+    let (code, stdout, _stderr) = connect(&[("LOAM_FEDERATION_ORG", "  ")], &[]);
+    assert_eq!(code, 64, "a blank org must refuse: {stdout}");
+    assert!(
+        stdout.contains("\"code\":\"federation_org_unconfigured\""),
+        "{stdout}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -413,7 +496,7 @@ fn commit_reachability_is_not_required() {
     assert_eq!(code, 0, "{stdout}");
     assert!(
         stdout.contains("\"org_id\":\"acme\"") && stdout.contains("\"project_id\":\"loam\""),
-        "org/project must be inferred from the remote path: {stdout}"
+        "the project must come from the remote path and the org from configuration: {stdout}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -521,6 +604,8 @@ fn bare_connect_with_token_uses_the_installed_global_root() {
             "--json",
         ])
         .env("LOAM_CONFIG_DIR", &root)
+        // See `run_connect`: the org is configuration and never inferred.
+        .env("LOAM_FEDERATION_ORG", "acme")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -591,6 +676,8 @@ fn connect_with_token_missing_git_identity_names_the_typed_refusal() {
         .arg("secret")
         .arg("--json")
         .env("LOAM_CONFIG_DIR", &root)
+        // See `run_connect`: the org is configuration and never inferred.
+        .env("LOAM_FEDERATION_ORG", "acme")
         .env("HOME", empty_home())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

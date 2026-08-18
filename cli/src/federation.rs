@@ -27,7 +27,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         _ => {
             eprintln!(
                 "Usage:\n  \
-                 loam federation connect <workspace> <broker> [--project org/project] [--global-root <path>] [--token <password>|--token-file <path>] [--json]\n  \
+                 loam federation connect <workspace> <broker> [--project org/project] [--global-root <path>] [--token <password>|--token-file <path>] [--json]\n    \
+                 the org comes from LOAM_FEDERATION_ORG or `org` in <profile>/config.json; --project overrides both and names the project too\n  \
                  loam federation disconnect <workspace> --global-root <path> [--json]\n  \
                  loam federation status [<workspace>] --global-root <path> [--json]\n  \
                  loam federation emit [<workspace>] --global-root <path> [--json]   (reads one operation on stdin)\n  \
@@ -675,10 +676,11 @@ fn auto_enroll(
     Ok(())
 }
 
-/// Build the validated enrollment from the one-command surface: org/project
-/// inferred from the workspace's git remote URL (overridable), the broker
-/// endpoint validated, and the physical-identity + remote-digest proof run
-/// exactly as the descriptor path did. No commit is read or proven.
+/// Build the validated enrollment from the one-command surface: the scope
+/// resolved by [`resolve_scope`] (org from configuration, project from the
+/// workspace's git remote), the broker endpoint validated, and the
+/// physical-identity + remote-digest proof run exactly as the descriptor path
+/// did. No commit is read or proven.
 fn validate_connect(
     workspace: &std::path::Path,
     broker: &str,
@@ -697,10 +699,7 @@ fn validate_connect(
     {
         return Err(EnrollmentError::InvalidEndpoint);
     }
-    let (org_id, project_id) = match project_override {
-        Some(scope) => split_scope(scope)?,
-        None => infer_scope(workspace)?,
-    };
+    let (org_id, project_id) = resolve_scope(workspace, project_override)?;
     let descriptor = enrollment::Descriptor {
         repository_id: format!("{org_id}/{project_id}"),
         org_id,
@@ -737,10 +736,86 @@ fn split_scope(scope: &str) -> Result<(String, String), EnrollmentError> {
     Ok((org.to_owned(), project.to_owned()))
 }
 
-/// Infer org/project from the workspace's `origin` remote URL path. The last
-/// two path segments of the repository path are the org and the project:
-/// `git@github.com:acme/loam.git` → `acme`/`loam`.
-fn infer_scope(workspace: &std::path::Path) -> Result<(String, String), EnrollmentError> {
+/// Which org and project this workspace federates under.
+///
+/// Precedence, first wins:
+///
+/// 1. `--project <org>/<project>` — the explicit override, supplying both.
+/// 2. `LOAM_FEDERATION_ORG` — the org, for CI and unattended installs.
+/// 3. `org` in the profile's `config.json` — the durable machine setting.
+/// 4. nothing. The org is *not* inferred, and an unconfigured machine is
+///    refused with a recipe rather than connected to a guess.
+///
+/// The project keeps coming from the workspace's `origin` remote unless
+/// `--project` names both: the repository *is* the project, one org holds many,
+/// and that is also the shape of the broker's topics
+/// (`loam/v1/<org>/<project>/...`). The org does not, because it is a property
+/// of the operator/org relationship rather than of where a repository happens
+/// to be hosted — inferring it yielded the host account for every repo on a
+/// real laptop, which is an org the broker's ACL denies. That failure is
+/// invisible at connect time and only shows up as denied subscribes, so
+/// falling back to the inference would preserve the exact footgun this
+/// resolution exists to remove.
+fn resolve_scope(
+    workspace: &std::path::Path,
+    project_override: Option<&str>,
+) -> Result<(String, String), EnrollmentError> {
+    if let Some(scope) = project_override {
+        return split_scope(scope);
+    }
+    let project_id = infer_project(workspace)?;
+    let org_id = configured_org()?;
+    validate_scope_part(&org_id, "org_id")?;
+    Ok((org_id, project_id))
+}
+
+/// The org from the environment, then from `config.json`. `Err` when neither
+/// names one, carrying the path an operator should write.
+fn configured_org() -> Result<String, EnrollmentError> {
+    let present = |value: String| {
+        let trimmed = value.trim().to_owned();
+        (!trimmed.is_empty()).then_some(trimmed)
+    };
+    if let Some(org) = std::env::var("LOAM_FEDERATION_ORG").ok().and_then(present) {
+        return Ok(org);
+    }
+    // A malformed `config.json` is deliberately not fatal here: the org is
+    // absent either way, and the recipe below is the more useful thing to say
+    // than a parse complaint about a file the operator may not know exists.
+    if let Ok(Some(config)) = crate::provisioning::read_configured_config() {
+        if let Some(org) = config
+            .get("org")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .and_then(present)
+        {
+            return Ok(org);
+        }
+    }
+    Err(EnrollmentError::FederationOrgUnconfigured {
+        config_path: crate::provisioning::configured_config_path()
+            .map(|path| path.display().to_string())
+            // No profile resolves at all, so there is nowhere to write. Name
+            // the file rather than an empty string; the other two rungs in the
+            // message still work.
+            .unwrap_or_else(|_| "config.json".to_owned()),
+    })
+}
+
+/// Reject an org or project that could not be one: the value becomes a topic
+/// segment, and a slash or an empty string there would silently re-scope every
+/// message this machine publishes.
+fn validate_scope_part(value: &str, field: &'static str) -> Result<(), EnrollmentError> {
+    if value.is_empty() || value.contains('/') || value.chars().any(char::is_control) {
+        return Err(EnrollmentError::InvalidField { field });
+    }
+    Ok(())
+}
+
+/// The project id from the workspace's `origin` remote: the last path segment
+/// of the URL, which is the repository name. See [`resolve_scope`] for why the
+/// org is not read from the segment before it.
+fn infer_project(workspace: &std::path::Path) -> Result<String, EnrollmentError> {
     let path_str = workspace
         .to_str()
         .ok_or(EnrollmentError::WorkspaceNotUtf8)?;
@@ -769,17 +844,12 @@ fn infer_scope(workspace: &std::path::Path) -> Result<(String, String), Enrollme
         .map(|(_, rest)| rest)
         .unwrap_or(&url);
     let path = path.trim_end_matches(".git").trim_end_matches('/');
-    let mut segments = path.split('/').filter(|s| !s.is_empty());
-    let project = segments
-        .next_back()
+    let project = path
+        .split('/')
+        .rfind(|segment| !segment.is_empty())
         .ok_or(EnrollmentError::InvalidField { field: "project" })?;
-    let org = segments
-        .next_back()
-        .ok_or(EnrollmentError::InvalidField { field: "org_id" })?;
-    if org.is_empty() || project.is_empty() {
-        return Err(EnrollmentError::InvalidField { field: "project" });
-    }
-    Ok((org.to_owned(), project.to_owned()))
+    validate_scope_part(project, "project")?;
+    Ok(project.to_owned())
 }
 
 /// Drive the transactional connect from the CLI: derive the connector's

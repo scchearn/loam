@@ -1575,13 +1575,8 @@ fn parse_member_card(text: &str) -> Result<MemberCard, &'static str> {
 /// empty is read as `None` (all defaults); a present, malformed `config.json`
 /// is an explicit error so a human edit that broke the file is surfaced, not
 /// silently ignored.
-pub fn read_config(mut root: &std::path::Path) -> Result<Option<crate::json::Value>, &'static str> {
-    // `resolve` paths point inside the profile; `config.json` sits at the
-    // profile root.
-    if root.file_name() == Some(std::ffi::OsStr::new("federation")) {
-        root = root.parent().unwrap_or(root);
-    }
-    let path = root.join("config.json");
+pub fn read_config(root: &std::path::Path) -> Result<Option<crate::json::Value>, &'static str> {
+    let path = config_path(root);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Ok(None);
     };
@@ -1591,6 +1586,32 @@ pub fn read_config(mut root: &std::path::Path) -> Result<Option<crate::json::Val
     crate::json::parse(&text)
         .map(Some)
         .map_err(|_| reason::ROSTER_MALFORMED)
+}
+
+/// Where `config.json` sits for a given profile path. `resolve` paths point
+/// inside the profile (`<...>/federation`); the config file sits one level up
+/// beside it, so both spellings resolve to the same file.
+pub fn config_path(root: &std::path::Path) -> std::path::PathBuf {
+    let root = if root.file_name() == Some(std::ffi::OsStr::new("federation")) {
+        root.parent().unwrap_or(root)
+    } else {
+        root
+    };
+    root.join("config.json")
+}
+
+/// This machine's `config.json` path, resolved through the same profile ladder
+/// as the identity and roster roots. Named separately from [`read_config`]
+/// because a diagnostic that tells an operator to write the file has to be able
+/// to say where.
+pub fn configured_config_path() -> Result<std::path::PathBuf, &'static str> {
+    configured_profile_root().map(|profile| config_path(&profile))
+}
+
+/// This machine's `config.json`, or `None` when there is none to read.
+pub fn read_configured_config() -> Result<Option<crate::json::Value>, &'static str> {
+    let profile = configured_profile_root()?;
+    read_config(&profile)
 }
 
 // ---------------------------------------------------------------------------
