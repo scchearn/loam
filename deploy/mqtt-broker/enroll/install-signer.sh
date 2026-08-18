@@ -166,6 +166,9 @@ Environment=ENROLL_OPENSSL_CONFIG=${ENROLL_DIR}/ca/openssl.cnf
 Environment=ENROLL_BIND_ADDRESS=0.0.0.0
 Environment=ENROLL_RATE_LIMIT=10
 Environment=ENROLL_RATE_WINDOW_SECONDS=60
+# Per-connection deadline covering the TLS handshake and every read/write, so
+# a client that connects and stalls cannot hold a worker thread open.
+Environment=ENROLL_CONNECTION_TIMEOUT_SECONDS=10
 EOF
     systemctl daemon-reload
     systemctl enable loam-enroll-signer.service

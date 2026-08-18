@@ -27,6 +27,7 @@ import http.server
 import json
 import os
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -55,6 +56,13 @@ class Config:
         # Requests per client per window; a burst above this is 429.
         self.rate_limit = int(os.environ.get("ENROLL_RATE_LIMIT", "10"))
         self.rate_window = float(os.environ.get("ENROLL_RATE_WINDOW_SECONDS", "60"))
+        # Per-connection deadline covering the TLS handshake and every
+        # subsequent read/write. A client that connects and then says nothing
+        # must not hold a worker thread — or, before the accept-loop fix
+        # below, the whole service — open forever.
+        self.connection_timeout = float(
+            os.environ.get("ENROLL_CONNECTION_TIMEOUT_SECONDS", "10")
+        )
         self.openssl = os.environ.get("ENROLL_OPENSSL", "openssl")
 
 
@@ -172,7 +180,16 @@ class EnrollHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(400, "password and csr are required")
             return
 
-        expected = _load_password(self.server)  # type: ignore[attr-defined]
+        try:
+            expected = _load_password(self.server)  # type: ignore[attr-defined]
+        except RuntimeError as error:
+            # An unreadable or empty password file is a signer-side
+            # misconfiguration, not a client error. Without this the exception
+            # escaped the handler and the client saw a bare closed connection
+            # — one more silent hang to debug from the outside.
+            self.log_error("password file unusable: %s", error)
+            self.send_error(503, "signer misconfigured")
+            return
         # Constant-time comparison: timing must not reveal how much of the
         # password matched, even under a guessed prefix.
         if not hmac.compare_digest(password.encode(), expected.encode()):
@@ -216,7 +233,47 @@ def _load_password(server: http.server.HTTPServer) -> str:
 
 
 class ThreadingEnrollServer(http.server.ThreadingHTTPServer):
+    """Threaded HTTPS whose TLS handshake never runs on the accept loop.
+
+    ThreadingHTTPServer on its own does not stop the wedge: wrapping the
+    *listening* socket — the obvious spelling — makes `ssl.SSLSocket.accept()`
+    perform the handshake itself, inside `serve_forever`'s single accept loop.
+    One client that completes the TCP connect and then stays silent blocks
+    every subsequent accept for as long as it holds the connection, which is
+    the LISTEN-with-an-undrained-backlog wedge observed in production: threads
+    were already in play and the service still stopped accepting.
+
+    So the listening socket is wrapped with `do_handshake_on_connect=False`
+    (the pattern wptserve and Tornado use for the same reason). `accept()`
+    then returns a handshake-pending SSLSocket immediately, and the
+    per-connection worker thread completes the handshake under
+    `connection_timeout`. A stalled client now only ever costs one thread,
+    and only until its deadline expires.
+    """
+
     daemon_threads = True
+    # Replaced from Config in main(); the class default keeps a directly
+    # constructed server bounded too.
+    connection_timeout = 10.0
+
+    def finish_request(self, request, client_address) -> None:
+        # Runs on the worker thread. The deadline is armed before the
+        # handshake, so it covers the handshake and every later read/write.
+        request.settimeout(self.connection_timeout)
+        request.do_handshake()
+        super().finish_request(request, client_address)
+
+    def handle_error(self, request, client_address) -> None:
+        error = sys.exc_info()[1]
+        if isinstance(error, (ssl.SSLError, socket.timeout, ConnectionError)):
+            # Routine traffic on a public port: TLS scanners, plain-HTTP
+            # probes, and clients that hit connection_timeout. One line each,
+            # no traceback. OpenSSL's message is an alert code, never request
+            # bytes, so it is safe to log.
+            peer = client_address[0] if client_address else "?"
+            sys.stderr.write("loam-enroll: dropped %s: %s\n" % (peer, error))
+            return
+        super().handle_error(request, client_address)
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +295,7 @@ def main(argv: list[str]) -> int:
         print(f"pki_dir={config.pki_dir}")
         print(f"password_file={config.password_file}")
         print(f"listen={config.bind_address}:{config.listen_port}")
+        print(f"connection_timeout={config.connection_timeout}")
         return 0
 
     # The port is public on a broker VPS; ENROLL_BIND_ADDRESS (default
@@ -266,7 +324,13 @@ def main(argv: list[str]) -> int:
     server = ThreadingEnrollServer((bind, config.listen_port), EnrollHandler)
     server.limiter = RateLimiter(config.rate_limit, config.rate_window)  # type: ignore[attr-defined]
     server.config = config  # type: ignore[attr-defined]
-    server.socket = context.wrap_socket(server.socket, server_side=True)
+    server.connection_timeout = config.connection_timeout
+    # do_handshake_on_connect=False is load-bearing, not a micro-optimisation:
+    # accept() propagates this flag to each accepted socket, which is what
+    # keeps the handshake off the accept loop. See ThreadingEnrollServer.
+    server.socket = context.wrap_socket(
+        server.socket, server_side=True, do_handshake_on_connect=False
+    )
     print(
         f"loam-enroll listening on {bind}:{config.listen_port} "
         f"(password file {config.password_file})",
