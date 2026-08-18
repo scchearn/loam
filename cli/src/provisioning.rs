@@ -215,6 +215,63 @@ fn bundled_trust_anchors(
     })
 }
 
+/// Build the mTLS client configuration for one session, naming *which input*
+/// failed instead of folding every credential problem into one reason.
+///
+/// Key encoding is deliberately permissive. The identity layout contract says
+/// PKCS#8, but every natural path an operator or an older script takes
+/// produces something else:
+///
+/// * PKCS#8 — `BEGIN PRIVATE KEY`, what this runtime's own auto-enrollment
+///   writes and what `openssl pkcs8 -topk8` produces;
+/// * SEC1 — `BEGIN EC PRIVATE KEY`, the default output of
+///   `openssl ecparam -genkey` on OpenSSL and on the LibreSSL that ships with
+///   macOS, optionally preceded by an `EC PARAMETERS` block;
+/// * PKCS#1 — `BEGIN RSA PRIVATE KEY`, what `openssl genrsa` emits before
+///   OpenSSL 3, which is what this repository's own `pki/issue-client.sh`
+///   calls.
+///
+/// All three are accepted: refusing them bought nothing but debugging time,
+/// and the last of them would have meant refusing identities minted by this
+/// project's own tooling. A key that still cannot be used gets a reason that
+/// names the actual problem.
+pub fn build_client_config(
+    roots: &rustls::RootCertStore,
+    client_auth: Option<(&[u8], &[u8])>,
+) -> Result<rustls::ClientConfig, &'static str> {
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots.clone());
+    let Some((certificate_pem, key_pem)) = client_auth else {
+        return Ok(builder.with_no_client_auth());
+    };
+    let mut certificate_reader = std::io::Cursor::new(certificate_pem);
+    let certificates = rustls_pemfile::certs(&mut certificate_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| reason::CERTIFICATE_MALFORMED)?;
+    if certificates.is_empty() {
+        return Err(reason::CERTIFICATE_MALFORMED);
+    }
+    let mut key_reader = std::io::Cursor::new(key_pem);
+    // `private_key` takes the first PKCS#8, SEC1, or PKCS#1 block and steps
+    // over anything else in the file, which is what makes the `EC PARAMETERS`
+    // preamble harmless.
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|_| reason::KEY_FORMAT_UNSUPPORTED)?
+        .ok_or(reason::KEY_FORMAT_UNSUPPORTED)?;
+    builder
+        .with_client_auth_cert(certificates, key)
+        .map_err(|error| match error {
+            // rustls compares the key's public half against the certificate's
+            // SubjectPublicKeyInfo. That is a mismatched pair, not a bad
+            // encoding, and it is the one an operator is most likely to have
+            // made by hand.
+            rustls::Error::InconsistentKeys(_) => reason::KEY_CERT_MISMATCH,
+            // Everything else at this point is the key provider refusing to
+            // load the bytes: a parseable container around something that is
+            // not a usable key.
+            _ => reason::KEY_FORMAT_UNSUPPORTED,
+        })
+}
+
 pub fn build_root_store(pem: &[u8]) -> Result<rustls::RootCertStore, &'static str> {
     let der_certs: Vec<rustls::pki_types::CertificateDer<'static>> = pem_certificate_ders(pem)
         .into_iter()

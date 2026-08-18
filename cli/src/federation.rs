@@ -899,6 +899,11 @@ fn orchestrate_cli(
             0
         }
         Err(error) => {
+            // Rendering belongs to `connect_error_json`/`connect_error_line`,
+            // which already emit the code plus the failing stage's own reason.
+            // #95 adds a reason where there was none: a `key.pem` that is not
+            // the key in `client.pem` used to report `connect_probe_failed`
+            // and nothing more. It flows through these renderers unchanged.
             if json_output {
                 println!("{}", connect_error_json(&error).to_json());
             } else {
