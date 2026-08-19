@@ -41,19 +41,36 @@ function slug(value) {
 }
 
 /**
- * Wikilink resolution against the snapshot inventory: basename or path match,
- * case-insensitive, and unique. An ambiguous target is treated as unresolved
- * rather than guessed — the spec makes ambiguity a diagnostic, not a redirect.
+ * Wikilink resolution against the snapshot inventory, case-insensitive and
+ * unique. An ambiguous target is treated as unresolved rather than guessed —
+ * the spec makes ambiguity a diagnostic, not a redirect.
+ *
+ * Targets are tried in tiers, most specific first, and the first tier that
+ * yields exactly one artifact wins. A tier that yields several stops the search:
+ * widening the net after an ambiguity would turn a diagnostic into a guess.
+ *
+ *   1. the target as written — full path, basename, or title
+ *   2. relative to the directory of the document doing the linking
+ *   3. relative to the wiki root, i.e. a trailing run of path segments —
+ *      `[[topics/greeting]]` from `wiki/index.md` is the normal Loam
+ *      convention and matches `wiki/topics/greeting.md`
  */
-export function resolverFor(snapshot) {
+export function resolverFor(snapshot, fromPath = '') {
   const artifacts = snapshot?.artifacts ?? [];
+  const dir = String(fromPath ?? '').split('/').slice(0, -1).join('/');
   return (target) => {
     const wanted = slug(target);
-    const matches = artifacts.filter((artifact) => {
-      const path = String(artifact.path ?? '');
-      return slug(path) === wanted || slug(path.split('/').pop()) === wanted || slug(artifact.title) === wanted;
-    });
-    return matches.length === 1 ? { path: matches[0].path, title: matches[0].title } : null;
+    if (!wanted) return null;
+    const tiers = [
+      (path, title) => slug(path) === wanted || slug(path.split('/').pop()) === wanted || slug(title) === wanted,
+      (path) => Boolean(dir) && slug(path) === slug(`${dir}/${target}`),
+      (path) => slug(path).endsWith(`/${wanted}`),
+    ];
+    for (const matches of tiers) {
+      const hits = artifacts.filter((artifact) => matches(String(artifact.path ?? ''), artifact.title));
+      if (hits.length) return hits.length === 1 ? { path: hits[0].path, title: hits[0].title } : null;
+    }
+    return null;
   };
 }
 
@@ -253,7 +270,7 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
     const renderer = createRenderer({
       window: win,
       basePath: path,
-      resolve: resolverFor(getSnapshot()),
+      resolve: resolverFor(getSnapshot(), path),
     });
     // The only insertion point for document content: a sanitized fragment.
     article.replaceChildren(renderer.render(body));

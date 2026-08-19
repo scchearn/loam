@@ -233,10 +233,17 @@
 
     <div class="query-filters" data-query-filters role="group" aria-label="Filter by kind"></div>
 
-    <div class="query-scroll">
+    <!-- Chrome focuses an overflowing scroller by itself, with the UA ring and
+         no name. Naming it makes that tab stop legible everywhere. -->
+    <div class="query-scroll" tabindex="0" role="region" aria-label="Search results">
       <ul class="query-results" id="query-results" data-query-results></ul>
       <p class="query-empty" id="query-empty" data-query-empty role="status"></p>
     </div>
   </dialog>
+
+  <!-- Present and empty from first paint: a live region inserted with its text
+       already in it is not reliably announced, so the first copy would be
+       silent for a screen reader. -->
+  <div class="toast" data-toast role="status" aria-live="polite"></div>
 </body>
 </html>

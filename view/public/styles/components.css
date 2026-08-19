@@ -353,8 +353,10 @@ a:focus-visible,
   position: relative;
   display: inline-grid;
   place-items: center;
-  width: 1.4rem;
-  height: 1.4rem;
+  /* 24px: the WCAG 2.5.8 minimum outright, so nothing here leans on the
+     spacing exception surviving the next layout change. */
+  width: 1.5rem;
+  height: 1.5rem;
   padding: 0;
   border: var(--rule) solid var(--border);
   border-radius: var(--radius-sm);
@@ -1661,7 +1663,14 @@ code,
   .nav-button { min-height: 4rem; font-size: 0.56rem; }
   .nav-glyph { display: none; }
 
-  .workspace { grid-column: 1; padding-bottom: 4rem; }
+  /* The rail is fixed across the bottom of the scrollport here, so the last
+     controls need room to sit above it, and scroll-into-view has to keep that
+     room clear — otherwise focus lands underneath the rail and neither the
+     control nor its ring is visible (WCAG 2.4.11 Focus Not Obscured). */
+  .workspace { grid-column: 1; padding-bottom: 5rem; }
+  .workspace :is(a, button, summary, input, select, textarea, [tabindex]) {
+    scroll-margin-bottom: 5rem;
+  }
   .view { padding: var(--space-6) var(--space-4) var(--space-12); }
 
   .query-result .result-row { grid-template-columns: 1fr; gap: var(--space-2); }

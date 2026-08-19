@@ -23,6 +23,7 @@ const SNAPSHOT = {
     { path: 'wiki/alpha.md', title: 'Alpha', kind: 'topic', content_hash: 'aaa' },
     { path: 'wiki/beta.md', title: 'Beta', kind: 'topic', content_hash: 'bbb' },
     { path: 'wiki/code/one.md', title: 'One', kind: 'code', content_hash: 'ccc' },
+    { path: 'wiki/root-relative.md', title: 'Root Relative', kind: 'topic', content_hash: 'ddd' },
   ],
 };
 
@@ -54,6 +55,13 @@ const DOCUMENTS = {
     content_hash: 'bbb-new',
     snapshot_hash: 'bbb',
     changed_since_snapshot: true,
+  },
+  // Targets written against the wiki root, the way loam's own pages write them.
+  'wiki/root-relative.md': {
+    content: '# Root Relative\n\nSee [[code/one|One]].\n',
+    content_hash: 'ddd',
+    snapshot_hash: 'ddd',
+    changed_since_snapshot: false,
   },
 };
 
@@ -117,6 +125,47 @@ describe('wikilink resolution', () => {
     assert.equal(resolve('Nowhere'), null);
     const ambiguous = resolverFor({ artifacts: [{ path: 'a/x.md' }, { path: 'b/x.md' }] });
     assert.equal(ambiguous('x'), null);
+  });
+
+  it('resolves a wiki-root-relative target, the normal Loam convention', () => {
+    const snapshot = {
+      artifacts: [
+        { path: 'wiki/index.md', title: 'Index' },
+        { path: 'wiki/topics/greeting.md', title: 'Greeting' },
+        { path: 'wiki/code/_index.md', title: 'Code graph' },
+      ],
+    };
+    const fromIndex = resolverFor(snapshot, 'wiki/index.md');
+    assert.deepEqual(fromIndex('topics/greeting'), { path: 'wiki/topics/greeting.md', title: 'Greeting' });
+    assert.deepEqual(fromIndex('code/_index'), { path: 'wiki/code/_index.md', title: 'Code graph' });
+  });
+
+  it('resolves a target written relative to the linking document', () => {
+    const snapshot = {
+      artifacts: [
+        { path: 'wiki/topics/greeting.md', title: 'Greeting' },
+        { path: 'wiki/topics/parting.md', title: 'Parting' },
+      ],
+    };
+    const fromGreeting = resolverFor(snapshot, 'wiki/topics/greeting.md');
+    assert.deepEqual(fromGreeting('parting'), { path: 'wiki/topics/parting.md', title: 'Parting' });
+  });
+
+  it('stops at the tier that is ambiguous instead of widening the net', () => {
+    const snapshot = { artifacts: [{ path: 'wiki/a/x.md' }, { path: 'wiki/b/x.md' }] };
+    assert.equal(resolverFor(snapshot, 'wiki/index.md')('x'), null);
+  });
+
+  it('renders a wiki-root-relative wikilink as a live link, not a broken one', async () => {
+    const { dom, doc } = mount({ hash: '' });
+    await announce(dom, { path: 'wiki/root-relative.md' });
+
+    const article = doc.querySelector('[data-reader-doc]');
+    assert.equal(article.querySelectorAll('.wikilink.is-broken').length, 0, 'the target is inventoried');
+    const link = article.querySelector('a.wikilink.is-resolved');
+    assert.ok(link, 'a resolved wikilink must be activatable');
+    assert.equal(link.getAttribute('href'), `#/reader/${encodeURIComponent('wiki/code/one.md')}`);
+    assert.equal(link.textContent, 'One');
   });
 });
 

@@ -85,20 +85,31 @@ These are contract, not configuration. None of them can be turned off.
 `Refresh` re-runs `loam state --view` and re-reads the snapshot. If the producer
 fails, **the previous snapshot stays on screen** and the error is surfaced in a
 live region above the view — you never lose your render because a refresh went
-wrong. The keyboard stays on the Refresh control throughout.
+wrong. The message names what failed, when the snapshot you are looking at was
+taken, and what to do; the freshness chip marks itself stale so nothing on
+screen reads as current. The keyboard stays on the Refresh control throughout.
+The message clears on the next successful read, not before.
 
 ## Keyboard and assistive technology
 
-- Every control is reachable by `Tab`, with a visible focus ring.
+- Every control is reachable by `Tab`, with a visible focus ring that is never
+  covered by the chrome — including the bottom rail on narrow viewports.
+- "Skip to content" is the first tab stop and jumps to the workspace region
+  without changing which area you are in.
 - `Ctrl`/`Cmd` + `K` opens Query from anywhere; `Escape` closes it. Results are
   walked with the arrow keys and chosen with `Enter` — the input keeps focus and
   points at the active option, so results are not separate tab stops.
-- Opening the Inspector or Reader makes everything behind it `inert`, moves
-  focus in, and returns focus to the control you came from on close — including
-  when leaving the view re-renders that control.
+- Opening the Inspector or Reader makes everything behind it `inert` — the skip
+  link included, since it lives inside the shell — moves focus in, and returns
+  focus to the control you came from on close, including when leaving the view
+  re-renders that control.
 - Severity is never carried by colour alone; every state has a text badge.
 - Atlas ships a list beside the graph. The list is the accessible interface and
   carries the same nodes, kinds, and relationship counts.
+- Reader wikilinks resolve the way loam writes them: as given, relative to the
+  linking document, or relative to the wiki root. A target that matches more
+  than one artifact stays unresolved and is labelled as such — ambiguity is a
+  diagnostic, never a guess.
 - `prefers-reduced-motion: reduce` is honoured.
 
 ## Empty and degraded workspaces
@@ -107,6 +118,11 @@ View never fakes completeness. A workspace with no wiki, no goals, or no
 recorded events says exactly what is missing and names the loam command that
 would fix it, rather than rendering an empty panel or inventing a number. A
 missing metric reads `—`, not `0`.
+
+"Nothing was read" and "nothing is there" are different claims, and View keeps
+them apart. If the snapshot cannot be read at all, the areas are not rendered:
+one panel says so and points at Refresh. An area's own empty state only ever
+speaks for a workspace that was actually read.
 
 ## Development
 

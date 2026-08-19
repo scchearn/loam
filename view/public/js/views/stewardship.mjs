@@ -311,9 +311,20 @@ export function renderStewardship(doc, snapshot, target) {
   grid.setAttribute('role', 'list');
   for (const row of rows) grid.append(card(doc, row, inventory));
 
-  const band = maker(doc)('section', 'band');
+  const el = maker(doc);
+  const band = el('section', 'band');
   band.setAttribute('aria-label', 'Trust signals');
-  band.append(grid);
+
+  // Every other band in the app carries a heading; without one, heading
+  // navigation files all twelve signals under Conservation status.
+  const head = el('header', 'band-head');
+  const title = el('h2', 'band-title');
+  const drag = el('span', 'drag', '⠿');
+  drag.setAttribute('aria-hidden', 'true');
+  title.append(drag, doc.createTextNode('Trust signals'));
+  head.append(title, el('span', 'pill', `${rows.length} signal${rows.length === 1 ? '' : 's'}`));
+
+  band.append(head, grid);
 
   target.replaceChildren(renderSummary(doc, snapshot, rows), band);
 }

@@ -164,6 +164,22 @@ describe('Stewardship signal mapping', () => {
     assert.equal(cardFor(root, 'retrieval').classList.contains('critical'), false);
   });
 
+  it('gives every band a heading so the signals do not file under Conservation status', async () => {
+    const { mount: root } = await mount(trustSnapshot());
+
+    for (const band of root.querySelectorAll('section.band')) {
+      const heading = band.querySelector('h2.band-title');
+      assert.ok(heading, `band "${band.getAttribute('aria-label')}" must carry its own heading`);
+      assert.match(heading.textContent, new RegExp(band.getAttribute('aria-label')));
+    }
+    // The outline is h1 > h2 per band > h3 per signal, with no level skipped.
+    const levels = [...root.querySelectorAll('h1, h2, h3, h4')].map((h) => Number(h.tagName[1]));
+    for (const [index, level] of levels.entries()) {
+      if (index === 0) continue;
+      assert.ok(level <= levels[index - 1] + 1, `heading ${index} jumps to h${level}`);
+    }
+  });
+
   it('renders emitted hints beside signals, with their routing severity mapped', async () => {
     const { mount: root } = await mount(trustSnapshot());
 
@@ -248,6 +264,23 @@ describe('Stewardship copy-prompt affordance', () => {
     const toast = doc.querySelector('[data-toast]');
     assert.ok(toast, 'a transient toast should appear');
     assert.match(toast.textContent, /paste/i);
+  });
+
+  it('ships the live region empty so the very first copy is announced', async () => {
+    const { doc, mount: root } = await mount(trustSnapshot());
+
+    // A role=status region inserted with content already in it is not reliably
+    // announced, so the first copy would be silent for a screen reader.
+    const toast = doc.querySelector('[data-toast]');
+    assert.ok(toast, 'the toast container must exist before any copy');
+    assert.equal(toast.textContent, '');
+    assert.equal(toast.getAttribute('role'), 'status');
+    assert.equal(toast.getAttribute('aria-live'), 'polite');
+
+    cardFor(root, 'wikilink-health').querySelector('[data-copy-prompt]').click();
+    await flush();
+    assert.equal(doc.querySelectorAll('[data-toast]').length, 1, 'no second region may be created');
+    assert.match(doc.querySelector('[data-toast]').textContent, /paste/i);
   });
 });
 

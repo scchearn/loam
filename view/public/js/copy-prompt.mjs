@@ -53,7 +53,12 @@ async function writeClipboard(win, text) {
   }
 }
 
-/** One shared toast node, created on demand so index.html stays static markup. */
+/**
+ * The one shared toast node. index.html ships it empty because a live region
+ * inserted with its text already in it is not reliably announced — the first
+ * copy would be silent. Creating it here is only a fallback for a host that
+ * mounted the controls without the shell markup.
+ */
 function showToast(doc, message) {
   let toast = doc.querySelector('[data-toast]');
   if (!toast) {
