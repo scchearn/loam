@@ -67,7 +67,7 @@ export async function runDoctor(options = {}) {
         // health-check result, shown rather than asserted.
         const toolBit = entry.tool
           ? `tool ${state.tool?.present
-            ? `present (${state.tool.source || (state.tool.managed ? 'loam-managed' : 'PATH')}${state.tool.version ? `, ${state.tool.version}` : ''})`
+            ? `present (${state.tool.source}${state.tool.version ? `, ${state.tool.version}` : ''})`
             : 'absent'}`
           : 'no tool';
         // An entry with no MCP lane has no per-harness state to report; saying

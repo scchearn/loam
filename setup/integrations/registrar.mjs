@@ -81,7 +81,14 @@ export async function enableIntegration(entry, ctx) {
   //    prefix only when absent. Install/verify BEFORE any MCP registration.
   let toolPath = null;
   let toolRecord = null;
-  if (entry.tool && !entry.tool.pkg) {
+  if (entry.tool && !entry.tool.pkg && dryRun) {
+    // Preview only — no resolution spawn, matching the managed lane below. A dry
+    // run says what enable would do; it is not a report on what this machine
+    // happens to have. Detecting here would also make this the one entry whose
+    // preview FAILS on an absent tool, when every other entry previews fine.
+    const sites = ['PATH', ...(entry.tool.dirs?.(home, ctx.env || process.env) || [])];
+    stepDetail(output, `would look for ${entry.tool.binName} in ${sites.join(', ')} and record the one it finds (loam never installs it), or print the install recipes and refuse`);
+  } else if (entry.tool && !entry.tool.pkg) {
     // Detection-only: resolve, never install. Absence is a typed refusal with
     // the per-OS recipes printed — the user installs it, then re-runs enable.
     const resolved = await resolveTool({

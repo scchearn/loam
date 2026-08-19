@@ -429,6 +429,26 @@ test('a relative install site is never searched, so nothing resolves out of the 
   }
 });
 
+test('a detection-only dry run previews the sites and never spawns or fails', async () => {
+  // qmd's dry run is a non-failing preview (pinned below); this lane must not be
+  // the one entry whose --dry-run turns into a detection gate that reports the
+  // machine's state as a command failure.
+  const fx = await installedHome();
+  const tool = hcomRunner();
+  const capture = outputCapture();
+  const result = await catalogEntry('hcom').enable(ctxFor(fx, capture, {
+    toolRunner: tool.runner,
+    dryRun: true,
+    env: { PATH: '' },
+  }));
+
+  assert.equal(result.ready, true, 'a preview never fails on what the machine has');
+  assert.equal(tool.calls.length, 0, 'a preview resolves nothing and spawns nothing');
+  assert.match(capture.text(), /would look for hcom in PATH/);
+  const ledger = await readLedger(fx.globalRoot);
+  assert.equal(ledger.integrations.hcom, undefined, 'a preview records nothing');
+});
+
 test('a chatty version answer is reduced to one short line', async () => {
   // doctor prints one line per integration and the ledger records the string,
   // so a tool that answers with a build banner must not be able to reshape
