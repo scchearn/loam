@@ -1,0 +1,104 @@
+[
+  {
+    "name": "missing_specversion",
+    "patches": [{"op": "remove", "path": ["specversion"]}]
+  },
+  {
+    "name": "wrong_specversion",
+    "patches": [{"op": "set", "path": ["specversion"], "value": "0.3"}]
+  },
+  {
+    "name": "missing_id",
+    "patches": [{"op": "remove", "path": ["id"]}]
+  },
+  {
+    "name": "missing_type",
+    "patches": [{"op": "remove", "path": ["type"]}]
+  },
+  {
+    "name": "empty_type",
+    "patches": [{"op": "set", "path": ["type"], "value": ""}]
+  },
+  {
+    "name": "missing_datacontenttype",
+    "patches": [{"op": "remove", "path": ["datacontenttype"]}]
+  },
+  {
+    "name": "wrong_datacontenttype",
+    "patches": [{"op": "set", "path": ["datacontenttype"], "value": "text/plain"}]
+  },
+  {
+    "name": "invalid_intent",
+    "patches": [{"op": "set", "path": ["data", "intent"], "value": "execute"}]
+  },
+  {
+    "name": "invalid_delivery_class",
+    "patches": [{"op": "set", "path": ["data", "delivery", "class"], "value": "broadcast"}]
+  },
+  {
+    "name": "missing_latest_state_key",
+    "patches": [{"op": "remove", "path": ["data", "delivery", "key"]}]
+  },
+  {
+    "name": "missing_latest_state_revision",
+    "patches": [{"op": "remove", "path": ["data", "delivery", "revision"]}]
+  },
+  {
+    "name": "duplicate_json_key",
+    "patches": [{"op": "duplicate", "path": ["specversion"]}]
+  },
+  {
+    "name": "duplicate_envelope_field",
+    "patches": [{"op": "set", "path": ["data", "id"], "value": "shadow-id"}]
+  },
+  {
+    "name": "oversized_payload",
+    "max_payload_bytes": "1"
+  },
+  {
+    "name": "oversized_document",
+    "max_document_bytes": "1"
+  },
+  {
+    "name": "invalid_expiry",
+    "patches": [{"op": "set", "path": ["data", "expires_at"], "value": "eventually"}]
+  },
+  {
+    "name": "expired",
+    "now": "2026-07-24T15:00:00Z"
+  },
+  {
+    "name": "expiry_too_far",
+    "max_future_seconds": "60"
+  },
+  {
+    "name": "invalid_envelope_shape",
+    "patches": [{"op": "remove", "path": ["source"]}]
+  },
+  {
+    "name": "request_missing_thread",
+    "base": "message",
+    "patches": [{"op": "remove", "path": ["data", "thread"]}]
+  },
+  {
+    "name": "request_wrong_correlation",
+    "base": "message",
+    "patches": [{"op": "set", "path": ["data", "thread", "correlation_id"], "value": "other-id"}]
+  },
+  {
+    "name": "response_missing_thread",
+    "base": "message",
+    "patches": [
+      {"op": "set", "path": ["data", "intent"], "value": "response"},
+      {"op": "remove", "path": ["data", "thread"]}
+    ]
+  },
+  {
+    "name": "response_missing_causation",
+    "base": "message",
+    "patches": [
+      {"op": "set", "path": ["data", "intent"], "value": "response"},
+      {"op": "remove", "path": ["data", "thread", "causation_id"]}
+    ]
+  }
+]

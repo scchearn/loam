@@ -1063,7 +1063,10 @@ test('published adapters load only the staged integration after the source tree 
     const worker = await import(`${pathToFileURL(join(adapterRoot, 'ingest-worker.mjs')).href}?test=worker`);
     assert.equal(typeof worker.main, 'function');
     const opencode = await import(`${pathToFileURL(join(adapterRoot, 'opencode.mjs')).href}?test=opencode`);
-    assert.equal(typeof opencode.createOpenCodeAdapter, 'function');
+    // The plugin file exports exactly one symbol (the OpenCode loader calls every
+    // top-level export as a plugin factory); the adapter factory rides on it.
+    assert.equal(typeof opencode.LoamPlugin, 'function');
+    assert.equal(typeof opencode.LoamPlugin.createOpenCodeAdapter, 'function');
   } finally {
     if (previousPath === undefined) delete process.env.LOAM_INTEGRATION_PATH;
     else process.env.LOAM_INTEGRATION_PATH = previousPath;

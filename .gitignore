@@ -6,5 +6,16 @@ target/
 .env
 .env.*
 
+# Loam MQTT broker deployment — filled host params + any generated PKI/secret material
+deploy/mqtt-broker/params.env
+deploy/mqtt-broker/OWNER-RUNBOOK.md
+deploy/mqtt-broker/pki/*.key
+deploy/mqtt-broker/pki/*.pem
+deploy/mqtt-broker/pki/private/
+
 specs/
 plans/
+
+# Python bytecode from the deploy signer (never committed)
+__pycache__/
+*.pyc

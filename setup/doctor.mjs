@@ -1,5 +1,6 @@
 import { discover } from './discovery.mjs';
 import { verifyInstallation } from './verify.mjs';
+import { CATALOG } from './integrations/catalog.mjs';
 
 function detail(check) {
   return check?.detail || check?.message || check?.category || '';
@@ -36,12 +37,46 @@ export async function runDoctor(options = {}) {
     report(output, 'Install metadata', result.install ? { ready: true } : { ready: false, category: 'install_metadata_missing' });
     if (result.install) {
       output.write(`  Plugin version: ${result.install.plugin_version}\n`);
-      output.write(`  CLI version: ${result.install.runtime_version}\n`);
+      // The runtime version is the config-dir ledger target (schema-2 install.json
+      // no longer records it); the schema-1 field is a display fallback.
+      const runtimeVersion = result.runtime?.ledger?.target ?? result.install.runtime_version ?? 'unknown';
+      output.write(`  CLI version: ${runtimeVersion}\n`);
     }
     report(output, 'Global skills', result.skills);
     report(output, 'Native runtime', result.runtime);
     for (const [id, harness] of Object.entries(result.harnesses)) report(output, `${id} integration`, harness);
     report(output, 'Workspace migration', result.migration);
+
+    // Optional integrations: informational only — an absent integration is a
+    // choice, never a failure, so this section never affects the exit code.
+    if (result.install) {
+      output.write('Optional integrations (informational):\n');
+      for (const entry of CATALOG) {
+        const state = await entry.verify({
+          discovery,
+          install: result.install,
+          runner: options.runner,
+          // Injectable in tests; production falls through to the real spawn and
+          // the real environment inside resolveTool.
+          toolRunner: options.toolRunner,
+          env: options.env,
+        });
+        const harnessBits = Object.entries(state.registered).map(([id, on]) => `${id}:${on ? 'yes' : 'no'}`).join(' ');
+        // `present` already means the health check passed (resolveTool only
+        // reports a binary it could run), so the version it answered with is the
+        // health-check result, shown rather than asserted.
+        const toolBit = entry.tool
+          ? `tool ${state.tool?.present
+            ? `present (${state.tool.source}${state.tool.version ? `, ${state.tool.version}` : ''})`
+            : 'absent'}`
+          : 'no tool';
+        // An entry with no MCP lane has no per-harness state to report; saying
+        // "no harness" would read as a misconfiguration instead of a design.
+        const mcpBit = entry.mcpName ? `MCP ${harnessBits || 'no harness'}` : 'MCP not applicable';
+        output.write(`  ${entry.id} (${entry.capability}): ${toolBit}; ${mcpBit}\n`);
+      }
+    }
+
     output.write(`Result: ${result.ready ? 'ready' : 'not ready'}\n`);
     return result.ready ? 0 : 1;
   } catch (error) {

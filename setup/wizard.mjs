@@ -64,7 +64,7 @@ export function renderDiscovery(discovery, output, { action = 'Setup', dryRun = 
   );
 }
 
-async function confirmAction({ yes = false, confirm, input, output, promptText, nonInteractiveMessage }) {
+export async function confirmAction({ yes = false, confirm, input, output, promptText, nonInteractiveMessage }) {
   if (yes) return true;
   if (confirm) return Boolean(await confirm());
   if (!input.isTTY) {

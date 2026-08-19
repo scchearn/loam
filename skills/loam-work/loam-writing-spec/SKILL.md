@@ -70,7 +70,8 @@ Collect evidence in this order, using the best sources available:
 2. Existing wiki notes when a wiki is present and relevant.
 3. Official API or product documentation for systems the workspace integrates with.
 4. Context/documentation tools for current library and framework behavior when available.
-5. Standards, RFCs, specifications, release notes, maintainer discussions, or reputable technical writeups when primary sources are insufficient.
+5. When a **code-search MCP is available** (e.g. grep.app, enabled via `npx @scchearn/loam setup --integration grep`), use it to verify how an external API, library, or config key is actually used across public repositories before asserting a contract. This is a soft dependency: if no code-search MCP is present, proceed from documentation and your own knowledge, flag the uncertainty in the spec, and fall back to the reader's own search (Sourcegraph / GitHub / local `rg`).
+6. Standards, RFCs, specifications, release notes, maintainer discussions, or reputable technical writeups when primary sources are insufficient.
 
 Prefer primary sources over summaries. Separate workspace evidence from external evidence.
 

@@ -1,0 +1,45 @@
+# Loam federation auto-enrollment signer — system service.
+# Install to /etc/systemd/system/ via enroll/install-signer.sh; it renders this
+# unit from params.env with envsubst. ${VARS} resolved from params.env.
+#
+# LIVE-HOST SAFETY: dedicated unprivileged ${ENROLL_USER} under a tight sandbox;
+# binds only ${ENROLL_PORT} (default 8443) on ${ENROLL_BIND_ADDRESS} (default
+# 0.0.0.0 — the port is public; TLS + the shared password + rate limiting are
+# the security walls). It reads the copied org CA under ${ENROLL_DIR}/ca and
+# writes CA-issued certs' inputs only under its own temp dir (PrivateTmp). The
+# shared enrollment password is a separate 0600 file staged by systemd.
+[Unit]
+Description=Loam Federation auto-enrollment signer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${ENROLL_USER}
+Group=${ENROLL_USER}
+# Keep the source password root-only; systemd stages a readable private copy
+# in the service credential directory before dropping privileges.
+LoadCredential=enrollment-password:${ENROLL_DIR}/password
+ExecStartPre=${PYTHON_BIN} ${ENROLL_DIR}/signer.py --ping
+ExecStart=${PYTHON_BIN} ${ENROLL_DIR}/signer.py
+Restart=on-failure
+RestartSec=5
+
+# --- sandbox (holds on a shared host; mirrors loam-mosquitto.service) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# The copied CA material is read-only; only the shared CA database directory is
+# writable so auto-enrollment and manual issuance share one history. Unix ACLs
+# on the database paths restrict the service's actual write access.
+ReadOnlyPaths=${ENROLL_DIR}
+ReadWritePaths=${PKI_DIR}
+# No writable host path; PrivateTmp gives it its own scratch for CSR/cert.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,280 @@
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
+import { discover } from './discovery.mjs';
+import {
+  enableFederationService,
+  removeFederationService,
+  verifyFederationAbsent,
+  verifyFederationService,
+} from './federation.mjs';
+import { catalogEntry, CATALOG } from './integrations/catalog.mjs';
+import { readLedger, resolveRuntimePath } from '../integration/ledger.mjs';
+import { announce, finish, stepStart, stepDone, stepDetail, confirmAction } from './wizard.mjs';
+
+// `setup` is the configurator for an EXISTING install: it toggles federation and
+// optional integrations, and selects harnesses. It never installs or updates
+// core loam and never touches versions. Federation is its headline job, so the
+// federation enable/disable/verify path is first-class here; harness selection
+// reconciles through the idempotent install transaction (a same-version install
+// is a no-op on skills/runtime, so no version moves); the integrations catalog
+// is iterated generically over the (Unit A: empty) registry seam.
+
+async function readInstall(globalRoot) {
+  try {
+    return JSON.parse(await readFile(join(globalRoot, 'install.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// Grace for the retired first-time `setup` (one release train): a bare `setup`
+// on a machine with no install guides to `install` rather than silently doing
+// nothing. Interactive TTY: offer to run install now; otherwise print the hint.
+async function graceNoInstall(parsed, discovery, options) {
+  const output = options.output || process.stdout;
+  const input = options.input || process.stdin;
+  await announce(output, '🌱 Loam setup', [
+    `No Loam installation found at ${discovery.globalRoot}.`,
+    '`setup` configures an existing install; it no longer performs first-time installation.',
+  ], { level: 'warn' });
+
+  if (parsed.dryRun) {
+    finish(output, 'Nothing to configure', 'run `npx @scchearn/loam install` first');
+    return 1;
+  }
+  const wantsInstall = await confirmAction({
+    yes: false,
+    confirm: options.confirm,
+    input,
+    output,
+    promptText: 'Run `npx @scchearn/loam install` now? [y/N] ',
+    nonInteractiveMessage: 'Run `npx @scchearn/loam install` first, then `setup` to configure it.',
+  });
+  if (!wantsInstall) {
+    finish(output, 'Nothing configured', 'run `npx @scchearn/loam install` first');
+    return 1;
+  }
+  const { runSetup } = await import('./main.mjs');
+  return runSetup({ command: 'install', yes: parsed.yes, dryRun: false }, options);
+}
+
+// The runtime spawner federation delegation uses. Tests inject options.runner
+// (a recording/stub runner); production leaves it undefined so invokeRuntime
+// spawns the installed private runtime binary.
+function federationRunner(options) {
+  return options.federationRunner;
+}
+
+async function configureFederation(action, { discovery, install, parsed, options }) {
+  const output = options.output || process.stdout;
+  const errorOutput = options.errorOutput || process.stderr;
+  const runner = federationRunner(options);
+  // The runtime path is the config-dir ledger's store binary (schema-1
+  // install.runtime_path as a migration fallback); null → refuse with an
+  // `update` hint, exactly as before.
+  const runtimePath = (await resolveRuntimePath({
+    globalRoot: discovery.globalRoot,
+    home: discovery.home,
+    platform: discovery.platform,
+  })) ?? install.runtime_path;
+  const platform = discovery.platform;
+  const base = { runtimePath, globalRoot: discovery.globalRoot, runner, timeoutMs: options.federationTimeoutMs, platform };
+
+  if (!runtimePath) {
+    errorOutput.write('Cannot manage federation: the install has no recorded runtime path. Run `update` first.\n');
+    return { ok: false };
+  }
+
+  if (parsed.dryRun) {
+    stepStart(output, `Federation ${action} (dry-run)`);
+    stepDone(output, action === 'enable'
+      ? 'Would install and enable the connector service definition through the runtime'
+      : 'Would stop, disable, and remove the connector service definition (identity/enrollment preserved)');
+    return { ok: true };
+  }
+
+  if (action === 'enable') {
+    stepStart(output, 'Enabling federation');
+    const result = await enableFederationService(base);
+    if (!result.ready) {
+      errorOutput.write(`Federation enable failed: ${result.detail || result.category}\n`);
+      await result.rollback?.();
+      return { ok: false };
+    }
+    // Verify the definition is actually present/inspectable through the runtime.
+    // Keep enable atomic: a service we installed+enabled but cannot verify is
+    // rolled back rather than left running in an unverifiable state.
+    const verified = await verifyFederationService(base);
+    if (!verified.ready) {
+      errorOutput.write(`Federation enable could not be verified: ${verified.detail || verified.category}\n`);
+      await result.rollback?.();
+      return { ok: false };
+    }
+    stepDone(output, 'Federation enabled — connector service installed and active');
+    return { ok: true };
+  }
+
+  // disable — symmetric, complete, and verified. Identity/enrollment/rosters are
+  // NOT destroyed (disable ≠ disenroll); only the service + staged definition go.
+  stepStart(output, 'Disabling federation');
+  const removed = await removeFederationService(base);
+  if (!removed.ok) {
+    errorOutput.write(`Federation disable did not complete cleanly: ${removed.stderr || removed.category}\n`);
+  }
+  const absence = await verifyFederationAbsent(base);
+  if (!absence.ready) {
+    // Never claim "disabled" with leftovers — name exactly what remains.
+    const detail = absence.leftovers.map((l) => l.path || l.detail || l.kind).join('; ');
+    errorOutput.write(`Federation disable incomplete — still present: ${detail}\n`);
+    return { ok: false };
+  }
+  stepDone(output, 'Federation disabled — service and definition removed; identity and enrollment preserved');
+  return { ok: true };
+}
+
+async function configureIntegration(id, mode, { discovery, install, parsed, options }) {
+  const output = options.output || process.stdout;
+  const errorOutput = options.errorOutput || process.stderr;
+  const entry = catalogEntry(id);
+  if (!entry) {
+    const known = CATALOG.map((e) => e.id).join(', ') || 'none available in this release';
+    errorOutput.write(`Unknown integration: ${id} (available: ${known})\n`);
+    return { ok: false };
+  }
+  const ctx = {
+    discovery,
+    install,
+    dryRun: parsed.dryRun,
+    purge: parsed.purge,
+    harnesses: discovery.harnesses,
+    runner: options.runner,
+    // Tool install/health spawns go through toolRunner (injected in tests, real
+    // spawn in production); the cache-removal prompt uses confirm/input.
+    toolRunner: options.toolRunner,
+    confirm: options.integrationConfirm,
+    input: options.input,
+    output,
+  };
+  if (mode === 'enable' && entry.egress) {
+    stepDetail(output, `${entry.label} sends queries to a third-party service (egress) — enabling is your consent.`);
+  }
+  const result = mode === 'enable' ? await entry.enable(ctx) : await entry.disable(ctx);
+  if (!result?.ready) {
+    const leftovers = result?.leftovers?.length
+      ? ` — leftovers: ${result.leftovers.map((l) => l.harness ? `${l.kind}:${l.harness}` : (l.path || l.kind)).join(', ')}`
+      : '';
+    errorOutput.write(`Integration ${id} ${mode} failed: ${result?.detail || result?.category || 'unknown'}${leftovers}\n`);
+    return { ok: false };
+  }
+  stepDone(output, `Integration ${id} ${mode === 'enable' ? 'enabled' : 'disabled'}`);
+  return { ok: true };
+}
+
+// Harness selection reconciles WHICH harnesses are wired. The adapter + native
+// marketplace-plugin pipeline that does this lives in the install transaction;
+// re-implementing it here would duplicate the marketplace/adapter/verify/rollback
+// machinery. Instead we drive that same transaction with a FIXED selection — so
+// only the harness wiring is reconciled to `desired`.
+//
+// The transaction stages at discovery.packageVersion (the npx package's version).
+// setup MUST NOT move versions, so if the running package differs from the
+// installed one we refuse and point at `update`: reconciling harnesses through a
+// newer package would stage skills/runtime at the newer version — a version move
+// under a verb whose whole contract is "never touches versions". Same version
+// makes skills/runtime a no-op, so only harness wiring changes. Returns { ok }.
+async function configureHarnesses(desired, { discovery, install, parsed, options }) {
+  const output = options.output || process.stdout;
+  const errorOutput = options.errorOutput || process.stderr;
+  if (discovery.packageVersion !== install.plugin_version) {
+    errorOutput.write(
+      `Cannot reconcile harnesses: this package is v${discovery.packageVersion} but the install is v${install.plugin_version}.\n`
+      + '`setup` never moves versions — run `npx @scchearn/loam update` first, then configure.\n',
+    );
+    return { ok: false };
+  }
+  stepStart(output, 'Reconciling harness selection');
+  const { runSetup } = await import('./main.mjs');
+  const select = async () => desired; // stands in for the clack multiselect widget
+  const code = await runSetup(
+    { command: 'install', yes: false, dryRun: parsed.dryRun },
+    { ...options, marketplaceSelect: select, confirm: async () => true, migrationConfirm: async () => true },
+  );
+  if (code !== 0) return { ok: false };
+  stepDone(output, 'Harness selection reconciled');
+  return { ok: true };
+}
+
+export async function runConfigure(parsed, options = {}) {
+  const output = options.output || process.stdout;
+  const errorOutput = options.errorOutput || process.stderr;
+  try {
+    const discovery = await discover({
+      home: options.home,
+      workspace: options.workspace,
+      packageRoot: options.packageRoot,
+      target: options.target,
+      platform: options.platform,
+      arch: options.arch,
+      runner: options.runner,
+    });
+
+    const install = await readInstall(discovery.globalRoot);
+    if (!install) return graceNoInstall(parsed, discovery, options);
+    // The runtime version is the ledger target now (schema-2 install.json drops
+    // runtime_version); the schema-1 field is a display fallback only.
+    const ledger = await readLedger({ home: discovery.home, platform: discovery.platform });
+
+    // The integration actions to apply, as {id, mode}. Flag-driven from
+    // --integration (enable) and --disable-integration (disable).
+    let integrationActions = [
+      ...(parsed.integrations || []).map((id) => ({ id, mode: 'enable' })),
+      ...(parsed.disableIntegrations || []).map((id) => ({ id, mode: 'disable' })),
+    ];
+
+    // Flag-driven when any component flag is present; otherwise interactive.
+    // `--yes` alone (no component flags) is a no-op.
+    const hasComponentFlags = parsed.federation !== null || integrationActions.length > 0;
+    let harnessSelection = null;
+    if (!hasComponentFlags) {
+      if (options.select) {
+        // Injected interactive selection (tests / future clack menu). Shape:
+        // { federation?: 'enable'|'disable', integrations?: [{id, mode}], harnesses?: string[] }.
+        const chosen = await options.select({ install, discovery });
+        parsed = { ...parsed, federation: chosen?.federation ?? null };
+        integrationActions = (chosen?.integrations || []).map((i) => ({ id: i.id, mode: i.mode || 'enable' }));
+        harnessSelection = Array.isArray(chosen?.harnesses) ? chosen.harnesses : null;
+      } else {
+        finish(output, 'Nothing to configure',
+          'pass --federation enable|disable, --integration <id>, or --disable-integration <id> (or run interactively)');
+        return 0;
+      }
+    }
+
+    await announce(output, `🌱 Loam setup${parsed.dryRun ? ' (dry-run)' : ''}`, [
+      `Global root: ${discovery.globalRoot}`,
+      `Plugin v${install.plugin_version} · runtime v${ledger?.target ?? install.runtime_version ?? 'unknown'}`,
+    ]);
+
+    let ok = true;
+    if (parsed.federation) {
+      const result = await configureFederation(parsed.federation, { discovery, install, parsed, options });
+      ok = ok && result.ok;
+    }
+    for (const { id, mode } of integrationActions) {
+      const result = await configureIntegration(id, mode, { discovery, install, parsed, options });
+      ok = ok && result.ok;
+    }
+    if (harnessSelection) {
+      const result = await configureHarnesses(harnessSelection, { discovery, install, parsed, options });
+      ok = ok && result.ok;
+    }
+
+    if (!ok) return 1;
+    finish(output, parsed.dryRun ? 'Dry run complete' : '🌱 Loam configured');
+    return 0;
+  } catch (error) {
+    errorOutput.write(`Setup failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+}

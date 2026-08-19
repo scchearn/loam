@@ -1,0 +1,31 @@
+# Loam MQTT broker — ACL (T3). Resolved from params.env (${ORG_ID}) at install.
+#
+# Substitutions Mosquitto provides:
+#   %u = MQTT username = client-cert CN = principal_id (use_identity_as_username true)
+#   %c = MQTT client-id — the connector MUST set this to the BARE instance_id
+#        (see INSTANCE-ID-CONTRACT.md). Origin-prefix write scoping keys off %c
+#        because two instances of the SAME principal must not forge each other's
+#        origin — so origin = instance, not principal.
+#
+# No anonymous access (broker sets allow_anonymous false). No blanket grants.
+# Everything is rooted at the single org: loam/v1/${ORG_ID}/...
+
+# ---- Reads: project peers' event/state (app-layer peer-roster filters delivery) ----
+pattern read loam/v1/${ORG_ID}/+/event/+
+pattern read loam/v1/${ORG_ID}/+/state/+/#
+
+# ---- Reads: a client reads only its OWN inbox (principal by %u, instance by %c) ----
+pattern read loam/v1/${ORG_ID}/+/inbox/principal/%u/#
+pattern read loam/v1/${ORG_ID}/+/inbox/instance/%c/#
+# (agent-addressed inbox confidentiality, if used, is enforced by per-principal
+#  `user <principal>` blocks appended at provisioning — not a broad pattern.)
+
+# ---- Writes: ONLY under the client's own origin (%c = its instance_id) ----
+pattern write loam/v1/${ORG_ID}/+/event/%c
+pattern write loam/v1/${ORG_ID}/+/state/%c/#
+pattern write loam/v1/${ORG_ID}/+/inbox/+/+/%c/#
+
+# Per-project tightening (optional hardening): provisioning MAY append
+# `user <principal_id>` blocks that restrict the `+` project wildcard above to the
+# principal's enrolled project(s). For the two-node single-project run the pattern
+# rules plus org-root + %c origin scoping are sufficient.

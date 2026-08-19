@@ -1,0 +1,56 @@
+[
+  {"name": "malformed_topic", "topic": "loam/v1/org-3A1/project-7M3/state"},
+  {"name": "wildcard_topic", "topic": "loam/v1/+/project-7M3/state/instance-01/activity-01K6Q5"},
+  {"name": "nul_topic", "topic": "loam/v1/org-3A1/project-7M3/state/instance-01/activity-01K6Q5\u0000"},
+  {"name": "organization_mismatch", "topic": "loam/v1/org-9Z9/project-7M3/state/instance-01/activity-01K6Q5"},
+  {"name": "cross_organization", "topic": "loam/v1/another-org/project-7M3/state/instance-01/activity-01K6Q5"},
+  {"name": "project_mismatch", "topic": "loam/v1/org-3A1/project-9Z9/state/instance-01/activity-01K6Q5"},
+  {"name": "origin_mismatch", "topic": "loam/v1/org-3A1/project-7M3/state/instance-99/activity-01K6Q5"},
+  {"name": "delivery_class_mismatch", "topic": "loam/v1/org-3A1/project-7M3/event/instance-01"},
+  {"name": "state_key_mismatch", "topic": "loam/v1/org-3A1/project-7M3/state/instance-01/activity-other"},
+  {
+    "name": "project_audience_mismatch",
+    "topic": "loam/v1/org-3A1/project-7M3/state/instance-01/activity-01K6Q5",
+    "patches": [
+      {"op": "set", "path": ["data", "to"], "value": [{"kind": "project", "id": "project-9Z9"}]}
+    ]
+  },
+  {
+    "name": "organization_audience_mismatch",
+    "topic": "loam/v1/org-3A1/project-7M3/state/instance-01/activity-01K6Q5",
+    "patches": [
+      {"op": "set", "path": ["data", "to"], "value": [{"kind": "org", "id": "org-EVIL"}]}
+    ]
+  },
+  {
+    "name": "direct_recipient_on_state",
+    "topic": "loam/v1/org-3A1/project-7M3/state/instance-01/activity-01K6Q5",
+    "patches": [
+      {"op": "set", "path": ["data", "to"], "value": [{"kind": "agent", "id": "agent-91"}]}
+    ]
+  },
+  {
+    "name": "empty_audience",
+    "topic": "loam/v1/org-3A1/project-7M3/state/instance-01/activity-01K6Q5",
+    "patches": [
+      {"op": "set", "path": ["data", "to"], "value": []}
+    ]
+  },
+  {
+    "name": "unknown_recipient_kind",
+    "topic": "loam/v1/org-3A1/project-7M3/state/instance-01/activity-01K6Q5",
+    "patches": [
+      {"op": "set", "path": ["data", "to"], "value": [{"kind": "team", "id": "team-1"}]}
+    ]
+  },
+  {"name": "inbox_recipient_mismatch", "base": "message", "topic": "loam/v1/org-3A1/project-7M3/inbox/agent/agent-99/instance-01/01K6Q6ESWMT48TPC"},
+  {
+    "name": "inbox_recipient_kind_mismatch",
+    "base": "message",
+    "topic": "loam/v1/org-3A1/project-7M3/inbox/principal/shared-42/instance-01/01K6Q6ESWMT48TPC",
+    "patches": [
+      {"op": "set", "path": ["data", "to"], "value": [{"kind": "agent", "id": "shared-42"}]}
+    ]
+  },
+  {"name": "inbox_message_mismatch", "base": "message", "topic": "loam/v1/org-3A1/project-7M3/inbox/agent/agent-91/instance-01/01K6Q6ESWMT48TPZ"}
+]

@@ -3,18 +3,18 @@ import { createHash } from 'node:crypto';
 import { chmod, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 
-import { formatContext, formatNativeRuntimeCommand } from '../integration/context.mjs';
 import {
   beginHookRun, finishHookRun, finishHookWorker, startHookWorker,
 } from '../integration/hooks.mjs';
 import { runIntegration } from '../integration/loam.mjs';
-import { readInstallMetadata, readRequiredVersion, validateInstallMetadata } from '../integration/metadata.mjs';
+import { readInstallMetadata, validateInstallMetadata } from '../integration/metadata.mjs';
 import { detectLegacyShadow } from '../integration/shadow.mjs';
 import { detectTarget, resolveGlobalRoot, SUPPORTED_TARGETS, runtimePath } from '../integration/paths.mjs';
 import { invokeRuntime, probeState, verifyRuntimeFile } from '../integration/runtime.mjs';
+import { runtimeStorePath, writeLedger } from '../integration/ledger.mjs';
 
 const target = detectTarget();
 
@@ -51,16 +51,32 @@ async function fixture({ runtimeVersion = '0.9.1', includeRuntime = true } = {})
     join(skillsRoot, 'loam-using', 'SKILL.md'),
     '---\nname: loam::using\nmetadata:\n  version: "1.7.2"\n---\n\n# Using loam\n',
   );
+  // The config-dir store + ledger are the readiness authority. install.json's
+  // bin/ runtime_path is still written (pre-T6) but no longer consulted for the
+  // version; the ledger's store binary is.
+  const configDir = join(home, 'config');
+  const storePath = runtimeStorePath({ version: runtimeVersion, target, root: configDir });
+  const runtimeSha = createHash('sha256').update(runtimeBytes).digest('hex');
   if (includeRuntime) {
     await mkdir(join(globalRoot, 'bin', runtimeVersion, target), { recursive: true });
     await writeFile(runtimeFile, runtimeBytes);
+    await mkdir(dirname(storePath), { recursive: true });
+    await writeFile(storePath, runtimeBytes);
   }
+  await writeLedger(
+    { channel: runtimeVersion.includes('-') ? 'next' : 'latest', target: runtimeVersion, sha256: runtimeSha, store_path: storePath },
+    { root: configDir },
+  );
   await mkdir(adapterRoot, { recursive: true });
 
-  return { home, globalRoot, skillsRoot, runtimePath: runtimeFile, integrationPath, target };
+  return {
+    home, globalRoot, skillsRoot, runtimePath: runtimeFile, storePath, integrationPath, target,
+    configDir, env: { LOAM_CONFIG_DIR: configDir }, runtimeVersion,
+  };
 }
 
 const state = {
+  version: '0.9.1',
   wiki_root: '/tmp/wiki',
   exists: true,
   qmd_ready: true,
@@ -89,19 +105,7 @@ test('ready state invokes native state once and formats one common context', asy
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].args, ['state', '--fast', fixtureData.home]);
 
-  const context = formatContext({
-    skillContent: '---\nname: loam::using\n---\n\n# Using loam\n',
-    state: result.state,
-    pluginVersion: '0.8.3',
-    runtimePath: fixtureData.runtimePath,
-    platform: 'linux',
-  });
-  assert.match(context, /^<LOAM_IMPORTANT>/);
-  assert.match(context, /You have loam \(v0\.8\.3\)/);
-  assert.match(context, /Native runtime command: '/);
-  assert.match(context, new RegExp(fixtureData.runtimePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(context, /project-wiki/);
-  assert.doesNotMatch(context, /^name: loam::using$/m);
+  assert.equal(result.state.collection, 'project-wiki');
 });
 
 test('metadata validation accepts prerelease versions and rejects build metadata', async () => {
@@ -136,25 +140,6 @@ test('metadata validation accepts prerelease versions and rejects build metadata
   }
 });
 
-test('CLI_VERSION accepts prerelease and rejects build metadata', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'loam-cliversion-'));
-  const skillsRoot = join(home, '.agents', 'skills');
-  const scripts = join(skillsRoot, 'loam-using', 'scripts');
-  await mkdir(scripts, { recursive: true });
-  for (const version of ['0.9.1-next.0', '0.9.1-next.1', '0.9.1-rc.1']) {
-    await writeFile(join(scripts, 'CLI_VERSION'), `${version}\n`);
-    assert.equal(await readRequiredVersion({ skillsRoot }), version, `CLI_VERSION ${version} should be accepted`);
-  }
-  for (const bad of ['0.9.1+build', '0.9.1-', '0.9.1-next.01', 'not-a-version']) {
-    await writeFile(join(scripts, 'CLI_VERSION'), `${bad}\n`);
-    await assert.rejects(
-      () => readRequiredVersion({ skillsRoot }),
-      /invalid CLI_VERSION/,
-      `CLI_VERSION ${bad} should be rejected`,
-    );
-  }
-});
-
 test('readInstallMetadata passes a prerelease fixture through', async () => {
   const fixtureData = await fixture({ runtimeVersion: '0.9.1-next.0' });
   const install = await readInstallMetadata(fixtureData.globalRoot);
@@ -168,6 +153,7 @@ test('versioned integration path resolves the global Loam root', async () => {
     skillsRoot: fixtureData.skillsRoot,
     integrationPath: fixtureData.integrationPath,
     target,
+    env: fixtureData.env,
     runner: async () => ({ code: 0, signal: null, stdout: JSON.stringify(state), stderr: '' }),
     output: { write: (chunk) => chunks.push(String(chunk)) },
   });
@@ -181,14 +167,6 @@ test('legacy integration path still resolves the global Loam root', () => {
   const integrationPath = join(globalRoot, 'integration', 'loam.mjs');
 
   assert.equal(resolveGlobalRoot({ env: {}, integrationPath }), globalRoot);
-});
-
-test('quotes native runtime paths for POSIX and PowerShell commands', () => {
-  const posixPath = '/home/Sam User/.agents/loam/bin/0.9.1/loam';
-  const windowsPath = String.raw`C:\Users\Sam User\.agents\loam\bin\0.9.1\loam.exe`;
-
-  assert.equal(formatNativeRuntimeCommand(posixPath, 'linux'), `'${posixPath}'`);
-  assert.equal(formatNativeRuntimeCommand(windowsPath, 'win32'), `& '${windowsPath}'`);
 });
 
 test('target detection accepts the five release targets and rejects unsupported hosts', () => {
@@ -217,35 +195,76 @@ test('missing runtime reports unavailable without invoking state or fabricating 
   assert.equal(result.category, 'runtime_missing');
   assert.equal(result.state, undefined);
   assert.equal(calls, 0);
-  const context = formatContext({
-    skillContent: '# Using loam\n',
-    unavailable: result,
-    pluginVersion: '0.8.3',
-  });
-  assert.match(context, /npx @scchearn\/loam setup/);
-  assert.match(context, /No workspace state was generated/);
-  assert.doesNotMatch(context, /## Workspace state/);
 });
 
-test('runtime version mismatch fails readiness before execution', async () => {
-  const fixtureData = await fixture({ runtimeVersion: '0.8.2' });
+test('a runtime self-report that differs from the ledger target is stale, not run-once', async () => {
+  const fixtureData = await fixture();
   const result = await probeState({
     ...fixtureData,
     workspace: fixtureData.home,
-    runner: async () => {
-      throw new Error('must not run');
-    },
+    // The store binary is intact; only the self-reported version disagrees.
+    runner: async () => ({ code: 0, stdout: JSON.stringify({ ...state, version: '0.8.2' }), stderr: '' }),
   });
 
   assert.equal(result.ready, false);
-  assert.equal(result.category, 'runtime_version_mismatch');
+  assert.equal(result.category, 'runtime_stale');
+  assert.equal(result.hint, 'update');
   assert.equal(result.expected, '0.9.1');
   assert.equal(result.actual, '0.8.2');
 });
 
-test('runtime readiness rejects tampered bytes before invoking native state', async () => {
+test('a sha-verified runtime with no self-report passes as pre-self-report, never a run-update loop', async () => {
   const fixtureData = await fixture();
-  await writeFile(fixtureData.runtimePath, 'tampered runtime');
+  // A pre-T1 binary: `state --fast` has no `version` field. checkReadiness has
+  // already matched its sha against the ledger, so it is the recorded target.
+  const { version, ...noVersionState } = state;
+  const result = await probeState({
+    ...fixtureData,
+    workspace: fixtureData.home,
+    runner: async () => ({ code: 0, stdout: JSON.stringify(noVersionState), stderr: '' }),
+  });
+
+  assert.equal(result.ready, true, 'a sha-verified pre-T1 runtime is ready, not stale');
+  assert.notEqual(result.category, 'runtime_stale');
+  assert.equal(result.note, 'runtime_predates_self_report');
+  assert.equal(result.hint, undefined, 'no update hint — re-running update would loop to the same state');
+});
+
+test('a matching self-report is ready and carries no pre-self-report note', async () => {
+  const fixtureData = await fixture();
+  const result = await probeState({
+    ...fixtureData,
+    workspace: fixtureData.home,
+    // The self-report equals the ledger target — the ordinary healthy case.
+    runner: async () => ({ code: 0, stdout: JSON.stringify(state), stderr: '' }),
+  });
+
+  assert.equal(result.ready, true);
+  assert.equal(result.note, undefined, 'the transitional note must not leak onto a normal match');
+});
+
+test('a stale or absent skills CLI_VERSION cannot change readiness', async () => {
+  const fixtureData = await fixture();
+  const scripts = join(fixtureData.skillsRoot, 'loam-using', 'scripts');
+  // Poison the skills CLI_VERSION: readiness must ignore it entirely.
+  await writeFile(join(scripts, 'CLI_VERSION'), '0.0.0\n');
+  const poisoned = await probeState({
+    ...fixtureData, workspace: fixtureData.home,
+    runner: async () => ({ code: 0, stdout: JSON.stringify(state), stderr: '' }),
+  });
+  assert.equal(poisoned.ready, true);
+  // And even when the file is gone.
+  await rm(join(scripts, 'CLI_VERSION'));
+  const absent = await probeState({
+    ...fixtureData, workspace: fixtureData.home,
+    runner: async () => ({ code: 0, stdout: JSON.stringify(state), stderr: '' }),
+  });
+  assert.equal(absent.ready, true);
+});
+
+test('runtime readiness rejects a store binary whose sha differs from the ledger', async () => {
+  const fixtureData = await fixture();
+  await writeFile(fixtureData.storePath, 'tampered runtime');
   let calls = 0;
   const result = await probeState({
     ...fixtureData,
@@ -256,8 +275,10 @@ test('runtime readiness rejects tampered bytes before invoking native state', as
     },
   });
 
+  // A sha divergence from the ledger means the store binary is not the target;
+  // stale (update), caught before ever spawning the runtime.
   assert.equal(result.ready, false);
-  assert.equal(result.category, 'runtime_untrusted');
+  assert.equal(result.category, 'runtime_stale');
   assert.equal(calls, 0);
 });
 
@@ -266,8 +287,8 @@ test('runtime readiness rejects symlinked executables', async (t) => {
   const fixtureData = await fixture();
   const outside = join(fixtureData.home, 'outside-runtime');
   await writeFile(outside, 'fixture runtime');
-  await rm(fixtureData.runtimePath);
-  await symlink(outside, fixtureData.runtimePath);
+  await rm(fixtureData.storePath);
+  await symlink(outside, fixtureData.storePath);
 
   const result = await probeState({ ...fixtureData, workspace: fixtureData.home });
   assert.equal(result.ready, false);
@@ -320,6 +341,9 @@ test('hook-run logging invokes the installed private runtime with fixed validate
     workspace: fixtureData.home,
     sessionId: 'session-42',
     runner,
+    // Isolate config-dir resolution to the fixture ledger; without this the hook
+    // resolver reads the host's real ~/.config/loam and the test is non-hermetic.
+    env: fixtureData.env,
   });
   const finished = await finishHookRun({
     run,
@@ -333,12 +357,14 @@ test('hook-run logging invokes the installed private runtime with fixed validate
   assert.deepEqual(run, {
     id: 42,
     globalRoot: fixtureData.globalRoot,
-    runtimePath: fixtureData.runtimePath,
+    // The hook resolver returns the config-dir ledger's store binary (T11), not
+    // the legacy install.json bin path.
+    runtimePath: fixtureData.storePath,
     workspace: fixtureData.home,
   });
   assert.equal(finished, true);
   assert.equal(calls.length, 2);
-  assert.equal(calls[0].runtimePath, fixtureData.runtimePath);
+  assert.equal(calls[0].runtimePath, fixtureData.storePath);
   assert.deepEqual(calls[0].args, [
     'hooks', 'begin', fixtureData.globalRoot,
     '--harness', 'codex',
@@ -700,9 +726,8 @@ test('legacy shadow detection handles a workspace with no shadow directories', a
   assert.deepEqual(report, { shadows: [], unsafe: [] });
 });
 
-test('status and hook commands share one read-only integration boundary', async () => {
+test('the integration boundary is status-only and refuses the retired hook command', async () => {
   const fixtureData = await fixture();
-  const workspace = fixtureData.home;
   const before = await readFile(join(fixtureData.skillsRoot, 'loam-using', 'SKILL.md'), 'utf8');
   const statusChunks = [];
   const statusCode = await runIntegration(['status'], {
@@ -710,39 +735,25 @@ test('status and hook commands share one read-only integration boundary', async 
     skillsRoot: fixtureData.skillsRoot,
     integrationPath: fixtureData.integrationPath,
     target,
+    env: fixtureData.env,
     runner: async () => ({ code: 0, signal: null, stdout: JSON.stringify(state), stderr: '' }),
     output: { write: (chunk) => statusChunks.push(String(chunk)) },
   });
   assert.equal(statusCode, 0);
   assert.equal(JSON.parse(statusChunks.join('')).ready, true);
 
-  await assert.rejects(
-    () => runIntegration(['run', '--', 'check', 'versions', fixtureData.home], { globalRoot: fixtureData.globalRoot }),
-    /usage: loam\.mjs status \| hook/,
-  );
-
-  const contexts = [];
-  for (const harness of ['opencode', 'claude', 'cursor']) {
-    const chunks = [];
-    const code = await runIntegration(
-      ['hook', '--harness', harness, '--workspace', workspace],
-      {
-        globalRoot: fixtureData.globalRoot,
-        skillsRoot: fixtureData.skillsRoot,
-        integrationPath: fixtureData.integrationPath,
-        target,
-        runner: async () => ({ code: 0, signal: null, stdout: JSON.stringify(state), stderr: '' }),
-        output: { write: (chunk) => chunks.push(String(chunk)) },
-      },
+  // The harness read path is the native `loam hook <harness>` command now;
+  // the shared Node integration no longer serves one at any spelling.
+  for (const argv of [
+    ['run', '--', 'check', 'versions', fixtureData.home],
+    ['hook', '--harness', 'claude', '--workspace', fixtureData.home],
+    ['hook', '--harness', 'opencode', '--workspace', fixtureData.home],
+  ]) {
+    await assert.rejects(
+      () => runIntegration(argv, { globalRoot: fixtureData.globalRoot }),
+      /usage: loam\.mjs status \| ingest-status/,
     );
-    assert.equal(code, 0);
-    contexts.push(chunks.join(''));
   }
-
-  assert.ok(contexts.every((context) => context.includes('<LOAM_IMPORTANT>')));
-  const runtimeCommand = formatNativeRuntimeCommand(fixtureData.runtimePath);
-  assert.ok(contexts.every((context) => context.includes(`Native runtime command: ${runtimeCommand}`)));
-  assert.deepEqual(new Set(contexts).size, 1);
   assert.equal(await readFile(join(fixtureData.skillsRoot, 'loam-using', 'SKILL.md'), 'utf8'), before);
 });
 
@@ -754,6 +765,7 @@ test('status rejects a correctly hashed runtime that fails bounded execution', a
     skillsRoot: fixtureData.skillsRoot,
     integrationPath: fixtureData.integrationPath,
     target,
+    env: fixtureData.env,
     runner: async () => ({ code: 1, signal: null, stdout: '', stderr: 'not executable' }),
     output: { write: (chunk) => chunks.push(String(chunk)) },
   });
@@ -765,13 +777,14 @@ test('status rejects a correctly hashed runtime that fails bounded execution', a
 test('status rejects a correctly hashed non-executable runtime', async (t) => {
   if (process.platform === 'win32') return t.skip('execute permissions are not portable on Windows');
   const fixtureData = await fixture();
-  await chmod(fixtureData.runtimePath, 0o600);
+  await chmod(fixtureData.storePath, 0o600);
   const chunks = [];
   const code = await runIntegration(['status'], {
     globalRoot: fixtureData.globalRoot,
     skillsRoot: fixtureData.skillsRoot,
     integrationPath: fixtureData.integrationPath,
     target,
+    env: fixtureData.env,
     output: { write: (chunk) => chunks.push(String(chunk)) },
   });
 
