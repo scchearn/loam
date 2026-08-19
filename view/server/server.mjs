@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import { assertInside } from '../../integration/paths.mjs';
 import { safeDetail } from '../../integration/runtime.mjs';
+import { buildSearchIndex as defaultBuildSearchIndex, search as runSearch } from './search.mjs';
 import { validateSnapshot } from './validate-snapshot.mjs';
 
 const CSP = [
@@ -86,7 +87,7 @@ export function createServer({
   publicRoot = fileURLToPath(new URL('../public/', import.meta.url)),
   initialSnapshot,
   refreshProducer,
-  buildSearchIndex = async () => null,
+  buildSearchIndex,
   stderr = process.stderr,
 } = {}) {
   if (!workspaceRoot) throw new Error('createServer requires workspaceRoot');
@@ -95,8 +96,17 @@ export function createServer({
     throw new Error(`initial snapshot failed schema validation: ${initialCheck.errors.join('; ')}`);
   }
 
+  const buildIndex = buildSearchIndex ?? ((snapshot) => defaultBuildSearchIndex(snapshot, { workspaceRoot }));
   const state = { snapshot: initialSnapshot, searchIndex: null };
   let refreshInFlight = null;
+  // Eagerly build the Search index from the initial snapshot so a fresh
+  // launch can search immediately, not only after the first refresh. A
+  // build failure just leaves search unavailable (503) rather than crashing.
+  let searchIndexReady = Promise.resolve(buildIndex(initialSnapshot))
+    .then((index) => { state.searchIndex = index; })
+    .catch((error) => {
+      stderr.write(`search index build failed: ${safeDetail(error?.message ?? error)}\n`);
+    });
 
   function findArtifact(path) {
     return state.snapshot.artifacts.find((entry) => entry.path === path);
@@ -126,7 +136,7 @@ export function createServer({
       }
       let index;
       try {
-        index = await buildSearchIndex(raw);
+        index = await buildIndex(raw);
       } catch (error) {
         sendJson(res, errorStatus(error), { error: 'refresh_index_failed', message: safeDetail(error?.message ?? error) });
         return;
@@ -134,6 +144,7 @@ export function createServer({
       // Swap snapshot and search index together: neither is visible until both succeeded.
       state.snapshot = raw;
       state.searchIndex = index;
+      searchIndexReady = Promise.resolve();
       sendEmpty(res, 204);
     })();
     try {
@@ -175,10 +186,22 @@ export function createServer({
     });
   }
 
-  async function handleSearch(req, res) {
-    // ponytail: real Search index ships in T10; until then every query is
-    // honestly unavailable rather than faked.
-    sendJson(res, 503, { error: 'search_unavailable' });
+  async function handleSearch(req, res, url) {
+    await searchIndexReady;
+    if (!state.searchIndex) return sendJson(res, 503, { error: 'search_unavailable' });
+
+    let results;
+    try {
+      results = runSearch(state.searchIndex, {
+        q: url.searchParams.get('q'),
+        kind: url.searchParams.get('kind') || undefined,
+        limit: url.searchParams.get('limit'),
+      });
+    } catch (error) {
+      if (Number(error?.status) === 400) return sendJson(res, 400, { error: 'invalid_query', message: safeDetail(error.message) });
+      return sendJson(res, 500, { error: 'search_failed', message: safeDetail(error?.message ?? error) });
+    }
+    sendJson(res, 200, { results });
   }
 
   async function handleStatic(req, res, pathname) {
@@ -227,7 +250,7 @@ export function createServer({
         if (url.pathname === '/api/snapshot' && req.method === 'GET') return handleSnapshot(req, res);
         if (url.pathname === '/api/refresh' && req.method === 'POST') return handleRefresh(req, res);
         if (url.pathname === '/api/document' && req.method === 'GET') return handleDocument(req, res, url);
-        if (url.pathname === '/api/search' && req.method === 'GET') return handleSearch(req, res);
+        if (url.pathname === '/api/search' && req.method === 'GET') return handleSearch(req, res, url);
         if (url.pathname.startsWith('/api/')) return sendJson(res, 404, { error: 'not_found' });
         if (req.method === 'GET' || req.method === 'HEAD') return handleStatic(req, res, url.pathname);
         return sendJson(res, 404, { error: 'not_found' });
