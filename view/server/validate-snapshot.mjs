@@ -7,6 +7,7 @@ const TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?[+-]\d{2}:\d{2
 const SHA256_RE = /^[0-9a-f]{64}$/;
 
 const STATUS_VALUES = new Set(['ready', 'degraded', 'not-configured']);
+const POSTURE_VALUES = new Set(['not-configured', 'at-risk', 'needs-review', 'healthy', 'unknown']);
 const CAPABILITY_STATE_VALUES = new Set(['ready', 'absent', 'unavailable', 'degraded', 'unknown']);
 const CAPABILITY_KEYS = ['wiki', 'code_graph', 'goals', 'work', 'checkpoints', 'git', 'qmd', 'search_corpus'];
 const ARTIFACT_KIND_VALUES = new Set([
@@ -35,6 +36,7 @@ const TOP_LEVEL_REQUIRED = [
   'schema_version',
   'generated_at',
   'status',
+  'posture',
   'workspace',
   'capabilities',
   'artifacts',
@@ -363,6 +365,10 @@ export function validateSnapshot(snapshot) {
 
   if (!STATUS_VALUES.has(snapshot.status)) {
     reporter.fail('$.status', `must be one of ${[...STATUS_VALUES].join(', ')}`);
+  }
+
+  if (!POSTURE_VALUES.has(snapshot.posture)) {
+    reporter.fail('$.posture', `must be one of ${[...POSTURE_VALUES].join(', ')}`);
   }
 
   if (!isPlainObject(snapshot.workspace)) {

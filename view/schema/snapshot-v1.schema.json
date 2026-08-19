@@ -10,6 +10,7 @@
     "schema_version",
     "generated_at",
     "status",
+    "posture",
     "workspace",
     "capabilities",
     "artifacts",
@@ -25,6 +26,10 @@
     "schema_version": { "const": 1 },
     "generated_at": { "$ref": "#/$defs/timestamp" },
     "status": { "enum": ["ready", "degraded", "not-configured"] },
+    "posture": {
+      "description": "Deterministic workspace trust verdict derived from the signal table (see specs/loam-view.md 'Signals and posture'). The frontend displays this value and never recalculates it.",
+      "enum": ["not-configured", "at-risk", "needs-review", "healthy", "unknown"]
+    },
     "workspace": {
       "type": "object",
       "additionalProperties": false,

@@ -139,9 +139,18 @@ fn view_inventory_sparse_workspace_is_not_configured_with_honest_capabilities() 
         snapshot.contains(r#""path":"AGENTS.md","kind":"guidance""#),
         "{snapshot}"
     );
-    assert!(snapshot.contains(
-        r#""relationships":[],"events":[],"metrics":{},"signals":[],"hints":[],"probes":[]"#
-    ));
+    // T6: no wiki substrate means metrics/signals/events/probes stay empty,
+    // but hints still carries the scaffold-wiki suggestion (see
+    // cli/tests/view_metrics.rs for the full T6 events/metrics/signals suite).
+    assert!(
+        snapshot.contains(r#""posture":"not-configured""#),
+        "{snapshot}"
+    );
+    assert!(
+        snapshot.contains(r#""relationships":[],"events":[],"metrics":{},"signals":[],"hints":[{"kind":"memory_missing""#),
+        "{snapshot}"
+    );
+    assert!(snapshot.contains(r#""probes":[]"#), "{snapshot}");
 
     assert_schema_valid(&snapshot);
 }
