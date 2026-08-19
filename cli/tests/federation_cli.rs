@@ -847,14 +847,6 @@ fn temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// Inject a deterministic git identity into a spawned command's environment.
-/// Enrollment reads `git config user.email/user.name`, and setup commits read
-/// the same identity — on CI, which has no ambient global gitconfig, both would
-/// otherwise resolve nothing and the token/auto-enroll path would refuse with
-/// `git-identity-required` instead of exercising the signer contact. `GIT_CONFIG_*`
-/// entries are parsed after every config file, so they win regardless of the
-/// host's global config: hermetic on CI and on a developer machine alike, and
-/// without mutating the real workspace's git config.
 /// A filesystem path as it appears inside JSON output.
 ///
 /// On Windows the path separator is the JSON escape character, so a raw path
@@ -884,6 +876,14 @@ fn json_needle_matches_what_the_runtime_encodes() {
     assert!(!encoded.contains(path), "{encoded}");
 }
 
+/// Inject a deterministic git identity into a spawned command's environment.
+/// Enrollment reads `git config user.email/user.name`, and setup commits read
+/// the same identity — on CI, which has no ambient global gitconfig, both would
+/// otherwise resolve nothing and the token/auto-enroll path would refuse with
+/// `git-identity-required` instead of exercising the signer contact. `GIT_CONFIG_*`
+/// entries are parsed after every config file, so they win regardless of the
+/// host's global config: hermetic on CI and on a developer machine alike, and
+/// without mutating the real workspace's git config.
 fn pin_git_identity(command: &mut Command) {
     command
         .env("GIT_CONFIG_COUNT", "2")
