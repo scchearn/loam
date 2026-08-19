@@ -87,7 +87,13 @@ export function createCopyPrompt(doc, { command, message }) {
   button.className = 'copy-prompt';
   button.dataset.tip = 'Copy prompt';
   button.dataset.copyPrompt = prompt;
-  button.setAttribute('aria-label', 'Copy a paste-ready prompt for your agent');
+  // A view can carry a dozen of these; an identical name on each one tells a
+  // screen-reader user nothing about which signal they are about to copy.
+  const purpose = String(message ?? '').trim();
+  button.setAttribute(
+    'aria-label',
+    purpose ? `Copy a paste-ready prompt for your agent: ${purpose}` : 'Copy a paste-ready prompt for your agent',
+  );
   button.append(icon(doc, 'i-sparkle'));
 
   button.addEventListener('click', async () => {

@@ -164,6 +164,12 @@ describe('Pulse copy-prompt affordance', () => {
         controls[0].dataset.copyPrompt,
         `Run loam ${command} to address: ${message}`,
       );
+      // Identical names across a dozen controls would tell a screen-reader user
+      // nothing about which signal they are copying.
+      assert.equal(
+        controls[0].getAttribute('aria-label'),
+        `Copy a paste-ready prompt for your agent: ${message}`,
+      );
     }
   });
 
