@@ -241,7 +241,10 @@ impl TrustFailure {
     /// finding that out is most of the debugging.
     pub fn described(&self) -> String {
         match &self.path {
-            Some(path) => format!("{} ({path})", self.reason),
+            // Colon-separated rather than parenthesised: the caller already
+            // wraps the whole detail in parentheses, and nesting them reads
+            // worse than the flat `rung: fault: file` the reader ends up with.
+            Some(path) => format!("{}: {path}", self.reason),
             None => self.reason.to_owned(),
         }
     }

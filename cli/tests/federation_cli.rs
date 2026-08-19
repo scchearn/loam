@@ -626,8 +626,11 @@ fn an_unusable_ssl_cert_file_names_the_trust_store_not_the_signer() {
         // file the operator still has to work out which `SSL_CERT_FILE` a
         // shell had exported, which is most of the debugging.
         let named = path.to_str().unwrap();
+        let encoded = json_needle(named);
         assert!(
-            stdout.contains("ssl-cert-file") && stdout.contains(expected) && stdout.contains(named),
+            stdout.contains("ssl-cert-file")
+                && stdout.contains(expected)
+                && stdout.contains(&encoded),
             "the detail must name the rung, `{expected}`, and `{named}`: {stdout}"
         );
     }
@@ -852,6 +855,35 @@ fn temp_dir(label: &str) -> PathBuf {
 /// entries are parsed after every config file, so they win regardless of the
 /// host's global config: hermetic on CI and on a developer machine alike, and
 /// without mutating the real workspace's git config.
+/// A filesystem path as it appears inside JSON output.
+///
+/// On Windows the path separator is the JSON escape character, so a raw path
+/// never appears verbatim in a JSON body even when the runtime named it
+/// correctly. An assertion that compared the raw path passed on both Unix
+/// runners and failed only on windows-2022, where the behaviour was right and
+/// the test was wrong. Every path asserted against JSON output goes through
+/// here so that cannot happen twice.
+fn json_needle(path: &str) -> String {
+    path.replace('\\', "\\\\")
+}
+
+/// The helper has to agree with the encoder it is standing in for. Checked on
+/// every platform, not just the one that produces paths needing it: the
+/// encoder is the same everywhere, so a Unix run catches a wrong helper before
+/// windows-2022 has to.
+#[test]
+fn json_needle_matches_what_the_runtime_encodes() {
+    let path = "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\bundle.pem";
+    let encoded = loam::json::Value::String(path.to_owned()).to_json();
+    assert!(
+        encoded.contains(&json_needle(path)),
+        "needle {} does not occur in {encoded}",
+        json_needle(path)
+    );
+    // And the raw path does not, which is the trap this exists for.
+    assert!(!encoded.contains(path), "{encoded}");
+}
+
 fn pin_git_identity(command: &mut Command) {
     command
         .env("GIT_CONFIG_COUNT", "2")
