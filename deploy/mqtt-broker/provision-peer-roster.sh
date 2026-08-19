@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Per-project peer-roster provisioning (T13). Implements ROSTER-CONTRACT.md.
+# Per-project peer-roster provisioning (T13). Implements docs/federation/ROSTER-CONTRACT.md.
 # The connector reads the written file as its injected PeerRoster (D-T1).
 # Requires: jq.
 #

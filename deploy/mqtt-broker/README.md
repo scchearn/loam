@@ -31,13 +31,13 @@ Two **different** CAs, one per direction:
 | `RUNBOOK.md` / `ACCEPTANCE.md` | ordered procedure + T2/T9 acceptance map | T8 |
 | `acceptance-gate.sh` | live T2/T9 probe (host-gated) | T9 |
 | `preflight.sh` / `postflight-assert.sh` | live-host service-integrity | T11 |
-| `resolve-credentials.sh` + `RESOLUTION-CONTRACT.md` | credential resolution (seam A) | T12 |
-| `provision-peer-roster.sh` + `ROSTER-CONTRACT.md` + `peer-roster.example.json` | peer roster (seam B) | T13 |
-| `provision-instance-id.sh` + `INSTANCE-ID-CONTRACT.md` | instance_id unification (seam C) | T14 |
+| `resolve-credentials.sh` + [`RESOLUTION-CONTRACT.md`](../../docs/federation/RESOLUTION-CONTRACT.md) | credential resolution (seam A) | T12 |
+| `provision-peer-roster.sh` + [`ROSTER-CONTRACT.md`](../../docs/federation/ROSTER-CONTRACT.md) + `peer-roster.example.json` | peer roster (seam B) | T13 |
+| `provision-instance-id.sh` + [`INSTANCE-ID-CONTRACT.md`](../../docs/federation/INSTANCE-ID-CONTRACT.md) | instance_id unification (seam C) | T14 |
 
 ## Contracts for the connector-side wiring slice
 
-`RESOLUTION-CONTRACT.md`, `ROSTER-CONTRACT.md`, and `INSTANCE-ID-CONTRACT.md` are the
+The contract docs (in [`docs/federation/`](../../docs/federation/)) are the
 interface the connector-side operational-wiring slice implements to. They are the
 authority for the two halves not disagreeing.
 

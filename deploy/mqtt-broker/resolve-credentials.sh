@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Credential resolution provisioning (T12). Implements RESOLUTION-CONTRACT.md.
+# Credential resolution provisioning (T12). Implements docs/federation/RESOLUTION-CONTRACT.md.
 # Provisioning side STORES; the connector side LOOKS UP with the identical keys.
 #
 # Backends (chosen by OS, overridable via LOAM_SECRET_BACKEND):

@@ -29,8 +29,8 @@ _Filled by T4._ Create the org CA (`pki/init-ca.sh`). The CA config now carries
 `copy_extensions = copy` so the auto-enrollment signer can issue a machine's
 CSR **verbatim** (CN + its own SAN). Manual per-node issuance remains available
 via `pki/issue-client.sh` alongside it; the auto-enrollment path (step 3.5) is
-what a new machine uses. See `RESOLUTION-CONTRACT.md` and
-`INSTANCE-ID-CONTRACT.md`.
+what a new machine uses. See `docs/federation/RESOLUTION-CONTRACT.md` and
+`docs/federation/INSTANCE-ID-CONTRACT.md` at the repo root.
 
 ## 3.5 Auto-enrollment signer (specs/federation-auto-enrollment.md)
 

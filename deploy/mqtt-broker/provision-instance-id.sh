@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# instance_id unification provisioning (T14). Implements INSTANCE-ID-CONTRACT.md.
+# instance_id unification provisioning (T14). Implements docs/federation/INSTANCE-ID-CONTRACT.md.
 # Mints ONE stable instance_id per node and EMITS it for the enrollment step to pin
 # into EnrolledRow.instance_id (the single source the connector reads). No sidecar.
 #

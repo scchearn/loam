@@ -33,7 +33,14 @@ dryrun() {
     certbot-deploy-hook.sh pki/init-ca.sh pki/issue-client.sh pki/revoke-client.sh
     pki/obtain-server-cert.sh pki/selfcheck.sh
     enroll/signer.py enroll/test_signer.py enroll/install-signer.sh enroll/loam-enroll-signer.service
-    RESOLUTION-CONTRACT.md ROSTER-CONTRACT.md INSTANCE-ID-CONTRACT.md IDENTITY-CONTRACT.md ACCEPTANCE.md"
+    ACCEPTANCE.md"
+  # The federation contract docs the provisioning scripts implement live in
+  # docs/federation/ at the repo root (#166), so the gate checks them there.
+  local repo_root contract
+  repo_root="$(cd "$HERE/../.." && pwd)"
+  for contract in RESOLUTION-CONTRACT.md ROSTER-CONTRACT.md INSTANCE-ID-CONTRACT.md IDENTITY-CONTRACT.md ENROLLMENT-DESCRIPTOR.md; do
+    [ -e "$repo_root/docs/federation/$contract" ] || { echo "MISSING: docs/federation/$contract"; ok=0; }
+  done
   local f
   for f in $need; do
     [ -e "$HERE/$f" ] || { echo "MISSING: $f"; ok=0; }
