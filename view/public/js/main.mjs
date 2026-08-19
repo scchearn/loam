@@ -8,6 +8,7 @@ import { initPulse } from './views/pulse.mjs';
 import { initChronicle } from './views/chronicle.mjs';
 import { initWorkStream } from './views/workstream.mjs';
 import { initAtlas } from './views/atlas.mjs';
+import { initStewardship } from './views/stewardship.mjs';
 
 // The Inspector is a top-level overlay, not part of a view, so it wires itself
 // to the static markup once and the area views just call openInspector().
@@ -18,5 +19,6 @@ initPulse({ root: document });
 initWorkStream({});
 initChronicle({});
 initAtlas();
+initStewardship({ root: document });
 
 boot();
