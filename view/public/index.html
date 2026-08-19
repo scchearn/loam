@@ -140,6 +140,28 @@
     </main>
   </div>
 
+  <!--
+    Inspector: a top-level overlay, deliberately a sibling of .app-shell and not
+    a grid column, so opening it cannot reflow the view beneath (DESIGN.md §5).
+  -->
+  <div class="inspector-scrim" data-inspector-scrim aria-hidden="true"></div>
+
+  <aside
+    class="inspector"
+    data-inspector
+    role="dialog"
+    aria-modal="true"
+    aria-hidden="true"
+    aria-labelledby="inspector-title"
+    tabindex="-1"
+  >
+    <div class="inspector-head">
+      <span id="inspector-title">Inspector</span>
+      <button class="dialog-close" type="button" data-inspector-close aria-label="Close Inspector">&#215;</button>
+    </div>
+    <div class="inspector-body" data-inspector-body></div>
+  </aside>
+
   <dialog class="query-dialog" data-query-dialog aria-labelledby="query-title">
     <div class="dialog-head">
       <h2 id="query-title">Query</h2>

@@ -333,6 +333,8 @@ describe('served shell', () => {
         ['/js/app.mjs', /javascript/],
         ['/js/store.mjs', /javascript/],
         ['/js/query.mjs', /javascript/],
+        ['/js/inspector.mjs', /javascript/],
+        ['/js/summary.mjs', /javascript/],
         ['/loam.svg', /image\/svg/],
       ]) {
         const asset = await realFetch(`${base}${path}`);
