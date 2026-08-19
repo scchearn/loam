@@ -5547,11 +5547,7 @@ mod connect_tests {
                     .to_ascii_lowercase()
                     .contains(&fail.to_ascii_lowercase())
                 {
-                    return Err(ServiceError::ManagerFailed {
-                        command: line,
-                        code: 1,
-                        detail: String::new(),
-                    });
+                    return Err(ServiceError::ManagerFailed { code: 1 });
                 }
             }
             Ok(ManagerOutput::ok())
@@ -5813,11 +5809,7 @@ mod lifecycle_tests {
             let line = format!("{} {}", command.program, command.args.join(" "));
             self.recorded.borrow_mut().push(line.clone());
             if self.fail_all {
-                return Err(ServiceError::ManagerFailed {
-                    command: line,
-                    code: 1,
-                    detail: String::new(),
-                });
+                return Err(ServiceError::ManagerFailed { code: 1 });
             }
             Ok(ManagerOutput::ok())
         }

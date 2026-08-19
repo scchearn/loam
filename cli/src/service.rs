@@ -90,22 +90,20 @@ impl ManagerOutput {
 pub enum ServiceError {
     Io(String),
     InvalidRuntimePath,
-    /// A manager step reported a nonzero status where the lifecycle required
-    /// success. Names the exact command and the manager's own message, so the
-    /// failure is diagnosable without re-running it by hand (#128).
     ManagerFailed {
-        command: String,
         code: i32,
-        detail: String,
     },
     NotUtf8,
     /// A manager subprocess did not exit within its bound and was killed. Names
     /// the full command — not just the program — because "launchctl hung" does
-    /// not say *which* launchctl invocation hung, and the three steps of an
-    /// activation wedge for entirely different reasons (#124).
+    /// not say *which* launchctl invocation hung, and the steps of an
+    /// activation wedge for entirely different reasons (#124). Carries whatever
+    /// the manager managed to write before it wedged: this is the message both
+    /// #128 and #124 were filed about, and a partial diagnosis beats none.
     Timeout {
         command: String,
         seconds: u64,
+        detail: String,
     },
     /// The start step ran, but the service was observably dead afterwards: the
     /// manager never loaded it, or it is cycling on a nonzero exit. Carries the
@@ -124,23 +122,21 @@ impl std::fmt::Display for ServiceError {
         match self {
             ServiceError::Io(why) => write!(f, "service io error: {why}"),
             ServiceError::InvalidRuntimePath => write!(f, "runtime path is not absolute/UTF-8"),
-            ServiceError::ManagerFailed {
+            ServiceError::ManagerFailed { code } => write!(f, "service manager exited {code}"),
+            ServiceError::NotUtf8 => write!(f, "path is not representable as UTF-8"),
+            ServiceError::Timeout {
                 command,
-                code,
+                seconds,
                 detail,
             } => {
-                write!(f, "service manager exited {code}: `{command}`")?;
-                if !detail.is_empty() {
-                    write!(f, " — {detail}")?;
-                }
-                Ok(())
-            }
-            ServiceError::NotUtf8 => write!(f, "path is not representable as UTF-8"),
-            ServiceError::Timeout { command, seconds } => {
                 write!(
                     f,
                     "service manager did not exit within {seconds}s and was killed: `{command}`"
-                )
+                )?;
+                if !detail.is_empty() {
+                    write!(f, " — it had written: {detail}")?;
+                }
+                Ok(())
             }
             ServiceError::StartRefused {
                 command,
@@ -226,11 +222,15 @@ fn run_bounded(
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
-                    // Reap so the killed child does not linger as a zombie.
+                    // Reap so the killed child does not linger as a zombie —
+                    // and only then read the capture, so anything the manager
+                    // wrote on its way to wedging is in the error rather than
+                    // discarded with the scratch file.
                     let _ = child.wait();
                     return Err(ServiceError::Timeout {
                         command: command_line(command),
                         seconds: timeout.as_secs(),
+                        detail: capture.take().map(ScratchCapture::read).unwrap_or_default(),
                     });
                 }
                 std::thread::sleep(MANAGER_POLL);
@@ -243,10 +243,14 @@ fn run_bounded(
 /// A private scratch file that collects one manager subprocess's two output
 /// streams, read back once the child has exited and removed on drop.
 ///
-/// `create_new` is the whole trust story: the temp dir is world-writable, so the
-/// file is only ever created fresh — an attacker-planted path (a symlink at the
-/// name we picked) makes the create fail and capture degrade to none, never an
-/// append into someone else's file.
+/// The temp dir is world-writable, so the file has to defend itself at both
+/// ends. `create_new` means it is only ever created fresh — an attacker-planted
+/// path (a symlink at the name we picked) makes the create fail and capture
+/// degrade to none, never an append into someone else's file. Mode `0600` means
+/// nobody else can read what lands in it: `launchctl print` dumps a job's whole
+/// `EnvironmentVariables` dict, and while nothing secret goes in there today
+/// (the renderer drops the one dead credential switch), a capture file that is
+/// world-readable by default is a leak waiting for the first variable that is.
 struct ScratchCapture {
     path: PathBuf,
     file: std::fs::File,
@@ -265,12 +269,14 @@ impl ScratchCapture {
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        let file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .ok()?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).ok()?;
         Some(ScratchCapture { path, file })
     }
 
@@ -801,8 +807,13 @@ pub fn disable_stop<R: CommandRunner>(
 }
 
 /// How long the start confirmation watches the manager. Long enough for launchd
-/// to record a job that dies on spawn (the exit-78 respawn cycle), short enough
-/// that it is invisible next to connect's own broker probe.
+/// to record a job that dies on spawn (the exit-78 respawn cycle).
+///
+/// This is a real cost, not a free one: only positive evidence ends the watch
+/// early, so an activation the manager reports nothing about — the inert
+/// connector on an empty registry, on either platform — spends the whole budget
+/// and about six manager subprocesses. That is the price of not reporting a
+/// dead connector as connected, and it is paid once per activation.
 const START_CONFIRM_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How often the confirmation asks the manager. Coarse on purpose: every probe
@@ -827,6 +838,16 @@ enum StartVerdict {
 /// moment the service is observably dead. A probe the runner cannot even execute
 /// is not evidence of death — the start itself succeeded — so a hard runner
 /// error ends the watch quietly rather than failing an activation on it.
+///
+/// Refusing here is not free for the caller, and that is deliberate: connect
+/// compensates a refused activation by removing the enrollment and, on an
+/// otherwise-empty registry, stopping the service. So a verdict of `Dead` has
+/// to mean the service this activation started is not coming up on its own —
+/// which is why each platform's verdict reads "currently up" before it reads
+/// "last run failed". The one case that is still refused while the manager
+/// would have retried is a unit that failed inside this window and is sitting
+/// in systemd's `RestartSec` gap: it failed the start we just performed, and a
+/// connected outcome over it is exactly what #101 is about.
 fn confirm_started<R: CommandRunner>(
     runner: &R,
     ctx: &ServiceContext,
@@ -893,15 +914,24 @@ fn start_probe_command(_ctx: &ServiceContext) -> ManagerCommand {
     )
 }
 
+/// `ActiveState` before `Result`, for the reason spelled out on the launchd
+/// arm: the two are reported together, and a unit systemd has already restarted
+/// after a watchdog exit is `active` while still carrying the failing `Result`.
+/// Refusing there would have connect roll the enrollment back and
+/// `disable --now` a unit that had recovered.
+///
+/// `Result` is reset when a unit is started, and this runs immediately after
+/// `enable --now`, so a non-success result belongs to the start this activation
+/// just performed rather than to some earlier run.
 #[cfg(target_os = "linux")]
 fn start_verdict(output: &ManagerOutput) -> StartVerdict {
+    if unit_property(&output.detail, "ActiveState") == Some("active") {
+        return StartVerdict::Alive;
+    }
     if let Some(result) = unit_result(&output.detail) {
         if result != "success" {
             return StartVerdict::Dead(format!("the unit's result is {result}"));
         }
-    }
-    if unit_property(&output.detail, "ActiveState") == Some("active") {
-        return StartVerdict::Alive;
     }
     StartVerdict::NoFailure
 }
@@ -963,8 +993,11 @@ fn disable_stop_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
 fn launchagent_enable_start_steps(plist: &str, domain: &str, service: &str) -> Vec<ManagerStep> {
     vec![
         step(ManagerCommand::new("launchctl", &["bootout", service])),
-        // `disable` writes a persistent override that makes a later `bootstrap`
-        // fail outright, so clearing it has to precede the load, not follow it.
+        // Defence against an override loam never writes: an operator's
+        // `launchctl disable` on this label persists in launchd's own database
+        // and makes a bootstrap fail outright, and only `enable` clears it.
+        // (loam's disable is `bootout` alone, which sets no override.) Clearing
+        // it has to precede the load, not follow it.
         step(ManagerCommand::new("launchctl", &["enable", service])),
         // Loads the rewritten definition and, through its `RunAtLoad`, starts
         // it — the equivalent of systemd's `enable --now` and schtasks' `/Run`,
@@ -990,20 +1023,35 @@ fn start_probe_command(_ctx: &ServiceContext) -> ManagerCommand {
     ManagerCommand::new("launchctl", &["print", &launchd::gui_service()])
 }
 
-/// launchd's own job dump is the evidence. A print that fails means the job is
-/// not in the domain at all — the start could not have worked. A print that
-/// reports a nonzero last exit means the job ran and died, which with
-/// `KeepAlive`/`SuccessfulExit=false` is the respawn cycle that reported a
-/// connected outcome over a dead connector (#101, observed last exit 78).
+/// launchd's own job dump is the evidence, and the order the three signals are
+/// read in is the whole correctness of this function.
+///
+/// `state` comes first. launchd reports the current state and the last exit in
+/// the SAME dump, so a job that exited nonzero and was respawned by
+/// `KeepAlive`/`SuccessfulExit=false` carries `state = running` *and*
+/// `last exit code = 75` together — that pair is the connector's liveness
+/// watchdog self-healing exactly as designed. Reading the exit first calls that
+/// recovered job dead, and the caller does not merely misreport it: connect
+/// compensates a refused activation by deleting the enrollment row and, with
+/// the registry now empty, booting the job out. A running connector would be
+/// torn down by the check meant to protect it.
+///
+/// Only once the job is not running does a nonzero last exit mean death — and
+/// it means it unambiguously here, because activation boots the old job out and
+/// bootstraps a fresh registration, so any exit this print reports belongs to
+/// the instance we just started. That is #101's dead-on-arrival case (observed
+/// last exit 78, the job cycling and never serving).
+///
+/// A print that fails at all is reported with launchctl's own words rather than
+/// a guess: it exits nonzero for an unreachable or unpermitted domain too, not
+/// only for a service it cannot find.
 #[cfg(target_os = "macos")]
 fn start_verdict(output: &ManagerOutput) -> StartVerdict {
     if output.code != 0 {
-        return StartVerdict::Dead("the job is not loaded in the domain".to_owned());
-    }
-    if let Some(status) = last_exit_status(&output.detail) {
-        if status != 0 {
-            return StartVerdict::Dead(format!("the job's last exit status is {status}"));
-        }
+        return StartVerdict::Dead(observed_detail(
+            output,
+            "the job could not be printed in the domain",
+        ));
     }
     if output
         .detail
@@ -1012,7 +1060,25 @@ fn start_verdict(output: &ManagerOutput) -> StartVerdict {
     {
         return StartVerdict::Alive;
     }
+    if let Some(status) = last_exit_status(&output.detail) {
+        if status != 0 {
+            return StartVerdict::Dead(format!(
+                "the job is not running and its last exit status is {status}"
+            ));
+        }
+    }
     StartVerdict::NoFailure
+}
+
+/// What the manager actually said, falling back to the caller's description
+/// only when it said nothing. An error built from a manager observation should
+/// carry the observation, not a confident guess at what it meant.
+fn observed_detail(output: &ManagerOutput, fallback: &str) -> String {
+    if output.detail.is_empty() {
+        format!("{fallback} (exit {})", output.code)
+    } else {
+        format!("{} (exit {})", output.detail, output.code)
+    }
 }
 
 /// The last exit status out of a `launchctl print` dump, or `None` when the job
@@ -1066,7 +1132,7 @@ fn start_probe_command(ctx: &ServiceContext) -> ManagerCommand {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn start_verdict(output: &ManagerOutput) -> StartVerdict {
     if output.code != 0 {
-        StartVerdict::Dead("the task is not registered".to_owned())
+        StartVerdict::Dead(observed_detail(output, "the task could not be queried"))
     } else {
         StartVerdict::NoFailure
     }
@@ -1158,6 +1224,7 @@ mod tests {
             Err(ServiceError::Timeout {
                 command: "sleep 30".to_owned(),
                 seconds: 0,
+                detail: String::new(),
             }),
             "a subprocess past its bound must surface a typed Timeout naming the whole command"
         );
@@ -1168,6 +1235,28 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "the bound must fire near its deadline, not wait for the child to exit: {elapsed:?}"
+        );
+    }
+
+    // Whatever the manager wrote before it wedged is the only diagnosis a
+    // timeout can offer, and it used to be dropped with the scratch file — in
+    // the exact error both #128 and #124 were reported as.
+    #[cfg(unix)]
+    #[test]
+    fn a_wedged_manager_subprocess_still_reports_what_it_had_written() {
+        let noisy = ManagerCommand::new("sh", &["-c", "echo halfway-there; sleep 30"]);
+        let error = run_bounded(&noisy, std::time::Duration::from_millis(300))
+            .expect_err("the bound must fire");
+        let ServiceError::Timeout { detail, .. } = &error else {
+            panic!("a wedge is a Timeout, got {error:?}");
+        };
+        assert!(
+            detail.contains("halfway-there"),
+            "the partial output must survive the kill: {detail:?}"
+        );
+        assert!(
+            error.to_string().contains("halfway-there"),
+            "and it must be in the rendered message: {error}"
         );
     }
 
@@ -1354,6 +1443,90 @@ mod tests {
             None
         );
         assert_eq!(last_exit_status("state = running\n"), None);
+    }
+
+    /// The verdict itself, not just the parser underneath it. The dangerous
+    /// dump is the one carrying BOTH signals: launchd reports the current state
+    /// and the last exit together, so the connector's watchdog exit followed by
+    /// a `KeepAlive` respawn looks like `state = running` next to
+    /// `last exit code = 75`. Reading the exit first calls that recovered job
+    /// dead, and a refused activation is not cosmetic — connect rolls the
+    /// enrollment back and boots the job out.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_respawned_job_is_alive_even_though_its_last_exit_failed() {
+        let respawned = ManagerOutput {
+            code: 0,
+            detail: "\tstate = running\n\tlast exit code = 75\n".into(),
+        };
+        assert!(
+            matches!(start_verdict(&respawned), StartVerdict::Alive),
+            "a running job that launchd already respawned must not be called dead"
+        );
+
+        // Not running AND a nonzero last exit is the real dead-on-arrival case:
+        // activation bootstraps a fresh registration, so that exit belongs to
+        // the instance this activation just started (#101).
+        let dead = ManagerOutput {
+            code: 0,
+            detail: "\tstate = not running\n\tlast exit code = 78\n".into(),
+        };
+        let StartVerdict::Dead(observed) = start_verdict(&dead) else {
+            panic!("a job that is down after a nonzero exit is dead");
+        };
+        assert!(observed.contains("78"), "{observed}");
+
+        // The inert connector: down, exited cleanly, nothing to refuse.
+        let inert = ManagerOutput {
+            code: 0,
+            detail: "\tstate = not running\n\tlast exit code = 0\n".into(),
+        };
+        assert!(matches!(start_verdict(&inert), StartVerdict::NoFailure));
+    }
+
+    /// A failed probe reports what launchctl said, not a guess at what it meant:
+    /// `print` exits nonzero for an unreachable or unpermitted domain too, and
+    /// the captured words are right there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_probe_that_fails_carries_the_managers_own_words() {
+        let refused = ManagerOutput {
+            code: 113,
+            detail: "Could not find service \"io.loam.connector\" in domain for uid: 501".into(),
+        };
+        let StartVerdict::Dead(observed) = start_verdict(&refused) else {
+            panic!("a print that fails means the start could not have worked");
+        };
+        assert!(
+            observed.contains("Could not find service") && observed.contains("113"),
+            "the verdict must carry launchctl's message and its status: {observed}"
+        );
+    }
+
+    /// The Linux mirror of the same ordering rule: a unit systemd has already
+    /// restarted is `active` while still carrying the failing `Result`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_restarted_unit_is_alive_even_though_its_last_result_failed() {
+        let restarted = ManagerOutput {
+            code: 0,
+            detail: "Result=exit-code\nActiveState=active\n".into(),
+        };
+        assert!(
+            matches!(start_verdict(&restarted), StartVerdict::Alive),
+            "a unit that is active again must not be called dead"
+        );
+        let failed = ManagerOutput {
+            code: 0,
+            detail: "Result=exit-code\nActiveState=failed\n".into(),
+        };
+        assert!(matches!(start_verdict(&failed), StartVerdict::Dead(_)));
+        // Inert: stopped cleanly, nothing failed.
+        let inert = ManagerOutput {
+            code: 0,
+            detail: "Result=success\nActiveState=inactive\n".into(),
+        };
+        assert!(matches!(start_verdict(&inert), StartVerdict::NoFailure));
     }
 
     #[test]
