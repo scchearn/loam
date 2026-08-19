@@ -95,6 +95,10 @@ export async function enableIntegration(entry, ctx) {
       extraDirs: entry.tool.dirs?.(home, ctx.env || process.env) || [],
     });
     if (!resolved.present) {
+      // The reason lands after this block (configure.mjs writes the failure
+      // detail), so without a header the user's first sight of the refusal is a
+      // wall of install commands with nothing saying why they are there.
+      stepDetail(output, `${entry.tool.binName} is not installed — loam detects it but never installs it. Install it with one of these, then re-run:`);
       for (const recipe of entry.tool.install || []) {
         stepDetail(output, `${recipe.label}: ${recipe.command}`);
       }

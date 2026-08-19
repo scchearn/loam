@@ -372,6 +372,11 @@ test('enabling hcom when it is absent refuses with the per-OS install recipes an
   assert.match(text, /hcom-installer\.sh/);
   assert.match(text, /hcom-installer\.ps1/);
   assert.match(text, /uv tool install hcom/);
+  // The reason comes BEFORE the commands: a wall of install lines with no
+  // framing, explained only afterwards, is the shape #163 is sweeping out.
+  const why = text.indexOf('is not installed');
+  const how = text.indexOf('brew install');
+  assert.ok(why >= 0 && why < how, `the refusal must say why before it says how:\n${text}`);
   // A refusal never half-enables: no health spawn, no ledger, no config.
   assert.equal(tool.calls.length, 0, 'nothing to health-check when nothing resolved');
   const ledger = await readLedger(fx.globalRoot);
@@ -397,6 +402,26 @@ test('enabling hcom found on PATH records it as unmanaged and registers no MCP',
   // The ledger records ownership of exactly nothing but the record itself.
   const ledger = await readLedger(fx.globalRoot);
   assert.deepEqual(ledger.integrations.hcom, { mcp: {}, tool: { managed: false, pkg: null, path: binPath } });
+});
+
+test('a chatty version answer is reduced to one short line', async () => {
+  // doctor prints one line per integration and the ledger records the string,
+  // so a tool that answers with a build banner must not be able to reshape
+  // either. The version is the tool's own words — untrusted for shape.
+  const fx = await installedHome();
+  const binDir = join(fx.home, 'bin');
+  await fakeHcom(binDir);
+  const runner = async () => ({
+    code: 0,
+    stdout: `hcom 0.7.25\nbuild: abc\n${'x'.repeat(200)}\n`,
+    stderr: '',
+  });
+  const result = await catalogEntry('hcom').enable(ctxFor(fx, outputCapture(), { toolRunner: runner, env: { PATH: binDir } }));
+  assert.equal(result.ready, true);
+
+  const state = await catalogEntry('hcom').verify(ctxFor(fx, outputCapture(), { toolRunner: runner, env: { PATH: binDir } }));
+  assert.equal(state.tool.version, 'hcom 0.7.25');
+  assert.ok(!state.tool.version.includes('\n'), 'a version is one line');
 });
 
 test('hcom is detected in the installer default directory and under HCOM_INSTALL_DIR, off PATH', async () => {

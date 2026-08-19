@@ -108,14 +108,23 @@ export async function resolvePathTool(binName, { platform = process.platform, en
   return null;
 }
 
+// How much of a version answer is kept. Doctor prints one line per integration
+// and the ledger records the string, so a tool that answers with a build banner,
+// a git sha and a deprecation notice must not be able to reshape either. Long
+// enough for any real "<name> <semver> (<sha>)"; short enough to stay a line.
+const MAX_VERSION = 80;
+
 // Run the entry's health check against a resolved absolute path. Returns
-// { ok, version, detail }.
+// { ok, version, detail }. `version` is the tool's own words, so it is trimmed
+// to its first line and capped — see MAX_VERSION.
 async function healthCheck({ binPath, healthArgs, runner, platform, timeoutMs }) {
   const result = await runner({ command: binPath, args: healthArgs, timeoutMs, platform });
   if (!result || result.code !== 0) {
     return { ok: false, detail: (result?.stderr || result?.category || 'health check failed').trim() };
   }
-  return { ok: true, version: `${result.stdout || ''}${result.stderr || ''}`.trim() };
+  const answer = `${result.stdout || ''}${result.stderr || ''}`.trim();
+  const line = answer.split(/\r?\n/, 1)[0].trim();
+  return { ok: true, version: line.length > MAX_VERSION ? `${line.slice(0, MAX_VERSION)}…` : line };
 }
 
 // Resolve a tool for an integration: managed copy first, then PATH, then the
