@@ -708,6 +708,130 @@ fn connect_with_token_but_no_certificate_fails_fast_on_an_unreachable_signer() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The installed runtime layout `installed_global_root()` probes for:
+/// `<root>/bin/<version>/<target>/loam[.exe]` beside an `install.json`. The
+/// target directory and the executable name follow the host, so the probe
+/// resolves the fixture on every supported platform — a hardcoded
+/// linux-musl/`loam` fixture is invisible to the Windows probe (#121).
+/// Returns the root and the installed executable to spawn.
+fn installed_layout(label: &str) -> (PathBuf, PathBuf) {
+    let root = temp_dir(label);
+    let target_dir = root
+        .join("bin")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join(host_target());
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let executable = target_dir.join(if cfg!(windows) { "loam.exe" } else { "loam" });
+    std::fs::copy(binary(), &executable).unwrap();
+    std::fs::write(root.join("install.json"), "{}\n").unwrap();
+    (root, executable)
+}
+
+/// The install-layout target directory for the host. The probe only checks the
+/// name against its supported set, but naming the host's own target keeps the
+/// fixture honest about the layout an install would actually produce.
+fn host_target() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "x86_64-pc-windows-msvc"
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "x86_64") {
+            "x86_64-apple-darwin"
+        } else {
+            "aarch64-apple-darwin"
+        }
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64-unknown-linux-musl"
+    } else {
+        "x86_64-unknown-linux-musl"
+    }
+}
+
+/// `status` resolves the installed global root the same way `connect` does, so
+/// a machine enrolled by a bare `connect` can read its own state without
+/// re-typing the root it never typed in the first place (#92).
+#[test]
+fn bare_status_uses_the_installed_global_root() {
+    let (root, executable) = installed_layout("status-installed-root");
+    let output = Command::new(&executable)
+        .args(["federation", "status", "--json"])
+        // Rung 1 of the registry ladder: hermetic, and never the developer's
+        // own store.
+        .env("LOAM_CONFIG_DIR", root.join("config"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn installed loam");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code().unwrap_or(-1),
+        0,
+        "status inside an install needs no --global-root: {stdout} {stderr}"
+    );
+    assert!(
+        stdout.contains("\"enrollments\":[]"),
+        "status reports the (empty) inventory: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The override still wins over the inferred root, and it is still the only
+/// root a non-installed runtime has.
+#[test]
+fn status_outside_an_install_still_requires_a_global_root() {
+    let output = Command::new(binary())
+        .args(["federation", "status"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn loam");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code().unwrap_or(-1), 64, "{stderr}");
+    assert!(stderr.contains("--global-root is required"), "{stderr}");
+}
+
+/// `disconnect` shares the resolution: an unenrolled workspace is reported as
+/// such, not refused for a missing flag (#92).
+#[test]
+fn bare_disconnect_uses_the_installed_global_root() {
+    let (root, executable) = installed_layout("disconnect-installed-root");
+    let workspace = temp_dir("disconnect-installed-workspace");
+    // The workspace key is a Git physical identity; a bare directory is refused
+    // before the root ever matters.
+    git(&["init", "--quiet", workspace.to_str().unwrap()], None);
+    let output = Command::new(&executable)
+        .args(["federation", "disconnect"])
+        .arg(&workspace)
+        .arg("--json")
+        .env("LOAM_CONFIG_DIR", root.join("config"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn installed loam");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code().unwrap_or(-1),
+        0,
+        "disconnect inside an install needs no --global-root: {stdout} {stderr}"
+    );
+    assert!(
+        stdout.contains("\"local\":\"not-enrolled\""),
+        "a dormant machine disconnects to not-enrolled: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn disconnect_outside_an_install_still_requires_a_global_root() {
+    let output = Command::new(binary())
+        .args(["federation", "disconnect", env!("CARGO_MANIFEST_DIR")])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn loam");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code().unwrap_or(-1), 64, "{stderr}");
+    assert!(stderr.contains("--global-root is required"), "{stderr}");
+}
+
 // Skipped on Windows: the fixture builds the installed layout under a hardcoded
 // linux-musl target with a `loam` (no `.exe`) binary, so the Windows install
 // probe (host target + `loam.exe`) never finds it; unvalidated on Windows. See

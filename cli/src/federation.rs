@@ -29,8 +29,9 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
                 "Usage:\n  \
                  loam federation connect <workspace> <broker> [--project org/project] [--global-root <path>] [--token <password>|--token-file <path>] [--json]\n    \
                  the org comes from LOAM_FEDERATION_ORG or `org` in <profile>/config.json; --project overrides both and names the project too\n  \
-                 loam federation disconnect <workspace> --global-root <path> [--json]\n  \
-                 loam federation status [<workspace>] --global-root <path> [--json]\n  \
+                 loam federation disconnect <workspace> [--global-root <path>] [--json]\n  \
+                 loam federation status [<workspace>] [--global-root <path>] [--json]\n  \
+                 disconnect/status infer the global root from the installed runtime layout; --global-root overrides\n  \
                  loam federation emit [<workspace>] --global-root <path> [--json]   (reads one operation on stdin)\n  \
                  loam federation inject <register|drop> [<workspace>] --global-root <path> --session-id <id> [--channel-ref <ref>] [--wake-ref <ref>] [--json]"
             );
@@ -100,7 +101,22 @@ fn workspace_key(workspace: &std::path::Path) -> Result<String, i32> {
     }
 }
 
-/// `loam federation disconnect <workspace> --global-root <path> [--json]`.
+/// Resolve the global root for a verb that requires one: the explicit
+/// `--global-root` wins, else the installed runtime layout — the same
+/// `installed_global_root()` probe `connect` uses, so a machine that enrolled
+/// with a bare `connect` can read its own status without re-typing the root.
+/// Resolution failure keeps the original required-flag refusal.
+fn resolve_global_root(command: &str, explicit: Option<PathBuf>) -> Result<PathBuf, i32> {
+    match explicit {
+        Some(root) => Ok(root),
+        None => crate::hooks::installed_global_root().map_err(|_| {
+            eprintln!("federation {command}: --global-root is required");
+            64
+        }),
+    }
+}
+
+/// `loam federation disconnect <workspace> [--global-root <path>] [--json]`.
 /// Local removal is authoritative; the service is reconciled from registry
 /// truth. Broker cleanup is deferred to the real adapter (T13).
 fn disconnect(mut args: impl Iterator<Item = String>) -> i32 {
@@ -130,9 +146,13 @@ fn disconnect(mut args: impl Iterator<Item = String>) -> i32 {
             }
         }
     }
-    let (Some(workspace), Some(root)) = (workspace, global_root) else {
-        eprintln!("federation disconnect: <workspace> and --global-root are required");
+    let Some(workspace) = workspace else {
+        eprintln!("federation disconnect: <workspace> is required");
         return 64;
+    };
+    let root = match resolve_global_root("disconnect", global_root) {
+        Ok(root) => root,
+        Err(code) => return code,
     };
 
     let key = match workspace_key(&workspace) {
@@ -175,7 +195,7 @@ fn disconnect(mut args: impl Iterator<Item = String>) -> i32 {
     }
 }
 
-/// `loam federation status [<workspace>] --global-root <path> [--json]`.
+/// `loam federation status [<workspace>] [--global-root <path>] [--json]`.
 /// Strictly read-only and egress-free: never creates the database or starts a
 /// process.
 fn status(mut args: impl Iterator<Item = String>) -> i32 {
@@ -205,9 +225,9 @@ fn status(mut args: impl Iterator<Item = String>) -> i32 {
             }
         }
     }
-    let Some(root) = global_root else {
-        eprintln!("federation status: --global-root is required");
-        return 64;
+    let root = match resolve_global_root("status", global_root) {
+        Ok(root) => root,
+        Err(code) => return code,
     };
 
     let key = match workspace.as_deref() {
