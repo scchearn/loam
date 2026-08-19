@@ -1,16 +1,42 @@
-import { mkdir, open, readdir, readFile, rename, rm, unlink } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, open, readdir, readFile, rename, rm, rmdir, unlink, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { cleanupStaging, createStagingDirectory, writeAtomicFile, publishJson } from './atomic.mjs';
+import { resolveRuntimeTarget } from './constants.mjs';
 import { confirmSetup, finish, harnessLabel, renderDiscovery, selectHarnesses, stepDetail, stepDone, stepSkip, stepStart, summaryNote } from './wizard.mjs';
 import { ensureGlobalSkills, verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
 import { installRuntime } from './runtime.mjs';
+import { ledgerPath, readLedger } from '../integration/ledger.mjs';
 import { detectHarnesses, installHarnesses } from './harnesses.mjs';
 import { installMarketplacePlugins } from './marketplace.mjs';
-import { migrateLegacyProject } from './migration.mjs';
+import { migrateEnrollment, migrateLegacyProject, migrateRuntimeLedger } from './migration.mjs';
 import { removeHarnesses } from './uninstall.mjs';
 import { verifyInstallation } from './verify.mjs';
+import { stageFederationService, federationDefinitionExists } from './federation.mjs';
+
+// #97 fix 1 — a destructive rollback decision must name its reason. Turn the
+// per-check breakdown the verifier already computes into one operator-readable
+// line instead of discarding it behind "Final readiness verification failed".
+function verifyFailureDetail(result, discovery) {
+  const failed = [];
+  if (result?.install?.plugin_version !== discovery.packageVersion) {
+    failed.push(`plugin version (${result?.install?.plugin_version ?? 'none'} != ${discovery.packageVersion})`);
+  }
+  if (result?.skills && !result.skills.ready) failed.push(`skills (${result.skills.category || result.skills.detail || 'not ready'})`);
+  if (result?.runtime && !result.runtime.ready) {
+    // The runtime check now fails on the config-dir ledger/store: name the
+    // category and, when present, the verb that converges it (install/update).
+    failed.push(`runtime (${result.runtime.category || 'not ready'}${result.runtime.hint ? `, run ${result.runtime.hint}` : ''})`);
+  }
+  for (const [id, harness] of Object.entries(result?.harnesses || {})) {
+    if (!harness.ready) failed.push(`harness ${id} (${harness.category || 'not ready'})`);
+  }
+  if (result?.migration && !result.migration.ready) failed.push(`legacy migration (${result.migration.category || 'not ready'})`);
+  if (result?.ingestExclusions && !result.ingestExclusions.ready) failed.push(`ingest exclusions (${result.ingestExclusions.category || 'not ready'})`);
+  if (result?.federation && result.federation.checked && !result.federation.ready) failed.push(`federation (${result.federation.category || 'not ready'})`);
+  return failed.length ? failed.join('; ') : (result?.category || 'unknown check');
+}
 
 // ponytail: trivial lockfile — no polling, no stale-PID detection.
 // Two concurrent setups on the same HOME is a near-zero event; the second
@@ -61,7 +87,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
   const refresh = parsed.command === 'update';
   const yes = parsed.yes || refresh;
   const tilde = (p) => (typeof p === 'string' && p.startsWith(discovery.home) ? `~${p.slice(discovery.home.length)}` : p);
-  await renderDiscovery(discovery, output, { action: refresh ? 'Update' : 'Setup', dryRun: parsed.dryRun });
+  await renderDiscovery(discovery, output, { action: refresh ? 'Update' : 'Install', dryRun: parsed.dryRun });
   if (parsed.dryRun) {
     finish(output, 'Dry run', 'no files, configuration, downloads, or mutating Skills CLI commands will run');
     return 0;
@@ -71,10 +97,19 @@ export async function executeSetup(parsed, discovery, options = {}) {
     return 130;
   }
   let previouslyConfigured = [];
+  // An install.json means this machine already has an install — so the `install`
+  // verb must PRESERVE existing federation state (re-render the service against
+  // the new runtime), not run as first-time. This is the reciprocal of update's
+  // refuse-when-fresh guard (#125 Q1): update refuses a fresh machine; install
+  // refreshes an existing one instead of skipping the preservation the `refresh`
+  // flag gated.
+  let existingInstall = false;
   try {
     const existing = JSON.parse(await readFile(join(discovery.globalRoot, 'install.json'), 'utf8'));
+    existingInstall = true;
     if (Array.isArray(existing.configured_harnesses)) previouslyConfigured = existing.configured_harnesses;
   } catch {}
+  const preserveExisting = refresh || existingInstall;
 
   const selection = await selectHarnesses({
     yes,
@@ -104,11 +139,64 @@ export async function executeSetup(parsed, discovery, options = {}) {
   const requestedDiscovery = { ...discovery, harnesses: requestedHarnesses };
 
   return withSetupLock({ globalRoot: discovery.globalRoot, ...(options.lockOptions || {}) }, async () => {
+    // Salvage-before-destroy (#125): copy legacy global-root state into the
+    // durable config dir BEFORE the workspace legacy sweep below. That sweep is
+    // now guarded from the global root (protectedRoots in migrateLegacyProject),
+    // but copying first is an independent second layer — if the guard ever
+    // regresses, the enrollment registry and runtime binary were already copied
+    // to safety. Both are copy-not-move + idempotent, run up front under
+    // setup.lock before staging/verify (preserves the #97-fix-2 property).
+    //
+    // Enrollment registry: legacy <global-root>/loam.sqlite3 -> config-dir, so an
+    // enrolled machine's enrollment survives a global-root rebuild.
+    await migrateEnrollment({
+      globalRoot: discovery.globalRoot,
+      home: discovery.home,
+      platform: discovery.platform,
+    });
+    // Runtime ledger/store: seed the config-dir ledger from a legacy machine
+    // (install.json or a binary under bin/) with no ledger yet. Idempotent — a
+    // fresh or already-migrated machine is a no-op. Also makes the update-refusal
+    // check see a legacy machine as upgradable, not fresh.
+    await migrateRuntimeLedger({
+      globalRoot: discovery.globalRoot,
+      home: discovery.home,
+      platform: discovery.platform,
+      arch: discovery.arch,
+      target: discovery.target,
+    });
+
+    // #97 fix 2 — migrate BEFORE staging and BEFORE any verify. Legacy migration
+    // mutates workspace state (removes legacy project skills/markers); running it
+    // mid-transaction let it fail the very verification of the transaction that
+    // performed it, which then rolled back and wiped a working install. Doing it
+    // up front, once, and feeding its post-migration result into every later
+    // verify means migration can no longer fail its own transaction. It is
+    // workspace cleanup, independent of and outside the staged global install.
+    let migration = { ...discovery.legacy, ready: true };
+    if (discovery.legacy.needed) {
+      migration = await migrateLegacyProject({
+        workspace: discovery.workspace,
+        packageRoot: discovery.packageRoot,
+        protectedRoots: discovery.protectedRoots,
+        yes,
+        prompt: options.migrationConfirm || options.confirm,
+        runner: options.runner,
+      });
+      if (!migration.ready) {
+        errorOutput.write(`Migration incomplete: ${migration.category || 'legacy project remains'}\n`);
+        return 1;
+      }
+      stepDone(output, 'Legacy project Loam migrated');
+    }
+    const migratedLegacy = { ...migration, ready: true };
+
     const alreadyReady = await verifyInstallation({
       discovery: requestedDiscovery,
       packageRoot: discovery.packageRoot,
       runner: options.runner,
       runtimeRunner: options.smokeRunner,
+      legacy: migratedLegacy,
     });
     if (alreadyReady.ready && !refresh && toRemove.length === 0) {
       finish(output, '🌱 Loam is ready', 'already ready; no replacement or network operation required');
@@ -116,12 +204,16 @@ export async function executeSetup(parsed, discovery, options = {}) {
     }
 
     stepStart(output, 'Checking environment');
-    stepDone(output, refresh ? 'Environment checked — refreshing existing install' : 'Environment checked');
+    stepDone(output, preserveExisting ? 'Environment checked — refreshing existing install' : 'Environment checked');
     const metadataPath = join(discovery.globalRoot, 'install.json');
     let candidateIntegration;
     let harnessInstall;
+    let federationRollback;
     let activated = false;
     let skillCount;
+    let runtime;
+    let priorLedger = null;
+    let ledgerStaged = false;
     try {
       stepStart(output, 'Installing global skills via the Skills CLI');
       const skills = await ensureGlobalSkills({
@@ -137,20 +229,40 @@ export async function executeSetup(parsed, discovery, options = {}) {
         return 1;
       }
       skillCount = skills.inventory?.skills?.length;
-      stepDone(output, `Skills ${skills.changed ? 'installed' : 'already current'}${skillCount ? ` — ${skillCount} skills` : ''} · runtime v${skills.requiredVersion}  →  ${tilde(discovery.skillsRoot)}`);
+      stepDone(output, `Skills ${skills.changed ? 'installed' : 'already current'}${skillCount ? ` — ${skillCount} skills` : ''}  →  ${tilde(discovery.skillsRoot)}`);
 
-      stepStart(output, `Preparing native runtime v${skills.requiredVersion} (${discovery.target})`);
-      const runtime = await installRuntime({
-        globalRoot: discovery.globalRoot,
-        version: skills.requiredVersion,
+      // The runtime version is resolved from the package constant / env pin —
+      // never the skills tree. A `channel: pinned` ledger keeps its target on a
+      // plain update without LOAM_RUNTIME_VERSION (locked-ref semantics), noted
+      // volta-style; the env var moves the pin.
+      priorLedger = await readLedger({ home: discovery.home, platform: discovery.platform });
+      let resolved = resolveRuntimeTarget({ env: process.env });
+      if (priorLedger?.channel === 'pinned' && !process.env.LOAM_RUNTIME_VERSION) {
+        resolved = { target: priorLedger.target, channel: 'pinned' };
+        stepDetail(output, `runtime pinned at ${resolved.target}; set LOAM_RUNTIME_VERSION to move or release the pin`);
+      }
+      stepStart(output, `Preparing native runtime v${resolved.target} (${discovery.target})`);
+      runtime = await installRuntime({
+        home: discovery.home,
+        version: resolved.target,
         target: discovery.target,
         platform: discovery.platform,
         arch: discovery.arch,
+        channel: resolved.channel,
         releaseBaseUrl: options.releaseBaseUrl,
         workspace: discovery.workspace,
         smokeRunner: options.smokeRunner,
-        expectedSha256: alreadyReady.install?.runtime_sha256,
+        expectedSha256: priorLedger?.sha256,
       });
+      if (runtime.pending) {
+        // Relocated 78/75 wait-retry: the target is not published yet. Never a
+        // wipe or downgrade — nothing was staged, so this run made no changes.
+        errorOutput.write(`Runtime ${resolved.target} is not published yet; waiting to retry (no changes made).\n`);
+        return 75;
+      }
+      // A new store/ledger was staged only when the target differs from the prior
+      // ledger's store; a same-version reuse restages nothing to roll back.
+      ledgerStaged = !priorLedger || priorLedger.store_path !== runtime.storePath;
       const shortSha = typeof runtime.sha256 === 'string' ? runtime.sha256.slice(0, 12) : '';
       if (runtime.reused) {
         stepDetail(output, `reused verified binary${shortSha ? ` (sha256 ${shortSha}…)` : ''}`);
@@ -184,7 +296,9 @@ export async function executeSetup(parsed, discovery, options = {}) {
       });
       for (const id of selectedMarketplaceHarnesses) {
         if (marketplace[id]?.state === 'ready' && !refreshedHarnesses[id]?.marketplaceReady) {
-          marketplace[id] = { ...marketplace[id], state: 'partial', category: 'verification_failed' };
+          // Verification failed: fall back to the refreshed detection, whose
+          // marketplaceReady/marketplaceRoot reflect what is actually on disk.
+          marketplace[id] = { ...refreshedHarnesses[id], state: 'partial', category: 'verification_failed' };
         }
         const st = marketplace[id];
         if (st?.state === 'ready') {
@@ -204,6 +318,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
         home: discovery.home,
         globalRoot: discovery.globalRoot,
         pluginVersion: discovery.packageVersion,
+        runtimePath: runtime.path,
         integrationPath,
         detected: effectiveHarnesses,
       });
@@ -255,29 +370,14 @@ export async function executeSetup(parsed, discovery, options = {}) {
         return 1;
       }
 
-      let migration = discovery.legacy;
-      if (discovery.legacy.needed) {
-        migration = await migrateLegacyProject({
-          workspace: discovery.workspace,
-          packageRoot: discovery.packageRoot,
-          yes,
-          prompt: options.migrationConfirm || options.confirm,
-          runner: options.runner,
-        });
-        if (!migration.ready) {
-          errorOutput.write(`Migration incomplete: ${migration.category || 'legacy project remains'}\n`);
-          return 1;
-        }
-        stepDone(output, 'Legacy project Loam migrated');
-      }
-
+      // Schema 2: the runtime_* fields are gone — the config-dir ledger is the
+      // runtime authority. install.json carries only the plugin/adapter/skills
+      // facts. The ledger write (inside installRuntime) already landed as the
+      // first commit; this install.json write is the second.
       const install = {
-        schema_version: 1,
+        schema_version: 2,
         plugin_version: discovery.packageVersion,
-        runtime_version: skills.requiredVersion,
         target: discovery.target,
-        runtime_path: runtime.path,
-        runtime_sha256: runtime.sha256,
         adapter_root: harnesses.versionRoot,
         integration_path: integrationPath,
         skills_scope: 'global',
@@ -298,21 +398,66 @@ export async function executeSetup(parsed, discovery, options = {}) {
         install,
         runner: options.runner,
         runtimeRunner: options.smokeRunner,
-        legacy: { ...migration, ready: true },
+        legacy: migratedLegacy,
       });
       if (!final.ready) {
-        errorOutput.write('Final readiness verification failed.\n');
+        // #97 fix 1 — name the check(s) that failed so the rollback decision is
+        // explained, not silent.
+        errorOutput.write(`Final readiness verification failed: ${verifyFailureDetail(final, discovery)}\n`);
         return 1;
       }
       stepDone(output, 'All checks passed');
+
+      // #100/#125 — a runtime version bump must refresh the service definition,
+      // which embeds the versioned binary path. On `update` OR an `install` over
+      // an existing machine (preserveExisting), and only when a definition already
+      // exists (federation was enabled here — a never-enabled or truly fresh
+      // machine leaves federation alone), re-render it through the just-committed
+      // runtime and preserve the prior active/inert state. #125: gating this on
+      // `refresh` alone let an `install` on an enrolled machine skip the re-render
+      // and strand the service at the old runtime path. The runtime owns rendering
+      // and the manager calls; its rollback joins this transaction. On win32 there
+      // is no file-based definition, so this no-ops. win32 is deliberately
+      // excluded: its definition lives in Task Scheduler with only a
+      // `windows-task.marker` file (federationDefinitionPath mirrors it for the
+      // absence verify). Re-rendering a scheduled task against the new runtime is
+      // Windows service parity — tracked with #100, out of scope — so the marker
+      // must NOT trip this refresh.
+      const definition = preserveExisting && discovery.platform !== 'win32'
+        ? await federationDefinitionExists({ globalRoot: discovery.globalRoot, platform: discovery.platform })
+        : { exists: false };
+      if (preserveExisting && definition.exists && runtime?.path) {
+        const federation = await stageFederationService({
+          runtimePath: runtime.path,
+          globalRoot: discovery.globalRoot,
+          runner: options.federationRunner,
+          timeoutMs: options.federationTimeoutMs,
+        });
+        if (!federation.ready) {
+          errorOutput.write(`Federation service refresh failed: ${federation.detail || federation.category}\n`);
+          return 1;
+        }
+        stepDone(output, 'Service definition refreshed for the new runtime');
+        federationRollback = federation.rollback;
+      }
+
       await options.beforeActivate?.({ install, metadataPath, integrationPath });
       await publishJson({ filePath: metadataPath, value: install });
       activated = true;
 
+      // Old-store removal — the LAST commit, best-effort and non-fatal. Both
+      // commits (ledger, install.json) are in; now retire only a PRIOR store
+      // entry at a different version. A delete that fails (e.g. Windows EBUSY on
+      // a running connector binary) leaves a named orphan, never a failed
+      // update; the config dir and the current store are never touched.
+      if (priorLedger?.store_path && runtime?.storePath && priorLedger.store_path !== runtime.storePath) {
+        await rm(dirname(dirname(priorLedger.store_path)), { recursive: true, force: true }).catch(() => {});
+      }
+
       const configuredLabels = install.configured_harnesses.map((id) => harnessLabel(id));
       summaryNote(output, 'Installed', [
         `Plugin     v${discovery.packageVersion}`,
-        `Runtime    v${skills.requiredVersion}  (${discovery.target})`,
+        `Runtime    v${resolved.target}  (${discovery.target})`,
         `Skills     ${skillCount ?? '?'} · ${tilde(discovery.skillsRoot)}`,
         `Harnesses  ${configuredLabels.length ? configuredLabels.join(', ') : 'none'}`,
         '',
@@ -322,10 +467,38 @@ export async function executeSetup(parsed, discovery, options = {}) {
       return marketplaceFailed ? 1 : 0;
     } finally {
       if (!activated) {
+        // #97 — the rollback restores ONLY what this run staged, never a prior
+        // ledger or store. A hard crash (finally never runs) instead leaves the
+        // ledger ahead of install.json, which readiness reports as runtime_stale
+        // and a re-run converges — loud, never silent skew.
+        // ponytail: if installRuntime throws AFTER moving the binary but BEFORE
+        // returning (e.g. commitLedger fails), `runtime` is undefined and this
+        // block skips store cleanup, orphaning the new <version> dir. The ledger
+        // is unchanged (publishJson is atomic), so state stays safe/convergent —
+        // a harmless disk leak, not skew. Reclaim it here only if it ever matters.
+        if (ledgerStaged) {
+          const file = ledgerPath({ home: discovery.home, platform: discovery.platform });
+          try {
+            if (priorLedger) await writeFile(file, `${JSON.stringify(priorLedger, null, 2)}\n`, { mode: 0o600 });
+            else if (file) await rm(file, { force: true });
+          } catch {}
+          if (runtime?.storePath && (!priorLedger || priorLedger.store_path !== runtime.storePath)) {
+            // Remove ONLY this run's <version>/<target> dir. Then drop the
+            // <version> parent only when it is now empty — a sibling <target>
+            // staged by a prior same-machine LOAM_TARGET run is not ours to
+            // delete (rmdir throws ENOTEMPTY, which we swallow).
+            await rm(dirname(runtime.storePath), { recursive: true, force: true }).catch(() => {});
+            await rmdir(dirname(dirname(runtime.storePath))).catch(() => {});
+          }
+        }
         try {
-          await harnessInstall?.rollback?.();
+          await federationRollback?.();
         } finally {
-          if (candidateIntegration) await rm(candidateIntegration.root, { recursive: true, force: true });
+          try {
+            await harnessInstall?.rollback?.();
+          } finally {
+            if (candidateIntegration) await rm(candidateIntegration.root, { recursive: true, force: true });
+          }
         }
       }
     }

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "org_id": "REPLACE-org-id",
+  "project_id": "REPLACE-project-id",
+  "principals": [
+    "REPLACE-principal-laptop",
+    "REPLACE-principal-macbook"
+  ],
+  "origins": [
+    "REPLACE-instance-laptop",
+    "REPLACE-instance-macbook"
+  ]
+}

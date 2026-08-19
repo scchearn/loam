@@ -3,11 +3,13 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { readInstallMetadata, readRequiredVersion, readSkillContent } from '../integration/metadata.mjs';
+import { readInstallMetadata, readSkillContent } from '../integration/metadata.mjs';
 import { resolveExclusions } from '../integration/ingest.mjs';
 import { checkReadiness, probeState } from '../integration/runtime.mjs';
+import { resolveRuntimePath } from '../integration/ledger.mjs';
 import { verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
-import { isOwnedCommand } from './harnesses.mjs';
+import { isOwnedCommand, nativeHookCommand, renderOpenCodePlugin } from './harnesses.mjs';
+import { federationDefinitionExists, verifyFederationService } from './federation.mjs';
 
 async function fileExists(path) {
   try {
@@ -19,25 +21,13 @@ async function fileExists(path) {
 
 async function localSkills(skillsRoot) {
   try {
-    const requiredVersion = await readRequiredVersion({ skillsRoot });
+    // Presence-only: a readable `loam-using/SKILL.md` proves the global skills
+    // are installed; the skills tree no longer carries a runtime version.
     await readSkillContent({ skillsRoot });
-    return { ready: true, requiredVersion };
+    return { ready: true };
   } catch (error) {
     return { ready: false, category: 'skills_missing', detail: error instanceof Error ? error.message : String(error) };
   }
-}
-
-function ownsCommand(entry, path) {
-  if (Array.isArray(entry?.hooks)) return entry.hooks.some((hook) => ownsCommand(hook, path));
-  if (entry?.type !== 'command') return false;
-  const candidates = [];
-  if (entry.command === 'node' && Array.isArray(entry.args) && entry.args.length === 1) candidates.push(entry.args[0]);
-  for (const value of [entry.command, entry.commandWindows]) {
-    if (typeof value !== 'string' || !value.startsWith('node ')) continue;
-    const raw = value.slice(5).trim();
-    try { candidates.push(JSON.parse(raw)); } catch { candidates.push(raw); }
-  }
-  return candidates.some((candidate) => candidate === path || candidate === path.replaceAll('/', '\\'));
 }
 
 async function verifyIngestExclusions(skillsRoot) {
@@ -58,7 +48,15 @@ async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, 
   }
   const context = '<LOAM_IMPORTANT>\nverification context\n</LOAM_IMPORTANT>';
   if (id === 'opencode') {
-    const adapter = await module.createOpenCodeAdapter({ getContext: async () => context })({ directory: workspace });
+    // The plugin file exports only LoamPlugin (OpenCode's loader calls every
+    // top-level export as a plugin factory); the adapter factory rides on it.
+    const adapter = await module.LoamPlugin.createOpenCodeAdapter({
+      getContext: async () => context,
+      // The envelope check fires the transform, which starts the notify
+      // listener on its first fire; a real listener would keep the process
+      // alive, so verification uses a stub.
+      wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', registered: false, close: async () => {} }),
+    })({ directory: workspace });
     const output = { messages: [{ info: { role: 'user' }, parts: [{ type: 'text', text: 'prompt' }] }] };
     await adapter['experimental.chat.messages.transform']({}, output);
     const previous = process.env.LOAM_INGEST_BACKGROUND;
@@ -83,7 +81,40 @@ async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, 
   return result?.additional_context === context;
 }
 
-async function verifyHarness(id, harness, { packageRoot, globalRoot, install, workspace }) {
+// Cursor's own hooks.json registers the runtime directly, as the one shell
+// string Cursor's schema takes (#135; `args` is not part of that schema and was
+// dropped on the floor). One registration is correct only when it runs the
+// staged private runtime as a `hook <id>` read; anything else — a Node shim, a
+// stale asset path, a runtime from a previous install, or an entry still in the
+// ignored args-array form — is a mismatch.
+function nativeHookCommands(entries, runtimePath, harnessId, event) {
+  const expected = nativeHookCommand(runtimePath, harnessId, event);
+  return entries
+    .flatMap((entry) => (Array.isArray(entry?.hooks) ? entry.hooks : [entry]))
+    .filter((entry) => entry?.type === 'command' && entry.command === expected);
+}
+
+// #137: claude/codex load their hooks from the marketplace SOURCE hooks.json,
+// which carries self-resolving node shims (landed with #114), not a setup-staged
+// runtime path. Verify asserts what the harness actually loads: one shim per
+// native read surface. The three-surfaces contract is SessionStart (baseline)
+// and UserPromptSubmit (per-turn drain); the Stop long-poll wake is a Stop entry
+// verified through its own shim, not here.
+const NATIVE_SHIMS = {
+  SessionStart: 'session-start.mjs',
+  UserPromptSubmit: 'user-prompt-submit.mjs',
+};
+
+function pluginShimCommands(entries, shimFile) {
+  return entries
+    .flatMap((entry) => (Array.isArray(entry?.hooks) ? entry.hooks : [entry]))
+    .filter((entry) => entry?.type === 'command'
+      && typeof entry.command === 'string'
+      && entry.command.startsWith('node ')
+      && entry.command.includes(`hooks/${shimFile}`));
+}
+
+async function verifyHarness(id, harness, { packageRoot, globalRoot, install, workspace, home, platform }) {
   if (harness.state === 'absent') return { ...harness, ready: true };
   if (id === 'codex') {
     const profilePath = join(harness.root, 'agents', 'loam_ingestor.toml');
@@ -104,13 +135,13 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
     if (harness.state === 'skipped') return { ...harness, ready: true, owner: 'setup' };
   } else if (harness.state === 'skipped') return { ...harness, ready: true };
   if (!install) return { ...harness, ready: false, category: 'install_metadata_missing' };
-  const assetRoot = install.adapter_root;
-  const assetName = id === 'opencode' ? 'opencode.mjs' : `${id}-session-start.mjs`;
-  const assetPath = join(assetRoot, id === 'codex' ? 'codex-stop.mjs' : assetName);
-  const sessionAssetPath = join(assetRoot, assetName);
+  // The injected hook command runs the config-dir store binary; compare against
+  // the ledger's store_path (schema-1 install.json runtime_path as migration
+  // fallback), never a dropped schema-2 field.
+  const runtimePath = (await resolveRuntimePath({ globalRoot, home, platform })) ?? install.runtime_path;
   try {
     if (id === 'claude' || id === 'codex') {
-      if (!harness.marketplaceReady) return { ...harness, ready: false, category: 'plugin_incomplete' };
+      if (!harness.marketplaceReady || !harness.marketplaceRoot) return { ...harness, ready: false, category: 'plugin_incomplete' };
       const configPath = id === 'claude' ? join(harness.root, 'settings.json') : join(harness.root, 'hooks.json');
       let config = {};
       try { config = JSON.parse(await readFile(configPath, 'utf8')); }
@@ -121,34 +152,38 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
         || stop.some((entry) => isOwnedCommand(entry, globalRoot, `${id}-stop.mjs`))) {
         return { ...harness, ready: false, category: 'registration_duplicate' };
       }
+      const plugin = JSON.parse(await readFile(join(harness.marketplaceRoot, 'hooks', 'hooks.json'), 'utf8'));
+      const counts = Object.entries(NATIVE_SHIMS).map(([event, shimFile]) =>
+        pluginShimCommands(Array.isArray(plugin.hooks?.[event]) ? plugin.hooks[event] : [], shimFile).length);
+      if (counts.some((n) => n !== 1)) {
+        return { ...harness, ready: false, category: counts.some((n) => n > 1) ? 'registration_duplicate' : 'registration_missing' };
+      }
       return { ...harness, ready: true, owner: 'marketplace' };
     }
     if (id === 'opencode') {
       const stablePath = join(harness.root, 'plugins', 'loam.js');
-      const [actual, expected] = await Promise.all([
+      const [actual, source] = await Promise.all([
         readFile(stablePath, 'utf8'),
         readFile(join(packageRoot, 'adapters', 'opencode.mjs'), 'utf8'),
       ]);
-      if (actual !== expected) return { ...harness, ready: false, category: 'registration_mismatch' };
-    } else {
-      const configPath = id === 'claude' ? join(harness.root, 'settings.json') : join(harness.root, 'hooks.json');
-      const config = JSON.parse(await readFile(configPath, 'utf8'));
-      const commands = id === 'claude'
-        ? (Array.isArray(config.hooks?.SessionStart) ? config.hooks.SessionStart : []).flatMap((entry) => Array.isArray(entry?.hooks) ? entry.hooks : [])
-        : (Array.isArray(config.hooks?.sessionStart) ? config.hooks.sessionStart : []);
-      const owned = commands.filter((entry) => ownsCommand(entry, assetPath));
-      const expectedSessionCount = 1;
-      if (owned.length !== expectedSessionCount) {
-        return {
-          ...harness,
-          ready: false,
-          category: owned.length ? 'registration_duplicate' : 'registration_missing',
-        };
+      if (actual !== renderOpenCodePlugin(source, runtimePath)) {
+        return { ...harness, ready: false, category: 'registration_mismatch' };
       }
+      const assetPath = join(install.adapter_root, 'opencode.mjs');
+      if (!(await fileExists(assetPath)) || !(await verifyAdapterEnvelope(id, assetPath, workspace, install.integration_path, globalRoot))) {
+        return { ...harness, ready: false, category: 'adapter_envelope_invalid' };
+      }
+      return { ...harness, ready: true, owner: 'setup' };
     }
-
-    if (!(await fileExists(assetPath)) || !(await verifyAdapterEnvelope(id, assetPath, workspace, install.integration_path, globalRoot))) {
-      return { ...harness, ready: false, category: 'adapter_envelope_invalid' };
+    const config = JSON.parse(await readFile(join(harness.root, 'hooks.json'), 'utf8'));
+    const owned = nativeHookCommands(
+      Array.isArray(config.hooks?.sessionStart) ? config.hooks.sessionStart : [],
+      runtimePath,
+      id,
+      'sessionStart',
+    );
+    if (owned.length !== 1) {
+      return { ...harness, ready: false, category: owned.length ? 'registration_duplicate' : 'registration_missing' };
     }
     return { ...harness, ready: true, owner: 'setup' };
   } catch (error) {
@@ -185,6 +220,7 @@ export async function verifyInstallation({
   install: suppliedInstall,
   runtimeRunner,
   runtimeTimeoutMs,
+  federationRunner,
 } = {}) {
   let install = suppliedInstall;
   if (!install) {
@@ -205,6 +241,7 @@ export async function verifyInstallation({
         target: discovery.target,
         platform: discovery.platform,
         arch: discovery.arch,
+        home: discovery.home,
         install,
       })
     : { ready: false, category: 'install_metadata_missing' };
@@ -223,6 +260,8 @@ export async function verifyInstallation({
       globalRoot: discovery.globalRoot,
       install,
       workspace: discovery.workspace,
+      home: discovery.home,
+      platform: discovery.platform,
     });
   }
   const migration = legacy || discovery.legacy;
@@ -230,8 +269,44 @@ export async function verifyInstallation({
   const pluginVersionReady = install?.plugin_version === discovery.packageVersion;
   const ingestExclusions = await verifyIngestExclusions(discovery.skillsRoot);
   const harvestAgent = await verifyHarvesterAgent(packageRoot, install, discovery.packageVersion);
+  // Opt-in native connector lifecycle check: only runs when a runner is supplied
+  // (default callers stay unchanged). Read-only status through the runtime proves
+  // the definition is present/inspectable and references the trusted runtime
+  // without starting the connector or contacting a broker.
+  let federation = { ready: true, checked: false };
+  // #125: if federation was enabled here (a service definition existed at
+  // discovery time), that definition MUST still be present after setup. The
+  // enrollment-state wipe deleted the plist and verify passed anyway because it
+  // asserted zero federation state — this makes a vanished definition a hard
+  // verification failure. File-only; win32's Task Scheduler definition is out of
+  // scope (#100), and a never-enabled machine (federationEnabled false) is
+  // unaffected.
+  if (discovery.federationEnabled && discovery.platform !== 'win32') {
+    const definition = await federationDefinitionExists({ globalRoot: discovery.globalRoot, platform: discovery.platform });
+    if (!definition.exists) {
+      federation = {
+        ready: false,
+        checked: true,
+        category: 'federation_definition_missing',
+        detail: 'federation was enabled but its service definition is missing after setup',
+      };
+    }
+  }
+  const federationRuntimePath = federation.ready && federationRunner !== undefined
+    ? (await resolveRuntimePath({ globalRoot: discovery.globalRoot, home: discovery.home, platform: discovery.platform })) ?? install?.runtime_path
+    : undefined;
+  if (federation.ready && federationRunner !== undefined && federationRuntimePath) {
+    federation = {
+      ...(await verifyFederationService({
+        runtimePath: federationRuntimePath,
+        globalRoot: discovery.globalRoot,
+        runner: federationRunner,
+      })),
+      checked: true,
+    };
+  }
   return {
-    ready: Boolean(pluginVersionReady && skills.ready && runtime.ready && harnessReady && migration.ready && ingestExclusions.ready),
+    ready: Boolean(pluginVersionReady && skills.ready && runtime.ready && harnessReady && migration.ready && ingestExclusions.ready && federation.ready),
     install,
     skills,
     runtime,
@@ -239,6 +314,7 @@ export async function verifyInstallation({
     ingestExclusions,
     harvestAgent,
     migration,
-    native: { ready: runtime.ready },
+    federation,
+    native: { ready: runtime.ready, federation: federation.ready },
   };
 }

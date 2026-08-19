@@ -22,30 +22,67 @@ test('package exposes the scoped setup executable and pinned Skills CLI', async 
   assert.match(HELP_TEXT, /@scchearn\/loam setup/);
 });
 
-test('setup accepts the confirmation and dry-run flags', () => {
+test('setup is the configurator with federation and integration flags', () => {
   assert.deepEqual(parseArgs(['setup']), {
     command: 'setup',
     dryRun: false,
     yes: false,
+    purge: false,
+    federation: null,
+    integrations: [],
+    disableIntegrations: [],
   });
-  assert.deepEqual(parseArgs(['setup', '--yes', '--dry-run']), {
+  assert.deepEqual(parseArgs(['setup', '--yes', '--dry-run', '--federation', 'enable']), {
     command: 'setup',
     dryRun: true,
     yes: true,
+    purge: false,
+    federation: 'enable',
+    integrations: [],
+    disableIntegrations: [],
   });
-});
-
-test('install aliases setup and doctor is a supported command', () => {
-  assert.deepEqual(parseArgs(['install']), {
+  assert.deepEqual(parseArgs(['setup', '--federation', 'disable', '--integration', 'qmd', '--integration', 'grep', '--purge']), {
     command: 'setup',
     dryRun: false,
     yes: false,
+    purge: true,
+    federation: 'disable',
+    integrations: ['qmd', 'grep'],
+    disableIntegrations: [],
+  });
+  assert.deepEqual(parseArgs(['setup', '--disable-integration', 'qmd', '--purge']), {
+    command: 'setup',
+    dryRun: false,
+    yes: false,
+    purge: true,
+    federation: null,
+    integrations: [],
+    disableIntegrations: ['qmd'],
+  });
+});
+
+test('--federation rejects a value that is not enable or disable', () => {
+  assert.throws(() => parseArgs(['setup', '--federation', 'maybe']), UsageError);
+  assert.throws(() => parseArgs(['setup', '--federation']), UsageError);
+  assert.throws(() => parseArgs(['setup', '--integration']), UsageError);
+});
+
+test('install is a distinct command (not an alias) and doctor is supported', () => {
+  assert.deepEqual(parseArgs(['install']), {
+    command: 'install',
+    dryRun: false,
+    yes: false,
+    purge: false,
   });
   assert.deepEqual(parseArgs(['doctor']), {
     command: 'doctor',
     dryRun: false,
     yes: false,
+    purge: false,
   });
+  // Configurator value flags belong to setup only.
+  assert.throws(() => parseArgs(['install', '--federation', 'enable']), UsageError);
+  assert.throws(() => parseArgs(['update', '--integration', 'qmd']), UsageError);
 });
 
 test('update is a supported setup mode with dry-run', () => {
@@ -53,11 +90,22 @@ test('update is a supported setup mode with dry-run', () => {
     command: 'update',
     dryRun: false,
     yes: false,
+    purge: false,
   });
   assert.deepEqual(parseArgs(['update', '--dry-run']), {
     command: 'update',
     dryRun: true,
     yes: false,
+    purge: false,
+  });
+});
+
+test('uninstall accepts an explicit --purge flag', () => {
+  assert.deepEqual(parseArgs(['uninstall', '--purge']), {
+    command: 'uninstall',
+    dryRun: false,
+    yes: false,
+    purge: true,
   });
 });
 

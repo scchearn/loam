@@ -13,7 +13,7 @@
 #
 #   --runtime <version>   cli/Cargo.toml   [package] version
 #                         Cargo.lock       [[package]] loam version
-#                         skills/loam-using/scripts/CLI_VERSION
+#                         setup/constants.mjs  RUNTIME_VERSION
 #                         -> released as tag  cli-v<version>   (only cli-v*
 #                            triggers the dist / raw-runtime build)
 #
@@ -23,9 +23,9 @@
 # implies the other.
 # The two versions are deliberately NOT kept equal. A plugin-only change must
 # not force a runtime release, and a runtime release must not churn the version
-# every harness displays. `CLI_VERSION` is the one value that escapes the repo:
-# the launcher interpolates it into the release URL and the on-disk runtime
-# path, so it must name a published cli-v<version> release.
+# every harness displays. `RUNTIME_VERSION` is the package-baked runtime target
+# the setup layer resolves from (channel routing + the config-dir ledger), so it
+# must name a published cli-v<version> release.
 #
 # A coordinated release is just both lanes run in either order.
 #
@@ -62,7 +62,7 @@ show_usage() {
   echo "  --plugin   package.json, package-lock.json, both marketplace fields,"
   echo "             Codex, Cursor"
   echo "             released as tag v<version>"
-  echo "  --runtime  cli/Cargo.toml, Cargo.lock, CLI_VERSION"
+  echo "  --runtime  cli/Cargo.toml, Cargo.lock, RUNTIME_VERSION"
   echo "             released as tag cli-v<version> (triggers dist)"
   echo
   echo "Versions are MAJOR.MINOR.PATCH with an optional -PRERELEASE suffix"
@@ -117,11 +117,13 @@ if ! "$LOAM" check versions "$ROOT" "--$DOMAIN" > /dev/null 2>&1; then
   exit 1
 fi
 
-CLI_VERSION_FILE="skills/loam-using/scripts/CLI_VERSION"
+CONSTANTS_FILE="setup/constants.mjs"
 
 read_current() {
   if [[ "$DOMAIN" == "runtime" ]]; then
-    tr -d ' \t\r\n' < "$ROOT/$CLI_VERSION_FILE"
+    # RUNTIME_VERSION in setup/constants.mjs is the runtime reference now (the
+    # skills-tree CLI_VERSION coupling is retired).
+    sed -n "s/.*RUNTIME_VERSION[[:space:]]*=[[:space:]]*'\\([^']*\\)'.*/\\1/p" "$ROOT/$CONSTANTS_FILE" | head -1
   else
     # package.json is the plugin reference; the domain check above already
     # proved the other six agree with it.
@@ -196,7 +198,10 @@ else
   # Cargo.lock is generated with one exact copy of the crate version. Refuse
   # if a dependency shares it rather than rewriting an unrelated package.
   stage_literal "Cargo.lock" 1 "version = \"$OLD\"" "version = \"$NEW\""
-  printf '%s\n' "$NEW" > "$STAGE/CLI_VERSION" || fail "cannot stage $CLI_VERSION_FILE"
+  # RUNTIME_VERSION is the package-baked runtime target the channel ledger
+  # records; it must move in lockstep with cli/Cargo.toml [package] (check.rs
+  # gates the two into agreement). Same exact-string staging as Cargo.lock.
+  stage_literal "$CONSTANTS_FILE" 1 "RUNTIME_VERSION = '$OLD'" "RUNTIME_VERSION = '$NEW'"
 fi
 
 # Every staged file must be non-empty, or an edit silently truncated something.
@@ -220,7 +225,7 @@ if [[ "$DOMAIN" == "plugin" ]]; then
 else
   publish "$STAGE/cli_Cargo.toml"  "cli/Cargo.toml"
   publish "$STAGE/Cargo.lock"      "Cargo.lock"
-  publish "$STAGE/CLI_VERSION"     "$CLI_VERSION_FILE"
+  publish "$STAGE/setup_constants.mjs" "$CONSTANTS_FILE"
   TAG="cli-v$NEW"
 fi
 
@@ -247,7 +252,7 @@ Next:
   1. review: git diff
   2. commit, then tag $TAG at the release commit and push the tag
      (v* is a plugin release and does not build a runtime)
-  3. CLI_VERSION is unchanged and still points at its published runtime;
+  3. RUNTIME_VERSION is unchanged and still points at its published runtime;
      bump it separately with --runtime only if the runtime actually changed
 NEXT
 fi

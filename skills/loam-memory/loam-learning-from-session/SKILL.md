@@ -3,7 +3,7 @@ name: loam::learning-from-session
 description: "Review the current session for durable learnings, then route each one through the five-way matrix: wiki page, guidance file, checkpoint, task annotation/plan, or discard. Use when the session uncovered decisions, architecture facts, commands, conventions, gotchas, or open questions that future sessions should inherit. Not for source ingestion or correcting stale wiki claims; use /loam::adding-to-memory or /loam::amending-memory. Routes goal-specific progress to /loam::setting-goals."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.5.1"
+  version: "1.5.2"
   author: scchearn
   argument-hint: [topic or session summary]
 ---
@@ -288,7 +288,7 @@ Apply each routed learning to its destination.
 
 Capture: session focus, pages updated or created, important learnings preserved, contradictions corrected, open questions left unresolved.
 
-5. **Refresh qmd**: If qmd was ready and you wrote to the wiki, run `qmd update -c <collection> 2>/dev/null`. If refresh fails, report it but do not roll back wiki edits.
+5. **Refresh qmd**: If qmd was ready and you wrote to the wiki, run `qmd update -c <collection>` then `qmd embed -c <collection>`; report both outcomes separately. If either fails, report it but do not roll back wiki edits.
 
 Do not create a conversation-source note in this skill.
 

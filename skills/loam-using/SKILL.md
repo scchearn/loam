@@ -2,7 +2,7 @@
 name: loam::using
 description: "The always-on protocol for the loam skill namespace. Use at session start and whenever a loam task appears. Routes goals and other loam work, explains the memory model (memory = umbrella; wiki, guidance, and checkpoints are substrates), and lists cross-cutting rules. This is a routing/meta skill — delegate to a specific loam skill rather than performing work itself."
 metadata:
-  version: "1.11.0"
+  version: "1.13.0"
   author: scchearn
 ---
 
@@ -177,6 +177,13 @@ workspace, it contains the fields the active skill needs, and no later
 operation changed the relevant wiki, qmd, checkpoint, or metadata state. Do
 not rerun the integration merely to rediscover the same state.
 
+The `hcom:` line is the availability answer for the optional hcom integration
+(agent messaging and delegation). Read it instead of probing for the binary —
+no `which hcom`, no `hcom --version`, no equivalent. It is workspace-independent,
+so it is present whether or not a wiki is. `not installed` means every
+hcom-dependent branch takes its documented fallback; it is never an error and
+never a reason to stop.
+
 Run a fresh native command when the block is absent, belongs to another
 workspace, lacks required fields, or relevant state changed after injection.
 Run the native command directly when omitted checks such as date drift or
@@ -189,6 +196,7 @@ The injected block uses these stable line forms; checkpoint and signal lines are
 Workspace: <absolute workspace> · Probe: state --fast
 Wiki: <absolute wiki root> · qmd: <ready|not installed> [· collection: <name>]
 Wiki: none
+hcom: <ready|not installed>
 Checkpoints: <count> (latest: "<title>" — <captured_at>)
 Signals:
 - [loam:hint] <kind> — <message> [(<evidence key>: <value>, ...)] [→ <command>]
@@ -230,7 +238,7 @@ When the integration reports `qmd_ready: true` and `collection: <name>`, prefer 
 - Strip the `qmd://<collection>/` prefix from paths to get the relative wiki path (e.g. `code/validate-token.md`)
 - Verify candidates by Reading the actual wiki files — qmd discovers paths, Read confirms content
 - Ignore `.archive/` paths (historical, not active memory)
-- After wiki writes, refresh: `qmd update -c <collection> 2>/dev/null`
+- After wiki writes, run `qmd update -c <collection>` then `qmd embed -c <collection>`; report both outcomes separately. If either fails, retain the wiki edits and report the failure.
 - On qmd degradation (command fails or returns stale/noisy output): fall back to Grep/Glob for the rest of the session
 
 ### Code graph precedence (all code discovery)

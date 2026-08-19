@@ -1,0 +1,10 @@
+# Loam MQTT — daily cert-expiry monitor timer (T7).
+[Unit]
+Description=Daily Loam MQTT org-CA client-cert expiry check
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

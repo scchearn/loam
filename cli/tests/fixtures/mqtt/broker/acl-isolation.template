@@ -1,0 +1,36 @@
+user actor-a
+topic write @ORG_A@/project-a/state/instance-01/#
+topic write @ORG_A@/project-a/event/instance-01
+topic write @ORG_A@/project-a/inbox/+/+/instance-01/+
+topic read @ORG_A@/project-a/state/#
+topic read @ORG_A@/project-a/event/#
+topic read @ORG_A@/project-a/inbox/agent/shared-42/#
+topic read @ORG_A@/project-a/inbox/principal/employee-184/#
+topic read @ORG_A@/project-a/inbox/instance/instance-01/#
+
+user mtls-actor
+topic write @ORG_A@/project-a/state/instance-02/#
+topic write @ORG_A@/project-a/event/instance-02
+topic write @ORG_A@/project-a/inbox/+/+/instance-02/+
+topic read @ORG_A@/project-a/state/#
+topic read @ORG_A@/project-a/event/#
+topic read @ORG_A@/project-a/inbox/agent/shared-42/#
+topic read @ORG_A@/project-a/inbox/principal/shared-42/#
+topic read @ORG_A@/project-a/inbox/principal/employee-191/#
+topic read @ORG_A@/project-a/inbox/instance/instance-02/#
+
+user actor-b
+topic write @ORG_A@/project-b/state/instance-01/#
+topic write @ORG_A@/project-b/event/instance-01
+topic write @ORG_A@/project-b/inbox/+/+/instance-01/+
+topic read @ORG_A@/project-b/state/#
+topic read @ORG_A@/project-b/event/#
+topic read @ORG_A@/project-b/inbox/instance/instance-01/#
+
+user actor-c
+topic write @ORG_B@/project-a/state/instance-01/#
+topic write @ORG_B@/project-a/event/instance-01
+topic write @ORG_B@/project-a/inbox/+/+/instance-01/+
+topic read @ORG_B@/project-a/state/#
+topic read @ORG_B@/project-a/event/#
+topic read @ORG_B@/project-a/inbox/instance/instance-01/#

@@ -1,0 +1,9 @@
+[
+  {"name": "expired_within_skew", "expected": "accepted"},
+  {"name": "expired_beyond_skew", "expected": "expired"},
+  {"name": "origin_tombstone", "expected": "removed"},
+  {"name": "cross_origin_tombstone", "expected": "origin_not_authorized"},
+  {"name": "clean_restart", "expected": "clean"},
+  {"name": "dirty_restart", "expected": "dirty"},
+  {"name": "degraded_restart", "expected": "degraded"}
+]

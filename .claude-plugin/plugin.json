@@ -22,6 +22,5 @@
     "./skills/loam-memory/loam-syncing-code-graph",
     "./skills/loam-ground/loam-scaffolding-wiki",
     "./skills/loam-ground/loam-initializing-vault"
-  ],
-  "hooks": "./hooks/hooks.json"
+  ]
 }

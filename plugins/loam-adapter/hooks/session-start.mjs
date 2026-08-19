@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { handleMarketplaceHook } from '../adapter.mjs';
+import { handleMarketplaceSessionStart } from '../adapter.mjs';
+import { marketplaceHarness } from './stop.mjs';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 
@@ -15,14 +16,11 @@ async function readPayload() {
   }
 }
 
-export function marketplaceHarness(env = process.env) {
-  return env.PLUGIN_ROOT ? 'codex' : 'claude';
+export async function handleSessionStart(payload = {}, env = process.env, options = {}) {
+  return handleMarketplaceSessionStart(payload, { ...options, env, harness: marketplaceHarness(env) });
 }
 
-export async function handleSessionStart(payload = {}, env = process.env) {
-  return handleMarketplaceHook(payload, { harness: marketplaceHarness(env) });
-}
-
+// The runtime already produced the harness-native envelope; write it verbatim.
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
-  process.stdout.write(`${JSON.stringify(await handleSessionStart(await readPayload()))}\n`);
+  process.stdout.write(`${await handleSessionStart(await readPayload())}\n`);
 }

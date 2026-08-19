@@ -1,0 +1,9 @@
+{
+  "broker_restart": "reconnect/reconcile: retained state is restored from persistence and no non-retained event is replayed",
+  "dropped_retained": "reconcile: Git reconstructs current truth even when the retained ref-change hint is dropped",
+  "duplicate_replay": "one logical item: a duplicate QoS 1 event is deduped and a re-delivered state revision is not re-applied",
+  "invalid_retained": "typed validation refusal: a privileged fixture publisher's malformed retained payload is rejected with a typed error",
+  "git_fetch_failure": "degraded Git result: an unreachable configured remote yields a typed GitFailure with no ref or worktree mutation",
+  "revoked_credential": "authentication refusal: a revoked credential cannot reconnect while an unrevoked peer keeps access",
+  "clock_skew": "bounded expiry decision: a lease is honored within the skew tolerance and rejected one second beyond it"
+}

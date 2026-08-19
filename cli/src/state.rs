@@ -44,9 +44,12 @@ fn usage() {
     eprintln!("Usage: loam state [--fast] <workspace-root>");
 }
 
-fn aggregate(workspace: &Path, fast: bool) -> String {
+pub(crate) fn aggregate(workspace: &Path, fast: bool) -> String {
+    // hcom is workspace-independent, so its readiness is resolved before the
+    // wiki gate and reported by both the full and the minimal aggregate.
+    let hcom_ready = hcom_readiness();
     let Some(wiki_root) = resolve_wiki_root(workspace) else {
-        return minimal_state();
+        return minimal_state(hcom_ready);
     };
 
     let has_schema = wiki_root.join("SCHEMA.md").is_file();
@@ -98,13 +101,15 @@ fn aggregate(workspace: &Path, fast: bool) -> String {
         .unwrap_or_default();
 
     format!(
-        "{{\"wiki_root\":\"{}\",\"exists\":true,\"has_schema\":{},\"has_index\":{},\"has_log\":{},\"has_overview\":{},\"qmd_ready\":{},\"collection\":\"{}\",\"metadata_status\":\"{}\",\"metadata_path\":\"{}\",\"latest_checkpoint\":{},\"recent_checkpoints\":{},\"checkpoint_count\":{},\"git_status\":{},\"drift_count\":{},\"hints\":{}}}",
+        "{{\"version\":\"{}\",\"wiki_root\":\"{}\",\"exists\":true,\"has_schema\":{},\"has_index\":{},\"has_log\":{},\"has_overview\":{},\"qmd_ready\":{},\"hcom_ready\":{},\"collection\":\"{}\",\"metadata_status\":\"{}\",\"metadata_path\":\"{}\",\"latest_checkpoint\":{},\"recent_checkpoints\":{},\"checkpoint_count\":{},\"git_status\":{},\"drift_count\":{},\"hints\":{}}}",
+        runtime_version(),
         json_escape(&wiki_root.display().to_string()),
         has_schema,
         has_index,
         has_log,
         has_overview,
         qmd_ready,
+        hcom_ready,
         json_escape(&collection),
         json_escape(&metadata.status),
         metadata_path,
@@ -117,8 +122,20 @@ fn aggregate(workspace: &Path, fast: bool) -> String {
     )
 }
 
-fn minimal_state() -> String {
-    "{\"wiki_root\":\"\",\"exists\":false,\"qmd_ready\":false,\"latest_checkpoint\":null,\"recent_checkpoints\":[],\"checkpoint_count\":0,\"git_status\":null,\"drift_count\":null,\"hints\":[{\"kind\":\"memory_missing\",\"group\":\"maintenance\",\"severity\":\"info\",\"message\":\"No memory substrate found; scaffold a wiki to begin.\",\"command\":\"/loam::scaffolding-wiki <goal>\",\"evidence\":{}}]}".to_owned()
+/// The runtime's own compiled version, from the crate's `CARGO_PKG_VERSION`.
+/// This is the self-report the config-dir ledger compares against at readiness;
+/// it can never be a stale skills-tree `CLI_VERSION`. See
+/// `plans/runtime-channel-ledger.md`.
+pub(crate) fn runtime_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn minimal_state(hcom_ready: bool) -> String {
+    format!(
+        "{{\"version\":\"{}\",\"wiki_root\":\"\",\"exists\":false,\"qmd_ready\":false,\"hcom_ready\":{},\"latest_checkpoint\":null,\"recent_checkpoints\":[],\"checkpoint_count\":0,\"git_status\":null,\"drift_count\":null,\"hints\":[{{\"kind\":\"memory_missing\",\"group\":\"maintenance\",\"severity\":\"info\",\"message\":\"No memory substrate found; scaffold a wiki to begin.\",\"command\":\"/loam::scaffolding-wiki <goal>\",\"evidence\":{{}}}}]}}",
+        runtime_version(),
+        hcom_ready
+    )
 }
 
 pub fn resolve_wiki_root(workspace: &Path) -> Option<PathBuf> {
@@ -185,6 +202,126 @@ fn qmd_readiness(wiki_root: &Path, metadata_collection: &str) -> (bool, String) 
         return (true, collection);
     }
     (false, metadata_collection.to_owned())
+}
+
+/// Detection-only readiness for the optional hcom integration (spec:
+/// loam-optional-integrations). loam never installs hcom, so this only answers
+/// "can this session reach it", cheapest rung first, because `state --fast` runs
+/// on every session start under a hard hook budget (`cli/tests/state_budget.rs`)
+/// and this probe sits outside the wiki gate that short-circuits the qmd one:
+///   1. `HCOM_TOOL` — hcom's launcher sets it for every session it starts, so an
+///      hcom-managed session skips straight past the health check. The marker is
+///      an identity marker, not a liveness one: it outlives an hcom that was
+///      removed or broken, and a user who exports it from a shell rc would
+///      otherwise be told `ready` on a machine with no hcom at all. So the rung
+///      still confirms by stat — no spawn, which is the property it exists for.
+///   2. Binary resolution by stat alone: PATH, then `HCOM_INSTALL_DIR` (and its
+///      `bin/`), then `~/.local/bin`. brew, uv/pip and both official installers
+///      land in one of those, on every OS.
+///   3. `hcom --version` — the only subprocess in the ladder, reached only once a
+///      binary actually exists. (`hcom version` is not a command.)
+///
+/// On Windows this ladder matches `hcom.exe` only, while the Node-side ladder in
+/// `setup/integrations/tools.mjs` also accepts `.cmd` and `.bat`. A hand-written
+/// `hcom.cmd` shim is therefore visible to `loam doctor` and to
+/// `--integration hcom` but not to this line. That is the adjudicated shape —
+/// every official installer produces the real executable — and it is recorded
+/// here so the next reader does not read the narrower rung as a bug.
+fn hcom_readiness() -> bool {
+    let Some(binary) = resolve_hcom_binary() else {
+        return false;
+    };
+    if std::env::var_os("HCOM_TOOL").is_some_and(|value| !value.is_empty()) {
+        return true;
+    }
+    hcom_answers_its_version(&binary)
+}
+
+/// How long the health check waits for `hcom --version` before giving up. The
+/// hook budget is five seconds and this is the one spawn on the path with no
+/// gate in front of it, so a binary on a stalled network mount, blocked on a
+/// build lock, or behind a wrapper shim that waits on something must not be able
+/// to hold the whole session start hostage. A real answer is milliseconds.
+const HCOM_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const HCOM_HEALTH_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// `hcom --version`, bounded. Expiry counts as not-ready: a binary that cannot
+/// say its own version in a second is not one a skill should route work to, and
+/// the briefing promising otherwise is the failure this probe exists to prevent.
+/// `std` has no `wait_timeout`, so this is a `try_wait` poll loop — the same
+/// shape as `run_bounded` in `cli/src/service.rs`, without its scratch-file
+/// capture, because only the exit status is read here. On expiry the child is
+/// killed and reaped so no zombie is left behind.
+fn hcom_answers_its_version(binary: &Path) -> bool {
+    use std::process::Stdio;
+    let Ok(mut child) = Command::new(binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + HCOM_HEALTH_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(HCOM_HEALTH_POLL);
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+/// The hcom binary as an absolute path, or `None` when no install site holds an
+/// executable of that name. Stat-only: never spawns, never trusts a bare name.
+///
+/// Only absolute directories are searched, and that is load-bearing rather than
+/// tidy. `split_paths` yields an EMPTY component for an empty `PATH` and for the
+/// empty element in `PATH=/usr/bin:` — a trailing colon is a common shell-rc
+/// accident — and joining a name onto an empty path gives the bare relative
+/// `hcom`, which `fs::metadata` resolves against the process CWD. The hook runs
+/// with CWD set to the workspace, so without this filter a checked-in `hcom` in
+/// a cloned repository would be stat'd and then run at session start. `HOME=""`
+/// and a relative `HCOM_INSTALL_DIR` reach the same place by the same route.
+fn resolve_hcom_binary() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "hcom.exe" } else { "hcom" };
+    let mut directories = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some(install_dir) = std::env::var_os("HCOM_INSTALL_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        directories.push(install_dir.join("bin"));
+        directories.push(install_dir);
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        directories.push(PathBuf::from(home).join(".local").join("bin"));
+    }
+    directories
+        .into_iter()
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn json_string_value(content: &str, key: &str) -> Option<String> {
@@ -769,7 +906,19 @@ fn json_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{days_since_unix_epoch, epoch_of, lint_age};
+    use super::{
+        aggregate, days_since_unix_epoch, epoch_of, lint_age, minimal_state, runtime_version,
+    };
+
+    #[test]
+    fn version_is_the_compiled_crate_version() {
+        assert_eq!(runtime_version(), env!("CARGO_PKG_VERSION"));
+        let needle = format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"));
+        // Present in both the wiki-less minimal state and a full aggregate.
+        assert!(minimal_state(false).contains(&needle));
+        let tmp = std::env::temp_dir();
+        assert!(aggregate(&tmp, true).contains("\"version\":\""));
+    }
 
     #[test]
     fn civil_dates_convert_without_platform_tools() {

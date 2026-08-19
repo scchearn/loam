@@ -1,0 +1,192 @@
+{
+  "comment": "Emit corpus. `accepted` operations must derive cleanly and refuse nothing. `overrides` each take the message.reply base and add one authority-bearing field the caller must not be able to set: the derived value must win and the attempt must be reported in `refused`. `rejected` operations must fail with the stated typed code rather than dispatch. `payload_is_not_authority` proves the refusal scan stops at the payload boundary — a payload field named `id` is caller data, not an authority claim.",
+  "base_reply": {
+    "type": "message.reply",
+    "causation_id": "01K6Q6ESWMT48TP1",
+    "summary": "Reviewed the anchored change.",
+    "to": [{ "kind": "instance", "id": "instance-01" }],
+    "payload": { "action": "collaboration.note", "params": {}, "response_status": "ok" }
+  },
+  "accepted": [
+    {
+      "name": "message-reply",
+      "operation": {
+        "type": "message.reply",
+        "causation_id": "01K6Q6ESWMT48TP1",
+        "summary": "Reviewed the anchored change.",
+        "to": [{ "kind": "instance", "id": "instance-01" }],
+        "payload": { "action": "collaboration.note", "params": {}, "response_status": "ok" }
+      },
+      "expect_causation": "01K6Q6ESWMT48TP1"
+    },
+    {
+      "name": "message-ack",
+      "operation": {
+        "type": "message.ack",
+        "causation_id": "01K6Q6ESWMT48TP2",
+        "summary": "Received.",
+        "to": [{ "kind": "principal", "id": "employee-184" }],
+        "payload": { "action": "collaboration.ack", "params": {} }
+      },
+      "expect_causation": "01K6Q6ESWMT48TP2"
+    },
+    {
+      "name": "work-report",
+      "operation": {
+        "type": "work.report",
+        "state_key": "work-SB-42",
+        "revision": "2",
+        "summary": "Ready for review.",
+        "plan_oid": "61af000000000000000000000000000000000001",
+        "artifacts": [{ "kind": "task", "id": "SB-42" }],
+        "payload": { "state": "ready", "acceptance": {}, "verification": [] }
+      },
+      "expect_causation": null
+    },
+    {
+      "name": "work-report-anchored-in-a-sha256-repository",
+      "why": "A Git object id is 40 hex or 64, and this repo supports both object formats. A CLI anchor check stricter than the envelope's would refuse a SHA-256 repository's claims — #98's symptom restored for that class of repo.",
+      "operation": {
+        "type": "work.report",
+        "state_key": "work-SB-42",
+        "revision": "2",
+        "summary": "Ready for review.",
+        "plan_oid": "61af0000000000000000000000000000000000000000000000000000000000ab",
+        "artifacts": [{ "kind": "task", "id": "SB-42" }],
+        "payload": { "state": "ready", "acceptance": {}, "verification": [] }
+      },
+      "expect_causation": null
+    }
+  ],
+  "overrides": [
+    { "name": "source", "patch": { "source": "urn:loam:instance:impostor" }, "refused": ["source"] },
+    { "name": "event-id", "patch": { "id": "01KFORGEDFORGEDFORGED00001" }, "refused": ["id"] },
+    { "name": "timestamp", "patch": { "time": "2000-01-01T00:00:00Z" }, "refused": ["time"] },
+    {
+      "name": "principal-binding",
+      "patch": { "from": { "principal_id": "employee-999", "agent_id": "agent-x", "instance_id": "instance-x" } },
+      "refused": ["from", "principal_id", "agent_id", "instance_id"]
+    },
+    {
+      "name": "project-context",
+      "patch": { "context": { "org_id": "org-other", "project_id": "someone-elses-project", "repository_id": "repo-other" } },
+      "refused": ["context", "org_id", "project_id", "repository_id"]
+    },
+    { "name": "specversion", "patch": { "specversion": "9.9" }, "refused": ["specversion"] },
+    { "name": "dataschema", "patch": { "dataschema": "urn:loam:schema:anything:1" }, "refused": ["dataschema"] }
+  ],
+  "payload_is_not_authority": {
+    "type": "message.reply",
+    "causation_id": "01K6Q6ESWMT48TP3",
+    "summary": "Carries caller data.",
+    "to": [{ "kind": "instance", "id": "instance-01" }],
+    "payload": {
+      "action": "collaboration.note",
+      "params": { "id": "ticket-7", "source": "the customer", "project_id": "their-tracker" },
+      "response_status": "ok"
+    }
+  },
+  "rejected": [
+    {
+      "name": "namespaced-extension-type",
+      "operation": {
+        "type": "com.example.deploy.request",
+        "causation_id": "01K6Q6ESWMT48TP4",
+        "summary": "Please deploy.",
+        "to": [{ "kind": "instance", "id": "instance-01" }],
+        "payload": {}
+      },
+      "code": "unsupported_operation_type"
+    },
+    {
+      "name": "loam-namespaced-but-unlisted",
+      "operation": {
+        "type": "io.loam.work.claim",
+        "summary": "Claiming.",
+        "payload": {}
+      },
+      "code": "unsupported_operation_type"
+    },
+    {
+      "name": "missing-type",
+      "operation": { "summary": "No type at all.", "payload": {} },
+      "code": "unsupported_operation_type"
+    },
+    {
+      "name": "reply-without-causation",
+      "operation": {
+        "type": "message.reply",
+        "summary": "Answering nothing in particular.",
+        "to": [{ "kind": "instance", "id": "instance-01" }],
+        "payload": { "action": "collaboration.note", "params": {} }
+      },
+      "code": "missing_causation_id"
+    },
+    {
+      "name": "reply-without-a-routable-recipient",
+      "operation": {
+        "type": "message.reply",
+        "causation_id": "01K6Q6ESWMT48TP5",
+        "summary": "To nobody.",
+        "to": [{ "kind": "project", "id": "loam" }],
+        "payload": { "action": "collaboration.note", "params": {} }
+      },
+      "code": "missing_recipient"
+    },
+    {
+      "name": "work-report-without-a-state-key",
+      "operation": {
+        "type": "work.report",
+        "summary": "Ready.",
+        "payload": { "state": "ready" }
+      },
+      "code": "missing_state_key"
+    },
+    {
+      "name": "claim-bearing-work-report-without-a-plan-anchor",
+      "why": "A task artifact makes the report a claim, and the envelope requires context.git.plan_oid for one. Refused here by name instead of costing a round trip to be told the envelope was invalid (#98).",
+      "operation": {
+        "type": "work.report",
+        "state_key": "work-SB-42",
+        "summary": "Ready for review.",
+        "artifacts": [{ "kind": "task", "id": "SB-42" }],
+        "payload": { "state": "ready" }
+      },
+      "code": "missing_plan_oid"
+    },
+    {
+      "name": "claim-bearing-work-report-with-an-acceptance-map-and-no-anchor",
+      "why": "The other half of the validator's claim test: a non-empty acceptance map is a claim even with no artifacts.",
+      "operation": {
+        "type": "work.report",
+        "state_key": "work-SB-42",
+        "summary": "Acceptance met.",
+        "payload": { "state": "ready", "acceptance": { "SB-42": "met" } }
+      },
+      "code": "missing_plan_oid"
+    },
+    {
+      "name": "work-report-with-a-malformed-plan-anchor",
+      "why": "An anchor that is not a full-length lowercase Git object id is a typo, not provenance; the envelope refuses it as invalid_plan_oid.",
+      "operation": {
+        "type": "work.report",
+        "state_key": "work-SB-42",
+        "summary": "Ready for review.",
+        "plan_oid": "61af00",
+        "artifacts": [{ "kind": "task", "id": "SB-42" }],
+        "payload": { "state": "ready" }
+      },
+      "code": "invalid_plan_oid"
+    },
+    {
+      "name": "work-report-with-an-unknown-state",
+      "operation": {
+        "type": "work.report",
+        "state_key": "work-SB-42",
+        "summary": "Vibing.",
+        "payload": { "state": "vibing" }
+      },
+      "code": "invalid_work_state"
+    }
+  ]
+}

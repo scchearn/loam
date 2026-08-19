@@ -1,11 +1,11 @@
 # Repository gates: contract tests, curation, version agreement on changes, and
-# a daily strict check that every CLI_VERSION still resolves. Rust workspace
+# a daily strict check that the package-baked RUNTIME_VERSION still resolves. Rust workspace
 # checks live in cli.yml, which is path-filtered to the runtime lane.
 name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, federation]
   pull_request:
   schedule:
     # Daily, so a release that never finished publishing is reported even when
@@ -23,6 +23,9 @@ jobs:
       - run: npm ci
       - run: bash bin/check-curation.sh
       - run: bash bin/setup-contract-test
+      # The enrollment signer's availability contract (#93): it must keep
+      # serving while a client stalls mid-handshake. python3 + openssl only.
+      - run: python3 deploy/mqtt-broker/enroll/test_signer.py
       - run: skills/loam-work/loam-setting-goals/scripts/goal-contract-test
 
   node-contracts:

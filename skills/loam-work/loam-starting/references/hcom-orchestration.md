@@ -37,7 +37,7 @@ Require delegated workers to use one of these on the shared thread:
 
 Before launching workers:
 
-1. Check `hcom` availability. If unavailable, execute inline and log the fallback.
+1. Read hcom availability from the `hcom:` line in the injected `## Workspace state` block — do not probe for the binary. If it says `not installed`, execute inline and log the fallback.
 2. Inspect any requested worktree or branch.
 3. Reuse an existing worktree only when it is on the expected branch and safe to reuse.
 4. If the worktree exists on a different branch, or contains conflicting unexpected changes, stop and ask the user.
@@ -73,7 +73,7 @@ Reuse the same `WF_THREAD` across sends, waits, FIX loops, and cleanup. Do not r
 Spawn the worker headless. Do not put `--thread` on spawn commands.
 
 ```bash
-AGENT_OUT=$(HCOM_OPENCODE_ARGS="--model <provider/model>" hcom opencode --tag <tag> --headless --go 2>&1)
+AGENT_OUT=$(HCOM_OPENCODE_ARGS="--model <provider/model>" hcom opencode --tag <tag> --headless 2>&1)
 AGENT_NAME=$(printf '%s\n' "$AGENT_OUT" | grep '^Names: ' | sed 's/^Names: //' | tr -d ' ')
 ```
 
@@ -149,10 +149,10 @@ Keep the delegated tasks `[h]` until hub verification passes.
 
 ## Cleanup
 
-Always clean up launched workers with `hcom kill` and `--go`:
+Always clean up launched workers with `hcom kill`:
 
 ```bash
-hcom kill "$AGENT_NAME" --go
+hcom kill "$AGENT_NAME"
 ```
 
 Do not use `stop` here. `kill` cleans up the headless worker reliably.

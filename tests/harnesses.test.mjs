@@ -5,29 +5,101 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 
-import { createClaudeAdapter, workspaceFromPayload as claudeWorkspace } from '../adapters/claude-session-start.mjs';
-import { createCursorAdapter, workspaceFromPayload as cursorWorkspace } from '../adapters/cursor-session-start.mjs';
-import { createOpenCodeAdapter } from '../adapters/opencode.mjs';
+import { LoamPlugin } from '../adapters/opencode.mjs';
+
+// adapters/opencode.mjs exports only LoamPlugin (OpenCode's loader calls every
+// top-level export as a plugin factory); test helpers ride on it as properties.
+const { createOpenCodeAdapter } = LoamPlugin;
 import { main as runIngestWorker } from '../adapters/ingest-worker.mjs';
 import { dedupe, mergeJsonConfig } from '../setup/config.mjs';
-import { detectHarnesses, installHarnesses } from '../setup/harnesses.mjs';
+import {
+  detectHarnesses,
+  installHarnesses,
+  reconcileOpenCodePluginEntry,
+} from '../setup/harnesses.mjs';
 
-test('OpenCode injects the shared context once and ignores unrelated dedup markers', async () => {
+test('opencode config plugin entries pointing at a repo-local loam.js are rewritten to the stable global path', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-opencode-rewrite-'));
+  const stable = join(home, '.config', 'opencode', 'plugins', 'loam.js');
+  await mkdir(join(home, '.config', 'opencode', 'plugins'), { recursive: true });
+  await writeFile(
+    join(home, '.config', 'opencode', 'opencode.json'),
+    JSON.stringify({
+      plugin: [
+        '/home/sam/Nextcloud/Clients/Dikokotech/loam/.opencode/plugins/loam.js',
+        'superpowers@git+https://github.com/obra/superpowers.git',
+        ['/repo/plugins/loam.js', { enabled: true }],
+      ],
+      mcp: { exa: { type: 'remote' } },
+    }),
+  );
+
+  const result = await reconcileOpenCodePluginEntry(home, stable);
+  assert.equal(result.action, 'rewritten');
+  const config = JSON.parse(await readFile(join(home, '.config', 'opencode', 'opencode.json'), 'utf8'));
+  assert.equal(config.plugin[0], stable, 'a repo-local loam.js entry points at the stable path');
+  assert.equal(config.plugin[1], 'superpowers@git+https://github.com/obra/superpowers.git', 'unrelated entries survive');
+  assert.deepEqual(config.plugin[2], [stable, { enabled: true }], 'tuple entries are rewritten in place');
+  assert.deepEqual(config.mcp, { exa: { type: 'remote' } }, 'unrelated config sections survive');
+
+  // Idempotent: a second pass rewrites nothing.
+  const again = await reconcileOpenCodePluginEntry(home, stable);
+  assert.equal(again.action, 'unchanged');
+
+  // A config with no Loam-owned entries is left alone.
+  await writeFile(
+    join(home, '.config', 'opencode', 'opencode.json'),
+    JSON.stringify({ plugin: ['other-plugin'] }),
+  );
+  const untouched = await reconcileOpenCodePluginEntry(home, stable);
+  assert.equal(untouched.action, 'unchanged');
+  assert.deepEqual(
+    JSON.parse(await readFile(join(home, '.config', 'opencode', 'opencode.json'), 'utf8')),
+    { plugin: ['other-plugin'] },
+  );
+});
+
+test('OpenCode re-injects on every turn: full block first, federation refresh after', async () => {
   const calls = [];
+  const wakeStarts = [];
   const plugin = await createOpenCodeAdapter({
-    getContext: async ({ workspace }) => {
-      calls.push(workspace);
-      return `<LOAM_IMPORTANT>\nYou have loam.\n${workspace}\n</LOAM_IMPORTANT>`;
+    getContext: async ({ workspace, event }) => {
+      calls.push({ workspace, event });
+      return event === 'SessionStart'
+        ? `<LOAM_IMPORTANT>\nYou have loam.\n${workspace}\n</LOAM_IMPORTANT>`
+        : `<LOAM_IMPORTANT>\n## Federation\nrefresh\n</LOAM_IMPORTANT>`;
+    },
+    wakeServer: async ({ workspace, sessionId }) => {
+      wakeStarts.push({ workspace, sessionId });
+      return { wakeRef: 'notify-tcp://127.0.0.1:0', registered: false, close: async () => {} };
     },
   })({ directory: '/workspace' });
   const output = {
-    messages: [{ info: { role: 'user' }, parts: [{ type: 'text', text: 'superpowers context' }] }],
+    messages: [{ info: { role: 'user', sessionID: 'sess-1' }, parts: [{ type: 'text', text: 'superpowers context' }] }],
   };
 
   await plugin['experimental.chat.messages.transform']({}, output);
   await plugin['experimental.chat.messages.transform']({}, output);
-  assert.equal(output.messages[0].parts.filter((part) => part.text?.includes('You have loam')).length, 1);
-  assert.deepEqual(calls, ['/workspace']);
+  await plugin['experimental.chat.messages.transform']({}, output);
+  // T4: the first fire is the session start (full block); every later fire is a
+  // per-turn refresh. The OWN_MARKER self-dedup is gone — the native hook
+  // renders the right shape per event.
+  assert.deepEqual(calls, [
+    { workspace: '/workspace', event: 'SessionStart' },
+    { workspace: '/workspace', event: 'UserPromptSubmit' },
+    { workspace: '/workspace', event: 'UserPromptSubmit' },
+  ]);
+  // The notify listener opens once, on the first fire, against the session id
+  // carried on the first user message (OpenCode emits no session.created for
+  // the main session).
+  assert.deepEqual(wakeStarts, [{ workspace: '/workspace', sessionId: 'sess-1' }]);
+  const parts = output.messages[0].parts.filter((part) => part.type === 'text');
+  assert.equal(parts.length, 4, 'one full block + two refreshes');
+  // unshift puts the newest injection first: the two refreshes, then the full
+  // block, then the original user text.
+  assert.ok(parts[0].text.includes('## Federation'), 'newest part is a refresh');
+  assert.ok(parts[1].text.includes('## Federation'), 'second part is a refresh');
+  assert.ok(parts[2].text.includes('You have loam'), 'the full block is still present');
 });
 
 test('OpenCode background events queue work and normalize the all-session status map', async () => {
@@ -296,6 +368,14 @@ test('OpenCode hook-run logging remains fail-open', async () => {
       beginHookRun: async () => { calls += 1; throw new Error('locked'); },
       finishHookRun: async () => { throw new Error('must not finish'); },
     },
+    // The idle event must not spawn the real gate's node subprocess after the
+    // test ends; this test is about hook-run logging, not ingestion.
+    ingestion: {
+      gate: async () => ({ action: 'skip' }),
+      resolveGlobalRoot: () => '/global',
+      resolveSkillsRoot: () => '/skills',
+      runWorker: async () => undefined,
+    },
   })({ directory: '/workspace' });
 
   await assert.doesNotReject(() => plugin.event({ event: { type: 'session.idle', sessionID: 'parent' } }));
@@ -326,26 +406,6 @@ test('OpenCode finishes a catchable gate failure without rejecting the hook', as
   assert.equal(finished[0].run, run);
   assert.equal(finished[0].status, 'failed');
   assert.match(finished[0].detail, /gate failed/);
-});
-
-test('Claude and Cursor adapters use payload workspace roots and emit documented envelopes', async () => {
-  const getContext = async ({ workspace }) => `context for ${workspace}`;
-  const claude = createClaudeAdapter({ getContext });
-  const cursor = createCursorAdapter({ getContext });
-  const workspace = resolve('/payload/workspace');
-  const payload = { cwd: workspace, workspace: { root: resolve('/nested/root') } };
-
-  assert.equal(claudeWorkspace(payload), workspace);
-  assert.equal(cursorWorkspace(payload), workspace);
-  const claudeOutput = await claude(payload);
-  const cursorOutput = await cursor(payload);
-  assert.deepEqual(claudeOutput, {
-    hookSpecificOutput: {
-      hookEventName: 'SessionStart',
-      additionalContext: `context for ${workspace}`,
-    },
-  });
-  assert.deepEqual(cursorOutput, { additional_context: `context for ${workspace}` });
 });
 
 test('config merge preserves unrelated JSON, creates a backup, and deduplicates Loam entries', async () => {
@@ -382,6 +442,7 @@ test('malformed and policy-owned config is rejected without mutation', async () 
 test('harness installation preserves unrelated hook commands containing loam', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-hook-ownership-'));
   const globalRoot = join(home, '.agents', 'loam');
+  const runtimePath = join(globalRoot, 'bin', '0.9.1', 'target', 'loam');
   await mkdir(join(home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(home, '.claude'), { recursive: true });
   await mkdir(join(home, '.cursor'), { recursive: true });
@@ -397,6 +458,7 @@ test('harness installation preserves unrelated hook commands containing loam', a
     home,
     globalRoot,
     pluginVersion: '0.8.3',
+    runtimePath,
     detected: await detectHarnesses({ home }),
   });
   const claude = JSON.parse(await readFile(join(home, '.claude', 'settings.json'), 'utf8'));
@@ -406,14 +468,80 @@ test('harness installation preserves unrelated hook commands containing loam', a
 
   assert.deepEqual(claudeHooks[0], unrelatedClaude);
   assert.deepEqual(cursorHooks[0], unrelatedCursor);
-  assert.equal(claudeHooks.filter((entry) => entry.command === 'node' && entry.args?.[0] === result.claude.path).length, 0);
-  assert.equal(cursorHooks.filter((entry) => entry.command === 'node' && entry.args?.[0] === result.cursor.path).length, 1);
+  assert.equal(claudeHooks.filter((entry) => entry.command === runtimePath).length, 0, 'Claude is registered in its plugin, not in user settings');
+  assert.deepEqual(
+    cursorHooks.filter((entry) => entry.command.includes(runtimePath)).map((entry) => entry.command),
+    [`"${runtimePath}" hook cursor --event sessionStart`],
+  );
+  await result.rollback();
+});
+
+test('installation replaces a legacy args-array cursor registration instead of stacking beside it', async () => {
+  // #135: the pre-fix entry Cursor silently ignored (`args` is not in its
+  // schema). An update has to recognize it as ours and take it out — a machine
+  // that already ran setup would otherwise keep the dead registration and gain
+  // a second, working one beside it.
+  const home = await mkdtemp(join(tmpdir(), 'loam-cursor-legacy-'));
+  const globalRoot = join(home, '.agents', 'loam');
+  const runtimePath = join(globalRoot, 'bin', '0.9.1', 'target', 'loam');
+  await mkdir(join(home, '.cursor'), { recursive: true });
+  const legacy = {
+    type: 'command',
+    command: runtimePath,
+    args: ['hook', 'cursor', '--event', 'sessionStart'],
+    async: false,
+  };
+  await writeFile(join(home, '.cursor', 'hooks.json'), JSON.stringify({ hooks: { sessionStart: [legacy] } }));
+
+  const result = await installHarnesses({
+    home,
+    globalRoot,
+    pluginVersion: '0.8.3',
+    runtimePath,
+    detected: await detectHarnesses({ home }),
+  });
+  const cursor = JSON.parse(await readFile(join(home, '.cursor', 'hooks.json'), 'utf8'));
+  assert.deepEqual(cursor.hooks.sessionStart, [
+    { type: 'command', command: `"${runtimePath}" hook cursor --event sessionStart` },
+  ]);
+  await result.rollback();
+});
+
+test('re-registration replaces a cursor entry naming an older staged runtime', async () => {
+  // The staged runtime lives in the versioned config-dir runtime store, not
+  // under the global root, so ownership matched nothing and every setup run
+  // appended one more entry: observed as four sessionStart registrations on a
+  // machine running the cursor lane, three of them pointing at runtime
+  // versions that had already been deleted.
+  const home = await mkdtemp(join(tmpdir(), 'loam-cursor-stale-'));
+  const globalRoot = join(home, '.agents', 'loam');
+  const store = join(home, '.config', 'loam', 'runtime');
+  const older = join(store, '0.11.0-next.19', 'x86_64-unknown-linux-musl', 'loam');
+  const runtimePath = join(store, '0.11.0-next.20', 'x86_64-unknown-linux-musl', 'loam');
+  await mkdir(join(home, '.cursor'), { recursive: true });
+  await writeFile(join(home, '.cursor', 'hooks.json'), JSON.stringify({
+    version: 1,
+    hooks: { sessionStart: [{ type: 'command', command: `"${older}" hook cursor --event sessionStart` }] },
+  }));
+
+  const result = await installHarnesses({
+    home,
+    globalRoot,
+    pluginVersion: '0.8.3',
+    runtimePath,
+    detected: await detectHarnesses({ home }),
+  });
+  const cursor = JSON.parse(await readFile(join(home, '.cursor', 'hooks.json'), 'utf8'));
+  assert.deepEqual(cursor.hooks.sessionStart, [
+    { type: 'command', command: `"${runtimePath}" hook cursor --event sessionStart` },
+  ]);
   await result.rollback();
 });
 
 test('harness detection and installation use only user HOME paths and are idempotent', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-home-'));
   const globalRoot = join(home, '.agents', 'loam');
+  const runtimePath = join(globalRoot, 'bin', '0.9.1', 'target', 'loam');
   await mkdir(join(home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(home, '.claude'), { recursive: true });
   await mkdir(join(home, '.cursor'), { recursive: true });
@@ -425,8 +553,8 @@ test('harness detection and installation use only user HOME paths and are idempo
   assert.equal(detected.claude.state, 'detected');
   assert.equal(detected.cursor.state, 'detected');
 
-  const first = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', detected });
-  const second = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', detected });
+  const first = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', runtimePath, detected });
+  const second = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', runtimePath, detected });
   assert.deepEqual(first.opencode.state, 'ready');
   assert.deepEqual(first.claude.state, 'skipped');
   assert.deepEqual(first.cursor.state, 'ready');
@@ -443,6 +571,7 @@ test('harness detection and installation use only user HOME paths and are idempo
 test('marketplace plugins own all Claude and Codex lifecycle hooks', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-owned-'));
   const globalRoot = join(home, '.agents', 'loam');
+  const runtimePath = join(globalRoot, 'bin', '0.9.1', 'target', 'loam');
   const oldRoot = join(globalRoot, 'plugins', 'old');
   const oldClaude = { type: 'command', command: `node ${JSON.stringify(join(oldRoot, 'claude-session-start.mjs'))}` };
   const oldCodex = { type: 'command', command: `node ${JSON.stringify(join(oldRoot, 'codex-session-start.mjs'))}` };
@@ -456,14 +585,14 @@ test('marketplace plugins own all Claude and Codex lifecycle hooks', async () =>
   await writeFile(join(home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
   const claudeCache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
   await mkdir(join(claudeCache, 'hooks'), { recursive: true });
-  await writeFile(join(claudeCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  await writeFile(join(claudeCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
   await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
     version: 2,
     plugins: { 'loam@loam': [{ scope: 'user', installPath: claudeCache, version: '0.8.6' }] },
   }));
   const codexCache = join(home, '.codex', 'plugins', 'cache', 'loam', 'loam', '0.8.6');
   await mkdir(join(codexCache, 'hooks'), { recursive: true });
-  await writeFile(join(codexCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  await writeFile(join(codexCache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
   await writeFile(join(home, '.codex', 'hooks.json'), JSON.stringify({
     hooks: { SessionStart: [{ hooks: [unrelated, oldCodex] }] },
   }));
@@ -476,7 +605,7 @@ test('marketplace plugins own all Claude and Codex lifecycle hooks', async () =>
   const stale = await detectHarnesses({ home, pluginVersion: '0.9.4' });
   assert.equal(stale.claude.marketplaceReady, false);
   assert.equal(stale.codex.marketplaceReady, false);
-  const owned = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.6', detected });
+  const owned = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.6', runtimePath, detected });
   const claude = JSON.parse(await readFile(join(home, '.claude', 'settings.json'), 'utf8'));
   const codex = JSON.parse(await readFile(join(home, '.codex', 'hooks.json'), 'utf8'));
   assert.equal(owned.claude.owner, 'marketplace');
@@ -495,6 +624,7 @@ test('marketplace plugins own all Claude and Codex lifecycle hooks', async () =>
     home: fallbackHome,
     globalRoot: join(fallbackHome, '.agents', 'loam'),
     pluginVersion: '0.8.6',
+    runtimePath: join(fallbackHome, '.agents', 'loam', 'bin', '0.9.1', 'target', 'loam'),
     detected: fallbackDetected,
   });
   assert.equal(fallback.codex.state, 'skipped');
@@ -520,7 +650,7 @@ test('disabled marketplace plugins remain discoverable for uninstall', async () 
   const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-disabled-'));
   const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.2');
   await mkdir(join(cache, 'hooks'), { recursive: true });
-  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
   await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': false } }));
   await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
     version: 2,
@@ -536,7 +666,7 @@ test('project-scoped Claude plugins do not satisfy a user-scoped install', async
   const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-project-scope-'));
   const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.4');
   await mkdir(join(cache, 'hooks'), { recursive: true });
-  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
   await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
   await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
     version: 2,
@@ -559,6 +689,7 @@ test('managed harness policy becomes partial without changing its settings', asy
     home,
     globalRoot: join(home, '.agents', 'loam'),
     pluginVersion: '0.8.3',
+    runtimePath: join(home, '.agents', 'loam', 'bin', '0.9.1', 'target', 'loam'),
     detected,
   });
 
@@ -574,6 +705,7 @@ test('absent harnesses remain absent and do not receive project-local hook files
     home,
     globalRoot: join(home, '.agents', 'loam'),
     pluginVersion: '0.8.3',
+    runtimePath: join(home, '.agents', 'loam', 'bin', '0.9.1', 'target', 'loam'),
     detected,
   });
 
@@ -593,6 +725,7 @@ test('Codex cleanup preserves unrelated hook groups without adding setup hooks',
     home,
     globalRoot: join(home, '.agents', 'loam'),
     pluginVersion: '0.8.3',
+    runtimePath: join(home, '.agents', 'loam', 'bin', '0.9.1', 'target', 'loam'),
     detected: { opencode: { id: 'opencode', state: 'absent' }, claude: { id: 'claude', state: 'absent' }, cursor: { id: 'cursor', state: 'absent' }, codex: { id: 'codex', state: 'detected', root: join(home, '.codex') } },
   });
   assert.equal(result.codex.state, 'skipped', JSON.stringify(result.codex));
@@ -614,7 +747,7 @@ test('Claude readiness follows the plugin cache when installed_plugins.json lags
   const fresh = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.15');
   for (const cache of [stale, fresh]) {
     await mkdir(join(cache, 'hooks'), { recursive: true });
-    await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+    await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
   }
   // The registry has not caught up: it still points at the previous version.
   await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
@@ -632,6 +765,7 @@ test('Claude readiness follows the plugin cache when installed_plugins.json lags
     home,
     globalRoot: join(home, '.agents', 'loam'),
     pluginVersion: '0.9.15',
+    runtimePath: join(home, '.agents', 'loam', 'bin', '0.9.1', 'target', 'loam'),
     detected,
   });
   assert.equal(installed.claude.state, 'ready');
@@ -650,7 +784,7 @@ test('Claude readiness works from the plugin cache with no registry file at all'
   }));
   const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.15');
   await mkdir(join(cache, 'hooks'), { recursive: true });
-  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}], Stop: [{}] } }));
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{}] } }));
 
   const detected = await detectHarnesses({ home, pluginVersion: '0.9.15' });
   assert.equal(detected.claude.marketplaceInstalled, true);
@@ -665,7 +799,7 @@ test('Claude is not ready when the cached plugin is missing its required hooks',
   }));
   const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.15');
   await mkdir(join(cache, 'hooks'), { recursive: true });
-  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{}] } }));
+  await writeFile(join(cache, 'hooks', 'hooks.json'), JSON.stringify({ hooks: {} }));
 
   const detected = await detectHarnesses({ home, pluginVersion: '0.9.15' });
   assert.equal(detected.claude.marketplaceInstalled, true);

@@ -1,0 +1,7776 @@
+//! The connector: the authority-preserving transport seam, its in-memory
+//! stub, and the enrollment connection probe.
+//!
+//! The transport seam is a trait consumed by **generics** (static dispatch) —
+//! never a trait object — so the crate's no-dispatch tripwire stays green and no
+//! callable capability is introduced. [`StubTransport`] keeps the probe testable
+//! without a broker; [`MqttTransport`] implements the same seam over the
+//! transport layer's public `transport` surface and is the only code here that touches it.
+//!
+//! `AuthenticatedPrincipal` is constructed only inside a transport adapter,
+//! after the transport reports an authenticated session. The probe derives every
+//! authority-bearing envelope field in trusted code; nothing is caller-supplied.
+//!
+//! Consumed by the connect orchestration, which retires this
+//! module-level allow once the stub and probe are wired to the CLI surface.
+#![allow(dead_code)]
+
+use std::io::Write;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+
+use crate::envelope::{self, AuthenticatedPrincipal, ValidatedEnvelope, ValidationConfig};
+
+/// What a transport can report and do. Implemented by [`StubTransport`] here and
+/// by the real transport adapter. Consumed only through generics.
+pub trait Transport {
+    /// Authenticate the session. On success the adapter learns the canonical
+    /// principal and the claims it may assert; only the adapter may turn these
+    /// into an [`AuthenticatedPrincipal`].
+    fn authenticate(&mut self) -> Result<SessionIdentity, ProbeError>;
+
+    /// Subscribe to a filter and require a successful SUBACK. `no_local` must be
+    /// `false` on every filter the probe verifies, because the self-published
+    /// echo is the positive receive proof.
+    fn subscribe(&mut self, filter: &str, no_local: bool) -> Result<(), ProbeError>;
+
+    /// Publish one validated envelope and require a PUBACK. `retain` must be
+    /// `false` for the probe: no retained probe may be left on the broker.
+    fn publish(
+        &mut self,
+        topic: &str,
+        envelope: &ValidatedEnvelope,
+        retain: bool,
+    ) -> Result<(), ProbeError>;
+
+    /// Receive the next frame within the deadline, or `None` on timeout.
+    fn receive(&mut self, deadline: Duration) -> Result<Option<ReceivedFrame>, ProbeError>;
+}
+
+/// The canonical identity a transport reports after authentication. The adapter
+/// maps this into the envelope authority model; the caller cannot supply it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionIdentity {
+    pub principal_id: String,
+    pub agent_id: String,
+    pub instance_id: String,
+    /// The sender's given name from the same authenticated certificate the
+    /// principal came from. Provenance, never authority.
+    pub display_name: Option<String>,
+    pub allowed_claims: Vec<String>,
+}
+
+/// One received frame: the wire bytes and the topic it arrived on. The probe
+/// re-validates the bytes so "self-receive" means a validated envelope, not just
+/// any echo.
+#[derive(Debug, Clone)]
+pub struct ReceivedFrame {
+    pub topic: String,
+    pub bytes: Vec<u8>,
+}
+
+/// The discrete capabilities the probe observed, with the moment it observed
+/// them. This is historical evidence — never a claim of enduring readiness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityEvidence {
+    pub authentication: bool,
+    pub publish: bool,
+    pub subscribe: bool,
+    pub self_receive: bool,
+    pub verified_at: DateTime<Utc>,
+}
+
+/// One-line runtime breadcrumbs for the delivery pipeline, on stderr, under a
+/// single grep-able prefix (#103). The connector is a background daemon whose
+/// output the staged service definitions capture, so this is the only place its
+/// pipeline is observable: without it, a parser bug that refuses every peer
+/// frame or a wake that never lands leaves no external signal at all, and the
+/// answer costs broker-side packet capture.
+///
+/// Content rules, enforced by review at every call site: ids, counts, ports,
+/// reasons. Never a summary, a payload, a state key, or a wake address.
+macro_rules! breadcrumb {
+    ($($arg:tt)*) => {
+        eprintln!("loam connector: {}", format_args!($($arg)*))
+    };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeError {
+    /// A broker that answered and rejected this identity: a CONNACK with a
+    /// non-success return code. Reachability is proven by the answer, so this
+    /// category points an operator at credentials — and nothing that failed
+    /// before the answer may borrow it (#115).
+    AuthenticationFailed,
+    /// The TCP dial was refused or reset. Nothing is listening, or something
+    /// closed the connection immediately: a closed port, a stopped broker, a
+    /// firewall that rejects rather than drops.
+    DialRefused,
+    /// The dial never completed and never failed outright: a timeout, an
+    /// unresolvable name, an unreachable network. A dropped packet looks like
+    /// this, which is why it is separate from a refusal.
+    TransportUnreachable,
+    /// TLS failed during the handshake, after the socket connected. Distinct
+    /// from `ConfigurationFailure` (this machine's own cert/key/trust material
+    /// could not even be loaded) and from `AuthenticationFailed` (the broker
+    /// spoke MQTT and refused the identity).
+    TlsHandshakeFailed,
+    SubscribeDenied {
+        filter: String,
+    },
+    PublishDenied,
+    /// Self-echo never arrived within the deadline.
+    NoSelfReceive,
+    /// An echo arrived but was not the exact probe event.
+    WrongSelfReceive,
+    /// A retained probe was observed — the probe must be non-retained.
+    RetainedProbe,
+    /// The probe envelope failed its own validation before publication.
+    InvalidProbe(String),
+    Timeout,
+    /// TLS configuration failed (invalid cert/key or trust store).
+    ConfigurationFailure(String),
+}
+
+impl ProbeError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ProbeError::AuthenticationFailed => "probe_authentication_failed",
+            // Transport-stage categories carry no `probe_` prefix: they happen
+            // before any probe step runs, on the live establishment path as much
+            // as on the enrollment probe.
+            ProbeError::DialRefused => "dial_refused",
+            ProbeError::TransportUnreachable => "transport_unreachable",
+            ProbeError::TlsHandshakeFailed => "tls_handshake_failed",
+            ProbeError::SubscribeDenied { .. } => "probe_subscribe_denied",
+            ProbeError::PublishDenied => "probe_publish_denied",
+            ProbeError::NoSelfReceive => "probe_no_self_receive",
+            ProbeError::WrongSelfReceive => "probe_wrong_self_receive",
+            ProbeError::RetainedProbe => "probe_retained",
+            ProbeError::InvalidProbe(_) => "probe_invalid_envelope",
+            ProbeError::Timeout => "probe_timeout",
+            ProbeError::ConfigurationFailure(_) => "tls_configuration_failure",
+        }
+    }
+
+    /// The one extra fact a `code()` cannot carry: which filter was denied,
+    /// which credential input was refused, which envelope rule was broken.
+    ///
+    /// `code()` alone was the whole diagnosis an operator got, and for a bad
+    /// key that meant `connect_probe_failed` and nothing else. Every value
+    /// here is a stable reason or a rule name, never credential material.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            ProbeError::SubscribeDenied { filter } => Some(filter),
+            ProbeError::InvalidProbe(detail) | ProbeError::ConfigurationFailure(detail) => {
+                Some(detail)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The non-secret inputs the connector supplies to build the probe. Every field
+/// is derived by the connector from the validated enrollment, never by a caller.
+#[derive(Debug, Clone)]
+pub struct ProbeContext {
+    pub org_id: String,
+    pub project_id: String,
+    pub repository_id: String,
+    pub base_oid: String,
+    pub plan_oid: String,
+}
+
+/// The filters the probe subscribes to before publishing. Kept explicit so the
+/// SUBACK requirement is auditable. `{origin}` is the connector's own instance.
+fn required_filters(context: &ProbeContext, identity: &SessionIdentity) -> Vec<String> {
+    let base = format!("loam/v1/{}/{}", context.org_id, context.project_id);
+    vec![
+        format!("{base}/event/{}", identity.instance_id),
+        format!("{base}/state/{}/+", identity.instance_id),
+        // The connector's own typed inbox (both kind and id bound), so the
+        // enrollment proves it can receive direct messages, not only events.
+        format!("{base}/inbox/instance/{}/+/+", identity.instance_id),
+    ]
+}
+
+/// The event topic the probe publishes on: `{origin}` binds to `instance_id`.
+fn probe_topic(context: &ProbeContext, identity: &SessionIdentity) -> String {
+    format!(
+        "loam/v1/{}/{}/event/{}",
+        context.org_id, context.project_id, identity.instance_id
+    )
+}
+
+/// A unique, envelope-legal probe id derived from time and the instance.
+fn probe_id(identity: &SessionIdentity, now: DateTime<Utc>) -> String {
+    // Uppercase alphanumeric, ULID-shaped enough for the envelope's id rule.
+    format!(
+        "01{:012X}{}",
+        now.timestamp_millis() & 0xFFFF_FFFF_FFFF,
+        short_suffix(&identity.instance_id)
+    )
+}
+
+fn short_suffix(instance: &str) -> String {
+    instance
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .rev()
+        .take(2)
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+/// Serialize the `federation.connection-probe` envelope as an `io.loam.message`,
+/// `intent=inform`, `delivery.class=event`, project-recipient, no body, with a
+/// summary that says it is a capability probe rather than enrollment/readiness.
+///
+/// Built as JSON directly (never touching the envelope module) so
+/// the connector owns nothing but data. Every value here is derived by the
+/// connector in trusted code; none is caller-supplied. The shape mirrors the
+/// event-class exemplar so it passes the envelope module's structural, identity, topic,
+/// anchor, and context-inventory validators, which `run_probe` re-checks.
+fn probe_envelope_json(
+    context: &ProbeContext,
+    identity: &SessionIdentity,
+    id: &str,
+    now: DateTime<Utc>,
+) -> String {
+    let time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let expires =
+        (now + chrono::Duration::seconds(60)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let outer = crate::json::Value::Object(vec![
+        ("specversion".into(), json_str("1.0")),
+        ("id".into(), json_str(id)),
+        (
+            "source".into(),
+            json_str(&format!("urn:loam:instance:{}", identity.instance_id)),
+        ),
+        ("type".into(), json_str("io.loam.message")),
+        ("time".into(), json_str(&time)),
+        ("datacontenttype".into(), json_str("application/json")),
+        ("dataschema".into(), json_str("urn:loam:schema:message:1")),
+        (
+            "data".into(),
+            crate::json::Value::Object(vec![
+                ("intent".into(), json_str("inform")),
+                (
+                    "from".into(),
+                    crate::json::Value::Object(vec![
+                        ("principal_id".into(), json_str(&identity.principal_id)),
+                        ("agent_id".into(), json_str(&identity.agent_id)),
+                        ("instance_id".into(), json_str(&identity.instance_id)),
+                    ]),
+                ),
+                (
+                    "to".into(),
+                    crate::json::Value::Array(vec![crate::json::Value::Object(vec![
+                        ("kind".into(), json_str("project")),
+                        ("id".into(), json_str(&context.project_id)),
+                    ])]),
+                ),
+                (
+                    "delivery".into(),
+                    crate::json::Value::Object(vec![("class".into(), json_str("event"))]),
+                ),
+                (
+                    "thread".into(),
+                    crate::json::Value::Object(vec![
+                        ("id".into(), json_str(id)),
+                        ("correlation_id".into(), json_str(id)),
+                        ("causation_id".into(), crate::json::Value::Null),
+                    ]),
+                ),
+                (
+                    "context".into(),
+                    crate::json::Value::Object(vec![
+                        ("org_id".into(), json_str(&context.org_id)),
+                        ("project_id".into(), json_str(&context.project_id)),
+                        ("repository_id".into(), json_str(&context.repository_id)),
+                        (
+                            "git".into(),
+                            crate::json::Value::Object(vec![
+                                ("base_oid".into(), json_str(&context.base_oid)),
+                                ("plan_oid".into(), json_str(&context.plan_oid)),
+                            ]),
+                        ),
+                        ("artifacts".into(), crate::json::Value::Array(vec![])),
+                    ]),
+                ),
+                ("expires_at".into(), json_str(&expires)),
+                (
+                    "summary".into(),
+                    json_str("Federation connection probe: a capability check, not enrollment or readiness."),
+                ),
+                (
+                    "payload".into(),
+                    crate::json::Value::Object(vec![
+                        ("action".into(), json_str("federation.connection-probe")),
+                        (
+                            "params".into(),
+                            crate::json::Value::Object(vec![]),
+                        ),
+                        ("response_status".into(), crate::json::Value::Null),
+                    ]),
+                ),
+            ]),
+        ),
+    ]);
+    outer.to_json()
+}
+
+fn json_str(value: &str) -> crate::json::Value {
+    crate::json::Value::String(value.to_owned())
+}
+
+/// Run the enrollment probe against a transport: authenticate, subscribe-first
+/// with No Local unset and required SUBACKs, publish one unique non-retained
+/// validated probe, and require the exact validated self-event within the
+/// deadline. Returns the four discrete capabilities observed.
+pub fn run_probe<T: Transport>(
+    transport: &mut T,
+    context: &ProbeContext,
+    config: &ValidationConfig,
+    deadline: Duration,
+    now: DateTime<Utc>,
+) -> Result<CapabilityEvidence, ProbeError> {
+    // 1. Authenticate; the adapter alone learns the canonical principal.
+    let identity = transport.authenticate()?;
+
+    // 2. Subscribe first, No Local unset, require every SUBACK.
+    for filter in required_filters(context, &identity) {
+        transport.subscribe(&filter, false)?;
+    }
+
+    // 3. Build and validate the probe in trusted code before publishing.
+    let id = probe_id(&identity, now);
+    let json = probe_envelope_json(context, &identity, &id, now);
+    let topic = probe_topic(context, &identity);
+    let claims: Vec<&str> = identity.allowed_claims.iter().map(String::as_str).collect();
+    let principal = AuthenticatedPrincipal::new(&identity.principal_id, &claims);
+    let validated = envelope::validate(json.as_bytes(), &topic, &principal, config, now)
+        .map_err(|violation| ProbeError::InvalidProbe(format!("{violation:?}")))?;
+
+    // 4. Publish non-retained, require PUBACK.
+    transport.publish(&topic, &validated, false)?;
+
+    // 5. Require the exact validated self-event within the deadline.
+    let frame = transport
+        .receive(deadline)?
+        .ok_or(ProbeError::NoSelfReceive)?;
+    let echoed = envelope::validate(&frame.bytes, &frame.topic, &principal, config, now)
+        .map_err(|_| ProbeError::WrongSelfReceive)?;
+    if echoed.as_envelope().id != id {
+        return Err(ProbeError::WrongSelfReceive);
+    }
+
+    Ok(CapabilityEvidence {
+        authentication: true,
+        publish: true,
+        subscribe: true,
+        self_receive: true,
+        verified_at: now,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// In-memory stub
+// ---------------------------------------------------------------------------
+
+/// A deterministic in-memory transport for exercising the probe without a
+/// broker. It echoes a non-retained published event back on the matching
+/// subscription (No Local unset), and can be configured to inject each failure.
+#[derive(Debug, Default)]
+pub struct StubTransport {
+    pub identity: Option<SessionIdentity>,
+    pub deny_auth: bool,
+    pub deny_subscribe: bool,
+    pub deny_publish: bool,
+    /// Drop the echo entirely (simulates a broker that cannot self-deliver).
+    pub swallow_echo: bool,
+    /// Echo a different id (simulates a wrong/foreign delivery).
+    pub corrupt_echo: bool,
+    /// Never deliver in time (simulates a stalled broker).
+    pub stall: bool,
+    subscriptions: Vec<String>,
+    /// The last non-retained publish, held for echo.
+    pending_echo: Option<ReceivedFrame>,
+    /// Retained publishes observed — must stay empty for a healthy probe.
+    pub retained: Vec<String>,
+}
+
+impl StubTransport {
+    pub fn healthy(identity: SessionIdentity) -> Self {
+        StubTransport {
+            identity: Some(identity),
+            ..StubTransport::default()
+        }
+    }
+
+    pub fn subscriptions(&self) -> &[String] {
+        &self.subscriptions
+    }
+}
+
+impl Transport for StubTransport {
+    fn authenticate(&mut self) -> Result<SessionIdentity, ProbeError> {
+        if self.deny_auth {
+            return Err(ProbeError::AuthenticationFailed);
+        }
+        self.identity
+            .clone()
+            .ok_or(ProbeError::AuthenticationFailed)
+    }
+
+    fn subscribe(&mut self, filter: &str, no_local: bool) -> Result<(), ProbeError> {
+        // The probe must never set No Local on a verified filter.
+        assert!(!no_local, "probe must subscribe with No Local unset");
+        if self.deny_subscribe {
+            return Err(ProbeError::SubscribeDenied {
+                filter: filter.to_owned(),
+            });
+        }
+        self.subscriptions.push(filter.to_owned());
+        Ok(())
+    }
+
+    fn publish(
+        &mut self,
+        topic: &str,
+        envelope: &ValidatedEnvelope,
+        retain: bool,
+    ) -> Result<(), ProbeError> {
+        if self.deny_publish {
+            return Err(ProbeError::PublishDenied);
+        }
+        if retain {
+            // A healthy probe is non-retained; record the violation so a test can
+            // observe a positive retained sentinel.
+            self.retained.push(topic.to_owned());
+        }
+        let bytes = envelope.as_envelope().to_json().into_bytes();
+        if !self.swallow_echo {
+            let bytes = if self.corrupt_echo {
+                corrupt_id(&bytes)
+            } else {
+                bytes
+            };
+            self.pending_echo = Some(ReceivedFrame {
+                topic: topic.to_owned(),
+                bytes,
+            });
+        }
+        Ok(())
+    }
+
+    fn receive(&mut self, _deadline: Duration) -> Result<Option<ReceivedFrame>, ProbeError> {
+        if self.stall {
+            return Ok(None);
+        }
+        Ok(self.pending_echo.take())
+    }
+}
+
+/// Flip one hex digit of the CloudEvents `id` so the echo re-validates but has a
+/// different id — the "wrong self-receive" case.
+fn corrupt_id(bytes: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(bytes);
+    if let Some(value) = crate::json::parse(&text)
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_owned))
+    {
+        let mut chars: Vec<char> = value.chars().collect();
+        if let Some(last) = chars.last_mut() {
+            *last = if *last == 'A' { 'B' } else { 'A' };
+        }
+        let replaced: String = chars.into_iter().collect();
+        return text.replacen(&value, &replaced, 1).into_bytes();
+    }
+    bytes.to_vec()
+}
+
+// ---------------------------------------------------------------------------
+// Real MQTT adapter over the transport
+// ---------------------------------------------------------------------------
+//
+// The only place an accepted broker session becomes an `AuthenticatedPrincipal`:
+// no authority exists before the CONNACK, and the caller can never supply one.
+// Wire encoding is delegated to `transport::publish` (the single
+// encoder) and every received frame is admitted by the `DeliveryProcessor`
+// (the single validator/deduplicator). This adapter adds no second encoder and
+// no capability of its own: certificate bytes arrive from the caller, so the
+// module stays filesystem-free, and rumqttc owns the socket.
+
+use std::time::Instant;
+
+use rumqttc::v5::mqttbytes::v5::{
+    ConnectReturnCode, Filter, Packet, PubAckReason, Publish, SubscribeReasonCode,
+};
+use rumqttc::v5::mqttbytes::QoS;
+use rumqttc::v5::{Client, Connection, Event, RecvTimeoutError};
+
+use crate::transport::{
+    AuthenticatedTransportPrincipal, DeliveryProcessor, ReceiveOutcome, TransportConfig,
+};
+
+/// How long the adapter waits for one broker acknowledgement (CONNACK, SUBACK,
+/// PUBACK). The probe's own receive deadline is passed in separately.
+const ACK_TIMEOUT: Duration = Duration::from_secs(10);
+const KEEP_ALIVE: Duration = Duration::from_secs(5);
+const REQUEST_CAPACITY: usize = 8;
+/// Bounded per-class delivery tracking for one probe session.
+const TRACKING_CAPACITY: usize = 32;
+
+/// One authenticated broker session's inputs. Secrets live only here, never in
+/// an envelope, a registry row, or a report.
+pub struct MqttSession {
+    /// The validated broker configuration (endpoint, client id, bounds).
+    pub config: TransportConfig,
+    /// Password authentication, which a provisioned session never uses: mTLS is
+    /// the sole authentication and the effective username is the certificate CN
+    /// the broker assigns. Sending a username would be an identity claim the
+    /// client is not entitled to make. Both stay for the password-port test tier
+    /// and are sent only when both are present.
+    pub username: Option<String>,
+    pub password: Option<String>,
+    /// Root certificate store for verifying the broker.
+    pub ca_certificate: rustls::RootCertStore,
+    pub client_authentication: Option<(Vec<u8>, Vec<u8>)>,
+    /// The identity these credentials assert. It becomes authority only after
+    /// the broker accepts the connection.
+    pub claimed_identity: SessionIdentity,
+}
+
+fn build_tls_transport(
+    roots: &rustls::RootCertStore,
+    client_auth: &Option<(Vec<u8>, Vec<u8>)>,
+) -> Result<rumqttc::Transport, &'static str> {
+    // Credential semantics live in `provisioning`, which owns the identity
+    // files; this module only needs the finished configuration. That is also
+    // what lets the typed credential reasons be tested without a broker.
+    let config = crate::provisioning::build_client_config(
+        roots,
+        client_auth
+            .as_ref()
+            .map(|(cert, key)| (cert.as_slice(), key.as_slice())),
+    )?;
+    Ok(rumqttc::Transport::tls_with_config(
+        rumqttc::TlsConfiguration::Rustls(std::sync::Arc::new(config)),
+    ))
+}
+
+/// The real transport: a connected rumqttc client plus the delivery
+/// processor, exposed through the same seam the stub implements.
+pub struct MqttTransport {
+    session: MqttSession,
+    client: Option<Client>,
+    connection: Option<Connection>,
+    /// Set only after an accepted CONNACK.
+    identity: Option<SessionIdentity>,
+    processor: DeliveryProcessor,
+    /// Inbound publishes parked while waiting for a control packet.
+    pending: Vec<Publish>,
+    now: DateTime<Utc>,
+    /// How long the CONNACK wait may run before the dial is abandoned. The probe
+    /// keeps the short default; a live session sets the longer `DIAL_DEADLINE`,
+    /// so a wedged SYN cannot block one establishment cycle forever.
+    dial_deadline: Duration,
+    /// Frames this session refused, logged individually up to
+    /// [`REFUSAL_LOG_LIMIT`] and counted after that, with the project the
+    /// refusals arrived on so the tail line can name it. The counter lives here
+    /// rather than in the pump because the refusal is swallowed here — the pump
+    /// never learns one happened.
+    refused_frames: usize,
+    refused_project: Option<String>,
+}
+
+/// How many refused frames one session logs individually before it switches to
+/// counting them.
+///
+/// Twice [`CARD_REJECTION_LOG_LIMIT`], for a related reason but a stronger
+/// case: frames are far more frequent than member cards, and the
+/// motivating incident — a roster that assembled to nothing, so every peer frame
+/// refuses as `OriginNotAuthorized` — produces one refusal per inbound frame for
+/// the life of the session, on a daemon built to respawn and with no rotation on
+/// macOS (#149). The diagnostic content of a refusal storm is the set of
+/// (class, origin, reason) triples it contains, and that saturates within a few
+/// lines; the rest is the same line again.
+const REFUSAL_LOG_LIMIT: usize = 16;
+
+impl MqttTransport {
+    pub fn new(
+        session: MqttSession,
+        validation: ValidationConfig,
+        now: DateTime<Utc>,
+    ) -> Result<Self, ProbeError> {
+        let processor = DeliveryProcessor::new(
+            validation,
+            TRACKING_CAPACITY,
+            TRACKING_CAPACITY,
+            TRACKING_CAPACITY,
+        )
+        .map_err(|error| ProbeError::InvalidProbe(format!("{error}")))?;
+        Ok(Self {
+            session,
+            client: None,
+            connection: None,
+            identity: None,
+            processor,
+            pending: Vec::new(),
+            now,
+            refused_frames: 0,
+            refused_project: None,
+            dial_deadline: ACK_TIMEOUT,
+        })
+    }
+
+    /// Extend the CONNACK wait for a live session's establishment cycle. The
+    /// probe leaves the default; a session dials with `DIAL_DEADLINE`.
+    fn set_dial_deadline(&mut self, deadline: Duration) {
+        self.dial_deadline = deadline;
+    }
+
+    /// Disconnect the session. Best-effort: the probe's evidence is already
+    /// recorded, and a broker that drops us first is not a probe failure.
+    pub fn disconnect(&mut self) {
+        if let Some(line) = suppression_breadcrumb(
+            "refused frames",
+            self.refused_project.as_deref().unwrap_or("-"),
+            REFUSAL_LOG_LIMIT,
+            self.refused_frames,
+        ) {
+            breadcrumb!("{line}");
+        }
+        if let Some(client) = self.client.take() {
+            let _ = client.disconnect();
+        }
+        if let Some(mut connection) = self.connection.take() {
+            let _ = poll_incoming(&mut connection, Instant::now() + Duration::from_secs(1));
+        }
+        self.identity = None;
+    }
+}
+
+impl Transport for MqttTransport {
+    fn authenticate(&mut self) -> Result<SessionIdentity, ProbeError> {
+        if let Some(identity) = &self.identity {
+            return Ok(identity.clone());
+        }
+        let mut options = self.session.config.mqtt_options();
+        // Only when both are present: an empty username is still a username on
+        // the wire, and an mTLS broker that assigns the CN would refuse it.
+        if let (Some(username), Some(password)) = (&self.session.username, &self.session.password) {
+            if !username.is_empty() {
+                options.set_credentials(username, password);
+            }
+        }
+        let tls_transport = build_tls_transport(
+            &self.session.ca_certificate,
+            &self.session.client_authentication,
+        )
+        .map_err(|e| ProbeError::ConfigurationFailure(e.to_string()))?;
+        options
+            .set_transport(tls_transport)
+            .set_keep_alive(KEEP_ALIVE)
+            .set_clean_start(true);
+        let (client, mut connection) = Client::new(options, REQUEST_CAPACITY);
+        let deadline = Instant::now() + self.dial_deadline;
+        // Every way this can fail keeps its own stage (#115). The loop used to
+        // reduce all of them — a refused dial, a DNS failure, a TLS handshake
+        // error, a timeout with no answer at all — to `false`, and `false` to
+        // `probe_authentication_failed`, which sent an operator to the
+        // certificates for what was a closed port.
+        dial_for_connack(&mut connection, &mut self.pending, deadline)?;
+        // Authority starts here and nowhere else.
+        self.client = Some(client);
+        self.connection = Some(connection);
+        self.identity = Some(self.session.claimed_identity.clone());
+        Ok(self.session.claimed_identity.clone())
+    }
+
+    fn subscribe(&mut self, filter: &str, no_local: bool) -> Result<(), ProbeError> {
+        let denied = || ProbeError::SubscribeDenied {
+            filter: filter.to_owned(),
+        };
+        let (Some(client), Some(connection)) = (self.client.clone(), self.connection.as_mut())
+        else {
+            return Err(denied());
+        };
+        client
+            .subscribe_many([Filter {
+                nolocal: no_local,
+                ..Filter::new(filter, QoS::AtLeastOnce)
+            }])
+            .map_err(|_| denied())?;
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        loop {
+            match await_control(connection, &mut self.pending, deadline) {
+                Some(Packet::SubAck(ack)) => {
+                    return match ack.return_codes.first() {
+                        Some(SubscribeReasonCode::Success(_)) => Ok(()),
+                        _ => Err(denied()),
+                    };
+                }
+                Some(_) => {}
+                None => return Err(denied()),
+            }
+        }
+    }
+
+    fn publish(
+        &mut self,
+        _topic: &str,
+        envelope: &ValidatedEnvelope,
+        retain: bool,
+    ) -> Result<(), ProbeError> {
+        // The probe is never retained, and the transport derives both the topic and
+        // the retain flag from the validated envelope itself — a probe that
+        // asked to be retained would mean the class is no longer `event`.
+        if retain {
+            return Err(ProbeError::RetainedProbe);
+        }
+        let (Some(client), Some(connection)) = (self.client.clone(), self.connection.as_mut())
+        else {
+            return Err(ProbeError::PublishDenied);
+        };
+        crate::transport::publish(&client, envelope.clone(), self.now)
+            .map_err(|_| ProbeError::PublishDenied)?;
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        loop {
+            match await_control(connection, &mut self.pending, deadline) {
+                Some(Packet::PubAck(ack)) => {
+                    return match ack.reason {
+                        PubAckReason::Success | PubAckReason::NoMatchingSubscribers => Ok(()),
+                        _ => Err(ProbeError::PublishDenied),
+                    };
+                }
+                Some(_) => {}
+                None => return Err(ProbeError::PublishDenied),
+            }
+        }
+    }
+
+    fn receive(&mut self, deadline: Duration) -> Result<Option<ReceivedFrame>, ProbeError> {
+        let identity = self
+            .identity
+            .clone()
+            .ok_or(ProbeError::AuthenticationFailed)?;
+        let claims: Vec<&str> = identity.allowed_claims.iter().map(String::as_str).collect();
+        // The adapter is the only constructor of envelope authority, and the
+        // only origin this session may speak or hear for is its own instance.
+        let origins = [identity.instance_id.as_str()];
+        let authenticated = AuthenticatedTransportPrincipal::new(
+            AuthenticatedPrincipal::new(&identity.principal_id, &claims),
+            &origins,
+        );
+        let deadline = Instant::now() + deadline;
+        loop {
+            let publish = match self.take_publish(deadline) {
+                Some(publish) => publish,
+                None => return Ok(None),
+            };
+            // A retained frame means a probe outlived its session on the broker.
+            if publish.retain {
+                return Err(ProbeError::RetainedProbe);
+            }
+            let Ok(topic) = String::from_utf8(publish.topic.to_vec()) else {
+                return Err(ProbeError::WrongSelfReceive);
+            };
+            match self
+                .processor
+                .receive(&topic, &publish.payload, &authenticated, self.now)
+            {
+                Ok(crate::transport::ReceiveOutcome::Accepted(_)) => {
+                    return Ok(Some(ReceivedFrame {
+                        topic,
+                        bytes: publish.payload.to_vec(),
+                    }));
+                }
+                // Duplicates and tombstones are not the probe's echo; keep
+                // waiting until the deadline rather than failing the probe.
+                Ok(_) => {}
+                Err(_) => return Err(ProbeError::WrongSelfReceive),
+            }
+        }
+    }
+}
+
+impl MqttTransport {
+    /// Publish a raw retained payload on a broker-track topic (a self-announced
+    /// member card). The card is not a loam envelope — it is the connector's own
+    /// retained card, so it is published verbatim and never routed through the
+    /// envelope encoder. Requires an authenticated session.
+    fn publish_raw_retained(&mut self, topic: &str, payload: Vec<u8>) -> Result<(), ProbeError> {
+        if self.client.is_none() {
+            return Err(ProbeError::PublishDenied);
+        }
+        let client = self.client.clone().expect("checked above");
+        let (client, connection) = (client, self.connection.as_mut().expect("checked above"));
+        client
+            .publish(
+                topic,
+                rumqttc::v5::mqttbytes::QoS::AtLeastOnce,
+                true,
+                payload,
+            )
+            .map_err(|_| ProbeError::PublishDenied)?;
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        loop {
+            match await_control(connection, &mut self.pending, deadline) {
+                Some(Packet::PubAck(ack)) => {
+                    return match ack.reason {
+                        PubAckReason::Success | PubAckReason::NoMatchingSubscribers => Ok(()),
+                        _ => Err(ProbeError::PublishDenied),
+                    };
+                }
+                Some(_) => {}
+                None => return Err(ProbeError::PublishDenied),
+            }
+        }
+    }
+
+    /// Ship one already-validated outbound envelope on the live session. Unlike
+    /// the probe's publish this honors the transport's retain derivation (state and
+    /// inbox are retained; an event is not) and takes `now` per call, because a
+    /// live session outlives the timestamp it was constructed with.
+    fn publish_outbound(
+        &mut self,
+        envelope: &ValidatedEnvelope,
+        now: DateTime<Utc>,
+    ) -> Result<(), ProbeError> {
+        let (Some(client), Some(connection)) = (self.client.clone(), self.connection.as_mut())
+        else {
+            return Err(ProbeError::PublishDenied);
+        };
+        crate::transport::publish(&client, envelope.clone(), now)
+            .map_err(|_| ProbeError::PublishDenied)?;
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        loop {
+            match await_control(connection, &mut self.pending, deadline) {
+                Some(Packet::PubAck(ack)) => {
+                    return match ack.reason {
+                        PubAckReason::Success | PubAckReason::NoMatchingSubscribers => Ok(()),
+                        _ => Err(ProbeError::PublishDenied),
+                    };
+                }
+                Some(_) => {}
+                None => return Err(ProbeError::PublishDenied),
+            }
+        }
+    }
+
+    /// Pump exactly one inbound frame through the `DeliveryProcessor` and
+    /// report the topic together with the delivery outcome.
+    ///
+    /// Unlike [`Transport::receive`], which exists to find the probe's own echo
+    /// and therefore swallows everything else, this reports duplicates, stale
+    /// state, and tombstones. The snapshot store needs them: a swallowed
+    /// tombstone would leave a resolved item on screen, and a swallowed
+    /// duplicate would hide the very property "one logical item per message"
+    /// asserts. `now` is passed per call because a live session outlives the
+    /// single timestamp the probe was constructed with.
+    ///
+    /// Read-only by construction: it never publishes.
+    pub fn receive_outcome(
+        &mut self,
+        deadline: Duration,
+        now: DateTime<Utc>,
+        roster: &PeerRoster,
+    ) -> Result<Option<(String, ReceiveOutcome)>, ProbeError> {
+        let identity = self
+            .identity
+            .clone()
+            .ok_or(ProbeError::AuthenticationFailed)?;
+        // The session admits its own principal and instance plus exactly the
+        // provisioned roster — nothing derived from the frame itself, or an
+        // untrusted sender would authorize itself.
+        let mut claims: Vec<&str> = identity.allowed_claims.iter().map(String::as_str).collect();
+        claims.extend(roster.principals.iter().map(String::as_str));
+        let mut origins: Vec<&str> = vec![identity.instance_id.as_str()];
+        origins.extend(roster.origins.iter().map(String::as_str));
+        let authenticated = AuthenticatedTransportPrincipal::new(
+            AuthenticatedPrincipal::new(&identity.principal_id, &claims),
+            &origins,
+        );
+        let deadline = Instant::now() + deadline;
+        let Some(publish) = self.take_publish(deadline) else {
+            return Ok(None);
+        };
+        let Ok(topic) = String::from_utf8(publish.topic.to_vec()) else {
+            return Err(ProbeError::WrongSelfReceive);
+        };
+        match self
+            .processor
+            .receive(&topic, &publish.payload, &authenticated, now)
+        {
+            Ok(outcome) => Ok(Some((topic, outcome))),
+            // A rejected frame is a sender's problem, not a session failure: the
+            // pump keeps running and the snapshot simply never sees it. The
+            // breadcrumb is emitted here rather than in the pump because the
+            // refusal is swallowed here — the pump sees the same `Ok(None)` a
+            // poll timeout produces and cannot tell the two apart. This is the
+            // motivating incident's downstream symptom: a peer missing from the
+            // roster refuses every one of its frames as `OriginNotAuthorized`,
+            // which is exactly the "every peer frame refused, zero external
+            // signal" this logging exists to end (#103).
+            Err(error) => {
+                self.refused_frames += 1;
+                if self.refused_project.is_none() {
+                    self.refused_project = crate::envelope::parse_topic(&topic)
+                        .ok()
+                        .map(|parsed| parsed.project.to_owned());
+                }
+                if self.refused_frames <= REFUSAL_LOG_LIMIT {
+                    breadcrumb!("{}", refusal_breadcrumb(&topic, &error));
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// The next inbound publish: parked frames first, then the wire.
+    fn take_publish(&mut self, deadline: Instant) -> Option<Publish> {
+        if !self.pending.is_empty() {
+            return Some(self.pending.remove(0));
+        }
+        let connection = self.connection.as_mut()?;
+        loop {
+            match poll_incoming(connection, deadline)? {
+                Packet::Publish(publish) => return Some(publish),
+                _ => continue,
+            }
+        }
+    }
+}
+
+/// Wait for the CONNACK, keeping the reason the dial failed instead of reducing
+/// it to "not accepted" (#115).
+///
+/// This is the one place a connection error carries stage information: after the
+/// CONNACK every failure is a broker decision on a proven-reachable session
+/// (subscribe denied, publish denied), and those already have their own
+/// categories. An inbound publish that races the CONNACK is parked for `receive`,
+/// exactly as [`await_control`] does.
+fn dial_for_connack(
+    connection: &mut Connection,
+    pending: &mut Vec<Publish>,
+    deadline: Instant,
+) -> Result<(), ProbeError> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // Nothing arrived and nothing failed: the far side is not answering.
+            return Err(ProbeError::TransportUnreachable);
+        }
+        match connection.recv_timeout(remaining) {
+            Ok(Ok(Event::Incoming(Packet::ConnAck(ack)))) => {
+                // The only failure that is genuinely an authentication verdict:
+                // the broker spoke MQTT back and refused this identity.
+                return if ack.code == ConnectReturnCode::Success {
+                    Ok(())
+                } else {
+                    Err(ProbeError::AuthenticationFailed)
+                };
+            }
+            Ok(Ok(Event::Incoming(Packet::Publish(publish)))) => pending.push(publish),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return Err(classify_dial_failure(&error)),
+            // The event loop ended or the wait ran out with no verdict either
+            // way. Unreachable is the honest answer: no authentication exchange
+            // took place, so it cannot have failed.
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                return Err(ProbeError::TransportUnreachable)
+            }
+        }
+    }
+}
+
+/// Which stage a failed dial failed at. Nothing from the error's text is kept —
+/// an OS error string carries the broker address — only its class.
+fn classify_dial_failure(error: &rumqttc::v5::ConnectionError) -> ProbeError {
+    use rumqttc::v5::ConnectionError;
+    match error {
+        // A CONNACK the client library rejected for us: the broker answered, so
+        // this is a real authentication/protocol verdict.
+        ConnectionError::ConnectionRefused(_) => ProbeError::AuthenticationFailed,
+        ConnectionError::Io(io) => classify_dial_io(io.kind()),
+        // Inside the TLS layer, an IO error is still the socket failing under
+        // the handshake, so it keeps the socket's classification rather than
+        // reading as a certificate problem.
+        ConnectionError::Tls(rumqttc::TlsError::Io(io)) => classify_dial_io(io.kind()),
+        ConnectionError::Tls(_) => ProbeError::TlsHandshakeFailed,
+        // Timeouts, MQTT state faults, and a client whose request stream ended:
+        // no answer arrived, and none of them is an identity verdict.
+        _ => ProbeError::TransportUnreachable,
+    }
+}
+
+fn classify_dial_io(kind: std::io::ErrorKind) -> ProbeError {
+    use std::io::ErrorKind;
+    match kind {
+        // Something answered the SYN with a refusal, or dropped the connection
+        // as it came up: a closed port, a stopped broker, a rejecting firewall.
+        ErrorKind::ConnectionRefused
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted => ProbeError::DialRefused,
+        // Everything else that stopped the dial is reachability: a name that
+        // does not resolve, a route that does not exist, a packet that vanished.
+        _ => ProbeError::TransportUnreachable,
+    }
+}
+
+/// The next incoming packet before `deadline`; `None` on timeout or a closed
+/// connection. Outgoing events carry no broker decision, so they are skipped.
+fn poll_incoming(connection: &mut Connection, deadline: Instant) -> Option<Packet> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match connection.recv_timeout(remaining) {
+            Ok(Ok(Event::Incoming(packet))) => return Some(packet),
+            Ok(Ok(Event::Outgoing(_))) => {}
+            Ok(Err(_)) | Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                return None;
+            }
+        }
+    }
+}
+
+/// The next control packet, parking inbound publishes for `receive` so an echo
+/// that races an acknowledgement is never dropped.
+fn await_control(
+    connection: &mut Connection,
+    pending: &mut Vec<Publish>,
+    deadline: Instant,
+) -> Option<Packet> {
+    loop {
+        match poll_incoming(connection, deadline)? {
+            Packet::Publish(publish) => pending.push(publish),
+            packet => return Some(packet),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inert-by-default connector service loop
+// ---------------------------------------------------------------------------
+//
+// One per-user connector hosts every enrolled project. The empty registry is the
+// desired-state switch: reconciliation runs *before* any endpoint or transport,
+// so a missing or empty registry means no socket, no process footprint, and no
+// network. Each request crosses two boundaries in order — the kernel peer check
+// (owner-only), then a registry workspace/project-binding resolution — before a
+// closed operation is dispatched. There is no generic dispatch.
+
+use std::collections::VecDeque;
+use std::path::Path;
+
+use crate::ipc::{self, IpcConfig, Operation, Request};
+
+/// The connector's volatile in-process state: the inject-channel
+/// registry, the per-session mailbox queues, and the live project sessions with
+/// their snapshot store. All of it dies with the process and none of it is ever
+/// written to SQLite.
+pub struct ConnectorState {
+    pub channels: ChannelRegistry,
+    pub sessions: ProjectSessions,
+}
+
+impl ConnectorState {
+    pub fn new() -> Self {
+        Self::build(ChannelRegistry::new())
+    }
+
+    /// The connector's state with wake-ref persistence bound to the registry at
+    /// `db_path` — the config-dir-resolved path the service already opened for
+    /// enrollment. The reload of persisted wakes is a separate explicit step so a
+    /// caller decides its ordering against `attach_enrolled`.
+    pub fn with_registry_path(db_path: std::path::PathBuf) -> Self {
+        Self::build(ChannelRegistry::persistent(db_path))
+    }
+
+    fn build(channels: ChannelRegistry) -> Self {
+        // ONE registry, shared by construction: `channels` is the IPC side
+        // (SessionRegisterInject writes here) and the pump side (wake_all and
+        // mailbox push read from here) must see the same registrations. A
+        // second registry inside `ProjectSessions` was the live-wake defect: IPC
+        // registrations landed in one Arc and the pump's `wake_targets`/`push`
+        // read the other, so no wake ever fired in production.
+        ConnectorState {
+            sessions: ProjectSessions::new(SNAPSHOT_CAPACITY, channels.clone()),
+            channels,
+        }
+    }
+}
+
+impl Default for ConnectorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Whether the service found work to host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceOutcome {
+    /// No enrollment exists: no endpoint was created and no network occurred.
+    Inert,
+    /// The endpoint was bound and the accept loop ran.
+    Served,
+}
+
+#[derive(Debug)]
+pub enum ServiceError {
+    Registry(crate::enrollment::RegistryError),
+    Ipc(ipc::IpcError),
+}
+
+/// A per-session inject-channel registry (2026-08-08 amendment, T18) and
+/// per-session mailbox queue (T2). The channels and mailboxes are volatile — a
+/// restart drops them and injection over a channel is live injection — but the
+/// *wake reference* of each registration is persisted to the registry sqlite
+/// (`db`) so a restart reloads it and an idle session (one that takes no turns,
+/// the #112 incident's shape) is still woken. The connector only admits, holds,
+/// hands back, and drops the channel; the wake ref is the one durable part.
+#[derive(Debug, Default, Clone)]
+pub struct ChannelRegistry {
+    inner: std::sync::Arc<std::sync::Mutex<MailboxInner>>,
+    /// The registry path wake refs persist to — the *same* config-dir-resolved
+    /// path enrollment uses, never a separate resolution, so there is no
+    /// `--global-root` shadowing. `None` in tests and in a registry-less state.
+    db: Option<std::sync::Arc<std::path::PathBuf>>,
+}
+
+/// The shared mailbox state: the channel registry and the per-session bounded
+/// queues. One mutex guards both so the receive path can atomically see which
+/// sessions belong to a project and enqueue for exactly those — a session that
+/// registers between the lookup and the push is not missed, and one that drops
+/// between them is not written to.
+#[derive(Debug, Default)]
+struct MailboxInner {
+    sessions: std::collections::HashMap<String, InjectChannel>,
+    mailboxes: std::collections::HashMap<String, std::collections::VecDeque<SnapshotItem>>,
+}
+
+/// One registered inject channel. `channel_ref` is opaque: the plugin hands it
+/// over and the connector holds it without interpreting it. `wake_ref` is the
+/// optional wake target the connector fires on new items — either or both may
+/// be absent (a registration may be mailbox-only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectChannel {
+    pub session_id: String,
+    pub project_id: String,
+    pub channel_ref: Option<String>,
+    pub wake_ref: Option<String>,
+}
+
+impl ChannelRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A registry whose wake refs persist to the sqlite at `db_path`.
+    pub fn persistent(db_path: std::path::PathBuf) -> Self {
+        ChannelRegistry {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(MailboxInner::default())),
+            db: Some(std::sync::Arc::new(db_path)),
+        }
+    }
+
+    /// Register a session's inject channel in memory and, if it carries a wake
+    /// ref, persist that ref so a restart can reload it. Idempotent: a repeated
+    /// registration for the same session id upserts. `&self` throughout — the
+    /// mutation is interior, so the pump side can prune without a `&mut`.
+    pub fn register(&self, channel: InjectChannel) {
+        self.register_in_memory(channel.clone());
+        self.persist_wake(&channel);
+    }
+
+    /// The in-memory half of registration, used both by `register` and by the
+    /// startup reload (which must not re-persist what it just read back).
+    fn register_in_memory(&self, channel: InjectChannel) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.sessions.insert(channel.session_id.clone(), channel);
+        }
+    }
+
+    pub fn drop_session(&self, session_id: &str) -> bool {
+        let removed = if let Ok(mut inner) = self.inner.lock() {
+            let removed = inner.sessions.remove(session_id).is_some();
+            inner.mailboxes.remove(session_id);
+            removed
+        } else {
+            false
+        };
+        // Whether or not it was live in memory, clear any persisted wake so a
+        // restart never reloads a dead one.
+        self.persist_delete(session_id);
+        removed
+    }
+
+    /// Persist one registration's wake ref (best-effort; a persistence failure
+    /// never fails the live registration — the plugin re-registers per hook).
+    fn persist_wake(&self, channel: &InjectChannel) {
+        let (Some(db), Some(wake_ref)) = (&self.db, &channel.wake_ref) else {
+            return;
+        };
+        if let Ok(connection) = crate::enrollment::open_writable(db) {
+            let _ = crate::enrollment::upsert_session_wake(
+                &connection,
+                &channel.session_id,
+                &channel.project_id,
+                wake_ref,
+                &Utc::now().to_rfc3339(),
+            );
+        }
+    }
+
+    /// Clear one session's wake ref — in memory and in its persisted row — while
+    /// keeping the session registration and its mailbox. Called when a wake proves
+    /// unreachable, so a restart never reloads a dead wake and the pump stops
+    /// re-dialing it; a live session stays pollable and re-registers per hook.
+    fn prune_wake_ref(&self, session_id: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(channel) = inner.sessions.get_mut(session_id) {
+                channel.wake_ref = None;
+            }
+        }
+        self.persist_delete(session_id);
+    }
+
+    /// Remove one session's persisted wake ref (best-effort).
+    fn persist_delete(&self, session_id: &str) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        if let Ok(connection) = crate::enrollment::open_writable(db) {
+            let _ = crate::enrollment::delete_session_wake(&connection, session_id);
+        }
+    }
+
+    /// Reload persisted wake refs into memory after a restart, so an idle session
+    /// registered before the restart is woken and mailbox-delivered again. Read
+    /// back as wake-only registrations (no live channel ref); the plugin's
+    /// per-hook re-registration re-attaches the channel for active sessions.
+    pub fn reload_persisted(&self) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        let Ok(Some(connection)) = crate::enrollment::open_readonly(db) else {
+            return;
+        };
+        let Ok(wakes) = crate::enrollment::list_session_wakes(&connection) else {
+            return;
+        };
+        for wake in wakes {
+            self.register_in_memory(InjectChannel {
+                session_id: wake.session_id,
+                project_id: wake.project_id,
+                channel_ref: None,
+                wake_ref: Some(wake.wake_ref),
+            });
+        }
+    }
+
+    pub fn contains(&self, session_id: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.sessions.contains_key(session_id))
+            .unwrap_or(false)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|inner| inner.sessions.len())
+            .unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.sessions.is_empty())
+            .unwrap_or(true)
+    }
+
+    /// Enqueue a batch of admitted items into every registered session's mailbox
+    /// for the given project. Non-blocking: a full queue drops the oldest item
+    /// (same eviction as the snapshot store). Never blocks the receive loop.
+    ///
+    /// The batch is the unit because the caller's batch is the unit: the pump
+    /// pushes a whole snapshot per admitted change, and every item in it targets
+    /// the same project and therefore the same session set. Taking the lock once
+    /// and resolving that set once means the fanout is a single fact rather than
+    /// one derived per item and reported from whichever happened to be last.
+    ///
+    /// Returns how many sessions the batch was enqueued into, so the caller can
+    /// say whether an admitted item actually reached anyone (#103). `Some(0)` is
+    /// a normal state — no local session is registered. `None` means the registry
+    /// lock is poisoned and nothing was enqueued, which is a fault and must not
+    /// be reported as "reached nobody".
+    pub fn push(&self, project_id: &str, items: &[SnapshotItem], capacity: usize) -> Option<usize> {
+        let mut inner = self.inner.lock().ok()?;
+        // Collect the matching session ids first: the mailboxes map is
+        // borrowed mutably per entry, so the sessions map cannot stay
+        // borrowed across it.
+        let session_ids: Vec<String> = inner
+            .sessions
+            .values()
+            .filter(|channel| channel.project_id == project_id)
+            .map(|channel| channel.session_id.clone())
+            .collect();
+        let delivered = session_ids.len();
+        for session_id in session_ids {
+            let queue = inner.mailboxes.entry(session_id).or_default();
+            for item in items {
+                if queue.len() == capacity {
+                    queue.pop_front();
+                }
+                queue.push_back(item.clone());
+            }
+        }
+        Some(delivered)
+    }
+
+    /// Drain one session's mailbox, oldest first, consuming every item that
+    /// arrived since the last poll. `None` when the session is not registered.
+    pub fn poll(&self, session_id: &str) -> Option<Vec<SnapshotItem>> {
+        let mut inner = self.inner.lock().ok()?;
+        if !inner.sessions.contains_key(session_id) {
+            return None;
+        }
+        Some(
+            inner
+                .mailboxes
+                .remove(session_id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// Collect the (session id, wake target) of every registered session for a
+    /// project, without touching the lock during I/O: the caller performs the
+    /// wake after the lock is dropped, and needs the session id so a wake that
+    /// proves unreachable can prune that session's registration and persisted row.
+    fn wake_targets(&self, project_id: &str) -> Vec<(String, String)> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        inner
+            .sessions
+            .values()
+            .filter(|channel| channel.project_id == project_id)
+            .filter_map(|channel| {
+                channel
+                    .wake_ref
+                    .clone()
+                    .map(|wake_ref| (channel.session_id.clone(), wake_ref))
+            })
+            .collect()
+    }
+}
+
+/// Wake frame shape shared by every adapter. Metadata-only by construction:
+/// `project` and `hint` are the only fields, and `hint` is a topic-derived id,
+/// never sender text. The structural test scans serialized wake bytes for
+/// every rendered field of the admitted item and finds none of them.
+fn wake_frame(project_id: &str, hint: Option<&str>) -> String {
+    crate::json::Value::Object(vec![
+        (
+            "kind".into(),
+            crate::json::Value::String("loam-wake".into()),
+        ),
+        (
+            "project".into(),
+            crate::json::Value::String(project_id.into()),
+        ),
+        (
+            "hint".into(),
+            crate::json::Value::String(hint.unwrap_or_default().into()),
+        ),
+    ])
+    .to_json()
+}
+
+/// Best-effort, one-shot wake of every registered session for a project after
+/// a changed admit. Never blocks the receive loop and never lets an error
+/// escape: connect failures and unknown schemes are all eaten silently per the
+/// degrade rule. Cross-platform std APIs only — no unix-only syscalls, so the
+/// windows-2022 CI legs exercise the same wake path.
+/// A wake attempt that did not fail.
+#[derive(Debug, PartialEq, Eq)]
+enum WakeAttempt {
+    Delivered,
+    /// The wake_ref names a scheme this connector does not speak. Not an error:
+    /// a wake it cannot make is a wake it does not attempt, and the ref is left
+    /// in place rather than pruned.
+    SchemeSkipped,
+}
+
+/// Why a wake attempt failed. Carries the target's port and a typed reason but
+/// never its address: a breadcrumb must localize the fault without recording
+/// where a colleague's session listens (#103). The port alone distinguishes a
+/// stale wake ref from a firewall or a wedged listener.
+#[derive(Debug, PartialEq, Eq)]
+struct WakeFailure {
+    port: Option<String>,
+    reason: &'static str,
+}
+
+/// How many malformed member cards one established session logs individually
+/// before it switches to counting them.
+///
+/// Retained cards replay on every subscribe and the connector re-subscribes on
+/// every re-establishment — which this design deliberately makes frequent, via
+/// the watchdog's exit-75 plus supervisor respawn. A systemic parser bug, which
+/// is the incident this logging exists for, therefore costs cards x reconnects
+/// lines and grows without bound in time on a long-lived daemon. Logging the
+/// first few per session still shows how widespread the failure is (the thing a
+/// once-per-session latch hid); the tail only repeats it.
+const CARD_REJECTION_LOG_LIMIT: usize = 8;
+
+fn wake_all(channels: &ChannelRegistry, project_id: &str, hint: Option<&str>) {
+    // Collect targets under the lock, then do the I/O after it is dropped: a
+    // blocking connect inside the lock would stall every other pump sharing
+    // the mailbox mutex.
+    let targets = channels.wake_targets(project_id);
+    // No registered wake is the idle steady state, and logging it on every
+    // admitted item would bury the fanouts that did happen.
+    if targets.is_empty() {
+        return;
+    }
+    let attempted = targets.len();
+    let (mut delivered, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+    for (session_id, wake_ref) in targets {
+        match wake_one(&wake_ref, project_id, hint) {
+            Ok(WakeAttempt::Delivered) => delivered += 1,
+            Ok(WakeAttempt::SchemeSkipped) => skipped += 1,
+            Err(failure) => {
+                failed += 1;
+                breadcrumb!(
+                    "wake failed project={project_id} port={} reason={}",
+                    failure.port.as_deref().unwrap_or("-"),
+                    failure.reason
+                );
+                // The wake target is unreachable (connection refused) or
+                // malformed. Prune only the wake ref — in memory and in the
+                // persisted row — so a restart never reloads a dead wake and the
+                // pump stops re-dialing it. The session registration and its
+                // mailbox stay: a live session is still pollable, and its
+                // per-hook re-registration restores the wake.
+                channels.prune_wake_ref(&session_id);
+            }
+        }
+    }
+    breadcrumb!(
+        "wake fanout project={project_id} targets={attempted} delivered={delivered} skipped={skipped} failed={failed}"
+    );
+}
+
+fn wake_one(
+    target: &str,
+    project_id: &str,
+    hint: Option<&str>,
+) -> Result<WakeAttempt, WakeFailure> {
+    let Some(rest) = target.strip_prefix("notify-tcp://") else {
+        return Ok(WakeAttempt::SchemeSkipped);
+    };
+    let Some((host, port)) = rest.rsplit_once(':') else {
+        return Err(WakeFailure {
+            port: None,
+            reason: "malformed_ref",
+        });
+    };
+    let Ok(address) = format!("{host}:{port}").parse() else {
+        return Err(WakeFailure {
+            port: Some(port.to_owned()),
+            reason: "unresolvable_address",
+        });
+    };
+    let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1))
+        .map_err(|_| WakeFailure {
+            port: Some(port.to_owned()),
+            reason: "connect_failed",
+        })?;
+    let frame = wake_frame(project_id, hint);
+    stream
+        .write_all(frame.as_bytes())
+        .map_err(|_| WakeFailure {
+            port: Some(port.to_owned()),
+            reason: "write_failed",
+        })?;
+    Ok(WakeAttempt::Delivered)
+}
+
+// ---------------------------------------------------------------------------
+// Bounded in-memory snapshot store and live project sessions
+// ---------------------------------------------------------------------------
+//
+// The `DeliveryProcessor` is the single validator, deduplicator, and
+// expiry tracker; it tracks *ids*, not bodies. The store below is the only place
+// a renderable body is retained, and it retains one per logical item so QoS 1
+// duplicates and redelivery collapse. It is in-memory only: there is no snapshot
+// table, no sidecar store, and no schema change, because MQTT is never durable
+// authority and retained state plus the inbox re-deliver on reconnect. A
+// restarted connector therefore serves nothing until state re-delivers, which is
+// correct rather than a bug.
+
+/// Whether a received work claim was reconciled against Git *at receive time*.
+///
+/// Every direction other than a real proof — a provisional claim, an oracle that
+/// could not be built for the project, an unreachable commit, a failed fetch —
+/// is [`Publication::Unverified`], so the fail-safe answer is always "sender
+/// claim, not reconciled". The renderer can only display a work claim as current
+/// when this says `Verified`, which is why the stamp lives here on the receive
+/// path rather than in the 2 s session hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Publication {
+    #[default]
+    Unverified,
+    Verified,
+}
+
+impl Publication {
+    pub fn code(self) -> &'static str {
+        match self {
+            Publication::Unverified => "unverified",
+            Publication::Verified => "verified",
+        }
+    }
+}
+
+/// One renderable item in a project's snapshot: normalized, already-deduped, and
+/// already-expiry-filtered. Carries no envelope bytes, no credential, and no raw
+/// remote URL — only what a hook may render.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotItem {
+    /// The logical identity of this item. QoS 1 duplicates and redelivery of the
+    /// same message share it, so the snapshot holds exactly one entry per
+    /// message; a later state revision replaces the earlier one in place.
+    pub key: String,
+    /// The work-state key from the envelope's `data.delivery.key` — the
+    /// validated, topic-bound one, not a copy a sender happened to put in its
+    /// payload (#99). `None` for anything that is not a latest-state frame.
+    pub state_key: Option<String>,
+    pub source: String,
+    pub item_type: String,
+    pub summary: String,
+    pub to: Vec<(String, String)>,
+    pub org_id: String,
+    pub project_id: String,
+    pub repository_id: String,
+    pub from_principal_id: String,
+    /// The sender's given name from their authenticated certificate, when they
+    /// published one. Absent is the ordinary case, not an error.
+    pub from_display_name: Option<String>,
+    pub from_agent_id: String,
+    pub from_instance_id: String,
+    pub payload: crate::json::Value,
+    pub expires_at: DateTime<Utc>,
+    /// Git-first reconciliation result, stamped by the receive path before the
+    /// item is ever readable. Never derived from the sender's own claim.
+    pub publication: Publication,
+}
+
+/// A bounded, per-project, in-memory item store with the same drop-on-restart
+/// lifetime as [`ChannelRegistry`]. Oldest is evicted at capacity.
+#[derive(Debug)]
+pub struct SnapshotStore {
+    capacity: usize,
+    projects: std::collections::HashMap<String, std::collections::VecDeque<SnapshotItem>>,
+}
+
+impl SnapshotStore {
+    pub fn new(capacity: usize) -> Result<Self, crate::transport::TransportError> {
+        if capacity == 0 {
+            return Err(crate::transport::TransportError::ZeroTrackingCapacity);
+        }
+        Ok(SnapshotStore {
+            capacity,
+            projects: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Admit one delivery outcome that `DeliveryProcessor` has already ruled on.
+    /// Only `Accepted` retains a body and only `Removed` resolves one; a
+    /// duplicate, stale, or conflicting outcome changes nothing here, which is
+    /// what makes one logical item per message hold under QoS 1. Returns whether
+    /// the store changed.
+    /// `publication` is the receive path's Git verdict for this frame; the store
+    /// never derives it, so a sender cannot stamp its own claim as verified.
+    pub fn admit(
+        &mut self,
+        topic: &str,
+        outcome: &ReceiveOutcome,
+        publication: Publication,
+    ) -> bool {
+        let Ok(parsed) = crate::envelope::parse_topic(topic) else {
+            return false;
+        };
+        match outcome {
+            ReceiveOutcome::Accepted(validated) => {
+                let key = accepted_key(&parsed.delivery, &validated.as_envelope().id);
+                let Some(item) = snapshot_item(key, validated, publication) else {
+                    return false;
+                };
+                self.store(parsed.project, item)
+            }
+            ReceiveOutcome::Removed => match tombstone_key(&parsed.delivery) {
+                Some(key) => self.remove(parsed.project, &key),
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn store(&mut self, project_id: &str, item: SnapshotItem) -> bool {
+        let items = self.projects.entry(project_id.to_owned()).or_default();
+        // A later revision of the same logical item replaces the earlier one in
+        // place, so a live state key never occupies two snapshot slots.
+        if let Some(existing) = items.iter_mut().find(|held| held.key == item.key) {
+            *existing = item;
+            return true;
+        }
+        if items.len() == self.capacity {
+            items.pop_front();
+        }
+        items.push_back(item);
+        true
+    }
+
+    fn remove(&mut self, project_id: &str, key: &str) -> bool {
+        match self.projects.get_mut(project_id) {
+            Some(items) => {
+                let before = items.len();
+                items.retain(|held| held.key != key);
+                items.len() != before
+            }
+            None => false,
+        }
+    }
+
+    /// The current snapshot for one project, oldest first, with expired items
+    /// dropped. An unresolved item is *not* dropped by a read, so it reappears on
+    /// a later hook until it expires or a tombstone resolves it.
+    pub fn snapshot(&mut self, project_id: &str, now: DateTime<Utc>) -> Vec<SnapshotItem> {
+        match self.projects.get_mut(project_id) {
+            Some(items) => {
+                items.retain(|held| held.expires_at > now);
+                items.iter().cloned().collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    pub fn len(&self, project_id: &str) -> usize {
+        self.projects.get(project_id).map_or(0, VecDeque::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.projects.values().all(VecDeque::is_empty)
+    }
+}
+
+fn accepted_key(delivery: &crate::envelope::TopicDelivery<'_>, envelope_id: &str) -> String {
+    use crate::envelope::TopicDelivery;
+    match delivery {
+        TopicDelivery::Event { .. } => format!("event:{envelope_id}"),
+        TopicDelivery::State { origin, key } => format!("state:{origin}/{key}"),
+        TopicDelivery::Inbox { message_id, .. } => format!("inbox:{message_id}"),
+        // A membership frame never becomes a snapshot item.
+        TopicDelivery::Membership | TopicDelivery::MemberCard { .. } => String::new(),
+    }
+}
+
+/// The logical key an empty-payload tombstone resolves. An event cannot be
+/// tombstoned (the transport rejects that), so only state and inbox have one.
+fn tombstone_key(delivery: &crate::envelope::TopicDelivery<'_>) -> Option<String> {
+    use crate::envelope::TopicDelivery;
+    match delivery {
+        TopicDelivery::Event { .. } => None,
+        TopicDelivery::State { origin, key } => Some(format!("state:{origin}/{key}")),
+        TopicDelivery::Inbox { message_id, .. } => Some(format!("inbox:{message_id}")),
+        TopicDelivery::Membership | TopicDelivery::MemberCard { .. } => None,
+    }
+}
+
+fn snapshot_item(
+    key: String,
+    validated: &ValidatedEnvelope,
+    publication: Publication,
+) -> Option<SnapshotItem> {
+    let envelope = validated.as_envelope();
+    let expires_at = DateTime::parse_from_rfc3339(&envelope.data.expires_at)
+        .ok()?
+        .with_timezone(&Utc);
+    Some(SnapshotItem {
+        key,
+        state_key: envelope.data.delivery.key.clone(),
+        source: envelope.source.clone(),
+        item_type: envelope.message_type.clone(),
+        summary: envelope.data.summary.clone(),
+        to: envelope
+            .data
+            .to
+            .iter()
+            .map(|recipient| (recipient.kind.clone(), recipient.id.clone()))
+            .collect(),
+        org_id: envelope.data.context.org_id.clone(),
+        project_id: envelope.data.context.project_id.clone(),
+        repository_id: envelope.data.context.repository_id.clone(),
+        from_principal_id: envelope.data.from.principal_id.clone(),
+        from_display_name: envelope.data.from.display_name.clone(),
+        from_agent_id: envelope.data.from.agent_id.clone(),
+        from_instance_id: envelope.data.from.instance_id.clone(),
+        payload: envelope.data.payload.clone(),
+        expires_at,
+        publication,
+    })
+}
+
+/// Who a project's live session will admit frames from. The transport checks every
+/// received frame's topic origin and `data.from.principal_id` against these, so
+/// a session with no roster hears only its own instance. Injected by the
+/// deployment at provisioning time — never invented here and never supplied by
+/// an IPC caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerRoster {
+    pub principals: Vec<String>,
+    pub origins: Vec<String>,
+}
+
+impl PeerRoster {
+    pub fn is_empty(&self) -> bool {
+        self.principals.is_empty() && self.origins.is_empty()
+    }
+}
+
+/// Resolve one enrolled project into a live broker session and the peer roster
+/// its received frames are checked against — the single injection point for both.
+///
+/// The work happens in `crate::provisioning`, which is admitted to the capability
+/// guard's filesystem and process lists by name. This module holds the broker
+/// socket, so it takes the resolved value and reaches for neither capability
+/// itself; that separation is the whole reason the resolver is a delegate rather
+/// than a body.
+///
+/// The seam is a plain function rather than a stored callable on purpose: the
+/// crate capability guard bars function-pointer and trait-object capabilities,
+/// and a provisioner that could be swapped at runtime would be exactly that.
+pub fn provision_session(
+    row: &crate::enrollment::EnrolledRow,
+) -> Result<(MqttSession, PeerRoster), ProvisionFailure> {
+    crate::provisioning::resolve(row)
+}
+
+/// The stable reasons the two provisioning failure states carry. They name the
+/// *input* that failed and never any material behind it, and they are additive:
+/// the `code()` strings above them are a tested IPC contract and do not move.
+pub mod reason {
+    pub const ENDPOINT_MALFORMED: &str = "endpoint-malformed";
+    pub const CREDENTIAL_REF_UNRESOLVED: &str = "credential-ref-unresolved";
+    /// `client.pem` holds no certificate this runtime can parse. Named
+    /// separately from the key reasons so the operator knows which of the two
+    /// files to look at.
+    pub const CERTIFICATE_MALFORMED: &str = "certificate-malformed";
+    /// `key.pem` holds no private key this runtime can use: no key block at
+    /// all, or a container it understands wrapping bytes it cannot load.
+    /// PKCS#8, SEC1, and PKCS#1 are all accepted, so this is a genuinely
+    /// unusable key rather than an unfashionable encoding.
+    pub const KEY_FORMAT_UNSUPPORTED: &str = "key-format-unsupported";
+    /// `key.pem` loads, but it is not the key inside `client.pem`. Caught here
+    /// rather than deep in a handshake, where the broker's side of the story
+    /// names neither file.
+    pub const KEY_CERT_MISMATCH: &str = "key-cert-mismatch";
+    /// No identity bundle at the identity path (`client.pem`/`key.pem` missing):
+    /// the certificate is the machine's only identity source, so a machine with
+    /// none cannot open a session and nothing is minted to paper over it.
+    pub const IDENTITY_REQUIRED: &str = "identity-required";
+    /// The single reason the session-credential surface reports for any trust
+    /// failure. It has meant that since the surface existed and it does not
+    /// move; the four specific reasons below are additive, and reach the
+    /// enrollment diagnostic only. See `provisioning::TrustFailure`.
+    pub const CA_UNRESOLVED: &str = "ca-unresolved";
+    /// A pinned `ca_ref` that is present but blank — a typo, not "no CA".
+    pub const CA_REF_BLANK: &str = "ca-ref-blank";
+    /// The named trust file could not be read: wrong path, or no permission.
+    /// The likeliest shape of a stale `SSL_CERT_FILE` left in a shell profile.
+    pub const CA_FILE_UNREADABLE: &str = "ca-file-unreadable";
+    /// The named trust file was read and holds nothing. Distinct from
+    /// unreadable because the fix differs: the path is right, the content is
+    /// not.
+    pub const CA_FILE_EMPTY: &str = "ca-file-empty";
+    /// The named trust file holds bytes but no certificate this runtime can
+    /// parse into a trust anchor — a PEM with the wrong block type, DER where
+    /// PEM was expected, or a truncated file.
+    pub const CA_NO_TRUSTED_CERTIFICATE: &str = "ca-no-trusted-certificate";
+    /// The local Git email and the authenticated certificate's common name
+    /// disagree. The certificate is authoritative and the disagreement is
+    /// surfaced rather than resolved in either direction.
+    pub const IDENTITY_MISMATCH: &str = "identity-mismatch";
+    pub const ROSTER_ABSENT: &str = "roster-absent";
+    pub const ROSTER_EMPTY: &str = "roster-empty";
+    /// Principals but no origins: not empty by `PeerRoster::is_empty`, yet it
+    /// admits nothing, because the receive path checks the topic origin first.
+    /// A session opened on it would look connected and hear no one.
+    pub const ROSTER_NO_ORIGINS: &str = "roster-no-origins";
+    /// Origins but no principals: the mirror of `ROSTER_NO_ORIGINS`, and deaf
+    /// for the same reason — the session would admit only its own principal, so
+    /// a colleague's frame arriving from an admitted origin is still refused.
+    pub const ROSTER_NO_PRINCIPALS: &str = "roster-no-principals";
+    pub const ROSTER_WILDCARD: &str = "roster-wildcard";
+    pub const ROSTER_MALFORMED: &str = "roster-malformed";
+    /// No federation profile resolved at all: no config dir, no legacy global
+    /// root. Distinct from `ROSTER_ABSENT` (profile resolved but no roster
+    /// file) so an operator can tell "no home to look in" from "nothing
+    /// written yet".
+    pub const PROFILE_ABSENT: &str = "profile-absent";
+    /// A one-time legacy→config-dir profile migration could not be performed.
+    pub const PROFILE_COPY_FAILED: &str = "profile-copy-failed";
+}
+
+/// Why provisioning refused, split by which half failed so the connector maps it
+/// to a state without sniffing the reason string. Carrying the reason is what
+/// lets an operator tell six failed inputs apart without six new states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionFailure {
+    /// The endpoint, the credential reference, or the CA did not resolve.
+    Credentials(&'static str),
+    /// Credentials resolved; the peer roster did not.
+    Roster(&'static str),
+}
+
+/// What a `project.attach` actually achieved. Reported honestly: an unopened
+/// session is never described as attached-and-live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionState {
+    /// A live subscribed broker session is held in this process for the project.
+    Live,
+    /// A session for this project was already live; attach is idempotent.
+    AlreadyLive,
+    /// An endpoint, credential, or CA input did not resolve.
+    CredentialsUnresolved(&'static str),
+    /// Credentials resolved but no usable peer roster was provisioned, so the
+    /// session could admit no colleague and was not opened.
+    NoPeerRoster(&'static str),
+    /// Credentials and roster resolved but the broker refused the session.
+    Unreachable(String),
+}
+
+impl SessionState {
+    pub fn code(&self) -> &'static str {
+        match self {
+            SessionState::Live => "live",
+            SessionState::AlreadyLive => "already-live",
+            SessionState::CredentialsUnresolved(_) => "credentials-unresolved",
+            SessionState::NoPeerRoster(_) => "no-peer-roster",
+            SessionState::Unreachable(_) => "unreachable",
+        }
+    }
+
+    /// Which input failed, for the two states that have one. `None` is not a
+    /// missing reason — it means nothing failed to resolve.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            SessionState::CredentialsUnresolved(reason) | SessionState::NoPeerRoster(reason) => {
+                Some(reason)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// How long a pump thread blocks on one receive before re-checking its stop
+/// flag. Short enough that a detach is prompt, long enough that an idle project
+/// costs nothing.
+const PUMP_POLL: Duration = Duration::from_millis(500);
+/// How long a receive-path reconciliation stays fresh before the oracle refetches.
+/// The pump is not on a session's critical path, so this trades a little
+/// staleness for not running `git ls-remote` on every received work claim.
+const RECONCILE_FRESHNESS: Duration = Duration::from_secs(30);
+/// Renderable items retained per project. The hook's own item budget is smaller;
+/// this is the store's ceiling, not the render budget.
+const SNAPSHOT_CAPACITY: usize = 64;
+
+// ---------------------------------------------------------------------------
+// Self-healing establishment supervisor (connector-self-healing)
+// ---------------------------------------------------------------------------
+//
+// Each live project runs a supervisor loop that owns an explicit establishment
+// cycle — build → dial → authenticate → subscribe → run — rebuilt from scratch on
+// every attempt rather than trusting rumqttc's internal eternal redial on a stale
+// socket path. The supervisor records what it observes into a shared
+// `ObservedSession` so status can never again claim "live" for a process that
+// holds no broker session.
+
+/// Per-attempt dial deadline: the whole build → dial → CONNACK must complete
+/// inside this, so a wedged SYN never blocks an establishment cycle forever.
+const DIAL_DEADLINE: Duration = Duration::from_secs(30);
+/// Reconnect backoff floor; doubled per consecutive failure, jittered, and
+/// capped at `BACKOFF_CAP`.
+const BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Hard ceiling on the reconnect backoff, jitter included.
+const BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+/// The outcome of one supervised establishment attempt, as the control loop sees
+/// it.
+enum EstablishOutcome {
+    /// A session opened and later dropped — reconnect.
+    Ended,
+    /// An establishment step failed before any session ran; the string is the
+    /// error category for the breadcrumb and the observed status.
+    Failed(String),
+    /// A typed provisioning refusal (credentials-unresolved / no-peer-roster).
+    /// Steady state, not a wedge: the supervisor stops rather than churning.
+    Refused(&'static str),
+}
+
+/// The connector's in-process observation of one project's broker session,
+/// shared between the supervisor thread that writes it and the IPC threads that
+/// read it for a truthful status. Volatile by design: it dies with the process,
+/// like every other connector session fact.
+#[derive(Debug, Clone)]
+pub struct ObservedSession {
+    /// True only while a broker session is established and subscribed *now*.
+    pub established: bool,
+    /// When the current established/disconnected state began.
+    pub since: DateTime<Utc>,
+    /// Consecutive failed establishment cycles since the last live session.
+    pub consecutive_failures: u32,
+    /// The last establishment error category, when not established.
+    pub last_error: Option<String>,
+    /// A typed provisioning refusal, when the supervisor has disarmed on one.
+    pub refusal: Option<&'static str>,
+}
+
+impl ObservedSession {
+    /// Whether every status surface should read observed-degraded: the session is
+    /// down and `DEGRADE_AFTER` consecutive establishment cycles have failed.
+    pub fn degraded(&self) -> bool {
+        !self.established && self.consecutive_failures >= DEGRADE_AFTER
+    }
+}
+
+/// Consecutive failed establishment cycles before every status surface flips to
+/// observed-degraded.
+const DEGRADE_AFTER: u32 = 3;
+
+/// How long the connector may stay enrolled-and-provisioned but sessionless
+/// before the watchdog hands recovery to the OS supervisor. The incident proved
+/// a fresh process image is the cure a wedge cannot heal in place.
+const SESSIONLESS_EXIT_AFTER: Duration = Duration::from_secs(600);
+
+/// The exit code the watchdog uses so systemd (`Restart=on-failure`) and launchd
+/// (`KeepAlive`/`SuccessfulExit=false`) treat the exit as a temporary failure and
+/// respawn a fresh process. `EX_TEMPFAIL` from sysexits.
+pub const WATCHDOG_EXIT_CODE: i32 = 75;
+
+// Test-tier tuning knobs. The spec thresholds above are the production defaults;
+// these env overrides exist ONLY so the `LOAM_MQTT_TEST` live respawn gate can
+// drive a real watchdog exit in seconds instead of ten minutes. They are additive
+// and never consulted unless set — production behavior is the consts, unchanged.
+const ENV_DIAL_SECS: &str = "LOAM_WATCHDOG_DIAL_SECS";
+const ENV_BACKOFF_CAP_SECS: &str = "LOAM_WATCHDOG_BACKOFF_CAP_SECS";
+const ENV_SESSIONLESS_SECS: &str = "LOAM_WATCHDOG_SESSIONLESS_SECS";
+
+/// Read a whole-seconds duration override from the environment, or the default.
+fn env_secs_or(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
+
+fn configured_dial_deadline() -> Duration {
+    env_secs_or(ENV_DIAL_SECS, DIAL_DEADLINE)
+}
+
+fn configured_backoff_cap() -> Duration {
+    env_secs_or(ENV_BACKOFF_CAP_SECS, BACKOFF_CAP)
+}
+
+fn configured_sessionless_budget() -> Duration {
+    env_secs_or(ENV_SESSIONLESS_SECS, SESSIONLESS_EXIT_AFTER)
+}
+
+/// The watchdog's verdict on a failed establishment cycle: keep retrying in this
+/// process, or exit so the OS supervisor respawns a fresh one. Pure and
+/// clock-injected so the ten-minute budget is unit-testable without a real wait
+/// and without ever calling `std::process::exit` inside a test.
+#[derive(Debug, PartialEq, Eq)]
+enum WatchdogVerdict {
+    Retry,
+    Exit,
+}
+
+/// Whether an enrolled, provisioned-but-sessionless connector has been down long
+/// enough to hand recovery to its OS supervisor. `sessionless_since` is when the
+/// current sessionless stretch began; `now` is the current instant; `budget` is
+/// the sessionless allowance (the const default, or the test-tier override).
+fn watchdog_verdict(sessionless_since: Instant, now: Instant, budget: Duration) -> WatchdogVerdict {
+    if now.saturating_duration_since(sessionless_since) >= budget {
+        WatchdogVerdict::Exit
+    } else {
+        WatchdogVerdict::Retry
+    }
+}
+
+/// The shared authenticated identity of a supervised session: `None` until the
+/// first successful open, then set by the supervisor thread and read by the emit
+/// path. Identity is stable across reconnects (the certificate CN does not
+/// change), so it is set once and never cleared.
+type IdentitySlot = std::sync::Arc<std::sync::Mutex<Option<SessionIdentity>>>;
+
+/// A cloneable handle to one project's `ObservedSession`. Every mutation is a
+/// named state transition so the supervisor cannot record an inconsistent view.
+#[derive(Clone)]
+pub struct LivenessHandle(std::sync::Arc<std::sync::Mutex<ObservedSession>>);
+
+impl LivenessHandle {
+    /// A handle for a session that has just been established (the synchronous
+    /// first attach succeeded).
+    fn established(now: DateTime<Utc>) -> Self {
+        LivenessHandle(std::sync::Arc::new(std::sync::Mutex::new(
+            ObservedSession {
+                established: true,
+                since: now,
+                consecutive_failures: 0,
+                last_error: None,
+                refusal: None,
+            },
+        )))
+    }
+
+    /// A handle for a session whose first establishment cycle failed but is
+    /// retryable (a dial/auth/subscribe failure, not a typed refusal). The
+    /// supervisor keeps trying and the watchdog is already counting: the first
+    /// failure is seeded here so the observation is truthful from attach.
+    fn down(now: DateTime<Utc>, category: String) -> Self {
+        LivenessHandle(std::sync::Arc::new(std::sync::Mutex::new(
+            ObservedSession {
+                established: false,
+                since: now,
+                consecutive_failures: 1,
+                last_error: Some(category),
+                refusal: None,
+            },
+        )))
+    }
+
+    /// A read-only snapshot of the current observation.
+    pub fn observe(&self) -> ObservedSession {
+        self.0
+            .lock()
+            .map(|inner| inner.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    /// A broker session just opened and subscribed: established, failure count
+    /// cleared, error cleared.
+    fn mark_established(&self, now: DateTime<Utc>) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.established = true;
+            inner.since = now;
+            inner.consecutive_failures = 0;
+            inner.last_error = None;
+            inner.refusal = None;
+        }
+    }
+
+    /// A running session dropped. Not a failed cycle — the count stays cleared —
+    /// but no session is established until the next cycle opens one.
+    fn mark_disconnected(&self, now: DateTime<Utc>) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.established = false;
+            inner.since = now;
+        }
+    }
+
+    /// An establishment cycle failed. Increments the consecutive count and
+    /// records the error category; returns the new count for backoff.
+    fn record_failure(&self, category: String) -> u32 {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.established = false;
+            inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
+            inner.last_error = Some(category);
+            return inner.consecutive_failures;
+        }
+        0
+    }
+
+    /// The supervisor disarmed on a typed provisioning refusal — a steady state,
+    /// never a wedge to churn against.
+    fn mark_refused(&self, reason: &'static str) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.established = false;
+            inner.refusal = Some(reason);
+        }
+    }
+}
+
+/// Exponential backoff with jitter, hard-capped at `BACKOFF_CAP`. `failures` is
+/// the consecutive count (>=1). Jitter only ever *subtracts* (up to 25%) so the
+/// cap is a true ceiling; it is derived from the system clock's subsecond nanos —
+/// reconnect spacing needs decorrelation, not cryptographic randomness, so no new
+/// dependency is pulled in.
+fn backoff_with_jitter(failures: u32, cap: Duration) -> Duration {
+    let shift = failures.saturating_sub(1).min(6);
+    let base = BACKOFF_BASE.saturating_mul(1u32 << shift);
+    let capped = base.min(cap);
+    let jitter_ceiling = (capped.as_millis() as u64) / 4;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    let jitter = if jitter_ceiling > 0 {
+        nanos % jitter_ceiling
+    } else {
+        0
+    };
+    capped.saturating_sub(Duration::from_millis(jitter))
+}
+
+/// Sleep up to `total`, but wake promptly if the stop flag is set so a detach or
+/// shutdown is never blocked behind a full backoff interval.
+fn interruptible_sleep(total: Duration, stop: &std::sync::atomic::AtomicBool) {
+    let step = Duration::from_millis(100);
+    let mut slept = Duration::ZERO;
+    while slept < total && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let chunk = step.min(total - slept);
+        std::thread::sleep(chunk);
+        slept += chunk;
+    }
+}
+
+/// The supervised reconnect loop. Generic over the establishment attempt and the
+/// sleeper so the control logic — reconnect on drop, backoff on failure, disarm
+/// on a typed refusal — is unit-testable with a scripted attempt sequence and no
+/// real broker or wall-clock delay.
+fn supervise<A, S>(
+    project_id: &str,
+    mut attempt: A,
+    mut sleep: S,
+    stop: &std::sync::atomic::AtomicBool,
+    liveness: &LivenessHandle,
+) where
+    A: FnMut() -> EstablishOutcome,
+    S: FnMut(Duration),
+{
+    use std::sync::atomic::Ordering::Relaxed;
+    // Tuning read once per supervisor: the production consts, unless the test tier
+    // overrode them via the environment.
+    let backoff_cap = configured_backoff_cap();
+    let sessionless_budget = configured_sessionless_budget();
+    // When the current sessionless stretch began. `None` while a session is live;
+    // set on the first failed cycle after a drop, cleared when one re-establishes.
+    // The watchdog measures its budget from here.
+    let mut sessionless_since: Option<Instant> = None;
+    while !stop.load(Relaxed) {
+        match attempt() {
+            // A session ran and dropped: the attempt already marked the session
+            // down. A session did exist, so the sessionless clock resets — the
+            // watchdog only fires on a sustained inability to establish one.
+            EstablishOutcome::Ended => {
+                sessionless_since = None;
+            }
+            EstablishOutcome::Failed(category) => {
+                let failures = liveness.record_failure(category.clone());
+                // Exactly one breadcrumb when the observation first crosses into
+                // degraded, not one per cycle after it.
+                if failures == DEGRADE_AFTER {
+                    breadcrumb!(
+                        "observed-degraded project={project_id} after {failures} failed cycles (last error {category})"
+                    );
+                }
+                breadcrumb!(
+                    "establishment failed project={project_id} error={category} (attempt {failures})"
+                );
+                let since = *sessionless_since.get_or_insert_with(Instant::now);
+                if watchdog_verdict(since, Instant::now(), sessionless_budget)
+                    == WatchdogVerdict::Exit
+                {
+                    breadcrumb!(
+                        "watchdog exit project={project_id} — enrolled but sessionless for {}s; exiting {WATCHDOG_EXIT_CODE} for supervisor respawn",
+                        sessionless_budget.as_secs()
+                    );
+                    std::process::exit(WATCHDOG_EXIT_CODE);
+                }
+                sleep(backoff_with_jitter(failures, backoff_cap));
+            }
+            EstablishOutcome::Refused(reason) => {
+                liveness.mark_refused(reason);
+                breadcrumb!(
+                    "provisioning refused project={project_id} reason={reason}; supervisor disarmed"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// The live broker sessions this connector process holds — one per enrolled
+/// project, in the same process, with no second daemon. Each pumps its received
+/// frames through the `DeliveryProcessor` into the shared snapshot store.
+pub struct ProjectSessions {
+    snapshots: std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
+    live: std::collections::HashMap<String, LiveSession>,
+    /// The shared channel registry + mailbox state, handed to each pump so the
+    /// receive path can push admitted items into registered sessions' mailboxes.
+    channels: ChannelRegistry,
+}
+
+struct LiveSession {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// The session's authenticated identity, captured at CONNACK and shared with
+    /// the supervisor thread that (re)establishes it. `None` until the first
+    /// successful open — a connector that boots while the broker is down keeps
+    /// retrying with no identity yet. This — not anything a caller supplies — is
+    /// what binds `data.from` on an outbound emit, which is why `federation emit`
+    /// forwards a derived operation rather than a finished envelope.
+    identity: IdentitySlot,
+    /// Outbound queue drained by the pump thread, which owns the client. The
+    /// CLI never opens a broker connection; the connector owns every publish.
+    outbound: std::sync::mpsc::Sender<ValidatedEnvelope>,
+    /// The connector's own observation of this project's broker session, updated
+    /// by the supervisor thread and read by the IPC status path so "live" can
+    /// only ever come from an actually-established session.
+    liveness: LivenessHandle,
+}
+
+/// What happened to one outbound emit. `NotShipped` is observational: an
+/// unopened session is reported as such, never as a silent success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmitOutcome {
+    Queued,
+    NotShipped(&'static str),
+}
+
+impl ProjectSessions {
+    /// A shared channel registry + mailbox state, handed to each pump so the
+    /// receive path can push admitted items into registered sessions' mailboxes
+    /// and fire wakes at their targets. Taking the registry as an argument is
+    /// what keeps the IPC side (`ConnectorState::channels`) and the pump side
+    /// on ONE registry — a second instance was the live-wake defect.
+    pub fn new(capacity: usize, channels: ChannelRegistry) -> Self {
+        ProjectSessions {
+            snapshots: std::sync::Arc::new(std::sync::Mutex::new(
+                SnapshotStore::new(capacity).expect("snapshot capacity is a non-zero constant"),
+            )),
+            live: std::collections::HashMap::new(),
+            channels,
+        }
+    }
+
+    /// The shared store, so a test (or a future in-process reader) can admit
+    /// frames and read them back without a broker.
+    pub fn store(&self) -> std::sync::Arc<std::sync::Mutex<SnapshotStore>> {
+        std::sync::Arc::clone(&self.snapshots)
+    }
+
+    /// The shared channel registry + mailbox state, so a test can register a
+    /// session and drive the push/poll path without a broker.
+    pub fn channels(&self) -> &ChannelRegistry {
+        &self.channels
+    }
+    pub fn snapshot(&self, project_id: &str, now: DateTime<Utc>) -> Vec<SnapshotItem> {
+        match self.snapshots.lock() {
+            Ok(mut store) => store.snapshot(project_id, now),
+            // A poisoned store means a pump thread panicked. Serving an empty
+            // snapshot is the honest answer; fabricating one is not.
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Open (or confirm) the project's live session from an already-resolved
+    /// provisioning result. Idempotent. The first establishment cycle runs here
+    /// synchronously so `project.attach` reports honestly (a refusal is returned,
+    /// not masked); on success a supervisor thread takes over, re-establishing
+    /// from scratch on every drop so a wedged socket path is never inherited.
+    /// Taking `provisioned` as an argument is what lets a test drive the first
+    /// cycle without the connector holding a swappable callable.
+    pub fn attach(
+        &mut self,
+        row: &crate::enrollment::EnrolledRow,
+        provisioned: Result<(MqttSession, PeerRoster), ProvisionFailure>,
+        now: DateTime<Utc>,
+    ) -> SessionState {
+        if self.live.contains_key(&row.project_id) {
+            return SessionState::AlreadyLive;
+        }
+        // The first cycle runs synchronously so `project.attach` reports honestly.
+        // A typed refusal is steady state — no supervisor, no watchdog. A live
+        // open primes the supervisor; a retryable failure (Unreachable) still
+        // arms it, because a connector that boots while the broker is down must
+        // keep trying and eventually exit for its supervisor to respawn.
+        let (primed, liveness, identity, state) = match open_transport(row, provisioned, now) {
+            Ok(open) => {
+                breadcrumb!("session up project={}", row.project_id);
+                let identity: IdentitySlot =
+                    std::sync::Arc::new(std::sync::Mutex::new(Some(open.identity.clone())));
+                (
+                    Some(open),
+                    LivenessHandle::established(now),
+                    identity,
+                    SessionState::Live,
+                )
+            }
+            Err(
+                refusal @ (SessionState::CredentialsUnresolved(_) | SessionState::NoPeerRoster(_)),
+            ) => {
+                return refusal;
+            }
+            Err(SessionState::Unreachable(category)) => (
+                None,
+                LivenessHandle::down(now, category.clone()),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                SessionState::Unreachable(category),
+            ),
+            // AlreadyLive/Live are never returned by open_transport; treat any
+            // other value as a retryable failure rather than dropping the session.
+            Err(other) => (
+                None,
+                LivenessHandle::down(now, other.code().to_owned()),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                other,
+            ),
+        };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (outbound, inbound) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn({
+            let stop = std::sync::Arc::clone(&stop);
+            let snapshots = std::sync::Arc::clone(&self.snapshots);
+            let channels = self.channels.clone();
+            let liveness = liveness.clone();
+            let identity = std::sync::Arc::clone(&identity);
+            let row = row.clone();
+            move || {
+                // The first cycle runs the session `attach` already opened (when
+                // primed); every cycle after — and the first, when the first open
+                // failed — re-provisions and rebuilds from scratch.
+                let mut primed = primed;
+                let project_id = row.project_id.clone();
+                supervise(
+                    &project_id,
+                    || match primed.take() {
+                        Some(open) => {
+                            run_pump_loop(open, &snapshots, &channels, &inbound, &stop, &liveness)
+                        }
+                        None => establish_and_run(
+                            &row, &snapshots, &channels, &inbound, &stop, &liveness, &identity,
+                        ),
+                    },
+                    |backoff| interruptible_sleep(backoff, &stop),
+                    &stop,
+                    &liveness,
+                );
+            }
+        });
+        self.live.insert(
+            row.project_id.clone(),
+            LiveSession {
+                stop,
+                thread: Some(thread),
+                identity,
+                outbound,
+                liveness,
+            },
+        );
+        state
+    }
+
+    /// The authenticated identity of a project's live session, if one has opened.
+    /// The emit path needs it to bind `data.from` before validating. `None` while
+    /// a supervised project has not yet completed a first successful open.
+    pub fn identity(&self, project_id: &str) -> Option<SessionIdentity> {
+        self.live
+            .get(project_id)
+            .and_then(|session| session.identity.lock().ok().and_then(|slot| slot.clone()))
+    }
+
+    /// The connector's own observation of a project's broker session, or `None`
+    /// when no session is supervised for it in this process. This is the single
+    /// source for every "live/degraded" status surface — enrollment records and
+    /// IPC reachability can never render "live" again.
+    pub fn observed(&self, project_id: &str) -> Option<ObservedSession> {
+        self.live
+            .get(project_id)
+            .map(|session| session.liveness.observe())
+    }
+
+    /// Hand one validated envelope to the project's live session for publishing.
+    /// Refuses honestly when no session is open rather than dropping it.
+    pub fn ship(&self, project_id: &str, envelope: ValidatedEnvelope) -> EmitOutcome {
+        let Some(session) = self.live.get(project_id) else {
+            return EmitOutcome::NotShipped("no-live-session");
+        };
+        match session.outbound.send(envelope) {
+            Ok(()) => EmitOutcome::Queued,
+            // The pump ended; the session is live in the map but not in fact.
+            Err(_) => EmitOutcome::NotShipped("session-ended"),
+        }
+    }
+
+    /// Stop the project's session, if any. A detached project keeps no session
+    /// and no snapshot.
+    pub fn detach(&mut self, project_id: &str) -> bool {
+        let Some(mut session) = self.live.remove(project_id) else {
+            return false;
+        };
+        session
+            .stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = session.thread.take() {
+            let _ = thread.join();
+        }
+        if let Ok(mut store) = self.snapshots.lock() {
+            store.projects.remove(project_id);
+        }
+        true
+    }
+
+    pub fn is_live(&self, project_id: &str) -> bool {
+        self.live.contains_key(project_id)
+    }
+}
+
+/// A live session hears colleagues, not only itself: every origin's events and
+/// state for the project, plus this connector's own three typed inboxes. The
+/// transport's per-frame origin and principal checks are what actually bound admission;
+/// the filters only decide what the broker sends.
+fn live_filters(org_id: &str, project_id: &str, identity: &SessionIdentity) -> Vec<String> {
+    let base = format!("loam/v1/{org_id}/{project_id}");
+    let mut filters = vec![
+        format!("{base}/event/+"),
+        format!("{base}/state/+/+"),
+        format!("{base}/inbox/instance/{}/+/+", identity.instance_id),
+        format!("{base}/inbox/principal/{}/+/+", identity.principal_id),
+        format!("{base}/inbox/agent/{}/+/+", identity.agent_id),
+    ];
+    // The broker-served membership topic: the retained payload the connector
+    // writes to the local roster file (`federation-enrollment-simplification.md`).
+    filters.push(format!("{base}/membership"));
+    // The self-announced member-card feed: every member's retained card on
+    // `loam/v1/{org}/members/{instance_id}`, from which this connector assembles
+    // the per-project roster (including its own card). Org-scoped, so the same
+    // filter covers every project a machine is in.
+    filters.push(crate::provisioning::member_filter(org_id));
+    filters
+}
+
+/// Pump one project's received frames into the snapshot store until stopped. The
+/// pump only reads: it never publishes, and a lost session simply goes quiet
+/// rather than fabricating state.
+/// The receive path's Git oracle for one project, derived entirely from the
+/// enrollment row and the provisioned roster — never from a message. Returns
+/// `None` whenever the workspace, remote, wiki root, scope, or origin set cannot
+/// be resolved, which leaves every work claim stamped as a sender claim.
+fn receive_oracle(
+    row: &crate::enrollment::EnrolledRow,
+    roster: &PeerRoster,
+) -> Option<crate::transport::GitOracle> {
+    let remote = row.remotes.first()?;
+    let workspace = std::path::PathBuf::from(&row.display_path);
+    let wiki_root = workspace.join("wiki");
+    let scope =
+        crate::transport::GitScope::new(&row.org_id, &row.project_id, &row.repository_id).ok()?;
+    crate::transport::GitOracle::new(
+        &workspace,
+        &wiki_root,
+        &remote.name,
+        scope,
+        &remote.allowed_refs,
+        &roster.origins,
+        RECONCILE_FRESHNESS,
+    )
+    .ok()
+}
+
+/// Build this machine's own retained member card from the enrollment and the
+/// authenticated identity. `projects` lists the enrolled project(s) this
+/// instance announces for; peers assemble per-project rosters from the subset
+/// of cards listing their project. `None` means no card can be announced (an
+/// identity with no principal or no instance) — a machine that cannot even
+/// build its own card has no member presence to publish.
+fn own_member_card(
+    row: &crate::enrollment::EnrolledRow,
+    identity: &SessionIdentity,
+    now: DateTime<Utc>,
+) -> Result<Option<crate::provisioning::MemberCard>, &'static str> {
+    if row.org_id.is_empty() || identity.instance_id.is_empty() || identity.principal_id.is_empty()
+    {
+        return Ok(None);
+    }
+    Ok(Some(crate::provisioning::MemberCard {
+        instance_id: identity.instance_id.clone(),
+        principal_id: identity.principal_id.clone(),
+        display_name: identity.display_name.clone(),
+        joined_at: now.to_rfc3339(),
+        projects: vec![row.project_id.clone()],
+    }))
+}
+
+/// The Git verdict for one received frame. Only an `io.loam.work.state` frame
+/// that the oracle proves published earns [`Publication::Verified`]; every other
+/// outcome, including every error, falls back to the sender-claim answer.
+fn stamp_publication(
+    oracle: Option<&mut crate::transport::GitOracle>,
+    outcome: &ReceiveOutcome,
+) -> Publication {
+    let (Some(oracle), ReceiveOutcome::Accepted(validated)) = (oracle, outcome) else {
+        return Publication::Unverified;
+    };
+    if validated.as_envelope().message_type != "io.loam.work.state" {
+        return Publication::Unverified;
+    }
+    match oracle.evaluate_work_state(validated) {
+        Ok(crate::transport::PublicationStatus::Verified(_)) => Publication::Verified,
+        _ => Publication::Unverified,
+    }
+}
+
+/// One established broker session and everything the pump reads from it. Produced
+/// by `open_transport` and consumed by `run_pump_loop`.
+struct OpenSession {
+    transport: MqttTransport,
+    identity: SessionIdentity,
+    roster: PeerRoster,
+    oracle: Option<crate::transport::GitOracle>,
+    org_id: String,
+    project_id: String,
+}
+
+/// Build, authenticate, subscribe, and self-announce one broker session from an
+/// already-resolved provisioning result. Every call rebuilds the transport from
+/// scratch — fresh `TransportConfig`, DNS, TLS, and rumqttc client — so a wedged
+/// socket path is never inherited across establishment cycles. Returns the open
+/// session, or the `SessionState` that explains why none opened.
+fn open_transport(
+    row: &crate::enrollment::EnrolledRow,
+    provisioned: Result<(MqttSession, PeerRoster), ProvisionFailure>,
+    now: DateTime<Utc>,
+) -> Result<OpenSession, SessionState> {
+    let (session, roster) = match provisioned {
+        Ok(pair) => pair,
+        Err(ProvisionFailure::Credentials(reason)) => {
+            return Err(SessionState::CredentialsUnresolved(reason))
+        }
+        Err(ProvisionFailure::Roster(reason)) => return Err(SessionState::NoPeerRoster(reason)),
+    };
+    if roster.is_empty() {
+        return Err(SessionState::NoPeerRoster(reason::ROSTER_EMPTY));
+    }
+    let mut transport = MqttTransport::new(session, ValidationConfig::default(), now)
+        .map_err(|error| SessionState::Unreachable(error.code().to_owned()))?;
+    // The live session dials with the longer deadline; the probe keeps the short
+    // default. A wedged SYN is abandoned after the dial deadline, not held
+    // forever. The test tier may shorten it to drive the watchdog quickly.
+    transport.set_dial_deadline(configured_dial_deadline());
+    let identity = transport
+        .authenticate()
+        .map_err(|error| SessionState::Unreachable(error.code().to_owned()))?;
+    let filters = live_filters(&row.org_id, &row.project_id, &identity);
+    for filter in &filters {
+        if let Err(error) = transport.subscribe(filter, false) {
+            // The filter itself is not logged: it embeds this machine's
+            // principal and agent ids. The count and the typed reason localize
+            // a broker ACL fault without publishing who this instance is.
+            breadcrumb!(
+                "subscribe denied project={} filters={} reason={}",
+                row.project_id,
+                filters.len(),
+                error.code()
+            );
+            return Err(SessionState::Unreachable(error.code().to_owned()));
+        }
+    }
+    breadcrumb!(
+        "subscribed project={} filters={}",
+        row.project_id,
+        filters.len()
+    );
+
+    // Self-announce: publish this machine's own retained member card on
+    // `loam/v1/{org}/members/{instance_id}`. Every connector does this on connect,
+    // so colleagues assembling their rosters from retained cards pick this machine
+    // up without an operator authoring anything. A refused self-publish is a
+    // broker/ACL fault: peers are still known, but this instance is invisible to
+    // first joiners.
+    let card_topic = crate::provisioning::member_topic(&row.org_id, &identity.instance_id);
+    if let Ok(Some(card)) = own_member_card(row, &identity, now) {
+        let body = crate::provisioning::member_card_to_json(&card);
+        if transport
+            .publish_raw_retained(&card_topic, body.into_bytes())
+            .is_ok()
+        {
+            if let Ok(root) = crate::provisioning::configured_roster_root() {
+                // Persist the own card immediately so a restart before the pump
+                // collects the broker's redelivery still admits this machine.
+                let _ = crate::provisioning::write_member_card(&root, &row.org_id, &card);
+            }
+        }
+    }
+
+    // Built before the pump starts, from the enrollment and the same roster the
+    // receive path admits frames against. `None` is the fail-safe: every work
+    // claim then renders as an unreconciled sender claim.
+    let oracle = receive_oracle(row, &roster);
+    Ok(OpenSession {
+        transport,
+        identity,
+        roster,
+        oracle,
+        org_id: row.org_id.clone(),
+        project_id: row.project_id.clone(),
+    })
+}
+
+/// One full establishment cycle for the supervisor: re-provision from scratch,
+/// open a fresh session, and run it until it drops. A typed provisioning refusal
+/// returns `Refused` (the supervisor disarms); a dial/auth/subscribe failure
+/// returns `Failed` (the supervisor backs off and retries).
+fn establish_and_run(
+    row: &crate::enrollment::EnrolledRow,
+    snapshots: &std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
+    channels: &ChannelRegistry,
+    outbound: &std::sync::mpsc::Receiver<ValidatedEnvelope>,
+    stop: &std::sync::atomic::AtomicBool,
+    liveness: &LivenessHandle,
+    identity: &IdentitySlot,
+) -> EstablishOutcome {
+    let now = Utc::now();
+    let open = match open_transport(row, provision_session(row), now) {
+        Ok(open) => open,
+        Err(SessionState::CredentialsUnresolved(reason))
+        | Err(SessionState::NoPeerRoster(reason)) => return EstablishOutcome::Refused(reason),
+        Err(SessionState::Unreachable(category)) => return EstablishOutcome::Failed(category),
+        Err(other) => return EstablishOutcome::Failed(other.code().to_owned()),
+    };
+    // Publish the authenticated identity for the emit path. Stable across
+    // reconnects, so a set-once is enough; a session that had never opened before
+    // (broker was down at boot) becomes emittable from here.
+    if let Ok(mut slot) = identity.lock() {
+        if slot.is_none() {
+            *slot = Some(open.identity.clone());
+        }
+    }
+    liveness.mark_established(now);
+    breadcrumb!("session up project={}", row.project_id);
+    run_pump_loop(open, snapshots, channels, outbound, stop, liveness)
+}
+
+/// One breadcrumb per received frame: the delivery class, the origin instance,
+/// the admission verdict, and the event id when the frame carried one.
+///
+/// Deliberately content-free. The state key is *not* logged even though it sits
+/// in the topic — it is caller-chosen text, and the class plus the origin
+/// already localize a delivery without it. Summary and payload never appear.
+/// This is the line that answers "did the frame arrive and was it admitted",
+/// which previously cost broker-side packet capture to establish.
+fn log_admission(project_id: &str, topic: &str, outcome: &ReceiveOutcome) {
+    breadcrumb!("{}", admission_breadcrumb(project_id, topic, outcome));
+}
+
+/// The admission line itself, split out so the content rules above are pinned by
+/// a test rather than by review alone.
+fn admission_breadcrumb(project_id: &str, topic: &str, outcome: &ReceiveOutcome) -> String {
+    let (class, origin) = topic_projection(topic);
+    format!(
+        "admission project={project_id} class={class} origin={origin} outcome={} event={}",
+        outcome.code(),
+        logged_event_id(outcome)
+    )
+}
+
+/// The breadcrumb for a frame the delivery processor refused outright.
+///
+/// Same content rules and same vocabulary source as the admission line: the
+/// typed violation's own code, never the frame. The project comes from the
+/// topic because the refusal is logged where it happens, one layer below the
+/// pump that knows the session's project.
+fn refusal_breadcrumb(topic: &str, error: &crate::transport::TransportError) -> String {
+    let (class, origin) = topic_projection(topic);
+    let project = crate::envelope::parse_topic(topic)
+        .map(|parsed| parsed.project.to_owned())
+        .unwrap_or_else(|_| "-".to_owned());
+    format!(
+        "admission project={project} class={class} origin={origin} outcome=refused reason={}",
+        error.code()
+    )
+}
+
+/// The tail line for a capped breadcrumb: what a session stopped logging
+/// individually, and how much of it there was.
+///
+/// `None` below the cap, so the caller cannot accidentally announce a
+/// suppression that never happened. Shared by the two capped classes — refused
+/// frames and rejected member cards — because they are the same rule, and a
+/// second copy is where the two would drift.
+fn suppression_breadcrumb(
+    what: &str,
+    project_id: &str,
+    logged: usize,
+    total: usize,
+) -> Option<String> {
+    if total <= logged {
+        return None;
+    }
+    Some(format!(
+        "{what} suppressed project={project_id} logged={logged} total={total}"
+    ))
+}
+
+/// The mailbox-push breadcrumb.
+///
+/// `fanout` is `None` when the channel registry's lock is poisoned: nothing was
+/// enqueued, and saying `sessions=0` there would report a fault as the ordinary
+/// "no local session is registered".
+fn mailbox_breadcrumb(
+    project_id: &str,
+    outcome: &ReceiveOutcome,
+    items: usize,
+    fanout: Option<usize>,
+) -> String {
+    let sessions = match fanout {
+        Some(sessions) => sessions.to_string(),
+        None => "unavailable".to_owned(),
+    };
+    format!(
+        "mailbox push project={project_id} event={} items={items} sessions={sessions}",
+        logged_event_id(outcome)
+    )
+}
+
+/// The content-free half of a topic: its delivery class and origin instance.
+/// Deliberately drops the state key and the message id, which are the parts a
+/// caller chooses.
+fn topic_projection(topic: &str) -> (String, String) {
+    match crate::envelope::parse_topic(topic) {
+        Ok(parsed) => {
+            let origin = parsed.delivery.origin();
+            (
+                parsed.delivery.envelope_class().to_owned(),
+                if origin.is_empty() { "-" } else { origin }.to_owned(),
+            )
+        }
+        // A topic the parser refuses never reaches the store; say so rather
+        // than dropping the frame from the record entirely.
+        Err(violation) => (format!("unparsed({violation:?})"), "-".to_owned()),
+    }
+}
+
+/// The event id a breadcrumb may carry: an admitted envelope's own id, and
+/// otherwise nothing.
+///
+/// Only `Accepted` carries an envelope, and therefore an id. Every other
+/// outcome must log `-` rather than a substitute scraped from the topic: the
+/// last topic segment is the caller-chosen state key on a state topic, so a
+/// tombstone would publish that key into the log. The wake path derives its own
+/// hint separately and may use the topic segment — it travels over loopback IPC
+/// to a local session, not into a durable log file.
+fn logged_event_id(outcome: &ReceiveOutcome) -> String {
+    match outcome {
+        ReceiveOutcome::Accepted(validated) => validated.as_envelope().id.clone(),
+        _ => "-".to_owned(),
+    }
+}
+
+/// Whether an admitted frame is this machine's own published echo — the #111
+/// self-receive case. Only `Accepted` frames carry an origin; every other outcome
+/// is a dedup/tombstone signal that never injects on its own.
+fn is_self_origin(outcome: &ReceiveOutcome, own_instance_id: &str) -> bool {
+    matches!(
+        outcome,
+        ReceiveOutcome::Accepted(envelope)
+            if envelope.as_envelope().data.from.instance_id == own_instance_id
+    )
+}
+
+/// Pump one open session's received frames into the snapshot store until it drops
+/// or a stop is requested, then mark the session down and return `Ended` so the
+/// supervisor re-establishes. The pump only reads: it never publishes on its own,
+/// and a lost session simply goes quiet rather than fabricating state.
+fn run_pump_loop(
+    open: OpenSession,
+    snapshots: &std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
+    channels: &ChannelRegistry,
+    outbound: &std::sync::mpsc::Receiver<ValidatedEnvelope>,
+    stop: &std::sync::atomic::AtomicBool,
+    liveness: &LivenessHandle,
+) -> EstablishOutcome {
+    let OpenSession {
+        mut transport,
+        identity,
+        mut roster,
+        mut oracle,
+        org_id,
+        project_id,
+    } = open;
+    // This machine's own origin. `self_receive` stays enabled (the enrollment
+    // probe proves the session by hearing its own echo), so the live pump does
+    // receive this instance's own published frames back — #111. They must never
+    // be injected into a local session: they would render as if from a teammate.
+    let own_instance_id = identity.instance_id;
+    // Rejected member cards this session, logged individually up to
+    // CARD_REJECTION_LOG_LIMIT and counted after that.
+    let mut rejected_cards = 0usize;
+    // The roster is what every received frame is admitted against, and a roster
+    // that assembled to nothing is the failure that starved delivery with no
+    // external signal at all. Logged here rather than at establishment because
+    // both entries into the pump — a freshly established session and the one
+    // `attach` primed — pass through this function. Counts only, never a peer's
+    // id.
+    breadcrumb!(
+        "roster loaded project={project_id} principals={} origins={}",
+        roster.principals.len(),
+        roster.origins.len()
+    );
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        // Outbound first: an emit the user just made should not wait behind a
+        // full poll interval of inbound traffic.
+        while let Ok(envelope) = outbound.try_recv() {
+            // A refused publish is the connector's problem, not the session's:
+            // one rejected envelope never takes the pump down. It is also the
+            // point where a user's emit silently disappears, so both outcomes
+            // are logged by event id — the id the caller already holds.
+            let event_id = envelope.as_envelope().id.clone();
+            match transport.publish_outbound(&envelope, Utc::now()) {
+                Ok(()) => breadcrumb!("publish queued project={project_id} event={event_id}"),
+                Err(error) => breadcrumb!(
+                    "publish denied project={project_id} event={event_id} reason={}",
+                    error.code()
+                ),
+            }
+        }
+        match transport.receive_outcome(PUMP_POLL, Utc::now(), &roster) {
+            Ok(Some((topic, outcome))) => {
+                log_admission(&project_id, &topic, &outcome);
+                // A self-announced member card: persist the card to the cache
+                // and reassemble this project's roster from every retained card
+                // listing the project. The connector is the roster author, so
+                // the assembled file is the durable truth the next session
+                // (and `provisioning::resolve`) reads.
+                if let ReceiveOutcome::MemberCard { payload, .. } = &outcome {
+                    if let Ok(text) = std::str::from_utf8(payload) {
+                        if let Ok(root) = crate::provisioning::configured_roster_root() {
+                            match crate::provisioning::parse_member_card_pub(text) {
+                                Ok(card) => {
+                                    breadcrumb!(
+                                        "member card accepted org={org_id} instance={}",
+                                        card.instance_id
+                                    );
+                                    let _ = crate::provisioning::write_member_card(
+                                        &root, &org_id, &card,
+                                    );
+                                    if let Ok(assembled) =
+                                        crate::provisioning::assemble_project_roster(
+                                            &root,
+                                            &org_id,
+                                            &project_id,
+                                        )
+                                    {
+                                        let body = crate::provisioning::roster_body(&assembled);
+                                        let _ = crate::provisioning::write_roster(
+                                            &root,
+                                            &org_id,
+                                            &project_id,
+                                            &body,
+                                        );
+                                        breadcrumb!(
+                                            "roster assembled project={project_id} principals={} origins={}",
+                                            assembled.principals.len(),
+                                            assembled.origins.len()
+                                        );
+                                        roster = assembled;
+                                    }
+                                }
+                                // Every rejection up to the per-session limit,
+                                // not just the first: a parser bug refusing one
+                                // peer card and one refusing every peer card are
+                                // the same single line otherwise, and breadth is
+                                // the diagnostic. Past the limit they are counted
+                                // and reported once at session down, so a
+                                // systemic failure on a respawning daemon cannot
+                                // grow the log without bound. The reason is a
+                                // typed parse verdict, never card content.
+                                Err(reason) => {
+                                    rejected_cards += 1;
+                                    if rejected_cards <= CARD_REJECTION_LOG_LIMIT {
+                                        breadcrumb!(
+                                            "member card rejected org={org_id} reason={reason}; roster may be incomplete"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // Broker-served membership: write the roster file from the
+                // retained payload. The write validates through the same rules
+                // the session build uses, so a payload that admits nobody is
+                // never persisted.
+                if let ReceiveOutcome::Membership(payload) = &outcome {
+                    if let Ok(text) = std::str::from_utf8(payload) {
+                        if let Ok(parsed) = crate::envelope::parse_topic(&topic) {
+                            if let Ok(root) = crate::provisioning::configured_roster_root() {
+                                let _ = crate::provisioning::write_roster(
+                                    &root,
+                                    parsed.organization,
+                                    parsed.project,
+                                    text,
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // #111 self-receive echo: drop this machine's own frames before
+                // they reach the store, so no injection surface — snapshot,
+                // mailbox push, or wake — ever renders this instance's own emit as
+                // a colleague's. Machine-level: filtered for every local session on
+                // this instance. Session-level "do not deliver to the emitting
+                // session" needs a session id the emit path does not carry today
+                // (residual on #111).
+                if is_self_origin(&outcome, &own_instance_id) {
+                    continue;
+                }
+                // Git-first: reconcile *before* the item is readable, so a hook
+                // can never display a provisional claim as current.
+                let publication = stamp_publication(oracle.as_mut(), &outcome);
+                if let Ok(mut store) = snapshots.lock() {
+                    let changed = store.admit(&topic, &outcome, publication);
+                    // Push delivery (T2): every registered session for this
+                    // project gets the new item in its mailbox, so the next
+                    // turn boundary can drain it without re-reading the whole
+                    // snapshot. The push is non-blocking and never fails the
+                    // receive loop.
+                    if changed {
+                        if let Ok(parsed) = crate::envelope::parse_topic(&topic) {
+                            // Two different values, deliberately not shared.
+                            //
+                            // The wake hint travels over loopback IPC to a local
+                            // session and may fall back to the topic's last
+                            // segment. The logged id may not: on a state topic
+                            // that segment is the caller-chosen state key, and a
+                            // tombstone (`Removed`, which `admit` reports as a
+                            // change) would then write that key into a durable
+                            // log file. Only an `Accepted` frame carries an id
+                            // that is ours to log.
+                            let hint = match &outcome {
+                                ReceiveOutcome::Accepted(validated) => {
+                                    Some(validated.as_envelope().id.clone())
+                                }
+                                _ => {
+                                    Some(topic.split('/').next_back().unwrap_or("state").to_owned())
+                                }
+                            };
+                            let items = store.snapshot(parsed.project, Utc::now());
+                            let fanout = channels.push(parsed.project, &items, SNAPSHOT_CAPACITY);
+                            // An admitted item with nowhere to land and one that
+                            // fanned out look identical from outside without this
+                            // line; a poisoned registry looks like neither.
+                            breadcrumb!(
+                                "{}",
+                                mailbox_breadcrumb(parsed.project, &outcome, items.len(), fanout)
+                            );
+                            // Wake fanout (live-push T1): after the mailbox push,
+                            // fire a best-effort metadata-only wake to every
+                            // registered session on this project that asked for
+                            // one.
+                            wake_all(channels, parsed.project, hint.as_deref());
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+    }
+    transport.disconnect();
+    liveness.mark_disconnected(Utc::now());
+    if let Some(line) = suppression_breadcrumb(
+        "member card rejections",
+        &project_id,
+        CARD_REJECTION_LOG_LIMIT,
+        rejected_cards,
+    ) {
+        breadcrumb!("{line}");
+    }
+    breadcrumb!("session down project={project_id}");
+    EstablishOutcome::Ended
+}
+
+/// Run the connector. Reconciles the registry before touching an endpoint: a
+/// missing database or an empty registry returns [`ServiceOutcome::Inert`]
+/// without binding a socket. Only a non-empty registry binds the owner-only
+/// endpoint and serves.
+#[cfg(unix)]
+pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
+    let Ok(db_path) = crate::provisioning::configured_registry_path(Some(global_root)) else {
+        return Ok(ServiceOutcome::Inert);
+    };
+    if !registry_has_enrollments(&db_path)? {
+        return Ok(ServiceOutcome::Inert);
+    }
+    let run_dir = global_root.join("run");
+    let endpoint = ipc::unix::bind(&run_dir).map_err(ServiceError::Ipc)?;
+    // Channels and mailboxes start empty each process, but persisted wake refs
+    // survive a restart: bind persistence to the same registry path, then reload
+    // so an idle session registered before the restart is woken again.
+    let mut state = ConnectorState::with_registry_path(db_path.clone());
+    state.channels.reload_persisted();
+    // Bring up a live session for every already-enrolled project before serving,
+    // so a hook's first snapshot read does not have to wait for an attach.
+    attach_enrolled(&db_path, &mut state);
+    accept_loop(&endpoint, &db_path, &mut state);
+    Ok(ServiceOutcome::Served)
+}
+
+fn registry_has_enrollments(db_path: &Path) -> Result<bool, ServiceError> {
+    match crate::enrollment::open_readonly(db_path).map_err(ServiceError::Registry)? {
+        None => Ok(false),
+        Some(connection) => Ok(!crate::enrollment::list_enrollments(&connection)
+            .map_err(ServiceError::Registry)?
+            .is_empty()),
+    }
+}
+
+#[cfg(unix)]
+fn accept_loop(endpoint: &ipc::unix::OwnedEndpoint, db_path: &Path, state: &mut ConnectorState) {
+    let config = IpcConfig::default();
+    loop {
+        // One failed connection never takes the connector down; keep serving.
+        let _ = serve_one(endpoint, db_path, &config, state);
+    }
+}
+
+/// Serve exactly one connection: prove the peer (inside `accept_verified`),
+/// read one bounded frame, dispatch through the registry, and write one
+/// response. Exposed for tests.
+#[cfg(unix)]
+pub fn serve_one(
+    endpoint: &ipc::unix::OwnedEndpoint,
+    db_path: &Path,
+    config: &IpcConfig,
+    state: &mut ConnectorState,
+) -> Result<(), ipc::IpcError> {
+    let mut connection = endpoint.accept_verified()?;
+    serve_connection(&mut connection, db_path, config, state)
+}
+
+/// One request/response exchange on an already owner-proven connection. Both
+/// platforms share it, so the codec, dispatch, and error shape cannot drift
+/// between them; the peer proof stays with each platform's accept.
+fn serve_connection<S: std::io::Read + std::io::Write>(
+    connection: &mut S,
+    db_path: &Path,
+    config: &IpcConfig,
+    state: &mut ConnectorState,
+) -> Result<(), ipc::IpcError> {
+    let frame = ipc::read_frame(connection, config)?;
+    let response = match ipc::parse_request(&frame, config) {
+        Ok(request) => dispatch(&request, db_path, config, state),
+        Err(error) => ipc::error_response("", &error, config),
+    };
+    ipc::write_frame(connection, &response, config)
+}
+
+/// Run the connector on Windows. Same contract as the Unix path: the registry
+/// decides whether an endpoint exists at all, and the peer's SID is proven
+/// inside `accept_verified` before the codec sees a byte.
+#[cfg(windows)]
+pub fn run_service(global_root: &Path) -> Result<ServiceOutcome, ServiceError> {
+    let Ok(db_path) = crate::provisioning::configured_registry_path(Some(global_root)) else {
+        return Ok(ServiceOutcome::Inert);
+    };
+    if !registry_has_enrollments(&db_path)? {
+        return Ok(ServiceOutcome::Inert);
+    }
+    // The pipe name is a digest of the run dir, and every client (the harness
+    // hook, `federation emit`) derives it from `global_root/run` — so the
+    // endpoint must bind the same directory the clients digest, or the two
+    // sides can never agree on a name.
+    let run_dir = global_root.join("run");
+    let endpoint = ipc::windows::bind(&run_dir).map_err(ServiceError::Ipc)?;
+    let mut state = ConnectorState::with_registry_path(db_path.clone());
+    state.channels.reload_persisted();
+    attach_enrolled(&db_path, &mut state);
+    let config = IpcConfig::default();
+    // The named-pipe accept is bounded, so the loop wakes regularly instead of
+    // blocking forever; a timeout is simply "no client yet".
+    let accept_wait = config.lifecycle_deadline;
+    loop {
+        match endpoint.accept_verified(accept_wait) {
+            Ok(served) => {
+                let mut served = served.with_io_deadline(config.read_deadline);
+                let _ = serve_connection(&mut served, &db_path, &config, &mut state);
+            }
+            // Neither an idle wait nor a rejected peer takes the connector down.
+            Err(ipc::IpcError::Timeout) | Err(ipc::IpcError::UnauthorizedPeer) => {}
+            Err(error) => return Err(ServiceError::Ipc(error)),
+        }
+    }
+}
+
+/// Resolve the request's workspace through the registry, enforce the project
+/// binding, and run the closed operation. Returns an encoded response body.
+fn dispatch(
+    request: &Request,
+    db_path: &Path,
+    config: &IpcConfig,
+    state: &mut ConnectorState,
+) -> Vec<u8> {
+    match resolve_and_run(request, db_path, state) {
+        Ok(result) => ipc::ok_response(&request.request_id, result),
+        Err(error) => ipc::error_response(&request.request_id, &error, config),
+    }
+}
+
+fn resolve_and_run(
+    request: &Request,
+    db_path: &Path,
+    state: &mut ConnectorState,
+) -> Result<crate::json::Value, ipc::IpcError> {
+    // Resolve the workspace to its physical identity exactly as enrollment did,
+    // so a path alias resolves to the same enrollment and a non-workspace path is
+    // treated as unenrolled.
+    let workspace = crate::enrollment::PhysicalWorkspace::resolve(Path::new(&request.workspace))
+        .map_err(|_| ipc::IpcError::WorkspaceUnenrolled)?;
+    let key = crate::enrollment::identity_key(&workspace);
+    dispatch_for_key(request, &key, db_path, state)
+}
+
+/// Dispatch a request that has already been resolved to a physical identity key.
+/// Separated from workspace resolution so the registry-binding and operation
+/// logic is testable without a Git workspace.
+pub(crate) fn dispatch_for_key(
+    request: &Request,
+    key: &str,
+    db_path: &Path,
+    state: &mut ConnectorState,
+) -> Result<crate::json::Value, ipc::IpcError> {
+    let read = crate::enrollment::open_readonly(db_path)
+        .map_err(|_| ipc::IpcError::Internal)?
+        .ok_or(ipc::IpcError::WorkspaceUnenrolled)?;
+    let row = crate::enrollment::lookup(&read, key)
+        .map_err(|_| ipc::IpcError::Internal)?
+        .ok_or(ipc::IpcError::WorkspaceUnenrolled)?;
+
+    // Project binding: if the caller names a project, it must match the
+    // enrollment's, or the request is rejected before any operation runs.
+    if let Some(claimed) = request.payload.get("project_id").and_then(|v| v.as_str()) {
+        if claimed != row.project_id {
+            return Err(ipc::IpcError::ProjectBindingMismatch);
+        }
+    }
+    drop(read);
+
+    match request.operation {
+        Operation::StatusGet => Ok(status_json(&row, state.sessions.observed(&row.project_id))),
+        Operation::ProjectAttach => {
+            // The enrollment already exists (looked up above). Open the live
+            // subscribed broker session in this same process — no second daemon,
+            // no per-project process — and report what actually happened rather
+            // than an unconditional acknowledgement.
+            let session_state = state
+                .sessions
+                .attach(&row, provision_session(&row), Utc::now());
+            Ok(attach_json(&row, &session_state))
+        }
+        Operation::ProjectDetach => {
+            let mut write =
+                crate::enrollment::open_writable(db_path).map_err(|_| ipc::IpcError::Internal)?;
+            let removed = crate::enrollment::delete_enrollment(&mut write, key)
+                .map_err(|_| ipc::IpcError::Internal)?;
+            if removed {
+                // Any live inject channels for this project become moot; the real
+                // per-session drop is driven by the live-injection session end. The live
+                // broker session and its snapshot go now, so a detached project
+                // is never readable.
+                state.sessions.detach(&row.project_id);
+                Ok(ack_json(&row, "detached"))
+            } else {
+                Err(ipc::IpcError::WorkspaceUnenrolled)
+            }
+        }
+        Operation::SessionRegisterInject => {
+            // Admit the session's inject channel to the volatile in-memory
+            // registry (2026-08-08 amendment). The enrollment + project binding
+            // were already proven above. Nothing is written to SQLite; injection
+            // over the channel is live injection. Either ref may be absent: a
+            // wake_ref-only or mailbox-only registration is valid.
+            let session_id = request
+                .payload
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .ok_or(ipc::IpcError::InvalidRequest)?;
+            let channel_ref = request
+                .payload
+                .get("channel_ref")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let wake_ref = request
+                .payload
+                .get("wake_ref")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            state.channels.register(InjectChannel {
+                session_id: session_id.to_owned(),
+                project_id: row.project_id.clone(),
+                channel_ref,
+                wake_ref,
+            });
+            Ok(register_ack_json(session_id, &row.project_id))
+        }
+        Operation::FederationEmit => {
+            // The CLI derived every authority-bearing field except one: the
+            // authenticated principal, which only a live session knows. Bind it
+            // here, validate the finished envelope through the envelope module, and hand it
+            // to the session that owns the client. Nothing publishes from the
+            // CLI process.
+            let Some(identity) = state.sessions.identity(&row.project_id) else {
+                return Ok(emit_json(&row, "not-shipped", "no-live-session", ""));
+            };
+            let validated = validated_emit(&request.payload, &row, &identity, Utc::now())?;
+            let event_id = validated.as_envelope().id.clone();
+            match state.sessions.ship(&row.project_id, validated) {
+                EmitOutcome::Queued => Ok(emit_json(&row, "queued", "queued", &event_id)),
+                EmitOutcome::NotShipped(reason) => Ok(emit_json(&row, "not-shipped", reason, "")),
+            }
+        }
+        Operation::SnapshotGet => {
+            // A read. Enrollment and project binding were already proven above,
+            // so an unenrolled or cross-project caller never reaches here. The
+            // snapshot is served from memory: nothing is opened for writing,
+            // nothing is persisted, and no envelope bytes leave the connector.
+            let items = state.sessions.snapshot(&row.project_id, Utc::now());
+            let observed = state.sessions.observed(&row.project_id);
+            Ok(snapshot_json(&row.project_id, &items, observed))
+        }
+        Operation::SessionPollInject => {
+            // Drain the session's mailbox (T2). The session must be registered
+            // and bound to this project; the enrollment + project binding were
+            // already proven above. The mailbox is volatile in-memory state:
+            // nothing is persisted, and the drain consumes each item exactly
+            // once. An unregistered session is refused, not silently empty —
+            // a hook that never registered would otherwise read "no new items"
+            // forever.
+            let session_id = request
+                .payload
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .ok_or(ipc::IpcError::InvalidRequest)?;
+            let items = state
+                .channels
+                .poll(session_id)
+                .ok_or(ipc::IpcError::InvalidRequest)?;
+            let observed = state.sessions.observed(&row.project_id);
+            Ok(snapshot_json(&row.project_id, &items, observed))
+        }
+        Operation::SessionDropInject => {
+            // Remove the session from the volatile channel registry (live-push
+            // T2). The mailbox is dropped with it. An unknown session is
+            // refused, not silently accepted — a plugin that never registered
+            // would otherwise believe its wake target was still live.
+            let session_id = request
+                .payload
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .ok_or(ipc::IpcError::InvalidRequest)?;
+            if !state.channels.drop_session(session_id) {
+                return Err(ipc::IpcError::InvalidRequest);
+            }
+            Ok(crate::json::Value::Object(vec![
+                ("schema".into(), crate::json::Value::Number("1".into())),
+                (
+                    "action".into(),
+                    crate::json::Value::String("inject-channel-dropped".into()),
+                ),
+                (
+                    "session_id".into(),
+                    crate::json::Value::String(session_id.to_owned()),
+                ),
+            ]))
+        }
+    }
+}
+
+/// Bring up a live session for every project already in the registry. Failure to
+/// provision one project never blocks the others or the endpoint.
+fn attach_enrolled(db_path: &Path, state: &mut ConnectorState) {
+    let rows = match crate::enrollment::open_readonly(db_path) {
+        Ok(Some(connection)) => {
+            crate::enrollment::list_enrollments(&connection).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    let now = Utc::now();
+    for row in &rows {
+        let _ = state.sessions.attach(row, provision_session(row), now);
+    }
+}
+
+/// The normalized snapshot projection. Already deduped and expiry-filtered by
+/// the store, and deliberately body-shaped: `source`, `type`, `summary`, `to`,
+/// `context`, sender attribution, and the preserved payload — never envelope
+/// bytes, a credential, or a raw remote URL.
+/// The emit projection. `status` is observational: an operation that reached no
+/// live session is reported as not shipped, never as sent.
+fn emit_json(
+    row: &crate::enrollment::EnrolledRow,
+    status: &str,
+    reason: &str,
+    event_id: &str,
+) -> crate::json::Value {
+    use crate::json::Value;
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        ("status".into(), Value::String(status.to_owned())),
+        ("reason".into(), Value::String(reason.to_owned())),
+        ("project_id".into(), Value::String(row.project_id.clone())),
+        ("event_id".into(), Value::String(event_id.to_owned())),
+    ])
+}
+
+/// Build the outbound envelope for one derived operation and validate it as the
+/// session's authenticated principal — the whole refusable part of an emit, with
+/// no live session in it, so every refusal it can produce is reachable from a
+/// test that owns nothing but an identity.
+///
+/// Both refusals keep their reason (#102). Before this the builder's `None` and
+/// the validator's `Violation` collapsed into the same bare `invalid_request`,
+/// and the CLI collapsed that into `connector_refused`: a missing plan anchor, an
+/// unaddressable recipient, and an expired envelope were one indistinguishable
+/// error, diagnosable only by capturing the socket and replaying the envelope
+/// through the validator out of process.
+fn validated_emit(
+    operation: &crate::json::Value,
+    row: &crate::enrollment::EnrolledRow,
+    identity: &SessionIdentity,
+    now: DateTime<Utc>,
+) -> Result<crate::envelope::ValidatedEnvelope, ipc::IpcError> {
+    let (document, topic) = outbound_envelope(operation, row, identity)
+        .map_err(|reason| ipc::IpcError::InvalidRequestBecause(reason.to_owned()))?;
+    // An empty claim set means the session claims only its own principal; it is
+    // never read as "claims anything".
+    let owned_claims: Vec<String> = if identity.allowed_claims.is_empty() {
+        vec![identity.principal_id.clone()]
+    } else {
+        identity.allowed_claims.clone()
+    };
+    let claims: Vec<&str> = owned_claims.iter().map(String::as_str).collect();
+    let principal = AuthenticatedPrincipal::new(&identity.principal_id, &claims);
+    crate::envelope::validate(
+        document.as_bytes(),
+        &topic,
+        &principal,
+        &ValidationConfig::default(),
+        now,
+    )
+    .map_err(|violation| ipc::IpcError::InvalidRequestBecause(violation.code()))
+}
+
+/// Build the outbound CloudEvents document and its topic from the CLI's derived
+/// operation plus the live session's authenticated identity. A structurally
+/// impossible operation is refused *by name* — a bare `None` here was one half of
+/// the double flattening #102 was filed for, and these shape refusals are exactly
+/// the ones the envelope validator never gets to explain because the document
+/// cannot be built at all. Everything else is the envelope module's job to refuse
+/// when the document is validated.
+///
+/// Every reason is a fixed literal, so nothing from the caller's operation can
+/// reach the IPC diagnostic through it.
+fn outbound_envelope(
+    operation: &crate::json::Value,
+    row: &crate::enrollment::EnrolledRow,
+    identity: &SessionIdentity,
+) -> Result<(String, String), &'static str> {
+    use crate::json::Value;
+    let string = |key: &str| operation.get(key).and_then(Value::as_str).unwrap_or("");
+    let owned = |key: &str| operation.get(key).cloned().unwrap_or(Value::Null);
+
+    let (message_type, dataschema, class, intent) = match string("type") {
+        "message.reply" => (
+            "io.loam.message",
+            "urn:loam:schema:message:1",
+            "inbox",
+            "response",
+        ),
+        "message.ack" => (
+            "io.loam.message",
+            "urn:loam:schema:message:1",
+            "inbox",
+            "ack",
+        ),
+        "work.report" => (
+            "io.loam.work.state",
+            "urn:loam:schema:work-state:1",
+            "latest-state",
+            "inform",
+        ),
+        _ => return Err("unsupported_operation_type"),
+    };
+
+    let event_id = string("id");
+    let prefix = format!("loam/v1/{}/{}", row.org_id, row.project_id);
+    let (delivery, to, topic) = if class == "inbox" {
+        let recipients = operation
+            .get("to")
+            .and_then(Value::as_array)
+            .ok_or("missing_recipients")?;
+        let first = recipients
+            .iter()
+            .find(|recipient| {
+                matches!(
+                    recipient.get("kind").and_then(Value::as_str),
+                    Some("agent" | "principal" | "instance")
+                )
+            })
+            .ok_or("no_addressable_recipient")?;
+        let kind = first
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or("no_addressable_recipient")?;
+        let id = first
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("missing_recipient_id")?;
+        (
+            Value::Object(vec![("class".into(), Value::String("inbox".into()))]),
+            Value::Array(recipients.to_vec()),
+            format!(
+                "{prefix}/inbox/{kind}/{id}/{}/{event_id}",
+                identity.instance_id
+            ),
+        )
+    } else {
+        let key = operation
+            .get("state_key")
+            .and_then(Value::as_str)
+            .ok_or("missing_state_key")?;
+        let revision = operation
+            .get("revision")
+            .and_then(Value::as_str)
+            .ok_or("missing_state_revision")?;
+        (
+            Value::Object(vec![
+                ("class".into(), Value::String("latest-state".into())),
+                ("key".into(), Value::String(key.to_owned())),
+                ("revision".into(), Value::Number(revision.to_owned())),
+            ]),
+            Value::Array(vec![Value::Object(vec![
+                ("kind".into(), Value::String("project".into())),
+                ("id".into(), Value::String(row.project_id.clone())),
+            ])]),
+            format!("{prefix}/state/{}/{key}", identity.instance_id),
+        )
+    };
+
+    // `base_oid` is the enrolled commit — derived, never a caller's. `plan_oid`
+    // is the caller's plan anchor when it supplied one (#98): provenance, not
+    // authority, and the only part of `context` an emit caller contributes. The
+    // shape is not re-checked here on purpose — `envelope::validate` refuses a
+    // malformed one as `InvalidPlanOid` and an absent one on a claim-bearing
+    // report as `MissingPlanOid`, and both now reach the caller by name.
+    let mut git = vec![("base_oid".into(), Value::String(row.commit.clone()))];
+    if let Some(plan_oid) = operation.get("plan_oid").and_then(Value::as_str) {
+        if !plan_oid.is_empty() {
+            git.push(("plan_oid".into(), Value::String(plan_oid.to_owned())));
+        }
+    }
+    let mut context = vec![
+        ("org_id".into(), Value::String(row.org_id.clone())),
+        ("project_id".into(), Value::String(row.project_id.clone())),
+        (
+            "repository_id".into(),
+            Value::String(row.repository_id.clone()),
+        ),
+        ("git".into(), Value::Object(git)),
+    ];
+    context.push((
+        "artifacts".into(),
+        match operation.get("artifacts") {
+            Some(artifacts @ Value::Array(_)) => artifacts.clone(),
+            _ => Value::Array(Vec::new()),
+        },
+    ));
+
+    let document = Value::Object(vec![
+        ("specversion".into(), Value::String("1.0".into())),
+        ("id".into(), Value::String(event_id.to_owned())),
+        ("source".into(), Value::String(string("source").to_owned())),
+        ("type".into(), Value::String(message_type.to_owned())),
+        ("time".into(), Value::String(string("time").to_owned())),
+        (
+            "datacontenttype".into(),
+            Value::String("application/json".into()),
+        ),
+        ("dataschema".into(), Value::String(dataschema.to_owned())),
+        (
+            "data".into(),
+            Value::Object(vec![
+                ("intent".into(), Value::String(intent.to_owned())),
+                (
+                    "from".into(),
+                    Value::Object(
+                        vec![
+                            (
+                                "principal_id".into(),
+                                Value::String(identity.principal_id.clone()),
+                            ),
+                            ("agent_id".into(), Value::String(identity.agent_id.clone())),
+                            (
+                                "instance_id".into(),
+                                Value::String(identity.instance_id.clone()),
+                            ),
+                        ]
+                        .into_iter()
+                        .chain(identity.display_name.clone().map(|name| {
+                            // From the certificate the broker authenticated, so a
+                            // caller cannot supply it and an absent one stays absent.
+                            ("display_name".to_owned(), Value::String(name))
+                        }))
+                        .collect(),
+                    ),
+                ),
+                ("to".into(), to),
+                ("delivery".into(), delivery),
+                ("thread".into(), owned("thread")),
+                ("context".into(), Value::Object(context)),
+                (
+                    "expires_at".into(),
+                    Value::String(string("expires_at").to_owned()),
+                ),
+                (
+                    "summary".into(),
+                    Value::String(string("summary").to_owned()),
+                ),
+                ("payload".into(), owned("payload")),
+            ]),
+        ),
+    ]);
+    Ok((document.to_json(), topic))
+}
+
+fn snapshot_json(
+    project_id: &str,
+    items: &[SnapshotItem],
+    observed: Option<ObservedSession>,
+) -> crate::json::Value {
+    use crate::json::Value;
+    let rendered = items
+        .iter()
+        .map(|item| {
+            let mut fields = vec![
+                ("source".into(), Value::String(item.source.clone())),
+                ("type".into(), Value::String(item.item_type.clone())),
+                ("summary".into(), Value::String(item.summary.clone())),
+                (
+                    "to".into(),
+                    Value::Array(
+                        item.to
+                            .iter()
+                            .map(|(kind, id)| {
+                                Value::Object(vec![
+                                    ("kind".into(), Value::String(kind.clone())),
+                                    ("id".into(), Value::String(id.clone())),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+                (
+                    "context".into(),
+                    Value::Object(vec![
+                        ("org_id".into(), Value::String(item.org_id.clone())),
+                        ("project_id".into(), Value::String(item.project_id.clone())),
+                        (
+                            "repository_id".into(),
+                            Value::String(item.repository_id.clone()),
+                        ),
+                    ]),
+                ),
+                (
+                    "from".into(),
+                    Value::Object(
+                        vec![
+                            (
+                                "principal_id".into(),
+                                Value::String(item.from_principal_id.clone()),
+                            ),
+                            ("agent_id".into(), Value::String(item.from_agent_id.clone())),
+                            (
+                                "instance_id".into(),
+                                Value::String(item.from_instance_id.clone()),
+                            ),
+                        ]
+                        .into_iter()
+                        .chain(item.from_display_name.clone().map(|name| {
+                            // Only when the sender published one: an always-present
+                            // empty name would render as an anonymous colleague.
+                            ("display_name".to_owned(), Value::String(name))
+                        }))
+                        .collect(),
+                    ),
+                ),
+                ("payload".into(), item.payload.clone()),
+                // The receive path's Git verdict. Always present and always
+                // explicit, so a missing field can never read as verified.
+                (
+                    "publication".into(),
+                    Value::String(item.publication.code().to_owned()),
+                ),
+            ];
+            // Only latest-state frames have one, and an inbox item carrying an
+            // empty `state_key` would render an empty `key=` attribute (#99).
+            if let Some(state_key) = &item.state_key {
+                fields.push(("state_key".into(), Value::String(state_key.clone())));
+            }
+            Value::Object(fields)
+        })
+        .collect();
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        ("project_id".into(), Value::String(project_id.to_owned())),
+        ("items".into(), Value::Array(rendered)),
+        // Additive: the same observed-session block the status IPC carries, so the
+        // harness renders "live" only when a session is established right now.
+        (
+            "observed_session".into(),
+            observed_session_json(observed.as_ref()),
+        ),
+    ])
+}
+
+/// The attach projection. `session_state` is observational: an unopened session
+/// is reported as such, never as attached-and-live.
+fn attach_json(
+    row: &crate::enrollment::EnrolledRow,
+    session_state: &SessionState,
+) -> crate::json::Value {
+    use crate::json::Value;
+    let mut fields = vec![
+        ("schema".into(), Value::Number("1".into())),
+        ("action".into(), Value::String("attached".into())),
+        ("project_id".into(), Value::String(row.project_id.clone())),
+        (
+            "session_state".into(),
+            Value::String(session_state.code().to_owned()),
+        ),
+    ];
+    if let Some(reason) = session_state.reason() {
+        fields.push(("reason".into(), Value::String(reason.to_owned())));
+    }
+    if let SessionState::Unreachable(reason) = session_state {
+        fields.push(("session_diagnostic".into(), Value::String(reason.clone())));
+    }
+    Value::Object(fields)
+}
+
+fn register_ack_json(session_id: &str, project_id: &str) -> crate::json::Value {
+    use crate::json::Value;
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        (
+            "action".into(),
+            Value::String("inject-channel-registered".into()),
+        ),
+        ("session_id".into(), Value::String(session_id.to_owned())),
+        ("project_id".into(), Value::String(project_id.to_owned())),
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// Transactional connect orchestration and rollback (T10)
+// ---------------------------------------------------------------------------
+//
+// The ordered contract: validate locally (done by the caller), then check
+// idempotence/conflict against the registry BEFORE probing, then run the
+// subscribe-first exact round-trip probe, then commit the enrollment
+// transactionally, then activate exactly one service and reach readiness. Any
+// failure after the registry commit removes only this attempt's row and
+// stops/disables an otherwise-empty service; a compound compensation failure is
+// surfaced as `RollbackIncomplete`, never as success. The transport and the
+// service manager are seams so the whole ordered failure matrix is testable.
+
+use crate::service;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConnectOutcome {
+    /// A new enrollment was probed, committed, and activated.
+    Connected {
+        capabilities: crate::enrollment::CapabilityRecord,
+    },
+    /// The same physical workspace with the same descriptor was already enrolled;
+    /// lifecycle drift was repaired without a re-probe.
+    AlreadyConnected,
+}
+
+#[derive(Debug)]
+pub enum ConnectError {
+    Probe(ProbeError),
+    Registry(crate::enrollment::RegistryError),
+    /// The same physical workspace is enrolled with a different binding.
+    EnrollmentConflict,
+    /// Activation failed but compensation succeeded (no residual enrollment).
+    ActivationFailed(String),
+    /// Compensation itself failed; the residual local state is reported.
+    RollbackIncomplete(String),
+}
+
+impl ConnectError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ConnectError::Probe(_) => "connect_probe_failed",
+            ConnectError::Registry(_) => "connect_registry_error",
+            ConnectError::EnrollmentConflict => "enrollment_conflict",
+            ConnectError::ActivationFailed(_) => "connect_activation_failed",
+            ConnectError::RollbackIncomplete(_) => "rollback_incomplete",
+        }
+    }
+
+    /// What went wrong underneath the code, when there is anything to say. A
+    /// bare `connect_activation_failed` names the step that failed and nothing
+    /// else — not which manager command, not what the manager returned — which
+    /// made a first-run darwin failure an open-ended investigation instead of a
+    /// 30-second read (#128). `connect_probe_failed` was the same dead end for
+    /// credentials: a `key.pem` that is not the key in `client.pem` said only
+    /// that a probe failed (#95). The variants that carry a reason surface it;
+    /// the ones whose code is already the whole story stay silent.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            ConnectError::Probe(probe) => probe.detail(),
+            ConnectError::ActivationFailed(why) | ConnectError::RollbackIncomplete(why) => {
+                Some(why.as_str())
+            }
+            ConnectError::Registry(_) | ConnectError::EnrollmentConflict => None,
+        }
+    }
+}
+
+fn capability_record(evidence: &CapabilityEvidence) -> crate::enrollment::CapabilityRecord {
+    crate::enrollment::CapabilityRecord {
+        authentication: evidence.authentication,
+        publish: evidence.publish,
+        subscribe: evidence.subscribe,
+        self_receive: evidence.self_receive,
+        verified_at: evidence.verified_at.to_rfc3339(),
+    }
+}
+
+fn probe_context_from(enrolled: &crate::enrollment::ValidatedEnrollment) -> ProbeContext {
+    // The probe is a capability check; its git anchors just need to be valid
+    // OIDs, so the enrolled commit serves for both.
+    ProbeContext {
+        org_id: enrolled.org_id.clone(),
+        project_id: enrolled.project_id.clone(),
+        repository_id: enrolled.repository_id.clone(),
+        base_oid: enrolled.commit.clone(),
+        plan_oid: enrolled.commit.clone(),
+    }
+}
+
+/// Orchestrate connect from an already-validated enrollment. Splitting the
+/// Git-dependent validation (the caller's step) from this lets the ordered
+/// failure matrix be tested without a real workspace.
+#[allow(clippy::too_many_arguments)]
+pub fn orchestrate_from_validated<T: Transport, R: service::CommandRunner>(
+    enrolled: &crate::enrollment::ValidatedEnrollment,
+    transport: &mut T,
+    service_runner: &R,
+    service_ctx: &service::ServiceContext,
+    db_path: &std::path::Path,
+    config: &ValidationConfig,
+    deadline: Duration,
+    now: DateTime<Utc>,
+) -> Result<ConnectOutcome, ConnectError> {
+    let key = crate::enrollment::identity_key(&enrolled.workspace);
+    let digest = crate::enrollment::descriptor_digest(enrolled);
+
+    // Idempotence / conflict — before any probe, so a healthy existing enrollment
+    // is never re-probed.
+    if let Some(connection) =
+        crate::enrollment::open_readonly(db_path).map_err(ConnectError::Registry)?
+    {
+        if let Some(existing) =
+            crate::enrollment::lookup(&connection, &key).map_err(ConnectError::Registry)?
+        {
+            drop(connection);
+            if existing.descriptor_digest == digest {
+                // Repair lifecycle drift, no re-publication.
+                let _ = service::install(service_runner, service_ctx);
+                let _ = service::enable_start(service_runner, service_ctx);
+                return Ok(ConnectOutcome::AlreadyConnected);
+            }
+            return Err(ConnectError::EnrollmentConflict);
+        }
+    }
+
+    // Subscribe-first exact round-trip probe.
+    let probe_ctx = probe_context_from(enrolled);
+    let evidence =
+        run_probe(transport, &probe_ctx, config, deadline, now).map_err(ConnectError::Probe)?;
+    let capabilities = capability_record(&evidence);
+
+    // Commit the enrollment transactionally before activation.
+    let mut connection =
+        crate::enrollment::open_writable(db_path).map_err(ConnectError::Registry)?;
+    match crate::enrollment::insert_enrollment(
+        &mut connection,
+        enrolled,
+        &service_ctx.instance_id,
+        &capabilities,
+        &now.to_rfc3339(),
+    )
+    .map_err(ConnectError::Registry)?
+    {
+        crate::enrollment::InsertOutcome::Inserted => {}
+        crate::enrollment::InsertOutcome::AlreadyEnrolled => {
+            return Ok(ConnectOutcome::AlreadyConnected)
+        }
+        crate::enrollment::InsertOutcome::Conflict => return Err(ConnectError::EnrollmentConflict),
+    }
+    drop(connection);
+
+    // Activate exactly one service; compensate on any failure.
+    let activation = service::install(service_runner, service_ctx)
+        .and_then(|()| service::enable_start(service_runner, service_ctx));
+    if let Err(error) = activation {
+        return Err(compensate_after_activation(
+            db_path,
+            &key,
+            service_runner,
+            service_ctx,
+            &error,
+        ));
+    }
+
+    Ok(ConnectOutcome::Connected { capabilities })
+}
+
+/// Remove only this attempt's enrollment row and, if the registry is now empty,
+/// stop/disable the service. A failure to compensate is `RollbackIncomplete`.
+fn compensate_after_activation<R: service::CommandRunner>(
+    db_path: &std::path::Path,
+    key: &str,
+    service_runner: &R,
+    service_ctx: &service::ServiceContext,
+    activation_error: &service::ServiceError,
+) -> ConnectError {
+    let mut connection = match crate::enrollment::open_writable(db_path) {
+        Ok(connection) => connection,
+        Err(_) => {
+            return ConnectError::RollbackIncomplete(format!(
+                "registry unreachable during rollback after activation error: {activation_error}"
+            ))
+        }
+    };
+    if crate::enrollment::delete_enrollment(&mut connection, key).is_err() {
+        return ConnectError::RollbackIncomplete(format!(
+            "enrollment row not removed during rollback after activation error: {activation_error}"
+        ));
+    }
+    let now_empty = crate::enrollment::list_enrollments(&connection)
+        .map(|rows| rows.is_empty())
+        .unwrap_or(false);
+    drop(connection);
+    if now_empty {
+        let _ = service::disable_stop(service_runner, service_ctx);
+    }
+    ConnectError::ActivationFailed(activation_error.to_string())
+}
+
+/// A precise, aggregate-free status projection: enrollment, historical verified
+/// capabilities, and a broker-session field that is explicitly not-live here (a
+/// real session is the adapter's, T13). No `connected`/`ready` boolean.
+fn status_json(
+    row: &crate::enrollment::EnrolledRow,
+    observed: Option<ObservedSession>,
+) -> crate::json::Value {
+    use crate::json::Value;
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        (
+            "enrollment".into(),
+            Value::Object(vec![
+                ("state".into(), Value::String("enrolled".into())),
+                ("org_id".into(), Value::String(row.org_id.clone())),
+                ("project_id".into(), Value::String(row.project_id.clone())),
+                (
+                    "repository_id".into(),
+                    Value::String(row.repository_id.clone()),
+                ),
+                (
+                    "display_path".into(),
+                    Value::String(row.display_path.clone()),
+                ),
+            ]),
+        ),
+        (
+            "verification".into(),
+            Value::Object(vec![
+                (
+                    "capabilities".into(),
+                    Value::Array(capability_names(&row.capabilities)),
+                ),
+                (
+                    "verified_at".into(),
+                    Value::String(row.capabilities.verified_at.clone()),
+                ),
+            ]),
+        ),
+        (
+            "broker".into(),
+            // Sourced from the connector's own live observation, never the
+            // enrollment row: "established" is true only while a broker session
+            // is held in this process right now.
+            Value::Object(vec![(
+                "observed_session".into(),
+                observed_session_json(observed.as_ref()),
+            )]),
+        ),
+    ])
+}
+
+/// The observed-session projection shared by the status and snapshot IPC
+/// responses. Additive to both — the existing fields and reason strings are
+/// untouched. `None` means no session is supervised for the project in this
+/// process (never attached, or detached), which reads as not-established and
+/// not-degraded rather than a fabricated "live".
+fn observed_session_json(observed: Option<&ObservedSession>) -> crate::json::Value {
+    use crate::json::Value;
+    let Some(observed) = observed else {
+        return Value::Object(vec![
+            ("supervised".into(), Value::Bool(false)),
+            ("established".into(), Value::Bool(false)),
+            ("degraded".into(), Value::Bool(false)),
+        ]);
+    };
+    let mut fields = vec![
+        ("supervised".into(), Value::Bool(true)),
+        ("established".into(), Value::Bool(observed.established)),
+        ("degraded".into(), Value::Bool(observed.degraded())),
+        ("since".into(), Value::String(observed.since.to_rfc3339())),
+        (
+            "consecutive_failures".into(),
+            Value::Number(observed.consecutive_failures.to_string()),
+        ),
+    ];
+    if let Some(error) = &observed.last_error {
+        fields.push(("last_error".into(), Value::String(error.clone())));
+    }
+    if let Some(refusal) = observed.refusal {
+        fields.push(("refusal".into(), Value::String(refusal.to_owned())));
+    }
+    Value::Object(fields)
+}
+
+fn capability_names(record: &crate::enrollment::CapabilityRecord) -> Vec<crate::json::Value> {
+    let mut names = Vec::new();
+    for (present, name) in [
+        (record.authentication, "authentication"),
+        (record.publish, "publish"),
+        (record.subscribe, "subscribe"),
+        (record.self_receive, "self_receive"),
+    ] {
+        if present {
+            names.push(crate::json::Value::String(name.to_owned()));
+        }
+    }
+    names
+}
+
+fn ack_json(row: &crate::enrollment::EnrolledRow, action: &str) -> crate::json::Value {
+    use crate::json::Value;
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        ("action".into(), Value::String(action.to_owned())),
+        ("project_id".into(), Value::String(row.project_id.clone())),
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// Disconnect, observational status, and lifecycle convergence (T11)
+// ---------------------------------------------------------------------------
+//
+// Local removal is authoritative: a disconnect deletes only the named
+// enrollment, preserves every other project, and — when the registry becomes
+// empty — stops/disables the one service. Broker cleanup (the best-effort
+// project tombstone) is a separate, failure-tolerant channel that never blocks
+// local removal; the real ordered tombstone via the adapter is T13, so here its
+// outcome is injected so both the success and the broker-down paths are tested.
+// Manager stop/disable failure is a precise degraded result, never hidden
+// success. Status is strictly read-only: it never creates the database, starts
+// a process, or claims an aggregate `connected`/`ready`.
+
+/// Whether the named enrollment was actually removed by this disconnect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalOutcome {
+    /// The row existed and was deleted — local removal is authoritative.
+    Removed,
+    /// Nothing was enrolled for this workspace (already gone / never enrolled).
+    AlreadyAbsent,
+}
+
+/// The best-effort broker-side cleanup outcome, reported separately from local
+/// removal so a broker-down tombstone failure is visible without blocking it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupOutcome {
+    Ok,
+    Failed(String),
+}
+
+impl From<Result<(), String>> for CleanupOutcome {
+    fn from(result: Result<(), String>) -> Self {
+        match result {
+            Ok(()) => CleanupOutcome::Ok,
+            Err(reason) => CleanupOutcome::Failed(reason),
+        }
+    }
+}
+
+/// The service lifecycle result after reconciling against registry truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleOutcome {
+    /// Other projects remain; the service stays up.
+    Preserved { remaining: usize },
+    /// The registry is now empty; the service was stopped and disabled.
+    StoppedDisabled,
+    /// The registry is empty but the manager stop/disable failed — a precise
+    /// degraded result, not hidden success.
+    ManagerDegraded(String),
+    /// The machine was already fully dormant (no store); nothing to reconcile.
+    Untouched,
+}
+
+/// The three separate lifecycle facts a disconnect reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisconnectReport {
+    pub local: LocalOutcome,
+    pub broker_cleanup: CleanupOutcome,
+    pub lifecycle: LifecycleOutcome,
+}
+
+#[derive(Debug)]
+pub enum DisconnectError {
+    Registry(crate::enrollment::RegistryError),
+}
+
+/// Disconnect a single physical workspace by its identity key. Best-effort
+/// broker cleanup (injected) is reported separately; local deletion is
+/// authoritative; the service is reconciled from registry truth afterward.
+///
+/// A missing database means a fully dormant machine: there is nothing to remove
+/// and no manager state to repair, so this never creates the store on a read.
+pub fn disconnect_by_key<R: service::CommandRunner>(
+    db_path: &std::path::Path,
+    key: &str,
+    broker_cleanup: Result<(), String>,
+    service_runner: &R,
+    service_ctx: &service::ServiceContext,
+) -> Result<DisconnectReport, DisconnectError> {
+    let cleanup = CleanupOutcome::from(broker_cleanup);
+
+    // Dormant machine: no store, so nothing to delete and nothing to reconcile.
+    let existed =
+        match crate::enrollment::open_readonly(db_path).map_err(DisconnectError::Registry)? {
+            None => {
+                return Ok(DisconnectReport {
+                    local: LocalOutcome::AlreadyAbsent,
+                    broker_cleanup: cleanup,
+                    lifecycle: LifecycleOutcome::Untouched,
+                });
+            }
+            Some(connection) => crate::enrollment::lookup(&connection, key)
+                .map_err(DisconnectError::Registry)?
+                .is_some(),
+        };
+
+    // The store exists, so we may open it writable to delete and to reconcile the
+    // manager lifecycle from registry truth (also the repeated-disconnect repair).
+    let mut connection =
+        crate::enrollment::open_writable(db_path).map_err(DisconnectError::Registry)?;
+    let removed = existed
+        && crate::enrollment::delete_enrollment(&mut connection, key)
+            .map_err(DisconnectError::Registry)?;
+    let remaining = crate::enrollment::list_enrollments(&connection)
+        .map_err(DisconnectError::Registry)?
+        .len();
+    drop(connection);
+
+    let lifecycle = if remaining == 0 {
+        // Final removal, or a repeated disconnect repairing residual drift:
+        // reconcile the one service to the empty desired state. Idempotent.
+        match service::disable_stop(service_runner, service_ctx) {
+            Ok(()) => LifecycleOutcome::StoppedDisabled,
+            Err(error) => LifecycleOutcome::ManagerDegraded(error.to_string()),
+        }
+    } else {
+        LifecycleOutcome::Preserved { remaining }
+    };
+
+    Ok(DisconnectReport {
+        local: if removed {
+            LocalOutcome::Removed
+        } else {
+            LocalOutcome::AlreadyAbsent
+        },
+        broker_cleanup: cleanup,
+        lifecycle,
+    })
+}
+
+/// One enrollment as JSON: the inventory projection shared by `status` and
+/// `list`, so both surfaces describe an enrollment identically and a new field
+/// cannot land on one and not the other.
+pub fn enrollment_json(row: &crate::enrollment::EnrolledRow) -> crate::json::Value {
+    use crate::json::Value;
+    Value::Object(vec![
+        ("org_id".into(), Value::String(row.org_id.clone())),
+        ("project_id".into(), Value::String(row.project_id.clone())),
+        (
+            "repository_id".into(),
+            Value::String(row.repository_id.clone()),
+        ),
+        (
+            "display_path".into(),
+            Value::String(row.display_path.clone()),
+        ),
+        // The endpoint the connector dials for this project. Part of the
+        // inventory an operator reads: two projects can federate through
+        // different brokers, and the row is where that is visible.
+        (
+            "broker_endpoint".into(),
+            Value::String(row.broker_endpoint.clone()),
+        ),
+        // Per-project historical verification, kept beside the enrollment
+        // and never collapsed into a readiness claim.
+        (
+            "verification".into(),
+            Value::Object(vec![
+                (
+                    "capabilities".into(),
+                    Value::Array(capability_names(&row.capabilities)),
+                ),
+                (
+                    "verified_at".into(),
+                    Value::String(row.capabilities.verified_at.clone()),
+                ),
+            ]),
+        ),
+        // Per-project health is the enrollment's own state, separate from
+        // any live-session claim.
+        ("health".into(), Value::String("enrolled".into())),
+    ])
+}
+
+/// A read-only, aggregate-free status projection for the whole machine (or one
+/// workspace when `key` is given). Never creates the database and never starts a
+/// process: enrollment comes from a read-only registry open, the definition from
+/// a filesystem presence check, and the process/enabled state from a read-only
+/// manager query. Historical verified capabilities, the (not-observed) live
+/// broker session, and per-project health are separate fields — there is no
+/// `connected`/`ready` boolean.
+pub fn status_report<R: service::CommandRunner>(
+    db_path: &std::path::Path,
+    service_runner: &R,
+    service_ctx: &service::ServiceContext,
+    key: Option<&str>,
+) -> crate::json::Value {
+    use crate::json::Value;
+
+    // Read-only registry open: a missing store yields no enrollments and is never
+    // created here.
+    let enrollments: Vec<crate::enrollment::EnrolledRow> =
+        match crate::enrollment::open_readonly(db_path) {
+            Ok(Some(connection)) => match key {
+                Some(key) => crate::enrollment::lookup(&connection, key)
+                    .ok()
+                    .flatten()
+                    .into_iter()
+                    .collect(),
+                None => crate::enrollment::list_enrollments(&connection).unwrap_or_default(),
+            },
+            _ => Vec::new(),
+        };
+
+    let enrollment_values = enrollments.iter().map(enrollment_json).collect();
+
+    // Definition presence is a filesystem fact; the process/enabled state is a
+    // read-only manager query. Neither starts anything.
+    let definition_present = service::definition_path(service_ctx).exists();
+    let manager_state = match service::status(service_runner, service_ctx) {
+        Ok(0) => "enabled",
+        Ok(_) => "disabled",
+        Err(_) => "unknown",
+    };
+
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        ("enrollments".into(), Value::Array(enrollment_values)),
+        (
+            "definition".into(),
+            Value::Object(vec![("present".into(), Value::Bool(definition_present))]),
+        ),
+        (
+            "process".into(),
+            Value::Object(vec![(
+                "manager_state".into(),
+                Value::String(manager_state.into()),
+            )]),
+        ),
+        (
+            "broker".into(),
+            // Read-only status does not observe a live broker session; the live
+            // session belongs to the running connector/adapter (T13).
+            Value::Object(vec![
+                ("session_observed".into(), Value::Bool(false)),
+                (
+                    "session_state".into(),
+                    Value::String("not-observed-in-read-only-status".into()),
+                ),
+            ]),
+        ),
+    ])
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    fn identity() -> SessionIdentity {
+        SessionIdentity {
+            principal_id: "employee-184".into(),
+            agent_id: "agent-72".into(),
+            instance_id: "instance-01".into(),
+            display_name: None,
+            allowed_claims: vec![],
+        }
+    }
+
+    fn context() -> ProbeContext {
+        ProbeContext {
+            org_id: "org-3A1".into(),
+            project_id: "project-7M3".into(),
+            repository_id: "repo-2F8".into(),
+            base_oid: "84be000000000000000000000000000000000001".into(),
+            plan_oid: "61af000000000000000000000000000000000001".into(),
+        }
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-24T14:20:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn deadline() -> Duration {
+        // Stub-transport connects resolve instantly, so this only ever bounds a
+        // pathologically slow runner — keep it generous for CI headroom.
+        Duration::from_secs(10)
+    }
+
+    #[test]
+    fn ordered_success_records_four_capabilities_and_no_retained_probe() {
+        let mut transport = StubTransport::healthy(identity());
+        let evidence = run_probe(
+            &mut transport,
+            &context(),
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        )
+        .expect("healthy probe succeeds");
+        assert!(
+            evidence.authentication
+                && evidence.publish
+                && evidence.subscribe
+                && evidence.self_receive
+        );
+        // subscribe-before-publish: three required filters subscribed.
+        assert_eq!(transport.subscriptions().len(), 3);
+        // No retained probe.
+        assert!(transport.retained.is_empty());
+    }
+
+    #[test]
+    fn authentication_failure_is_reported() {
+        let mut transport = StubTransport {
+            deny_auth: true,
+            ..StubTransport::healthy(identity())
+        };
+        assert_eq!(
+            run_probe(
+                &mut transport,
+                &context(),
+                &ValidationConfig::default(),
+                deadline(),
+                now()
+            ),
+            Err(ProbeError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn subscribe_denied_stops_before_publish() {
+        let mut transport = StubTransport {
+            deny_subscribe: true,
+            ..StubTransport::healthy(identity())
+        };
+        assert!(matches!(
+            run_probe(
+                &mut transport,
+                &context(),
+                &ValidationConfig::default(),
+                deadline(),
+                now()
+            ),
+            Err(ProbeError::SubscribeDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn publish_denied_is_reported() {
+        let mut transport = StubTransport {
+            deny_publish: true,
+            ..StubTransport::healthy(identity())
+        };
+        assert_eq!(
+            run_probe(
+                &mut transport,
+                &context(),
+                &ValidationConfig::default(),
+                deadline(),
+                now()
+            ),
+            Err(ProbeError::PublishDenied)
+        );
+    }
+
+    #[test]
+    fn no_self_receive_is_reported() {
+        let mut transport = StubTransport {
+            swallow_echo: true,
+            ..StubTransport::healthy(identity())
+        };
+        assert_eq!(
+            run_probe(
+                &mut transport,
+                &context(),
+                &ValidationConfig::default(),
+                deadline(),
+                now()
+            ),
+            Err(ProbeError::NoSelfReceive)
+        );
+    }
+
+    #[test]
+    fn wrong_self_receive_is_reported() {
+        let mut transport = StubTransport {
+            corrupt_echo: true,
+            ..StubTransport::healthy(identity())
+        };
+        assert_eq!(
+            run_probe(
+                &mut transport,
+                &context(),
+                &ValidationConfig::default(),
+                deadline(),
+                now()
+            ),
+            Err(ProbeError::WrongSelfReceive)
+        );
+    }
+
+    #[test]
+    fn stalled_broker_times_out_as_no_self_receive() {
+        let mut transport = StubTransport {
+            stall: true,
+            ..StubTransport::healthy(identity())
+        };
+        assert_eq!(
+            run_probe(
+                &mut transport,
+                &context(),
+                &ValidationConfig::default(),
+                deadline(),
+                now()
+            ),
+            Err(ProbeError::NoSelfReceive)
+        );
+    }
+
+    #[test]
+    fn probe_envelope_is_a_valid_non_retained_event_message() {
+        // The probe envelope must pass envelope validation on its event topic.
+        let id = probe_id(&identity(), now());
+        let json = probe_envelope_json(&context(), &identity(), &id, now());
+        let topic = probe_topic(&context(), &identity());
+        let principal = AuthenticatedPrincipal::new("employee-184", &[]);
+        let validated = envelope::validate(
+            json.as_bytes(),
+            &topic,
+            &principal,
+            &ValidationConfig::default(),
+            now(),
+        )
+        .expect("probe envelope validates");
+        assert_eq!(validated.as_envelope().id, id);
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+    use crate::enrollment::{
+        CapabilityRecord, PhysicalWorkspace, PlatformIdentity, ValidatedEnrollment, ValidatedRemote,
+    };
+    use std::io::Read;
+
+    fn temp_db(label: &str) -> std::path::PathBuf {
+        // Leaked on purpose: connector.rs is not on the filesystem capability
+        // allowlist, so these tests never perform any filesystem cleanup here.
+        std::env::temp_dir().join(format!(
+            "loam-svc-{label}-{}.sqlite3",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn synthetic(device: u64, inode: u64) -> ValidatedEnrollment {
+        ValidatedEnrollment {
+            org_id: "acme".into(),
+            project_id: "loam".into(),
+            repository_id: "repo".into(),
+            broker_profile: "acme-prod".into(),
+            broker_endpoint: "mqtts://h:8883".into(),
+            tls_server_name: "h".into(),
+            ca_ref: None,
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            remotes: vec![ValidatedRemote {
+                name: "origin".into(),
+                url_digest: "a".repeat(64),
+                allowed_refs: vec!["refs/heads/main".into()],
+            }],
+            workspace: PhysicalWorkspace {
+                display_path: "/w/proj".into(),
+                identity: PlatformIdentity::Unix { device, inode },
+            },
+        }
+    }
+
+    fn caps() -> CapabilityRecord {
+        CapabilityRecord {
+            authentication: true,
+            publish: true,
+            subscribe: true,
+            self_receive: true,
+            verified_at: "2026-08-08T10:00:00Z".into(),
+        }
+    }
+
+    fn enrolled_db(label: &str, device: u64, inode: u64) -> (std::path::PathBuf, String) {
+        let path = temp_db(label);
+        let mut connection = crate::enrollment::open_writable(&path).unwrap();
+        let enrollment = synthetic(device, inode);
+        crate::enrollment::insert_enrollment(
+            &mut connection,
+            &enrollment,
+            "instance-under-test",
+            &caps(),
+            "t",
+        )
+        .unwrap();
+        let key = crate::enrollment::identity_key(&enrollment.workspace);
+        (path, key)
+    }
+
+    fn request(operation: Operation, payload: crate::json::Value) -> Request {
+        Request {
+            request_id: "r-1".into(),
+            workspace: "/w/proj".into(),
+            operation,
+            payload,
+        }
+    }
+
+    #[test]
+    fn empty_and_missing_registries_are_inert() {
+        // A path with no database: reconciliation finds nothing, no endpoint.
+        let missing = temp_db("inert-missing");
+        assert!(!registry_has_enrollments(&missing).unwrap());
+
+        // An existing database with zero enrollments is equally inert.
+        let empty = temp_db("inert-empty");
+        drop(crate::enrollment::open_writable(&empty).unwrap());
+        assert!(!registry_has_enrollments(&empty).unwrap());
+    }
+
+    #[test]
+    fn a_populated_registry_reports_work_to_host() {
+        let (path, _key) = enrolled_db("populated", 1, 10);
+        assert!(registry_has_enrollments(&path).unwrap());
+    }
+
+    #[test]
+    fn status_get_returns_an_aggregate_free_projection() {
+        let (path, key) = enrolled_db("status", 2, 20);
+        let result = dispatch_for_key(
+            &request(Operation::StatusGet, crate::json::Value::Object(vec![])),
+            &key,
+            &path,
+            &mut ConnectorState::new(),
+        )
+        .expect("status");
+        let text = result.to_json();
+        assert!(text.contains("\"enrollment\""));
+        assert!(text.contains("\"capabilities\""));
+        // The broker block is sourced from the connector's own observation. A
+        // fresh state supervises no session for this project, so the honest report
+        // is not-supervised / not-established — never a fabricated "live".
+        assert!(text.contains("\"observed_session\""));
+        assert!(text.contains("\"supervised\":false"));
+        assert!(text.contains("\"established\":false"));
+        assert!(!text.contains("\"connected\"") && !text.contains("\"ready\""));
+    }
+
+    #[test]
+    fn an_unenrolled_workspace_is_rejected() {
+        let (path, _key) = enrolled_db("unenrolled", 3, 30);
+        let outcome = dispatch_for_key(
+            &request(Operation::StatusGet, crate::json::Value::Object(vec![])),
+            "unix:999:999",
+            &path,
+            &mut ConnectorState::new(),
+        );
+        assert_eq!(outcome.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
+    }
+
+    #[test]
+    fn a_cross_project_binding_is_rejected() {
+        let (path, key) = enrolled_db("binding", 4, 40);
+        let payload = crate::json::Value::Object(vec![(
+            "project_id".into(),
+            crate::json::Value::String("some-other-project".into()),
+        )]);
+        let outcome = dispatch_for_key(
+            &request(Operation::StatusGet, payload),
+            &key,
+            &path,
+            &mut ConnectorState::new(),
+        );
+        assert_eq!(outcome.err(), Some(ipc::IpcError::ProjectBindingMismatch));
+    }
+
+    #[test]
+    fn detach_removes_then_status_is_unenrolled() {
+        let (path, key) = enrolled_db("detach", 5, 50);
+        dispatch_for_key(
+            &request(Operation::ProjectDetach, crate::json::Value::Object(vec![])),
+            &key,
+            &path,
+            &mut ConnectorState::new(),
+        )
+        .expect("detach");
+        let after = dispatch_for_key(
+            &request(Operation::StatusGet, crate::json::Value::Object(vec![])),
+            &key,
+            &path,
+            &mut ConnectorState::new(),
+        );
+        assert_eq!(after.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
+    }
+
+    // --- T18 register-inject + volatile channel registry ---
+
+    fn register_request(session_id: &str, channel_ref: &str) -> Request {
+        Request {
+            request_id: "r-1".into(),
+            workspace: "/w/proj".into(),
+            operation: Operation::SessionRegisterInject,
+            payload: crate::json::Value::Object(vec![
+                (
+                    "session_id".into(),
+                    crate::json::Value::String(session_id.into()),
+                ),
+                (
+                    "channel_ref".into(),
+                    crate::json::Value::String(channel_ref.into()),
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn register_inject_admits_a_channel_without_persisting() {
+        let (path, key) = enrolled_db("register", 6, 60);
+        let mut state = ConnectorState::new();
+        let result = dispatch_for_key(
+            &register_request("sess-1", "chan-token-1"),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register");
+        assert!(result.to_json().contains("inject-channel-registered"));
+        assert!(state.channels.contains("sess-1"));
+        assert_eq!(state.channels.len(), 1);
+
+        // Nothing about the channel is written to SQLite: no table holds it, and
+        // the enrollment row count is unchanged.
+        let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+        let channel_tables: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE '%channel%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(channel_tables, 0, "no channel table may exist in SQLite");
+        assert_eq!(
+            crate::enrollment::list_enrollments(&connection)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// A whole snapshot session — attach, admit real frames, read repeatedly —
+    /// must leave the database byte-identical. The snapshot is
+    /// in-memory only: no snapshot table, no schema bump, no enrollment churn.
+    #[test]
+    fn a_full_snapshot_session_leaves_sqlite_byte_unchanged() {
+        let (path, key) = enrolled_db("snapshot-nonpersistence", 9, 90);
+        // One long-lived read connection is the witness: SQLite bumps
+        // `data_version` on it whenever *another* connection commits a write, so
+        // an unchanged value is a real "nothing was written" proof — and unlike a
+        // byte comparison it needs no filesystem capability, which this module
+        // deliberately does not have.
+        let witness = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+        let data_version = |connection: &rusqlite::Connection| -> i64 {
+            connection
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        let schema_sql = |connection: &rusqlite::Connection| -> String {
+            let mut statement = connection
+                .prepare("SELECT COALESCE(group_concat(name || '|' || COALESCE(sql, '')), '') FROM sqlite_master ORDER BY name")
+                .unwrap();
+            statement.query_row([], |r| r.get(0)).unwrap()
+        };
+        let before_version = data_version(&witness);
+        let before_schema_sql = schema_sql(&witness);
+        let before_schema: i64 = witness
+            .query_row("SELECT version FROM federation_schema", [], |r| r.get(0))
+            .unwrap();
+
+        let mut state = ConnectorState::new();
+        // Attach opens no session here (nothing is provisioned) but must still
+        // answer honestly rather than claiming a live broker session.
+        let attach = dispatch_for_key(
+            &request(Operation::ProjectAttach, crate::json::Value::Object(vec![])),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("attach");
+        assert!(
+            attach.to_json().contains("credentials-unresolved"),
+            "an unprovisioned attach must report its real session state: {}",
+            attach.to_json()
+        );
+
+        // Admit real frames straight into the store the dispatch reads from, so
+        // the read below returns something and the absence of writes is not
+        // vacuous.
+        {
+            let store = state.sessions.store();
+            let mut store = store.lock().unwrap();
+            store.store(
+                "loam",
+                SnapshotItem {
+                    key: "state:instance-01/work-SB-42".into(),
+                    state_key: Some("work-SB-42".into()),
+                    source: "urn:loam:instance:instance-01".into(),
+                    item_type: "io.loam.work.state".into(),
+                    summary: "Work is active.".into(),
+                    to: vec![("project".into(), "loam".into())],
+                    org_id: "org-3A1".into(),
+                    project_id: "loam".into(),
+                    repository_id: "repo-2F8".into(),
+                    from_principal_id: "employee-184".into(),
+                    from_display_name: None,
+                    from_agent_id: "agent-72".into(),
+                    from_instance_id: "instance-01".into(),
+                    payload: crate::json::Value::Object(vec![]),
+                    expires_at: Utc::now() + chrono::Duration::hours(1),
+                    publication: Publication::Unverified,
+                },
+            );
+        }
+
+        for _ in 0..3 {
+            let snapshot = dispatch_for_key(
+                &request(Operation::SnapshotGet, crate::json::Value::Object(vec![])),
+                &key,
+                &path,
+                &mut state,
+            )
+            .expect("snapshot");
+            let text = snapshot.to_json();
+            assert!(
+                text.contains("Work is active."),
+                "the snapshot read must serve the held item: {text}"
+            );
+            // A read never consumes: the same unresolved item is still there.
+        }
+
+        // The database is untouched: no committed write, the same table
+        // inventory, the same schema version, the same enrollment count, and no
+        // snapshot table was invented.
+        assert_eq!(
+            data_version(&witness),
+            before_version,
+            "a snapshot session must commit no write to SQLite"
+        );
+        assert_eq!(
+            schema_sql(&witness),
+            before_schema_sql,
+            "a snapshot session must add no table"
+        );
+        let after_schema: i64 = witness
+            .query_row("SELECT version FROM federation_schema", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before_schema, after_schema);
+        let snapshot_tables: i64 = witness
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE '%snapshot%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(snapshot_tables, 0, "no snapshot table may exist in SQLite");
+        assert_eq!(
+            crate::enrollment::list_enrollments(&witness).unwrap().len(),
+            1
+        );
+
+        // Positive control: the witness *can* see a write. A real committed
+        // insert from another connection must advance the very `data_version`
+        // asserted unchanged above, so "unchanged" is evidence of no write
+        // rather than of a blind witness.
+        let mut writer = crate::enrollment::open_writable(&path).unwrap();
+        crate::enrollment::insert_enrollment(
+            &mut writer,
+            &synthetic(19, 190),
+            "instance-under-test",
+            &caps(),
+            "t",
+        )
+        .unwrap();
+        assert_ne!(
+            data_version(&witness),
+            before_version,
+            "the witness must observe a real committed write, or the unchanged assertion is vacuous"
+        );
+        assert_eq!(
+            crate::enrollment::list_enrollments(&witness).unwrap().len(),
+            2
+        );
+    }
+
+    /// The snapshot read inherits `dispatch_for_key`'s enrollment resolution and
+    /// project-binding proof rather than sitting beside them.
+    #[test]
+    fn the_snapshot_read_rejects_unenrolled_and_cross_project_callers() {
+        let (path, key) = enrolled_db("snapshot-binding", 10, 100);
+        let mut state = ConnectorState::new();
+
+        let unenrolled = dispatch_for_key(
+            &request(Operation::SnapshotGet, crate::json::Value::Object(vec![])),
+            "unix:404:404",
+            &path,
+            &mut state,
+        );
+        assert_eq!(unenrolled.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
+
+        let cross_project = dispatch_for_key(
+            &request(
+                Operation::SnapshotGet,
+                crate::json::Value::Object(vec![(
+                    "project_id".into(),
+                    crate::json::Value::String("someone-elses-project".into()),
+                )]),
+            ),
+            &key,
+            &path,
+            &mut state,
+        );
+        assert_eq!(
+            cross_project.err(),
+            Some(ipc::IpcError::ProjectBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn register_inject_requires_an_enrolled_workspace() {
+        let (path, _key) = enrolled_db("register-unenrolled", 7, 70);
+        let outcome = dispatch_for_key(
+            &register_request("sess-x", "chan"),
+            "unix:404:404",
+            &path,
+            &mut ConnectorState::new(),
+        );
+        assert_eq!(outcome.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
+    }
+
+    #[test]
+    fn a_channel_is_dropped_on_session_end() {
+        let state = ConnectorState::new();
+        state.channels.register(InjectChannel {
+            session_id: "sess-2".into(),
+            project_id: "loam".into(),
+            channel_ref: Some("c".into()),
+            wake_ref: None,
+        });
+        assert!(state.channels.contains("sess-2"));
+        assert!(state.channels.drop_session("sess-2"));
+        assert!(!state.channels.contains("sess-2"));
+        assert!(!state.channels.drop_session("sess-2")); // idempotent
+    }
+
+    // --- T2: mailbox queue + SessionPollInject ---
+
+    fn poll_request(session_id: &str) -> Request {
+        Request {
+            request_id: "r-poll".into(),
+            workspace: "/w/proj".into(),
+            operation: Operation::SessionPollInject,
+            payload: crate::json::Value::Object(vec![(
+                "session_id".into(),
+                crate::json::Value::String(session_id.into()),
+            )]),
+        }
+    }
+
+    fn sample_item(key: &str, summary: &str) -> SnapshotItem {
+        SnapshotItem {
+            key: key.into(),
+            state_key: None,
+            source: "urn:loam:instance:instance-01".into(),
+            item_type: "io.loam.message".into(),
+            summary: summary.into(),
+            to: vec![("instance".into(), "instance-02".into())],
+            org_id: "acme".into(),
+            project_id: "loam".into(),
+            repository_id: "repo".into(),
+            from_principal_id: "employee-184".into(),
+            from_display_name: None,
+            from_agent_id: "agent-72".into(),
+            from_instance_id: "instance-01".into(),
+            payload: crate::json::Value::Object(vec![]),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            publication: Publication::Unverified,
+        }
+    }
+
+    #[test]
+    fn poll_inject_drains_the_mailbox_and_a_second_poll_is_empty() {
+        let (path, key) = enrolled_db("poll-drain", 11, 110);
+        let mut state = ConnectorState::new();
+        dispatch_for_key(
+            &register_request("sess-poll", "chan-poll"),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register");
+
+        // The pump pushes after admit; drive the same push the pump performs.
+        state.channels.push(
+            "loam",
+            &[sample_item("inbox:01", "Held.")],
+            SNAPSHOT_CAPACITY,
+        );
+
+        let first =
+            dispatch_for_key(&poll_request("sess-poll"), &key, &path, &mut state).expect("poll");
+        let text = first.to_json();
+        assert!(
+            text.contains("Held."),
+            "the poll must return the item: {text}"
+        );
+
+        let second = dispatch_for_key(&poll_request("sess-poll"), &key, &path, &mut state)
+            .expect("poll again");
+        assert!(
+            !second.to_json().contains("Held."),
+            "a second poll must be empty (drained): {}",
+            second.to_json()
+        );
+    }
+
+    #[test]
+    fn two_sessions_on_the_same_project_both_receive_the_item() {
+        let (path, key) = enrolled_db("poll-two", 12, 120);
+        let mut state = ConnectorState::new();
+        for session in ["sess-a", "sess-b"] {
+            dispatch_for_key(
+                &register_request(session, &format!("chan-{session}")),
+                &key,
+                &path,
+                &mut state,
+            )
+            .expect("register");
+        }
+
+        let delivered = state.channels.push(
+            "loam",
+            &[sample_item("inbox:02", "Both.")],
+            SNAPSHOT_CAPACITY,
+        );
+        // The fanout count the mailbox breadcrumb reports (#103): a push that
+        // reached nobody and one that reached every session are otherwise
+        // indistinguishable from outside the registry.
+        assert_eq!(
+            delivered,
+            Some(2),
+            "the item lands in both registered mailboxes"
+        );
+
+        for session in ["sess-a", "sess-b"] {
+            let polled =
+                dispatch_for_key(&poll_request(session), &key, &path, &mut state).expect("poll");
+            assert!(
+                polled.to_json().contains("Both."),
+                "session {session} must receive the item: {}",
+                polled.to_json()
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_on_another_project_does_not_receive_the_item() {
+        let (path, key) = enrolled_db("poll-other-project", 13, 130);
+        let mut state = ConnectorState::new();
+        dispatch_for_key(
+            &register_request("sess-other", "chan-other"),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register");
+
+        // The registered session is bound to "loam"; pushing for another
+        // project must not reach it.
+        let delivered = state.channels.push(
+            "other-project",
+            &[sample_item("inbox:03", "Not yours.")],
+            SNAPSHOT_CAPACITY,
+        );
+        assert_eq!(
+            delivered,
+            Some(0),
+            "a cross-project push reaches no mailbox"
+        );
+
+        let polled =
+            dispatch_for_key(&poll_request("sess-other"), &key, &path, &mut state).expect("poll");
+        assert!(
+            !polled.to_json().contains("Not yours."),
+            "a session must not receive another project's items: {}",
+            polled.to_json()
+        );
+    }
+
+    #[test]
+    fn drop_session_removes_its_mailbox_and_poll_refuses() {
+        let (path, key) = enrolled_db("poll-drop", 14, 140);
+        let mut state = ConnectorState::new();
+        dispatch_for_key(
+            &register_request("sess-drop", "chan-drop"),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register");
+        state.channels.push(
+            "loam",
+            &[sample_item("inbox:04", "Dropped.")],
+            SNAPSHOT_CAPACITY,
+        );
+
+        assert!(state.channels.drop_session("sess-drop"));
+        assert!(!state.channels.contains("sess-drop"));
+
+        // An unregistered session is refused, not silently empty.
+        let outcome = dispatch_for_key(&poll_request("sess-drop"), &key, &path, &mut state);
+        assert_eq!(outcome.err(), Some(ipc::IpcError::InvalidRequest));
+    }
+
+    #[test]
+    fn poll_inject_requires_an_enrolled_workspace() {
+        let (path, _key) = enrolled_db("poll-unenrolled", 15, 150);
+        let outcome = dispatch_for_key(
+            &poll_request("sess-x"),
+            "unix:404:404",
+            &path,
+            &mut ConnectorState::new(),
+        );
+        assert_eq!(outcome.err(), Some(ipc::IpcError::WorkspaceUnenrolled));
+    }
+
+    #[test]
+    fn a_restart_starts_with_empty_mailboxes() {
+        // Register + push for real, then drop the state: a restarted connector
+        // must recover no mailbox (in-memory only, like the channel registry).
+        let (path, key) = enrolled_db("poll-restart", 16, 160);
+        let mut before = ConnectorState::new();
+        dispatch_for_key(
+            &register_request("sess-restart", "chan-restart"),
+            &key,
+            &path,
+            &mut before,
+        )
+        .expect("register");
+        before.channels.push(
+            "loam",
+            &[sample_item("inbox:05", "Volatile.")],
+            SNAPSHOT_CAPACITY,
+        );
+
+        drop(before);
+        let mut after = ConnectorState::new();
+        let outcome = dispatch_for_key(&poll_request("sess-restart"), &key, &path, &mut after);
+        assert_eq!(
+            outcome.err(),
+            Some(ipc::IpcError::InvalidRequest),
+            "a restarted connector must recover no mailbox"
+        );
+    }
+
+    #[test]
+    fn a_channel_only_registration_persists_nothing_across_a_restart() {
+        // A registration with a channel ref but no wake ref: the channel and its
+        // mailbox are live-only and must not survive a restart, and — since only
+        // wake refs are durable — nothing is written to SQLite for it.
+        let (path, key) = enrolled_db("restart", 8, 80);
+        let mut before = ConnectorState::with_registry_path(path.clone());
+        dispatch_for_key(
+            &register_request("sess-restart", "chan-restart"),
+            &key,
+            &path,
+            &mut before,
+        )
+        .expect("register");
+        assert!(before.channels.contains("sess-restart"));
+
+        // The restart: the process-local registry is gone, the database is not.
+        drop(before);
+        let after = ConnectorState::with_registry_path(path.clone());
+        after.channels.reload_persisted();
+        assert!(
+            after.channels.is_empty(),
+            "a channel-only registration must not survive a restart"
+        );
+
+        // The wake-ref table exists but holds no row for a wake-less registration.
+        let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+        assert!(
+            crate::enrollment::list_session_wakes(&connection)
+                .unwrap()
+                .is_empty(),
+            "a registration without a wake ref persists nothing"
+        );
+        assert_eq!(
+            crate::enrollment::list_enrollments(&connection)
+                .unwrap()
+                .len(),
+            1,
+            "the enrollment itself must survive the restart"
+        );
+    }
+
+    fn register_wake_request(session_id: &str, wake_ref: &str) -> Request {
+        Request {
+            request_id: "r-1".into(),
+            workspace: "/w/proj".into(),
+            operation: Operation::SessionRegisterInject,
+            payload: crate::json::Value::Object(vec![
+                (
+                    "session_id".into(),
+                    crate::json::Value::String(session_id.into()),
+                ),
+                (
+                    "wake_ref".into(),
+                    crate::json::Value::String(wake_ref.into()),
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn a_persisted_wake_reloads_after_a_restart_and_fires() {
+        // The #112 incident's shape: an idle session (takes no turns, so never
+        // re-registers) must still be woken after the connector restarts.
+        let (path, key) = enrolled_db("reload", 9, 90);
+        let (listener, address) = wake_listener();
+        let mut before = ConnectorState::with_registry_path(path.clone());
+        dispatch_for_key(
+            &register_wake_request("sess-idle", &format!("notify-tcp://{address}")),
+            &key,
+            &path,
+            &mut before,
+        )
+        .expect("register");
+        {
+            let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+            assert_eq!(
+                crate::enrollment::list_session_wakes(&connection)
+                    .unwrap()
+                    .len(),
+                1,
+                "a wake-bearing registration persists its wake ref"
+            );
+        }
+
+        // The restart: fresh process-local state, then reload the persisted wakes.
+        drop(before);
+        let after = ConnectorState::with_registry_path(path.clone());
+        after.channels.reload_persisted();
+        assert!(
+            after.channels.contains("sess-idle"),
+            "the persisted wake reloads as a registration"
+        );
+
+        // The next admitted frame both mailbox-pushes and wakes the reloaded target.
+        after.channels.push(
+            "loam",
+            &[sample_item("inbox:reload:1", "hi")],
+            SNAPSHOT_CAPACITY,
+        );
+        wake_all(&after.channels, "loam", Some("hint-reload"));
+        assert!(
+            !accept_wake_frame(&listener).is_empty(),
+            "the reloaded idle session must be woken"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_reloaded_wake_prunes_its_persisted_row() {
+        let (path, key) = enrolled_db("prune", 11, 110);
+        let mut state = ConnectorState::with_registry_path(path.clone());
+        dispatch_for_key(
+            &register_wake_request("sess-dead", "notify-tcp://127.0.0.1:1"),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register");
+        {
+            let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+            assert_eq!(
+                crate::enrollment::list_session_wakes(&connection)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        // A changed admit fires the wake; the dead port prunes the persisted row.
+        state.channels.push(
+            "loam",
+            &[sample_item("inbox:prune:1", "hi")],
+            SNAPSHOT_CAPACITY,
+        );
+        wake_all(&state.channels, "loam", Some("hint-prune"));
+
+        let connection = crate::enrollment::open_readonly(&path).unwrap().unwrap();
+        assert!(
+            crate::enrollment::list_session_wakes(&connection)
+                .unwrap()
+                .is_empty(),
+            "an unreachable wake prunes its persisted row"
+        );
+        // The session and its mailbox survive; only the dead wake ref is gone.
+        assert!(state.channels.contains("sess-dead"));
+        assert_eq!(
+            state
+                .channels
+                .poll("sess-dead")
+                .expect("still registered")
+                .len(),
+            1,
+            "the mailbox item survives a failed wake"
+        );
+    }
+
+    // --- T1 (live-push): wake fanout ---
+
+    /// Bind a one-shot localhost TCP listener and return it plus its address,
+    /// so a test can register a `notify-tcp://` wake_ref and observe the wake
+    /// frame the connector delivers.
+    fn wake_listener() -> (std::net::TcpListener, std::net::SocketAddr) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind wake listener");
+        let address = listener.local_addr().expect("listener address");
+        (listener, address)
+    }
+
+    /// Accept one wake connection on the listener and return the bytes read,
+    /// waiting at most 10 seconds so a missing wake never hangs the test.
+    fn accept_wake_frame(listener: &std::net::TcpListener) -> String {
+        listener
+            .set_nonblocking(true)
+            .expect("listener nonblocking");
+        // Generous CI headroom: a localhost accept normally lands in <10ms, but a
+        // loaded/throttled runner can stall it well past a second. A longer
+        // deadline only slows a genuinely failing run, never passes a broken one.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // BSD/macOS makes the accepted socket INHERIT the listener's
+                    // non-blocking flag (Linux does not — the whole darwin-only
+                    // signature). Left non-blocking, read() returns EWOULDBLOCK
+                    // before the loopback frame lands; restore blocking so the
+                    // read timeout actually governs.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("accepted stream blocking");
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .expect("set wake read timeout");
+                    let mut buffer = [0u8; 4096];
+                    // Never swallow a read error into an empty frame: the old
+                    // `.unwrap_or(0)` turned EWOULDBLOCK into a fake "0 bytes" and
+                    // hid this bug for days. A test helper must fail loudly with
+                    // the error, never fabricate data.
+                    let read = stream.read(&mut buffer).expect("read wake frame");
+                    return String::from_utf8_lossy(&buffer[..read]).into_owned();
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("no wake connection arrived within 10s");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(other) => panic!("wake accept failed: {other}"),
+            }
+        }
+    }
+
+    /// A wake_ref-bearing registration, mirroring the pump's fanout shape.
+    fn wake_register_request(session_id: &str, channel_ref: &str, wake_ref: &str) -> Request {
+        Request {
+            request_id: "r-wake".into(),
+            workspace: "/w/proj".into(),
+            operation: Operation::SessionRegisterInject,
+            payload: crate::json::Value::Object(vec![
+                (
+                    "session_id".into(),
+                    crate::json::Value::String(session_id.into()),
+                ),
+                (
+                    "channel_ref".into(),
+                    crate::json::Value::String(channel_ref.into()),
+                ),
+                (
+                    "wake_ref".into(),
+                    crate::json::Value::String(wake_ref.into()),
+                ),
+            ]),
+        }
+    }
+
+    /// The rendered field values of an admitted item that must never appear in
+    /// a wake frame. Scanning for these proves the wake channel is
+    /// metadata-only.
+    fn item_render_fields(item: &SnapshotItem) -> Vec<String> {
+        vec![
+            item.summary.clone(),
+            item.from_principal_id.clone(),
+            item.key.clone(),
+            item.payload.to_json(),
+        ]
+    }
+
+    #[test]
+    fn registered_session_with_wake_ref_receives_a_metadata_only_wake_frame() {
+        let (path, key) = enrolled_db("wake-tcp", 20, 200);
+        let mut state = ConnectorState::new();
+        let (listener, address) = wake_listener();
+        let wake_ref = format!("notify-tcp://{address}");
+        dispatch_for_key(
+            &wake_register_request("sess-wake", "chan-wake", &wake_ref),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register with wake_ref");
+
+        let item = sample_item("inbox:wake:01", "Private summary.");
+
+        // Fan out through the *pump's* registry, exactly as the receive path
+        // does after a changed admit. `ConnectorState::new` shares ONE registry
+        // between the IPC side and the pumps — the live-wake defect was a
+        // second registry inside ProjectSessions that never saw IPC
+        // registrations, so no wake ever fired in production.
+        let pump_registry = state.sessions.channels().clone();
+        pump_registry.push("loam", std::slice::from_ref(&item), SNAPSHOT_CAPACITY);
+        wake_all(&pump_registry, "loam", Some("event-id-42"));
+
+        let frame = accept_wake_frame(&listener);
+        let parsed = crate::json::parse(&frame).expect("wake frame is valid JSON");
+        assert_eq!(
+            parsed.get("kind").and_then(crate::json::Value::as_str),
+            Some("loam-wake")
+        );
+        assert_eq!(
+            parsed.get("project").and_then(crate::json::Value::as_str),
+            Some("loam")
+        );
+        assert_eq!(
+            parsed.get("hint").and_then(crate::json::Value::as_str),
+            Some("event-id-42")
+        );
+        for field in item_render_fields(&item) {
+            assert!(
+                !frame.contains(&field),
+                "the wake frame must not carry item content, found {field:?}: {frame}"
+            );
+        }
+        assert!(
+            !frame.contains("summary") && !frame.contains("principal"),
+            "no sender-content keys may ride the wake frame: {frame}"
+        );
+    }
+
+    #[test]
+    fn an_ipc_registration_is_seen_by_the_pump_registry() {
+        // The live-wake regression: `ConnectorState::new` must hand the pumps
+        // the SAME registry the IPC side writes to. Before the fix, a second
+        // registry inside `ProjectSessions` made `wake_all` fire zero connects
+        // no matter how many sessions registered.
+        let (path, key) = enrolled_db("wake-shared", 21, 210);
+        let mut state = ConnectorState::new();
+        let (listener, address) = wake_listener();
+        let wake_ref = format!("notify-tcp://{address}");
+        dispatch_for_key(
+            &wake_register_request("sess-shared", "chan-shared", &wake_ref),
+            &key,
+            &path,
+            &mut state,
+        )
+        .expect("register with wake_ref");
+
+        // The pump side is `state.sessions.channels()`; a registration made
+        // through the IPC side (`state.channels`) must be visible there.
+        assert!(
+            state.sessions.channels().contains("sess-shared"),
+            "an IPC registration must be visible to the pump registry"
+        );
+        assert_eq!(state.sessions.channels().len(), 1);
+
+        // And a fanout driven through the pump side must fire the connect.
+        wake_all(state.sessions.channels(), "loam", Some("event-id-43"));
+        let frame = accept_wake_frame(&listener);
+        assert!(
+            frame.contains("loam-wake"),
+            "the pump-side fanout must reach the registered wake target: {frame}"
+        );
+    }
+
+    #[test]
+    fn session_without_wake_ref_produces_no_wake() {
+        let channels = ChannelRegistry::new();
+        let (listener, address) = wake_listener();
+        // Register without a wake_ref; a plain channel is the mailbox-only case.
+        channels.register(InjectChannel {
+            session_id: "sess-plain".into(),
+            project_id: "loam".into(),
+            channel_ref: Some("chan-plain".into()),
+            wake_ref: None,
+        });
+        // A second session has a wake_ref, so a wake *would* fire if the plain
+        // one's absence were mis-read.
+        channels.register(InjectChannel {
+            session_id: "sess-wakey".into(),
+            project_id: "loam".into(),
+            channel_ref: Some("chan-wakey".into()),
+            wake_ref: Some(format!("notify-tcp://{address}")),
+        });
+
+        channels.push(
+            "loam",
+            &[sample_item("inbox:wake:02", "Plain.")],
+            SNAPSHOT_CAPACITY,
+        );
+        wake_all(&channels, "loam", None);
+
+        // Only the wake_ref-bearing session connects.
+        let frame = accept_wake_frame(&listener);
+        assert!(
+            !frame.is_empty(),
+            "the wake_ref session must still be woken"
+        );
+    }
+
+    #[test]
+    fn wake_to_a_dead_port_never_blocks_or_fails_the_push() {
+        let channels = ChannelRegistry::new();
+        // An address nothing listens on: connect must fail fast, and the error
+        // must be swallowed — the pump loop keeps going either way.
+        channels.register(InjectChannel {
+            session_id: "sess-dead".into(),
+            project_id: "loam".into(),
+            channel_ref: Some("chan-dead".into()),
+            wake_ref: Some("notify-tcp://127.0.0.1:1".into()),
+        });
+
+        let item = sample_item("inbox:wake:03", "Still stored.");
+        channels.push("loam", std::slice::from_ref(&item), SNAPSHOT_CAPACITY);
+        // No panic, no hang: wake_all returns normally.
+        wake_all(&channels, "loam", Some("hint-dead"));
+
+        // And the mailbox still holds the item for the next poll.
+        let drained = channels.poll("sess-dead").expect("registered");
+        assert_eq!(drained.len(), 1);
+    }
+
+    #[test]
+    fn two_sessions_with_wake_refs_both_get_woken() {
+        let channels = ChannelRegistry::new();
+        let (listener_a, address_a) = wake_listener();
+        let (listener_b, address_b) = wake_listener();
+        channels.register(InjectChannel {
+            session_id: "sess-a".into(),
+            project_id: "loam".into(),
+            channel_ref: Some("chan-a".into()),
+            wake_ref: Some(format!("notify-tcp://{address_a}")),
+        });
+        channels.register(InjectChannel {
+            session_id: "sess-b".into(),
+            project_id: "loam".into(),
+            channel_ref: Some("chan-b".into()),
+            wake_ref: Some(format!("notify-tcp://{address_b}")),
+        });
+
+        channels.push(
+            "loam",
+            &[sample_item("inbox:wake:04", "Both woken.")],
+            SNAPSHOT_CAPACITY,
+        );
+        wake_all(&channels, "loam", Some("hint-both"));
+
+        let frame_a = accept_wake_frame(&listener_a);
+        let frame_b = accept_wake_frame(&listener_b);
+        assert!(frame_a.contains("loam-wake"));
+        assert!(frame_b.contains("loam-wake"));
+    }
+
+    #[test]
+    fn an_unknown_wake_scheme_is_ignored_silently() {
+        let channels = ChannelRegistry::new();
+        // A wake_ref the connector does not understand: skipped silently, and
+        // the mailbox still holds the item for the next poll.
+        channels.register(InjectChannel {
+            session_id: "sess-odd".into(),
+            project_id: "loam".into(),
+            channel_ref: Some("chan-odd".into()),
+            wake_ref: Some("telepathy://session-1".into()),
+        });
+        channels.push(
+            "loam",
+            &[sample_item("inbox:wake:05", "Odd.")],
+            SNAPSHOT_CAPACITY,
+        );
+        // Must not panic, must not hang, must not propagate an error.
+        wake_all(&channels, "loam", Some("hint-odd"));
+        let drained = channels.poll("sess-odd").expect("registered");
+        assert_eq!(drained.len(), 1, "mailbox survives an unknown wake scheme");
+        assert_eq!(channels.len(), 1, "the session stays registered");
+    }
+
+    #[test]
+    fn registration_accepts_mailbox_only_without_channel_or_wake_ref() {
+        let (path, key) = enrolled_db("wake-mailbox-only", 21, 210);
+        let mut state = ConnectorState::new();
+        // Neither ref present: mailbox-only registration, valid per the plan.
+        let request = Request {
+            request_id: "r-mb".into(),
+            workspace: "/w/proj".into(),
+            operation: Operation::SessionRegisterInject,
+            payload: crate::json::Value::Object(vec![(
+                "session_id".into(),
+                crate::json::Value::String("sess-mb".into()),
+            )]),
+        };
+        let result = dispatch_for_key(&request, &key, &path, &mut state).expect("register");
+        assert!(result.to_json().contains("inject-channel-registered"));
+        assert!(state.channels.contains("sess-mb"));
+        // And the channel is pollable: a mailbox-only session still receives
+        // items.
+        state.channels.push(
+            "loam",
+            &[sample_item("inbox:wake:07", "Mailbox.")],
+            SNAPSHOT_CAPACITY,
+        );
+        let drained = state.channels.poll("sess-mb").expect("registered");
+        assert_eq!(drained.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+    use crate::enrollment::{
+        PhysicalWorkspace, PlatformIdentity, ValidatedEnrollment, ValidatedRemote,
+    };
+    use crate::service::{
+        CommandRunner, ManagerCommand, ManagerOutput, ServiceContext, ServiceError,
+    };
+    use std::cell::RefCell;
+
+    /// A recording service runner that can be made to fail when a command line
+    /// contains a substring (e.g. "enable" to fail activation).
+    struct FakeService {
+        fail_on: Option<String>,
+        recorded: RefCell<Vec<String>>,
+    }
+
+    impl FakeService {
+        fn ok() -> Self {
+            FakeService {
+                fail_on: None,
+                recorded: RefCell::new(Vec::new()),
+            }
+        }
+        fn failing(substr: &str) -> Self {
+            FakeService {
+                fail_on: Some(substr.to_owned()),
+                recorded: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl FakeService {
+        /// Case-insensitive, because the three managers do not agree on case:
+        /// `systemctl --user enable --now` and `launchctl enable` are lowercase,
+        /// `schtasks /Change /ENABLE` is not.
+        fn recorded_any(&self, mark: &str) -> bool {
+            let mark = mark.to_ascii_lowercase();
+            self.recorded
+                .borrow()
+                .iter()
+                .any(|line| line.to_ascii_lowercase().contains(&mark))
+        }
+    }
+
+    /// Activation and deactivation are spelled differently per manager, so the
+    /// tests match the word the *current* platform's commands actually use:
+    /// systemd `enable --now`/`disable --now`, launchctl `bootstrap`+`enable`/
+    /// `bootout`, Task Scheduler `/Change /ENABLE`/`/Change /DISABLE`.
+    const ENABLE_MARK: &str = "enable";
+    #[cfg(target_os = "macos")]
+    const DISABLE_MARK: &str = "bootout";
+    #[cfg(not(target_os = "macos"))]
+    const DISABLE_MARK: &str = "disable";
+
+    impl CommandRunner for FakeService {
+        fn run(&self, command: &ManagerCommand) -> Result<ManagerOutput, ServiceError> {
+            let line = format!("{} {}", command.program, command.args.join(" "));
+            self.recorded.borrow_mut().push(line.clone());
+            if let Some(fail) = &self.fail_on {
+                if line
+                    .to_ascii_lowercase()
+                    .contains(&fail.to_ascii_lowercase())
+                {
+                    return Err(ServiceError::ManagerFailed { code: 1 });
+                }
+            }
+            Ok(ManagerOutput::ok())
+        }
+    }
+
+    fn identity() -> SessionIdentity {
+        SessionIdentity {
+            principal_id: "employee-184".into(),
+            agent_id: "agent-72".into(),
+            instance_id: "instance-01".into(),
+            display_name: None,
+            allowed_claims: vec![],
+        }
+    }
+
+    fn enrolled(device: u64, inode: u64, commit: &str) -> ValidatedEnrollment {
+        ValidatedEnrollment {
+            org_id: "acme".into(),
+            project_id: "loam".into(),
+            repository_id: "repo-2F8".into(),
+            broker_profile: "acme-prod".into(),
+            broker_endpoint: "mqtts://broker:8883".into(),
+            tls_server_name: "broker".into(),
+            ca_ref: None,
+            commit: commit.into(),
+            remotes: vec![ValidatedRemote {
+                name: "origin".into(),
+                url_digest: "a".repeat(64),
+                allowed_refs: vec!["refs/heads/main".into()],
+            }],
+            workspace: PhysicalWorkspace {
+                display_path: "/w/proj".into(),
+                identity: PlatformIdentity::Unix { device, inode },
+            },
+        }
+    }
+
+    fn setup(label: &str) -> (std::path::PathBuf, ServiceContext) {
+        // The global root is created explicitly; the instance id is a test
+        // constant (the certificate is the identity source in production).
+        let root = crate::enrollment::temp_global_root(label);
+        let instance_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned();
+        let ctx = ServiceContext {
+            global_root: root.clone(),
+            instance_id,
+            runtime_path: std::env::temp_dir().join("loam-rt").join("loam"),
+            // A temp systemd user dir, so the Linux symlink step never touches
+            // a real user config in tests.
+            systemd_user_dir: Some(std::env::temp_dir().join(format!(
+                    "loam-connect-{label}-systemd-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))),
+        };
+        (root.join("loam.sqlite3"), ctx)
+    }
+
+    fn deadline() -> Duration {
+        // Stub-transport connects resolve instantly, so this only ever bounds a
+        // pathologically slow runner — keep it generous for CI headroom.
+        Duration::from_secs(10)
+    }
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-08T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    const COMMIT_A: &str = "0123456789abcdef0123456789abcdef01234567";
+    const COMMIT_B: &str = "ffffffffffffffffffffffffffffffffffffffff";
+
+    #[test]
+    fn happy_path_probes_commits_and_activates() {
+        let (db, ctx) = setup("happy");
+        let mut transport = StubTransport::healthy(identity());
+        let service = FakeService::ok();
+        let outcome = orchestrate_from_validated(
+            &enrolled(1, 10, COMMIT_A),
+            &mut transport,
+            &service,
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        )
+        .expect("connect");
+        assert!(matches!(outcome, ConnectOutcome::Connected { .. }));
+        // Enrollment persisted.
+        let connection = crate::enrollment::open_readonly(&db).unwrap().unwrap();
+        assert_eq!(
+            crate::enrollment::list_enrollments(&connection)
+                .unwrap()
+                .len(),
+            1
+        );
+        // The service was enabled/started.
+        assert!(service.recorded_any(ENABLE_MARK));
+    }
+
+    #[test]
+    fn probe_failure_leaves_no_enrollment_and_no_activation() {
+        let (db, ctx) = setup("probe-fail");
+        let mut transport = StubTransport {
+            deny_auth: true,
+            ..StubTransport::healthy(identity())
+        };
+        let service = FakeService::ok();
+        let outcome = orchestrate_from_validated(
+            &enrolled(2, 20, COMMIT_A),
+            &mut transport,
+            &service,
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        );
+        assert!(matches!(outcome, Err(ConnectError::Probe(_))));
+        // No database row, no activation command.
+        assert!(crate::enrollment::open_readonly(&db).unwrap().is_none());
+        assert!(service.recorded.borrow().is_empty());
+    }
+
+    #[test]
+    fn activation_failure_rolls_the_enrollment_back() {
+        let (db, ctx) = setup("activate-fail");
+        let mut transport = StubTransport::healthy(identity());
+        let service = FakeService::failing(ENABLE_MARK); // enable_start fails
+        let outcome = orchestrate_from_validated(
+            &enrolled(3, 30, COMMIT_A),
+            &mut transport,
+            &service,
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        );
+        assert!(matches!(outcome, Err(ConnectError::ActivationFailed(_))));
+        // The row was removed (registry now empty) and the service was disabled.
+        let connection = crate::enrollment::open_readonly(&db).unwrap().unwrap();
+        assert!(crate::enrollment::list_enrollments(&connection)
+            .unwrap()
+            .is_empty());
+        assert!(service.recorded_any(DISABLE_MARK));
+    }
+
+    #[test]
+    fn repeated_identical_connect_repairs_without_reprobe() {
+        let (db, ctx) = setup("idempotent");
+        // First connect.
+        let mut transport = StubTransport::healthy(identity());
+        orchestrate_from_validated(
+            &enrolled(4, 40, COMMIT_A),
+            &mut transport,
+            &FakeService::ok(),
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        )
+        .expect("first connect");
+        // Second identical connect: a fresh transport that would FAIL a probe,
+        // proving no re-probe happens for a healthy existing enrollment.
+        let mut no_probe = StubTransport {
+            deny_auth: true,
+            ..StubTransport::healthy(identity())
+        };
+        let service = FakeService::ok();
+        let outcome = orchestrate_from_validated(
+            &enrolled(4, 40, COMMIT_A),
+            &mut no_probe,
+            &service,
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        )
+        .expect("idempotent connect");
+        assert_eq!(outcome, ConnectOutcome::AlreadyConnected);
+    }
+
+    #[test]
+    fn a_changed_binding_for_the_same_workspace_is_a_conflict() {
+        let (db, ctx) = setup("conflict");
+        orchestrate_from_validated(
+            &enrolled(5, 50, COMMIT_A),
+            &mut StubTransport::healthy(identity()),
+            &FakeService::ok(),
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        )
+        .expect("first connect");
+        // Same physical identity, different commit -> conflict, no re-probe.
+        let outcome = orchestrate_from_validated(
+            &enrolled(5, 50, COMMIT_B),
+            &mut StubTransport {
+                deny_auth: true,
+                ..StubTransport::healthy(identity())
+            },
+            &FakeService::ok(),
+            &ctx,
+            &db,
+            &ValidationConfig::default(),
+            deadline(),
+            now(),
+        );
+        assert!(matches!(outcome, Err(ConnectError::EnrollmentConflict)));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::enrollment::{
+        CapabilityRecord, PhysicalWorkspace, PlatformIdentity, ValidatedEnrollment, ValidatedRemote,
+    };
+    use crate::service::{
+        CommandRunner, ManagerCommand, ManagerOutput, ServiceContext, ServiceError,
+    };
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    /// A recording service runner. `failing_all` makes every manager command fail
+    /// (fail substring `""` matches any line), so the degraded-lifecycle path is
+    /// exercised without depending on a platform-specific command string.
+    struct FakeService {
+        fail_all: bool,
+        recorded: RefCell<Vec<String>>,
+    }
+    impl FakeService {
+        fn ok() -> Self {
+            FakeService {
+                fail_all: false,
+                recorded: RefCell::new(Vec::new()),
+            }
+        }
+        fn failing_all() -> Self {
+            FakeService {
+                fail_all: true,
+                recorded: RefCell::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.recorded.borrow().clone()
+        }
+    }
+    impl CommandRunner for FakeService {
+        fn run(&self, command: &ManagerCommand) -> Result<ManagerOutput, ServiceError> {
+            let line = format!("{} {}", command.program, command.args.join(" "));
+            self.recorded.borrow_mut().push(line.clone());
+            if self.fail_all {
+                return Err(ServiceError::ManagerFailed { code: 1 });
+            }
+            Ok(ManagerOutput::ok())
+        }
+    }
+
+    fn caps() -> CapabilityRecord {
+        CapabilityRecord {
+            authentication: true,
+            publish: true,
+            subscribe: true,
+            self_receive: true,
+            verified_at: "2026-08-08T10:00:00Z".into(),
+        }
+    }
+
+    fn synthetic(project: &str, device: u64, inode: u64) -> ValidatedEnrollment {
+        ValidatedEnrollment {
+            org_id: "acme".into(),
+            project_id: project.into(),
+            repository_id: "repo".into(),
+            broker_profile: "acme-prod".into(),
+            broker_endpoint: "mqtts://h:8883".into(),
+            tls_server_name: "h".into(),
+            ca_ref: None,
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            remotes: vec![ValidatedRemote {
+                name: "origin".into(),
+                url_digest: "a".repeat(64),
+                allowed_refs: vec!["refs/heads/main".into()],
+            }],
+            workspace: PhysicalWorkspace {
+                display_path: format!("/w/{project}"),
+                identity: PlatformIdentity::Unix { device, inode },
+            },
+        }
+    }
+
+    fn setup(label: &str) -> (PathBuf, ServiceContext) {
+        // The global root is created explicitly; the instance id is a test
+        // constant (the certificate is the identity source in production).
+        let root = crate::enrollment::temp_global_root(label);
+        let instance_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned();
+        let ctx = ServiceContext {
+            global_root: root.clone(),
+            instance_id,
+            runtime_path: std::env::temp_dir().join("loam-rt").join("loam"),
+            // A temp systemd user dir, so the Linux symlink step never touches
+            // a real user config in tests.
+            systemd_user_dir: Some(std::env::temp_dir().join(format!(
+                    "loam-lifecycle-{label}-systemd-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))),
+        };
+        (root.join("loam.sqlite3"), ctx)
+    }
+
+    fn insert(db: &Path, enrollment: &ValidatedEnrollment) {
+        let mut connection = crate::enrollment::open_writable(db).unwrap();
+        crate::enrollment::insert_enrollment(
+            &mut connection,
+            enrollment,
+            "instance-under-test",
+            &caps(),
+            "t",
+        )
+        .unwrap();
+    }
+
+    fn key_of(enrollment: &ValidatedEnrollment) -> String {
+        crate::enrollment::identity_key(&enrollment.workspace)
+    }
+
+    #[test]
+    fn intermediate_disconnect_removes_one_and_preserves_the_others() {
+        let (db, ctx) = setup("intermediate");
+        let a = synthetic("proj-a", 1, 10);
+        let b = synthetic("proj-b", 1, 11);
+        let c = synthetic("proj-c", 1, 12);
+        insert(&db, &a);
+        insert(&db, &b);
+        insert(&db, &c);
+
+        let service = FakeService::ok();
+        let report =
+            disconnect_by_key(&db, &key_of(&b), Ok(()), &service, &ctx).expect("disconnect");
+
+        assert_eq!(report.local, LocalOutcome::Removed);
+        assert_eq!(
+            report.lifecycle,
+            LifecycleOutcome::Preserved { remaining: 2 }
+        );
+        // Preserving the service means no stop/disable was issued.
+        assert!(
+            service.calls().is_empty(),
+            "an intermediate disconnect must not touch the manager: {:?}",
+            service.calls()
+        );
+        // The other two projects survive.
+        let read = crate::enrollment::open_readonly(&db).unwrap().unwrap();
+        assert!(crate::enrollment::lookup(&read, &key_of(&a))
+            .unwrap()
+            .is_some());
+        assert!(crate::enrollment::lookup(&read, &key_of(&c))
+            .unwrap()
+            .is_some());
+        assert!(crate::enrollment::lookup(&read, &key_of(&b))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn final_disconnect_removes_and_stops_the_service() {
+        let (db, ctx) = setup("final");
+        let only = synthetic("proj-only", 2, 20);
+        insert(&db, &only);
+
+        let service = FakeService::ok();
+        let report =
+            disconnect_by_key(&db, &key_of(&only), Ok(()), &service, &ctx).expect("disconnect");
+
+        assert_eq!(report.local, LocalOutcome::Removed);
+        assert_eq!(report.lifecycle, LifecycleOutcome::StoppedDisabled);
+        // The registry is empty and the manager stop/disable was attempted.
+        assert!(
+            !service.calls().is_empty(),
+            "final disconnect stops the service"
+        );
+        let read = crate::enrollment::open_readonly(&db).unwrap().unwrap();
+        assert!(crate::enrollment::list_enrollments(&read)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn final_disconnect_stops_even_when_broker_cleanup_fails() {
+        let (db, ctx) = setup("broker-down");
+        let only = synthetic("proj-only", 3, 30);
+        insert(&db, &only);
+
+        let service = FakeService::ok();
+        // Broker tombstone failed (broker down / credential revoked) — local
+        // removal and service stop proceed regardless, and the failure is
+        // reported separately.
+        let report = disconnect_by_key(
+            &db,
+            &key_of(&only),
+            Err("broker unreachable".into()),
+            &service,
+            &ctx,
+        )
+        .expect("disconnect");
+
+        assert_eq!(report.local, LocalOutcome::Removed);
+        assert_eq!(report.lifecycle, LifecycleOutcome::StoppedDisabled);
+        assert_eq!(
+            report.broker_cleanup,
+            CleanupOutcome::Failed("broker unreachable".into())
+        );
+    }
+
+    #[test]
+    fn manager_failure_on_final_disconnect_is_a_degraded_result_not_hidden_success() {
+        let (db, ctx) = setup("degraded");
+        let only = synthetic("proj-only", 4, 40);
+        insert(&db, &only);
+
+        let service = FakeService::failing_all();
+        let report =
+            disconnect_by_key(&db, &key_of(&only), Ok(()), &service, &ctx).expect("disconnect");
+
+        // Local removal still succeeded; the manager failure is surfaced.
+        assert_eq!(report.local, LocalOutcome::Removed);
+        assert!(matches!(
+            report.lifecycle,
+            LifecycleOutcome::ManagerDegraded(_)
+        ));
+        let read = crate::enrollment::open_readonly(&db).unwrap().unwrap();
+        assert!(crate::enrollment::list_enrollments(&read)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn repeated_disconnect_repairs_residual_manager_state() {
+        let (db, ctx) = setup("repair");
+        let only = synthetic("proj-only", 5, 50);
+        insert(&db, &only);
+        // First disconnect empties the registry.
+        disconnect_by_key(&db, &key_of(&only), Ok(()), &FakeService::ok(), &ctx)
+            .expect("first disconnect");
+
+        // A repeated disconnect of the same (now-absent) workspace: nothing to
+        // remove, but the empty registry is reconciled — the manager is
+        // stopped/disabled again to repair any residual drift, without recreating
+        // an enrollment or contacting the broker.
+        let service = FakeService::ok();
+        let report =
+            disconnect_by_key(&db, &key_of(&only), Ok(()), &service, &ctx).expect("repeat");
+        assert_eq!(report.local, LocalOutcome::AlreadyAbsent);
+        assert_eq!(report.lifecycle, LifecycleOutcome::StoppedDisabled);
+        assert!(!service.calls().is_empty(), "repair reconciles the manager");
+    }
+
+    #[test]
+    fn disconnect_on_a_dormant_machine_creates_no_database_and_touches_no_manager() {
+        let (db, ctx) = setup("dormant");
+        // No enrollment ever existed: the store is absent.
+        assert!(!db.exists());
+        let service = FakeService::ok();
+        let report =
+            disconnect_by_key(&db, "unix:9:9", Ok(()), &service, &ctx).expect("disconnect");
+        assert_eq!(report.local, LocalOutcome::AlreadyAbsent);
+        assert_eq!(report.lifecycle, LifecycleOutcome::Untouched);
+        assert!(service.calls().is_empty(), "a dormant disconnect is inert");
+        // A disconnect read never creates the database.
+        assert!(!db.exists(), "disconnect must not create the store");
+    }
+
+    #[test]
+    fn status_on_a_missing_registry_is_empty_and_creates_no_database() {
+        let (db, ctx) = setup("status-missing");
+        assert!(!db.exists());
+        let service = FakeService::ok();
+        let report = status_report(&db, &service, &ctx, None);
+        let text = report.to_json();
+        assert!(text.contains("\"enrollments\":[]"));
+        // No aggregate readiness claim, and the read created no database.
+        assert!(!text.contains("\"connected\"") && !text.contains("\"ready\""));
+        assert!(!db.exists(), "status must not create the store");
+    }
+
+    #[test]
+    fn status_reports_separate_enrollment_and_verification_fields() {
+        let (db, ctx) = setup("status-enrolled");
+        let a = synthetic("proj-a", 6, 60);
+        let b = synthetic("proj-b", 6, 61);
+        insert(&db, &a);
+        insert(&db, &b);
+
+        let service = FakeService::ok();
+        let report = status_report(&db, &service, &ctx, None);
+        let text = report.to_json();
+        // Two enrollments, each with its own historical verification, plus the
+        // separate definition/process/broker fields — no aggregate boolean.
+        assert!(text.contains("proj-a") && text.contains("proj-b"));
+        assert!(text.contains("\"verification\""));
+        assert!(text.contains("\"definition\""));
+        assert!(text.contains("\"process\""));
+        assert!(text.contains("\"session_observed\":false"));
+        assert!(!text.contains("\"connected\"") && !text.contains("\"ready\""));
+
+        // A workspace filter narrows to one enrollment.
+        let one = status_report(&db, &service, &ctx, Some(&key_of(&a)));
+        let one_text = one.to_json();
+        assert!(one_text.contains("proj-a") && !one_text.contains("proj-b"));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    //! The bounded in-memory snapshot contract.
+    //!
+    //! Every case drives real frames through the `DeliveryProcessor` — the
+    //! single validator, deduplicator, and expiry tracker — and then reads the
+    //! store back, so "exactly one logical item per message" is proven against
+    //! the actual dedupe path rather than a hand-written stub of it.
+
+    use super::*;
+    use crate::json::Value;
+    use crate::transport::DeliveryProcessor;
+
+    const CASES: &str = include_str!("../tests/fixtures/mqtt/harness-snapshot-cases.json");
+    const SENDER_INSTANCE: &str = "instance-01";
+    const SENDER_PRINCIPAL: &str = "employee-184";
+    const RECIPIENT_INSTANCE: &str = "instance-02";
+
+    fn base_time() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-24T14:20:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn number(value: &Value, key: &str) -> Option<i64> {
+        match value.get(key) {
+            Some(Value::Number(literal)) => literal.parse().ok(),
+            _ => None,
+        }
+    }
+
+    fn flag(value: &Value, key: &str) -> bool {
+        matches!(value.get(key), Some(Value::Bool(true)))
+    }
+
+    /// One frame's topic and wire bytes. An empty body is a tombstone.
+    fn frame(frame: &Value, org: &str, project: &str, now: DateTime<Utc>) -> (String, Vec<u8>) {
+        let kind = frame.get("kind").and_then(Value::as_str).expect("kind");
+        let expires =
+            now + chrono::Duration::seconds(number(frame, "expires_in_seconds").unwrap_or(86_400));
+        let expires = expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let summary = frame
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        match kind {
+            "inbox" => {
+                let message_id = frame
+                    .get("message_id")
+                    .and_then(Value::as_str)
+                    .expect("message_id");
+                let topic = format!(
+                    "loam/v1/{org}/{project}/inbox/instance/{RECIPIENT_INSTANCE}/{SENDER_INSTANCE}/{message_id}"
+                );
+                let body = envelope_json(
+                    message_id,
+                    "io.loam.message",
+                    "urn:loam:schema:message:1",
+                    &time,
+                    &expires,
+                    &summary,
+                    project,
+                    org,
+                    Value::Array(vec![Value::Object(vec![
+                        ("kind".into(), Value::String("instance".into())),
+                        ("id".into(), Value::String(RECIPIENT_INSTANCE.into())),
+                    ])]),
+                    Value::Object(vec![("class".into(), Value::String("inbox".into()))]),
+                    Value::Object(vec![
+                        ("action".into(), Value::String("collaboration.note".into())),
+                        ("params".into(), Value::Object(vec![])),
+                        ("response_status".into(), Value::Null),
+                    ]),
+                );
+                (topic, body.into_bytes())
+            }
+            "state" => {
+                let key = frame
+                    .get("state_key")
+                    .and_then(Value::as_str)
+                    .expect("state_key");
+                let topic = format!("loam/v1/{org}/{project}/state/{SENDER_INSTANCE}/{key}");
+                if flag(frame, "tombstone") {
+                    // An empty MQTT payload is the tombstone: the transport resolves it
+                    // and the store must drop the same logical item.
+                    return (topic, Vec::new());
+                }
+                let revision = frame
+                    .get("revision")
+                    .and_then(Value::as_str)
+                    .unwrap_or("1")
+                    .to_owned();
+                let body = envelope_json(
+                    "01K6Q6ESWMT48TPB",
+                    "io.loam.work.state",
+                    "urn:loam:schema:work-state:1",
+                    &time,
+                    &expires,
+                    &summary,
+                    project,
+                    org,
+                    Value::Array(vec![Value::Object(vec![
+                        ("kind".into(), Value::String("project".into())),
+                        ("id".into(), Value::String(project.to_owned())),
+                    ])]),
+                    Value::Object(vec![
+                        ("class".into(), Value::String("latest-state".into())),
+                        ("key".into(), Value::String(key.to_owned())),
+                        ("revision".into(), Value::Number(revision)),
+                    ]),
+                    Value::Object(vec![
+                        ("state".into(), Value::String("active".into())),
+                        ("acceptance".into(), Value::Object(vec![])),
+                        ("verification".into(), Value::Array(vec![])),
+                    ]),
+                );
+                (topic, body.into_bytes())
+            }
+            other => panic!("unknown frame kind `{other}`"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn envelope_json(
+        id: &str,
+        message_type: &str,
+        dataschema: &str,
+        time: &str,
+        expires: &str,
+        summary: &str,
+        project: &str,
+        org: &str,
+        to: Value,
+        delivery: Value,
+        payload: Value,
+    ) -> String {
+        Value::Object(vec![
+            ("specversion".into(), Value::String("1.0".into())),
+            ("id".into(), Value::String(id.to_owned())),
+            (
+                "source".into(),
+                Value::String(format!("urn:loam:instance:{SENDER_INSTANCE}")),
+            ),
+            ("type".into(), Value::String(message_type.to_owned())),
+            ("time".into(), Value::String(time.to_owned())),
+            (
+                "datacontenttype".into(),
+                Value::String("application/json".into()),
+            ),
+            ("dataschema".into(), Value::String(dataschema.to_owned())),
+            (
+                "data".into(),
+                Value::Object(vec![
+                    ("intent".into(), Value::String("inform".into())),
+                    (
+                        "from".into(),
+                        Value::Object(vec![
+                            (
+                                "principal_id".into(),
+                                Value::String(SENDER_PRINCIPAL.into()),
+                            ),
+                            ("agent_id".into(), Value::String("agent-72".into())),
+                            ("instance_id".into(), Value::String(SENDER_INSTANCE.into())),
+                        ]),
+                    ),
+                    ("to".into(), to),
+                    ("delivery".into(), delivery),
+                    (
+                        "thread".into(),
+                        Value::Object(vec![
+                            ("id".into(), Value::String("thread-01K6Q5".into())),
+                            ("correlation_id".into(), Value::String(id.to_owned())),
+                            ("causation_id".into(), Value::Null),
+                        ]),
+                    ),
+                    (
+                        "context".into(),
+                        Value::Object(vec![
+                            ("org_id".into(), Value::String(org.to_owned())),
+                            ("project_id".into(), Value::String(project.to_owned())),
+                            ("repository_id".into(), Value::String("repo-2F8".into())),
+                            (
+                                "git".into(),
+                                Value::Object(vec![
+                                    (
+                                        "base_oid".into(),
+                                        Value::String(
+                                            "84be000000000000000000000000000000000002".into(),
+                                        ),
+                                    ),
+                                    (
+                                        "plan_oid".into(),
+                                        Value::String(
+                                            "61af000000000000000000000000000000000001".into(),
+                                        ),
+                                    ),
+                                ]),
+                            ),
+                            ("artifacts".into(), Value::Array(vec![])),
+                        ]),
+                    ),
+                    ("expires_at".into(), Value::String(expires.to_owned())),
+                    ("summary".into(), Value::String(summary.to_owned())),
+                    ("payload".into(), payload),
+                ]),
+            ),
+        ])
+        .to_json()
+    }
+
+    fn keys(items: &[SnapshotItem]) -> Vec<String> {
+        items.iter().map(|item| item.key.clone()).collect()
+    }
+
+    #[test]
+    fn the_snapshot_store_honors_every_recorded_case() {
+        let cases = crate::json::parse(CASES).expect("fixture parses");
+        let org = cases.get("org_id").and_then(Value::as_str).unwrap();
+        let project = cases.get("project_id").and_then(Value::as_str).unwrap();
+        let other_project = cases
+            .get("other_project_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let now = base_time();
+
+        for case in cases.get("cases").and_then(Value::as_array).unwrap() {
+            let name = case.get("name").and_then(Value::as_str).unwrap();
+            let capacity = number(case, "capacity").unwrap() as usize;
+            let mut store = SnapshotStore::new(capacity).expect("capacity is non-zero");
+            // Generously sized so the store's own capacity, not the processor's
+            // tracking window, is what the overflow case exercises.
+            let mut processor =
+                DeliveryProcessor::new(ValidationConfig::default(), 64, 64, 64).expect("processor");
+            let claims = [SENDER_PRINCIPAL];
+            let origins = [SENDER_INSTANCE];
+            let identity = AuthenticatedTransportPrincipal::new(
+                AuthenticatedPrincipal::new(SENDER_PRINCIPAL, &claims),
+                &origins,
+            );
+
+            for value in case.get("frames").and_then(Value::as_array).unwrap() {
+                let scope = if flag(value, "other_project") {
+                    other_project
+                } else {
+                    project
+                };
+                let (topic, bytes) = frame(value, org, scope, now);
+                let outcome = processor
+                    .receive(&topic, &bytes, &identity, now)
+                    .unwrap_or_else(|error| panic!("{name}: frame rejected: {error:?}"));
+                store.admit(&topic, &outcome, Publication::Unverified);
+            }
+
+            let read_at =
+                now + chrono::Duration::seconds(number(case, "read_after_seconds").unwrap_or(0));
+            let expected: Vec<String> = case
+                .get("expect")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_owned())
+                .collect();
+
+            // Keys alone would not catch an in-place *content* update, so a case
+            // may also pin the served summaries.
+            let expected_summaries: Option<Vec<String>> = case
+                .get("expect_summaries")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| value.as_str().unwrap().to_owned())
+                        .collect()
+                });
+
+            // A read never consumes: an unresolved item must still be there on
+            // the next hook, so repeated reads must agree.
+            for round in 0..number(case, "reads").unwrap_or(1) {
+                let items = store.snapshot(project, read_at);
+                assert_eq!(
+                    keys(&items),
+                    expected,
+                    "{name}: snapshot mismatch on read {round}"
+                );
+                if let Some(summaries) = &expected_summaries {
+                    assert_eq!(
+                        &items
+                            .iter()
+                            .map(|item| item.summary.clone())
+                            .collect::<Vec<_>>(),
+                        summaries,
+                        "{name}: served summary mismatch on read {round}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_capacity_store_is_refused() {
+        assert!(SnapshotStore::new(0).is_err());
+    }
+
+    #[test]
+    fn a_restarted_connector_serves_an_empty_snapshot() {
+        // Retained state and the inbox re-deliver on reconnect, so the correct
+        // post-restart snapshot is empty rather than recovered from disk.
+        let mut before = SnapshotStore::new(4).expect("capacity");
+        let now = base_time();
+        let (topic, bytes) = frame(
+            &crate::json::parse(
+                r#"{"kind":"inbox","message_id":"01K6Q6ESWMT48TPD","summary":"Held."}"#,
+            )
+            .unwrap(),
+            "org-3A1",
+            "project-7M3",
+            now,
+        );
+        let claims = [SENDER_PRINCIPAL];
+        let origins = [SENDER_INSTANCE];
+        let identity = AuthenticatedTransportPrincipal::new(
+            AuthenticatedPrincipal::new(SENDER_PRINCIPAL, &claims),
+            &origins,
+        );
+        let mut processor =
+            DeliveryProcessor::new(ValidationConfig::default(), 8, 8, 8).expect("processor");
+        let outcome = processor.receive(&topic, &bytes, &identity, now).unwrap();
+        assert!(before.admit(&topic, &outcome, Publication::Unverified));
+        assert_eq!(before.len("project-7M3"), 1);
+
+        drop(before);
+        let mut after = SnapshotStore::new(4).expect("capacity");
+        assert!(after.snapshot("project-7M3", now).is_empty());
+        assert!(after.is_empty());
+    }
+
+    /// One enrolled row for the attach-path tests. Only the identity key varies,
+    /// so a test that needs two distinct workspaces cannot collide by accident.
+    fn sample_row(identity_key: &str) -> crate::enrollment::EnrolledRow {
+        crate::enrollment::EnrolledRow {
+            identity_key: identity_key.into(),
+            org_id: "org-3A1".into(),
+            project_id: "project-7M3".into(),
+            repository_id: "repo-2F8".into(),
+            descriptor_digest: "d".into(),
+            display_path: "/w".into(),
+            instance_id: RECIPIENT_INSTANCE.into(),
+            broker_profile: "p".into(),
+            broker_endpoint: "mqtts://broker.example:8883".into(),
+            tls_server_name: "broker.example".into(),
+            ca_ref: None,
+            commit: "84be000000000000000000000000000000000001".into(),
+            capabilities: crate::enrollment::CapabilityRecord {
+                authentication: true,
+                publish: true,
+                subscribe: true,
+                self_receive: true,
+                verified_at: "2026-07-24T14:20:00Z".into(),
+            },
+            remotes: Vec::new(),
+        }
+    }
+
+    /// `code()` alone was the entire diagnosis a failed connect produced. A
+    /// probe that failed on the credentials must be able to say which input.
+    #[test]
+    fn a_failed_connect_carries_the_failing_stage_reason() {
+        let mismatch = ConnectError::Probe(ProbeError::ConfigurationFailure(
+            reason::KEY_CERT_MISMATCH.to_owned(),
+        ));
+        assert_eq!(mismatch.code(), "connect_probe_failed");
+        assert_eq!(
+            mismatch.detail(),
+            Some(reason::KEY_CERT_MISMATCH),
+            "a mismatched key/cert pair must name itself, not just the probe"
+        );
+
+        // A denied subscribe names the filter, which is the equivalent fact
+        // for that stage.
+        let denied = ConnectError::Probe(ProbeError::SubscribeDenied {
+            filter: "loam/v1/acme/widgets/#".to_owned(),
+        });
+        assert_eq!(denied.detail(), Some("loam/v1/acme/widgets/#"));
+
+        // Stages with nothing to add stay silent rather than inventing text.
+        assert_eq!(
+            ConnectError::Probe(ProbeError::AuthenticationFailed).detail(),
+            None
+        );
+        assert_eq!(ConnectError::EnrollmentConflict.detail(), None);
+    }
+
+    #[test]
+    fn the_failure_codes_are_unchanged_and_the_reasons_are_additive() {
+        // `code()` is a tested IPC contract other slices pin, so the reason is
+        // an added field and never a renamed state. An operator debugging a real
+        // deployment needs to know which of eight inputs failed; the eight do
+        // not each deserve a variant.
+        assert_eq!(SessionState::Live.code(), "live");
+        assert_eq!(SessionState::AlreadyLive.code(), "already-live");
+        assert_eq!(
+            SessionState::CredentialsUnresolved(reason::CREDENTIAL_REF_UNRESOLVED).code(),
+            "credentials-unresolved"
+        );
+        assert_eq!(
+            SessionState::NoPeerRoster(reason::ROSTER_ABSENT).code(),
+            "no-peer-roster"
+        );
+        assert_eq!(SessionState::Unreachable("x".into()).code(), "unreachable");
+
+        // Every reason is reachable and distinct: a duplicated constant would
+        // make two different failures indistinguishable to the operator.
+        let all = [
+            reason::ENDPOINT_MALFORMED,
+            reason::CREDENTIAL_REF_UNRESOLVED,
+            reason::CA_REF_BLANK,
+            reason::CA_FILE_UNREADABLE,
+            reason::CA_FILE_EMPTY,
+            reason::CA_NO_TRUSTED_CERTIFICATE,
+            reason::CERTIFICATE_MALFORMED,
+            reason::KEY_FORMAT_UNSUPPORTED,
+            reason::KEY_CERT_MISMATCH,
+            reason::IDENTITY_REQUIRED,
+            reason::CA_UNRESOLVED,
+            reason::ROSTER_ABSENT,
+            reason::ROSTER_EMPTY,
+            reason::ROSTER_NO_ORIGINS,
+            reason::ROSTER_WILDCARD,
+            reason::ROSTER_MALFORMED,
+        ];
+        let mut seen = all.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), all.len(), "reason codes must be distinct");
+
+        let row = sample_row("unix:1:9");
+        for state in [
+            SessionState::CredentialsUnresolved(reason::ENDPOINT_MALFORMED),
+            SessionState::NoPeerRoster(reason::ROSTER_WILDCARD),
+        ] {
+            let json = attach_json(&row, &state).to_json();
+            assert!(
+                json.contains(&format!(
+                    "\"reason\":\"{}\"",
+                    state.reason().expect("reason")
+                )),
+                "attach JSON must name the failed input: {json}"
+            );
+            assert!(
+                json.contains(&format!("\"session_state\":\"{}\"", state.code())),
+                "the code contract must survive alongside the reason: {json}"
+            );
+        }
+
+        // Positive control: a state with no failed input carries no reason key,
+        // so `reason` is never a decorative always-present field.
+        assert!(SessionState::Live.reason().is_none());
+        let live = attach_json(&row, &SessionState::Live).to_json();
+        assert!(!live.contains("\"reason\""), "{live}");
+    }
+
+    #[test]
+    fn an_unresolvable_attach_opens_no_session_and_names_the_input() {
+        // Driven through the real seam, and deliberately through the one input
+        // that fails *before* the secret store is consulted: a unit test must
+        // not depend on this machine's keyring, and it must never risk a
+        // desktop unlock prompt inside `cargo test`. The backend's own refusals
+        // are covered against an explicit failing backend in `provisioning`.
+        let mut sessions = ProjectSessions::new(4, ChannelRegistry::new());
+        let mut row = sample_row("unix:1:1");
+        row.broker_endpoint = "not-an-endpoint".into();
+        assert_eq!(
+            sessions.attach(&row, provision_session(&row), base_time()),
+            SessionState::CredentialsUnresolved(reason::ENDPOINT_MALFORMED)
+        );
+        assert!(!sessions.is_live(&row.project_id));
+        assert!(sessions.snapshot(&row.project_id, base_time()).is_empty());
+    }
+
+    #[test]
+    fn a_provisioned_but_rosterless_project_opens_no_session() {
+        // Credentials without a peer roster would open a session that can admit
+        // no colleague; refusing it beats a live session that hears nothing.
+        fn rosterless() -> Result<(MqttSession, PeerRoster), ProvisionFailure> {
+            let config = TransportConfig::new(
+                "localhost",
+                1883,
+                "loam-connector-test",
+                8,
+                400_000,
+                ValidationConfig::default(),
+            )
+            .expect("transport config");
+            Ok((
+                MqttSession {
+                    config,
+                    username: None,
+                    password: None,
+                    ca_certificate: rustls::RootCertStore::empty(),
+                    client_authentication: None,
+                    claimed_identity: SessionIdentity {
+                        principal_id: SENDER_PRINCIPAL.into(),
+                        agent_id: "agent-72".into(),
+                        instance_id: RECIPIENT_INSTANCE.into(),
+                        display_name: None,
+                        allowed_claims: Vec::new(),
+                    },
+                },
+                PeerRoster::default(),
+            ))
+        }
+
+        let mut sessions = ProjectSessions::new(4, ChannelRegistry::new());
+        let row = sample_row("unix:1:2");
+        assert_eq!(
+            sessions.attach(&row, rosterless(), base_time()),
+            SessionState::NoPeerRoster(reason::ROSTER_EMPTY)
+        );
+        assert!(!sessions.is_live(&row.project_id));
+    }
+
+    /// #115: a failure before the authentication exchange is never reported as an
+    /// authentication failure.
+    ///
+    /// The observed symptom was an operator sent to certificates and identity for
+    /// a closed port: `establishment failed error=probe_authentication_failed`,
+    /// inherited by `observed-degraded` and by the degraded status render, for a
+    /// broker endpoint where no TLS and no auth exchange was even possible. The
+    /// two faults have opposite remediations.
+    #[test]
+    fn a_dial_that_never_reached_an_auth_exchange_is_categorized_by_its_stage() {
+        use rumqttc::v5::ConnectionError;
+        use std::io::{Error, ErrorKind};
+
+        // Nothing listening, or the connection cut as it came up: a network fault.
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+        ] {
+            let classified = classify_dial_failure(&ConnectionError::Io(Error::from(kind)));
+            assert_eq!(
+                classified,
+                ProbeError::DialRefused,
+                "{kind:?} is a refused dial"
+            );
+            assert_eq!(classified.code(), "dial_refused");
+        }
+
+        // No answer either way: a dropped packet, an unresolvable name, a route
+        // that does not exist. Still a network fault, but not a refusal.
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::NotFound,
+            ErrorKind::AddrNotAvailable,
+        ] {
+            assert_eq!(
+                classify_dial_failure(&ConnectionError::Io(Error::from(kind))),
+                ProbeError::TransportUnreachable,
+                "{kind:?} is unreachable, not refused"
+            );
+        }
+        assert_eq!(
+            ProbeError::TransportUnreachable.code(),
+            "transport_unreachable"
+        );
+
+        // A socket that failed under the TLS layer keeps the socket's answer: it
+        // is not a certificate problem.
+        assert_eq!(
+            classify_dial_failure(&ConnectionError::Tls(rumqttc::TlsError::Io(Error::from(
+                ErrorKind::ConnectionRefused
+            )))),
+            ProbeError::DialRefused
+        );
+
+        // The one failure that *is* an identity verdict: the broker answered MQTT
+        // and refused. This is the positive control that keeps
+        // `probe_authentication_failed` meaningful rather than merely rarer.
+        assert_eq!(
+            classify_dial_failure(&ConnectionError::ConnectionRefused(
+                ConnectReturnCode::NotAuthorized
+            )),
+            ProbeError::AuthenticationFailed
+        );
+        assert_eq!(
+            ProbeError::AuthenticationFailed.code(),
+            "probe_authentication_failed"
+        );
+
+        // Every stage code is a distinct grep token — a category that collided
+        // with another would be the same defect wearing a new name.
+        let codes = [
+            ProbeError::AuthenticationFailed.code(),
+            ProbeError::DialRefused.code(),
+            ProbeError::TransportUnreachable.code(),
+            ProbeError::TlsHandshakeFailed.code(),
+            ProbeError::ConfigurationFailure(String::new()).code(),
+        ];
+        for (index, code) in codes.iter().enumerate() {
+            assert!(!code.is_empty() && !code.contains(' '), "{code}");
+            assert!(
+                !codes[..index].contains(code),
+                "two stages share the code `{code}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_first_dial_failure_still_arms_the_supervisor_and_watchdog() {
+        // A connector that boots while the broker is down must not give up: the
+        // first dial fails (closed local port, no broker), attach reports the
+        // honest Unreachable, but a supervised session exists and keeps retrying
+        // so the watchdog can eventually hand recovery to the OS supervisor. A
+        // typed refusal, by contrast, arms nothing (covered above).
+        fn to_a_closed_port() -> Result<(MqttSession, PeerRoster), ProvisionFailure> {
+            let config = TransportConfig::new(
+                "127.0.0.1",
+                1, // closed: connection refused is an immediate dial failure
+                "loam-connector-test",
+                8,
+                400_000,
+                ValidationConfig::default(),
+            )
+            .expect("transport config");
+            Ok((
+                MqttSession {
+                    config,
+                    username: None,
+                    password: None,
+                    ca_certificate: rustls::RootCertStore::empty(),
+                    client_authentication: None,
+                    claimed_identity: SessionIdentity {
+                        principal_id: SENDER_PRINCIPAL.into(),
+                        agent_id: "agent-72".into(),
+                        instance_id: RECIPIENT_INSTANCE.into(),
+                        display_name: None,
+                        allowed_claims: Vec::new(),
+                    },
+                },
+                PeerRoster {
+                    principals: vec![SENDER_PRINCIPAL.into()],
+                    origins: vec![RECIPIENT_INSTANCE.into()],
+                },
+            ))
+        }
+
+        let mut sessions = ProjectSessions::new(4, ChannelRegistry::new());
+        let row = sample_row("unix:1:9");
+        let state = sessions.attach(&row, to_a_closed_port(), base_time());
+        assert_eq!(
+            state,
+            SessionState::Unreachable("dial_refused".into()),
+            "a closed-port dial is a refused dial, not a rejected identity (#115)"
+        );
+        assert!(
+            sessions.is_live(&row.project_id),
+            "an Unreachable first cycle must still arm a supervised session"
+        );
+        // Stop the retry loop so the test leaves no dialing thread behind.
+        assert!(sessions.detach(&row.project_id));
+    }
+
+    #[test]
+    fn status_and_snapshot_report_the_observed_session_truthfully() {
+        let row = sample_row("unix:1:7");
+        // A sustained-dead session: not established, past the degrade budget,
+        // carrying its last dial error. Both IPC surfaces must say so.
+        let degraded = ObservedSession {
+            established: false,
+            since: base_time(),
+            consecutive_failures: DEGRADE_AFTER,
+            last_error: Some("connection-refused".into()),
+            refusal: None,
+        };
+        assert!(degraded.degraded());
+        let status = status_json(&row, Some(degraded.clone())).to_json();
+        assert!(status.contains("\"observed_session\""));
+        assert!(status.contains("\"established\":false"));
+        assert!(status.contains("\"degraded\":true"));
+        assert!(status.contains("connection-refused"));
+        let snapshot = snapshot_json(&row.project_id, &[], Some(degraded)).to_json();
+        assert!(snapshot.contains("\"degraded\":true"));
+        assert!(snapshot.contains("connection-refused"));
+
+        // An established session reads live — but only because it is established,
+        // not because the IPC answered.
+        let live = ObservedSession {
+            established: true,
+            since: base_time(),
+            consecutive_failures: 0,
+            last_error: None,
+            refusal: None,
+        };
+        assert!(!live.degraded());
+        let status = status_json(&row, Some(live)).to_json();
+        assert!(status.contains("\"established\":true"));
+        assert!(status.contains("\"degraded\":false"));
+    }
+
+    #[test]
+    fn supervisor_reconnects_after_a_transient_drop_and_clears_the_failure_count() {
+        // Scenario: transient drop heals without escalation. Cycle 1 fails to
+        // establish; cycle 2 opens, runs, and drops. The supervisor must run the
+        // second cycle (reconnect happened) and a successful open must clear the
+        // failure count, so no status surface ever reaches observed-degraded.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        let liveness = LivenessHandle::established(base_time());
+        let mut cycle = 0u32;
+        supervise(
+            "project-7M3",
+            || {
+                let outcome = match cycle {
+                    0 => EstablishOutcome::Failed("dial-timeout".into()),
+                    _ => {
+                        // A session opened and dropped, exactly as the real
+                        // establish-and-run would record it.
+                        liveness.mark_established(base_time());
+                        liveness.mark_disconnected(base_time());
+                        EstablishOutcome::Ended
+                    }
+                };
+                cycle += 1;
+                if cycle == 2 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                outcome
+            },
+            |_backoff| {},
+            &stop,
+            &liveness,
+        );
+        assert_eq!(cycle, 2, "the supervisor must re-establish after a drop");
+        let observed = liveness.observe();
+        assert!(!observed.established);
+        assert_eq!(
+            observed.consecutive_failures, 0,
+            "a successful cycle clears the count"
+        );
+        assert!(!observed.degraded());
+    }
+
+    #[test]
+    fn supervisor_counts_consecutive_failures_toward_degrade() {
+        // Every cycle fails; after DEGRADE_AFTER cycles the observation is
+        // degraded and carries the last error category.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        let liveness = LivenessHandle::established(base_time());
+        let mut cycle = 0u32;
+        supervise(
+            "project-7M3",
+            || {
+                cycle += 1;
+                if cycle == DEGRADE_AFTER {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                EstablishOutcome::Failed("connection-refused".into())
+            },
+            |_backoff| {},
+            &stop,
+            &liveness,
+        );
+        assert_eq!(cycle, DEGRADE_AFTER);
+        let observed = liveness.observe();
+        assert_eq!(observed.consecutive_failures, DEGRADE_AFTER);
+        assert!(observed.degraded());
+        assert_eq!(observed.last_error.as_deref(), Some("connection-refused"));
+    }
+
+    #[test]
+    fn supervisor_disarms_on_a_typed_refusal() {
+        // A provisioning refusal is steady state, not a wedge: the supervisor
+        // stops rather than churning, and records the refusal reason.
+        use std::sync::atomic::AtomicBool;
+        let stop = AtomicBool::new(false);
+        let liveness = LivenessHandle::established(base_time());
+        let mut cycle = 0u32;
+        supervise(
+            "project-7M3",
+            || {
+                cycle += 1;
+                EstablishOutcome::Refused(reason::ROSTER_ABSENT)
+            },
+            |_backoff| panic!("a disarmed supervisor must not back off"),
+            &stop,
+            &liveness,
+        );
+        assert_eq!(cycle, 1, "the supervisor stops after one refusal");
+        assert_eq!(liveness.observe().refusal, Some(reason::ROSTER_ABSENT));
+    }
+
+    #[test]
+    fn watchdog_holds_until_the_sessionless_budget_then_exits() {
+        // A mock clock: synthetic instants, so the ten-minute budget is proven
+        // without a wait and without ever calling process::exit in a test.
+        let start = std::time::Instant::now();
+        let budget = SESSIONLESS_EXIT_AFTER;
+        assert_eq!(
+            watchdog_verdict(start, start, budget),
+            WatchdogVerdict::Retry
+        );
+        assert_eq!(
+            watchdog_verdict(start, start + budget - Duration::from_secs(1), budget),
+            WatchdogVerdict::Retry,
+            "one second short of the budget keeps retrying"
+        );
+        assert_eq!(
+            watchdog_verdict(start, start + budget, budget),
+            WatchdogVerdict::Exit,
+            "the budget boundary hands recovery to the supervisor"
+        );
+        assert_eq!(WATCHDOG_EXIT_CODE, 75);
+    }
+
+    #[test]
+    fn backoff_is_hard_capped_and_grows_with_failures() {
+        // Jitter only ever subtracts, so the cap is a true ceiling, and more
+        // consecutive failures never produce a shorter nominal backoff.
+        assert!(backoff_with_jitter(1, BACKOFF_CAP) <= BACKOFF_BASE);
+        assert!(backoff_with_jitter(50, BACKOFF_CAP) <= BACKOFF_CAP);
+        assert!(backoff_with_jitter(3, BACKOFF_CAP) > backoff_with_jitter(1, BACKOFF_CAP));
+    }
+
+    #[test]
+    fn a_live_session_subscribes_to_colleagues_not_only_itself() {
+        let identity = SessionIdentity {
+            principal_id: SENDER_PRINCIPAL.into(),
+            agent_id: "agent-72".into(),
+            instance_id: RECIPIENT_INSTANCE.into(),
+            display_name: None,
+            allowed_claims: Vec::new(),
+        };
+        let filters = live_filters("org-3A1", "project-7M3", &identity);
+        assert!(filters.contains(&"loam/v1/org-3A1/project-7M3/event/+".to_string()));
+        assert!(filters.contains(&"loam/v1/org-3A1/project-7M3/state/+/+".to_string()));
+        assert!(filters
+            .iter()
+            .any(|filter| filter == "loam/v1/org-3A1/project-7M3/inbox/instance/instance-02/+/+"));
+        // Not a self-only event filter: that is the probe's shape, not a live
+        // collaboration session's.
+        assert!(!filters
+            .iter()
+            .any(|filter| filter.ends_with("/event/instance-02")));
+    }
+
+    #[test]
+    fn the_snapshot_projection_carries_no_envelope_bytes_or_credential() {
+        let item = SnapshotItem {
+            key: "inbox:01K6Q6ESWMT48TPD".into(),
+            state_key: None,
+            source: format!("urn:loam:instance:{SENDER_INSTANCE}"),
+            item_type: "io.loam.message".into(),
+            summary: "Held.".into(),
+            to: vec![("instance".into(), RECIPIENT_INSTANCE.into())],
+            org_id: "org-3A1".into(),
+            project_id: "project-7M3".into(),
+            repository_id: "repo-2F8".into(),
+            from_principal_id: SENDER_PRINCIPAL.into(),
+            from_display_name: None,
+            from_agent_id: "agent-72".into(),
+            from_instance_id: SENDER_INSTANCE.into(),
+            payload: crate::json::Value::Object(vec![]),
+            expires_at: base_time(),
+            publication: Publication::Unverified,
+        };
+        let text = snapshot_json("project-7M3", std::slice::from_ref(&item), None).to_json();
+        for field in [
+            "source", "type", "summary", "to", "context", "from", "payload",
+        ] {
+            assert!(text.contains(field), "the projection must carry `{field}`");
+        }
+        for forbidden in [
+            "specversion",
+            "dataschema",
+            "password",
+            "credential",
+            "mqtts://",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "the projection must not carry `{forbidden}`"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod outbound_tests {
+    //! The CLI derives an *operation*; this module builds the
+    //! envelope from it. Nothing tested that seam, and `work.report` was broken
+    //! across it — `revision` was derived as a JSON number and read back with
+    //! `as_str`, so `outbound_envelope` returned `None` and every work report
+    //! surfaced as `connector_refused`.
+
+    use super::*;
+    use crate::json::Value;
+
+    fn row() -> crate::enrollment::EnrolledRow {
+        crate::enrollment::EnrolledRow {
+            identity_key: "unix:1:1".into(),
+            org_id: "acme".into(),
+            project_id: "loam".into(),
+            repository_id: "repo".into(),
+            descriptor_digest: "d".into(),
+            display_path: "/w".into(),
+            instance_id: "instance-01".into(),
+            broker_profile: "p".into(),
+            broker_endpoint: "mqtts://broker.example:8883".into(),
+            tls_server_name: "broker.example".into(),
+            ca_ref: None,
+            commit: "84be000000000000000000000000000000000001".into(),
+            capabilities: crate::enrollment::CapabilityRecord {
+                authentication: true,
+                publish: true,
+                subscribe: true,
+                self_receive: true,
+                verified_at: "2026-07-24T14:20:00Z".into(),
+            },
+            remotes: Vec::new(),
+        }
+    }
+
+    fn identity() -> SessionIdentity {
+        SessionIdentity {
+            principal_id: "employee-42".into(),
+            agent_id: "agent-7".into(),
+            instance_id: "instance-01".into(),
+            display_name: None,
+            allowed_claims: vec!["employee-42".into()],
+        }
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-24T14:20:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// Replace (or add) one field on an operation object. Used to build the
+    /// operations a non-CLI IPC caller could send, which the connector has to
+    /// refuse on its own terms rather than assuming its caller pre-checked them.
+    fn with_field(operation: &Value, name: &str, value: Value) -> Value {
+        let Value::Object(entries) = operation else {
+            panic!("an operation is an object");
+        };
+        let mut fields: Vec<(String, Value)> = entries
+            .iter()
+            .filter(|(key, _)| key != name)
+            .cloned()
+            .collect();
+        fields.push((name.to_owned(), value));
+        Value::Object(fields)
+    }
+
+    /// Derive through the real CLI path, then build through the real connector
+    /// path — the round trip neither half tested on its own.
+    fn round_trip(operation: &str) -> Result<(String, String), &'static str> {
+        let parsed = crate::json::parse(operation).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+        outbound_envelope(&derived.operation, &row(), &identity())
+    }
+
+    /// The same round trip, but with a session claiming an instance other than
+    /// the enrolled row's.
+    fn round_trip_with(
+        operation: &str,
+        identity: &SessionIdentity,
+    ) -> Result<crate::envelope::ValidatedEnvelope, crate::envelope::Violation> {
+        let parsed = crate::json::parse(operation).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+        let (document, topic) = outbound_envelope(&derived.operation, &row(), identity)
+            .expect("the connector builds an envelope");
+        let claims: Vec<&str> = identity.allowed_claims.iter().map(String::as_str).collect();
+        let principal =
+            crate::envelope::AuthenticatedPrincipal::new(&identity.principal_id, &claims);
+        crate::envelope::validate(
+            document.as_bytes(),
+            &topic,
+            &principal,
+            &ValidationConfig::default(),
+            now(),
+        )
+    }
+
+    /// The composed path #143 broke on, walked end to end in one test: two
+    /// `federation emit` calls on one state key, each stamped from the real
+    /// registry, built into a real envelope by the real connector path, and fed
+    /// to the real receiving admission.
+    ///
+    /// Each half of this was already covered — the counter strictly increases,
+    /// the stamp reaches the frame, the admission accepts a strictly-greater
+    /// revision — and the bug still shipped, because nothing joined them. A
+    /// revision that advances in the ledger but never reaches the wire, or
+    /// reaches it in a spelling the admission cannot parse, passes every one of
+    /// those tests and still freezes the key at its first emit on every
+    /// receiver.
+    #[test]
+    fn two_emits_on_one_key_are_both_admitted_by_the_receiving_side() {
+        let registry = crate::enrollment::temp_global_root("emit-admission").join("loam.sqlite3");
+        let identity = identity();
+        let claims: Vec<&str> = identity.allowed_claims.iter().map(String::as_str).collect();
+        let principal =
+            crate::envelope::AuthenticatedPrincipal::new(&identity.principal_id, &claims);
+        let origins = [identity.instance_id.as_str()];
+        let authenticated =
+            crate::transport::AuthenticatedTransportPrincipal::new(principal, &origins);
+        let mut processor =
+            crate::transport::DeliveryProcessor::new(ValidationConfig::default(), 8, 8, 8)
+                .expect("bounded processor should configure");
+
+        let mut admitted = Vec::new();
+        let mut shipped = Vec::new();
+        for summary in ["blocked on review", "ready to land"] {
+            let operation = format!(
+                r#"{{"type":"work.report","state_key":"task-7","revision":"1","summary":"{summary}","payload":{{"state":"ready"}}}}"#
+            );
+            let parsed = crate::json::parse(&operation).expect("operation parses");
+            let mut derived =
+                crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+            crate::federation::stamp_work_revision(
+                &mut derived.operation,
+                &row(),
+                &registry,
+                now(),
+            )
+            .expect("the registry stamps a revision");
+            shipped.push(
+                derived
+                    .operation
+                    .get("revision")
+                    .and_then(Value::as_str)
+                    .expect("the stamped revision is a string on the wire")
+                    .to_owned(),
+            );
+            let (document, topic) = outbound_envelope(&derived.operation, &row(), &identity)
+                .expect("the connector builds an envelope");
+            admitted.push(
+                processor
+                    .receive(&topic, document.as_bytes(), &authenticated, now())
+                    .expect("a well-formed work frame is not refused"),
+            );
+        }
+
+        assert_eq!(
+            shipped,
+            vec!["1".to_owned(), "2".to_owned()],
+            "successive emits on one key must ship strictly increasing revisions"
+        );
+        assert!(
+            matches!(admitted[0], crate::transport::ReceiveOutcome::Accepted(_)),
+            "the first emit on a key is admitted: {:?}",
+            admitted[0]
+        );
+        assert!(
+            matches!(admitted[1], crate::transport::ReceiveOutcome::Accepted(_)),
+            "the second emit on the same key must be admitted too, not dropped as \
+             stale or duplicate: {:?}",
+            admitted[1]
+        );
+    }
+
+    /// #102: every way an emit can be refused says which rule refused it.
+    ///
+    /// Both layers, in one test, because the bug was that they produced the same
+    /// answer: the builder cannot even construct a document for some operations
+    /// (so the validator never gets to explain them), and the validator refuses
+    /// others. Before this each one arrived as a bare `invalid_request`.
+    #[test]
+    fn every_emit_refusal_names_the_rule_that_refused_it() {
+        // Shape refusals, from the builder. Each of these returned a bare `None`.
+        for (operation, expected) in [
+            (
+                r#"{"type":"work.report","summary":"s","revision":"1","payload":{"state":"ready"}}"#,
+                "missing_state_key",
+            ),
+            (
+                r#"{"type":"message.ack","causation_id":"c-1","summary":"s","to":[],"payload":{}}"#,
+                "no_addressable_recipient",
+            ),
+        ] {
+            let parsed = crate::json::parse(operation).expect("operation parses");
+            // Derivation is not the subject here: `to: []` is derived happily and
+            // refused at build time, which is exactly the gap being closed.
+            let derived = crate::federation::derive_emit(&parsed, &row(), now())
+                .map(|derived| derived.operation)
+                .unwrap_or(parsed);
+            let refusal = validated_emit(&derived, &row(), &identity(), now())
+                .expect_err("a structurally impossible operation must be refused");
+            assert_eq!(
+                refusal.code(),
+                "invalid_request",
+                "the IPC code stays stable: {refusal:?}"
+            );
+            assert_eq!(
+                refusal.diagnostic(),
+                expected,
+                "the refusal must name its own reason"
+            );
+        }
+
+        // A validation refusal, from the envelope module. The claim is injected
+        // *after* derivation on purpose: `derive_emit` now refuses an unanchored
+        // claim itself (#98), so the operation an IPC caller other than this CLI
+        // could still send is the one that reaches the validator — and the
+        // connector must name that refusal too rather than trusting its callers.
+        let claimless = r#"{"type":"work.report","state_key":"task-7","revision":"1","summary":"s","payload":{"state":"ready"}}"#;
+        let parsed = crate::json::parse(claimless).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+        let unanchored_claim = with_field(
+            &derived.operation,
+            "artifacts",
+            crate::json::parse(r#"[{"kind":"task","id":"T-1"}]"#).expect("artifacts parse"),
+        );
+        let refusal = validated_emit(&unanchored_claim, &row(), &identity(), now())
+            .expect_err("a claim-bearing report with no plan anchor is refused");
+        assert_eq!(refusal.code(), "invalid_request");
+        assert_eq!(
+            refusal.diagnostic(),
+            crate::envelope::Violation::MissingPlanOid.code(),
+            "the violation the validator raised must be the reason reported"
+        );
+
+        // The same claim, anchored: it validates, so the refusal above is the
+        // anchor rule and not the artifact. And the anchor has to land in
+        // `context.git` beside the derived `base_oid` — accepting it at the CLI
+        // and dropping it at envelope build would leave #98 exactly where it was.
+        let plan_oid = "61af000000000000000000000000000000000001";
+        let anchored = with_field(
+            &unanchored_claim,
+            "plan_oid",
+            Value::String(plan_oid.into()),
+        );
+        let validated = validated_emit(&anchored, &row(), &identity(), now())
+            .expect("an anchored claim must ship");
+        let git = validated
+            .as_envelope()
+            .data
+            .context
+            .git
+            .as_ref()
+            .expect("the envelope carries a git context");
+        assert_eq!(git.plan_oid.as_deref(), Some(plan_oid));
+        assert_eq!(
+            git.base_oid.as_deref(),
+            Some(row().commit.as_str()),
+            "the caller's plan anchor must not disturb the derived base anchor"
+        );
+
+        // The positive control in the same run: a claimless report still ships,
+        // so the refusals above are the rules firing and not a broken fixture.
+        let claimless = r#"{"type":"work.report","state_key":"task-7","revision":"1","summary":"s","payload":{"state":"ready"}}"#;
+        let parsed = crate::json::parse(claimless).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+        assert!(
+            validated_emit(&derived.operation, &row(), &identity(), now()).is_ok(),
+            "a claimless report must still validate"
+        );
+    }
+
+    /// #99: an emitted work.report, carried all the way to the shared renderer,
+    /// must render its `key`.
+    ///
+    /// The mismatch this closes was invisible to both sides' own tests: the emit
+    /// path put `state_key` at the operation top level (consumed for the topic and
+    /// `delivery.key`), the renderer read `payload.state_key`, and the renderer's
+    /// fixture built the key inside the payload — so each half passed while no
+    /// emitted report ever rendered a key, and cross-revision correlation was lost
+    /// for every consumer. Nothing but a test that spans derive -> build ->
+    /// validate -> project -> render can catch that, which is why this one does.
+    #[test]
+    fn an_emitted_work_report_renders_its_key_through_the_shared_renderer() {
+        let rendered = |operation: &str| {
+            let parsed = crate::json::parse(operation).expect("operation parses");
+            let derived =
+                crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+            let validated = validated_emit(&derived.operation, &row(), &identity(), now())
+                .expect("the connector builds and validates");
+            let topic = format!(
+                "loam/v1/{}/{}/state/{}/{}",
+                row().org_id,
+                row().project_id,
+                identity().instance_id,
+                derived
+                    .operation
+                    .get("state_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            );
+            let delivery = crate::envelope::parse_topic(&topic)
+                .expect("the topic the connector just published on parses")
+                .delivery;
+            let item = snapshot_item(
+                accepted_key(&delivery, &validated.as_envelope().id),
+                &validated,
+                Publication::Unverified,
+            )
+            .expect("the accepted frame projects to a snapshot item");
+            let served = snapshot_json(&row().project_id, std::slice::from_ref(&item), None);
+            let first = served
+                .get("items")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .cloned()
+                .expect("the snapshot serves the item");
+            crate::harness::render_terse_item(&first, 4096)
+        };
+
+        let element = rendered(
+            r#"{"type":"work.report","state_key":"task-7","revision":"4","summary":"ready","payload":{"state":"ready"}}"#,
+        );
+        assert!(
+            element.contains("key=\"task-7\""),
+            "an emitted report must render the key it was published under:\n{element}"
+        );
+        assert!(element.contains("state=\"ready\""), "{element}");
+
+        // The key is the envelope's, not a copy in the payload: an emitter that
+        // puts nothing in the payload but the state still renders a key, and the
+        // payload is forwarded verbatim (no `state_key` is merged into it).
+        assert!(
+            !element.contains("\"state_key\""),
+            "the payload must not be rewritten to carry the key:\n{element}"
+        );
+    }
+
+    #[test]
+    fn an_inbox_item_renders_no_key_because_it_has_none() {
+        // The control for the projection's optional field: only latest-state
+        // frames have a delivery key, and an empty `key=""` on a message would be
+        // a fabricated correlation handle.
+        let operation = r#"{"type":"message.ack","causation_id":"cause-9","summary":"Received.","to":[{"kind":"instance","id":"instance-02"}],"payload":{"action":"collaboration.note","params":{}}}"#;
+        let parsed = crate::json::parse(operation).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+        let validated = validated_emit(&derived.operation, &row(), &identity(), now())
+            .expect("the connector builds and validates");
+        let event_id = validated.as_envelope().id.clone();
+        let topic = format!(
+            "loam/v1/{}/{}/inbox/instance/instance-02/{}/{event_id}",
+            row().org_id,
+            row().project_id,
+            identity().instance_id
+        );
+        let delivery = crate::envelope::parse_topic(&topic)
+            .expect("the inbox topic parses")
+            .delivery;
+        let item = snapshot_item(
+            accepted_key(&delivery, &event_id),
+            &validated,
+            Publication::Unverified,
+        )
+        .expect("the accepted frame projects");
+        assert_eq!(item.state_key, None);
+        let served = snapshot_json(&row().project_id, std::slice::from_ref(&item), None);
+        let first = served
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .cloned()
+            .expect("the snapshot serves the item");
+        let element = crate::harness::render_terse_item(&first, 4096);
+        assert!(
+            !element.contains("key=\""),
+            "a message has no state key to render:\n{element}"
+        );
+    }
+
+    #[test]
+    fn a_session_claiming_another_instance_is_refused_and_ships_nothing() {
+        // The negative control that makes the instance-id unification
+        // load-bearing. `federation emit` derives `source` from the enrolled
+        // row while the connector derives the topic origin from the session, so
+        // a deployment that opened a session under any other instance id would
+        // ship envelopes Slice A rejects — surfacing to a user as an
+        // unexplained `connector_refused` with no hint of the cause.
+        let operation = r#"{"type":"work.report","state_key":"task-7","revision":"12","summary":"ready","payload":{"state":"ready"}}"#;
+
+        // Positive control first, in the same run: the enrolled instance id
+        // validates, so the refusal below is the mismatch and not the fixture.
+        assert!(
+            round_trip_with(operation, &identity()).is_ok(),
+            "the enrolled instance must validate"
+        );
+
+        let mut divergent = identity();
+        divergent.instance_id = "instance-99".into();
+        let violation = round_trip_with(operation, &divergent)
+            .expect_err("a divergent instance id must be refused");
+        assert_eq!(
+            violation,
+            crate::envelope::Violation::SourceInstanceMismatch,
+            "a divergent session must be refused as a source mismatch, not accepted"
+        );
+    }
+
+    #[test]
+    fn a_self_origin_frame_is_filtered_from_the_injection_path() {
+        // #111: this machine hears its own emit echoed back (self_receive stays on
+        // for the enrollment probe). The pump must drop it before the store, so no
+        // local session renders its own frame as a colleague's.
+        let operation = r#"{"type":"work.report","state_key":"task-9","revision":"3","summary":"s","payload":{"state":"ready"}}"#;
+        let envelope =
+            round_trip_with(operation, &identity()).expect("the enrolled instance validates");
+        let own = identity().instance_id;
+        let echo = crate::transport::ReceiveOutcome::Accepted(Box::new(envelope));
+
+        // This machine's own frame is self-origin — filtered.
+        assert!(is_self_origin(&echo, &own));
+        // A colleague on another instance is not.
+        assert!(!is_self_origin(&echo, "instance-a-teammates-machine"));
+        // A non-Accepted outcome carries no origin and is never self-filtered.
+        assert!(!is_self_origin(
+            &crate::transport::ReceiveOutcome::DuplicateEvent,
+            &own
+        ));
+    }
+
+    #[test]
+    fn the_certificate_display_name_reaches_the_envelope_and_an_absent_one_stays_absent() {
+        let operation = r#"{"type":"work.report","state_key":"task-7","revision":"12","summary":"ready","payload":{"state":"ready"}}"#;
+        let parsed = crate::json::parse(operation).expect("operation parses");
+        let derived =
+            crate::federation::derive_emit(&parsed, &row(), now()).expect("the CLI derives");
+
+        let mut named = identity();
+        named.display_name = Some("Ada Lovelace".into());
+        let (document, _) =
+            outbound_envelope(&derived.operation, &row(), &named).expect("envelope");
+        assert!(
+            document.contains("\"display_name\":\"Ada Lovelace\""),
+            "the authenticated given name must reach data.from: {document}"
+        );
+
+        // Control: a certificate without a given name leaves the field absent
+        // rather than sending an empty one.
+        let (plain, _) =
+            outbound_envelope(&derived.operation, &row(), &identity()).expect("envelope");
+        assert!(!plain.contains("display_name"), "{plain}");
+    }
+
+    #[test]
+    fn a_derived_work_report_builds_an_envelope_and_its_revision_survives() {
+        let (document, topic) = round_trip(
+            r#"{"type":"work.report","state_key":"task-7","revision":"12","summary":"ready","payload":{"state":"ready"}}"#,
+        )
+        .expect("the connector builds an envelope from the CLI's derived work report");
+        assert_eq!(topic, "loam/v1/acme/loam/state/instance-01/task-7");
+        let parsed = crate::json::parse(&document).expect("envelope parses");
+        let delivery = parsed
+            .get("data")
+            .and_then(|data| data.get("delivery"))
+            .expect("delivery");
+        assert_eq!(
+            delivery.get("class").and_then(Value::as_str),
+            Some("latest-state")
+        );
+        assert_eq!(delivery.get("key").and_then(Value::as_str), Some("task-7"));
+        // The caller's revision, not the derived default.
+        assert_eq!(
+            delivery.get("revision"),
+            Some(&Value::Number("12".into())),
+            "revision must survive the CLI→connector round trip: {document}"
+        );
+    }
+
+    #[test]
+    fn a_numeric_revision_is_read_as_the_same_revision_not_silently_defaulted() {
+        // A JSON-numeric `revision` is the natural spelling; reading it only as
+        // a string would coerce every such report to revision 1.
+        let (document, _topic) = round_trip(
+            r#"{"type":"work.report","state_key":"task-7","revision":12,"summary":"ready","payload":{"state":"ready"}}"#,
+        )
+        .expect("envelope");
+        let parsed = crate::json::parse(&document).expect("envelope parses");
+        assert_eq!(
+            parsed
+                .get("data")
+                .and_then(|data| data.get("delivery"))
+                .and_then(|delivery| delivery.get("revision")),
+            Some(&Value::Number("12".into())),
+            "{document}"
+        );
+    }
+
+    #[test]
+    fn the_reply_path_still_builds_its_inbox_envelope() {
+        // The positive control that this round trip is not work.report-shaped by
+        // accident: the untouched vocabulary types still build.
+        let (document, topic) = round_trip(
+            r#"{"type":"message.reply","causation_id":"c-1","summary":"On it.","to":[{"kind":"instance","id":"instance-02"}],"payload":{}}"#,
+        )
+        .expect("envelope");
+        assert!(
+            topic.starts_with("loam/v1/acme/loam/inbox/instance/instance-02/instance-01/"),
+            "{topic}"
+        );
+        assert!(document.contains("\"intent\":\"response\""), "{document}");
+    }
+}
+
+#[cfg(test)]
+mod breadcrumb_tests {
+    //! The runtime breadcrumbs (#103) are the connector's only external signal,
+    //! and they run on a path that carries colleagues' message content. Two
+    //! things therefore need pinning rather than reviewing: that a line says
+    //! enough to localize a fault, and that it says nothing more than ids,
+    //! counts, ports, and reasons.
+
+    use super::*;
+
+    const STATE_TOPIC: &str = "loam/v1/org-3A1/project-7M3/state/instance-01/activity-01K6Q5";
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-24T14:20:00Z")
+            .expect("fixture time parses")
+            .with_timezone(&Utc)
+    }
+
+    fn accepted_work_frame() -> ReceiveOutcome {
+        let frame = include_bytes!("../tests/fixtures/mqtt/work-state.json");
+        let principal = crate::envelope::AuthenticatedPrincipal::new("employee-184", &[]);
+        let validated = crate::envelope::validate(
+            frame,
+            STATE_TOPIC,
+            &principal,
+            &ValidationConfig::default(),
+            now(),
+        )
+        .expect("the work-state fixture validates");
+        ReceiveOutcome::Accepted(Box::new(validated))
+    }
+
+    #[test]
+    fn the_admission_breadcrumb_localizes_a_frame_without_carrying_its_content() {
+        let line = admission_breadcrumb("project-7M3", STATE_TOPIC, &accepted_work_frame());
+
+        // Enough to answer "did it arrive, from whom, and was it admitted".
+        assert!(line.contains("project=project-7M3"), "{line}");
+        assert!(line.contains("class=latest-state"), "{line}");
+        assert!(line.contains("origin=instance-01"), "{line}");
+        assert!(line.contains("outcome=accepted"), "{line}");
+        assert!(line.contains("event=01K6Q6ESWMT48TPB"), "{line}");
+
+        // And nothing more. The summary and payload are a colleague's words; the
+        // state key is caller-chosen text that rides in the topic and would be
+        // the easy accident, since the topic is right there in the same call.
+        assert!(
+            !line.contains("Implementation is ready locally"),
+            "the summary must never reach the log: {line}"
+        );
+        assert!(
+            !line.contains("acceptance") && !line.contains("cargo test"),
+            "the payload must never reach the log: {line}"
+        );
+        assert!(
+            !line.contains("activity-01K6Q5"),
+            "the caller-chosen state key must never reach the log: {line}"
+        );
+    }
+
+    #[test]
+    fn a_refused_frame_is_still_named_by_class_and_outcome() {
+        // The stale/duplicate verdicts are the ones that made delivery look like
+        // a black box: the frame reached the connector and went nowhere, with
+        // nothing said. They carry no envelope, so the event id is absent.
+        let line = admission_breadcrumb("project-7M3", STATE_TOPIC, &ReceiveOutcome::StaleState);
+        assert!(line.contains("outcome=stale_state"), "{line}");
+        assert!(line.contains("class=latest-state"), "{line}");
+        assert!(line.contains("event=-"), "{line}");
+    }
+
+    #[test]
+    fn an_unparsable_topic_is_recorded_rather_than_dropped_from_the_record() {
+        let line =
+            admission_breadcrumb("project-7M3", "not/a/loam/topic", &ReceiveOutcome::Removed);
+        assert!(line.contains("class=unparsed"), "{line}");
+        assert!(line.contains("outcome=removed"), "{line}");
+        assert!(line.contains("origin=-"), "{line}");
+    }
+
+    #[test]
+    fn the_mailbox_breadcrumb_never_carries_the_state_key_a_tombstone_rides_in_on() {
+        // The live leak, not a hypothetical one. `SnapshotStore::admit` reports
+        // a change for `Removed`, so a state tombstone reaches this line, and
+        // the topic's last segment on a state topic is the caller-chosen state
+        // key. Asserting over `Accepted` would pass vacuously: that arm carries
+        // a real envelope id and was never the leak.
+        let line = mailbox_breadcrumb("project-7M3", &ReceiveOutcome::Removed, 0, Some(3));
+        assert!(
+            !line.contains("activity-01K6Q5"),
+            "a tombstone must not write the state key into the log: {line}"
+        );
+        assert!(line.contains("event=-"), "{line}");
+        assert!(line.contains("items=0"), "{line}");
+        assert!(line.contains("sessions=3"), "{line}");
+
+        // An admitted frame does carry an id of ours to log.
+        let admitted = mailbox_breadcrumb("project-7M3", &accepted_work_frame(), 2, Some(1));
+        assert!(admitted.contains("event=01K6Q6ESWMT48TPB"), "{admitted}");
+    }
+
+    #[test]
+    fn a_poisoned_registry_is_not_reported_as_reaching_nobody() {
+        let unavailable = mailbox_breadcrumb("project-7M3", &ReceiveOutcome::Removed, 1, None);
+        assert!(
+            unavailable.contains("sessions=unavailable"),
+            "{unavailable}"
+        );
+        let nobody = mailbox_breadcrumb("project-7M3", &ReceiveOutcome::Removed, 1, Some(0));
+        assert!(nobody.contains("sessions=0"), "{nobody}");
+    }
+
+    #[test]
+    fn a_refused_frame_is_named_by_its_typed_reason() {
+        // The failure class #103 was filed for: a peer missing from the roster
+        // refuses every one of its frames as `OriginNotAuthorized`, and the
+        // delivery processor's refusals are swallowed one layer below the pump,
+        // so without this line they are indistinguishable from an idle poll.
+        let line = refusal_breadcrumb(
+            STATE_TOPIC,
+            &crate::transport::TransportError::OriginNotAuthorized,
+        );
+        assert!(line.contains("outcome=refused"), "{line}");
+        assert!(line.contains("reason=origin_not_authorized"), "{line}");
+        assert!(line.contains("class=latest-state"), "{line}");
+        assert!(line.contains("origin=instance-01"), "{line}");
+        assert!(line.contains("project=project-7M3"), "{line}");
+        assert!(
+            !line.contains("activity-01K6Q5"),
+            "the state key must not reach a refusal line either: {line}"
+        );
+
+        // A validation violation keeps its own name: "validation" alone would
+        // not separate the #143 near-miss spelling from an expired frame. The
+        // name is `Violation::code`, the same token `federation emit` reports
+        // for the same rule (#102) — one refusal vocabulary, not two spellings.
+        let violation = refusal_breadcrumb(
+            STATE_TOPIC,
+            &crate::transport::TransportError::Validation(
+                crate::envelope::Violation::MissingLatestStateRevision,
+            ),
+        );
+        assert!(
+            violation.contains("reason=validation:missing_latest_state_revision"),
+            "{violation}"
+        );
+    }
+
+    #[test]
+    fn every_transport_refusal_has_a_content_free_code() {
+        // TransportError is Copy, so no variant can hold a piece of a frame —
+        // this pins that the code derived from it stays a bare token rather
+        // than growing prose or interpolated values.
+        for error in [
+            crate::transport::TransportError::OriginNotAuthorized,
+            crate::transport::TransportError::InvalidStateRevision,
+            crate::transport::TransportError::EventTombstone,
+            crate::transport::TransportError::Expired,
+            // The payload-carrying variant, and specifically the axis whose
+            // name is a state key: this is the arm that invites frame content
+            // into a code, so a hand-picked list without it proves little.
+            crate::transport::TransportError::Validation(
+                crate::envelope::Violation::BindingMismatch(crate::envelope::BindingAxis::StateKey),
+            ),
+        ] {
+            let code = error.code();
+            assert!(!code.is_empty(), "{error:?} has no code");
+            assert!(
+                !code.contains(' '),
+                "a code is a grep token, not prose: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_suppression_line_exists_only_past_the_cap() {
+        // The rule both capped classes share: below the cap every occurrence was
+        // logged individually, so announcing a suppression would be a lie.
+        assert_eq!(
+            suppression_breadcrumb("refused frames", "project-7M3", 16, 16),
+            None,
+            "a session exactly at the cap suppressed nothing"
+        );
+        assert_eq!(
+            suppression_breadcrumb("refused frames", "project-7M3", 16, 3),
+            None
+        );
+
+        let line = suppression_breadcrumb("refused frames", "project-7M3", 16, 4_000)
+            .expect("past the cap the tail is reported");
+        assert!(line.contains("logged=16"), "{line}");
+        assert!(line.contains("total=4000"), "{line}");
+        assert!(line.contains("project=project-7M3"), "{line}");
+
+        // Counts and a project id, nothing else — the refusals themselves are
+        // gone by now and must not be reconstructed here.
+        let cards = suppression_breadcrumb("member card rejections", "-", 8, 9)
+            .expect("past the cap the tail is reported");
+        assert!(
+            cards.starts_with("member card rejections suppressed"),
+            "{cards}"
+        );
+    }
+
+    #[test]
+    fn the_payload_carrying_refusal_keeps_its_axis_and_nothing_else() {
+        // `Validation` is the arm that could carry frame content into a code,
+        // and `StateKey` is the axis whose name is itself a caller-chosen key.
+        // Pinned exactly, not just "has no spaces": a `Violation` variant that
+        // grew a `String` payload would still pass a shape check.
+        assert_eq!(
+            crate::transport::TransportError::Validation(
+                crate::envelope::Violation::BindingMismatch(
+                    crate::envelope::BindingAxis::StateKey,
+                ),
+            )
+            .code(),
+            "validation:binding_mismatch:state_key"
+        );
+    }
+
+    #[test]
+    fn a_wake_failure_carries_the_port_and_a_reason_but_never_the_address() {
+        // Port 1 on loopback: nothing listens there, so the connect is refused
+        // immediately rather than waiting out the one-second timeout.
+        let failure = wake_one("notify-tcp://127.0.0.1:1", "project-7M3", None)
+            .expect_err("a wake to a closed port must fail");
+        assert_eq!(failure.port.as_deref(), Some("1"));
+        assert_eq!(failure.reason, "connect_failed");
+        // The reason is a fixed vocabulary, so no OS error string carrying the
+        // address can reach the log through it.
+        assert!(!failure.reason.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn a_malformed_wake_ref_is_typed_and_a_foreign_scheme_is_skipped_not_failed() {
+        let failure = wake_one("notify-tcp://no-port-here", "project-7M3", None)
+            .expect_err("a wake_ref without a port must fail");
+        assert_eq!(failure.port, None);
+        assert_eq!(failure.reason, "malformed_ref");
+
+        // A scheme this connector does not speak is not a failure: pruning the
+        // ref would silently disarm a wake target a future runtime understands.
+        assert_eq!(
+            wake_one("notify-carrier-pigeon://roost", "project-7M3", None),
+            Ok(WakeAttempt::SchemeSkipped)
+        );
+    }
+}

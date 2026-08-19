@@ -1,0 +1,14 @@
+[
+  {"name": "event_publish", "expected": "event_nonretained_qos1"},
+  {"name": "state_publish", "expected": "state_retained_qos1"},
+  {"name": "inbox_publish", "expected": "inbox_retained_qos1"},
+  {"name": "duplicate_event", "expected": "duplicate_event"},
+  {"name": "stale_state", "expected": "stale_state"},
+  {"name": "equal_state", "expected": "duplicate_state"},
+  {"name": "conflicting_state", "expected": "conflicting_state"},
+  {"name": "new_state", "expected": "accepted"},
+  {"name": "expired_state", "expected": "expired"},
+  {"name": "expired_inbox", "expected": "expired"},
+  {"name": "wrong_origin_tombstone", "expected": "origin_not_authorized"},
+  {"name": "colliding_recipient_kind", "expected": "recipient_kind_mismatch"}
+]
