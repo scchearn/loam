@@ -222,6 +222,26 @@ describe('Query palette', () => {
     assert.equal(items[0].getAttribute('aria-selected'), 'true');
   });
 
+  it('keeps results out of the tab order so the combobox owns focus', async () => {
+    const { doc } = await mountShell({ routes: searchRoutes([hostile, plain]) });
+    const input = doc.querySelector('[data-query-input]');
+    input.value = 'service';
+    doc.querySelector('[data-query-open]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const list = doc.querySelector('[data-query-results]');
+    assert.equal(
+      list.querySelectorAll('a, button, input, select, textarea, [tabindex]').length,
+      0,
+      'an ARIA option may not contain interactive descendants',
+    );
+    // Clicking the option itself still opens the document.
+    const opened = [];
+    doc.addEventListener('loam:open-document', (event) => opened.push(event.detail));
+    list.querySelectorAll('.query-result')[1].click();
+    assert.deepEqual(opened, [{ path: plain.path, kind: plain.kind, title: plain.title }]);
+  });
+
   it('walks results with the arrow keys and hands the chosen path to Reader', async () => {
     const { doc, dom } = await mountShell({ routes: searchRoutes([hostile, plain]) });
     const input = doc.querySelector('[data-query-input]');

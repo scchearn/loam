@@ -885,7 +885,7 @@ code,
   list-style: none;
 }
 
-.query-result button {
+.query-result .result-row {
   display: grid;
   grid-template-columns: 6rem minmax(0, 1fr);
   gap: var(--space-4);
@@ -895,10 +895,11 @@ code,
   background: transparent;
   color: var(--ink-chrome);
   text-align: left;
+  cursor: pointer;
 }
 
-.query-result button:hover,
-.query-result[aria-selected="true"] button { background: var(--surface-app-active); }
+.query-result:hover .result-row,
+.query-result[aria-selected="true"] .result-row { background: var(--surface-app-active); }
 
 .result-kind {
   color: var(--accent-bright);
@@ -1639,7 +1640,7 @@ code,
   .workspace { grid-column: 1; padding-bottom: 4rem; }
   .view { padding: var(--space-6) var(--space-4) var(--space-12); }
 
-  .query-result button { grid-template-columns: 1fr; gap: var(--space-2); }
+  .query-result .result-row { grid-template-columns: 1fr; gap: var(--space-2); }
 
   /* DESIGN.md §5: card rows scroll horizontally; the timeline stacks. */
   .river { grid-auto-columns: minmax(14rem, 1fr); }

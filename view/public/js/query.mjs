@@ -106,8 +106,11 @@ export function initQuery({ root = document, getSnapshot = () => null, debounceM
       item.setAttribute('role', 'option');
       item.setAttribute('aria-selected', 'false');
 
-      const button = doc.createElement('button');
-      button.type = 'button';
+      // ARIA: an option may not contain interactive descendants, and the combobox
+      // already drives selection via aria-activedescendant — so the row is a plain
+      // element and the option itself takes the click.
+      const row = doc.createElement('div');
+      row.className = 'result-row';
 
       const kindEl = doc.createElement('span');
       kindEl.className = 'result-kind';
@@ -121,9 +124,9 @@ export function initQuery({ root = document, getSnapshot = () => null, debounceM
       snippet.appendChild(doc.createTextNode(hit.snippet ?? ''));
       copy.append(title, snippet);
 
-      button.append(kindEl, copy);
-      button.addEventListener('click', () => activate(index));
-      item.appendChild(button);
+      row.append(kindEl, copy);
+      item.addEventListener('click', () => activate(index));
+      item.appendChild(row);
       list.appendChild(item);
     }
     selected = -1;
