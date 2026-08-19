@@ -1042,6 +1042,161 @@ code,
   color: var(--ink-chrome);
 }
 
+/* ---------- Atlas (DESIGN.md §2 Graph Palette, §4 card, §5 dot-grid stage) ---------- */
+
+.atlas-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 20rem;
+  gap: var(--space-6);
+}
+
+/* The bordered map card the graph lives in (spec: Atlas). */
+.atlas-map {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: var(--rule) solid var(--border);
+  border-radius: var(--radius-lg);
+  background-color: var(--surface-card);
+}
+
+/* Dot-grid texture: the "field/desk" surface DESIGN.md gives the Atlas stage. */
+.atlas-stage {
+  min-height: 30rem;
+  background-color: var(--surface-canvas);
+  background-image: radial-gradient(var(--border-faint) 1px, transparent 1px);
+  background-size: var(--dot-grid) var(--dot-grid);
+}
+
+.atlas-scope {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border-top: var(--rule) solid var(--border);
+}
+
+.atlas-scope .mono-label { margin: 0; }
+.atlas-scope [hidden] { display: none; }
+
+.atlas-marginalia {
+  min-width: 0;
+  padding-left: var(--space-4);
+  border-left: var(--rule) solid var(--border);
+}
+
+.atlas-marginalia .mono-label { margin: 0 0 var(--space-2); }
+.atlas-marginalia .mono-label + .atlas-table { margin-bottom: var(--space-6); }
+.atlas-edge-list + .edge-key { margin-top: var(--space-6); }
+
+.atlas-table {
+  width: 100%;
+  border-collapse: collapse;
+  font: 400 0.72rem/1.3 var(--font-mono);
+  text-align: left;
+}
+
+.atlas-table th,
+.atlas-table td {
+  padding: var(--space-2) var(--space-2) var(--space-2) 0;
+  border-bottom: var(--rule) solid var(--border-faint);
+  vertical-align: top;
+}
+
+.atlas-table thead th {
+  color: var(--ink-tertiary);
+  font: 600 0.62rem/1 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.atlas-cluster-row th {
+  color: var(--ink-primary);
+  font: 600 0.66rem/1 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* The kind cell is the coloured mark that carries node identity into the text
+   alternative, holding the same graph palette the canvas draws with. The node
+   name itself stays in ink: colour is the mark's job, not the label's. */
+.atlas-row-kind {
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.atlas-node-row[data-cluster="code"] .atlas-row-kind { color: var(--node-code); }
+
+.atlas-node-row[data-cluster="concept"] .atlas-row-kind,
+.atlas-node-row[data-cluster="domain"] .atlas-row-kind { color: var(--node-concept); }
+
+.atlas-node-row[data-cluster="work"] .atlas-row-kind { color: var(--node-work); }
+
+.atlas-node-row[data-cluster="memory"] .atlas-row-kind { color: var(--node-memory); }
+
+/* Stale or drifted nodes: dimmed, and coral wherever the state is named
+   (DESIGN.md §2 Graph Palette). Never colour alone — the state cell says why. */
+.atlas-node-row[data-stale="true"] { opacity: 0.72; }
+
+.atlas-node-row[data-stale="true"] .atlas-row-state { color: var(--state-drift); }
+
+.atlas-node-row[data-stale="true"] .atlas-row-kind { color: var(--state-drift); }
+
+.atlas-row-state { color: var(--ink-tertiary); }
+
+.atlas-node-row .atlas-row-button { color: var(--ink-secondary); }
+
+.atlas-row-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.atlas-row-button:hover { color: var(--ink-primary); }
+
+.atlas-row-text { color: var(--ink-secondary); }
+
+.atlas-edge-list,
+.edge-key {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.atlas-edge-list li,
+.edge-key li {
+  display: grid;
+  grid-template-columns: 1.75rem 1fr;
+  gap: var(--space-2);
+  align-items: center;
+  padding: var(--space-2) 0;
+  color: var(--ink-secondary);
+  font: 400 0.7rem/1.35 var(--font-mono);
+}
+
+.atlas-edge-list li { border-bottom: var(--rule) solid var(--border-faint); }
+
+.atlas-empty { color: var(--ink-tertiary); }
+
+/* Explicit is a solid line in edge-explicit; derived is a dashed line in
+   edge-derived. The two must never resolve to the same mark. */
+.edge-sample {
+  height: 1px;
+  background: var(--edge-explicit);
+}
+
+.edge-sample.derived {
+  height: 0;
+  border-top: var(--rule) dashed var(--edge-derived);
+  background: transparent;
+}
+
 /* ---------- Icons (Phosphor regular, inline sprite, currentColor, em-sized) ---------- */
 
 .icon {
@@ -1076,6 +1231,18 @@ code,
   .topbar { grid-template-columns: var(--nav-width) minmax(12rem, 1fr) auto; }
   .freshness { display: none; }
   .query-trigger { min-width: 10rem; }
+
+  /* The text alternative moves under the map rather than squeezing beside it. */
+  .atlas-layout { grid-template-columns: minmax(0, 1fr); }
+
+  .atlas-marginalia {
+    padding-left: 0;
+    padding-top: var(--space-4);
+    border-left: 0;
+    border-top: var(--rule) solid var(--border);
+  }
+
+  .atlas-stage { min-height: 24rem; }
 }
 
 /* Rail becomes a bottom tab bar with text labels. */

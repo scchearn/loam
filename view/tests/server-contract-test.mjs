@@ -395,3 +395,33 @@ test('serves static files with immutable caching, and index.html with no-store',
   await rm(root, { recursive: true, force: true });
   await rm(publicRoot, { recursive: true, force: true });
 });
+
+test('serves the pinned vendor modules under /vendor/ as their own static root', async () => {
+  const { root } = await makeWorkspace();
+  const publicRoot = await mkdtemp(join(tmpdir(), 'loam-view-public-'));
+  const vendorRoot = await mkdtemp(join(tmpdir(), 'loam-view-vendor-'));
+  await mkdir(join(vendorRoot, 'cytoscape'), { recursive: true });
+  await writeFile(join(vendorRoot, 'cytoscape', 'cytoscape.esm.min.mjs'), 'export default 1;\n', 'utf8');
+  await writeFile(join(publicRoot, 'index.html'), '<!doctype html><title>Loam View</title>', 'utf8');
+
+  await withServer(
+    { workspaceRoot: root, publicRoot, vendorRoot, initialSnapshot: baseSnapshot(root) },
+    async (baseUrl) => {
+      // Atlas imports this exact URL; without the route the view never boots.
+      const module = await rawRequest(baseUrl, '/vendor/cytoscape/cytoscape.esm.min.mjs');
+      assert.equal(module.status, 200);
+      assert.equal(module.headers['content-type'], 'text/javascript; charset=utf-8');
+      assert.match(module.body, /export default/);
+
+      // The vendor prefix is its own root: a public/ file is not reachable
+      // through it, and a missing module is a 404 rather than a fallback.
+      const wrongRoot = await rawRequest(baseUrl, '/vendor/index.html');
+      assert.equal(wrongRoot.status, 404);
+      const missing = await rawRequest(baseUrl, '/vendor/cytoscape/nope.mjs');
+      assert.equal(missing.status, 404);
+    },
+  );
+  await rm(root, { recursive: true, force: true });
+  await rm(publicRoot, { recursive: true, force: true });
+  await rm(vendorRoot, { recursive: true, force: true });
+});
