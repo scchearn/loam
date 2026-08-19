@@ -22,6 +22,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         Some("service") => service(args),
         Some("disconnect") => disconnect(args),
         Some("status") => status(args),
+        Some("list") => list(args),
         Some("emit") => emit(args),
         Some("inject") => inject(args),
         _ => {
@@ -32,6 +33,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
                  loam federation disconnect <workspace> [--global-root <path>] [--json]\n  \
                  loam federation status [<workspace>] [--global-root <path>] [--json]\n  \
                  disconnect/status infer the global root from the installed runtime layout; --global-root overrides\n  \
+                 loam federation list [--global-root <path>] [--json]   (every project this machine has joined)\n  \
                  loam federation emit [<workspace>] --global-root <path> [--json]   (reads one operation on stdin)\n  \
                  loam federation inject <register|drop> [<workspace>] --global-root <path> --session-id <id> [--channel-ref <ref>] [--wake-ref <ref>] [--json]"
             );
@@ -252,6 +254,126 @@ fn status(mut args: impl Iterator<Item = String>) -> i32 {
         println!("{}", status_summary(&report));
     }
     0
+}
+
+/// `loam federation list [--global-root <path>] [--json]`.
+///
+/// The human-facing enrollment inventory: which projects this machine has
+/// joined, from which workspace, through which broker, last verified when.
+/// Read-only and egress-free — it never creates the registry, never queries
+/// the service manager, and makes no liveness claim (which peers are online is
+/// a separate question this command deliberately does not answer).
+///
+/// The registry is resolved by the config-dir ladder alone, so the common case
+/// takes no flags at all. `--global-root` (else the installed layout, when
+/// there is one) only supplies the legacy rung for a machine whose enrollment
+/// has not yet migrated out of its global root.
+fn list(mut args: impl Iterator<Item = String>) -> i32 {
+    let mut global_root: Option<PathBuf> = None;
+    let mut json_output = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => json_output = true,
+            "--global-root" => match args.next() {
+                Some(value) => global_root = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("federation list: --global-root needs a value");
+                    return 64;
+                }
+            },
+            other => {
+                eprintln!("federation list: unexpected argument `{other}`");
+                return 64;
+            }
+        }
+    }
+
+    // Unlike status/disconnect, a missing root is never fatal here: it is only
+    // the legacy rung of the registry ladder, and the durable config-dir
+    // registry answers without it.
+    let legacy_root = global_root.or_else(|| crate::hooks::installed_global_root().ok());
+    let db_path = match crate::provisioning::configured_registry_path(legacy_root.as_deref()) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("federation list: {error}");
+            return 78;
+        }
+    };
+    let rows = match enrollment::open_readonly(&db_path) {
+        // No registry file yet: a machine that has joined nothing, not an error.
+        Ok(None) => Vec::new(),
+        Ok(Some(connection)) => match enrollment::list_enrollments(&connection) {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!("federation list: {error}");
+                return 73;
+            }
+        },
+        Err(error) => {
+            eprintln!("federation list: {error}");
+            return 73;
+        }
+    };
+
+    if json_output {
+        let values = rows.iter().map(crate::connector::enrollment_json).collect();
+        println!(
+            "{}",
+            Value::Object(vec![
+                ("schema".into(), Value::Number("1".into())),
+                ("enrollments".into(), Value::Array(values)),
+            ])
+            .to_json()
+        );
+    } else {
+        print!("{}", enrollment_table(&rows));
+    }
+    0
+}
+
+/// The `list` table: one row per enrollment, columns padded to their widest
+/// cell so the inventory reads as a table without pulling in a formatter. An
+/// empty inventory says how to fill it rather than printing a bare header.
+fn enrollment_table(rows: &[enrollment::EnrolledRow]) -> String {
+    if rows.is_empty() {
+        return "no federation enrollments; `loam federation connect <workspace> <broker>` joins one\n"
+            .to_owned();
+    }
+    let cells: Vec<[String; 4]> = rows
+        .iter()
+        .map(|row| {
+            [
+                format!("{}/{}", row.org_id, row.project_id),
+                row.display_path.clone(),
+                row.broker_endpoint.clone(),
+                row.capabilities.verified_at.clone(),
+            ]
+        })
+        .collect();
+    let headers = ["PROJECT", "WORKSPACE", "BROKER", "LAST VERIFIED"];
+    // Widths are in characters, not bytes: a workspace path is user data and
+    // may hold non-ASCII, which would otherwise pad short.
+    let mut widths = headers.map(|header| header.chars().count());
+    for row in &cells {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut out = String::new();
+    for row in std::iter::once(&headers.map(str::to_owned)).chain(cells.iter()) {
+        let mut line = String::new();
+        for (index, (cell, width)) in row.iter().zip(widths).enumerate() {
+            // No trailing whitespace on the last column.
+            if index + 1 == row.len() {
+                line.push_str(cell);
+            } else {
+                line.push_str(&format!("{cell:<width$}  "));
+            }
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 /// A terse, read-only human summary of the status projection: enrollment count,
