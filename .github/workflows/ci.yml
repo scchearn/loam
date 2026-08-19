@@ -39,6 +39,16 @@ jobs:
       - run: node --version
       - run: npm ci
       - run: npm test
+      # Loam View producer/validator agreement (T7): the native binary and the
+      # Rust producer contract itself (cli/tests/view_contract.rs) already run
+      # per-OS via cli.yml's `build` job (`cargo test --workspace`); this leg
+      # only needs a debug binary to prove the Node validator agrees with it.
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - run: cargo +1.94.1 build --locked --package loam
+      - name: Loam View producer/validator agreement
+        run: node --test view/tests/loamstate-view-contract-test.mjs
 
   release-resolution:
     runs-on: ubuntu-22.04

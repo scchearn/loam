@@ -7,10 +7,12 @@ use crate::{codegraph, datecheck};
 
 pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     let mut fast = false;
+    let mut view = false;
     let mut workspace = None;
     for arg in args.by_ref() {
         match arg.as_str() {
             "--fast" => fast = true,
+            "--view" => view = true,
             value if value.starts_with('-') => {
                 usage();
                 return 1;
@@ -36,12 +38,16 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         return 0;
     }
 
-    println!("{}", aggregate(workspace_path, fast));
+    if view {
+        println!("{}", crate::view::snapshot(workspace_path));
+    } else {
+        println!("{}", aggregate(workspace_path, fast));
+    }
     0
 }
 
 fn usage() {
-    eprintln!("Usage: loam state [--fast] <workspace-root>");
+    eprintln!("Usage: loam state [--fast|--view] <workspace-root>");
 }
 
 pub(crate) fn aggregate(workspace: &Path, fast: bool) -> String {
@@ -122,6 +128,40 @@ pub(crate) fn aggregate(workspace: &Path, fast: bool) -> String {
     )
 }
 
+/// The exact hint pipeline `aggregate` uses, reused verbatim by the View
+/// snapshot's `hints` field (`specs/loam-view.md`: "pass through existing
+/// hint objects unchanged"). Each returned string is already a serialized
+/// hint object.
+pub(crate) fn hints_for_view(workspace: &Path, wiki_root: &Path) -> Vec<String> {
+    let metadata = read_metadata(wiki_root);
+    let checkpoints = read_checkpoints(wiki_root);
+    let git_status = git_status(workspace);
+    let drift_count = Some(datecheck::drift_count(wiki_root));
+    let mut hints = Vec::new();
+    add_hints(
+        HintContext {
+            workspace,
+            wiki_root,
+            metadata: &metadata,
+            checkpoints: &checkpoints,
+            git_status: git_status.as_deref(),
+            drift_count,
+            fast: false,
+        },
+        &mut hints,
+    );
+    hints
+}
+
+/// `wiki/log.md`'s newest `## [YYYY-MM-DD] lint-check` marker and its age in
+/// whole UTC days, for the View `wiki.last_lint_at`/`wiki.lint_age_days`
+/// metrics and the `memory-lint` signal. Reuses `lint_age` rather than
+/// re-scanning `log.md`.
+pub(crate) fn last_lint(wiki_root: &Path) -> Option<(String, i64)> {
+    let content = fs::read_to_string(wiki_root.join("log.md")).ok()?;
+    lint_age(&content)
+}
+
 /// The runtime's own compiled version, from the crate's `CARGO_PKG_VERSION`.
 /// This is the self-report the config-dir ledger compares against at readiness;
 /// it can never be a stale skills-tree `CLI_VERSION`. See
@@ -149,13 +189,13 @@ pub fn resolve_wiki_root(workspace: &Path) -> Option<PathBuf> {
         .and_then(|path| fs::canonicalize(path).ok())
 }
 
-struct Metadata {
+pub(crate) struct Metadata {
     path: Option<String>,
-    status: String,
-    collection: String,
+    pub(crate) status: String,
+    pub(crate) collection: String,
 }
 
-fn read_metadata(wiki_root: &Path) -> Metadata {
+pub(crate) fn read_metadata(wiki_root: &Path) -> Metadata {
     let path = wiki_root.join(".wiki-metadata.json");
     let Ok(content) = fs::read_to_string(&path) else {
         return Metadata {
@@ -171,7 +211,7 @@ fn read_metadata(wiki_root: &Path) -> Metadata {
     }
 }
 
-fn qmd_readiness(wiki_root: &Path, metadata_collection: &str) -> (bool, String) {
+pub(crate) fn qmd_readiness(wiki_root: &Path, metadata_collection: &str) -> (bool, String) {
     let metadata_path = wiki_root.join(".wiki-metadata.json");
     if let Ok(content) = fs::read_to_string(metadata_path) {
         if json_string_value(&content, "status").as_deref() == Some("ready") {
@@ -399,7 +439,7 @@ fn parse_checkpoint(path: PathBuf) -> Checkpoint {
     }
 }
 
-fn checkpoint_field(line: &str, field: &str) -> Option<String> {
+pub(crate) fn checkpoint_field(line: &str, field: &str) -> Option<String> {
     let rest = line.trim_start().strip_prefix('-')?.trim_start();
     let rest = rest.strip_prefix(field)?.strip_prefix(':')?.trim();
     Some(rest.to_owned())
@@ -422,7 +462,7 @@ fn checkpoint_json(checkpoint: &Checkpoint, include_scope: bool) -> String {
     output
 }
 
-fn git_status(workspace: &Path) -> Option<String> {
+pub(crate) fn git_status(workspace: &Path) -> Option<String> {
     let output = Command::new("git")
         .args(["-C", &workspace.to_string_lossy(), "status", "--porcelain"])
         .output()
@@ -801,13 +841,13 @@ fn add_hint(
     ));
 }
 
-fn optional_json(value: Option<&str>) -> String {
+pub(crate) fn optional_json(value: Option<&str>) -> String {
     value
         .map(|value| format!("\"{}\"", json_escape(value)))
         .unwrap_or_else(|| "null".to_owned())
 }
 
-fn days_since_unix_epoch(value: &str) -> Option<i64> {
+pub(crate) fn days_since_unix_epoch(value: &str) -> Option<i64> {
     if !is_iso_date(value) {
         return None;
     }
@@ -886,7 +926,7 @@ fn is_iso_date(value: &str) -> bool {
         && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
-fn json_escape(value: &str) -> String {
+pub(crate) fn json_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
         match character {

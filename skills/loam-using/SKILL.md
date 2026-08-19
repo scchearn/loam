@@ -107,9 +107,10 @@ If you catch yourself rationalizing a shortcut, invoke the skill instead — eve
 │  ├─ create or review a goal ────────── /loam::setting-goals
 │  ├─ pause, reactivate, achieve ────── /loam::setting-goals
 │  └─ change what a goal means ──────── /loam::setting-goals
-└─ set up the substrate
-   ├─ scaffold the wiki ─────────────── /loam::scaffolding-wiki
-   └─ init Obsidian vault ───────────── /loam::initializing-vault
+├─ set up the substrate
+│  ├─ scaffold the wiki ─────────────── /loam::scaffolding-wiki
+│  └─ init Obsidian vault ───────────── /loam::initializing-vault
+└─ see the workspace ────────────────── open Loam View (below)
 ```
 
 ## Disambiguation (two skills seem to fit)
@@ -139,6 +140,25 @@ quoted command shown in the `Native runtime command:` context line:
 
 The harness hook operation is reserved for adapters and session startup; skills
 must not use it to resolve workspace state.
+
+### Opening Loam View
+
+"Open loam view", "show me the project view", "let me see the workspace" — the
+user wants the local read-only view of this workspace. It is a server, not a
+skill: background-spawn it, report the URL, and let the harness own the child.
+
+1. Background-spawn `npx @scchearn/loam view "$(pwd)" --no-open`. This is the
+   packaged Node entry, not the native runtime — the native binary has no
+   `view` verb. `--no-open` because a headless agent has no browser to hand the
+   page to.
+2. Read the first stdout line: `Loam View: http://127.0.0.1:<port>/`. The port
+   is ephemeral — parse it every time, never assume one.
+3. Give the user that URL. Do not poll the process, do not kill it, and do not
+   try to read the page yourself.
+
+It is read-only, loopback-only, and exports nothing. If the launcher reports an
+unsupported Node.js (needs >= 22) or a missing runtime, relay its message and
+the recovery line it prints; do not work around it.
 
 ### Background code ingestion
 

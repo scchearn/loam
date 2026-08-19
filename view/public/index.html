@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loam View</title>
+  <link rel="icon" href="/loam.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles/tokens.css">
+  <link rel="stylesheet" href="/styles/components.css">
+  <script type="module" src="/js/main.mjs"></script>
+</head>
+<body>
+  <svg width="0" height="0" class="sprite" aria-hidden="true" focusable="false">
+    <defs>
+      <symbol id="i-pulse" viewBox="0 0 256 256"><path d="M240,128a8,8,0,0,1-8,8H204.94l-37.78,75.58A8,8,0,0,1,160,216h-.4a8,8,0,0,1-7.08-5.14L95.35,60.76,63.28,131.31A8,8,0,0,1,56,136H24a8,8,0,0,1,0-16H50.85L88.72,36.69a8,8,0,0,1,14.76.46l57.51,151,31.85-63.71A8,8,0,0,1,200,120h32A8,8,0,0,1,240,128Z"/></symbol>
+      <symbol id="i-graph" viewBox="0 0 256 256"><path d="M200,152a31.84,31.84,0,0,0-19.53,6.68l-23.11-18A31.65,31.65,0,0,0,160,128c0-.74,0-1.48-.08-2.21l13.23-4.41A32,32,0,1,0,168,104c0,.74,0,1.48.08,2.21l-13.23,4.41A32,32,0,0,0,128,96a32.59,32.59,0,0,0-5.27.44L115.89,81A32,32,0,1,0,96,88a32.59,32.59,0,0,0,5.27-.44l6.84,15.4a31.92,31.92,0,0,0-8.57,39.64L73.83,165.44a32.06,32.06,0,1,0,10.63,12l25.71-22.84a31.91,31.91,0,0,0,37.36-1.24l23.11,18A31.65,31.65,0,0,0,168,184a32,32,0,1,0,32-32Zm0-64a16,16,0,1,1-16,16A16,16,0,0,1,200,88ZM80,56A16,16,0,1,1,96,72,16,16,0,0,1,80,56ZM56,208a16,16,0,1,1,16-16A16,16,0,0,1,56,208Zm56-80a16,16,0,1,1,16,16A16,16,0,0,1,112,128Zm88,72a16,16,0,1,1,16-16A16,16,0,0,1,200,200Z"/></symbol>
+      <symbol id="i-branch" viewBox="0 0 256 256"><path d="M232,64a32,32,0,1,0-40,31v17a8,8,0,0,1-8,8H96a23.84,23.84,0,0,0-8,1.38V95a32,32,0,1,0-16,0v66a32,32,0,1,0,16,0V144a8,8,0,0,1,8-8h88a24,24,0,0,0,24-24V95A32.06,32.06,0,0,0,232,64ZM64,64A16,16,0,1,1,80,80,16,16,0,0,1,64,64ZM96,192a16,16,0,1,1-16-16A16,16,0,0,1,96,192ZM200,80a16,16,0,1,1,16-16A16,16,0,0,1,200,80Z"/></symbol>
+      <symbol id="i-clock" viewBox="0 0 256 256"><path d="M136,80v43.47l36.12,21.67a8,8,0,0,1-8.24,13.72l-40-24A8,8,0,0,1,120,128V80a8,8,0,0,1,16,0Zm-8-48A95.44,95.44,0,0,0,60.08,60.15C52.81,67.51,46.35,74.59,40,82V64a8,8,0,0,0-16,0v40a8,8,0,0,0,8,8H72a8,8,0,0,0,0-16H49c7.15-8.42,14.27-16.35,22.39-24.57a80,80,0,1,1,1.66,114.75,8,8,0,1,0-11,11.64A96,96,0,1,0,128,32Z"/></symbol>
+      <symbol id="i-shield" viewBox="0 0 256 256"><path d="M208,40H48A16,16,0,0,0,32,56v56c0,52.72,25.52,84.67,46.93,102.19,23.06,18.86,46,25.26,47,25.53a8,8,0,0,0,4.2,0c1-.27,23.91-6.67,47-25.53C198.48,196.67,224,164.72,224,112V56A16,16,0,0,0,208,40Zm0,72c0,37.07-13.66,67.16-40.6,89.42A129.3,129.3,0,0,1,128,223.62a128.25,128.25,0,0,1-38.92-21.81C61.82,179.51,48,149.3,48,112l0-56,160,0ZM82.34,141.66a8,8,0,0,1,11.32-11.32L112,148.69l50.34-50.35a8,8,0,0,1,11.32,11.32l-56,56a8,8,0,0,1-11.32,0Z"/></symbol>
+      <symbol id="i-database" viewBox="0 0 256 256"><path d="M128,24C74.17,24,32,48.6,32,80v96c0,31.4,42.17,56,96,56s96-24.6,96-56V80C224,48.6,181.83,24,128,24Zm80,104c0,9.62-7.88,19.43-21.61,26.92C170.93,163.35,150.19,168,128,168s-42.93-4.65-58.39-13.08C55.88,147.43,48,137.62,48,128V111.36c17.06,15,46.23,24.64,80,24.64s62.94-9.68,80-24.64ZM69.61,53.08C85.07,44.65,105.81,40,128,40s42.93,4.65,58.39,13.08C200.12,60.57,208,70.38,208,80s-7.88,19.43-21.61,26.92C170.93,115.35,150.19,120,128,120s-42.93-4.65-58.39-13.08C55.88,99.43,48,89.62,48,80S55.88,60.57,69.61,53.08ZM186.39,202.92C170.93,211.35,150.19,216,128,216s-42.93-4.65-58.39-13.08C55.88,195.43,48,185.62,48,176V159.36c17.06,15,46.23,24.64,80,24.64s62.94-9.68,80-24.64V176C208,185.62,200.12,195.43,186.39,202.92Z"/></symbol>
+      <symbol id="i-target" viewBox="0 0 256 256"><path d="M221.87,83.16A104.1,104.1,0,1,1,195.67,49l22.67-22.68a8,8,0,0,1,11.32,11.32l-96,96a8,8,0,0,1-11.32-11.32l27.72-27.72a40,40,0,1,0,17.87,31.09,8,8,0,1,1,16-.9,56,56,0,1,1-22.38-41.65L184.3,60.39a87.88,87.88,0,1,0,23.13,29.67,8,8,0,0,1,14.44-6.9Z"/></symbol>
+      <symbol id="i-code" viewBox="0 0 256 256"><path d="M69.12,94.15,28.5,128l40.62,33.85a8,8,0,1,1-10.24,12.29l-48-40a8,8,0,0,1,0-12.29l48-40a8,8,0,0,1,10.24,12.3Zm176,27.7-48-40a8,8,0,1,0-10.24,12.3L227.5,128l-40.62,33.85a8,8,0,1,0,10.24,12.29l48-40a8,8,0,0,0,0-12.29ZM162.73,32.48a8,8,0,0,0-10.25,4.79l-64,176a8,8,0,0,0,4.79,10.26A8.14,8.14,0,0,0,96,224a8,8,0,0,0,7.52-5.27l64-176A8,8,0,0,0,162.73,32.48Z"/></symbol>
+      <symbol id="i-search" viewBox="0 0 256 256"><path d="M229.66,218.34l-50.07-50.06a88.11,88.11,0,1,0-11.31,11.31l50.06,50.07a8,8,0,0,0,11.32-11.32ZM40,112a72,72,0,1,1,72,72A72.08,72.08,0,0,1,40,112Z"/></symbol>
+      <symbol id="i-shapes" viewBox="0 0 256 256"><path d="M71.59,61.47a8,8,0,0,0-15.18,0l-40,120A8,8,0,0,0,24,192h80a8,8,0,0,0,7.59-10.53ZM35.1,176,64,89.3,92.9,176ZM208,76a52,52,0,1,0-52,52A52.06,52.06,0,0,0,208,76Zm-88,0a36,36,0,1,1,36,36A36,36,0,0,1,120,76Zm104,68H136a8,8,0,0,0-8,8v56a8,8,0,0,0,8,8h88a8,8,0,0,0,8-8V152A8,8,0,0,0,224,144Zm-8,56H144V160h72Z"/></symbol>
+      <symbol id="i-flag" viewBox="0 0 256 256"><path d="M42.76,50A8,8,0,0,0,40,56V224a8,8,0,0,0,16,0V179.77c26.79-21.16,49.87-9.75,76.45,3.41,16.4,8.11,34.06,16.85,53,16.85,13.93,0,28.54-4.75,43.82-18a8,8,0,0,0,2.76-6V56A8,8,0,0,0,218.76,50c-28,24.23-51.72,12.49-79.21-1.12C111.07,34.76,78.78,18.79,42.76,50ZM216,172.25c-26.79,21.16-49.87,9.74-76.45-3.41-25-12.35-52.81-26.13-83.55-8.4V59.79c26.79-21.16,49.87-9.75,76.45,3.4,25,12.35,52.82,26.13,83.55,8.4Z"/></symbol>
+      <symbol id="i-sparkle" viewBox="0 0 256 256"><path d="M197.58,129.06,146,110l-19-51.62a15.92,15.92,0,0,0-29.88,0L78,110l-51.62,19a15.92,15.92,0,0,0,0,29.88L78,178l19,51.62a15.92,15.92,0,0,0,29.88,0L146,178l51.62-19a15.92,15.92,0,0,0,0-29.88ZM137,164.22a8,8,0,0,0-4.74,4.74L112,223.85,91.78,169A8,8,0,0,0,87,164.22L32.15,144,87,123.78A8,8,0,0,0,91.78,119L112,64.15,132.22,119a8,8,0,0,0,4.74,4.74L191.85,144ZM144,40a8,8,0,0,1,8-8h16V16a8,8,0,0,1,16,0V32h16a8,8,0,0,1,0,16H184V64a8,8,0,0,1-16,0V48H152A8,8,0,0,1,144,40ZM248,88a8,8,0,0,1-8,8h-8v8a8,8,0,0,1-16,0V96h-8a8,8,0,0,1,0-16h8V72a8,8,0,0,1,16,0v8h8A8,8,0,0,1,248,88Z"/></symbol>
+      <symbol id="i-book" viewBox="0 0 256 256"><path d="M213.66,82.34l-56-56A8,8,0,0,0,152,24H56A16,16,0,0,0,40,40V216a16,16,0,0,0,16,16H200a16,16,0,0,0,16-16V88A8,8,0,0,0,213.66,82.34ZM160,51.31,188.69,80H160ZM200,216H56V40h88V88a8,8,0,0,0,8,8h48V216Zm-32-80a8,8,0,0,1-8,8H96a8,8,0,0,1,0-16h64A8,8,0,0,1,168,136Zm0,32a8,8,0,0,1-8,8H96a8,8,0,0,1,0-16h64A8,8,0,0,1,168,168Zm-64-64a8,8,0,0,1,0-16h8a8,8,0,0,1,0,16Z"/></symbol>
+      <symbol id="i-arrow-left" viewBox="0 0 256 256"><path d="M224,128a8,8,0,0,1-8,8H59.31l58.35,58.34a8,8,0,0,1-11.32,11.32l-72-72a8,8,0,0,1,0-11.32l72-72a8,8,0,0,1,11.32,11.32L59.31,120H216A8,8,0,0,1,224,128Z"/></symbol>
+      <symbol id="i-seal" viewBox="0 0 256 256"><path d="M225.86,102.82c-3.77-3.94-7.67-8-9.14-11.57-1.36-3.27-1.44-8.69-1.52-13.94-.15-9.76-.31-20.82-8-28.51s-18.75-7.85-28.51-8c-5.25-.08-10.67-.16-13.94-1.52-3.56-1.47-7.63-5.37-11.57-9.14C146.28,23.51,138.44,16,128,16s-18.27,7.51-25.18,14.14c-3.94,3.77-8,7.67-11.57,9.14C88,40.64,82.56,40.72,77.31,40.8c-9.76.15-20.82.31-28.51,8S41,67.55,40.8,77.31c-.08,5.25-.16,10.67-1.52,13.94-1.47,3.56-5.37,7.63-9.14,11.57C23.51,109.72,16,117.56,16,128s7.51,18.27,14.14,25.18c3.77,3.94,7.67,8,9.14,11.57,1.36,3.27,1.44,8.69,1.52,13.94.15,9.76.31,20.82,8,28.51s18.75,7.85,28.51,8c5.25.08,10.67.16,13.94,1.52,3.56,1.47,7.63,5.37,11.57,9.14C109.72,232.49,117.56,240,128,240s18.27-7.51,25.18-14.14c3.94-3.77,8-7.67,11.57-9.14,3.27-1.36,8.69-1.44,13.94-1.52,9.76-.15,20.82-.31,28.51-8s7.85-18.75,8-28.51c.08-5.25.16-10.67,1.52-13.94,1.47-3.56,5.37-7.63,9.14-11.57C232.49,146.28,240,138.44,240,128S232.49,109.73,225.86,102.82ZM173.66,109.66l-56,56a8,8,0,0,1-11.32,0l-24-24a8,8,0,0,1,11.32-11.32L112,148.69l50.34-50.35a8,8,0,0,1,11.32,11.32Z"/></symbol>
+    </defs>
+  </svg>
+
+  <div class="app-shell" data-app-shell>
+    <!-- Inside the shell, not beside it: the Inspector and Reader make the shell
+         inert, and a skip link outside it would stay reachable from a modal. -->
+    <a class="skip-link" href="#workspace">Skip to content</a>
+
+    <header class="topbar">
+      <div class="brand">
+        <img src="/loam.svg" alt="Loam" width="36" height="36">
+      </div>
+
+      <div class="workspace-mark">
+        <span class="workspace-name" data-workspace-name>Loam View</span>
+        <span class="workspace-context" data-workspace-context>Reading workspace</span>
+        <button class="ghost-btn" type="button" data-refresh>
+          Refresh
+        </button>
+      </div>
+
+      <div class="freshness">
+        <span class="freshness-dot" data-freshness-dot aria-hidden="true"></span>
+        <span data-freshness>Snapshot pending</span>
+      </div>
+
+      <button class="query-trigger" type="button" data-query-open aria-haspopup="dialog"
+              aria-label="Query" aria-keyshortcuts="Control+K Meta+K">
+        Query <kbd>&#8984;K</kbd>
+      </button>
+    </header>
+
+    <nav class="sidebar" aria-label="Areas">
+      <ul class="nav-list" data-nav>
+        <li class="nav-item">
+          <button class="nav-button" type="button" data-route="pulse">
+            <span class="nav-glyph" aria-hidden="true"><svg class="icon"><use href="#i-pulse"/></svg></span>Pulse
+          </button>
+        </li>
+        <li class="nav-item">
+          <button class="nav-button" type="button" data-route="atlas">
+            <span class="nav-glyph" aria-hidden="true"><svg class="icon"><use href="#i-graph"/></svg></span>Atlas
+          </button>
+        </li>
+        <li class="nav-item">
+          <button class="nav-button" type="button" data-route="work-stream">
+            <span class="nav-glyph" aria-hidden="true"><svg class="icon"><use href="#i-branch"/></svg></span>Work Stream
+          </button>
+        </li>
+        <li class="nav-item">
+          <button class="nav-button" type="button" data-route="chronicle">
+            <span class="nav-glyph" aria-hidden="true"><svg class="icon"><use href="#i-clock"/></svg></span>Chronicle
+          </button>
+        </li>
+        <li class="nav-item">
+          <button class="nav-button" type="button" data-route="stewardship">
+            <span class="nav-glyph" aria-hidden="true"><svg class="icon"><use href="#i-shield"/></svg></span>Stewardship
+          </button>
+        </li>
+      </ul>
+    </nav>
+
+    <main class="workspace" id="workspace" tabindex="-1">
+      <p class="notice" data-notice role="status"></p>
+
+      <!-- Shown instead of the areas when there is no snapshot to render. An
+           area's own empty state means "this workspace has none of X"; with no
+           snapshot at all that would be a fabricated claim. -->
+      <section class="view unreadable" data-unreadable hidden aria-labelledby="unreadable-title">
+        <div class="view-top">
+          <div class="view-top-main">
+            <h1 class="view-title" id="unreadable-title">No snapshot</h1>
+            <p class="view-subtitle">Nothing has been read from this workspace yet.</p>
+          </div>
+        </div>
+        <p class="view-empty" data-unreadable-reason></p>
+      </section>
+
+      <section class="view" data-view="pulse" aria-labelledby="pulse-title">
+        <div class="view-top">
+          <div class="view-top-main">
+            <h1 class="view-title" id="pulse-title">Pulse</h1>
+            <p class="view-subtitle">What needs attention now, with the evidence behind it.</p>
+          </div>
+        </div>
+        <div data-mount="pulse"></div>
+      </section>
+
+      <section class="view" data-view="atlas" aria-labelledby="atlas-title">
+        <div class="view-top">
+          <div class="view-top-main">
+            <h1 class="view-title" id="atlas-title">Atlas</h1>
+            <p class="view-subtitle">How code, concepts, work, and memory fit together.</p>
+          </div>
+        </div>
+        <div data-mount="atlas"></div>
+      </section>
+
+      <section class="view" data-view="work-stream" aria-labelledby="work-stream-title">
+        <div class="view-top">
+          <div class="view-top-main">
+            <h1 class="view-title" id="work-stream-title">Work Stream</h1>
+            <p class="view-subtitle">Why work exists, how far it has progressed, and what it touches.</p>
+          </div>
+        </div>
+        <div data-mount="work-stream"></div>
+      </section>
+
+      <section class="view" data-view="chronicle" aria-labelledby="chronicle-title">
+        <div class="view-top">
+          <div class="view-top-main">
+            <h1 class="view-title" id="chronicle-title">Chronicle</h1>
+            <p class="view-subtitle">How project understanding changed, event by event.</p>
+          </div>
+        </div>
+        <div data-mount="chronicle"></div>
+      </section>
+
+      <section class="view" data-view="stewardship" aria-labelledby="stewardship-title">
+        <div class="view-top">
+          <div class="view-top-main">
+            <h1 class="view-title" id="stewardship-title">Stewardship</h1>
+            <p class="view-subtitle">Whether this memory can be trusted, and what to fix first.</p>
+          </div>
+        </div>
+        <div data-mount="stewardship"></div>
+      </section>
+    </main>
+  </div>
+
+  <!--
+    Inspector: a top-level overlay, deliberately a sibling of .app-shell and not
+    a grid column, so opening it cannot reflow the view beneath (DESIGN.md §5).
+  -->
+  <div class="inspector-scrim" data-inspector-scrim aria-hidden="true"></div>
+
+  <aside
+    class="inspector"
+    data-inspector
+    role="dialog"
+    aria-modal="true"
+    aria-hidden="true"
+    aria-labelledby="inspector-title"
+    tabindex="-1"
+    inert
+  >
+    <div class="inspector-head">
+      <span id="inspector-title">Inspector</span>
+      <button class="dialog-close" type="button" data-inspector-close aria-label="Close Inspector">&#215;</button>
+    </div>
+    <div class="inspector-body" data-inspector-body></div>
+  </aside>
+  <section class="reader" data-reader hidden tabindex="-1" aria-labelledby="reader-title">
+    <header class="reader-bar">
+      <button class="ghost-btn reader-back" type="button" data-reader-back>
+        <svg class="icon" aria-hidden="true"><use href="#i-arrow-left"/></svg>Back
+      </button>
+      <div class="reader-ident">
+        <h1 class="reader-title" id="reader-title" data-reader-title>Document</h1>
+        <code class="code-chip reader-path" data-reader-path></code>
+      </div>
+    </header>
+
+    <p class="reader-banner" data-reader-banner hidden role="status">
+      <span data-reader-banner-text></span>
+      <button class="ghost-btn" type="button" data-reader-refresh>Refresh</button>
+    </p>
+
+    <div class="reader-body">
+      <nav class="reader-outline" data-reader-outline aria-labelledby="reader-outline-title" hidden>
+        <p class="label" id="reader-outline-title">On this page</p>
+        <ul class="reader-outline-list" data-reader-outline-list></ul>
+      </nav>
+
+      <div class="reader-main">
+        <p class="notice reader-status" data-reader-status role="status"></p>
+        <details class="reader-meta" data-reader-frontmatter hidden>
+          <summary>Front matter</summary>
+          <dl class="reader-meta-list" data-reader-frontmatter-body></dl>
+        </details>
+        <article class="reader-doc" data-reader-doc tabindex="-1"></article>
+      </div>
+    </div>
+  </section>
+
+  <dialog class="query-dialog" data-query-dialog aria-labelledby="query-title">
+    <div class="dialog-head">
+      <h2 id="query-title">Query</h2>
+      <button class="dialog-close" type="button" data-query-close aria-label="Close Query">&#215;</button>
+    </div>
+
+    <input
+      class="query-field"
+      id="query-input"
+      type="search"
+      autocomplete="off"
+      spellcheck="false"
+      placeholder="Search memory, code, and work"
+      aria-label="Search memory, code, and work"
+      data-query-input
+      aria-controls="query-results"
+      aria-describedby="query-empty"
+    >
+
+    <div class="query-filters" data-query-filters role="group" aria-label="Filter by kind"></div>
+
+    <!-- Chrome focuses an overflowing scroller by itself, with the UA ring and
+         no name. Naming it makes that tab stop legible everywhere. -->
+    <div class="query-scroll" tabindex="0" role="region" aria-label="Search results">
+      <ul class="query-results" id="query-results" data-query-results></ul>
+      <p class="query-empty" id="query-empty" data-query-empty role="status"></p>
+    </div>
+  </dialog>
+
+  <!-- Present and empty from first paint: a live region inserted with its text
+       already in it is not reliably announced, so the first copy would be
+       silent for a screen reader. -->
+  <div class="toast" data-toast role="status" aria-live="polite"></div>
+</body>
+</html>

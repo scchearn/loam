@@ -83,6 +83,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         Some("walk") => run_walk(args),
         Some("index") => run_index(args),
         Some("diff") => run_diff(args),
+        Some("snapshot") => run_snapshot(args),
         _ => {
             usage();
             1
@@ -270,6 +271,94 @@ fn run_diff(mut args: impl Iterator<Item = String>) -> i32 {
         }
     };
     let index = index_records(&wiki_root, Some(&codebase_root));
+    let entries = diff_entries(&walk, &index, &codebase_root, &wiki_root, &options);
+    println!("[{}]", entries.join(","));
+    0
+}
+
+fn run_snapshot(mut args: impl Iterator<Item = String>) -> i32 {
+    let Some(codebase_root) = args.next() else {
+        usage();
+        return 1;
+    };
+    let Some(wiki_root) = args.next() else {
+        usage();
+        return 1;
+    };
+
+    let mut options = Options::default();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--no-gitignore" => options.no_gitignore = true,
+            "--ref" => {
+                let Some(value) = args.next() else {
+                    eprintln!("Error: --ref requires a commit");
+                    return 1;
+                };
+                options.source_ref = Some(value);
+            }
+            "--generator-version" => {
+                let Some(value) = args.next() else {
+                    eprintln!("Error: --generator-version requires a value");
+                    return 1;
+                };
+                options.generator_version = value;
+            }
+            "--exclusions" => {
+                let Some(path) = args.next() else {
+                    eprintln!("Error: --exclusions requires a file");
+                    return 1;
+                };
+                options.exclusions = Some(PathBuf::from(path));
+            }
+            _ => {
+                eprintln!("Error: unknown flag: {arg}");
+                return 1;
+            }
+        }
+    }
+
+    let codebase_root = PathBuf::from(codebase_root);
+    if !codebase_root.is_dir() {
+        eprintln!(
+            "Error: codebase root not found: {}",
+            codebase_root.display()
+        );
+        return 2;
+    }
+    let wiki_root = PathBuf::from(wiki_root);
+    if let Err(code) = validate_wiki_root(&wiki_root) {
+        return code;
+    }
+
+    let walk = match collect(&codebase_root, &options) {
+        Ok(walk) => walk,
+        Err((code, message)) => {
+            eprintln!("Error: {message}");
+            return code;
+        }
+    };
+    let index = index_records(&wiki_root, Some(&codebase_root));
+    let diff = diff_entries(&walk, &index, &codebase_root, &wiki_root, &options);
+    println!(
+        "{{\"walk\":{},\"index\":{},\"diff\":[{}]}}",
+        walk_json(&walk.items),
+        index_json(&index),
+        diff.join(",")
+    );
+    0
+}
+
+/// One candidate walk and one index read already ran; this turns them into the same `diff`
+/// entries `run_diff` would print, including the shared-store publish/reuse side effects.
+/// Shared by `diff` and `snapshot` so the two commands can never drift apart.
+fn diff_entries(
+    walk: &WalkResult,
+    index: &[IndexEntry],
+    codebase_root: &Path,
+    wiki_root: &Path,
+    options: &Options,
+) -> Vec<String> {
     let by_source: HashMap<&str, &IndexEntry> = index
         .iter()
         .map(|entry| (entry.source_path.as_str(), entry))
@@ -283,9 +372,9 @@ fn run_diff(mut args: impl Iterator<Item = String>) -> i32 {
     // The store is repo-scoped and shared by every worktree. Publishing local bodies here
     // keeps it current without adding a step for the agent, and back-fills an existing
     // corpus the first time a repository sees this version. Absent outside Git.
-    let store_root = GitRepo::discover(&codebase_root).and_then(|git| git.store_root());
+    let store_root = GitRepo::discover(codebase_root).and_then(|git| git.store_root());
     if let Some(store_root) = store_root.as_deref() {
-        store_sync(store_root, &wiki_root, &index);
+        store_sync(store_root, wiki_root, index);
     }
 
     let mut entries = Vec::new();
@@ -321,8 +410,7 @@ fn run_diff(mut args: impl Iterator<Item = String>) -> i32 {
             None,
         ));
     }
-    println!("[{}]", entries.join(","));
-    0
+    entries
 }
 
 fn diff_record_json(
@@ -538,6 +626,59 @@ fn pending_count_with(codebase: &Path, wiki_root: &Path, options: Options) -> Op
     )
 }
 
+/// `specs/loam-view.md` "Codegraph snapshot and formulas": `W` = unique
+/// `walk.path` candidates, `I` = unique indexed `source_path` entries, `S` =
+/// stale paths, `N` = new paths. `current = |(W ∩ I) − S|`,
+/// `orphan = |I − W|`. Reuses the same `collect`/`index_records`/`is_stale`
+/// machinery as `snapshot`/`diff` rather than re-deriving it, so the three
+/// commands can never drift apart.
+pub(crate) struct CoverageMetrics {
+    pub(crate) candidates: usize,
+    pub(crate) source_backed_pages: usize,
+    pub(crate) current: usize,
+    pub(crate) stale: usize,
+    pub(crate) new: usize,
+    pub(crate) orphan: usize,
+}
+
+pub(crate) fn coverage_metrics(codebase: &Path, wiki_root: &Path) -> Option<CoverageMetrics> {
+    let walk = collect(codebase, &Options::default()).ok()?;
+    let index = index_records(wiki_root, Some(codebase));
+    let by_source: HashMap<&str, &IndexEntry> = index
+        .iter()
+        .map(|entry| (entry.source_path.as_str(), entry))
+        .collect();
+    let walk_paths: HashSet<&str> = walk.items.iter().map(|item| item.path.as_str()).collect();
+    let index_paths: HashSet<&str> = index
+        .iter()
+        .map(|entry| entry.source_path.as_str())
+        .collect();
+
+    let matched = walk
+        .items
+        .iter()
+        .filter(|item| by_source.contains_key(item.path.as_str()))
+        .count();
+    let stale = walk
+        .items
+        .iter()
+        .filter(|item| match by_source.get(item.path.as_str()) {
+            Some(record) => is_stale(item, record, ""),
+            None => false,
+        })
+        .count();
+    let orphan = index_paths.difference(&walk_paths).count();
+
+    Some(CoverageMetrics {
+        candidates: walk_paths.len(),
+        source_backed_pages: index_paths.len(),
+        current: matched.saturating_sub(stale),
+        stale,
+        new: walk.items.len().saturating_sub(matched),
+        orphan,
+    })
+}
+
 struct IndexRecord {
     ingested_at: String,
     source_size: Option<String>,
@@ -612,6 +753,9 @@ fn usage() {
     );
     eprintln!(
         "  loam codegraph diff  <codebase-root> [<wiki-root>] [--exclusions <file>] [--no-gitignore] [--strict] [--ref <commit>] [--generator-version <opaque>]"
+    );
+    eprintln!(
+        "  loam codegraph snapshot <codebase-root> <wiki-root> [--exclusions <file>] [--no-gitignore] [--ref <commit>] [--generator-version <opaque>]"
     );
 }
 

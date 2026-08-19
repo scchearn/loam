@@ -19,3 +19,4 @@ plans/
 # Python bytecode from the deploy signer (never committed)
 __pycache__/
 *.pyc
+.worktrees/
