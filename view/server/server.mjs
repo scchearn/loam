@@ -4,7 +4,7 @@ import { createServer as createHttpServer } from 'node:http';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { assertInside } from '../../integration/paths.mjs';
+import { assertInside, assertPhysicalInside } from '../../integration/paths.mjs';
 import { safeDetail } from '../../integration/runtime.mjs';
 import { buildSearchIndex as defaultBuildSearchIndex, search as runSearch } from './search.mjs';
 import { validateSnapshot } from './validate-snapshot.mjs';
@@ -206,14 +206,11 @@ export function createServer({
   }
 
   async function handleStatic(req, res, pathname) {
-    // /vendor/* serves the pinned third-party modules, which live beside public/
-    // so the vendor manifest can police that tree as one unit. The prefix is
-    // what lets a browser module and a Node test share one import specifier.
-    const vendored = pathname.startsWith('/vendor/');
-    const root = vendored ? vendorRoot : publicRoot;
-    const relative = vendored
-      ? pathname.slice('/vendor'.length)
-      : (pathname === '/' ? '/index.html' : pathname);
+    // The pinned vendor builds live beside `public/`, not inside it, so they are
+    // served from their own root rather than copied or symlinked.
+    const isVendor = pathname.startsWith('/vendor/');
+    const root = isVendor ? vendorRoot : publicRoot;
+    const relative = isVendor ? pathname.slice('/vendor'.length) : (pathname === '/' ? '/index.html' : pathname);
     let target;
     try {
       target = assertInside(root, join(root, decodeURIComponent(relative)), 'static path');
@@ -228,6 +225,15 @@ export function createServer({
       return sendJson(res, 404, { error: 'not_found' });
     }
     if (!info.isFile()) return sendJson(res, 404, { error: 'not_found' });
+
+    // Lexical bounding is not enough on its own: a symlink planted inside a
+    // served root would otherwise be read through. Resolve both ends and check
+    // the physical path as well.
+    try {
+      await assertPhysicalInside(root, target, 'static path');
+    } catch {
+      return sendJson(res, 400, { error: 'invalid_path' });
+    }
 
     const body = await readFile(target);
     const isIndex = relative === '/index.html';
