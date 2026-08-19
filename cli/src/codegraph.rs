@@ -607,6 +607,59 @@ pub fn pending_count(codebase: &Path, wiki_root: &Path) -> Option<usize> {
     )
 }
 
+/// `specs/loam-view.md` "Codegraph snapshot and formulas": `W` = unique
+/// `walk.path` candidates, `I` = unique indexed `source_path` entries, `S` =
+/// stale paths, `N` = new paths. `current = |(W ∩ I) − S|`,
+/// `orphan = |I − W|`. Reuses the same `collect`/`index_records`/`is_stale`
+/// machinery as `snapshot`/`diff` rather than re-deriving it, so the three
+/// commands can never drift apart.
+pub(crate) struct CoverageMetrics {
+    pub(crate) candidates: usize,
+    pub(crate) source_backed_pages: usize,
+    pub(crate) current: usize,
+    pub(crate) stale: usize,
+    pub(crate) new: usize,
+    pub(crate) orphan: usize,
+}
+
+pub(crate) fn coverage_metrics(codebase: &Path, wiki_root: &Path) -> Option<CoverageMetrics> {
+    let walk = collect(codebase, &Options::default()).ok()?;
+    let index = index_records(wiki_root, Some(codebase));
+    let by_source: HashMap<&str, &IndexEntry> = index
+        .iter()
+        .map(|entry| (entry.source_path.as_str(), entry))
+        .collect();
+    let walk_paths: HashSet<&str> = walk.items.iter().map(|item| item.path.as_str()).collect();
+    let index_paths: HashSet<&str> = index
+        .iter()
+        .map(|entry| entry.source_path.as_str())
+        .collect();
+
+    let matched = walk
+        .items
+        .iter()
+        .filter(|item| by_source.contains_key(item.path.as_str()))
+        .count();
+    let stale = walk
+        .items
+        .iter()
+        .filter(|item| match by_source.get(item.path.as_str()) {
+            Some(record) => is_stale(item, record, ""),
+            None => false,
+        })
+        .count();
+    let orphan = index_paths.difference(&walk_paths).count();
+
+    Some(CoverageMetrics {
+        candidates: walk_paths.len(),
+        source_backed_pages: index_paths.len(),
+        current: matched.saturating_sub(stale),
+        stale,
+        new: walk.items.len().saturating_sub(matched),
+        orphan,
+    })
+}
+
 struct IndexRecord {
     ingested_at: String,
     source_size: Option<String>,

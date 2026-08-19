@@ -1,18 +1,19 @@
-//! `loam state --view` snapshot producer (Loam View, T3 + T4).
+//! `loam state --view` snapshot producer (Loam View, T3 + T4 + T6).
 //!
-//! Emits the `workspace`, `capabilities`, `artifacts` (T3), and
-//! `relationships` (T4: wikilink scanner + derivation) sections of the
-//! snapshot v1 contract (`view/schema/snapshot-v1.schema.json`). The
-//! remaining arrays (`events`, `metrics`, `signals`, `hints`, `probes`) are
-//! always empty here; other tasks own them.
+//! Emits the full snapshot v1 contract (`view/schema/snapshot-v1.schema.json`):
+//! `workspace`, `capabilities`, `artifacts` (T3); `relationships` (T4:
+//! wikilink scanner + derivation); and `events`, `metrics`, `signals`,
+//! `hints`, `probes`, and the top-level `posture` verdict (T6).
 //! See `specs/loam-view.md` "Snapshot v1 shape", "Artifact inventory and
-//! wikilink rules", and "V1 relationship rules are limited to ...".
+//! wikilink rules", "V1 relationship rules are limited to ...", "Loam State
+//! View profile contract" (events/metric catalog/signals and posture).
 
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::Instant;
 
-use crate::{sha256, state};
+use crate::{codegraph, datecheck, sha256, state};
 
 const SKIP_DIRS: [&str; 5] = [".git", "node_modules", "target", ".archive", "log-archive"];
 
@@ -49,15 +50,129 @@ pub(crate) fn snapshot(workspace: &Path) -> String {
     collect_agents(workspace, workspace, &canonical_root, &mut artifacts);
     artifacts.sort_by(|left, right| left.path.cmp(&right.path));
 
-    let status = if has_wiki { "ready" } else { "not-configured" };
-    let capabilities = build_capabilities(&wiki_root, has_wiki, &artifacts, &git);
     let generated_at = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
-    let relationships = derive_relationships(&artifacts, workspace, &generated_at);
+    let (relationships, wikilink_diagnostics) =
+        derive_relationships(&artifacts, workspace, &generated_at);
+    let broken_wikilinks = wikilink_diagnostics
+        .iter()
+        .filter(|diagnostic| matches!(diagnostic.kind, "broken-wikilink" | "ambiguous-wikilink"))
+        .count();
+
+    let qmd = qmd_capability(&wiki_root, has_wiki);
+    let capabilities = build_capabilities(has_wiki, &artifacts, &git, qmd.clone());
+
+    let status = if has_wiki { "ready" } else { "not-configured" };
+    let required_incomplete = ![&capabilities.wiki, &capabilities.search_corpus]
+        .into_iter()
+        .all(|capability| matches!(capability.state, "ready" | "absent"));
+
+    let (events, metrics, signals, hints, probes, posture) = if has_wiki {
+        let mut probes = Vec::new();
+
+        let coverage_start = Instant::now();
+        let coverage = codegraph::coverage_metrics(workspace, &wiki_root);
+        probes.push(Probe {
+            id: "codegraph",
+            state: if coverage.is_some() {
+                "ok".to_owned()
+            } else {
+                "error".to_owned()
+            },
+            duration_ms: coverage_start.elapsed().as_secs_f64() * 1000.0,
+            message: coverage
+                .is_none()
+                .then(|| "codegraph snapshot did not produce a walk/index result".to_owned()),
+        });
+
+        probes.push(Probe {
+            id: "git",
+            state: git.capability_state.to_owned(),
+            duration_ms: 0.0,
+            message: git.capability_reason.clone(),
+        });
+
+        probes.push(Probe {
+            id: "qmd",
+            state: if qmd.0 {
+                "ok".to_owned()
+            } else {
+                "skipped".to_owned()
+            },
+            duration_ms: 0.0,
+            message: qmd.1.clone(),
+        });
+
+        probes.push(Probe {
+            id: "wikilink-scan",
+            state: "ok".to_owned(),
+            duration_ms: 0.0,
+            message: None,
+        });
+
+        let last_lint = state::last_lint(&wiki_root);
+        let noncanonical_timestamps: Vec<(String, String)> = artifacts
+            .iter()
+            .flat_map(|artifact| {
+                artifact
+                    .noncanonical_timestamps
+                    .iter()
+                    .map(move |field| (artifact.path.clone(), field.clone()))
+            })
+            .collect();
+        let metadata = state::read_metadata(&wiki_root);
+        let checkpoint_watch = checkpoint_state_watch(&artifacts, git.dirty.unwrap_or(false));
+        let code_graph_ready = artifacts.iter().any(|artifact| artifact.kind == "code");
+
+        let broken_wikilink_diagnostics: Vec<&WikilinkDiagnostic> = wikilink_diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                matches!(diagnostic.kind, "broken-wikilink" | "ambiguous-wikilink")
+            })
+            .collect();
+
+        let events = derive_events(&artifacts, workspace, &wiki_root);
+        let metrics = compute_metrics(
+            &artifacts,
+            &wiki_root,
+            broken_wikilinks,
+            &coverage,
+            &last_lint,
+        );
+        let signals = compute_signals(
+            &artifacts,
+            &wiki_root,
+            code_graph_ready,
+            &coverage,
+            &broken_wikilink_diagnostics,
+            &last_lint,
+            &noncanonical_timestamps,
+            &metadata.status,
+            checkpoint_watch,
+        );
+        let hints = state::hints_for_view(workspace, &wiki_root);
+        let posture = compute_posture(has_wiki, required_incomplete, &signals);
+
+        (events, metrics, signals, hints, probes, posture)
+    } else {
+        let hints = vec![
+            "{\"kind\":\"memory_missing\",\"group\":\"maintenance\",\"severity\":\"info\",\"message\":\"No memory substrate found; scaffold a wiki to begin.\",\"command\":\"/loam::scaffolding-wiki <goal>\",\"evidence\":{}}"
+                .to_owned(),
+        ];
+        (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            hints,
+            Vec::new(),
+            compute_posture(has_wiki, required_incomplete, &[]),
+        )
+    };
 
     format!(
-        "{{\"profile\":\"loam-view\",\"schema_version\":1,\"generated_at\":\"{}\",\"status\":\"{}\",\"workspace\":{},\"capabilities\":{},\"artifacts\":[{}],\"relationships\":[{}],\"events\":[],\"metrics\":{{}},\"signals\":[],\"hints\":[],\"probes\":[]}}",
+        "{{\"profile\":\"loam-view\",\"schema_version\":1,\"generated_at\":\"{}\",\"status\":\"{}\",\"posture\":\"{}\",\"workspace\":{},\"capabilities\":{},\"artifacts\":[{}],\"relationships\":[{}],\"events\":[{}],\"metrics\":{},\"signals\":{},\"hints\":[{}],\"probes\":{}}}",
         state::json_escape(&generated_at),
         status,
+        posture,
         workspace_json(&canonical_root, &name, platform, &git),
         capabilities.to_json(),
         artifacts
@@ -70,7 +185,63 @@ pub(crate) fn snapshot(workspace: &Path) -> String {
             .map(Relationship::to_json)
             .collect::<Vec<_>>()
             .join(","),
+        events.iter().map(Event::to_json).collect::<Vec<_>>().join(","),
+        metrics_json(&metrics),
+        signals_json(&signals),
+        hints.join(","),
+        probes_json(&probes),
     )
+}
+
+/// Mirrors `state.rs`'s dirty-worktree-30-minute and resume-24-hour rules
+/// (`checkpoint_stale`/`resume_stale` hints) against the latest checkpoint by
+/// filename order, per `specs/loam-view.md`'s `checkpoint-state` signal row.
+fn checkpoint_state_watch(artifacts: &[Artifact], git_dirty: bool) -> bool {
+    let mut checkpoints: Vec<&Artifact> = artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == "checkpoint")
+        .collect();
+    checkpoints.sort_by(|left, right| right.path.cmp(&left.path));
+    let latest_age_minutes = checkpoints
+        .iter()
+        .find_map(|artifact| artifact.captured_at.as_deref())
+        .and_then(rfc3339_epoch_seconds)
+        .map(|captured| (now_epoch_seconds() - captured) / 60);
+
+    let checkpoint_stale =
+        git_dirty && (checkpoints.is_empty() || latest_age_minutes.is_some_and(|age| age >= 30));
+    let resume_stale = !checkpoints.is_empty() && latest_age_minutes.is_some_and(|age| age >= 1440);
+    checkpoint_stale || resume_stale
+}
+
+/// Inverse of `parse_loam_timestamp`'s output shape (fixed-width
+/// `YYYY-MM-DDTHH:MM:SS±HH:MM`, seconds always `:00`), for age comparisons
+/// against the wall clock.
+fn rfc3339_epoch_seconds(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 25
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || !matches!(bytes[19], b'+' | b'-')
+        || bytes[22] != b':'
+    {
+        return None;
+    }
+    let day = state::days_since_unix_epoch(&value[..10])?;
+    let hour: i64 = value[11..13].parse().ok()?;
+    let minute: i64 = value[14..16].parse().ok()?;
+    let offset_hour: i64 = value[20..22].parse().ok()?;
+    let offset_minute: i64 = value[23..25].parse().ok()?;
+    let offset = (offset_hour * 60 + offset_minute) * 60;
+    let offset = if bytes[19] == b'+' { offset } else { -offset };
+    Some(day * 86_400 + hour * 3_600 + minute * 60 - offset)
+}
+
+fn now_epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64)
 }
 
 // --- workspace / git -------------------------------------------------
@@ -217,10 +388,10 @@ impl Capabilities {
 }
 
 fn build_capabilities(
-    wiki_root: &Path,
     has_wiki: bool,
     artifacts: &[Artifact],
     git: &GitInfo,
+    qmd: (bool, Option<String>),
 ) -> Capabilities {
     let no_wiki_reason = || Some("no wiki/ directory found".to_owned());
     let wiki = if has_wiki {
@@ -268,8 +439,8 @@ fn build_capabilities(
         None,
     );
 
-    let (qmd_ready, qmd_reason) = qmd_capability(wiki_root, has_wiki);
-    let qmd = if qmd_ready {
+    let (qmd_ready, qmd_reason) = qmd;
+    let qmd_cap = if qmd_ready {
         cap("ready", false, None, None)
     } else {
         cap("absent", false, qmd_reason, None)
@@ -282,7 +453,7 @@ fn build_capabilities(
         work,
         checkpoints,
         git: git_cap,
-        qmd,
+        qmd: qmd_cap,
         search_corpus,
     }
 }
@@ -318,6 +489,20 @@ struct Artifact {
     /// (front matter/body are already parsed in `build_artifact`) rather than
     /// re-parsed from `attributes`'s JSON string. Not part of the wire shape.
     link_facts: LinkFacts,
+    /// Top-level timestamp fields (`created_at`, `updated_at`, `captured_at`)
+    /// that parsed via the T6 `±HHMM` amendment rather than the canonical
+    /// `±HH:MM` form. Feeds the `memory-lint` signal. Not part of the wire
+    /// shape.
+    noncanonical_timestamps: Vec<String>,
+    /// Parsed `## Reviews` -> `### YYYY-MM-DD` entries for goal artifacts
+    /// (empty for every other kind). Feeds Chronicle `goal-review` events.
+    /// Not part of the wire shape.
+    goal_reviews: Vec<GoalReview>,
+}
+
+struct GoalReview {
+    date: String,
+    result: Option<String>,
 }
 
 #[derive(Default)]
@@ -330,6 +515,8 @@ struct LinkFacts {
     plan_touched_files: Vec<String>,
     checkpoint_previous: Option<String>,
     checkpoint_supersedes: Option<String>,
+    checkpoint_scope: Option<String>,
+    checkpoint_workstreams: Vec<Workstream>,
     code_source_path: Option<String>,
 }
 
@@ -532,23 +719,40 @@ fn build_artifact(workspace: &Path, file: &Path, kind: &'static str) -> Artifact
             attributes: default_attributes(kind),
             parse_errors: vec!["content is not valid UTF-8".to_owned()],
             link_facts: LinkFacts::default(),
+            noncanonical_timestamps: Vec::new(),
+            goal_reviews: Vec::new(),
         };
     };
 
     let (front_matter, body) = parse_front_matter(&content);
     let mut parse_errors = front_matter.parse_errors.clone();
+    let mut noncanonical_timestamps = Vec::new();
 
     let title = extract_title(&front_matter, &body);
     let lifecycle_status = front_matter.get("status").map(str::to_owned);
 
-    let created_at = extract_timestamp(&front_matter, "created_at", &mut parse_errors);
-    let updated_at = extract_timestamp(&front_matter, "updated_at", &mut parse_errors);
+    let created_at = extract_timestamp(
+        &front_matter,
+        "created_at",
+        &mut parse_errors,
+        &mut noncanonical_timestamps,
+    );
+    let updated_at = extract_timestamp(
+        &front_matter,
+        "updated_at",
+        &mut parse_errors,
+        &mut noncanonical_timestamps,
+    );
 
     let captured_at = if kind == "checkpoint" {
         body.lines()
             .find_map(|line| state::checkpoint_field(line, "Captured"))
             .and_then(|raw| match parse_loam_timestamp(&raw) {
-                Some(value) => Some(value),
+                Some(LoamTimestamp::Canonical(value)) => Some(value),
+                Some(LoamTimestamp::Noncanonical(value)) => {
+                    noncanonical_timestamps.push("captured_at".to_owned());
+                    Some(value)
+                }
                 None => {
                     parse_errors.push(format!("invalid captured_at: {raw}"));
                     None
@@ -556,6 +760,12 @@ fn build_artifact(workspace: &Path, file: &Path, kind: &'static str) -> Artifact
             })
     } else {
         None
+    };
+
+    let goal_reviews = if kind == "goal" {
+        parse_goal_reviews(&body, &mut parse_errors)
+    } else {
+        Vec::new()
     };
 
     let attributes = match kind {
@@ -594,6 +804,10 @@ fn build_artifact(workspace: &Path, file: &Path, kind: &'static str) -> Artifact
             checkpoint_supersedes: body
                 .lines()
                 .find_map(|line| state::checkpoint_field(line, "Supersedes")),
+            checkpoint_scope: body
+                .lines()
+                .find_map(|line| state::checkpoint_field(line, "Scope")),
+            checkpoint_workstreams: parse_workstreams(&body),
             ..LinkFacts::default()
         },
         _ => LinkFacts::default(),
@@ -612,7 +826,55 @@ fn build_artifact(workspace: &Path, file: &Path, kind: &'static str) -> Artifact
         attributes,
         parse_errors,
         link_facts,
+        noncanonical_timestamps,
+        goal_reviews,
     }
+}
+
+/// `## Reviews` -> `### YYYY-MM-DD` entries per
+/// `skills/loam-work/loam-setting-goals/references/template.md`. An
+/// unparseable heading is recorded as a parse diagnostic and skipped rather
+/// than becoming a Chronicle event with an invented date.
+fn parse_goal_reviews(body: &str, parse_errors: &mut Vec<String>) -> Vec<GoalReview> {
+    let mut reviews = Vec::new();
+    let mut in_reviews = false;
+    let mut current: Option<(String, Option<String>)> = None;
+
+    let flush = |current: &mut Option<(String, Option<String>)>,
+                 reviews: &mut Vec<GoalReview>,
+                 parse_errors: &mut Vec<String>| {
+        let Some((date, result)) = current.take() else {
+            return;
+        };
+        if state::days_since_unix_epoch(&date).is_some() {
+            reviews.push(GoalReview { date, result });
+        } else {
+            parse_errors.push(format!("invalid goal review date: {date}"));
+        }
+    };
+
+    for line in body.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            flush(&mut current, &mut reviews, parse_errors);
+            in_reviews = heading.trim().eq_ignore_ascii_case("reviews");
+            continue;
+        }
+        if !in_reviews {
+            continue;
+        }
+        if let Some(date) = line.strip_prefix("### ") {
+            flush(&mut current, &mut reviews, parse_errors);
+            current = Some((date.trim().to_owned(), None));
+            continue;
+        }
+        if let (Some((_, result)), Some(value)) =
+            (current.as_mut(), state::checkpoint_field(line, "Result"))
+        {
+            *result = Some(value);
+        }
+    }
+    flush(&mut current, &mut reviews, parse_errors);
+    reviews
 }
 
 /// Same "Files:" body lines `plan_attributes` reads, factored out so
@@ -638,10 +900,15 @@ fn extract_timestamp(
     front_matter: &FrontMatter,
     key: &str,
     parse_errors: &mut Vec<String>,
+    noncanonical_timestamps: &mut Vec<String>,
 ) -> Option<String> {
     let raw = front_matter.get(key)?;
     match parse_loam_timestamp(raw) {
-        Some(value) => Some(value),
+        Some(LoamTimestamp::Canonical(value)) => Some(value),
+        Some(LoamTimestamp::Noncanonical(value)) => {
+            noncanonical_timestamps.push(key.to_owned());
+            Some(value)
+        }
         None => {
             parse_errors.push(format!("invalid {key}: {raw}"));
             None
@@ -1032,36 +1299,63 @@ fn extract_title(front_matter: &FrontMatter, body: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// Loam's flat timestamp convention (`YYYY-MM-DD HH:MM ±HH:MM`, matching
-/// `state.rs`'s `epoch_of`) reformatted to the schema's RFC 3339 shape
-/// (`YYYY-MM-DDTHH:MM:SS±HH:MM`). Returns `None` for anything that isn't
-/// that exact shape or fails calendar validation, rather than guessing.
-fn parse_loam_timestamp(raw: &str) -> Option<String> {
+/// A successfully parsed loam timestamp, normalized to RFC 3339. `Canonical`
+/// used the documented `±HH:MM` offset form; `Noncanonical` accepted an
+/// unambiguous `±HHMM` offset (T6 amendment, user-approved 2026-08-19) and
+/// still normalizes to the same RFC 3339 string -- chronology is preserved,
+/// this is never a parse error, but the caller records a distinct
+/// `noncanonical-timestamp` diagnostic for it.
+#[derive(Debug, PartialEq)]
+enum LoamTimestamp {
+    Canonical(String),
+    Noncanonical(String),
+}
+
+/// Loam's flat timestamp convention reformatted to the schema's RFC 3339
+/// shape (`YYYY-MM-DDTHH:MM:SS±HH:MM`). Accepts both the documented
+/// `YYYY-MM-DD HH:MM ±HH:MM` form and an unambiguous `YYYY-MM-DD HH:MM
+/// ±HHMM` form (23 vs. 22 bytes -- offset with or without its colon).
+/// Returns `None` for anything else or a value that fails calendar
+/// validation, rather than guessing.
+fn parse_loam_timestamp(raw: &str) -> Option<LoamTimestamp> {
     let value = raw.trim();
     let bytes = value.as_bytes();
-    if bytes.len() != 23
-        || bytes[10] != b' '
+    let canonical = bytes.len() == 23 && bytes[20] == b':';
+    let noncanonical = bytes.len() == 22;
+    if !canonical && !noncanonical {
+        return None;
+    }
+    if bytes[10] != b' '
         || bytes[13] != b':'
         || bytes[16] != b' '
         || !matches!(bytes[17], b'+' | b'-')
-        || bytes[20] != b':'
     {
         return None;
     }
     state::days_since_unix_epoch(&value[..10])?;
     let hour: u32 = value[11..13].parse().ok()?;
     let minute: u32 = value[14..16].parse().ok()?;
-    let offset_hour: u32 = value[18..20].parse().ok()?;
-    let offset_minute: u32 = value[21..23].parse().ok()?;
+    let (offset_hour, offset_minute): (u32, u32) = if canonical {
+        (value[18..20].parse().ok()?, value[21..23].parse().ok()?)
+    } else {
+        (value[18..20].parse().ok()?, value[20..22].parse().ok()?)
+    };
     if hour > 23 || minute > 59 || offset_hour > 23 || offset_minute > 59 {
         return None;
     }
-    Some(format!(
-        "{}T{}:00{}",
+    let normalized = format!(
+        "{}T{}:00{}{:02}:{:02}",
         &value[..10],
         &value[11..16],
-        &value[17..23]
-    ))
+        &value[17..18],
+        offset_hour,
+        offset_minute,
+    );
+    Some(if canonical {
+        LoamTimestamp::Canonical(normalized)
+    } else {
+        LoamTimestamp::Noncanonical(normalized)
+    })
 }
 
 // --- relationships: wikilink scanner + derivation (T4) --------------------
@@ -1219,11 +1513,22 @@ fn relationship_id(
     hasher.finish()
 }
 
+/// One diagnostic per unresolved or noncanonically-resolved wikilink
+/// occurrence, feeding `wiki.broken_wikilinks` and the `wikilink-health`
+/// signal. `kind` is `broken-wikilink`, `ambiguous-wikilink`, or
+/// `noncanonical-link-case` per `specs/loam-view.md`'s scanner rules.
+struct WikilinkDiagnostic {
+    kind: &'static str,
+    path: String,
+    line: u64,
+    raw_target: String,
+}
+
 fn derive_relationships(
     artifacts: &[Artifact],
     workspace: &Path,
     generated_at: &str,
-) -> Vec<Relationship> {
+) -> (Vec<Relationship>, Vec<WikilinkDiagnostic>) {
     let refs = wiki_refs(artifacts);
     let known_paths: std::collections::HashSet<&str> = artifacts
         .iter()
@@ -1234,16 +1539,53 @@ fn derive_relationships(
         known_paths: &known_paths,
     };
     let mut relationships = Vec::new();
+    let mut diagnostics = Vec::new();
 
     for artifact in artifacts {
         let Ok(content) = fs::read_to_string(workspace.join(&artifact.path)) else {
             continue;
         };
         for occurrence in scan_wikilink_occurrences(&content) {
-            let Resolution::Resolved { target_path, .. } =
-                resolve_wikilink_target(&occurrence.raw_target, &refs)
-            else {
-                continue;
+            let target_path = match resolve_wikilink_target(&occurrence.raw_target, &refs) {
+                Resolution::Resolved {
+                    target_path,
+                    diagnostic: Some(Diagnostic::NoncanonicalCase),
+                } => {
+                    diagnostics.push(WikilinkDiagnostic {
+                        kind: "noncanonical-link-case",
+                        path: artifact.path.clone(),
+                        line: occurrence.line,
+                        raw_target: occurrence.raw_target.clone(),
+                    });
+                    target_path
+                }
+                Resolution::Resolved {
+                    target_path,
+                    diagnostic: None,
+                } => target_path,
+                // `resolve_by_key` never constructs `Resolved` with `Ambiguous`/`Broken` --
+                // those only appear on `Unresolved` -- but the type doesn't say so.
+                Resolution::Resolved {
+                    diagnostic: Some(_),
+                    ..
+                } => {
+                    unreachable!("resolve_by_key only attaches NoncanonicalCase to Resolved")
+                }
+                Resolution::Unresolved(kind) => {
+                    diagnostics.push(WikilinkDiagnostic {
+                        kind: match kind {
+                            Diagnostic::Ambiguous => "ambiguous-wikilink",
+                            Diagnostic::Broken => "broken-wikilink",
+                            Diagnostic::NoncanonicalCase => unreachable!(
+                                "Unresolved never carries NoncanonicalCase; that diagnostic is only attached to Resolved"
+                            ),
+                        },
+                        path: artifact.path.clone(),
+                        line: occurrence.line,
+                        raw_target: occurrence.raw_target.clone(),
+                    });
+                    continue;
+                }
             };
             let evidence = EvidenceLocation {
                 path: Some(artifact.path.clone()),
@@ -1402,7 +1744,10 @@ fn derive_relationships(
             right.kind.as_str(),
         ))
     });
-    relationships
+    diagnostics.sort_by(|left, right| {
+        (left.path.as_str(), left.line).cmp(&(right.path.as_str(), right.line))
+    });
+    (relationships, diagnostics)
 }
 
 struct StructuralEdgeContext<'a> {
@@ -1666,12 +2011,988 @@ fn extract_wikilink_targets(line: &str) -> Vec<String> {
     targets
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = sha256::Sha256::default();
+    hasher.update(bytes);
+    hasher.finish()
+}
+
+fn json_string_value(value: &str) -> String {
+    format!("\"{}\"", state::json_escape(value))
+}
+
+// --- events (T6) --------------------------------------------------------
+//
+// See specs/loam-view.md "events" row: parseable wiki/log.md headings,
+// artifact lifecycle fields, checkpoints, goal reviews, and up to 100 git
+// commits. Filesystem mtime never creates an event; every occurred_at here
+// traces to an explicit field, heading, or `git log --format=%aI` (strict
+// RFC 3339).
+
+struct Event {
+    id: String,
+    occurred_at: String,
+    kind: &'static str,
+    title: String,
+    artifact_id: Option<String>,
+    strength: &'static str,
+    evidence: EvidenceLocation,
+}
+
+impl Event {
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"id\":\"{}\",\"occurred_at\":\"{}\",\"kind\":\"{}\",\"title\":\"{}\",\"artifact_id\":{},\"strength\":\"{}\",\"evidence\":{}}}",
+            state::json_escape(&self.id),
+            state::json_escape(&self.occurred_at),
+            self.kind,
+            state::json_escape(&self.title),
+            state::optional_json(self.artifact_id.as_deref()),
+            self.strength,
+            self.evidence.to_json(),
+        )
+    }
+}
+
+/// Source-ID dedupe per `specs/loam-view.md`: the same source id is kept
+/// once, but semantically similar events from different authoritative
+/// sources stay separate (they carry different ids by construction).
+fn push_event(events: &mut Vec<Event>, seen: &mut std::collections::HashSet<String>, event: Event) {
+    if seen.insert(event.id.clone()) {
+        events.push(event);
+    }
+}
+
+fn artifact_display_title(artifact: &Artifact) -> &str {
+    artifact.title.as_deref().unwrap_or(artifact.path.as_str())
+}
+
+fn derive_events(artifacts: &[Artifact], workspace: &Path, wiki_root: &Path) -> Vec<Event> {
+    let mut events = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for artifact in artifacts {
+        if let Some(created_at) = &artifact.created_at {
+            push_event(
+                &mut events,
+                &mut seen,
+                Event {
+                    id: format!("lifecycle:{}:created_at", artifact.path),
+                    occurred_at: created_at.clone(),
+                    kind: "created",
+                    title: format!("{} created", artifact_display_title(artifact)),
+                    artifact_id: Some(artifact.path.clone()),
+                    strength: "strong",
+                    evidence: EvidenceLocation {
+                        path: Some(artifact.path.clone()),
+                        line: None,
+                        section: None,
+                        field: Some("created_at".to_owned()),
+                        content_hash: Some(artifact.content_hash.clone()),
+                    },
+                },
+            );
+        }
+        if let Some(updated_at) = &artifact.updated_at {
+            push_event(
+                &mut events,
+                &mut seen,
+                Event {
+                    id: format!("lifecycle:{}:updated_at", artifact.path),
+                    occurred_at: updated_at.clone(),
+                    kind: "updated",
+                    title: format!("{} updated", artifact_display_title(artifact)),
+                    artifact_id: Some(artifact.path.clone()),
+                    strength: "strong",
+                    evidence: EvidenceLocation {
+                        path: Some(artifact.path.clone()),
+                        line: None,
+                        section: None,
+                        field: Some("updated_at".to_owned()),
+                        content_hash: Some(artifact.content_hash.clone()),
+                    },
+                },
+            );
+        }
+        if artifact.kind == "checkpoint" {
+            if let Some(captured_at) = &artifact.captured_at {
+                let stem = Path::new(&artifact.path)
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or(artifact.path.as_str())
+                    .to_owned();
+                let scope = artifact
+                    .link_facts
+                    .checkpoint_scope
+                    .as_deref()
+                    .unwrap_or(artifact.path.as_str());
+                push_event(
+                    &mut events,
+                    &mut seen,
+                    Event {
+                        id: stem,
+                        occurred_at: captured_at.clone(),
+                        kind: "checkpoint-captured",
+                        title: format!("Checkpoint captured: {scope}"),
+                        artifact_id: Some(artifact.path.clone()),
+                        strength: "strong",
+                        evidence: EvidenceLocation {
+                            path: Some(artifact.path.clone()),
+                            line: None,
+                            section: None,
+                            field: Some("Captured".to_owned()),
+                            content_hash: Some(artifact.content_hash.clone()),
+                        },
+                    },
+                );
+            }
+        }
+        for review in &artifact.goal_reviews {
+            push_event(
+                &mut events,
+                &mut seen,
+                Event {
+                    id: format!("goal-review:{}:{}", artifact.path, review.date),
+                    occurred_at: format!("{}T00:00:00+00:00", review.date),
+                    kind: "goal-review",
+                    title: format!(
+                        "Goal review: {}",
+                        review.result.as_deref().unwrap_or("recorded")
+                    ),
+                    artifact_id: Some(artifact.path.clone()),
+                    strength: "strong",
+                    evidence: EvidenceLocation {
+                        path: Some(artifact.path.clone()),
+                        line: None,
+                        section: Some("Reviews".to_owned()),
+                        field: Some("Result".to_owned()),
+                        content_hash: Some(artifact.content_hash.clone()),
+                    },
+                },
+            );
+        }
+    }
+
+    push_log_events(wiki_root, &mut events, &mut seen);
+    push_git_commit_events(workspace, &mut events, &mut seen);
+
+    events.sort_by(|left, right| {
+        left.occurred_at
+            .cmp(&right.occurred_at)
+            .then(left.id.cmp(&right.id))
+    });
+    events
+}
+
+/// `specs/loam-view.md` "wiki/log.md is a Chronicle probe source but not a
+/// Reader/Search artifact": `## [YYYY-MM-DD] <text>` headings, day-granularity
+/// by design (`skills/loam-using/references/date-formats.md`), so
+/// `occurred_at` synthesizes midnight UTC rather than inventing a time. An
+/// unparseable date is skipped silently -- log.md is not an inventoried
+/// artifact, so there is no parse_errors sink to record it against.
+fn push_log_events(
+    wiki_root: &Path,
+    events: &mut Vec<Event>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let Ok(content) = fs::read_to_string(wiki_root.join("log.md")) else {
+        return;
+    };
+    let content_hash = sha256_hex(content.as_bytes());
+    for (index, line) in content.lines().enumerate() {
+        let line_number = (index + 1) as u64;
+        let Some(rest) = line.strip_prefix("## [") else {
+            continue;
+        };
+        let Some(close) = rest.find(']') else {
+            continue;
+        };
+        let date = &rest[..close];
+        if state::days_since_unix_epoch(date).is_none() {
+            continue;
+        }
+        let title = rest[close + 1..].trim();
+        if title.is_empty() {
+            continue;
+        }
+        push_event(
+            events,
+            seen,
+            Event {
+                id: format!("log:{line_number}"),
+                occurred_at: format!("{date}T00:00:00+00:00"),
+                kind: "log-entry",
+                title: title.to_owned(),
+                artifact_id: None,
+                strength: "strong",
+                evidence: EvidenceLocation {
+                    path: Some("wiki/log.md".to_owned()),
+                    line: Some(line_number),
+                    section: None,
+                    field: None,
+                    content_hash: Some(content_hash.clone()),
+                },
+            },
+        );
+    }
+}
+
+/// Up to 100 git commits, `strength: "source"` per `specs/loam-view.md`
+/// (weaker chronology evidence than an explicit field). `%aI` already emits
+/// strict RFC 3339, matching the schema's timestamp pattern exactly. Absent
+/// git or an empty history yields no events, not an error.
+fn push_git_commit_events(
+    workspace: &Path,
+    events: &mut Vec<Event>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let Ok(output) = Command::new("git")
+        .args([
+            "-C",
+            &workspace.to_string_lossy(),
+            "log",
+            "-n",
+            "100",
+            "--format=%H%x1f%aI%x1f%s",
+        ])
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.splitn(3, '\u{1f}');
+        let (Some(hash), Some(occurred_at), Some(subject)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if hash.is_empty() || occurred_at.is_empty() {
+            continue;
+        }
+        push_event(
+            events,
+            seen,
+            Event {
+                id: format!("git:{hash}"),
+                occurred_at: occurred_at.to_owned(),
+                kind: "commit",
+                title: if subject.is_empty() {
+                    "(no commit message)".to_owned()
+                } else {
+                    subject.to_owned()
+                },
+                artifact_id: None,
+                strength: "source",
+                evidence: EvidenceLocation {
+                    path: None,
+                    line: None,
+                    section: None,
+                    field: Some(hash.to_owned()),
+                    content_hash: None,
+                },
+            },
+        );
+    }
+}
+
+// --- metrics (T6) ---------------------------------------------------------
+//
+// specs/loam-view.md "Metric catalog": every metric is
+// {value, unit, state, evidence}; a check that did not run is
+// value: null + state: unknown|unavailable, never zero.
+
+struct Metric {
+    key: &'static str,
+    value: String,
+    unit: Option<&'static str>,
+    state: &'static str,
+    evidence: Option<String>,
+}
+
+impl Metric {
+    fn ready(key: &'static str, value: impl std::fmt::Display, unit: Option<&'static str>) -> Self {
+        Metric {
+            key,
+            value: value.to_string(),
+            unit,
+            state: "ready",
+            evidence: None,
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "\"{}\":{{\"value\":{},\"unit\":{},\"state\":\"{}\",\"evidence\":{}}}",
+            self.key,
+            self.value,
+            self.unit
+                .map_or_else(|| "null".to_owned(), |unit| format!("\"{unit}\"")),
+            self.state,
+            self.evidence.as_deref().unwrap_or("null"),
+        )
+    }
+}
+
+fn metrics_json(metrics: &[Metric]) -> String {
+    format!(
+        "{{{}}}",
+        metrics
+            .iter()
+            .map(Metric::to_json)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn count_markdown_recursive(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            count += count_markdown_recursive(&path);
+        } else if path.extension().and_then(|value| value.to_str()) == Some("md") {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn round1(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
+}
+
+fn compute_metrics(
+    artifacts: &[Artifact],
+    wiki_root: &Path,
+    broken_wikilinks: usize,
+    coverage: &Option<codegraph::CoverageMetrics>,
+    last_lint: &Option<(String, i64)>,
+) -> Vec<Metric> {
+    let mut metrics = Vec::new();
+
+    let knowledge_pages = artifacts
+        .iter()
+        .filter(|artifact| {
+            artifact.path.starts_with("wiki/")
+                && artifact.kind != "checkpoint"
+                && artifact.path != "wiki/SCHEMA.md"
+        })
+        .count();
+    metrics.push(Metric::ready(
+        "wiki.knowledge_pages",
+        knowledge_pages,
+        Some("count"),
+    ));
+    metrics.push(Metric::ready(
+        "wiki.broken_wikilinks",
+        broken_wikilinks,
+        Some("count"),
+    ));
+    let archived_pages = count_markdown_recursive(&wiki_root.join(".archive"));
+    metrics.push(Metric::ready(
+        "wiki.archived_pages",
+        archived_pages,
+        Some("count"),
+    ));
+    match last_lint {
+        Some((date, age_days)) => {
+            metrics.push(Metric {
+                key: "wiki.last_lint_at",
+                value: json_string_value(date),
+                unit: None,
+                state: "ready",
+                evidence: None,
+            });
+            metrics.push(Metric::ready("wiki.lint_age_days", *age_days, Some("days")));
+        }
+        None => {
+            metrics.push(Metric {
+                key: "wiki.last_lint_at",
+                value: "null".to_owned(),
+                unit: None,
+                state: "unavailable",
+                evidence: None,
+            });
+            metrics.push(Metric {
+                key: "wiki.lint_age_days",
+                value: "null".to_owned(),
+                unit: Some("days"),
+                state: "unavailable",
+                evidence: None,
+            });
+        }
+    }
+    let concepts = artifacts.iter().filter(|a| a.kind == "concept").count();
+    metrics.push(Metric::ready("wiki.concepts", concepts, Some("count")));
+
+    match coverage {
+        Some(coverage) => {
+            metrics.push(Metric::ready(
+                "code.candidates",
+                coverage.candidates,
+                Some("count"),
+            ));
+            metrics.push(Metric::ready(
+                "code.source_backed_pages",
+                coverage.source_backed_pages,
+                Some("count"),
+            ));
+            metrics.push(Metric::ready(
+                "code.current",
+                coverage.current,
+                Some("count"),
+            ));
+            metrics.push(Metric::ready("code.stale", coverage.stale, Some("count")));
+            metrics.push(Metric::ready("code.new", coverage.new, Some("count")));
+            metrics.push(Metric::ready("code.orphan", coverage.orphan, Some("count")));
+            if coverage.candidates == 0 {
+                metrics.push(Metric {
+                    key: "code.coverage_percent",
+                    value: "null".to_owned(),
+                    unit: Some("percent"),
+                    state: "unavailable",
+                    evidence: None,
+                });
+            } else {
+                let percent = round1(100.0 * coverage.current as f64 / coverage.candidates as f64);
+                metrics.push(Metric {
+                    key: "code.coverage_percent",
+                    value: percent.to_string(),
+                    unit: Some("percent"),
+                    state: "ready",
+                    evidence: Some(format!(
+                        "{{\"candidates\":{},\"current\":{}}}",
+                        coverage.candidates, coverage.current
+                    )),
+                });
+            }
+        }
+        None => {
+            for key in [
+                "code.candidates",
+                "code.source_backed_pages",
+                "code.current",
+                "code.stale",
+                "code.new",
+                "code.orphan",
+            ] {
+                metrics.push(Metric {
+                    key,
+                    value: "null".to_owned(),
+                    unit: Some("count"),
+                    state: "unknown",
+                    evidence: None,
+                });
+            }
+            metrics.push(Metric {
+                key: "code.coverage_percent",
+                value: "null".to_owned(),
+                unit: Some("percent"),
+                state: "unknown",
+                evidence: None,
+            });
+        }
+    }
+
+    let goals: Vec<&Artifact> = artifacts.iter().filter(|a| a.kind == "goal").collect();
+    metrics.push(Metric::ready("work.goals", goals.len(), Some("count")));
+    metrics.push(Metric::ready(
+        "work.active_goals",
+        goals
+            .iter()
+            .filter(|a| a.lifecycle_status.as_deref() == Some("active"))
+            .count(),
+        Some("count"),
+    ));
+
+    let specs: Vec<&Artifact> = artifacts.iter().filter(|a| a.kind == "spec").collect();
+    metrics.push(Metric::ready("work.specs", specs.len(), Some("count")));
+    metrics.push(Metric::ready(
+        "work.approved_specs",
+        specs
+            .iter()
+            .filter(|a| a.lifecycle_status.as_deref() == Some("approved"))
+            .count(),
+        Some("count"),
+    ));
+
+    let plans: Vec<&Artifact> = artifacts.iter().filter(|a| a.kind == "plan").collect();
+    metrics.push(Metric::ready("work.plans", plans.len(), Some("count")));
+    metrics.push(Metric::ready(
+        "work.active_plans",
+        plans
+            .iter()
+            .filter(|a| a.lifecycle_status.as_deref() == Some("in-progress"))
+            .count(),
+        Some("count"),
+    ));
+
+    let checkpoints: Vec<&Artifact> = artifacts
+        .iter()
+        .filter(|a| a.kind == "checkpoint")
+        .collect();
+    metrics.push(Metric::ready(
+        "checkpoints.total",
+        checkpoints.len(),
+        Some("count"),
+    ));
+    metrics.push(Metric::ready(
+        "checkpoints.actionable",
+        actionable_checkpoint_count(&checkpoints),
+        Some("count"),
+    ));
+    let mut by_path_desc = checkpoints.clone();
+    by_path_desc.sort_by(|left, right| right.path.cmp(&left.path));
+    match by_path_desc.iter().find_map(|a| a.captured_at.clone()) {
+        Some(value) => metrics.push(Metric {
+            key: "checkpoints.latest_at",
+            value: json_string_value(&value),
+            unit: None,
+            state: "ready",
+            evidence: None,
+        }),
+        None => metrics.push(Metric {
+            key: "checkpoints.latest_at",
+            value: "null".to_owned(),
+            unit: None,
+            state: "unavailable",
+            evidence: None,
+        }),
+    }
+
+    let guidance_files = artifacts.iter().filter(|a| a.kind == "guidance").count();
+    metrics.push(Metric::ready(
+        "guidance.files",
+        guidance_files,
+        Some("count"),
+    ));
+
+    metrics
+}
+
+/// `specs/loam-view.md` "Non-superseded checkpoints containing at least one
+/// active|blocked|waiting|ready-to-resume workstream with a non-empty Next".
+/// A checkpoint counts as superseded when some other checkpoint's
+/// `Supersedes` field names its path.
+fn actionable_checkpoint_count(checkpoints: &[&Artifact]) -> usize {
+    let superseded: std::collections::HashSet<&str> = checkpoints
+        .iter()
+        .filter_map(|a| a.link_facts.checkpoint_supersedes.as_deref())
+        .collect();
+    checkpoints
+        .iter()
+        .filter(|a| {
+            !superseded.contains(a.path.as_str())
+                && a.link_facts.checkpoint_workstreams.iter().any(|w| {
+                    matches!(
+                        w.status.as_deref(),
+                        Some("active" | "blocked" | "waiting" | "ready-to-resume")
+                    ) && w
+                        .next
+                        .as_deref()
+                        .is_some_and(|next| !next.trim().is_empty())
+                })
+        })
+        .count()
+}
+
+// --- signals + posture (T6) -----------------------------------------------
+//
+// specs/loam-view.md "Signals and posture": signal state is a separate
+// vocabulary from hint severity and is never derived from it. Posture is a
+// deterministic verdict over the emitted signals; the frontend displays it
+// and never recalculates it.
+
+struct Signal {
+    id: &'static str,
+    state: &'static str,
+    message: String,
+    evidence: Option<String>,
+    command: Option<&'static str>,
+}
+
+impl Signal {
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"id\":\"{}\",\"state\":\"{}\",\"message\":\"{}\",\"evidence\":{},\"command\":{}}}",
+            self.id,
+            self.state,
+            state::json_escape(&self.message),
+            self.evidence.as_deref().unwrap_or("null"),
+            self.command
+                .map_or_else(|| "null".to_owned(), |command| format!("\"{command}\"")),
+        )
+    }
+}
+
+fn signals_json(signals: &[Signal]) -> String {
+    format!(
+        "[{}]",
+        signals
+            .iter()
+            .map(Signal::to_json)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+/// Only called when `has_wiki`, so every row that "emits no signal when
+/// absent" is about an *optional* layer within an existing wiki, not the
+/// wiki itself.
+#[allow(clippy::too_many_arguments)]
+fn compute_signals(
+    artifacts: &[Artifact],
+    wiki_root: &Path,
+    code_graph_ready: bool,
+    coverage: &Option<codegraph::CoverageMetrics>,
+    broken_wikilink_diagnostics: &[&WikilinkDiagnostic],
+    last_lint: &Option<(String, i64)>,
+    noncanonical_timestamps: &[(String, String)],
+    qmd_metadata_status: &str,
+    checkpoint_watch: bool,
+) -> Vec<Signal> {
+    let mut signals = Vec::new();
+
+    if code_graph_ready {
+        match coverage {
+            Some(coverage) => {
+                let drifted = coverage.new + coverage.stale + coverage.orphan;
+                if drifted > 0 {
+                    signals.push(Signal {
+                        id: "code-graph-drift",
+                        state: "watch",
+                        message: format!(
+                            "{} new, {} stale, {} orphan code page(s).",
+                            coverage.new, coverage.stale, coverage.orphan
+                        ),
+                        evidence: Some(format!(
+                            "{{\"new\":{},\"stale\":{},\"orphan\":{}}}",
+                            coverage.new, coverage.stale, coverage.orphan
+                        )),
+                        command: Some("/loam::syncing-code-graph"),
+                    });
+                } else {
+                    signals.push(Signal {
+                        id: "code-graph-drift",
+                        state: "healthy",
+                        message: "No stale, new, or orphan code pages.".to_owned(),
+                        evidence: None,
+                        command: None,
+                    });
+                }
+            }
+            None => signals.push(Signal {
+                id: "code-graph-drift",
+                state: "unknown",
+                message: "codegraph probe failed; drift is unknown this snapshot.".to_owned(),
+                evidence: None,
+                command: None,
+            }),
+        }
+    }
+
+    if !broken_wikilink_diagnostics.is_empty() {
+        let evidence = broken_wikilink_diagnostics
+            .iter()
+            .map(|diagnostic| {
+                format!(
+                    "{{\"path\":{},\"line\":{},\"kind\":{},\"target\":{}}}",
+                    json_string_value(&diagnostic.path),
+                    diagnostic.line,
+                    json_string_value(diagnostic.kind),
+                    json_string_value(&diagnostic.raw_target),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        signals.push(Signal {
+            id: "wikilink-health",
+            state: "watch",
+            message: format!(
+                "{} broken or ambiguous wikilink(s).",
+                broken_wikilink_diagnostics.len()
+            ),
+            evidence: Some(format!("[{evidence}]")),
+            command: Some("/loam::linting-memory"),
+        });
+    } else {
+        signals.push(Signal {
+            id: "wikilink-health",
+            state: "healthy",
+            message: "No broken or ambiguous wikilinks.".to_owned(),
+            evidence: None,
+            command: None,
+        });
+    }
+
+    let lint_stale = match last_lint {
+        Some((_, age_days)) => *age_days >= 7,
+        None => true,
+    };
+    let has_noncanonical = !noncanonical_timestamps.is_empty();
+    if lint_stale || has_noncanonical {
+        let lint_evidence = match last_lint {
+            Some((date, age_days)) => {
+                format!(
+                    "\"last_lint\":{},\"age_days\":{age_days}",
+                    json_string_value(date)
+                )
+            }
+            None => "\"last_lint\":null,\"age_days\":null".to_owned(),
+        };
+        let noncanonical_evidence = noncanonical_timestamps
+            .iter()
+            .map(|(path, field)| {
+                format!(
+                    "{{\"path\":{},\"field\":{}}}",
+                    json_string_value(path),
+                    json_string_value(field)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let message = match (lint_stale, has_noncanonical) {
+            (true, true) => format!(
+                "No recent lint marker, and {} timestamp(s) use a noncanonical \u{b1}HHMM offset.",
+                noncanonical_timestamps.len()
+            ),
+            (true, false) => {
+                "No lint marker found in wiki/log.md, or it is 7+ days old.".to_owned()
+            }
+            (false, true) => format!(
+                "{} timestamp(s) use a noncanonical \u{b1}HHMM offset.",
+                noncanonical_timestamps.len()
+            ),
+            (false, false) => unreachable!("guarded by lint_stale || has_noncanonical above"),
+        };
+        signals.push(Signal {
+            id: "memory-lint",
+            state: "watch",
+            message,
+            evidence: Some(format!(
+                "{{{lint_evidence},\"noncanonical_timestamps\":[{noncanonical_evidence}]}}"
+            )),
+            command: Some("/loam::linting-memory"),
+        });
+    } else {
+        signals.push(Signal {
+            id: "memory-lint",
+            state: "healthy",
+            message: "Lint is recent and every timestamp uses the canonical offset form."
+                .to_owned(),
+            evidence: None,
+            command: None,
+        });
+    }
+
+    let orphaned_work: Vec<&str> = artifacts
+        .iter()
+        .filter(|a| {
+            (a.kind == "spec"
+                && matches!(a.lifecycle_status.as_deref(), Some("active" | "draft"))
+                && a.link_facts.spec_goal.is_none())
+                || (a.kind == "plan"
+                    && matches!(
+                        a.lifecycle_status.as_deref(),
+                        Some("in-progress" | "pending")
+                    )
+                    && a.link_facts.plan_goal.is_none())
+        })
+        .map(|a| a.path.as_str())
+        .collect();
+    if !orphaned_work.is_empty() {
+        signals.push(Signal {
+            id: "goal-traceability",
+            state: "watch",
+            message: format!(
+                "{} active work artifact(s) have no goal provenance.",
+                orphaned_work.len()
+            ),
+            evidence: Some(format!(
+                "[{}]",
+                orphaned_work
+                    .iter()
+                    .map(|path| json_string_value(path))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+            command: Some("/loam::setting-goals"),
+        });
+    }
+
+    match qmd_metadata_status {
+        "" => {}
+        "ready" => signals.push(Signal {
+            id: "retrieval",
+            state: "healthy",
+            message: "qmd retrieval is ready.".to_owned(),
+            evidence: None,
+            command: None,
+        }),
+        other => signals.push(Signal {
+            id: "retrieval",
+            state: "watch",
+            message: format!("qmd metadata expects ready but reports \"{other}\"."),
+            evidence: None,
+            command: None,
+        }),
+    }
+
+    let has_checkpoints = artifacts.iter().any(|a| a.kind == "checkpoint");
+    if checkpoint_watch {
+        signals.push(Signal {
+            id: "checkpoint-state",
+            state: "watch",
+            message: "The latest checkpoint is missing, stale, or the worktree changed without a fresh one.".to_owned(),
+            evidence: None,
+            command: Some("/loam::resuming"),
+        });
+    } else if has_checkpoints {
+        signals.push(Signal {
+            id: "checkpoint-state",
+            state: "healthy",
+            message: "The latest checkpoint is current.".to_owned(),
+            evidence: None,
+            command: None,
+        });
+    }
+
+    let malformed: Vec<&str> = artifacts
+        .iter()
+        .filter(|a| !a.parse_errors.is_empty())
+        .map(|a| a.path.as_str())
+        .collect();
+    if !malformed.is_empty() {
+        signals.push(Signal {
+            id: "artifact-parse",
+            state: "watch",
+            message: format!(
+                "{} artifact(s) have malformed fields or timestamps.",
+                malformed.len()
+            ),
+            evidence: Some(format!(
+                "[{}]",
+                malformed
+                    .iter()
+                    .map(|path| json_string_value(path))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+            command: None,
+        });
+    }
+
+    let drift_count = datecheck::drift_count(wiki_root);
+    if drift_count > 0 {
+        signals.push(Signal {
+            id: "date-drift",
+            state: "watch",
+            message: format!("{drift_count} date/timezone drift finding(s) in memory pages."),
+            evidence: None,
+            command: Some("/loam::linting-memory"),
+        });
+    }
+    if let Ok(log_content) = fs::read_to_string(wiki_root.join("log.md")) {
+        let lines = log_content.bytes().filter(|byte| *byte == b'\n').count();
+        if lines > 500 {
+            signals.push(Signal {
+                id: "log-rotation",
+                state: "watch",
+                message: format!("wiki/log.md exceeds 500 lines ({lines})."),
+                evidence: None,
+                command: Some("/loam::linting-memory"),
+            });
+        }
+    }
+    if wiki_root.join("overview.md").is_file() {
+        signals.push(Signal {
+            id: "legacy-structure",
+            state: "watch",
+            message: "Legacy overview.md present; consolidate into index.md.".to_owned(),
+            evidence: None,
+            command: Some("/loam::linting-memory"),
+        });
+    }
+
+    signals
+}
+
+fn compute_posture(has_wiki: bool, required_incomplete: bool, signals: &[Signal]) -> &'static str {
+    if !has_wiki {
+        return "not-configured";
+    }
+    if required_incomplete {
+        return "unknown";
+    }
+    if signals.iter().any(|signal| signal.state == "critical") {
+        return "at-risk";
+    }
+    if signals
+        .iter()
+        .any(|signal| matches!(signal.state, "watch" | "unknown"))
+    {
+        return "needs-review";
+    }
+    "healthy"
+}
+
+// --- probes (T6) ------------------------------------------------------
+
+struct Probe {
+    id: &'static str,
+    state: String,
+    duration_ms: f64,
+    message: Option<String>,
+}
+
+impl Probe {
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"id\":\"{}\",\"state\":\"{}\",\"duration_ms\":{},\"message\":{}}}",
+            self.id,
+            state::json_escape(&self.state),
+            self.duration_ms,
+            self.message
+                .as_deref()
+                .map(|message| json_string_value(&truncate_probe_message(message)))
+                .unwrap_or_else(|| "null".to_owned()),
+        )
+    }
+}
+
+fn probes_json(probes: &[Probe]) -> String {
+    format!(
+        "[{}]",
+        probes
+            .iter()
+            .map(Probe::to_json)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+/// `specs/loam-view.md`: probe messages are bounded to 500 characters and
+/// never contain document bodies.
+fn truncate_probe_message(message: &str) -> String {
+    if message.chars().count() <= 500 {
+        message.to_owned()
+    } else {
+        message.chars().take(500).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_wikilink_targets, linked_paths, parse_front_matter, parse_loam_timestamp,
-        resolve_wikilink_target, scan_wikilink_occurrences, Diagnostic, Resolution,
-        WikiArtifactRef,
+        extract_wikilink_targets, linked_paths, parse_front_matter, parse_goal_reviews,
+        parse_loam_timestamp, resolve_wikilink_target, scan_wikilink_occurrences, Diagnostic,
+        LoamTimestamp, Resolution, WikiArtifactRef,
     };
 
     fn wiki_ref(path: &str) -> WikiArtifactRef {
@@ -1776,10 +3097,55 @@ mod tests {
     fn loam_timestamps_convert_to_rfc3339_and_reject_invalid_calendar_values() {
         assert_eq!(
             parse_loam_timestamp("2026-08-10 09:00 +02:00"),
-            Some("2026-08-10T09:00:00+02:00".to_owned())
+            Some(LoamTimestamp::Canonical(
+                "2026-08-10T09:00:00+02:00".to_owned()
+            ))
         );
         assert_eq!(parse_loam_timestamp("not-a-real-date"), None);
         assert_eq!(parse_loam_timestamp("2026-13-45 99:99 +99:99"), None);
+    }
+
+    #[test]
+    fn loam_timestamps_accept_an_unambiguous_hhmm_offset_as_noncanonical_not_invalid() {
+        assert_eq!(
+            parse_loam_timestamp("2026-08-10 09:00 +0200"),
+            Some(LoamTimestamp::Noncanonical(
+                "2026-08-10T09:00:00+02:00".to_owned()
+            ))
+        );
+        assert_eq!(
+            parse_loam_timestamp("2026-08-10 09:00 -0530"),
+            Some(LoamTimestamp::Noncanonical(
+                "2026-08-10T09:00:00-05:30".to_owned()
+            ))
+        );
+        // A calendar-invalid `±HHMM` offset is still rejected outright.
+        assert_eq!(parse_loam_timestamp("2026-08-10 09:00 +9900"), None);
+    }
+
+    #[test]
+    fn goal_reviews_parse_valid_dates_and_diagnose_invalid_ones_without_dropping_the_valid_entry() {
+        let body = "## Reviews\n\n\
+             ### 2026-08-12\n\n\
+             - Result: pass\n\
+             - Checked: fixture\n\n\
+             ### not-a-date\n\n\
+             - Result: blocked\n";
+        let mut parse_errors = Vec::new();
+        let reviews = parse_goal_reviews(body, &mut parse_errors);
+
+        assert_eq!(
+            reviews.len(),
+            1,
+            "{:?}",
+            reviews.iter().map(|r| &r.date).collect::<Vec<_>>()
+        );
+        assert_eq!(reviews[0].date, "2026-08-12");
+        assert_eq!(reviews[0].result.as_deref(), Some("pass"));
+        assert_eq!(
+            parse_errors,
+            vec!["invalid goal review date: not-a-date".to_owned()]
+        );
     }
 
     #[test]

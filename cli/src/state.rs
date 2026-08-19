@@ -123,6 +123,40 @@ fn aggregate(workspace: &Path, fast: bool) -> String {
     )
 }
 
+/// The exact hint pipeline `aggregate` uses, reused verbatim by the View
+/// snapshot's `hints` field (`specs/loam-view.md`: "pass through existing
+/// hint objects unchanged"). Each returned string is already a serialized
+/// hint object.
+pub(crate) fn hints_for_view(workspace: &Path, wiki_root: &Path) -> Vec<String> {
+    let metadata = read_metadata(wiki_root);
+    let checkpoints = read_checkpoints(wiki_root);
+    let git_status = git_status(workspace);
+    let drift_count = Some(datecheck::drift_count(wiki_root));
+    let mut hints = Vec::new();
+    add_hints(
+        HintContext {
+            workspace,
+            wiki_root,
+            metadata: &metadata,
+            checkpoints: &checkpoints,
+            git_status: git_status.as_deref(),
+            drift_count,
+            fast: false,
+        },
+        &mut hints,
+    );
+    hints
+}
+
+/// `wiki/log.md`'s newest `## [YYYY-MM-DD] lint-check` marker and its age in
+/// whole UTC days, for the View `wiki.last_lint_at`/`wiki.lint_age_days`
+/// metrics and the `memory-lint` signal. Reuses `lint_age` rather than
+/// re-scanning `log.md`.
+pub(crate) fn last_lint(wiki_root: &Path) -> Option<(String, i64)> {
+    let content = fs::read_to_string(wiki_root.join("log.md")).ok()?;
+    lint_age(&content)
+}
+
 fn minimal_state() -> String {
     "{\"wiki_root\":\"\",\"exists\":false,\"qmd_ready\":false,\"latest_checkpoint\":null,\"recent_checkpoints\":[],\"checkpoint_count\":0,\"git_status\":null,\"drift_count\":null,\"hints\":[{\"kind\":\"memory_missing\",\"group\":\"maintenance\",\"severity\":\"info\",\"message\":\"No memory substrate found; scaffold a wiki to begin.\",\"command\":\"/loam::scaffolding-wiki <goal>\",\"evidence\":{}}]}".to_owned()
 }

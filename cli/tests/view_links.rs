@@ -238,7 +238,18 @@ fn view_links_broken_links_fixture_never_turns_an_unresolved_target_into_an_edge
 
     // `[[does-not-exist]]` (broken) and `[[overview]]` (ambiguous -- matches both
     // wiki/topics/overview.md and wiki/entities/overview.md) never become edges.
-    assert!(!snapshot.contains("does-not-exist"), "{snapshot}");
+    // (T6's wikilink-health signal legitimately cites "does-not-exist" as
+    // evidence outside the relationships array, so this checks only the
+    // relationships array itself, not the whole snapshot.)
+    let relationships_start = snapshot.find("\"relationships\":[").unwrap();
+    let relationships_end = snapshot[relationships_start..]
+        .find("],\"events\"")
+        .unwrap()
+        + relationships_start;
+    assert!(
+        !snapshot[relationships_start..relationships_end].contains("does-not-exist"),
+        "{snapshot}"
+    );
     assert!(
         !snapshot.contains(
             r#""from":"wiki/topics/broken-links-demo.md","to":"wiki/topics/overview.md""#

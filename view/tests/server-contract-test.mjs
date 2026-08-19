@@ -25,6 +25,7 @@ function baseSnapshot(root, artifacts = []) {
     schema_version: 1,
     generated_at: '2026-08-19T00:00:00+00:00',
     status: 'ready',
+    posture: 'healthy',
     workspace: { root, name: 'workspace', platform: 'linux', git: { state: 'clean', branch: 'main', dirty: false, changed_count: 0 } },
     capabilities: BASE_CAPABILITIES,
     artifacts,

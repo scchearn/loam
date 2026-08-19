@@ -3,6 +3,7 @@
   "schema_version": 1,
   "generated_at": "2026-08-01T09:15:30+02:00",
   "status": "degraded",
+  "posture": "unknown",
   "workspace": {
     "root": "/home/sam/work/loam",
     "name": "loam",
