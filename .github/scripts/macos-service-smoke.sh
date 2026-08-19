@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # Dormant-lifecycle service smoke (macOS/LaunchAgent).
 # Proves our rendered plist round-trips through real launchctl: install writes a
-# valid dormant plist, launchctl bootstraps and prints it, then bootout + our
-# uninstall remove it. RunAtLoad=false, so bootstrapping never starts it.
+# valid plist and loads nothing, our enable bootstraps it, and disable +
+# uninstall remove it.
+#
+# Dormancy here is a property of the lifecycle, not of RunAtLoad: the plist lives
+# under the global root rather than a launchd search path, so nothing reads it
+# until enable bootstraps it. The plist starts the job at load precisely so the
+# activation never calls `launchctl kickstart`, which waits out launchd's
+# ThrottleInterval when the started process exits within milliseconds — the 10s
+# wedge that made this leg red on every run (#124).
 set -euo pipefail
 BIN="${1:?path to loam binary required}"
 # Short root on purpose: the connector endpoint is a Unix socket and macOS
@@ -23,7 +30,13 @@ trap cleanup EXIT
 "$BIN" federation service install --global-root "$ROOT"
 test -f "$PLIST" || { echo "FAIL: plist not written"; exit 1; }
 plutil -lint "$PLIST" || { echo "FAIL: plist invalid"; exit 1; }
-grep -q "<key>RunAtLoad</key><false/>" "$PLIST" || { echo "FAIL: plist not dormant"; exit 1; }
+grep -q "<key>RunAtLoad</key><true/>" "$PLIST" || { echo "FAIL: plist does not start at load"; exit 1; }
+# The real dormancy check: install loaded nothing. A definition launchctl already
+# knows about here would mean install started the connector behind our back.
+if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+  echo "FAIL: install left a loaded job; the definition must stay dormant until enable"
+  exit 1
+fi
 test ! -f "$ROOT/loam.sqlite3" || { echo "FAIL: database created by install"; exit 1; }
 # Read-only status (the verb packaged setup delegates to for verification) must
 # not create a database or start anything; a dormant definition reports disabled.

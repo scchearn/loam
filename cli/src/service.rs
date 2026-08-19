@@ -350,9 +350,19 @@ pub fn render_systemd_unit(ctx: &ServiceContext) -> Result<String, ServiceError>
     ))
 }
 
-/// The macOS LaunchAgent plist. `RunAtLoad` is `false` so bootstrapping only
-/// *loads* the job — it stays dormant until first enrollment kickstarts it, and
-/// `bootout` (disable) removes it entirely, which wins over `KeepAlive`.
+/// The macOS LaunchAgent plist. `RunAtLoad` is `true`, which does NOT make the
+/// definition eager: dormancy on this platform is a property of the *lifecycle*,
+/// not of this key. `install` writes this file and runs no manager command at
+/// all (the plist lives under loam's global root, never in a launchd search
+/// path), so nothing loads it; `enable_start` is the only thing that
+/// bootstraps, and `bootout` (disable) removes it entirely, which wins over
+/// `KeepAlive`. Letting the load start the job is what removes `launchctl
+/// kickstart` from the lifecycle, and with it the 10s wedge that made the
+/// hosted macos-14 smoke red on every run for months (#124): kickstart waits out
+/// launchd's `ThrottleInterval` whenever the spawned process exits within
+/// milliseconds, which is exactly what the connector does when the registry is
+/// empty. Measured on the runner, same plist either way — bootstrap-start 0s and
+/// 8/8, kickstart 10s and 8/8.
 /// `KeepAlive` is `{SuccessfulExit = false}` so once running, launchd respawns
 /// the connector when its liveness watchdog exits nonzero (code 75) — the
 /// self-heal the incident proved on this platform — while an inert connector that
@@ -378,7 +388,7 @@ pub fn render_launchagent_plist(ctx: &ServiceContext) -> Result<String, ServiceE
          \t\t<string>federation</string>\n\t\t<string>service</string>\n\t\t<string>run</string>\n\
          \t\t<string>--global-root</string>\n\t\t<string>{root}</string>\n\
          \t</array>\n\
-         \t<key>RunAtLoad</key><false/>\n\
+         \t<key>RunAtLoad</key><true/>\n\
          \t<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key><false/>\n\t</dict>\n\
          \t<key>StandardOutPath</key><string>{stdout_path}</string>\n\
          \t<key>StandardErrorPath</key><string>{stderr_path}</string>\n\
@@ -934,6 +944,19 @@ fn disable_stop_commands(_ctx: &ServiceContext) -> Vec<ManagerCommand> {
 /// is deliberate: the callers of this function (first activation, the installer's
 /// post-update refresh, drift repair) all want the running process to match the
 /// definition on disk, and only a reload can promise that.
+///
+/// The load is also the start. `launchctl kickstart` is deliberately absent:
+/// it waits out launchd's `ThrottleInterval` — 10s by default — whenever the
+/// job it started exits within milliseconds of spawning, which is precisely
+/// what the connector does on an empty registry. Against the runtime's own 10s
+/// bound that produced the "launchctl did not exit within 10s and was killed"
+/// wedge (#124), consistently with `kickstart -k` and about one run in four
+/// without it. Measured on a hosted macos-14 runner, one plist, one variable:
+/// bootstrap-start returned in 0s on 8 of 8 attempts and the job ran every
+/// time; the same job started by kickstart blocked for exactly 10s on 8 of 8.
+/// So `RunAtLoad` does the start and the lifecycle is three commands, none of
+/// which waits on a spawn.
+///
 /// Always compiled, and taking the domain/service targets as arguments, so the
 /// ordering is unit-testable on any host — the same rule the plist renderer
 /// follows. Only the *selection* below is cfg-gated.
@@ -943,21 +966,13 @@ fn launchagent_enable_start_steps(plist: &str, domain: &str, service: &str) -> V
         // `disable` writes a persistent override that makes a later `bootstrap`
         // fail outright, so clearing it has to precede the load, not follow it.
         step(ManagerCommand::new("launchctl", &["enable", service])),
-        step(ManagerCommand::new(
+        // Loads the rewritten definition and, through its `RunAtLoad`, starts
+        // it — the equivalent of systemd's `enable --now` and schtasks' `/Run`,
+        // and the step whose outcome the start confirmation checks.
+        start_step(ManagerCommand::new(
             "launchctl",
             &["bootstrap", domain, plist],
         )),
-        // The plist is dormant (`RunAtLoad` false), so bootstrapping it only
-        // *loads* the job; the start is explicit, as it is for systemd's
-        // `enable --now` and schtasks' `/Run`.
-        //
-        // Deliberately NOT `kickstart -k`: `-k` kills the current instance and
-        // forces its respawn through launchd's ThrottleInterval (10s by
-        // default), and kickstart blocks for that whole window — which is
-        // exactly the 10s "launchctl did not exit and was killed" wedge the
-        // hosted macos runners hit (#124). After the bootout above there is no
-        // instance left to kill, so `-k` bought nothing but the wedge.
-        start_step(ManagerCommand::new("launchctl", &["kickstart", service])),
     ]
 }
 
@@ -1277,10 +1292,6 @@ mod tests {
             "the enable must precede the bootstrap: {lines:?}"
         );
         assert!(
-            position("bootstrap") < position("kickstart"),
-            "the job must be loaded before it is started: {lines:?}"
-        );
-        assert!(
             lines
                 .iter()
                 .any(|line| line.contains("bootstrap gui/501 /root/launchagents/")),
@@ -1289,21 +1300,23 @@ mod tests {
     }
 
     #[test]
-    fn the_launchd_start_never_uses_the_kill_flag_that_wedges_on_the_respawn_throttle() {
+    fn the_launchd_activation_never_calls_kickstart_in_any_form() {
         let lines = launchagent_lines();
-        // `kickstart -k` kills the running instance and forces its respawn
-        // through launchd's ThrottleInterval; kickstart blocks for that whole
-        // window, which is the 10s "launchctl did not exit" wedge (#124). After
-        // the bootout there is no instance to kill anyway.
+        // `kickstart` waits out launchd's ThrottleInterval whenever the job it
+        // started exits within milliseconds — which the connector does on an
+        // empty registry — and that 10s wait against the runtime's 10s bound is
+        // the "launchctl did not exit and was killed" wedge (#124). Measured on
+        // the runner: kickstart 10s on 8 of 8, bootstrap-start 0s on 8 of 8.
+        // The plist's RunAtLoad does the start instead, so no step in the
+        // activation waits on a spawn.
         assert!(
-            !lines.iter().any(|line| line.contains("kickstart -k")),
-            "the start step must not pass -k: {lines:?}"
+            !lines.iter().any(|line| line.contains("kickstart")),
+            "no activation step may call kickstart, with or without -k: {lines:?}"
         );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line == "launchctl kickstart gui/501/io.loam.connector"),
-            "the start step must still start the dormant job: {lines:?}"
+        assert_eq!(
+            lines.len(),
+            3,
+            "activation is bootout, enable, bootstrap — nothing else: {lines:?}"
         );
     }
 
@@ -1314,11 +1327,13 @@ mod tests {
         assert_eq!(
             started.len(),
             1,
-            "exactly one step is the start; bootout/enable/bootstrap stay \
-             exit-code-tolerant because they report nonzero on idempotent \
-             re-activation and on fresh machines (#101)"
+            "exactly one step is the start; bootout and enable stay \
+             exit-code-tolerant because they report nonzero on a machine where \
+             nothing is loaded yet (#101)"
         );
-        assert!(started[0].command.args.contains(&"kickstart".to_owned()));
+        // The load IS the start on this platform, so it is the bootstrap whose
+        // outcome the confirmation checks.
+        assert!(started[0].command.args.contains(&"bootstrap".to_owned()));
     }
 
     // --- #101: a start that leaves the service dead is not a success ---
@@ -1491,12 +1506,16 @@ mod tests {
     }
 
     #[test]
-    fn launchagent_plist_is_dormant_and_respawns_only_a_nonzero_exit() {
+    fn launchagent_plist_starts_at_load_and_respawns_only_a_nonzero_exit() {
         let context = ctx("launchd");
         let runtime = runtime_string(&context);
         let plist = render_launchagent_plist(&context).unwrap();
-        // Dormant until kickstarted; bootout (disable) removes it entirely.
-        assert!(plist.contains("<key>RunAtLoad</key><false/>"));
+        // The load is the start, so activation never has to call `kickstart`
+        // and never waits out launchd's respawn throttle (#124). This is not
+        // what makes the definition eager or dormant — see
+        // `install_writes_the_definition_and_never_starts`, which pins the
+        // actual invariant: install runs no command that loads it.
+        assert!(plist.contains("<key>RunAtLoad</key><true/>"));
         // KeepAlive with SuccessfulExit=false: respawn a nonzero (watchdog) exit,
         // leave a clean inert exit(0) down. This is the macOS half of the
         // incident's self-heal, absent before.
@@ -1586,13 +1605,24 @@ mod tests {
         // On this platform a definition file was written (Linux/macOS).
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(definition_path(&context).exists());
-        // No manager command starts the service.
+        // THE dormancy invariant, and on darwin now the only one: install runs
+        // no manager command that loads or starts the definition it just wrote.
+        // The plist's own `RunAtLoad` cannot make the definition eager, because
+        // the file lives under loam's global root rather than in a launchd
+        // search path — nothing reads it until `enable_start` bootstraps it.
+        // Matched per argument, not as a substring: systemd's `daemon-reload` is
+        // a legitimate install step and contains the word "load".
+        const LOADS_OR_STARTS: [&str; 6] =
+            ["bootstrap", "kickstart", "load", "start", "--now", "/Run"];
         for command in runner.recorded.borrow().iter() {
-            let joined = command.args.join(" ");
-            assert!(
-                !joined.contains("start") && !joined.contains("bootstrap"),
-                "install must not start the service: {joined}"
-            );
+            for arg in &command.args {
+                assert!(
+                    !LOADS_OR_STARTS.contains(&arg.as_str()),
+                    "install must not load or start the service: {} {}",
+                    command.program,
+                    command.args.join(" ")
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&context.global_root);
     }
