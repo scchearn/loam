@@ -2021,6 +2021,18 @@ fn json_string_value(value: &str) -> String {
     format!("\"{}\"", state::json_escape(value))
 }
 
+/// The schema's timestamp pattern requires a numeric offset and rejects a
+/// literal `Z` (Zulu/UTC) suffix. Every timestamp this module constructs
+/// itself already uses `+00:00`/`±HH:MM`; the one external source is `git
+/// log`'s `%aI`, which preserves `Z` when the underlying author/committer
+/// date was itself recorded with `Z`.
+fn normalize_rfc3339_offset(value: &str) -> String {
+    match value.strip_suffix(['Z', 'z']) {
+        Some(prefix) => format!("{prefix}+00:00"),
+        None => value.to_owned(),
+    }
+}
+
 // --- events (T6) --------------------------------------------------------
 //
 // See specs/loam-view.md "events" row: parseable wiki/log.md headings,
@@ -2238,9 +2250,11 @@ fn push_log_events(
 }
 
 /// Up to 100 git commits, `strength: "source"` per `specs/loam-view.md`
-/// (weaker chronology evidence than an explicit field). `%aI` already emits
-/// strict RFC 3339, matching the schema's timestamp pattern exactly. Absent
-/// git or an empty history yields no events, not an error.
+/// (weaker chronology evidence than an explicit field). `%aI` emits RFC 3339
+/// but preserves a literal `Z` when the underlying author date was itself
+/// recorded with `Z` (bot/CI commits, `GIT_AUTHOR_DATE=...Z`); the schema
+/// requires a numeric offset, so `normalize_rfc3339_offset` fixes that up.
+/// Absent git or an empty history yields no events, not an error.
 fn push_git_commit_events(
     workspace: &Path,
     events: &mut Vec<Event>,
@@ -2277,7 +2291,7 @@ fn push_git_commit_events(
             seen,
             Event {
                 id: format!("git:{hash}"),
-                occurred_at: occurred_at.to_owned(),
+                occurred_at: normalize_rfc3339_offset(occurred_at),
                 kind: "commit",
                 title: if subject.is_empty() {
                     "(no commit message)".to_owned()
@@ -2990,9 +3004,9 @@ fn truncate_probe_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_wikilink_targets, linked_paths, parse_front_matter, parse_goal_reviews,
-        parse_loam_timestamp, resolve_wikilink_target, scan_wikilink_occurrences, Diagnostic,
-        LoamTimestamp, Resolution, WikiArtifactRef,
+        extract_wikilink_targets, linked_paths, normalize_rfc3339_offset, parse_front_matter,
+        parse_goal_reviews, parse_loam_timestamp, resolve_wikilink_target,
+        scan_wikilink_occurrences, Diagnostic, LoamTimestamp, Resolution, WikiArtifactRef,
     };
 
     fn wiki_ref(path: &str) -> WikiArtifactRef {
@@ -3145,6 +3159,29 @@ mod tests {
         assert_eq!(
             parse_errors,
             vec!["invalid goal review date: not-a-date".to_owned()]
+        );
+    }
+
+    #[test]
+    fn view_rfc3339_offset_normalization_rewrites_a_literal_z_suffix_and_leaves_others_alone() {
+        // `git log --format=%aI` preserves a literal `Z` when the underlying
+        // author date was itself recorded with `Z` (e.g. `GIT_AUTHOR_DATE=...Z`,
+        // common for bot/CI commits); the schema rejects `Z` outright.
+        assert_eq!(
+            normalize_rfc3339_offset("2026-07-16T13:23:38Z"),
+            "2026-07-16T13:23:38+00:00"
+        );
+        assert_eq!(
+            normalize_rfc3339_offset("2026-07-16T13:23:38z"),
+            "2026-07-16T13:23:38+00:00"
+        );
+        assert_eq!(
+            normalize_rfc3339_offset("2026-07-16T13:23:38+02:00"),
+            "2026-07-16T13:23:38+02:00"
+        );
+        assert_eq!(
+            normalize_rfc3339_offset("2026-07-16T13:23:38-05:30"),
+            "2026-07-16T13:23:38-05:30"
         );
     }
 

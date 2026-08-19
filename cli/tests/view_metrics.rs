@@ -518,6 +518,23 @@ fn view_metrics_up_to_100_git_commits_become_source_strength_events() {
     git(&["add", "-A"]);
     git(&["commit", "-q", "-m", "one real fixture commit"]);
 
+    // A `Z`-suffixed author/committer date (common for bot/CI commits) survives
+    // through `git log --format=%aI` as a literal `Z`, which the schema
+    // rejects; the producer must normalize it to a numeric offset.
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&workspace)
+        .args(["commit", "-q", "--allow-empty", "-m", "a zulu-dated commit"])
+        .env("GIT_AUTHOR_NAME", "Fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.com")
+        .env("GIT_COMMITTER_NAME", "Fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.com")
+        .env("GIT_AUTHOR_DATE", "2026-07-16T13:23:38Z")
+        .env("GIT_COMMITTER_DATE", "2026-07-16T13:23:38Z")
+        .status()
+        .expect("git should run");
+    assert!(status.success());
+
     let snapshot = view_snapshot(&workspace);
     fs::remove_dir_all(&workspace).ok();
 
@@ -528,6 +545,14 @@ fn view_metrics_up_to_100_git_commits_become_source_strength_events() {
         "{snapshot}"
     );
     assert!(snapshot.contains(r#""strength":"source""#), "{snapshot}");
+    assert!(
+        snapshot.contains(r#""occurred_at":"2026-07-16T13:23:38+00:00""#),
+        "the Z-suffixed commit date should normalize to a numeric offset: {snapshot}"
+    );
+    assert!(
+        !snapshot.contains("13:23:38Z"),
+        "no event should carry a literal Z offset: {snapshot}"
+    );
 
     assert_schema_valid(&snapshot);
 }
