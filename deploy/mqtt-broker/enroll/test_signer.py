@@ -15,7 +15,6 @@ the `openssl` the deploy already manages. Run it directly:
 import http.client
 import json
 import os
-import select
 import socket
 import ssl
 import subprocess
@@ -181,25 +180,38 @@ def check_bounds_drop_a_silent_client():
             # header read for as long as the bytes keep coming.
             header = b"POST /v1/enroll HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Drip: "
             header += b"a" * 200
+            # Non-blocking for the whole loop. A blocking recv here does not
+            # work: TLS 1.3 sends a NewSessionTicket right after the handshake,
+            # so the socket is readable on the very first pass, and the recv
+            # consumes the ticket, finds no application data, and blocks —
+            # turning the drip into "send one byte, then go quiet", which is
+            # the case the idle timeout already covers. Any probe that blocks
+            # after a readable check on a TLS 1.3 socket has the same trap.
+            client.setblocking(False)
             started = time.monotonic()
+            sent = 0
             dropped = False
             try:
                 for byte in header:
                     try:
                         client.send(bytes([byte]))
+                    except (BlockingIOError, ssl.SSLWantWriteError):
+                        pass  # socket buffer full; this byte goes next pass
                     except OSError:
                         dropped = True
                         break
-                    # Idle rather than sleeping, so the drop is noticed when it
-                    # happens instead of one tick later.
-                    if select.select([client], [], [], 0.25)[0]:
-                        try:
-                            if client.recv(1) == b"":
-                                dropped = True
-                                break
-                        except OSError:
+                    else:
+                        sent += 1
+                    time.sleep(0.25)
+                    try:
+                        if client.recv(1) == b"":
                             dropped = True
                             break
+                    except (BlockingIOError, ssl.SSLWantReadError):
+                        pass  # nothing to read yet, which means still open
+                    except OSError:
+                        dropped = True
+                        break
                     if time.monotonic() - started > 25.0:
                         break
             finally:
@@ -210,13 +222,20 @@ def check_bounds_drop_a_silent_client():
                 "a 3s ceiling: the idle timeout is rearmed by every byte, so "
                 "only the ceiling bounds this"
             )
+            # The drip has to have actually dripped. If this case ever degrades
+            # to a byte or two it stops testing the ceiling and starts
+            # retesting the idle timeout, silently.
+            assert sent >= 5, (
+                f"only {sent} byte(s) went out before the drop: this is not a "
+                "drip, and the idle timeout would have caught it anyway"
+            )
             # Dropped eventually is not dropped by the ceiling: with the
             # ceiling gone this lands near the 30s idle timeout instead.
             assert elapsed < 20.0, (
                 f"dropped, but only after {elapsed:.1f}s against a 3s ceiling "
                 "— that is the idle timeout, not the ceiling"
             )
-            print(f"ok: dripping client dropped after {elapsed:.2f}s")
+            print(f"ok: dripping client dropped after {elapsed:.2f}s ({sent} bytes)")
         finally:
             child.terminate()
             child.wait(timeout=10)

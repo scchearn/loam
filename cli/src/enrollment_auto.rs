@@ -439,15 +439,29 @@ fn transport_failure(stage: &'static str, error: &std::io::Error) -> EnrollmentF
     }
 }
 
-/// Connect to the signer under a bounded deadline, trying every resolved
-/// address. Resolution failure is genuinely "no such signer", so it stays
-/// `SignerUnreachable`; a connect that runs out of time is a timeout.
+/// Connect to the signer, trying every resolved address, under both the
+/// per-attempt timeout and the whole-exchange `deadline`. Resolution failure
+/// is genuinely "no such signer", so it stays `SignerUnreachable`; running out
+/// of time is a timeout.
+///
+/// The deadline matters here and not only later: a host with an A and a AAAA
+/// record on a black-holed route costs two full per-attempt timeouts, and a
+/// wide round-robin record costs one each. Bounding only the reads would have
+/// left the connect phase proportional to how many addresses DNS returned,
+/// which is the hang this exists to remove. Each attempt is clamped to what is
+/// left, so the phase can never overrun the ceiling, and a slow-but-real
+/// connect cannot eat the whole budget before the exchange starts either.
 ///
 /// `getaddrinfo` itself has no deadline in `std`, so the resolver's own is the
-/// only bound available here. That is a smaller exposure than an unbounded
-/// connect: a black-holed route hangs the connect indefinitely, whereas a
-/// resolver that never answers is already bounded by its own configuration.
-fn connect_to_signer(host: &str, port: u16) -> Result<TcpStream, EnrollmentFailure> {
+/// only bound available for that step. That is a smaller exposure than an
+/// unbounded connect: a black-holed route hangs the connect indefinitely,
+/// whereas a resolver that never answers is already bounded by its own
+/// configuration.
+fn connect_to_signer(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<TcpStream, EnrollmentFailure> {
     use std::net::ToSocketAddrs;
 
     let addresses = (host, port)
@@ -456,7 +470,12 @@ fn connect_to_signer(host: &str, port: u16) -> Result<TcpStream, EnrollmentFailu
     let timeout = enroll_timeout();
     let mut timed_out = false;
     for address in addresses {
-        match TcpStream::connect_timeout(&address, timeout) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
+        match TcpStream::connect_timeout(&address, timeout.min(remaining)) {
             Ok(stream) => return Ok(stream),
             Err(error) if is_timeout(&error) => timed_out = true,
             Err(_) => {}
@@ -484,7 +503,7 @@ pub fn request_signed_certificate(
 ) -> Result<Vec<u8>, EnrollmentFailure> {
     let (host, port, path) = parse_url(url)?;
     let deadline = exchange_deadline();
-    let mut tcp = connect_to_signer(&host, port)?;
+    let mut tcp = connect_to_signer(&host, port, deadline)?;
     tcp.set_nodelay(true).ok();
     // Armed before the TLS handshake, which `rustls::Stream` performs lazily
     // on the first write, so the handshake is bounded too.
@@ -523,13 +542,19 @@ pub fn request_signed_certificate(
     );
     // The TLS handshake happens here, on the first write, so a signer that
     // accepts the connection and never completes the handshake fails as a
-    // `request` timeout rather than hanging.
-    stream
+    // `request` timeout rather than hanging. The write timeout is rearmed by
+    // every partial write exactly as the read timeout is by every byte, so the
+    // ceiling is checked around this too — a peer that accepts the request one
+    // byte at a time is the same shape of stall as one that answers that way.
+    let write_result = stream
         .write_all(request.as_bytes())
-        .map_err(|error| transport_failure("request", &error))?;
-    stream
-        .flush()
-        .map_err(|error| transport_failure("request", &error))?;
+        .and_then(|()| stream.flush());
+    if let Err(error) = write_result {
+        return Err(transport_failure("request", &error));
+    }
+    if Instant::now() >= deadline {
+        return Err(EnrollmentFailure::SignerTimeout { stage: "request" });
+    }
 
     let mut response = Vec::new();
     // Read until the header/body separator is present. The body is read once we
@@ -762,6 +787,44 @@ mod tests {
         // The network refusals stay as they are; they have nothing to add.
         assert_eq!(EnrollmentFailure::SignerUnreachable.detail(), None);
         assert_eq!(EnrollmentFailure::BadToken.detail(), None);
+    }
+
+    /// #106 review: the exchange ceiling has to bound the connect phase too.
+    /// Without the clamp each resolved address got a full per-attempt timeout
+    /// before the ceiling was consulted at all, so a host with an A and a AAAA
+    /// record on a black-holed route cost two of them, and a wide round-robin
+    /// record one each — the bound was proportional to what DNS returned.
+    ///
+    /// 192.0.2.1 is TEST-NET-1 (RFC 5737): reserved for documentation and
+    /// routed nowhere, so a connect to it stalls rather than being refused. A
+    /// network that does refuse it quickly makes this pass trivially rather
+    /// than flakily.
+    #[test]
+    fn the_connect_phase_cannot_outrun_the_exchange_deadline() {
+        // A deadline with nothing left must stop the phase, not open a fresh
+        // full-length attempt.
+        let started = Instant::now();
+        let failure = connect_to_signer("192.0.2.1", 8443, Instant::now())
+            .expect_err("a black-holed address cannot connect");
+        assert_eq!(
+            failure,
+            EnrollmentFailure::SignerTimeout { stage: "connect" }
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an exhausted deadline still spent {:?}",
+            started.elapsed()
+        );
+
+        // And a small remaining budget is honoured instead of being replaced
+        // by the full per-attempt timeout.
+        let started = Instant::now();
+        let _ = connect_to_signer("192.0.2.1", 8443, Instant::now() + Duration::from_secs(1));
+        assert!(
+            started.elapsed() < enroll_timeout(),
+            "a 1s budget spent {:?}; the attempt was not clamped to it",
+            started.elapsed()
+        );
     }
 
     #[test]

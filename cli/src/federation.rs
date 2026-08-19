@@ -666,29 +666,20 @@ fn auto_enroll(
         })
         .unwrap_or_default();
     let url = crate::enrollment_auto::signer_url(host);
-    let ssl_cert_file = std::env::var("SSL_CERT_FILE").ok();
-    // Which rung is answering decides what the operator has to go and fix, and
-    // it is the fact that was missing when this failed on a laptop: an
-    // `SSL_CERT_FILE` the shell had exported and the file no longer existed is
-    // indistinguishable, from the outside, from a broker that is down.
-    let trust_source = match (
-        enrolled.ca_ref.as_deref(),
-        ssl_cert_file
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty()),
-    ) {
-        (Some(_), _) => "ca-ref",
-        (None, Some(_)) => "ssl-cert-file",
-        (None, None) => "bundled-roots",
-    };
+    // Which rung answered decides what the operator has to go and fix, and it
+    // is the fact that was missing when this failed on a laptop: an
+    // `SSL_CERT_FILE` the shell had exported, pointing at a file that no longer
+    // existed, is indistinguishable from the outside from a broker that is
+    // down. Both the rung and the specific fault come from the resolver, which
+    // owns the ladder — deriving them here would mean reporting the old
+    // precedence the day the ladder changed.
     let trust = crate::provisioning::resolve_trust_anchors(
         enrolled.ca_ref.as_deref(),
-        ssl_cert_file.as_deref(),
+        std::env::var("SSL_CERT_FILE").ok().as_deref(),
     )
-    .map_err(|reason| EnrollmentFailure::TrustAnchorsUnresolved {
-        source: trust_source,
-        reason,
+    .map_err(|failure| EnrollmentFailure::TrustAnchorsUnresolved {
+        source: failure.source,
+        reason: failure.reason,
     })?;
     let certificate =
         crate::enrollment_auto::request_signed_certificate(&url, token, &csr_pem, &trust)?;
@@ -763,13 +754,18 @@ fn validate_connect(
 }
 
 /// Split a `--project org/project` value into its two atoms.
+///
+/// Both halves go through [`validate_scope_part`], the same gate the config
+/// and inferred rungs pass. This is the rung an operator actually types, so it
+/// is the one most likely to carry a stray character — and nothing downstream
+/// re-checks it: `validate_enrollment`'s bounded-id rules run on the JSON
+/// parse path, not on a `Descriptor` built here.
 fn split_scope(scope: &str) -> Result<(String, String), EnrollmentError> {
     let (org, project) = scope
         .split_once('/')
         .ok_or(EnrollmentError::InvalidField { field: "project" })?;
-    if org.is_empty() || project.is_empty() || org.contains('/') || project.contains('/') {
-        return Err(EnrollmentError::InvalidField { field: "project" });
-    }
+    validate_scope_part(org, "org_id")?;
+    validate_scope_part(project, "project")?;
     Ok((org.to_owned(), project.to_owned()))
 }
 

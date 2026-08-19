@@ -116,16 +116,30 @@ fn connect_rejects_a_plaintext_broker_endpoint() {
 #[test]
 fn connect_rejects_a_malformed_project_override() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let (code, stdout, _stderr) = run_connect(
-        Some(&workspace),
-        "mqtts://broker.example:8883",
-        &["--project", "no-slash", "--json"],
-    );
-    assert_eq!(code, 65);
-    assert!(
-        stdout.contains("descriptor_invalid_field"),
-        "expected typed code, got: {stdout}"
-    );
+    // Both halves get the same gate the config and inferred rungs pass.
+    // `--project` is the rung an operator types, so it is the likeliest to
+    // carry a stray character, and nothing downstream re-checks it: a control
+    // character here would become a broker topic segment.
+    for override_value in [
+        "no-slash",
+        "/project",
+        "org/",
+        "org/pro/ject",
+        "ac\tme/project",
+        "org/pro\nject",
+        "org/pro\u{7f}ject",
+    ] {
+        let (code, stdout, _stderr) = run_connect(
+            Some(&workspace),
+            "mqtts://broker.example:8883",
+            &["--project", override_value, "--json"],
+        );
+        assert_eq!(code, 65, "`{override_value:?}` must be refused: {stdout}");
+        assert!(
+            stdout.contains("descriptor_invalid_field"),
+            "expected typed code for {override_value:?}, got: {stdout}"
+        );
+    }
 }
 
 // Skipped on Windows: this full-flow federation-connect integration test has
@@ -582,23 +596,38 @@ fn an_unusable_ssl_cert_file_names_the_trust_store_not_the_signer() {
     // is dialled, so the signer never sees the attempt — which is exactly the
     // reported symptom, an empty signer journal.
     let root = temp_dir("autoenroll-trust");
-    let missing = root.join("no-such-bundle.pem");
-    let (code, stdout, stderr) =
-        connect_with_token(&root, &[("SSL_CERT_FILE", missing.to_str().unwrap())], &[]);
-    assert_eq!(code, 69, "{stdout} {stderr}");
-    assert!(
-        stdout.contains("trust-anchors-unresolved"),
-        "an unresolvable trust store must name itself: {stdout}"
-    );
-    assert!(
-        !stdout.contains("signer-unreachable"),
-        "a local trust-store failure must not read as a network one: {stdout}"
-    );
-    // The detail says which rung answered, which is the whole fix instruction.
-    assert!(
-        stdout.contains("ssl-cert-file") && stdout.contains("ca-unresolved"),
-        "the detail must name the rung and the reason: {stdout}"
-    );
+    std::fs::create_dir_all(&root).unwrap();
+    let empty = root.join("empty-bundle.pem");
+    std::fs::write(&empty, "").unwrap();
+    let junk = root.join("junk-bundle.pem");
+    std::fs::write(&junk, "not a certificate\n").unwrap();
+
+    // Three faults, three fixes, three reasons. One reason for all of them was
+    // the dead end: "the CA did not resolve" does not say whether the path is
+    // wrong, the file is empty, or the contents are not certificates.
+    for (path, expected) in [
+        (root.join("no-such-bundle.pem"), "ca-file-unreadable"),
+        (empty, "ca-file-empty"),
+        (junk, "ca-no-trusted-certificate"),
+    ] {
+        let (code, stdout, stderr) =
+            connect_with_token(&root, &[("SSL_CERT_FILE", path.to_str().unwrap())], &[]);
+        assert_eq!(code, 69, "{stdout} {stderr}");
+        assert!(
+            stdout.contains("trust-anchors-unresolved"),
+            "an unresolvable trust store must name itself: {stdout}"
+        );
+        assert!(
+            !stdout.contains("signer-unreachable"),
+            "a local trust-store failure must not read as a network one: {stdout}"
+        );
+        // The detail names the rung that answered and what was wrong with it,
+        // which together are the whole fix instruction.
+        assert!(
+            stdout.contains("ssl-cert-file") && stdout.contains(expected),
+            "the detail must name the rung and `{expected}`: {stdout}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -181,21 +181,70 @@ pub fn split_credential(blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'static str>
 pub fn resolve_trust_anchors(
     ca_ref: Option<&str>,
     ssl_cert_file: Option<&str>,
-) -> Result<rustls::RootCertStore, &'static str> {
+) -> Result<rustls::RootCertStore, TrustFailure> {
     match ca_ref {
         // Present but blank is a malformed reference, not an absent one. Reading
         // it as "no CA pinned" would turn a typo into a silently wider trust
         // decision — the same downgrade an unresolvable reference is refused for.
-        Some(reference) if reference.trim().is_empty() => Err(reason::CA_UNRESOLVED),
-        Some(reference) => {
-            let bytes = std::fs::read(reference.trim()).map_err(|_| reason::CA_UNRESOLVED)?;
-            if bytes.is_empty() {
-                return Err(reason::CA_UNRESOLVED);
-            }
-            build_root_store(&bytes)
+        Some(reference) if reference.trim().is_empty() => {
+            Err(TrustFailure::new(CA_REF, reason::CA_REF_BLANK))
         }
+        Some(reference) => read_trust_file(CA_REF, reference.trim()),
         None => bundled_trust_anchors(ssl_cert_file),
     }
+}
+
+/// The rung names a [`TrustFailure`] reports. They are derived here, beside the
+/// ladder itself, because a caller that re-derived the precedence would keep
+/// reporting the old one the day the ladder changed. There is no name for the
+/// bundled rung: the roots are compiled in, so it has no way to fail.
+const CA_REF: &str = "ca-ref";
+const SSL_CERT_FILE: &str = "ssl-cert-file";
+
+/// Which trust rung answered, and what specifically went wrong on it.
+///
+/// One reason for every trust failure was the whole diagnosis an operator got,
+/// and "the CA did not resolve" does not say whether the path is wrong, the
+/// file is empty, or the contents are not certificates — three different fixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustFailure {
+    /// `ca-ref` or `ssl-cert-file` — the two rungs that read a file. The
+    /// bundled rung is compiled in and cannot fail.
+    pub source: &'static str,
+    /// One of the `reason::CA_*` constants.
+    pub reason: &'static str,
+}
+
+impl TrustFailure {
+    fn new(source: &'static str, reason: &'static str) -> Self {
+        Self { source, reason }
+    }
+
+    /// The reason the *session-credential* surface reports.
+    ///
+    /// `credentials-unresolved / ca-unresolved` is what that path has said for
+    /// every trust failure since it existed, and the connector's reason strings
+    /// are a tested IPC contract that does not move. So it keeps saying exactly
+    /// that, deliberately and in one place. The specific [`TrustFailure::reason`]
+    /// is additive: it reaches the enrollment diagnostic, which is new, and
+    /// nothing else.
+    pub fn credential_reason(&self) -> &'static str {
+        reason::CA_UNRESOLVED
+    }
+}
+
+/// Read one named trust file into a root store, naming which of the three ways
+/// it can fail happened.
+fn read_trust_file(
+    source: &'static str,
+    path: &str,
+) -> Result<rustls::RootCertStore, TrustFailure> {
+    let bytes =
+        std::fs::read(path).map_err(|_| TrustFailure::new(source, reason::CA_FILE_UNREADABLE))?;
+    if bytes.is_empty() {
+        return Err(TrustFailure::new(source, reason::CA_FILE_EMPTY));
+    }
+    build_root_store(&bytes).map_err(|reason| TrustFailure::new(source, reason))
 }
 
 /// The no-`ca_ref` trust path: `SSL_CERT_FILE` first, then the bundled Mozilla
@@ -203,12 +252,13 @@ pub fn resolve_trust_anchors(
 /// become "trust nothing".
 fn bundled_trust_anchors(
     ssl_cert_file: Option<&str>,
-) -> Result<rustls::RootCertStore, &'static str> {
+) -> Result<rustls::RootCertStore, TrustFailure> {
     if let Some(path) = ssl_cert_file.map(str::trim).filter(|v| !v.is_empty()) {
-        let bytes = std::fs::read(path).map_err(|_| reason::CA_UNRESOLVED)?;
-        if !bytes.is_empty() {
-            return build_root_store(&bytes);
-        }
+        // A set override is honoured or refused, never quietly skipped. An
+        // empty file used to fall through to the bundle, which is the same
+        // silent widening the blank `ca_ref` above is refused for: the operator
+        // pinned trust and got a hundred Mozilla roots instead.
+        return read_trust_file(SSL_CERT_FILE, path);
     }
     Ok(rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
@@ -280,7 +330,7 @@ pub fn build_root_store(pem: &[u8]) -> Result<rustls::RootCertStore, &'static st
     let mut store = rustls::RootCertStore::empty();
     store.add_parsable_certificates(der_certs);
     if store.is_empty() {
-        return Err(reason::CA_UNRESOLVED);
+        return Err(reason::CA_NO_TRUSTED_CERTIFICATE);
     }
     Ok(store)
 }
@@ -331,8 +381,10 @@ pub fn resolve_credentials(
     let key = std::fs::read(&key_path).map_err(|_| credentials(reason::IDENTITY_REQUIRED))?;
     harden_identity_permissions(identity_root, &certificate_path, &key_path)
         .map_err(ProvisionFailure::Credentials)?;
-    let certificate_authority =
-        resolve_trust_anchors(ca_ref, ssl_cert_file).map_err(ProvisionFailure::Credentials)?;
+    // The session-credential surface keeps reporting `ca-unresolved`; see
+    // `TrustFailure::credential_reason`.
+    let certificate_authority = resolve_trust_anchors(ca_ref, ssl_cert_file)
+        .map_err(|failure| ProvisionFailure::Credentials(failure.credential_reason()))?;
     Ok(CredentialMaterial {
         certificate,
         key,
@@ -3112,30 +3164,93 @@ mod tests {
             "the override branch is the file's roots, never the bundle"
         );
 
+        // Each way a trust rung can fail names itself, because the fixes
+        // differ: a wrong path, a file with nothing in it, and a file that
+        // holds something other than certificates are three different jobs.
+        // The rung comes from the resolver, so a caller reporting it cannot
+        // drift out of step with the precedence it describes.
+        //
         // A named CA that resolves to nothing is a refusal, never a silent
         // downgrade to the bundle — that downgrade would turn a pinning
         // failure into a quietly wider trust decision.
-        assert!(matches!(
-            resolve_trust_anchors(Some("/nonexistent/loam/ca.pem"), None),
-            Err(reason::CA_UNRESOLVED)
-        ));
+        assert_eq!(
+            resolve_trust_anchors(Some("/nonexistent/loam/ca.pem"), None).unwrap_err(),
+            TrustFailure {
+                source: "ca-ref",
+                reason: reason::CA_FILE_UNREADABLE
+            }
+        );
 
         // A present-but-blank reference is malformed, not absent: reading it as
         // "no CA pinned" would turn a typo into a silently wider trust decision.
-        assert!(matches!(
-            resolve_trust_anchors(Some("   "), None),
-            Err(reason::CA_UNRESOLVED)
-        ));
+        assert_eq!(
+            resolve_trust_anchors(Some("   "), None).unwrap_err(),
+            TrustFailure {
+                source: "ca-ref",
+                reason: reason::CA_REF_BLANK
+            }
+        );
 
         // An empty trust file is not a trust store: it would build a root store
         // that refuses every connection, which is a broken session rather than
         // a resolved one.
         let empty = directory.join("empty.pem");
         std::fs::write(&empty, "").expect("empty trust file is writable");
-        assert!(matches!(
-            resolve_trust_anchors(Some(&empty.to_string_lossy()), None),
-            Err(reason::CA_UNRESOLVED)
-        ));
+        assert_eq!(
+            resolve_trust_anchors(Some(&empty.to_string_lossy()), None).unwrap_err(),
+            TrustFailure {
+                source: "ca-ref",
+                reason: reason::CA_FILE_EMPTY
+            }
+        );
+
+        // Bytes that are not certificates: the path and the content are both
+        // there, and neither is the problem the operator has.
+        let junk = directory.join("junk.pem");
+        std::fs::write(&junk, "not a certificate\n").expect("junk trust file is writable");
+        assert_eq!(
+            resolve_trust_anchors(Some(&junk.to_string_lossy()), None).unwrap_err(),
+            TrustFailure {
+                source: "ca-ref",
+                reason: reason::CA_NO_TRUSTED_CERTIFICATE
+            }
+        );
+
+        // The same three faults on the SSL_CERT_FILE rung report that rung.
+        // An empty override used to fall through to the bundled roots, which
+        // is the silent widening the blank `ca_ref` case above is refused for.
+        for (path, expected) in [
+            ("/nonexistent/loam/bundle.pem", reason::CA_FILE_UNREADABLE),
+            (empty.to_string_lossy().as_ref(), reason::CA_FILE_EMPTY),
+            (
+                junk.to_string_lossy().as_ref(),
+                reason::CA_NO_TRUSTED_CERTIFICATE,
+            ),
+        ] {
+            assert_eq!(
+                resolve_trust_anchors(None, Some(path)).unwrap_err(),
+                TrustFailure {
+                    source: "ssl-cert-file",
+                    reason: expected
+                }
+            );
+        }
+
+        // Whatever the specific fault, the session-credential surface keeps
+        // reporting the one reason it has always reported. The new ones are
+        // additive, for the enrollment diagnostic, and do not move this.
+        for failure in [
+            TrustFailure {
+                source: "ca-ref",
+                reason: reason::CA_REF_BLANK,
+            },
+            TrustFailure {
+                source: "ssl-cert-file",
+                reason: reason::CA_NO_TRUSTED_CERTIFICATE,
+            },
+        ] {
+            assert_eq!(failure.credential_reason(), reason::CA_UNRESOLVED);
+        }
 
         let _ = std::fs::remove_dir_all(directory);
     }

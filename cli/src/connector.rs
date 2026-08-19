@@ -1789,7 +1789,24 @@ pub mod reason {
     /// the certificate is the machine's only identity source, so a machine with
     /// none cannot open a session and nothing is minted to paper over it.
     pub const IDENTITY_REQUIRED: &str = "identity-required";
+    /// The single reason the session-credential surface reports for any trust
+    /// failure. It has meant that since the surface existed and it does not
+    /// move; the four specific reasons below are additive, and reach the
+    /// enrollment diagnostic only. See `provisioning::TrustFailure`.
     pub const CA_UNRESOLVED: &str = "ca-unresolved";
+    /// A pinned `ca_ref` that is present but blank — a typo, not "no CA".
+    pub const CA_REF_BLANK: &str = "ca-ref-blank";
+    /// The named trust file could not be read: wrong path, or no permission.
+    /// The likeliest shape of a stale `SSL_CERT_FILE` left in a shell profile.
+    pub const CA_FILE_UNREADABLE: &str = "ca-file-unreadable";
+    /// The named trust file was read and holds nothing. Distinct from
+    /// unreadable because the fix differs: the path is right, the content is
+    /// not.
+    pub const CA_FILE_EMPTY: &str = "ca-file-empty";
+    /// The named trust file holds bytes but no certificate this runtime can
+    /// parse into a trust anchor — a PEM with the wrong block type, DER where
+    /// PEM was expected, or a truncated file.
+    pub const CA_NO_TRUSTED_CERTIFICATE: &str = "ca-no-trusted-certificate";
     /// The local Git email and the authenticated certificate's common name
     /// disagree. The certificate is authoritative and the disagreement is
     /// surfaced rather than resolved in either direction.
@@ -6507,6 +6524,10 @@ mod snapshot_tests {
         let all = [
             reason::ENDPOINT_MALFORMED,
             reason::CREDENTIAL_REF_UNRESOLVED,
+            reason::CA_REF_BLANK,
+            reason::CA_FILE_UNREADABLE,
+            reason::CA_FILE_EMPTY,
+            reason::CA_NO_TRUSTED_CERTIFICATE,
             reason::CERTIFICATE_MALFORMED,
             reason::KEY_FORMAT_UNSUPPORTED,
             reason::KEY_CERT_MISMATCH,
