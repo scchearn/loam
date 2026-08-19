@@ -1,11 +1,12 @@
-//! `loam state --view` snapshot producer (Loam View, T3).
+//! `loam state --view` snapshot producer (Loam View, T3 + T4).
 //!
-//! Emits the `workspace`, `capabilities`, and `artifacts` sections of the
+//! Emits the `workspace`, `capabilities`, `artifacts` (T3), and
+//! `relationships` (T4: wikilink scanner + derivation) sections of the
 //! snapshot v1 contract (`view/schema/snapshot-v1.schema.json`). The
-//! remaining arrays (`relationships`, `events`, `metrics`, `signals`,
-//! `hints`, `probes`) are always empty here; other tasks own them.
-//! See `specs/loam-view.md` "Snapshot v1 shape" and "Artifact inventory
-//! and wikilink rules".
+//! remaining arrays (`events`, `metrics`, `signals`, `hints`, `probes`) are
+//! always empty here; other tasks own them.
+//! See `specs/loam-view.md` "Snapshot v1 shape", "Artifact inventory and
+//! wikilink rules", and "V1 relationship rules are limited to ...".
 
 use std::fs;
 use std::path::Path;
@@ -51,9 +52,10 @@ pub(crate) fn snapshot(workspace: &Path) -> String {
     let status = if has_wiki { "ready" } else { "not-configured" };
     let capabilities = build_capabilities(&wiki_root, has_wiki, &artifacts, &git);
     let generated_at = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let relationships = derive_relationships(&artifacts, workspace, &generated_at);
 
     format!(
-        "{{\"profile\":\"loam-view\",\"schema_version\":1,\"generated_at\":\"{}\",\"status\":\"{}\",\"workspace\":{},\"capabilities\":{},\"artifacts\":[{}],\"relationships\":[],\"events\":[],\"metrics\":{{}},\"signals\":[],\"hints\":[],\"probes\":[]}}",
+        "{{\"profile\":\"loam-view\",\"schema_version\":1,\"generated_at\":\"{}\",\"status\":\"{}\",\"workspace\":{},\"capabilities\":{},\"artifacts\":[{}],\"relationships\":[{}],\"events\":[],\"metrics\":{{}},\"signals\":[],\"hints\":[],\"probes\":[]}}",
         state::json_escape(&generated_at),
         status,
         workspace_json(&canonical_root, &name, platform, &git),
@@ -61,6 +63,11 @@ pub(crate) fn snapshot(workspace: &Path) -> String {
         artifacts
             .iter()
             .map(Artifact::to_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        relationships
+            .iter()
+            .map(Relationship::to_json)
             .collect::<Vec<_>>()
             .join(","),
     )
@@ -307,6 +314,23 @@ struct Artifact {
     bytes: u64,
     attributes: String,
     parse_errors: Vec<String>,
+    /// Structured fields relationship derivation needs, captured once here
+    /// (front matter/body are already parsed in `build_artifact`) rather than
+    /// re-parsed from `attributes`'s JSON string. Not part of the wire shape.
+    link_facts: LinkFacts,
+}
+
+#[derive(Default)]
+struct LinkFacts {
+    goal_linked_specs: Vec<String>,
+    goal_linked_plans: Vec<String>,
+    spec_goal: Option<String>,
+    plan_spec: Option<String>,
+    plan_goal: Option<String>,
+    plan_touched_files: Vec<String>,
+    checkpoint_previous: Option<String>,
+    checkpoint_supersedes: Option<String>,
+    code_source_path: Option<String>,
 }
 
 impl Artifact {
@@ -507,6 +531,7 @@ fn build_artifact(workspace: &Path, file: &Path, kind: &'static str) -> Artifact
             bytes,
             attributes: default_attributes(kind),
             parse_errors: vec!["content is not valid UTF-8".to_owned()],
+            link_facts: LinkFacts::default(),
         };
     };
 
@@ -542,6 +567,38 @@ fn build_artifact(workspace: &Path, file: &Path, kind: &'static str) -> Artifact
         _ => "{}".to_owned(),
     };
 
+    let link_facts = match kind {
+        "code" => LinkFacts {
+            code_source_path: front_matter.get("source_path").map(str::to_owned),
+            ..LinkFacts::default()
+        },
+        "goal" => LinkFacts {
+            goal_linked_specs: linked_paths(&body, "specs/"),
+            goal_linked_plans: linked_paths(&body, "plans/"),
+            ..LinkFacts::default()
+        },
+        "spec" => LinkFacts {
+            spec_goal: front_matter.get("goal").map(str::to_owned),
+            ..LinkFacts::default()
+        },
+        "plan" => LinkFacts {
+            plan_spec: front_matter.get("spec").map(str::to_owned),
+            plan_goal: front_matter.get("goal").map(str::to_owned),
+            plan_touched_files: plan_touched_files(&body),
+            ..LinkFacts::default()
+        },
+        "checkpoint" => LinkFacts {
+            checkpoint_previous: body
+                .lines()
+                .find_map(|line| state::checkpoint_field(line, "Previous")),
+            checkpoint_supersedes: body
+                .lines()
+                .find_map(|line| state::checkpoint_field(line, "Supersedes")),
+            ..LinkFacts::default()
+        },
+        _ => LinkFacts::default(),
+    };
+
     Artifact {
         path,
         kind,
@@ -554,7 +611,27 @@ fn build_artifact(workspace: &Path, file: &Path, kind: &'static str) -> Artifact
         bytes,
         attributes,
         parse_errors,
+        link_facts,
     }
+}
+
+/// Same "Files:" body lines `plan_attributes` reads, factored out so
+/// relationship derivation (rule 7) doesn't reparse `attributes`' JSON string.
+fn plan_touched_files(body: &str) -> Vec<String> {
+    let mut touched = Vec::new();
+    for line in body.lines() {
+        if let Some(value) = state::checkpoint_field(line, "Files") {
+            touched.extend(
+                value
+                    .split(',')
+                    .map(|item| item.trim().to_owned())
+                    .filter(|item| !item.is_empty()),
+            );
+        }
+    }
+    touched.sort();
+    touched.dedup();
+    touched
 }
 
 fn extract_timestamp(
@@ -987,9 +1064,713 @@ fn parse_loam_timestamp(raw: &str) -> Option<String> {
     ))
 }
 
+// --- relationships: wikilink scanner + derivation (T4) --------------------
+//
+// See specs/loam-view.md "Artifact inventory and wikilink rules" (scanner
+// state machine) and the "V1 relationship rules are limited to ..."
+// paragraph. Two families of edges are derived:
+//
+//   1. every resolved `[[wikilink]]` anywhere in the corpus (rule 1), plus a
+//      typed overlay for wikilinks found under a code page's "Dependencies"
+//      or "Callers" heading (rule 6);
+//   2. structural edges read from already-parsed front matter/body fields
+//      captured on `Artifact::link_facts` at build time (rules 2-5, 7).
+//
+// Unresolved wikilinks (broken/ambiguous) and structural targets absent from
+// the inventory never become edges -- `derive_relationships` is the only
+// place that turns a candidate into a `Relationship`.
+
+struct EvidenceLocation {
+    path: Option<String>,
+    line: Option<u64>,
+    section: Option<String>,
+    field: Option<String>,
+    content_hash: Option<String>,
+}
+
+impl Clone for EvidenceLocation {
+    fn clone(&self) -> Self {
+        EvidenceLocation {
+            path: self.path.clone(),
+            line: self.line,
+            section: self.section.clone(),
+            field: self.field.clone(),
+            content_hash: self.content_hash.clone(),
+        }
+    }
+}
+
+impl EvidenceLocation {
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"path\":{},\"line\":{},\"section\":{},\"field\":{},\"content_hash\":{}}}",
+            state::optional_json(self.path.as_deref()),
+            self.line
+                .map_or_else(|| "null".to_owned(), |line| line.to_string()),
+            state::optional_json(self.section.as_deref()),
+            state::optional_json(self.field.as_deref()),
+            state::optional_json(self.content_hash.as_deref()),
+        )
+    }
+}
+
+struct Rule {
+    id: String,
+    version: String,
+    generated_at: String,
+    confidence: f64,
+}
+
+impl Rule {
+    fn new(id: &str, generated_at: &str) -> Self {
+        Rule {
+            id: id.to_owned(),
+            version: "1".to_owned(),
+            generated_at: generated_at.to_owned(),
+            confidence: 1.0,
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"id\":\"{}\",\"version\":\"{}\",\"generated_at\":\"{}\",\"confidence\":{}}}",
+            state::json_escape(&self.id),
+            state::json_escape(&self.version),
+            state::json_escape(&self.generated_at),
+            self.confidence,
+        )
+    }
+}
+
+struct Relationship {
+    id: String,
+    from: String,
+    to: String,
+    kind: String,
+    origin: &'static str,
+    evidence: EvidenceLocation,
+    rule: Option<Rule>,
+}
+
+impl Relationship {
+    fn new(
+        from: String,
+        to: String,
+        kind: String,
+        origin: &'static str,
+        evidence: EvidenceLocation,
+        rule: Option<Rule>,
+    ) -> Self {
+        let id = relationship_id(origin, &kind, &from, &to, &evidence);
+        Relationship {
+            id,
+            from,
+            to,
+            kind,
+            origin,
+            evidence,
+            rule,
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"id\":\"{}\",\"from\":\"{}\",\"to\":\"{}\",\"kind\":\"{}\",\"origin\":\"{}\",\"evidence\":{},\"rule\":{}}}",
+            self.id,
+            state::json_escape(&self.from),
+            state::json_escape(&self.to),
+            state::json_escape(&self.kind),
+            self.origin,
+            self.evidence.to_json(),
+            self.rule
+                .as_ref()
+                .map_or_else(|| "null".to_owned(), Rule::to_json),
+        )
+    }
+}
+
+/// SHA-256 over origin+kind+endpoints+evidence location, unit-separated so
+/// adjacent fields can never collide (`"ab"+"c"` vs. `"a"+"bc"`). Every input
+/// is deterministic given the same workspace, so ids are stable across runs.
+fn relationship_id(
+    origin: &str,
+    kind: &str,
+    from: &str,
+    to: &str,
+    evidence: &EvidenceLocation,
+) -> String {
+    let line = evidence.line.map(|value| value.to_string());
+    let parts: [&str; 9] = [
+        origin,
+        kind,
+        from,
+        to,
+        evidence.path.as_deref().unwrap_or(""),
+        line.as_deref().unwrap_or(""),
+        evidence.section.as_deref().unwrap_or(""),
+        evidence.field.as_deref().unwrap_or(""),
+        evidence.content_hash.as_deref().unwrap_or(""),
+    ];
+    let mut hasher = sha256::Sha256::default();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(&[0x1f]);
+    }
+    hasher.finish()
+}
+
+fn derive_relationships(
+    artifacts: &[Artifact],
+    workspace: &Path,
+    generated_at: &str,
+) -> Vec<Relationship> {
+    let refs = wiki_refs(artifacts);
+    let known_paths: std::collections::HashSet<&str> = artifacts
+        .iter()
+        .map(|artifact| artifact.path.as_str())
+        .collect();
+    let ctx = StructuralEdgeContext {
+        generated_at,
+        known_paths: &known_paths,
+    };
+    let mut relationships = Vec::new();
+
+    for artifact in artifacts {
+        let Ok(content) = fs::read_to_string(workspace.join(&artifact.path)) else {
+            continue;
+        };
+        for occurrence in scan_wikilink_occurrences(&content) {
+            let Resolution::Resolved { target_path, .. } =
+                resolve_wikilink_target(&occurrence.raw_target, &refs)
+            else {
+                continue;
+            };
+            let evidence = EvidenceLocation {
+                path: Some(artifact.path.clone()),
+                line: Some(occurrence.line),
+                section: occurrence.section.clone(),
+                field: None,
+                content_hash: Some(artifact.content_hash.clone()),
+            };
+            relationships.push(Relationship::new(
+                artifact.path.clone(),
+                target_path.clone(),
+                "wikilink".to_owned(),
+                "explicit",
+                evidence.clone(),
+                None,
+            ));
+
+            if artifact.kind == "code" {
+                let derived_kind = match occurrence.section.as_deref() {
+                    Some(section) if section.eq_ignore_ascii_case("dependencies") => {
+                        Some("code-dependency")
+                    }
+                    Some(section) if section.eq_ignore_ascii_case("callers") => Some("code-caller"),
+                    _ => None,
+                };
+                if let Some(kind) = derived_kind {
+                    relationships.push(Relationship::new(
+                        artifact.path.clone(),
+                        target_path,
+                        kind.to_owned(),
+                        "derived",
+                        evidence,
+                        Some(Rule::new(kind, generated_at)),
+                    ));
+                }
+            }
+        }
+    }
+
+    for artifact in artifacts {
+        match artifact.kind {
+            "goal" => {
+                for spec in &artifact.link_facts.goal_linked_specs {
+                    push_structural_edge(
+                        &mut relationships,
+                        artifact,
+                        spec,
+                        "goal-linked-spec",
+                        Some("Linked work"),
+                        None,
+                        &ctx,
+                    );
+                }
+                for plan in &artifact.link_facts.goal_linked_plans {
+                    push_structural_edge(
+                        &mut relationships,
+                        artifact,
+                        plan,
+                        "goal-linked-plan",
+                        Some("Linked work"),
+                        None,
+                        &ctx,
+                    );
+                }
+            }
+            "spec" => {
+                if let Some(goal) = &artifact.link_facts.spec_goal {
+                    push_structural_edge(
+                        &mut relationships,
+                        artifact,
+                        goal,
+                        "spec-goal",
+                        None,
+                        Some("goal"),
+                        &ctx,
+                    );
+                }
+            }
+            "plan" => {
+                if let Some(spec) = &artifact.link_facts.plan_spec {
+                    push_structural_edge(
+                        &mut relationships,
+                        artifact,
+                        spec,
+                        "plan-spec",
+                        None,
+                        Some("spec"),
+                        &ctx,
+                    );
+                }
+                if let Some(goal) = &artifact.link_facts.plan_goal {
+                    push_structural_edge(
+                        &mut relationships,
+                        artifact,
+                        goal,
+                        "plan-goal",
+                        None,
+                        Some("goal"),
+                        &ctx,
+                    );
+                }
+                for touched in &artifact.link_facts.plan_touched_files {
+                    let mapped: Vec<&Artifact> = artifacts
+                        .iter()
+                        .filter(|candidate| candidate.kind == "code")
+                        .filter(|candidate| {
+                            candidate.link_facts.code_source_path.as_deref()
+                                == Some(touched.as_str())
+                        })
+                        .collect();
+                    if let [only] = mapped.as_slice() {
+                        push_structural_edge(
+                            &mut relationships,
+                            artifact,
+                            only.path.as_str(),
+                            "plan-touched-file",
+                            Some("Touched files"),
+                            None,
+                            &ctx,
+                        );
+                    }
+                }
+            }
+            "checkpoint" => {
+                if let Some(previous) = &artifact.link_facts.checkpoint_previous {
+                    push_structural_edge(
+                        &mut relationships,
+                        artifact,
+                        previous,
+                        "checkpoint-previous",
+                        None,
+                        Some("previous"),
+                        &ctx,
+                    );
+                }
+                if let Some(supersedes) = &artifact.link_facts.checkpoint_supersedes {
+                    push_structural_edge(
+                        &mut relationships,
+                        artifact,
+                        supersedes,
+                        "checkpoint-supersedes",
+                        None,
+                        Some("supersedes"),
+                        &ctx,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    relationships.sort_by(|left, right| {
+        (left.from.as_str(), left.to.as_str(), left.kind.as_str()).cmp(&(
+            right.from.as_str(),
+            right.to.as_str(),
+            right.kind.as_str(),
+        ))
+    });
+    relationships
+}
+
+struct StructuralEdgeContext<'a> {
+    generated_at: &'a str,
+    known_paths: &'a std::collections::HashSet<&'a str>,
+}
+
+/// Rules 2-5 and 7: a structural target that is not an inventoried artifact
+/// path is never turned into an edge, matching the wikilink scanner's
+/// "unresolved links never become edges" rule.
+fn push_structural_edge(
+    relationships: &mut Vec<Relationship>,
+    from_artifact: &Artifact,
+    to_path: &str,
+    kind: &str,
+    section: Option<&str>,
+    field: Option<&str>,
+    ctx: &StructuralEdgeContext,
+) {
+    if !ctx.known_paths.contains(to_path) {
+        return;
+    }
+    let evidence = EvidenceLocation {
+        path: Some(from_artifact.path.clone()),
+        line: None,
+        section: section.map(str::to_owned),
+        field: field.map(str::to_owned),
+        content_hash: Some(from_artifact.content_hash.clone()),
+    };
+    relationships.push(Relationship::new(
+        from_artifact.path.clone(),
+        to_path.to_owned(),
+        kind.to_owned(),
+        "derived",
+        evidence,
+        Some(Rule::new(kind, ctx.generated_at)),
+    ));
+}
+
+// --- wikilink resolution ---------------------------------------------------
+
+struct WikiArtifactRef {
+    path: String,
+    rel_no_ext: String,
+    stem: String,
+}
+
+/// The resolution pool: every inventoried Markdown artifact under `wiki/`
+/// (goals/specs/plans/AGENTS.md are never wikilink targets -- they use plain
+/// Markdown links, per `specs/loam-view.md`'s path-normalization rule).
+fn wiki_refs(artifacts: &[Artifact]) -> Vec<WikiArtifactRef> {
+    artifacts
+        .iter()
+        .filter(|artifact| artifact.path.starts_with("wiki/"))
+        .map(|artifact| {
+            let rel = artifact
+                .path
+                .strip_prefix("wiki/")
+                .unwrap_or(artifact.path.as_str());
+            let rel_no_ext = rel.strip_suffix(".md").unwrap_or(rel).to_owned();
+            let stem = rel_no_ext
+                .rsplit('/')
+                .next()
+                .unwrap_or(rel_no_ext.as_str())
+                .to_owned();
+            WikiArtifactRef {
+                path: artifact.path.clone(),
+                rel_no_ext,
+                stem,
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, PartialEq)]
+enum Diagnostic {
+    NoncanonicalCase,
+    Ambiguous,
+    Broken,
+}
+
+#[derive(Debug, PartialEq)]
+enum Resolution {
+    Resolved {
+        target_path: String,
+        diagnostic: Option<Diagnostic>,
+    },
+    Unresolved(Diagnostic),
+}
+
+/// `specs/loam-view.md` "Artifact inventory and wikilink rules", steps 3-4:
+/// a `/`-containing target resolves by normalized wiki-relative path; a bare
+/// target resolves by unique case-sensitive basename stem. Either form falls
+/// back to a unique case-insensitive match (`noncanonical-link-case`); more
+/// than one match at either case sensitivity is `ambiguous-wikilink`; no
+/// match at all is `broken-wikilink`.
+fn resolve_wikilink_target(raw_target: &str, refs: &[WikiArtifactRef]) -> Resolution {
+    let normalized = normalize_wikilink_target(raw_target);
+    if normalized.contains('/') {
+        resolve_by_key(&normalized, refs, false)
+    } else {
+        resolve_by_key(&normalized, refs, true)
+    }
+}
+
+fn normalize_wikilink_target(raw_target: &str) -> String {
+    let value = raw_target.trim().replace('\\', "/");
+    value.strip_suffix(".md").unwrap_or(&value).to_owned()
+}
+
+fn resolve_by_key(target: &str, refs: &[WikiArtifactRef], by_stem: bool) -> Resolution {
+    fn key_of(reference: &WikiArtifactRef, by_stem: bool) -> &str {
+        if by_stem {
+            reference.stem.as_str()
+        } else {
+            reference.rel_no_ext.as_str()
+        }
+    }
+    let exact: Vec<&WikiArtifactRef> = refs
+        .iter()
+        .filter(|r| key_of(r, by_stem) == target)
+        .collect();
+    if exact.len() == 1 {
+        return Resolution::Resolved {
+            target_path: exact[0].path.clone(),
+            diagnostic: None,
+        };
+    }
+    if exact.len() > 1 {
+        return Resolution::Unresolved(Diagnostic::Ambiguous);
+    }
+    let case_insensitive: Vec<&WikiArtifactRef> = refs
+        .iter()
+        .filter(|r| key_of(r, by_stem).eq_ignore_ascii_case(target))
+        .collect();
+    match case_insensitive.len() {
+        1 => Resolution::Resolved {
+            target_path: case_insensitive[0].path.clone(),
+            diagnostic: Some(Diagnostic::NoncanonicalCase),
+        },
+        0 => Resolution::Unresolved(Diagnostic::Broken),
+        _ => Resolution::Unresolved(Diagnostic::Ambiguous),
+    }
+}
+
+// --- wikilink scanner state machine ----------------------------------------
+
+struct WikilinkOccurrence {
+    line: u64,
+    section: Option<String>,
+    raw_target: String,
+}
+
+/// `specs/loam-view.md` "Artifact inventory and wikilink rules", steps 1-2:
+/// strip front matter for scanning only, ignore fenced code blocks and
+/// inline-code spans, and recognize `[[target]]`, `[[target|alias]]`,
+/// `[[target#heading]]`, and their `![[...]]` embed form (alias/heading
+/// fragments never change resolution).
+fn scan_wikilink_occurrences(content: &str) -> Vec<WikilinkOccurrence> {
+    let mut occurrences = Vec::new();
+    let mut in_front_matter = false;
+    let mut in_fence = false;
+    let mut section: Option<String> = None;
+
+    for (index, raw_line) in content.lines().enumerate() {
+        let line_number = (index + 1) as u64;
+
+        if index == 0 && raw_line.trim_end() == "---" {
+            in_front_matter = true;
+            continue;
+        }
+        if in_front_matter {
+            if raw_line.trim_end() == "---" {
+                in_front_matter = false;
+            }
+            continue;
+        }
+
+        if raw_line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        if let Some(heading) = heading_text(raw_line) {
+            section = Some(heading);
+            continue;
+        }
+
+        let scanned = strip_inline_code(raw_line);
+        for raw_target in extract_wikilink_targets(&scanned) {
+            occurrences.push(WikilinkOccurrence {
+                line: line_number,
+                section: section.clone(),
+                raw_target,
+            });
+        }
+    }
+    occurrences
+}
+
+fn heading_text(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let hashes = trimmed
+        .chars()
+        .take_while(|&character| character == '#')
+        .count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &trimmed[hashes..];
+    if !rest.is_empty() && !rest.starts_with(' ') {
+        return None;
+    }
+    Some(rest.trim().to_owned())
+}
+
+/// Blanks out `` `...` `` spans (backticks included) so a link-like sequence
+/// inside inline code, such as `` `[[not-a-link]]` ``, is never scanned.
+/// Ceiling: single-backtick spans only, matching every fixture's usage; a
+/// double-backtick span containing a literal backtick would misparse.
+fn strip_inline_code(line: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut in_code = false;
+    for character in line.chars() {
+        if character == '`' {
+            in_code = !in_code;
+            result.push(' ');
+            continue;
+        }
+        result.push(if in_code { ' ' } else { character });
+    }
+    result
+}
+
+fn extract_wikilink_targets(line: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'[' && bytes[index + 1] == b'[' {
+            if let Some(end) = line[index + 2..].find("]]") {
+                let inner = &line[index + 2..index + 2 + end];
+                let target = inner
+                    .split(['|', '#'])
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                if !target.is_empty() {
+                    targets.push(target);
+                }
+                index += 2 + end + 2;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    targets
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{linked_paths, parse_front_matter, parse_loam_timestamp};
+    use super::{
+        extract_wikilink_targets, linked_paths, parse_front_matter, parse_loam_timestamp,
+        resolve_wikilink_target, scan_wikilink_occurrences, Diagnostic, Resolution,
+        WikiArtifactRef,
+    };
+
+    fn wiki_ref(path: &str) -> WikiArtifactRef {
+        let rel = path.strip_prefix("wiki/").unwrap_or(path);
+        let rel_no_ext = rel.strip_suffix(".md").unwrap_or(rel).to_owned();
+        let stem = rel_no_ext
+            .rsplit('/')
+            .next()
+            .unwrap_or(rel_no_ext.as_str())
+            .to_owned();
+        WikiArtifactRef {
+            path: path.to_owned(),
+            rel_no_ext,
+            stem,
+        }
+    }
+
+    /// Mirrors `cli/tests/fixtures/view/broken-links/` exactly: one basename
+    /// resolves cleanly, one is broken, one is ambiguous (shared stem across
+    /// two directories), and one resolves only case-insensitively.
+    fn broken_links_refs() -> Vec<WikiArtifactRef> {
+        vec![
+            wiki_ref("wiki/topics/broken-links-demo.md"),
+            wiki_ref("wiki/topics/overview.md"),
+            wiki_ref("wiki/entities/overview.md"),
+            wiki_ref("wiki/topics/Setup.md"),
+        ]
+    }
+
+    #[test]
+    fn view_links_scanner_classifies_broken_ambiguous_and_noncanonical_targets() {
+        let refs = broken_links_refs();
+
+        assert_eq!(
+            resolve_wikilink_target("does-not-exist", &refs),
+            Resolution::Unresolved(Diagnostic::Broken)
+        );
+        assert_eq!(
+            resolve_wikilink_target("overview", &refs),
+            Resolution::Unresolved(Diagnostic::Ambiguous)
+        );
+        assert_eq!(
+            resolve_wikilink_target("setup", &refs),
+            Resolution::Resolved {
+                target_path: "wiki/topics/Setup.md".to_owned(),
+                diagnostic: Some(Diagnostic::NoncanonicalCase),
+            }
+        );
+        assert_eq!(
+            resolve_wikilink_target("topics/broken-links-demo", &refs),
+            Resolution::Resolved {
+                target_path: "wiki/topics/broken-links-demo.md".to_owned(),
+                diagnostic: None,
+            }
+        );
+    }
+
+    #[test]
+    fn view_links_scanner_ignores_fenced_and_inline_code() {
+        let content = "# Demo\n\n\
+             A real link: [[real-target]].\n\n\
+             ```\n[[fenced-not-a-link]]\n```\n\n\
+             An inline code span is inert too: `[[inline-not-a-link]]`.\n";
+        let occurrences = scan_wikilink_occurrences(content);
+        assert_eq!(
+            occurrences.len(),
+            1,
+            "{:?}",
+            occurrences
+                .iter()
+                .map(|o| &o.raw_target)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(occurrences[0].raw_target, "real-target");
+        assert_eq!(occurrences[0].line, 3);
+    }
+
+    #[test]
+    fn view_links_scanner_strips_front_matter_and_tracks_sections() {
+        let content = "---\ntitle: Demo\n---\n\n## Callers\n\n- [[greeting]]\n";
+        let occurrences = scan_wikilink_occurrences(content);
+        assert_eq!(occurrences.len(), 1);
+        assert_eq!(occurrences[0].line, 7);
+        assert_eq!(occurrences[0].section.as_deref(), Some("Callers"));
+    }
+
+    #[test]
+    fn view_links_extracts_alias_and_heading_forms_without_changing_the_target() {
+        let line =
+            "[[topics/greeting|Greeting]] and [[code/greeter#Summary]] and ![[embed-target]]";
+        assert_eq!(
+            extract_wikilink_targets(line),
+            vec![
+                "topics/greeting".to_owned(),
+                "code/greeter".to_owned(),
+                "embed-target".to_owned(),
+            ]
+        );
+    }
 
     #[test]
     fn loam_timestamps_convert_to_rfc3339_and_reject_invalid_calendar_values() {
