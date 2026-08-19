@@ -93,6 +93,8 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
   let expectedHash = null;
   /** Where Back returns to, and the opener's own payload, verbatim. */
   let returnContext = { hash: '', detail: null };
+  /** The control that opened Reader, so Back can hand the keyboard back to it. */
+  let invoker = null;
 
   function setStatus(message) {
     statusEl.textContent = message ?? '';
@@ -159,16 +161,26 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
     open = true;
     surface.hidden = false;
     shell?.setAttribute('aria-hidden', 'true');
+    // aria-hidden alone would leave the shell's controls in the tab order while
+    // screen readers cannot see them; `inert` takes them out of both.
+    shell?.setAttribute('inert', '');
     doc.body.classList.add('reader-open');
+    // Move focus in immediately: the document may take a fetch to arrive, and
+    // an error path never renders an article to focus.
+    surface.focus?.();
   }
 
   function hide() {
     open = false;
     surface.hidden = true;
     shell?.removeAttribute('aria-hidden');
+    shell?.removeAttribute('inert');
     doc.body.classList.remove('reader-open');
     article.replaceChildren();
     currentPath = null;
+    // Focus is restored only after the shell is interactive again.
+    invoker?.focus?.();
+    invoker = null;
   }
 
   async function loadDocument(path, fragment = '') {
@@ -230,8 +242,11 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
   function openPath(path, { detail = null, fragment = '' } = {}) {
     const hash = String(win.location?.hash ?? '');
     if (!open) {
-      // Remember exactly where the human was before Reader covered the shell.
+      // Remember exactly where the human was before Reader covered the shell —
+      // both the route and the control that sent them here, so Back restores
+      // the keyboard position as well as the view.
       returnContext = { hash, detail: detail?.return ?? detail?.context ?? detail ?? null };
+      invoker = doc.activeElement;
     }
     const target = `#/reader/${encodeURIComponent(path)}${fragment ? `#${fragment}` : ''}`;
     if (hash !== target) {

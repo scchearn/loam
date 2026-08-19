@@ -101,12 +101,17 @@ export async function boot(doc = globalThis.document) {
   const refreshButton = doc.querySelector('[data-refresh]');
   refreshButton?.addEventListener('click', async () => {
     refreshButton.disabled = true;
+    refreshButton.setAttribute('aria-busy', 'true');
     refreshButton.textContent = 'Refreshing';
     try {
       await refresh();
     } finally {
       refreshButton.disabled = false;
+      refreshButton.removeAttribute('aria-busy');
       refreshButton.textContent = 'Refresh';
+      // Disabling the control drops focus to <body>; hand it back so a
+      // keyboard-only refresh does not restart the tab order.
+      if (doc.activeElement === doc.body || !doc.activeElement) refreshButton.focus();
       render();
     }
   });

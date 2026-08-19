@@ -161,6 +161,21 @@ describe('Inspector overlay', () => {
     assert.equal(panel.getAttribute('aria-modal'), 'true');
   });
 
+  it('keeps the closed panel out of the tab order', async () => {
+    const { doc, panel } = await mount();
+
+    // The panel is never removed from the layout — it slides out — so without
+    // `inert` its close control and links keep taking Tab stops while invisible.
+    assert.equal(panel.hasAttribute('inert'), true, 'a closed Inspector must be inert');
+
+    openInspector(CODE_NODE);
+    await flush();
+    assert.equal(panel.hasAttribute('inert'), false, 'an open Inspector must be reachable');
+
+    doc.querySelector('[data-inspector-close]').click();
+    assert.equal(panel.hasAttribute('inert'), true, 'closing must make it inert again');
+  });
+
   it('closes on the close control, Escape, and a scrim click, restoring focus each time', async () => {
     const { doc, panel, scrim, press } = await mount();
     const invoker = doc.querySelector('[data-route="atlas"]');

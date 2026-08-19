@@ -232,6 +232,34 @@ describe('reader surface', () => {
     assert.deepEqual(closed, [inspectorState], 'the opener state is handed back untouched');
   });
 
+  it('takes the shell out of the tab order and moves focus into Reader', async () => {
+    const { dom, doc } = mount({ hash: '#/pulse' });
+    const shell = doc.querySelector('[data-app-shell]');
+    const invoker = doc.querySelector('[data-refresh]');
+    invoker.focus();
+
+    await announce(dom, { path: 'wiki/alpha.md' });
+    assert.equal(shell.hasAttribute('inert'), true, 'the covered shell must be inert, not just aria-hidden');
+    assert.ok(
+      doc.querySelector('[data-reader]').contains(doc.activeElement),
+      'focus must move inside Reader, not stay on the covered shell',
+    );
+
+    doc.querySelector('[data-reader-back]').click();
+    assert.equal(shell.hasAttribute('inert'), false, 'Back must hand the shell back');
+    assert.equal(doc.activeElement, invoker, 'Back must restore focus to the control that opened Reader');
+  });
+
+  it('moves focus into Reader even when the document cannot be read', async () => {
+    const { dom, doc } = mount({ hash: '#/pulse' });
+    await announce(dom, { path: 'wiki/missing.md' });
+    assert.ok(
+      doc.querySelector('[data-reader]').contains(doc.activeElement),
+      'an error state must still be reachable by keyboard',
+    );
+    assert.match(doc.querySelector('[data-reader-status]').textContent, /could not be read/);
+  });
+
   it('accepts the Query palette event name as the same contract', async () => {
     const { dom, doc } = mount();
     await announce(dom, { path: 'wiki/alpha.md' }, 'loam:open-document');

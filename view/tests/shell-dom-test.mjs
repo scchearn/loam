@@ -153,6 +153,25 @@ describe('refresh', () => {
     assert.equal(doc.querySelector('[data-freshness]').textContent, 'Snapshot 2026-08-19 09:05 · qmd absent');
     assert.equal(doc.querySelector('[data-notice]').classList.contains('is-visible'), false);
   });
+
+  it('keeps the keyboard on Refresh across the disabled window', async () => {
+    const { doc } = await mountShell({
+      routes: {
+        ...okSnapshot(),
+        '/api/refresh': () => ({ ok: true, status: 204, json: async () => null }),
+      },
+    });
+
+    const refreshButton = doc.querySelector('[data-refresh]');
+    refreshButton.focus();
+    refreshButton.click();
+    // Disabling a focused control drops focus to <body> in every browser.
+    assert.equal(refreshButton.getAttribute('aria-busy'), 'true', 'the busy state must be announced');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(refreshButton.hasAttribute('aria-busy'), false);
+    assert.equal(doc.activeElement, refreshButton, 'focus must come back to Refresh, not restart at the top');
+  });
 });
 
 describe('Query palette', () => {

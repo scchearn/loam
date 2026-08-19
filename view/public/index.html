@@ -155,6 +155,7 @@
     aria-hidden="true"
     aria-labelledby="inspector-title"
     tabindex="-1"
+    inert
   >
     <div class="inspector-head">
       <span id="inspector-title">Inspector</span>
@@ -162,7 +163,7 @@
     </div>
     <div class="inspector-body" data-inspector-body></div>
   </aside>
-  <section class="reader" data-reader hidden aria-labelledby="reader-title">
+  <section class="reader" data-reader hidden tabindex="-1" aria-labelledby="reader-title">
     <header class="reader-bar">
       <button class="ghost-btn reader-back" type="button" data-reader-back>
         <svg class="icon" aria-hidden="true"><use href="#i-arrow-left"/></svg>Back
