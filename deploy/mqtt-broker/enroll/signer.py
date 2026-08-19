@@ -22,6 +22,8 @@ deploy already manages. Mirrors the deploy's bash+openssl style.
 """
 
 import argparse
+import contextlib
+import fcntl
 import hmac
 import http.server
 import json
@@ -75,6 +77,19 @@ class Config:
             )
         )
         self.openssl = os.environ.get("ENROLL_OPENSSL", "openssl")
+        # `openssl ca` read-modify-writes the CA's shared index and serial, and
+        # locks nothing itself. One lock file beside that database serializes
+        # every signing against it — see ca_lock().
+        self.ca_lock_file = os.environ.get(
+            "ENROLL_CA_LOCK_FILE", os.path.join(self.pki_dir, "ca.lock")
+        )
+        # A signing takes milliseconds, so this bounds a queue, not a signing:
+        # long enough that a genuine onboarding burst waits its turn, short
+        # enough that a wedged holder becomes a refusal instead of a worker
+        # thread parked forever.
+        self.ca_lock_timeout = float(
+            os.environ.get("ENROLL_CA_LOCK_TIMEOUT_SECONDS", "30")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +127,66 @@ class RateLimiter:
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def ca_lock(config: Config):
+    """Hold the CA database lock for the duration of one `openssl ca` run.
+
+    `openssl ca` read-modify-writes the CA's shared `index.txt` and `serial`
+    and does no locking of its own: two overlapping runs can issue the same
+    serial or leave the index half-written. Worker threads made that genuinely
+    reachable — before #93 moved the TLS handshake off the accept loop,
+    connections were serialized in practice and two signings never overlapped.
+
+    `flock`, not `fcntl.lockf`: POSIX record locks are owned by the *process*,
+    so a second thread of this same process would be handed the lock it is
+    meant to wait for — the exact case being fixed. A `flock` is owned by the
+    open file description, so two threads that each open the file contend
+    properly, and so does any other process (a manual `pki/issue-client.sh`)
+    that takes the same lock.
+
+    Opened read-only: `flock(2)` needs no write access to the file, only an
+    open descriptor. The lock is provisioned by install-signer.sh with an ACL
+    for this user, but a lock file created by a root-run manual issuance is
+    root-owned, and asking for write access there would refuse every later
+    enrollment over a file this service never writes a byte to.
+
+    Non-blocking with a bounded poll rather than a blocking `LOCK_EX`: nothing
+    can interrupt a thread parked in flock (the connection reaper shuts sockets
+    down, which does not touch it), so an unbounded wait would turn one wedged
+    holder into every worker thread stuck behind it. The poll-with-deadline
+    shape follows ansible's community.general `_filelock`.
+    """
+    try:
+        # O_CREAT, not "w": truncation would race another holder pointlessly,
+        # and the file's contents are irrelevant — only the lock on it matters.
+        handle = os.open(config.ca_lock_file, os.O_RDONLY | os.O_CREAT, 0o600)
+    except OSError as error:
+        # Fail closed. Signing anyway is exactly the unserialized write this
+        # exists to prevent, and it would be invisible in the response.
+        raise SigningError(
+            f"cannot open the CA lock file {config.ca_lock_file}: {error}"
+        ) from error
+    deadline = time.monotonic() + config.ca_lock_timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise SigningError(
+                        "the CA database lock was held by another signing for "
+                        f"more than {config.ca_lock_timeout:g}s"
+                    ) from None
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        os.close(handle)
+
+
 def sign_csr(config: Config, csr_pem: str) -> bytes:
     """Sign one CSR with the org CA, returning the certificate PEM. Raises
     SigningError on any failure. The subject is signed verbatim (the signer
@@ -140,7 +215,10 @@ def sign_csr(config: Config, csr_pem: str) -> bytes:
         ]
         env = dict(os.environ)
         env["PKI_DIR"] = config.pki_dir
-        result = subprocess.run(argv, capture_output=True, text=True, env=env)
+        # Serialized: the CA index and serial are shared mutable state and
+        # `openssl ca` guards neither.
+        with ca_lock(config):
+            result = subprocess.run(argv, capture_output=True, text=True, env=env)
         if result.returncode != 0:
             raise SigningError(
                 "openssl ca rejected the CSR: "
@@ -379,6 +457,8 @@ def main(argv: list[str]) -> int:
         print(f"listen={config.bind_address}:{config.listen_port}")
         print(f"connection_timeout={config.connection_timeout}")
         print(f"connection_max={config.connection_max}")
+        print(f"ca_lock_file={config.ca_lock_file}")
+        print(f"ca_lock_timeout={config.ca_lock_timeout}")
         return 0
 
     # The port is public on a broker VPS; ENROLL_BIND_ADDRESS (default

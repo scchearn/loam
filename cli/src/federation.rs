@@ -22,6 +22,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         Some("service") => service(args),
         Some("disconnect") => disconnect(args),
         Some("status") => status(args),
+        Some("list") => list(args),
         Some("emit") => emit(args),
         Some("inject") => inject(args),
         _ => {
@@ -29,8 +30,10 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
                 "Usage:\n  \
                  loam federation connect <workspace> <broker> [--project org/project] [--global-root <path>] [--token <password>|--token-file <path>] [--json]\n    \
                  the org comes from LOAM_FEDERATION_ORG or `org` in <profile>/config.json; --project overrides both and names the project too\n  \
-                 loam federation disconnect <workspace> --global-root <path> [--json]\n  \
-                 loam federation status [<workspace>] --global-root <path> [--json]\n  \
+                 loam federation disconnect <workspace> [--global-root <path>] [--json]\n  \
+                 loam federation status [<workspace>] [--global-root <path>] [--json]\n  \
+                 disconnect/status infer the global root from the installed runtime layout; --global-root overrides\n  \
+                 loam federation list [--global-root <path>] [--json]   (every project this machine has joined)\n  \
                  loam federation emit [<workspace>] --global-root <path> [--json]   (reads one operation on stdin)\n  \
                  loam federation inject <register|drop> [<workspace>] --global-root <path> --session-id <id> [--channel-ref <ref>] [--wake-ref <ref>] [--json]"
             );
@@ -100,7 +103,22 @@ fn workspace_key(workspace: &std::path::Path) -> Result<String, i32> {
     }
 }
 
-/// `loam federation disconnect <workspace> --global-root <path> [--json]`.
+/// Resolve the global root for a verb that requires one: the explicit
+/// `--global-root` wins, else the installed runtime layout — the same
+/// `installed_global_root()` probe `connect` uses, so a machine that enrolled
+/// with a bare `connect` can read its own status without re-typing the root.
+/// Resolution failure keeps the original required-flag refusal.
+fn resolve_global_root(command: &str, explicit: Option<PathBuf>) -> Result<PathBuf, i32> {
+    match explicit {
+        Some(root) => Ok(root),
+        None => crate::hooks::installed_global_root().map_err(|_| {
+            eprintln!("federation {command}: --global-root is required");
+            64
+        }),
+    }
+}
+
+/// `loam federation disconnect <workspace> [--global-root <path>] [--json]`.
 /// Local removal is authoritative; the service is reconciled from registry
 /// truth. Broker cleanup is deferred to the real adapter (T13).
 fn disconnect(mut args: impl Iterator<Item = String>) -> i32 {
@@ -130,9 +148,13 @@ fn disconnect(mut args: impl Iterator<Item = String>) -> i32 {
             }
         }
     }
-    let (Some(workspace), Some(root)) = (workspace, global_root) else {
-        eprintln!("federation disconnect: <workspace> and --global-root are required");
+    let Some(workspace) = workspace else {
+        eprintln!("federation disconnect: <workspace> is required");
         return 64;
+    };
+    let root = match resolve_global_root("disconnect", global_root) {
+        Ok(root) => root,
+        Err(code) => return code,
     };
 
     let key = match workspace_key(&workspace) {
@@ -175,7 +197,7 @@ fn disconnect(mut args: impl Iterator<Item = String>) -> i32 {
     }
 }
 
-/// `loam federation status [<workspace>] --global-root <path> [--json]`.
+/// `loam federation status [<workspace>] [--global-root <path>] [--json]`.
 /// Strictly read-only and egress-free: never creates the database or starts a
 /// process.
 fn status(mut args: impl Iterator<Item = String>) -> i32 {
@@ -205,9 +227,9 @@ fn status(mut args: impl Iterator<Item = String>) -> i32 {
             }
         }
     }
-    let Some(root) = global_root else {
-        eprintln!("federation status: --global-root is required");
-        return 64;
+    let root = match resolve_global_root("status", global_root) {
+        Ok(root) => root,
+        Err(code) => return code,
     };
 
     let key = match workspace.as_deref() {
@@ -232,6 +254,126 @@ fn status(mut args: impl Iterator<Item = String>) -> i32 {
         println!("{}", status_summary(&report));
     }
     0
+}
+
+/// `loam federation list [--global-root <path>] [--json]`.
+///
+/// The human-facing enrollment inventory: which projects this machine has
+/// joined, from which workspace, through which broker, last verified when.
+/// Read-only and egress-free — it never creates the registry, never queries
+/// the service manager, and makes no liveness claim (which peers are online is
+/// a separate question this command deliberately does not answer).
+///
+/// The registry is resolved by the config-dir ladder alone, so the common case
+/// takes no flags at all. `--global-root` (else the installed layout, when
+/// there is one) only supplies the legacy rung for a machine whose enrollment
+/// has not yet migrated out of its global root.
+fn list(mut args: impl Iterator<Item = String>) -> i32 {
+    let mut global_root: Option<PathBuf> = None;
+    let mut json_output = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => json_output = true,
+            "--global-root" => match args.next() {
+                Some(value) => global_root = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("federation list: --global-root needs a value");
+                    return 64;
+                }
+            },
+            other => {
+                eprintln!("federation list: unexpected argument `{other}`");
+                return 64;
+            }
+        }
+    }
+
+    // Unlike status/disconnect, a missing root is never fatal here: it is only
+    // the legacy rung of the registry ladder, and the durable config-dir
+    // registry answers without it.
+    let legacy_root = global_root.or_else(|| crate::hooks::installed_global_root().ok());
+    let db_path = match crate::provisioning::configured_registry_path(legacy_root.as_deref()) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("federation list: {error}");
+            return 78;
+        }
+    };
+    let rows = match enrollment::open_readonly(&db_path) {
+        // No registry file yet: a machine that has joined nothing, not an error.
+        Ok(None) => Vec::new(),
+        Ok(Some(connection)) => match enrollment::list_enrollments(&connection) {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!("federation list: {error}");
+                return 73;
+            }
+        },
+        Err(error) => {
+            eprintln!("federation list: {error}");
+            return 73;
+        }
+    };
+
+    if json_output {
+        let values = rows.iter().map(crate::connector::enrollment_json).collect();
+        println!(
+            "{}",
+            Value::Object(vec![
+                ("schema".into(), Value::Number("1".into())),
+                ("enrollments".into(), Value::Array(values)),
+            ])
+            .to_json()
+        );
+    } else {
+        print!("{}", enrollment_table(&rows));
+    }
+    0
+}
+
+/// The `list` table: one row per enrollment, columns padded to their widest
+/// cell so the inventory reads as a table without pulling in a formatter. An
+/// empty inventory says how to fill it rather than printing a bare header.
+fn enrollment_table(rows: &[enrollment::EnrolledRow]) -> String {
+    if rows.is_empty() {
+        return "no federation enrollments; `loam federation connect <workspace> <broker>` joins one\n"
+            .to_owned();
+    }
+    let cells: Vec<[String; 4]> = rows
+        .iter()
+        .map(|row| {
+            [
+                format!("{}/{}", row.org_id, row.project_id),
+                row.display_path.clone(),
+                row.broker_endpoint.clone(),
+                row.capabilities.verified_at.clone(),
+            ]
+        })
+        .collect();
+    let headers = ["PROJECT", "WORKSPACE", "BROKER", "LAST VERIFIED"];
+    // Widths are in characters, not bytes: a workspace path is user data and
+    // may hold non-ASCII, which would otherwise pad short.
+    let mut widths = headers.map(|header| header.chars().count());
+    for row in &cells {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut out = String::new();
+    for row in std::iter::once(&headers.map(str::to_owned)).chain(cells.iter()) {
+        let mut line = String::new();
+        for (index, (cell, width)) in row.iter().zip(widths).enumerate() {
+            // No trailing whitespace on the last column.
+            if index + 1 == row.len() {
+                line.push_str(cell);
+            } else {
+                line.push_str(&format!("{cell:<width$}  "));
+            }
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 /// A terse, read-only human summary of the status projection: enrollment count,
@@ -872,17 +1014,37 @@ fn infer_project(workspace: &std::path::Path) -> Result<String, EnrollmentError>
         })?
         .trim()
         .to_owned();
-    let path = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(&url)
-        .split_once(':')
-        .map(|(_, rest)| rest)
-        .unwrap_or(&url);
-    let path = path.trim_end_matches(".git").trim_end_matches('/');
+    project_from_remote_url(&url)
+}
+
+/// The repository name inside a remote URL, in every form git stores one:
+/// `scheme://host/org/repo.git`, the scp form `user@host:org/repo.git`, and a
+/// plain filesystem path — including a Windows one, `C:\src\acme\loam.git`,
+/// whose separator is a backslash and whose leading `C:` is a drive letter
+/// rather than an scp host separator. Getting either wrong on Windows did not
+/// refuse: it produced a project id holding the machine's own directory path,
+/// which then became an MQTT topic segment (#121).
+fn project_from_remote_url(url: &str) -> Result<String, EnrollmentError> {
+    let is_drive_letter = |head: &str| {
+        let mut chars = head.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.next().is_none()
+    };
+    let path = match url.split_once("://") {
+        // `scheme://host[:port]/org/repo` — everything after the authority.
+        Some((_, rest)) => rest.split_once('/').map(|(_, path)| path).unwrap_or(""),
+        None => match url.split_once(':') {
+            // `user@host:org/repo`, the scp form. A single letter before the
+            // colon is a Windows drive, not a host, and the whole string is
+            // then the path.
+            Some((head, rest)) if !is_drive_letter(head) => rest,
+            _ => url,
+        },
+    };
+    // Separators first: `…/loam.git/` would otherwise keep its `.git`.
+    let path = path.trim_end_matches(['/', '\\']).trim_end_matches(".git");
     let project = path
-        .split('/')
-        .rfind(|segment| !segment.is_empty())
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
         .ok_or(EnrollmentError::InvalidField { field: "project" })?;
     validate_scope_part(project, "project")?;
     Ok(project.to_owned())
@@ -2002,6 +2164,70 @@ fn emit_round_trip(
     let mut connection = crate::ipc::windows::connect(&name)?;
     crate::ipc::write_frame(&mut connection, request, config)?;
     crate::ipc::read_frame(&mut connection, config)
+}
+
+#[cfg(test)]
+mod scope_tests {
+    //! Where the project id comes from. Every form git stores a remote URL in
+    //! has to reduce to the repository name — the value that becomes an MQTT
+    //! topic segment.
+
+    use super::*;
+
+    #[test]
+    fn every_remote_url_form_reduces_to_the_repository_name() {
+        for url in [
+            "https://github.com/acme/loam.git",
+            "https://github.com:443/acme/loam.git",
+            "ssh://git@github.com/acme/loam.git",
+            "git@github.com:acme/loam.git",
+            "git@github.com:acme/loam.git/",
+            "/home/dev/src/acme/loam.git",
+            "file:///home/dev/src/acme/loam.git",
+        ] {
+            assert_eq!(
+                project_from_remote_url(url).as_deref(),
+                Ok("loam"),
+                "wrong project for {url}"
+            );
+        }
+    }
+
+    /// #121: a Windows local-path remote. The backslash is the separator and
+    /// the leading `C:` is a drive letter, not an scp host separator. Read as
+    /// scp form and split on `/` only, the whole thing survived
+    /// `validate_scope_part` — it holds no slash — and the machine's own
+    /// directory path became the project id, and with it an MQTT topic
+    /// segment. Asserted on every platform: the parser is the same everywhere,
+    /// so a Unix run catches this before a Windows runner has to.
+    #[test]
+    fn a_windows_path_remote_reduces_to_the_repository_name_too() {
+        for url in [
+            r"C:\Users\dev\src\acme\loam.git",
+            r"C:\Users\dev\src\acme\loam",
+            r"\\server\share\acme\loam.git",
+            "C:/Users/dev/src/acme/loam.git",
+            "file:///C:/Users/dev/src/acme/loam.git",
+        ] {
+            assert_eq!(
+                project_from_remote_url(url).as_deref(),
+                Ok("loam"),
+                "wrong project for {url}"
+            );
+        }
+    }
+
+    /// A remote that names no repository is a typed refusal, not a project id
+    /// made of whatever was left over.
+    #[test]
+    fn a_remote_without_a_repository_segment_is_refused() {
+        for url in ["https://github.com", "https://github.com/", ""] {
+            assert!(
+                project_from_remote_url(url).is_err(),
+                "{url} must not yield a project"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

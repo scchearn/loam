@@ -22,6 +22,10 @@ fn binary() -> PathBuf {
 }
 
 fn run_connect(workspace: Option<&Path>, broker: &str, extra: &[&str]) -> (i32, String, String) {
+    // Rung 1 of the config ladder, per run. Without it a connect that reaches
+    // the org rung or the registry reads the developer's own config dir, and a
+    // test describing an unconfigured machine describes theirs instead (#130).
+    let config = temp_dir("connect-config");
     let mut command = Command::new(binary());
     command.arg("federation").arg("connect");
     if let Some(ws) = workspace {
@@ -30,6 +34,7 @@ fn run_connect(workspace: Option<&Path>, broker: &str, extra: &[&str]) -> (i32, 
     command.arg(broker);
     command.args(extra);
     command
+        .env("LOAM_CONFIG_DIR", &config)
         // The org is configuration, never inferred from the remote. These
         // tests are about everything downstream of that, so they pin the org
         // rung explicitly: it keeps a developer's real config.json out of the
@@ -40,6 +45,7 @@ fn run_connect(workspace: Option<&Path>, broker: &str, extra: &[&str]) -> (i32, 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let output = command.output().expect("spawn loam");
+    let _ = std::fs::remove_dir_all(&config);
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -142,10 +148,6 @@ fn connect_rejects_a_malformed_project_override() {
     }
 }
 
-// Skipped on Windows: this full-flow federation-connect integration test has
-// never run there (the build did not compile before the cfg-gate fix) and needs
-// real Windows validation of the git fixtures and connect resolution. See #121.
-#[cfg(not(windows))]
 #[test]
 fn full_happy_path_validates_against_hermetic_repos() {
     // Build an origin repo with a commit on refs/heads/main, then a workspace
@@ -235,17 +237,17 @@ fn full_happy_path_validates_against_hermetic_repos() {
         stdout.contains("\"url_digest\""),
         "remote digest present: {stdout}"
     );
+    // Through `json_needle`, or on Windows this passes for the wrong reason:
+    // the raw path never appears in JSON output because the separator is the
+    // escape character, so the assertion would hold even if the URL leaked.
     assert!(
-        !stdout.contains(origin.to_str().unwrap()),
-        "raw remote URL must not leak"
+        !stdout.contains(&json_needle(origin.to_str().unwrap())),
+        "raw remote URL must not leak: {stdout}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// Skipped on Windows: federation-connect integration coverage is unvalidated
-// there (never compiled before the cfg-gate fix). See #121.
-#[cfg(not(windows))]
 #[test]
 fn the_org_comes_from_configuration_and_the_project_from_the_remote() {
     let root = temp_dir("scope-ladder");
@@ -358,9 +360,16 @@ fn the_org_comes_from_configuration_and_the_project_from_the_remote() {
     );
     let config_path = profile.join("config.json");
     let config_path = config_path.to_str().unwrap();
-    for expected in [config_path, "LOAM_FEDERATION_ORG", "--project"] {
+    // The path is compared as JSON encodes it: on Windows the separator is the
+    // escape character, so a raw comparison fails on a refusal that named the
+    // path correctly.
+    for expected in [
+        json_needle(config_path),
+        "LOAM_FEDERATION_ORG".to_owned(),
+        "--project".to_owned(),
+    ] {
         assert!(
-            stdout.contains(expected),
+            stdout.contains(&expected),
             "the refusal must name every way to fix it, missing {expected}: {stdout}"
         );
     }
@@ -413,9 +422,6 @@ fn the_org_comes_from_configuration_and_the_project_from_the_remote() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// Skipped on Windows: federation-connect integration coverage is unvalidated
-// there (never compiled before the cfg-gate fix). See #121.
-#[cfg(not(windows))]
 #[test]
 fn commit_reachability_is_not_required() {
     // The connect surface deliberately does not prove the HEAD commit is
@@ -708,23 +714,158 @@ fn connect_with_token_but_no_certificate_fails_fast_on_an_unreachable_signer() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// Skipped on Windows: the fixture builds the installed layout under a hardcoded
-// linux-musl target with a `loam` (no `.exe`) binary, so the Windows install
-// probe (host target + `loam.exe`) never finds it; unvalidated on Windows. See
-// #121.
-#[cfg(not(windows))]
-#[test]
-fn bare_connect_with_token_uses_the_installed_global_root() {
-    let root = temp_dir("autoenroll-installed-root");
+/// The installed runtime layout `installed_global_root()` probes for:
+/// `<root>/bin/<version>/<target>/loam[.exe]` beside an `install.json`. The
+/// target directory and the executable name follow the host, so the probe
+/// resolves the fixture on every supported platform — a hardcoded
+/// linux-musl/`loam` fixture is invisible to the Windows probe (#121).
+/// Returns the root and the installed executable to spawn.
+fn installed_layout(label: &str) -> (PathBuf, PathBuf) {
+    let root = temp_dir(label);
     let target_dir = root
         .join("bin")
         .join(env!("CARGO_PKG_VERSION"))
-        .join("x86_64-unknown-linux-musl");
+        .join(host_target());
     std::fs::create_dir_all(&target_dir).unwrap();
-    std::fs::copy(binary(), target_dir.join("loam")).unwrap();
+    let executable = target_dir.join(if cfg!(windows) { "loam.exe" } else { "loam" });
+    std::fs::copy(binary(), &executable).unwrap();
     std::fs::write(root.join("install.json"), "{}\n").unwrap();
+    (root, executable)
+}
 
-    let mut command = Command::new(target_dir.join("loam"));
+/// Run a command whose program was just copied into place.
+///
+/// Copying an executable and executing it immediately is racy on Linux under a
+/// threaded test harness: while the copy's write descriptor is open, another
+/// test's spawn forks and the child inherits it, and `execve` on the fresh
+/// copy then fails ETXTBSY until that child reaches its own exec and the
+/// descriptor closes. The window is microseconds wide and shows up as
+/// `Text file busy` in maybe one run in ten; the only correct response is to
+/// try again. Any other spawn error fails immediately, so a real one is not
+/// buried under a second of retries.
+fn output_installed(command: &mut Command) -> std::process::Output {
+    for _ in 0..100 {
+        match command.output() {
+            Ok(output) => return output,
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("spawn installed loam: {error}"),
+        }
+    }
+    panic!("the freshly copied runtime stayed busy for a second")
+}
+
+/// The install-layout target directory for the host. The probe only checks the
+/// name against its supported set, but naming the host's own target keeps the
+/// fixture honest about the layout an install would actually produce.
+fn host_target() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "x86_64-pc-windows-msvc"
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "x86_64") {
+            "x86_64-apple-darwin"
+        } else {
+            "aarch64-apple-darwin"
+        }
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64-unknown-linux-musl"
+    } else {
+        "x86_64-unknown-linux-musl"
+    }
+}
+
+/// `status` resolves the installed global root the same way `connect` does, so
+/// a machine enrolled by a bare `connect` can read its own state without
+/// re-typing the root it never typed in the first place (#92).
+#[test]
+fn bare_status_uses_the_installed_global_root() {
+    let (root, executable) = installed_layout("status-installed-root");
+    let output = output_installed(
+        Command::new(&executable)
+            .args(["federation", "status", "--json"])
+            // Rung 1 of the registry ladder: hermetic, and never the
+            // developer's own store.
+            .env("LOAM_CONFIG_DIR", root.join("config"))
+            .stdin(Stdio::null()),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code().unwrap_or(-1),
+        0,
+        "status inside an install needs no --global-root: {stdout} {stderr}"
+    );
+    assert!(
+        stdout.contains("\"enrollments\":[]"),
+        "status reports the (empty) inventory: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The override still wins over the inferred root, and it is still the only
+/// root a non-installed runtime has.
+#[test]
+fn status_outside_an_install_still_requires_a_global_root() {
+    let output = Command::new(binary())
+        .args(["federation", "status"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn loam");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code().unwrap_or(-1), 64, "{stderr}");
+    assert!(stderr.contains("--global-root is required"), "{stderr}");
+}
+
+/// `disconnect` shares the resolution: an unenrolled workspace is reported as
+/// such, not refused for a missing flag (#92).
+#[test]
+fn bare_disconnect_uses_the_installed_global_root() {
+    let (root, executable) = installed_layout("disconnect-installed-root");
+    let workspace = temp_dir("disconnect-installed-workspace");
+    // The workspace key is a Git physical identity; a bare directory is refused
+    // before the root ever matters.
+    git(&["init", "--quiet", workspace.to_str().unwrap()], None);
+    let output = output_installed(
+        Command::new(&executable)
+            .args(["federation", "disconnect"])
+            .arg(&workspace)
+            .arg("--json")
+            .env("LOAM_CONFIG_DIR", root.join("config"))
+            .stdin(Stdio::null()),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code().unwrap_or(-1),
+        0,
+        "disconnect inside an install needs no --global-root: {stdout} {stderr}"
+    );
+    assert!(
+        stdout.contains("\"local\":\"not-enrolled\""),
+        "a dormant machine disconnects to not-enrolled: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn disconnect_outside_an_install_still_requires_a_global_root() {
+    let output = Command::new(binary())
+        .args(["federation", "disconnect", env!("CARGO_MANIFEST_DIR")])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn loam");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code().unwrap_or(-1), 64, "{stderr}");
+    assert!(stderr.contains("--global-root is required"), "{stderr}");
+}
+
+#[test]
+fn bare_connect_with_token_uses_the_installed_global_root() {
+    let (root, executable) = installed_layout("autoenroll-installed-root");
+
+    let mut command = Command::new(&executable);
     command
         .args([
             "federation",
@@ -744,7 +885,7 @@ fn bare_connect_with_token_uses_the_installed_global_root() {
     // The token/auto-enroll path reads the git identity; pin it so this resolves
     // on CI (no ambient global gitconfig) and reaches the signer contact.
     pin_git_identity(&mut command);
-    let output = command.output().expect("spawn installed loam");
+    let output = output_installed(&mut command);
     let code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -893,10 +1034,6 @@ fn pin_git_identity(command: &mut Command) {
         .env("GIT_CONFIG_VALUE_1", "ci@loam.test");
 }
 
-// Only the git-fixture tests call this, and those are skipped on Windows (see
-// #121). Keep it compiled — so the helpers it references stay live — but let it
-// be unused on Windows.
-#[cfg_attr(windows, allow(dead_code))]
 fn git(args: &[&str], cwd: Option<&Path>) -> String {
     let mut command = Command::new("git");
     command.args(args);

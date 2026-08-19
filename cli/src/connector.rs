@@ -4125,6 +4125,50 @@ pub fn disconnect_by_key<R: service::CommandRunner>(
     })
 }
 
+/// One enrollment as JSON: the inventory projection shared by `status` and
+/// `list`, so both surfaces describe an enrollment identically and a new field
+/// cannot land on one and not the other.
+pub fn enrollment_json(row: &crate::enrollment::EnrolledRow) -> crate::json::Value {
+    use crate::json::Value;
+    Value::Object(vec![
+        ("org_id".into(), Value::String(row.org_id.clone())),
+        ("project_id".into(), Value::String(row.project_id.clone())),
+        (
+            "repository_id".into(),
+            Value::String(row.repository_id.clone()),
+        ),
+        (
+            "display_path".into(),
+            Value::String(row.display_path.clone()),
+        ),
+        // The endpoint the connector dials for this project. Part of the
+        // inventory an operator reads: two projects can federate through
+        // different brokers, and the row is where that is visible.
+        (
+            "broker_endpoint".into(),
+            Value::String(row.broker_endpoint.clone()),
+        ),
+        // Per-project historical verification, kept beside the enrollment
+        // and never collapsed into a readiness claim.
+        (
+            "verification".into(),
+            Value::Object(vec![
+                (
+                    "capabilities".into(),
+                    Value::Array(capability_names(&row.capabilities)),
+                ),
+                (
+                    "verified_at".into(),
+                    Value::String(row.capabilities.verified_at.clone()),
+                ),
+            ]),
+        ),
+        // Per-project health is the enrollment's own state, separate from
+        // any live-session claim.
+        ("health".into(), Value::String("enrolled".into())),
+    ])
+}
+
 /// A read-only, aggregate-free status projection for the whole machine (or one
 /// workspace when `key` is given). Never creates the database and never starts a
 /// process: enrollment comes from a read-only registry open, the definition from
@@ -4155,41 +4199,7 @@ pub fn status_report<R: service::CommandRunner>(
             _ => Vec::new(),
         };
 
-    let enrollment_values = enrollments
-        .iter()
-        .map(|row| {
-            Value::Object(vec![
-                ("org_id".into(), Value::String(row.org_id.clone())),
-                ("project_id".into(), Value::String(row.project_id.clone())),
-                (
-                    "repository_id".into(),
-                    Value::String(row.repository_id.clone()),
-                ),
-                (
-                    "display_path".into(),
-                    Value::String(row.display_path.clone()),
-                ),
-                // Per-project historical verification, kept beside the enrollment
-                // and never collapsed into a readiness claim.
-                (
-                    "verification".into(),
-                    Value::Object(vec![
-                        (
-                            "capabilities".into(),
-                            Value::Array(capability_names(&row.capabilities)),
-                        ),
-                        (
-                            "verified_at".into(),
-                            Value::String(row.capabilities.verified_at.clone()),
-                        ),
-                    ]),
-                ),
-                // Per-project health is the enrollment's own state, separate from
-                // any live-session claim.
-                ("health".into(), Value::String("enrolled".into())),
-            ])
-        })
-        .collect();
+    let enrollment_values = enrollments.iter().map(enrollment_json).collect();
 
     // Definition presence is a filesystem fact; the process/enabled state is a
     // read-only manager query. Neither starts anything.

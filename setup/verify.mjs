@@ -8,7 +8,7 @@ import { resolveExclusions } from '../integration/ingest.mjs';
 import { checkReadiness, probeState } from '../integration/runtime.mjs';
 import { resolveRuntimePath } from '../integration/ledger.mjs';
 import { verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
-import { isOwnedCommand, renderOpenCodePlugin } from './harnesses.mjs';
+import { isOwnedCommand, nativeHookCommand, renderOpenCodePlugin } from './harnesses.mjs';
 import { federationDefinitionExists, verifyFederationService } from './federation.mjs';
 
 async function fileExists(path) {
@@ -81,18 +81,17 @@ async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, 
   return result?.additional_context === context;
 }
 
-// Cursor's own hooks.json still registers the runtime directly (args-array form
-// into ~/.cursor/hooks.json). One registration is correct only when it runs the
+// Cursor's own hooks.json registers the runtime directly, as the one shell
+// string Cursor's schema takes (#135; `args` is not part of that schema and was
+// dropped on the floor). One registration is correct only when it runs the
 // staged private runtime as a `hook <id>` read; anything else — a Node shim, a
-// stale asset path, a runtime from a previous install — is a mismatch.
-function nativeHookCommands(entries, runtimePath, harnessId) {
+// stale asset path, a runtime from a previous install, or an entry still in the
+// ignored args-array form — is a mismatch.
+function nativeHookCommands(entries, runtimePath, harnessId, event) {
+  const expected = nativeHookCommand(runtimePath, harnessId, event);
   return entries
     .flatMap((entry) => (Array.isArray(entry?.hooks) ? entry.hooks : [entry]))
-    .filter((entry) => entry?.type === 'command'
-      && entry.command === runtimePath
-      && Array.isArray(entry.args)
-      && entry.args[0] === 'hook'
-      && entry.args[1] === harnessId);
+    .filter((entry) => entry?.type === 'command' && entry.command === expected);
 }
 
 // #137: claude/codex load their hooks from the marketplace SOURCE hooks.json,
@@ -181,6 +180,7 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
       Array.isArray(config.hooks?.sessionStart) ? config.hooks.sessionStart : [],
       runtimePath,
       id,
+      'sessionStart',
     );
     if (owned.length !== 1) {
       return { ...harness, ready: false, category: owned.length ? 'registration_duplicate' : 'registration_missing' };

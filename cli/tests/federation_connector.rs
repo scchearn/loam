@@ -337,3 +337,143 @@ fn lifecycle_disconnect_on_a_dormant_machine_is_inert() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// --- `federation list`: the human-facing enrollment inventory (#146) ---
+
+#[test]
+fn list_on_a_fresh_machine_reports_an_empty_inventory_and_creates_nothing() {
+    let root = temp_root("list-empty");
+    let config = temp_config_dir(&root);
+    let output = loam(&config)
+        .args(["federation", "list"])
+        .output()
+        .expect("spawn list");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "an empty inventory is not an error; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("no federation enrollments") && stdout.contains("federation connect"),
+        "the empty inventory names the command that fills it; got: {stdout}"
+    );
+    // The empty array is the contract a --json consumer leans on hardest: no
+    // enrollments must read as an empty inventory, never as an absent field or
+    // a refusal it has to special-case.
+    let json = loam(&config)
+        .args(["federation", "list", "--json"])
+        .output()
+        .expect("spawn list --json");
+    let json_stdout = String::from_utf8_lossy(&json.stdout);
+    assert!(json.status.success(), "{json_stdout}");
+    assert_eq!(
+        json_stdout.trim(),
+        "{\"schema\":1,\"enrollments\":[]}",
+        "an empty inventory is an empty array"
+    );
+
+    assert!(
+        !pinned_registry(&config).exists(),
+        "a read-only inventory must not create the registry"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn list_reads_the_config_dir_registry_without_a_global_root() {
+    let root = temp_root("list-enrolled");
+    let config = temp_config_dir(&root);
+    seed_enrollment(&root, &pinned_registry(&config));
+
+    // No --global-root: the whole point of the command is that the config-dir
+    // ladder already knows where the registry is.
+    let output = loam(&config)
+        .args(["federation", "list"])
+        .output()
+        .expect("spawn list");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "list exits 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for column in [
+        "PROJECT",
+        "WORKSPACE",
+        "BROKER",
+        "LAST VERIFIED",
+        "org-smoke/project-smoke",
+        "mqtts://broker.invalid:8883",
+        "2026-08-08T00:00:00Z",
+    ] {
+        assert!(stdout.contains(column), "missing {column} in: {stdout}");
+    }
+    assert!(
+        stdout.contains(&root.to_string_lossy().into_owned()),
+        "the workspace column names the enrolled workspace; got: {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `list --json` and `status --json` describe an enrollment identically: one
+/// projection, two surfaces. If they ever diverge, a JSON consumer of `list`
+/// silently loses a field `status` still reports.
+#[test]
+fn list_json_is_the_same_per_enrollment_array_status_builds() {
+    let root = temp_root("list-json");
+    let config = temp_config_dir(&root);
+    seed_enrollment(&root, &pinned_registry(&config));
+
+    let listed = loam(&config)
+        .args(["federation", "list", "--json"])
+        .output()
+        .expect("spawn list");
+    assert!(listed.status.success());
+    let listed = loam::json::parse(&String::from_utf8_lossy(&listed.stdout)).expect("list json");
+
+    let status = loam(&config)
+        .args(["federation", "status", "--json", "--global-root"])
+        .arg(&root)
+        .output()
+        .expect("spawn status");
+    assert!(status.status.success());
+    let status = loam::json::parse(&String::from_utf8_lossy(&status.stdout)).expect("status json");
+
+    let listed = listed.get("enrollments").expect("list enrollments");
+    assert_eq!(
+        listed.to_json(),
+        status
+            .get("enrollments")
+            .expect("status enrollments")
+            .to_json(),
+        "list and status must project an enrollment identically"
+    );
+    // And the projection carries what the table shows, so a --json consumer is
+    // never poorer than the human reading the same command.
+    assert!(
+        listed.to_json().contains("mqtts://broker.invalid:8883"),
+        "the projection carries the broker endpoint: {}",
+        listed.to_json()
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn list_rejects_an_unknown_argument_instead_of_ignoring_it() {
+    let root = temp_root("list-badarg");
+    let config = temp_config_dir(&root);
+    let output = loam(&config)
+        .args(["federation", "list", "--verbose"])
+        .output()
+        .expect("spawn list");
+    assert_eq!(output.status.code().unwrap_or(-1), 64);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}

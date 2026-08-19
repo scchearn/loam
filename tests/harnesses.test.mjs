@@ -470,9 +470,71 @@ test('harness installation preserves unrelated hook commands containing loam', a
   assert.deepEqual(cursorHooks[0], unrelatedCursor);
   assert.equal(claudeHooks.filter((entry) => entry.command === runtimePath).length, 0, 'Claude is registered in its plugin, not in user settings');
   assert.deepEqual(
-    cursorHooks.filter((entry) => entry.command === runtimePath).map((entry) => entry.args),
-    [['hook', 'cursor', '--event', 'sessionStart']],
+    cursorHooks.filter((entry) => entry.command.includes(runtimePath)).map((entry) => entry.command),
+    [`"${runtimePath}" hook cursor --event sessionStart`],
   );
+  await result.rollback();
+});
+
+test('installation replaces a legacy args-array cursor registration instead of stacking beside it', async () => {
+  // #135: the pre-fix entry Cursor silently ignored (`args` is not in its
+  // schema). An update has to recognize it as ours and take it out — a machine
+  // that already ran setup would otherwise keep the dead registration and gain
+  // a second, working one beside it.
+  const home = await mkdtemp(join(tmpdir(), 'loam-cursor-legacy-'));
+  const globalRoot = join(home, '.agents', 'loam');
+  const runtimePath = join(globalRoot, 'bin', '0.9.1', 'target', 'loam');
+  await mkdir(join(home, '.cursor'), { recursive: true });
+  const legacy = {
+    type: 'command',
+    command: runtimePath,
+    args: ['hook', 'cursor', '--event', 'sessionStart'],
+    async: false,
+  };
+  await writeFile(join(home, '.cursor', 'hooks.json'), JSON.stringify({ hooks: { sessionStart: [legacy] } }));
+
+  const result = await installHarnesses({
+    home,
+    globalRoot,
+    pluginVersion: '0.8.3',
+    runtimePath,
+    detected: await detectHarnesses({ home }),
+  });
+  const cursor = JSON.parse(await readFile(join(home, '.cursor', 'hooks.json'), 'utf8'));
+  assert.deepEqual(cursor.hooks.sessionStart, [
+    { type: 'command', command: `"${runtimePath}" hook cursor --event sessionStart` },
+  ]);
+  await result.rollback();
+});
+
+test('re-registration replaces a cursor entry naming an older staged runtime', async () => {
+  // The staged runtime lives in the versioned config-dir runtime store, not
+  // under the global root, so ownership matched nothing and every setup run
+  // appended one more entry: observed as four sessionStart registrations on a
+  // machine running the cursor lane, three of them pointing at runtime
+  // versions that had already been deleted.
+  const home = await mkdtemp(join(tmpdir(), 'loam-cursor-stale-'));
+  const globalRoot = join(home, '.agents', 'loam');
+  const store = join(home, '.config', 'loam', 'runtime');
+  const older = join(store, '0.11.0-next.19', 'x86_64-unknown-linux-musl', 'loam');
+  const runtimePath = join(store, '0.11.0-next.20', 'x86_64-unknown-linux-musl', 'loam');
+  await mkdir(join(home, '.cursor'), { recursive: true });
+  await writeFile(join(home, '.cursor', 'hooks.json'), JSON.stringify({
+    version: 1,
+    hooks: { sessionStart: [{ type: 'command', command: `"${older}" hook cursor --event sessionStart` }] },
+  }));
+
+  const result = await installHarnesses({
+    home,
+    globalRoot,
+    pluginVersion: '0.8.3',
+    runtimePath,
+    detected: await detectHarnesses({ home }),
+  });
+  const cursor = JSON.parse(await readFile(join(home, '.cursor', 'hooks.json'), 'utf8'));
+  assert.deepEqual(cursor.hooks.sessionStart, [
+    { type: 'command', command: `"${runtimePath}" hook cursor --event sessionStart` },
+  ]);
   await result.rollback();
 });
 

@@ -127,9 +127,15 @@ test('claude and codex carry self-resolving hook shims; cursor invokes the runti
   );
 
   const cursor = JSON.parse(await readFile(join(home, '.cursor', 'hooks.json'), 'utf8'));
-  const cursorOwned = sessionEntries(cursor, 'sessionStart').filter((entry) => entry.command === runtimePath);
+  // #135: Cursor's schema has no `args`. The subcommand has to live in the one
+  // `command` string or the registration runs the bare runtime and does
+  // nothing — and the file needs its schema version to be read at all.
+  assert.equal(cursor.version, 1);
+  const cursorOwned = sessionEntries(cursor, 'sessionStart')
+    .filter((entry) => typeof entry.command === 'string' && entry.command.includes(runtimePath));
   assert.equal(cursorOwned.length, 1);
-  assert.deepEqual(cursorOwned[0].args, ['hook', 'cursor', '--event', 'sessionStart']);
+  assert.equal(cursorOwned[0].command, `"${runtimePath}" hook cursor --event sessionStart`);
+  assert.equal(cursorOwned[0].args, undefined, 'an args array is ignored by Cursor and must not be written');
 
   // #137: claude/codex load hooks from the marketplace SOURCE hooks.json, which
   // setup no longer rewrites — the installed cache copy is the shipped file
@@ -176,8 +182,8 @@ test('the rendered command tracks the staged runtime rather than a constant', as
 
   const read = async ({ home }) => JSON.parse(await readFile(join(home, '.cursor', 'hooks.json'), 'utf8'));
   const command = (config) => sessionEntries(config, 'sessionStart').map((entry) => entry.command);
-  assert.deepEqual(command(await read(first)), [first.runtimePath]);
-  assert.deepEqual(command(await read(second)), [second.runtimePath]);
+  assert.deepEqual(command(await read(first)), [`"${first.runtimePath}" hook cursor --event sessionStart`]);
+  assert.deepEqual(command(await read(second)), [`"${second.runtimePath}" hook cursor --event sessionStart`]);
 
   const openCode = async ({ home }) => readFile(join(home, '.config', 'opencode', 'plugins', 'loam.js'), 'utf8');
   assert.ok((await openCode(first)).includes(JSON.stringify(first.runtimePath)));
