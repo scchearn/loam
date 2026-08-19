@@ -83,7 +83,7 @@ async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, 
   return result?.additional_context === context;
 }
 
-async function verifyHarness(id, harness, { packageRoot, globalRoot, install, workspace }) {
+async function verifyHarness(id, harness, { packageRoot, globalRoot, install, installReadiness, workspace }) {
   if (harness.state === 'absent') return { ...harness, ready: true };
   if (id === 'codex') {
     const profilePath = join(harness.root, 'agents', 'loam_ingestor.toml');
@@ -103,7 +103,7 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
     }
     if (harness.state === 'skipped') return { ...harness, ready: true, owner: 'setup' };
   } else if (harness.state === 'skipped') return { ...harness, ready: true };
-  if (!install) return { ...harness, ready: false, category: 'install_metadata_missing' };
+  if (!install) return { ...harness, ...(installReadiness || { ready: false, category: 'install_metadata_missing' }) };
   const assetRoot = install.adapter_root;
   const assetName = id === 'opencode' ? 'opencode.mjs' : `${id}-session-start.mjs`;
   const assetPath = join(assetRoot, id === 'codex' ? 'codex-stop.mjs' : assetName);
@@ -187,11 +187,19 @@ export async function verifyInstallation({
   runtimeTimeoutMs,
 } = {}) {
   let install = suppliedInstall;
+  let installReadiness = { ready: true };
   if (!install) {
     try {
       install = await readInstallMetadata(discovery.globalRoot);
-    } catch {
+    } catch (error) {
       install = null;
+      // Distinguish an absent install.json (run setup) from one that exists but
+      // fails to parse/validate (a real problem worth surfacing). Collapsing both
+      // into install_metadata_missing hides validateInstallMetadata's diagnostics.
+      const present = await fileExists(join(discovery.globalRoot, 'install.json'));
+      installReadiness = present
+        ? { ready: false, category: 'install_metadata_invalid', detail: error instanceof Error ? error.message : String(error) }
+        : { ready: false, category: 'install_metadata_missing' };
     }
   }
 
@@ -207,7 +215,7 @@ export async function verifyInstallation({
         arch: discovery.arch,
         install,
       })
-    : { ready: false, category: 'install_metadata_missing' };
+    : installReadiness;
   if (runtime.ready) {
     runtime = await probeState({
       readiness: runtime,
@@ -222,6 +230,7 @@ export async function verifyInstallation({
       packageRoot,
       globalRoot: discovery.globalRoot,
       install,
+      installReadiness,
       workspace: discovery.workspace,
     });
   }
@@ -233,6 +242,7 @@ export async function verifyInstallation({
   return {
     ready: Boolean(pluginVersionReady && skills.ready && runtime.ready && harnessReady && migration.ready && ingestExclusions.ready),
     install,
+    installReadiness,
     skills,
     runtime,
     harnesses,
