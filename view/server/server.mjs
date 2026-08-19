@@ -85,6 +85,7 @@ function errorStatus(error) {
 export function createServer({
   workspaceRoot,
   publicRoot = fileURLToPath(new URL('../public/', import.meta.url)),
+  vendorRoot = fileURLToPath(new URL('../vendor/', import.meta.url)),
   initialSnapshot,
   refreshProducer,
   buildSearchIndex,
@@ -205,10 +206,17 @@ export function createServer({
   }
 
   async function handleStatic(req, res, pathname) {
-    const relative = pathname === '/' ? '/index.html' : pathname;
+    // /vendor/* serves the pinned third-party modules, which live beside public/
+    // so the vendor manifest can police that tree as one unit. The prefix is
+    // what lets a browser module and a Node test share one import specifier.
+    const vendored = pathname.startsWith('/vendor/');
+    const root = vendored ? vendorRoot : publicRoot;
+    const relative = vendored
+      ? pathname.slice('/vendor'.length)
+      : (pathname === '/' ? '/index.html' : pathname);
     let target;
     try {
-      target = assertInside(publicRoot, join(publicRoot, decodeURIComponent(relative)), 'static path');
+      target = assertInside(root, join(root, decodeURIComponent(relative)), 'static path');
     } catch {
       return sendJson(res, 400, { error: 'invalid_path' });
     }
