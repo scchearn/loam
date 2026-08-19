@@ -89,6 +89,20 @@ fn run_hook_env(
     skills_root: &Path,
     config_dir: Option<&Path>,
 ) -> Run {
+    run_hook_full(harness, stdin, global_root, skills_root, config_dir, &[])
+}
+
+/// [`run_hook_env`] with extra environment entries. The optional-integration
+/// probes read the environment, so a test asserting on their briefing line must
+/// pin it rather than inherit the running machine's.
+fn run_hook_full(
+    harness: &str,
+    stdin: &[u8],
+    global_root: &Path,
+    skills_root: &Path,
+    config_dir: Option<&Path>,
+    extra_env: &[(&str, &str)],
+) -> Run {
     let mut command = Command::new(binary());
     command
         .args(["hook", harness])
@@ -96,6 +110,9 @@ fn run_hook_env(
         .env("LOAM_SKILLS_ROOT", skills_root);
     if let Some(config_dir) = config_dir {
         command.env("LOAM_CONFIG_DIR", config_dir);
+    }
+    for (key, value) in extra_env {
+        command.env(key, value);
     }
     let mut child = command
         .current_dir(workspace())
@@ -494,4 +511,46 @@ fn an_unwritable_ledger_never_fails_the_hook() {
         "the hook still renders the baseline: {}",
         run.stdout
     );
+}
+
+#[test]
+fn the_briefing_reports_hcom_readiness_both_ways() {
+    // The injected answer skills read instead of shelling out to `which hcom`.
+    let (global_root, skills_root) = installation("hcom-state");
+    let root = workspace();
+    let stdin = format!(r#"{{"cwd":"{}"}}"#, json_path(&root));
+    let harness = loam::json::parse(r#"{"id":"claude","key":"additionalContext"}"#).unwrap();
+
+    let ready = run_hook_full(
+        "claude",
+        stdin.as_bytes(),
+        &global_root,
+        &skills_root,
+        None,
+        &[("HCOM_TOOL", "claude")],
+    );
+    assert_eq!(ready.status, 0, "{}", ready.stderr);
+    let body = body_of(&harness, &ready.stdout);
+    assert!(body.contains("hcom: ready"), "{body}");
+
+    // No launcher marker, no PATH and a HOME with no install site: absent, and
+    // said plainly rather than omitted.
+    let empty_home = temp_root("hcom-absent");
+    let absent = run_hook_full(
+        "claude",
+        stdin.as_bytes(),
+        &global_root,
+        &skills_root,
+        None,
+        &[
+            ("HCOM_TOOL", ""),
+            ("HCOM_INSTALL_DIR", ""),
+            ("PATH", ""),
+            ("HOME", empty_home.to_str().unwrap()),
+            ("USERPROFILE", empty_home.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(absent.status, 0, "{}", absent.stderr);
+    let body = body_of(&harness, &absent.stdout);
+    assert!(body.contains("hcom: not installed"), "{body}");
 }

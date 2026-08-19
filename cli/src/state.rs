@@ -45,8 +45,11 @@ fn usage() {
 }
 
 pub(crate) fn aggregate(workspace: &Path, fast: bool) -> String {
+    // hcom is workspace-independent, so its readiness is resolved before the
+    // wiki gate and reported by both the full and the minimal aggregate.
+    let hcom_ready = hcom_readiness();
     let Some(wiki_root) = resolve_wiki_root(workspace) else {
-        return minimal_state();
+        return minimal_state(hcom_ready);
     };
 
     let has_schema = wiki_root.join("SCHEMA.md").is_file();
@@ -98,7 +101,7 @@ pub(crate) fn aggregate(workspace: &Path, fast: bool) -> String {
         .unwrap_or_default();
 
     format!(
-        "{{\"version\":\"{}\",\"wiki_root\":\"{}\",\"exists\":true,\"has_schema\":{},\"has_index\":{},\"has_log\":{},\"has_overview\":{},\"qmd_ready\":{},\"collection\":\"{}\",\"metadata_status\":\"{}\",\"metadata_path\":\"{}\",\"latest_checkpoint\":{},\"recent_checkpoints\":{},\"checkpoint_count\":{},\"git_status\":{},\"drift_count\":{},\"hints\":{}}}",
+        "{{\"version\":\"{}\",\"wiki_root\":\"{}\",\"exists\":true,\"has_schema\":{},\"has_index\":{},\"has_log\":{},\"has_overview\":{},\"qmd_ready\":{},\"hcom_ready\":{},\"collection\":\"{}\",\"metadata_status\":\"{}\",\"metadata_path\":\"{}\",\"latest_checkpoint\":{},\"recent_checkpoints\":{},\"checkpoint_count\":{},\"git_status\":{},\"drift_count\":{},\"hints\":{}}}",
         runtime_version(),
         json_escape(&wiki_root.display().to_string()),
         has_schema,
@@ -106,6 +109,7 @@ pub(crate) fn aggregate(workspace: &Path, fast: bool) -> String {
         has_log,
         has_overview,
         qmd_ready,
+        hcom_ready,
         json_escape(&collection),
         json_escape(&metadata.status),
         metadata_path,
@@ -126,10 +130,11 @@ pub(crate) fn runtime_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-fn minimal_state() -> String {
+fn minimal_state(hcom_ready: bool) -> String {
     format!(
-        "{{\"version\":\"{}\",\"wiki_root\":\"\",\"exists\":false,\"qmd_ready\":false,\"latest_checkpoint\":null,\"recent_checkpoints\":[],\"checkpoint_count\":0,\"git_status\":null,\"drift_count\":null,\"hints\":[{{\"kind\":\"memory_missing\",\"group\":\"maintenance\",\"severity\":\"info\",\"message\":\"No memory substrate found; scaffold a wiki to begin.\",\"command\":\"/loam::scaffolding-wiki <goal>\",\"evidence\":{{}}}}]}}",
-        runtime_version()
+        "{{\"version\":\"{}\",\"wiki_root\":\"\",\"exists\":false,\"qmd_ready\":false,\"hcom_ready\":{},\"latest_checkpoint\":null,\"recent_checkpoints\":[],\"checkpoint_count\":0,\"git_status\":null,\"drift_count\":null,\"hints\":[{{\"kind\":\"memory_missing\",\"group\":\"maintenance\",\"severity\":\"info\",\"message\":\"No memory substrate found; scaffold a wiki to begin.\",\"command\":\"/loam::scaffolding-wiki <goal>\",\"evidence\":{{}}}}]}}",
+        runtime_version(),
+        hcom_ready
     )
 }
 
@@ -197,6 +202,65 @@ fn qmd_readiness(wiki_root: &Path, metadata_collection: &str) -> (bool, String) 
         return (true, collection);
     }
     (false, metadata_collection.to_owned())
+}
+
+/// Detection-only readiness for the optional hcom integration (spec:
+/// loam-optional-integrations). loam never installs hcom, so this only answers
+/// "can this session reach it", cheapest rung first, because `state --fast` runs
+/// on every session start under a hard hook budget (`cli/tests/state_budget.rs`)
+/// and this probe sits outside the wiki gate that short-circuits the qmd one:
+///   1. `HCOM_TOOL` — hcom's launcher sets it for every session it starts, so an
+///      hcom-managed session answers without touching disk or spawning anything.
+///   2. Binary resolution by stat alone: PATH, then `HCOM_INSTALL_DIR` (and its
+///      `bin/`), then `~/.local/bin`. brew, uv/pip and both official installers
+///      land in one of those, on every OS.
+///   3. `hcom --version` — the only subprocess in the ladder, reached only once a
+///      binary actually exists. (`hcom version` is not a command.)
+fn hcom_readiness() -> bool {
+    if std::env::var_os("HCOM_TOOL").is_some_and(|value| !value.is_empty()) {
+        return true;
+    }
+    let Some(binary) = resolve_hcom_binary() else {
+        return false;
+    };
+    Command::new(binary)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// The hcom binary as an absolute path, or `None` when no install site holds an
+/// executable of that name. Stat-only: never spawns, never trusts a bare name.
+fn resolve_hcom_binary() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "hcom.exe" } else { "hcom" };
+    let mut directories = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some(install_dir) = std::env::var_os("HCOM_INSTALL_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        directories.push(install_dir.join("bin"));
+        directories.push(install_dir);
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        directories.push(PathBuf::from(home).join(".local").join("bin"));
+    }
+    directories
+        .into_iter()
+        .map(|directory| directory.join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn json_string_value(content: &str, key: &str) -> Option<String> {
@@ -790,7 +854,7 @@ mod tests {
         assert_eq!(runtime_version(), env!("CARGO_PKG_VERSION"));
         let needle = format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"));
         // Present in both the wiki-less minimal state and a full aggregate.
-        assert!(minimal_state().contains(&needle));
+        assert!(minimal_state(false).contains(&needle));
         let tmp = std::env::temp_dir();
         assert!(aggregate(&tmp, true).contains("\"version\":\""));
     }

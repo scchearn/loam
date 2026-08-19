@@ -16,6 +16,23 @@ fn temporary_workspace() -> std::path::PathBuf {
     path
 }
 
+/// A `loam state` invocation with every hcom detection site neutralised: no
+/// launcher env marker, no PATH, and a HOME that holds no `.local/bin`. Without
+/// this the probe would answer from the *developer's* machine and the pinned
+/// aggregates would flip depending on who ran the suite.
+fn state_command(workspace: &std::path::Path) -> Command {
+    let binary = std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide the loam binary");
+    let mut command = Command::new(binary);
+    command
+        .args(["state", "--fast", workspace.to_str().unwrap()])
+        .env_remove("HCOM_TOOL")
+        .env_remove("HCOM_INSTALL_DIR")
+        .env("PATH", "")
+        .env("HOME", workspace)
+        .env("USERPROFILE", workspace);
+    command
+}
+
 fn plan_with(criteria: &str) -> String {
     format!(
         "---\nstatus: in-progress\n---\n\n## Acceptance criteria\n\n{criteria}\n\n## Tasks\n\n### T1\n\n- **Status:** [x]\n"
@@ -109,11 +126,7 @@ fn plan_with_pending_tasks_is_not_reconcilable() {
 #[test]
 fn state_fast_without_wiki_returns_minimal_fallback() {
     let workspace = temporary_workspace();
-    let binary = std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide the loam binary");
-    let output = Command::new(binary)
-        .args(["state", "--fast", workspace.to_str().unwrap()])
-        .output()
-        .expect("loam should run");
+    let output = state_command(&workspace).output().expect("loam should run");
     fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
 
     assert!(
@@ -123,7 +136,7 @@ fn state_fast_without_wiki_returns_minimal_fallback() {
     );
     // The runtime self-reports its compiled version as the first key (T1); derive
     // it from the crate version rather than hard-coding, so a bump stays green.
-    let body = r#"{"wiki_root":"","exists":false,"qmd_ready":false,"latest_checkpoint":null,"recent_checkpoints":[],"checkpoint_count":0,"git_status":null,"drift_count":null,"hints":[{"kind":"memory_missing","group":"maintenance","severity":"info","message":"No memory substrate found; scaffold a wiki to begin.","command":"/loam::scaffolding-wiki <goal>","evidence":{}}]}"#;
+    let body = r#"{"wiki_root":"","exists":false,"qmd_ready":false,"hcom_ready":false,"latest_checkpoint":null,"recent_checkpoints":[],"checkpoint_count":0,"git_status":null,"drift_count":null,"hints":[{"kind":"memory_missing","group":"maintenance","severity":"info","message":"No memory substrate found; scaffold a wiki to begin.","command":"/loam::scaffolding-wiki <goal>","evidence":{}}]}"#;
     let expected = format!(
         "{{\"version\":\"{}\",{}",
         env!("CARGO_PKG_VERSION"),
@@ -167,4 +180,137 @@ fn full_state_pending_hint_uses_stable_content_identity() {
     assert!(!current.contains("code_ingest_pending"), "{current}");
     assert!(changed.contains("code_ingest_pending"), "{changed}");
     assert!(changed.contains(r#""pending_count":1"#), "{changed}");
+}
+
+// ---- optional hcom integration (detection-only) ---------------------------
+
+/// A stand-in `hcom` that records every invocation. Detection must not run it
+/// when a cheaper rung already answered, and the recording is what proves it.
+#[cfg(unix)]
+fn fake_hcom(directory: &std::path::Path, marker: &std::path::Path, exit_code: u8) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(directory).expect("bin directory should be created");
+    let path = directory.join("hcom");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\necho ran >> {}\necho 'hcom 0.7.25'\nexit {exit_code}\n",
+            marker.display()
+        ),
+    )
+    .expect("fake hcom should be written");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("fake hcom should be executable");
+}
+
+#[test]
+#[cfg(unix)]
+fn an_hcom_launched_session_reports_ready_without_spawning_anything() {
+    // The session-start budget guarantee: HCOM_TOOL answers the probe on its own,
+    // so the health check never runs. The fake on PATH exits non-zero — if the
+    // probe reached it, readiness would flip to false and the marker would exist.
+    let workspace = temporary_workspace();
+    let bin = workspace.join("bin");
+    let marker = workspace.join("spawned");
+    fake_hcom(&bin, &marker, 1);
+    let output = state_command(&workspace)
+        .env("PATH", &bin)
+        .env("HCOM_TOOL", "claude")
+        .output()
+        .expect("loam should run");
+    let stdout = String::from_utf8(output.stdout).expect("state output should be UTF-8");
+    let spawned = marker.exists();
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert!(stdout.contains(r#""hcom_ready":true"#), "{stdout}");
+    assert!(
+        !spawned,
+        "the launcher env marker must short-circuit before any spawn"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn hcom_installed_on_path_is_health_checked_and_ready() {
+    let workspace = temporary_workspace();
+    let bin = workspace.join("bin");
+    let marker = workspace.join("spawned");
+    fake_hcom(&bin, &marker, 0);
+    let output = state_command(&workspace)
+        .env("PATH", &bin)
+        .output()
+        .expect("loam should run");
+    let stdout = String::from_utf8(output.stdout).expect("state output should be UTF-8");
+    let spawned = marker.exists();
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert!(stdout.contains(r#""hcom_ready":true"#), "{stdout}");
+    assert!(
+        spawned,
+        "a resolved binary must be health-checked, not assumed working"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn hcom_in_the_installer_default_directory_is_found_off_path() {
+    // Both official installers, uv and pip all land here; PATH may not carry it
+    // in a non-login shell, so the ladder checks the site directly.
+    let workspace = temporary_workspace();
+    let marker = workspace.join("spawned");
+    fake_hcom(&workspace.join(".local/bin"), &marker, 0);
+    let output = state_command(&workspace).output().expect("loam should run");
+    let stdout = String::from_utf8(output.stdout).expect("state output should be UTF-8");
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert!(stdout.contains(r#""hcom_ready":true"#), "{stdout}");
+}
+
+#[test]
+#[cfg(unix)]
+fn hcom_under_the_install_dir_override_is_found() {
+    let workspace = temporary_workspace();
+    let root = workspace.join("opt/hcom");
+    let marker = workspace.join("spawned");
+    fake_hcom(&root.join("bin"), &marker, 0);
+    let output = state_command(&workspace)
+        .env("HCOM_INSTALL_DIR", &root)
+        .output()
+        .expect("loam should run");
+    let stdout = String::from_utf8(output.stdout).expect("state output should be UTF-8");
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert!(stdout.contains(r#""hcom_ready":true"#), "{stdout}");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_broken_hcom_binary_is_not_ready() {
+    // Present but unhealthy is not ready: the briefing must not promise a tool
+    // the skills would then fail to use.
+    let workspace = temporary_workspace();
+    let bin = workspace.join("bin");
+    let marker = workspace.join("spawned");
+    fake_hcom(&bin, &marker, 3);
+    let output = state_command(&workspace)
+        .env("PATH", &bin)
+        .output()
+        .expect("loam should run");
+    let stdout = String::from_utf8(output.stdout).expect("state output should be UTF-8");
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert!(stdout.contains(r#""hcom_ready":false"#), "{stdout}");
+}
+
+#[test]
+fn hcom_absent_from_every_install_site_is_not_installed() {
+    let workspace = temporary_workspace();
+    fs::create_dir(workspace.join("wiki")).expect("wiki directory should be created");
+    fs::write(workspace.join("wiki/index.md"), "# Index\n").expect("index should be written");
+    let output = state_command(&workspace).output().expect("loam should run");
+    let stdout = String::from_utf8(output.stdout).expect("state output should be UTF-8");
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    // Present in the full aggregate too, not only the wiki-less fallback.
+    assert!(stdout.contains(r#""hcom_ready":false"#), "{stdout}");
 }

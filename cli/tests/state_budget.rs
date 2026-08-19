@@ -61,18 +61,44 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
         .expect("checkpoint");
     }
 
+    // The hcom probe's WORST case, deliberately: no launcher env marker to
+    // short-circuit on, so the fixture pays the full ladder — directory
+    // resolution plus one health-check spawn — inside the same budget.
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    let fake = bin.join("hcom");
+    fs::write(&fake, "#!/bin/sh\necho 'hcom 0.7.25'\n").expect("fake hcom");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("fake hcom mode");
+    }
+
+    let path_with = |directory: &std::path::Path| {
+        let mut entries = vec![directory.to_path_buf()];
+        if let Some(existing) = std::env::var_os("PATH") {
+            entries.extend(std::env::split_paths(&existing));
+        }
+        std::env::join_paths(entries).expect("PATH should join")
+    };
+
     let binary = std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide the loam binary");
+    let state = |binary: &str| {
+        let mut command = Command::new(binary);
+        command
+            .args(["state", "--fast", root.to_str().unwrap()])
+            .env("HCOM_TOOL", "")
+            .env("HCOM_INSTALL_DIR", "")
+            // Prepended, not replaced: the fixture must still pay for the git
+            // probe the real hook path pays for.
+            .env("PATH", path_with(&bin));
+        command
+    };
     // One warmup so the page cache, not cold I/O, is what the budget measures.
-    Command::new(&binary)
-        .args(["state", "--fast", root.to_str().unwrap()])
-        .output()
-        .expect("warmup should run");
+    state(&binary).output().expect("warmup should run");
 
     let started = Instant::now();
-    let output = Command::new(&binary)
-        .args(["state", "--fast", root.to_str().unwrap()])
-        .output()
-        .expect("state should run");
+    let output = state(&binary).output().expect("state should run");
     let elapsed = started.elapsed();
     fs::remove_dir_all(&root).ok();
 
@@ -86,6 +112,10 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
     assert!(stdout.contains("\"drift_count\":null"), "{stdout}");
     assert!(!stdout.contains("date_drift_pending"), "{stdout}");
     assert!(!stdout.contains("code_ingest_pending"), "{stdout}");
+    // The measured run really did walk the whole hcom ladder, spawn included —
+    // a probe that silently stopped detecting would make this budget meaningless.
+    #[cfg(unix)]
+    assert!(stdout.contains("\"hcom_ready\":true"), "{stdout}");
     assert!(
         elapsed.as_secs() < BUDGET_SECONDS,
         "state --fast took {elapsed:?} on {SOURCE_FILES} sources / {CODE_PAGES} code pages / \
