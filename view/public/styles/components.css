@@ -1358,6 +1358,30 @@ code,
 
 .timeline-kind {
   color: var(--ink-tertiary);
+  font: 600 0.66rem/1 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.timeline-copy h2 {
+  margin: var(--space-2) 0;
+  color: var(--ink-primary);
+  font: 600 1.05rem/1.25 var(--font-sans);
+}
+
+.timeline-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  margin: 0;
+  gap: var(--space-2);
+  color: var(--ink-secondary);
+  font: 400 0.72rem/1.45 var(--font-mono);
+}
+
+.timeline-strength { color: var(--ink-tertiary); }
+.timeline-path { color: var(--ink-tertiary); overflow-wrap: anywhere; }
+
 /* ---------- Atlas (DESIGN.md §2 Graph Palette, §4 card, §5 dot-grid stage) ---------- */
 
 .atlas-layout {
@@ -1378,6 +1402,8 @@ code,
 
 /* Dot-grid texture: the "field/desk" surface DESIGN.md gives the Atlas stage. */
 .atlas-stage {
+  /* Cytoscape warns and disables its UI extensions on a static container. */
+  position: relative;
   min-height: 30rem;
   background-color: var(--surface-canvas);
   background-image: radial-gradient(var(--border-faint) 1px, transparent 1px);
@@ -1434,24 +1460,6 @@ code,
   text-transform: uppercase;
 }
 
-.timeline-copy h2 {
-  margin: var(--space-2) 0;
-  color: var(--ink-primary);
-  font: 600 1.05rem/1.25 var(--font-sans);
-}
-
-.timeline-evidence {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  margin: 0;
-  gap: var(--space-2);
-  color: var(--ink-secondary);
-  font: 400 0.72rem/1.45 var(--font-mono);
-}
-
-.timeline-strength { color: var(--ink-tertiary); }
-.timeline-path { color: var(--ink-tertiary); overflow-wrap: anywhere; }
 /* The kind cell is the coloured mark that carries node identity into the text
    alternative, holding the same graph palette the canvas draws with. The node
    name itself stays in ink: colour is the mark's job, not the label's. */

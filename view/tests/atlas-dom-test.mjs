@@ -17,7 +17,7 @@ import { JSDOM, VirtualConsole } from 'jsdom';
 import { boot } from '../public/js/app.mjs';
 import { initInspector } from '../public/js/inspector.mjs';
 import { state } from '../public/js/store.mjs';
-import { CLUSTERS, MAX_NODES, PROJECTIONS, emptyStateFor, initAtlas, projectGraph } from '../public/js/views/atlas.mjs';
+import { CLUSTERS, MAX_NODES, PROJECTIONS, canvasToken, emptyStateFor, initAtlas, projectGraph } from '../public/js/views/atlas.mjs';
 
 const PUBLIC_ROOT = new URL('../public/', import.meta.url);
 const html = await readFile(new URL('index.html', PUBLIC_ROOT), 'utf8');
@@ -171,6 +171,51 @@ async function mount(served = snapshot) {
 afterEach(() => {
   globalThis.fetch = realFetch;
   delete globalThis.document;
+});
+
+/* ---------- graph palette ---------- */
+
+describe('graph colours reach the canvas as sRGB', () => {
+  /**
+   * A stub 2D context that behaves like a modern browser's: it accepts OKLCH and
+   * serialises it straight back (which is exactly why reading `fillStyle` is not
+   * a conversion), and it paints a known pixel.
+   */
+  function stubDoc(tokens, pixel, { rejects = [] } = {}) {
+    let fillStyle = '';
+    const context = {
+      globalCompositeOperation: 'source-over',
+      // A real context silently ignores an unparseable assignment, leaving the
+      // previous value standing; that is what the sentinel check relies on.
+      get fillStyle() { return fillStyle; },
+      set fillStyle(value) { if (!rejects.includes(value)) fillStyle = value; },
+      fillRect() {},
+      getImageData: () => ({ data: pixel }),
+    };
+    const doc = { createElement: () => ({ getContext: () => context }), documentElement: {} };
+    const win = { getComputedStyle: () => ({ getPropertyValue: (name) => tokens[name] ?? '' }) };
+    return { token: canvasToken(doc, win), context };
+  }
+
+  it('converts an OKLCH token through a painted pixel, not through fillStyle', () => {
+    const { token, context } = stubDoc(
+      { '--node-code': 'oklch(68% 0.11 244)' },
+      [95, 165, 235, 255],
+    );
+    assert.equal(token('--node-code'), 'rgb(95, 165, 235)');
+    assert.equal(context.globalCompositeOperation, 'copy', 'the fill must replace, not composite');
+  });
+
+  it('keeps a token’s alpha', () => {
+    const { token } = stubDoc({ '--border': 'oklch(100% 0 0 / 0.09)' }, [255, 255, 255, 23]);
+    assert.equal(token('--border'), 'rgba(255, 255, 255, 0.09)');
+  });
+
+  it('drops a token the browser will not parse rather than inventing one', () => {
+    const { token } = stubDoc({ '--bogus': 'not-a-colour' }, [0, 0, 0, 255], { rejects: ['not-a-colour'] });
+    assert.equal(token('--bogus'), '', 'an unparseable token is dropped, never guessed');
+    assert.equal(token('--missing'), '');
+  });
 });
 
 /* ---------- honest empty states ---------- */

@@ -211,9 +211,15 @@ export function projectGraph(snapshot, { projection = 'architecture', focus = nu
  * rather than restating the palette here as sRGB literals that could drift from
  * tokens.css. A value the context will not take is dropped, never invented.
  */
-function canvasToken(doc, win) {
+export function canvasToken(doc, win) {
   const styles = win.getComputedStyle?.(doc.documentElement);
-  const context = doc.createElement('canvas').getContext('2d');
+  const canvas = doc.createElement('canvas');
+  canvas.width = 1;
+  canvas.height = 1;
+  const context = canvas.getContext?.('2d', { willReadFrequently: true });
+  // `copy` makes each fill replace the pixel outright, so a token's own alpha
+  // survives instead of compositing over whatever was painted before.
+  if (context) context.globalCompositeOperation = 'copy';
   return (name) => {
     const raw = styles?.getPropertyValue(name).trim() ?? '';
     if (!raw || !context) return '';
@@ -221,7 +227,17 @@ function canvasToken(doc, win) {
     // no token uses tells "parsed" and "rejected" apart.
     context.fillStyle = '#010101';
     context.fillStyle = raw;
-    return context.fillStyle === '#010101' ? '' : context.fillStyle;
+    if (context.fillStyle === '#010101') return '';
+    // Reading fillStyle back is no longer a conversion: a browser that supports
+    // OKLCH serialises `oklch(...)` straight back, and Cytoscape's own parser
+    // rejects it, which is how the palette silently fell back to defaults.
+    // Painting one pixel and reading it makes the browser do the OKLCH -> sRGB
+    // conversion for real, so the palette still comes from tokens.css alone.
+    context.fillRect(0, 0, 1, 1);
+    const [red, green, blue, alpha] = context.getImageData(0, 0, 1, 1).data;
+    return alpha === 255
+      ? `rgb(${red}, ${green}, ${blue})`
+      : `rgba(${red}, ${green}, ${blue}, ${Number((alpha / 255).toFixed(3))})`;
   };
 }
 
