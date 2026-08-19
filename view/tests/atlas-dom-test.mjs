@@ -220,6 +220,20 @@ describe('graph colours reach the canvas as sRGB', () => {
 
 /* ---------- honest empty states ---------- */
 
+describe('Atlas on a snapshot nobody could read', () => {
+  it('renders nothing rather than claiming the workspace has no substrate', async () => {
+    const { doc } = await mount(null);
+
+    const target = doc.querySelector('[data-mount="atlas"]');
+    assert.equal(
+      target.textContent.trim(),
+      '',
+      '"no pages to connect" is a claim about the workspace; with no snapshot it is unfounded',
+    );
+    assert.equal(target.querySelector('[data-empty="atlas"]'), null);
+  });
+});
+
 describe('an empty Atlas says why it is empty', () => {
   const capabilities = (overrides = {}) => ({
     wiki: { state: 'ready' },

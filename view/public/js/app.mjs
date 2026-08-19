@@ -108,8 +108,10 @@ export async function boot(doc = globalThis.document) {
     if (!readable) {
       const reason = doc.querySelector('[data-unreadable-reason]');
       if (reason) {
+        // The notice above already carries the full sentence; under the panel's
+        // own "No snapshot" heading the reason alone is enough.
         reason.textContent = state.error
-          ? `Could not read the snapshot: ${sentence(state.error)} Press Refresh to retry.`
+          ? `${sentence(state.error)} Press Refresh to retry.`
           : 'Reading the workspace…';
       }
       // Never hand the areas a null snapshot: each one would render its own

@@ -146,8 +146,10 @@ describe('a workspace that could not be read', () => {
 
     const panel = doc.querySelector('[data-unreadable]');
     assert.equal(panel.hidden, false, 'the no-snapshot panel must be shown');
-    assert.match(doc.querySelector('[data-unreadable-reason]').textContent, /Press Refresh to retry\.$/);
-    assert.match(doc.querySelector('[data-unreadable-reason]').textContent, /unreadable: permission denied/);
+    assert.equal(
+      doc.querySelector('[data-unreadable-reason]').textContent,
+      'unreadable: permission denied. Press Refresh to retry.',
+    );
 
     assert.equal(
       doc.querySelectorAll('.view.is-active').length,

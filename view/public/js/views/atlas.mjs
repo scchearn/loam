@@ -418,7 +418,6 @@ export function initAtlas({ root = document, getSnapshot = () => state.snapshot 
   emptyNote.dataset.empty = 'atlas';
   emptyNote.hidden = true;
   band.append(head, emptyNote, layout);
-  mount.replaceChildren(band);
 
   /* ---- per-render fills ---- */
 
@@ -583,6 +582,13 @@ export function initAtlas({ root = document, getSnapshot = () => state.snapshot 
   }
 
   function render() {
+    // With nothing read, "no pages to connect" would be a claim about the
+    // workspace rather than about the snapshot. The shell says so once instead.
+    if (!getSnapshot()) {
+      mount.replaceChildren();
+      return;
+    }
+    if (!mount.contains(band)) mount.replaceChildren(band);
     view = projectGraph(getSnapshot(), chosen);
     // A focus that the current snapshot no longer resolves falls back to clusters.
     chosen.focus = view.focus;
