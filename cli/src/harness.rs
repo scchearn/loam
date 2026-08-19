@@ -962,6 +962,18 @@ fn workspace_state_section(workspace: &Path) -> String {
         lines.push("Wiki: none".to_owned());
     }
 
+    // Detection-only optional integration: hcom is workspace-independent, so it
+    // gets its own line rather than riding the wiki one. Skills read this instead
+    // of probing for the binary themselves.
+    lines.push(
+        if matches!(state.get("hcom_ready"), Some(Value::Bool(true))) {
+            "hcom: ready"
+        } else {
+            "hcom: not installed"
+        }
+        .to_owned(),
+    );
+
     let checkpoint_count = number(&state, "checkpoint_count");
     if checkpoint_count > 0 {
         if let Some(latest) = state.get("latest_checkpoint").filter(|v| !v.is_null()) {

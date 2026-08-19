@@ -3,7 +3,7 @@ name: loam::configuring-agents
 description: "Use when agents must debate, conference, deliberate, or reach consensus on a goal — competing positions argue and converge on one deliverable, adversarial review with synthesis, multi-stakeholder deliberation, structured disagreement with a forcing-field deliverable. Triggers: 'have agents debate X', 'reach consensus on Y', 'argue distinct positions and converge'. Not for saved team configs, agents/<slug> artifacts, implementation, or open-ended research."
 compatibility: "Requires hcom for live agent coordination. The prepared plan can be returned without hcom when approval is denied or hcom is unavailable."
 metadata:
-  version: "2.0.0"
+  version: "2.1.0"
   author: scchearn
   phase: execution
   outputs: prepared-debate-plan-and-convergence-result
@@ -55,14 +55,14 @@ Three rules with no exceptions. Violating any produces work that looks right but
 
 ## Check hcom availability
 
-Before entering the hcom-specific workflow, check whether hcom is available:
+Before entering the hcom-specific workflow, read the `hcom:` line in the
+injected `## Workspace state` block (reuse contract in `loam::using`). Do not
+probe for the binary; the briefing already answered. Only when that block is
+absent or belongs to another workspace, refresh native state through the
+injected native runtime command.
 
-```bash
-which hcom 2>/dev/null
-```
-
-- **If hcom is available:** continue with the workflow below (sections 1–7 + common mistakes). This is the primary mode.
-- **If hcom is not available:** see [When hcom is unavailable](#when-hcom-is-unavailable) at the bottom. The interview, gate, and mechanics are identical; only the dispatch mechanism differs.
+- **If hcom is available (`hcom: ready`):** continue with the workflow below (sections 1–7 + common mistakes). This is the primary mode.
+- **If hcom is not available (`hcom: not installed`):** see [When hcom is unavailable](#when-hcom-is-unavailable) at the bottom. The interview, gate, and mechanics are identical; only the dispatch mechanism differs.
 
 ## Input
 

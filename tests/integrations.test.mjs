@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { test } from 'node:test';
 
 import { catalogEntry } from '../setup/integrations/catalog.mjs';
@@ -320,4 +320,229 @@ test('disabling one tool-backed integration leaves another integration\'s manage
   assert.equal((await disableIntegration(alpha, baseCtx({}))).ready, true);
   await assert.rejects(() => stat(managedBinPath(fx.globalRoot, 'alpha', 'alpha', 'linux')), 'alpha tool removed');
   await assert.doesNotReject(() => stat(managedBinPath(fx.globalRoot, 'beta', 'beta', 'linux')), 'beta tool survives');
+});
+
+// --- hcom: the detection-only shape ---------------------------------------
+
+// A stand-in hcom binary at a chosen site. Detection is filesystem-real (the
+// resolver stats for an executable), so the fake has to be a real executable
+// file; only the health check goes through the injected runner.
+async function fakeHcom(directory) {
+  await mkdir(directory, { recursive: true });
+  const path = join(directory, 'hcom');
+  await writeFile(path, '#!/bin/sh\necho "hcom 0.7.25"\n');
+  await chmod(path, 0o755);
+  return path;
+}
+
+function hcomRunner({ versionCode = 0 } = {}) {
+  const calls = [];
+  return {
+    calls,
+    runner: async ({ command, args = [] }) => {
+      calls.push([command, ...args].join(' '));
+      return { code: versionCode, stdout: 'hcom 0.7.25\n', stderr: versionCode === 0 ? '' : 'boom' };
+    },
+  };
+}
+
+async function noMcpAnywhere(home) {
+  for (const path of [
+    join(home, '.claude.json'),
+    join(home, '.cursor', 'mcp.json'),
+    join(home, '.config', 'opencode', 'opencode.json'),
+    join(home, '.codex', 'config.toml'),
+  ]) {
+    await assert.rejects(() => stat(path), `${path} was written for an entry with no MCP lane`);
+  }
+}
+
+test('enabling hcom when it is absent refuses with the per-OS install recipes and records nothing', async () => {
+  const fx = await installedHome();
+  const capture = outputCapture();
+  const tool = hcomRunner();
+  const result = await catalogEntry('hcom').enable(ctxFor(fx, capture, { toolRunner: tool.runner }));
+
+  assert.equal(result.ready, false);
+  assert.equal(result.category, 'tool-not-installed');
+  assert.match(result.detail, /never installs it/);
+  // Recipes, not a label: every route the user could actually run.
+  const text = capture.text();
+  assert.match(text, /brew install aannoo\/hcom\/hcom/);
+  assert.match(text, /hcom-installer\.sh/);
+  assert.match(text, /hcom-installer\.ps1/);
+  assert.match(text, /uv tool install hcom/);
+  // The reason comes BEFORE the commands: a wall of install lines with no
+  // framing, explained only afterwards, is the shape #163 is sweeping out.
+  const why = text.indexOf('is not installed');
+  const how = text.indexOf('brew install');
+  assert.ok(why >= 0 && why < how, `the refusal must say why before it says how:\n${text}`);
+  // A refusal never half-enables: no health spawn, no ledger, no config.
+  assert.equal(tool.calls.length, 0, 'nothing to health-check when nothing resolved');
+  const ledger = await readLedger(fx.globalRoot);
+  assert.equal(ledger.integrations.hcom, undefined);
+  await noMcpAnywhere(fx.home);
+});
+
+test('enabling hcom found on PATH records it as unmanaged and registers no MCP', async () => {
+  const fx = await installedHome();
+  const binDir = join(fx.home, 'bin');
+  const binPath = await fakeHcom(binDir);
+  const capture = outputCapture();
+  const tool = hcomRunner();
+  const result = await catalogEntry('hcom').enable(ctxFor(fx, capture, { toolRunner: tool.runner, env: { PATH: binDir } }));
+
+  assert.equal(result.ready, true, capture.text());
+  assert.deepEqual(result.registered, [], 'no MCP lane, so nothing is registered');
+  assert.deepEqual(result.tool, { managed: false, pkg: null, path: binPath });
+  assert.deepEqual(tool.calls, [`${binPath} --version`], 'detection health-checks with --version');
+  assert.match(capture.text(), /registers no MCP server/);
+  await noMcpAnywhere(fx.home);
+
+  // The ledger records ownership of exactly nothing but the record itself.
+  const ledger = await readLedger(fx.globalRoot);
+  assert.deepEqual(ledger.integrations.hcom, { mcp: {}, tool: { managed: false, pkg: null, path: binPath } });
+});
+
+test('a relative install site is never searched, so nothing resolves out of the CWD', async () => {
+  // Same class as the Rust ladder's: an empty element in PATH, or a relative
+  // HCOM_INSTALL_DIR, makes join() produce a relative candidate that is stat'd
+  // against the process CWD — a binary in whatever repository is checked out.
+  const fx = await installedHome();
+  const cwd = process.cwd();
+  try {
+    const bait = await mkdtemp(join(tmpdir(), 'loam-relative-bait-'));
+    await fakeHcom(join(bait, 'rel', 'bin'));
+    await fakeHcom(bait);
+    process.chdir(bait);
+    const tool = hcomRunner();
+    const result = await catalogEntry('hcom').enable(ctxFor(fx, outputCapture(), {
+      toolRunner: tool.runner,
+      // A trailing delimiter leaves an empty element; HCOM_INSTALL_DIR is relative.
+      env: { PATH: `${join(fx.home, 'nowhere')}${delimiter}`, HCOM_INSTALL_DIR: 'rel' },
+    }));
+    assert.equal(result.ready, false, 'a relative candidate must never resolve');
+    assert.equal(result.category, 'tool-not-installed');
+    assert.equal(tool.calls.length, 0, 'nothing relative may even be health-checked');
+  } finally {
+    process.chdir(cwd);
+  }
+});
+
+test('a detection-only dry run previews the sites and never spawns or fails', async () => {
+  // qmd's dry run is a non-failing preview (pinned below); this lane must not be
+  // the one entry whose --dry-run turns into a detection gate that reports the
+  // machine's state as a command failure.
+  const fx = await installedHome();
+  const tool = hcomRunner();
+  const capture = outputCapture();
+  const result = await catalogEntry('hcom').enable(ctxFor(fx, capture, {
+    toolRunner: tool.runner,
+    dryRun: true,
+    env: { PATH: '' },
+  }));
+
+  assert.equal(result.ready, true, 'a preview never fails on what the machine has');
+  assert.equal(tool.calls.length, 0, 'a preview resolves nothing and spawns nothing');
+  assert.match(capture.text(), /would look for hcom in PATH/);
+  const ledger = await readLedger(fx.globalRoot);
+  assert.equal(ledger.integrations.hcom, undefined, 'a preview records nothing');
+});
+
+test('a chatty version answer is reduced to one short line', async () => {
+  // doctor prints one line per integration and the ledger records the string,
+  // so a tool that answers with a build banner must not be able to reshape
+  // either. The version is the tool's own words — untrusted for shape.
+  const fx = await installedHome();
+  const binDir = join(fx.home, 'bin');
+  await fakeHcom(binDir);
+  const runner = async () => ({
+    code: 0,
+    stdout: `hcom 0.7.25\nbuild: abc\n${'x'.repeat(200)}\n`,
+    stderr: '',
+  });
+  const result = await catalogEntry('hcom').enable(ctxFor(fx, outputCapture(), { toolRunner: runner, env: { PATH: binDir } }));
+  assert.equal(result.ready, true);
+
+  const state = await catalogEntry('hcom').verify(ctxFor(fx, outputCapture(), { toolRunner: runner, env: { PATH: binDir } }));
+  assert.equal(state.tool.version, 'hcom 0.7.25');
+  assert.ok(!state.tool.version.includes('\n'), 'a version is one line');
+});
+
+test('hcom is detected in the installer default directory and under HCOM_INSTALL_DIR, off PATH', async () => {
+  const fx = await installedHome();
+  const capture = outputCapture();
+  const tool = hcomRunner();
+  // The installers target ~/.local/bin on every OS; a non-login shell may not
+  // carry it on PATH, so the entry's declared sites are searched too.
+  const localBin = await fakeHcom(join(fx.home, '.local', 'bin'));
+  const viaSite = await catalogEntry('hcom').enable(ctxFor(fx, capture, { toolRunner: tool.runner, env: { PATH: '' } }));
+  assert.equal(viaSite.ready, true, capture.text());
+  assert.equal(viaSite.tool.path, localBin);
+  assert.match(capture.text(), /install site/);
+
+  const overrideRoot = join(fx.home, 'opt', 'hcom');
+  const overrideBin = await fakeHcom(join(overrideRoot, 'bin'));
+  const viaOverride = await catalogEntry('hcom').enable(ctxFor(fx, outputCapture(), {
+    toolRunner: tool.runner,
+    env: { PATH: '', HCOM_INSTALL_DIR: overrideRoot },
+  }));
+  assert.equal(viaOverride.ready, true);
+  assert.equal(viaOverride.tool.path, overrideBin, 'the override wins over the default site');
+});
+
+test('an hcom binary that fails its health check is not enabled', async () => {
+  const fx = await installedHome();
+  const binDir = join(fx.home, 'bin');
+  await fakeHcom(binDir);
+  const capture = outputCapture();
+  const tool = hcomRunner({ versionCode: 1 });
+  const result = await catalogEntry('hcom').enable(ctxFor(fx, capture, { toolRunner: tool.runner, env: { PATH: binDir } }));
+
+  assert.equal(result.ready, false, capture.text());
+  assert.equal(result.category, 'tool-not-installed');
+  const ledger = await readLedger(fx.globalRoot);
+  assert.equal(ledger.integrations.hcom, undefined);
+});
+
+test('disabling hcom clears the ledger record and touches nothing else, even with --purge', async () => {
+  const fx = await installedHome();
+  const binDir = join(fx.home, 'bin');
+  const binPath = await fakeHcom(binDir);
+  const tool = hcomRunner();
+  const enableCtx = { toolRunner: tool.runner, env: { PATH: binDir } };
+  await catalogEntry('hcom').enable(ctxFor(fx, outputCapture(), enableCtx));
+
+  // Live hcom state: message history and agent data, which loam never created.
+  const hcomDir = join(fx.home, '.hcom');
+  await mkdir(hcomDir, { recursive: true });
+  await writeFile(join(hcomDir, 'hcom.db'), Buffer.alloc(4096));
+
+  const capture = outputCapture();
+  const off = await catalogEntry('hcom').disable(ctxFor(fx, capture, { ...enableCtx, purge: true }));
+  assert.equal(off.ready, true, capture.text());
+  assert.deepEqual(off.caches, [], '~/.hcom is user data — never offered as a purgeable cache');
+
+  const ledger = await readLedger(fx.globalRoot);
+  assert.equal(ledger.integrations.hcom, undefined, 'ledger record cleared');
+  await assert.doesNotReject(() => stat(binPath), 'a detected binary is never removed');
+  await assert.doesNotReject(() => stat(join(hcomDir, 'hcom.db')), '~/.hcom survives --purge');
+  assert.match(capture.text(), /never installed by loam/);
+});
+
+test('hcom verify reports the detected tool and no MCP state for doctor', async () => {
+  const fx = await installedHome();
+  const binDir = join(fx.home, 'bin');
+  const binPath = await fakeHcom(binDir);
+  const tool = hcomRunner();
+  const state = await catalogEntry('hcom').verify(ctxFor(fx, outputCapture(), { toolRunner: tool.runner, env: { PATH: binDir } }));
+
+  assert.equal(state.ready, true);
+  assert.equal(state.id, 'hcom');
+  assert.equal(state.tool.present, true);
+  assert.equal(state.tool.managed, false);
+  assert.equal(state.tool.source, 'PATH');
+  assert.equal(state.tool.path, binPath);
+  assert.equal(state.tool.version, 'hcom 0.7.25', 'the health-check answer doctor prints');
+  assert.deepEqual(state.registered, {}, 'no MCP lane means no per-harness state');
 });

@@ -52,12 +52,28 @@ export async function runDoctor(options = {}) {
     if (result.install) {
       output.write('Optional integrations (informational):\n');
       for (const entry of CATALOG) {
-        const state = await entry.verify({ discovery, install: result.install, runner: options.runner });
+        const state = await entry.verify({
+          discovery,
+          install: result.install,
+          runner: options.runner,
+          // Injectable in tests; production falls through to the real spawn and
+          // the real environment inside resolveTool.
+          toolRunner: options.toolRunner,
+          env: options.env,
+        });
         const harnessBits = Object.entries(state.registered).map(([id, on]) => `${id}:${on ? 'yes' : 'no'}`).join(' ');
+        // `present` already means the health check passed (resolveTool only
+        // reports a binary it could run), so the version it answered with is the
+        // health-check result, shown rather than asserted.
         const toolBit = entry.tool
-          ? `tool ${state.tool?.present ? `present (${state.tool.managed ? 'loam-managed' : 'PATH'})` : 'absent'}`
+          ? `tool ${state.tool?.present
+            ? `present (${state.tool.source}${state.tool.version ? `, ${state.tool.version}` : ''})`
+            : 'absent'}`
           : 'no tool';
-        output.write(`  ${entry.id} (${entry.capability}): ${toolBit}; MCP ${harnessBits || 'no harness'}\n`);
+        // An entry with no MCP lane has no per-harness state to report; saying
+        // "no harness" would read as a misconfiguration instead of a design.
+        const mcpBit = entry.mcpName ? `MCP ${harnessBits || 'no harness'}` : 'MCP not applicable';
+        output.write(`  ${entry.id} (${entry.capability}): ${toolBit}; ${mcpBit}\n`);
       }
     }
 
