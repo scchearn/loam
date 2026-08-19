@@ -182,7 +182,6 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
     doc.body.classList.remove('reader-open');
     article.replaceChildren();
     currentPath = null;
-    restoreFocus();
   }
 
   /**
@@ -190,6 +189,8 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
    * route, and the view underneath re-renders on that change — which detaches
    * the very node that opened Reader — so the control is found again by the
    * hook it carries, and only then focused, one task after the route settles.
+   * Callers run this *after* writing the route, so the hashchange task that
+   * triggers the re-render is already queued ahead of the focus task.
    */
   function restoreFocus() {
     const target = invoker;
@@ -299,6 +300,7 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
     if (String(win.location?.hash ?? '') !== context.hash) win.location.hash = context.hash;
     const CustomEventCtor = doc.defaultView?.CustomEvent ?? CustomEvent;
     doc.dispatchEvent(new CustomEventCtor('loam:reader-closed', { detail: context.detail }));
+    restoreFocus();
   }
 
   backButton.addEventListener('click', back);
@@ -344,6 +346,7 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
       loadDocument(route.path, route.fragment);
     } else if (open) {
       hide();
+      restoreFocus();
     }
   }
 

@@ -693,7 +693,13 @@ a:focus-visible,
   font: 400 0.85rem/1.4 var(--font-sans);
 }
 
-.overview-url { font-family: var(--font-mono); font-size: 0.8rem; }
+.overview-url {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  /* A workspace root is one unbreakable token; without this it runs off a
+     narrow viewport with nothing to scroll it back into view. */
+  overflow-wrap: anywhere;
+}
 
 /* ---------- Focus card (current return point) ---------- */
 
