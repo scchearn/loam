@@ -128,7 +128,13 @@ fn view_inventory_sparse_workspace_is_not_configured_with_honest_capabilities() 
     );
 
     // Only AGENTS.md is inventoried -- no wiki/, goals/, specs/, or plans/ exist.
-    assert_eq!(count_occurrences(&snapshot, "\"kind\":"), 1, "{snapshot}");
+    // `"parse_errors":` is an artifact-only key (relationships also carry a
+    // `"kind"` field, so counting that key directly would double-count edges).
+    assert_eq!(
+        count_occurrences(&snapshot, "\"parse_errors\":"),
+        1,
+        "{snapshot}"
+    );
     assert!(
         snapshot.contains(r#""path":"AGENTS.md","kind":"guidance""#),
         "{snapshot}"
@@ -160,7 +166,13 @@ fn view_inventory_healthy_workspace_is_a_complete_correctly_kinded_inventory() {
     assert!(snapshot.contains(r#""qmd":{"state":"absent","required":false,"reason":"no qmd config found","evidence":null}"#));
 
     // AGENTS.md, goal, spec, plan, checkpoint, wiki-index, topic, and two code pages.
-    assert_eq!(count_occurrences(&snapshot, "\"kind\":"), 9, "{snapshot}");
+    // `"parse_errors":` is an artifact-only key (relationships also carry a
+    // `"kind"` field, so counting that key directly would double-count edges).
+    assert_eq!(
+        count_occurrences(&snapshot, "\"parse_errors\":"),
+        9,
+        "{snapshot}"
+    );
     assert_eq!(
         count_occurrences(&snapshot, "\"kind\":\"code\""),
         2,
@@ -236,8 +248,9 @@ fn view_inventory_broken_links_fixture_classifies_every_page_without_scanning_li
     let snapshot = view_snapshot(&workspace);
     fs::remove_dir_all(&workspace).ok();
 
-    // Wikilink diagnostics (broken/ambiguous/case-drift) are a later task's concern --
-    // T3 only needs a complete, correctly kinded inventory of the pages involved.
+    // Wikilink diagnostics (broken/ambiguous/case-drift) and the relationships they
+    // gate are cli/tests/view_links.rs's concern -- this test only needs a complete,
+    // correctly kinded inventory of the pages involved.
     for (path, kind) in [
         ("wiki/index.md", "wiki-index"),
         ("wiki/entities/overview.md", "entity"),
@@ -249,7 +262,13 @@ fn view_inventory_broken_links_fixture_classifies_every_page_without_scanning_li
         let needle = format!("\"path\":\"{path}\",\"kind\":\"{kind}\"");
         assert!(snapshot.contains(&needle), "missing {needle} in {snapshot}");
     }
-    assert_eq!(count_occurrences(&snapshot, "\"kind\":"), 6, "{snapshot}");
+    // `"parse_errors":` is an artifact-only key (relationships also carry a
+    // `"kind"` field, so counting that key directly would double-count edges).
+    assert_eq!(
+        count_occurrences(&snapshot, "\"parse_errors\":"),
+        6,
+        "{snapshot}"
+    );
 
     assert_schema_valid(&snapshot);
 }
