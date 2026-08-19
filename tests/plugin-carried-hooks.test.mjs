@@ -86,5 +86,5 @@ test('#137 the session-start shim soft-degrades to the repair hint when no runti
   });
   const parsed = JSON.parse(stdout);
   assert.equal(parsed.hookSpecificOutput.hookEventName, 'SessionStart');
-  assert.match(parsed.hookSpecificOutput.additionalContext, /Loam is unavailable\.\s*Run: npx @scchearn\/loam install/);
+  assert.match(parsed.hookSpecificOutput.additionalContext, /runtime failed to load[\s\S]*npx @scchearn\/loam install/);
 });

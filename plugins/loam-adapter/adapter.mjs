@@ -295,7 +295,7 @@ const WAKE_KIND = 'loam-wake';
 // Soft-degrade text when no runtime resolves (a marketplace-only machine with no
 // staged install): the SessionStart surface shows a repair hint; the per-turn and
 // wake surfaces stay silent rather than spam. Mirrors the OpenCode UNAVAILABLE hint.
-const UNAVAILABLE_HINT = 'You have loam.\nLoam is unavailable. Run: npx @scchearn/loam install';
+const UNAVAILABLE_HINT = 'Loam is installed for this workspace, but its runtime failed to load for this session, so the loam memory, goals, plans, and checkpoint skills are unavailable right now.\nTo repair it, run: npx @scchearn/loam install\nThen start a new session.';
 // The wake window: the poller waits at most this long for a frame, then returns
 // allow-stop. Deliberate 1h (not the old 14520s dev-era arming value). On Claude
 // the Stop hook is registered `asyncRewake`, so this window runs OFF the visible
