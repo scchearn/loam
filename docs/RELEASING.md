@@ -44,14 +44,6 @@ track; do not copy them blindly.
   a plugin bump are coordinated, publish and verify the runtime first, then
   publish the plugin that points to it.
 
-### The v1.0.0 gate
-
-The v1.0.0 feature set is currently on the `federation` branch. [PR #123]
-remains open and has not been merged into `main`, so keep the plugin on the
-`1.0.0-next.N` prerelease series and do not describe v1.0.0 as released yet. The
-runtime keeps its own version sequence; it is not renumbered to match the
-plugin.
-
 ## Required changelog work
 
 Update [`CHANGELOG.md`](../CHANGELOG.md) before creating a release tag. The
@@ -63,8 +55,6 @@ changelog update is part of the release change, not a follow-up task.
    heading for the exact plugin or runtime version. If both tracks ship
    together, name both versions in the heading or its first paragraph.
 3. Leave a new `[Unreleased]` heading at the top for work that has not shipped.
-4. Until PR #123 is merged into `main`, keep the v1.0.0 story under
-   `[Unreleased]`.
 
 ## Version gates
 

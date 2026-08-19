@@ -4,11 +4,9 @@ All notable changes to loam are documented here. This file follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — planned v1.0.0
+## [Unreleased]
 
-**v1.0.0 is not released yet.** This entry describes the feature set on the
-`federation` branch while [PR #123] remains open and has not been merged into
-`main`. Prerelease versions continue until that promotion is complete.
+## [1.0.0]
 
 ### Added
 
@@ -69,11 +67,11 @@ All notable changes to loam are documented here. This file follows
   fixes cover Linux, macOS, and Windows setup, service lifecycle, hooks, and
   runtime downloads before a release is promoted.
 
-The next release entry must be added or moved from this section as part of the
-release work; see [RELEASING.md](./docs/RELEASING.md).
+Release entries are maintained as part of release work; see
+[RELEASING.md](./docs/RELEASING.md).
 
-[Unreleased]: https://github.com/scchearn/loam/compare/main...federation
-[PR #123]: https://github.com/scchearn/loam/pull/123
+[Unreleased]: https://github.com/scchearn/loam/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/scchearn/loam/releases/tag/v1.0.0
 [#114]: https://github.com/scchearn/loam/pull/114
 [#146]: https://github.com/scchearn/loam/issues/146
 [#163]: https://github.com/scchearn/loam/issues/163

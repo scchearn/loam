@@ -19,14 +19,7 @@ tools or machines.
 
 [Why loam exists →](./WHY.md)
 
-## v1.0.0 status
-
-The v1.0.0 feature set is on the `federation` branch. **v1.0.0 is not
-released yet:** [PR #123](https://github.com/scchearn/loam/pull/123) remains open
-and has not been merged into `main`. Until that changes, plugin and runtime
-versions continue as prereleases; see the [changelog](./CHANGELOG.md).
-
-## What v1.0.0 adds
+## What loam includes
 
 - **Workflow skills** for specifications, plans, goals, checkpoints, memory,
   code indexing, and keeping project guidance current.
@@ -118,12 +111,6 @@ Federation lets people on different computers see current work state in their
 own coding tool. Each computer joins a project through a TLS-protected broker.
 
 ### Set up a broker
-
-> **HARD STOP — production broker deployment is currently blocked.** The
-> checked-in broker ACL is incompatible with the current connector. Do not
-> deploy or enable it from the walkthrough; read the
-> [federation hard-stop warning](./docs/federation/README.md#production-broker-hard-stop)
-> first.
 
 For a self-hosted Mosquitto broker, start with the
 [broker deployment overview](./deploy/mqtt-broker/README.md), then follow the
