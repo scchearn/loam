@@ -181,10 +181,13 @@ export function renderOpenCodePlugin(source, runtimePath) {
 // failure #133 was for Claude/Codex, which #134 fixed for those two and left
 // here (#135).
 //
-// The runtime path is JSON-quoted, so a path with a space survives the shell
-// and the ownership matcher can read it back out with JSON.parse.
+// The runtime path is wrapped in double quotes so a path with a space survives
+// the shell. Quoted literally, NOT JSON-escaped: a JSON-escaped Windows path
+// doubles every separator (`C:\\Users\\...`), which is a different string for
+// anything that reads the command back and leans on how the executor unescapes
+// it. A `"` cannot occur in a Windows path and is pathological in a POSIX one.
 export function nativeHookCommand(runtimePath, harness, event) {
-  return `${JSON.stringify(resolve(runtimePath))} hook ${harness} --event ${event}`;
+  return `"${resolve(runtimePath)}" hook ${harness} --event ${event}`;
 }
 
 export function nativeHookEntry(runtimePath, harness, event, { timeout } = {}) {
@@ -203,10 +206,8 @@ const RUNTIME_EXECUTABLES = new Set(['loam', 'loam.exe']);
 // it instead of stacking a second registration beside it.
 function nativeHookRuntimePath(item) {
   if (typeof item?.command !== 'string') return null;
-  const quoted = /^("(?:[^"\\]|\\.)*")\s+hook\s/.exec(item.command);
-  if (quoted) {
-    try { return JSON.parse(quoted[1]); } catch { return null; }
-  }
+  const quoted = /^"([^"]+)"\s+hook\s/.exec(item.command);
+  if (quoted) return quoted[1];
   if (Array.isArray(item.args) && item.args[0] === 'hook') return item.command;
   return null;
 }

@@ -471,7 +471,7 @@ test('harness installation preserves unrelated hook commands containing loam', a
   assert.equal(claudeHooks.filter((entry) => entry.command === runtimePath).length, 0, 'Claude is registered in its plugin, not in user settings');
   assert.deepEqual(
     cursorHooks.filter((entry) => entry.command.includes(runtimePath)).map((entry) => entry.command),
-    [`${JSON.stringify(runtimePath)} hook cursor --event sessionStart`],
+    [`"${runtimePath}" hook cursor --event sessionStart`],
   );
   await result.rollback();
 });
@@ -502,7 +502,7 @@ test('installation replaces a legacy args-array cursor registration instead of s
   });
   const cursor = JSON.parse(await readFile(join(home, '.cursor', 'hooks.json'), 'utf8'));
   assert.deepEqual(cursor.hooks.sessionStart, [
-    { type: 'command', command: `${JSON.stringify(runtimePath)} hook cursor --event sessionStart` },
+    { type: 'command', command: `"${runtimePath}" hook cursor --event sessionStart` },
   ]);
   await result.rollback();
 });
@@ -521,7 +521,7 @@ test('re-registration replaces a cursor entry naming an older staged runtime', a
   await mkdir(join(home, '.cursor'), { recursive: true });
   await writeFile(join(home, '.cursor', 'hooks.json'), JSON.stringify({
     version: 1,
-    hooks: { sessionStart: [{ type: 'command', command: `${JSON.stringify(older)} hook cursor --event sessionStart` }] },
+    hooks: { sessionStart: [{ type: 'command', command: `"${older}" hook cursor --event sessionStart` }] },
   }));
 
   const result = await installHarnesses({
@@ -533,7 +533,7 @@ test('re-registration replaces a cursor entry naming an older staged runtime', a
   });
   const cursor = JSON.parse(await readFile(join(home, '.cursor', 'hooks.json'), 'utf8'));
   assert.deepEqual(cursor.hooks.sessionStart, [
-    { type: 'command', command: `${JSON.stringify(runtimePath)} hook cursor --event sessionStart` },
+    { type: 'command', command: `"${runtimePath}" hook cursor --event sessionStart` },
   ]);
   await result.rollback();
 });
