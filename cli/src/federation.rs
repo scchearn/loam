@@ -1014,17 +1014,37 @@ fn infer_project(workspace: &std::path::Path) -> Result<String, EnrollmentError>
         })?
         .trim()
         .to_owned();
-    let path = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(&url)
-        .split_once(':')
-        .map(|(_, rest)| rest)
-        .unwrap_or(&url);
-    let path = path.trim_end_matches(".git").trim_end_matches('/');
+    project_from_remote_url(&url)
+}
+
+/// The repository name inside a remote URL, in every form git stores one:
+/// `scheme://host/org/repo.git`, the scp form `user@host:org/repo.git`, and a
+/// plain filesystem path — including a Windows one, `C:\src\acme\loam.git`,
+/// whose separator is a backslash and whose leading `C:` is a drive letter
+/// rather than an scp host separator. Getting either wrong on Windows did not
+/// refuse: it produced a project id holding the machine's own directory path,
+/// which then became an MQTT topic segment (#121).
+fn project_from_remote_url(url: &str) -> Result<String, EnrollmentError> {
+    let is_drive_letter = |head: &str| {
+        let mut chars = head.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.next().is_none()
+    };
+    let path = match url.split_once("://") {
+        // `scheme://host[:port]/org/repo` — everything after the authority.
+        Some((_, rest)) => rest.split_once('/').map(|(_, path)| path).unwrap_or(""),
+        None => match url.split_once(':') {
+            // `user@host:org/repo`, the scp form. A single letter before the
+            // colon is a Windows drive, not a host, and the whole string is
+            // then the path.
+            Some((head, rest)) if !is_drive_letter(head) => rest,
+            _ => url,
+        },
+    };
+    // Separators first: `…/loam.git/` would otherwise keep its `.git`.
+    let path = path.trim_end_matches(['/', '\\']).trim_end_matches(".git");
     let project = path
-        .split('/')
-        .rfind(|segment| !segment.is_empty())
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
         .ok_or(EnrollmentError::InvalidField { field: "project" })?;
     validate_scope_part(project, "project")?;
     Ok(project.to_owned())
@@ -2144,6 +2164,70 @@ fn emit_round_trip(
     let mut connection = crate::ipc::windows::connect(&name)?;
     crate::ipc::write_frame(&mut connection, request, config)?;
     crate::ipc::read_frame(&mut connection, config)
+}
+
+#[cfg(test)]
+mod scope_tests {
+    //! Where the project id comes from. Every form git stores a remote URL in
+    //! has to reduce to the repository name — the value that becomes an MQTT
+    //! topic segment.
+
+    use super::*;
+
+    #[test]
+    fn every_remote_url_form_reduces_to_the_repository_name() {
+        for url in [
+            "https://github.com/acme/loam.git",
+            "https://github.com:443/acme/loam.git",
+            "ssh://git@github.com/acme/loam.git",
+            "git@github.com:acme/loam.git",
+            "git@github.com:acme/loam.git/",
+            "/home/dev/src/acme/loam.git",
+            "file:///home/dev/src/acme/loam.git",
+        ] {
+            assert_eq!(
+                project_from_remote_url(url).as_deref(),
+                Ok("loam"),
+                "wrong project for {url}"
+            );
+        }
+    }
+
+    /// #121: a Windows local-path remote. The backslash is the separator and
+    /// the leading `C:` is a drive letter, not an scp host separator. Read as
+    /// scp form and split on `/` only, the whole thing survived
+    /// `validate_scope_part` — it holds no slash — and the machine's own
+    /// directory path became the project id, and with it an MQTT topic
+    /// segment. Asserted on every platform: the parser is the same everywhere,
+    /// so a Unix run catches this before a Windows runner has to.
+    #[test]
+    fn a_windows_path_remote_reduces_to_the_repository_name_too() {
+        for url in [
+            r"C:\Users\dev\src\acme\loam.git",
+            r"C:\Users\dev\src\acme\loam",
+            r"\\server\share\acme\loam.git",
+            "C:/Users/dev/src/acme/loam.git",
+            "file:///C:/Users/dev/src/acme/loam.git",
+        ] {
+            assert_eq!(
+                project_from_remote_url(url).as_deref(),
+                Ok("loam"),
+                "wrong project for {url}"
+            );
+        }
+    }
+
+    /// A remote that names no repository is a typed refusal, not a project id
+    /// made of whatever was left over.
+    #[test]
+    fn a_remote_without_a_repository_segment_is_refused() {
+        for url in ["https://github.com", "https://github.com/", ""] {
+            assert!(
+                project_from_remote_url(url).is_err(),
+                "{url} must not yield a project"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

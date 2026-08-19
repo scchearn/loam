@@ -612,8 +612,9 @@ impl PhysicalWorkspace {
     /// physical identity. Never fetches, never mutates the repo.
     pub fn resolve(path: &Path) -> Result<PhysicalWorkspace, EnrollmentError> {
         let top = git_toplevel(path)?;
-        let canonical =
-            std::fs::canonicalize(&top).map_err(|_| EnrollmentError::WorkspaceNotGit)?;
+        let canonical = dos_compatible(
+            std::fs::canonicalize(&top).map_err(|_| EnrollmentError::WorkspaceNotGit)?,
+        );
         let display_path = canonical
             .to_str()
             .ok_or(EnrollmentError::WorkspaceNotUtf8)?
@@ -623,6 +624,125 @@ impl PhysicalWorkspace {
             display_path,
             identity,
         })
+    }
+}
+
+/// On Windows `std::fs::canonicalize` returns a *verbatim* path
+/// (`\\?\C:\src\loam`). It names the same file, but hardly any program
+/// accepts one — Git included — and this path is both handed to `git -C` and
+/// stored as the enrollment's display path, so a canonical workspace made
+/// every later remote lookup fail and printed a path no operator typed (#121).
+/// Reduce the ordinary disk-designator case back to `C:\src\loam`.
+///
+/// A UNC path, a path past the DOS length limit, and a path holding a reserved
+/// device name or a component ending in a dot or space keep the prefix: there
+/// it is load-bearing, and dropping it would name a different file or none.
+#[cfg(windows)]
+fn dos_compatible(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+    const DOS_PATH_MAX: usize = 260;
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path;
+    };
+    let Prefix::VerbatimDisk(letter) = prefix.kind() else {
+        return path;
+    };
+    let mut reduced = PathBuf::from(format!("{}:\\", letter as char));
+    for component in components {
+        let Component::Normal(name) = component else {
+            // RootDir is already in the prefix above; anything else (`.`,
+            // `..`, another prefix) cannot appear in a canonical path, and
+            // reducing one is not worth guessing at.
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return path;
+        };
+        let Some(name) = name.to_str() else {
+            return path;
+        };
+        let stem = name.split_once('.').map_or(name, |(stem, _)| stem);
+        if name.ends_with('.')
+            || name.ends_with(' ')
+            || RESERVED
+                .iter()
+                .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+        {
+            return path;
+        }
+        reduced.push(name);
+    }
+    if reduced.as_os_str().len() >= DOS_PATH_MAX {
+        return path;
+    }
+    reduced
+}
+
+/// Nothing to reduce anywhere else: a canonical path is already the path every
+/// tool takes.
+#[cfg(not(windows))]
+fn dos_compatible(path: PathBuf) -> PathBuf {
+    path
+}
+
+#[cfg(all(test, windows))]
+mod verbatim_tests {
+    use super::dos_compatible;
+    use std::path::PathBuf;
+
+    /// #121: `git -C \\?\C:\src\loam` fails, so a canonical workspace path
+    /// broke every remote lookup connect makes. The reduction has to happen —
+    /// and has to stop where the prefix means something.
+    #[test]
+    fn a_verbatim_disk_path_is_reduced_and_everything_else_is_left_alone() {
+        assert_eq!(
+            dos_compatible(PathBuf::from(r"\\?\C:\src\loam")),
+            PathBuf::from(r"C:\src\loam")
+        );
+        // A UNC path reduced by dropping the prefix would name a relative
+        // directory instead of a host.
+        assert_eq!(
+            dos_compatible(PathBuf::from(r"\\?\UNC\server\share\loam")),
+            PathBuf::from(r"\\?\UNC\server\share\loam")
+        );
+        // A reserved device name is reachable only through the verbatim form.
+        assert_eq!(
+            dos_compatible(PathBuf::from(r"\\?\C:\src\NUL")),
+            PathBuf::from(r"\\?\C:\src\NUL")
+        );
+        assert_eq!(
+            dos_compatible(PathBuf::from(r"\\?\C:\src\aux.git")),
+            PathBuf::from(r"\\?\C:\src\aux.git")
+        );
+        // Already DOS-compatible: unchanged.
+        assert_eq!(
+            dos_compatible(PathBuf::from(r"C:\src\loam")),
+            PathBuf::from(r"C:\src\loam")
+        );
+    }
+
+    /// The reduced path must still open the same directory — the reduction is
+    /// only correct if the two forms name one file.
+    #[test]
+    fn the_reduced_path_names_the_same_directory() {
+        let canonical = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("canonicalize");
+        let reduced = dos_compatible(canonical.clone());
+        assert!(reduced.is_dir(), "{reduced:?} does not resolve");
+        assert!(
+            !reduced.to_string_lossy().starts_with(r"\\?\"),
+            "the manifest dir should reduce: {reduced:?}"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&reduced).expect("re-canonicalize"),
+            canonical,
+            "the reduced path must canonicalize back to the same file"
+        );
     }
 }
 

@@ -22,6 +22,10 @@ fn binary() -> PathBuf {
 }
 
 fn run_connect(workspace: Option<&Path>, broker: &str, extra: &[&str]) -> (i32, String, String) {
+    // Rung 1 of the config ladder, per run. Without it a connect that reaches
+    // the org rung or the registry reads the developer's own config dir, and a
+    // test describing an unconfigured machine describes theirs instead (#130).
+    let config = temp_dir("connect-config");
     let mut command = Command::new(binary());
     command.arg("federation").arg("connect");
     if let Some(ws) = workspace {
@@ -30,6 +34,7 @@ fn run_connect(workspace: Option<&Path>, broker: &str, extra: &[&str]) -> (i32, 
     command.arg(broker);
     command.args(extra);
     command
+        .env("LOAM_CONFIG_DIR", &config)
         // The org is configuration, never inferred from the remote. These
         // tests are about everything downstream of that, so they pin the org
         // rung explicitly: it keeps a developer's real config.json out of the
@@ -40,6 +45,7 @@ fn run_connect(workspace: Option<&Path>, broker: &str, extra: &[&str]) -> (i32, 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let output = command.output().expect("spawn loam");
+    let _ = std::fs::remove_dir_all(&config);
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -142,10 +148,6 @@ fn connect_rejects_a_malformed_project_override() {
     }
 }
 
-// Skipped on Windows: this full-flow federation-connect integration test has
-// never run there (the build did not compile before the cfg-gate fix) and needs
-// real Windows validation of the git fixtures and connect resolution. See #121.
-#[cfg(not(windows))]
 #[test]
 fn full_happy_path_validates_against_hermetic_repos() {
     // Build an origin repo with a commit on refs/heads/main, then a workspace
@@ -235,17 +237,17 @@ fn full_happy_path_validates_against_hermetic_repos() {
         stdout.contains("\"url_digest\""),
         "remote digest present: {stdout}"
     );
+    // Through `json_needle`, or on Windows this passes for the wrong reason:
+    // the raw path never appears in JSON output because the separator is the
+    // escape character, so the assertion would hold even if the URL leaked.
     assert!(
-        !stdout.contains(origin.to_str().unwrap()),
-        "raw remote URL must not leak"
+        !stdout.contains(&json_needle(origin.to_str().unwrap())),
+        "raw remote URL must not leak: {stdout}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// Skipped on Windows: federation-connect integration coverage is unvalidated
-// there (never compiled before the cfg-gate fix). See #121.
-#[cfg(not(windows))]
 #[test]
 fn the_org_comes_from_configuration_and_the_project_from_the_remote() {
     let root = temp_dir("scope-ladder");
@@ -358,9 +360,16 @@ fn the_org_comes_from_configuration_and_the_project_from_the_remote() {
     );
     let config_path = profile.join("config.json");
     let config_path = config_path.to_str().unwrap();
-    for expected in [config_path, "LOAM_FEDERATION_ORG", "--project"] {
+    // The path is compared as JSON encodes it: on Windows the separator is the
+    // escape character, so a raw comparison fails on a refusal that named the
+    // path correctly.
+    for expected in [
+        json_needle(config_path),
+        "LOAM_FEDERATION_ORG".to_owned(),
+        "--project".to_owned(),
+    ] {
         assert!(
-            stdout.contains(expected),
+            stdout.contains(&expected),
             "the refusal must name every way to fix it, missing {expected}: {stdout}"
         );
     }
@@ -413,9 +422,6 @@ fn the_org_comes_from_configuration_and_the_project_from_the_remote() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// Skipped on Windows: federation-connect integration coverage is unvalidated
-// there (never compiled before the cfg-gate fix). See #121.
-#[cfg(not(windows))]
 #[test]
 fn commit_reachability_is_not_required() {
     // The connect surface deliberately does not prove the HEAD commit is
@@ -832,23 +838,11 @@ fn disconnect_outside_an_install_still_requires_a_global_root() {
     assert!(stderr.contains("--global-root is required"), "{stderr}");
 }
 
-// Skipped on Windows: the fixture builds the installed layout under a hardcoded
-// linux-musl target with a `loam` (no `.exe`) binary, so the Windows install
-// probe (host target + `loam.exe`) never finds it; unvalidated on Windows. See
-// #121.
-#[cfg(not(windows))]
 #[test]
 fn bare_connect_with_token_uses_the_installed_global_root() {
-    let root = temp_dir("autoenroll-installed-root");
-    let target_dir = root
-        .join("bin")
-        .join(env!("CARGO_PKG_VERSION"))
-        .join("x86_64-unknown-linux-musl");
-    std::fs::create_dir_all(&target_dir).unwrap();
-    std::fs::copy(binary(), target_dir.join("loam")).unwrap();
-    std::fs::write(root.join("install.json"), "{}\n").unwrap();
+    let (root, executable) = installed_layout("autoenroll-installed-root");
 
-    let mut command = Command::new(target_dir.join("loam"));
+    let mut command = Command::new(&executable);
     command
         .args([
             "federation",
@@ -1017,10 +1011,6 @@ fn pin_git_identity(command: &mut Command) {
         .env("GIT_CONFIG_VALUE_1", "ci@loam.test");
 }
 
-// Only the git-fixture tests call this, and those are skipped on Windows (see
-// #121). Keep it compiled — so the helpers it references stay live — but let it
-// be unused on Windows.
-#[cfg_attr(windows, allow(dead_code))]
 fn git(args: &[&str], cwd: Option<&Path>) -> String {
     let mut command = Command::new("git");
     command.args(args);
