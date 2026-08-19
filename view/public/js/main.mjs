@@ -4,9 +4,13 @@
 import { boot } from './app.mjs';
 import { initInspector } from './inspector.mjs';
 import { state } from './store.mjs';
+import { initPulse } from './views/pulse.mjs';
 
 // The Inspector is a top-level overlay, not part of a view, so it wires itself
 // to the static markup once and the area views just call openInspector().
 initInspector({ getSnapshot: () => state.snapshot });
+
+// Area views subscribe to the shell's `loam:render` event before it boots.
+initPulse({ root: document });
 
 boot();
