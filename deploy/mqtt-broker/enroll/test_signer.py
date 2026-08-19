@@ -12,6 +12,7 @@ the `openssl` the deploy already manages. Run it directly:
     python3 deploy/mqtt-broker/enroll/test_signer.py
 """
 
+import fcntl
 import http.client
 import json
 import os
@@ -20,10 +21,12 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SIGNER = os.path.join(HERE, "signer.py")
+INIT_CA = os.path.join(os.path.dirname(HERE), "pki", "init-ca.sh")
 PASSWORD = "correct-horse-battery-staple"
 # Generous enough that a slow CI runner is not a false failure, tight enough
 # that a wedged accept loop is not mistaken for slowness.
@@ -53,7 +56,7 @@ def free_port():
         return probe.getsockname()[1]
 
 
-def start_signer(work, port, timeouts=None):
+def start_signer(work, port, env_overrides=None):
     cert, key = make_self_signed(work)
     password_file = os.path.join(work, "enroll-password")
     with open(password_file, "w", encoding="ascii") as handle:
@@ -75,7 +78,7 @@ def start_signer(work, port, timeouts=None):
         # High enough that the test's own requests never trip the limiter.
         ENROLL_RATE_LIMIT="100",
     )
-    env.update(timeouts or {})
+    env.update(env_overrides or {})
     child = subprocess.Popen([sys.executable, SIGNER], env=env)
     deadline = time.monotonic() + 20.0
     while time.monotonic() < deadline:
@@ -241,6 +244,187 @@ def check_bounds_drop_a_silent_client():
             child.wait(timeout=10)
 
 
+# ---------------------------------------------------------------------------
+# #158: `openssl ca` mutates a shared index/serial and locks nothing itself.
+# ---------------------------------------------------------------------------
+
+
+def make_ca(work):
+    """A real org CA, built by the deploy's own init-ca.sh.
+
+    The script is the production craft — index.txt, serial, `unique_subject =
+    no`, `copy_extensions = copy`. A hand-rolled fixture would test a CA this
+    deploy never issues from.
+    """
+    pki = os.path.join(work, "pki")
+    os.makedirs(pki, exist_ok=True)
+    env = dict(os.environ, PKI_DIR=pki)
+    subprocess.run(["bash", INIT_CA], env=env, check=True, capture_output=True)
+    return pki
+
+
+def make_csr(work, index):
+    """One machine's CSR, with its own instance SAN, as the runtime sends."""
+    key = os.path.join(work, f"machine-{index}.key")
+    csr = os.path.join(work, f"machine-{index}.csr")
+    instance = f"01ARZ3NDEKTSV4RRFFQ69G5F{index:02d}"
+    subprocess.run(
+        [
+            "openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", key, "-out", csr,
+            "-subj", "/CN=ci@loam.test",
+            "-addext", f"subjectAltName=URI:urn:loam:instance:{instance}",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    with open(csr, encoding="ascii") as handle:
+        return handle.read()
+
+
+def enroll(port, csr_pem, timeout=30.0):
+    """One real enrollment: returns (status, body)."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    connection = http.client.HTTPSConnection(
+        "127.0.0.1", port, context=context, timeout=timeout
+    )
+    try:
+        body = json.dumps({"password": PASSWORD, "csr": csr_pem})
+        connection.request("POST", "/v1/enroll", body=body)
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+def check_concurrent_enrollments_are_serialized():
+    """Several machines enrolling at once must all get a valid certificate.
+
+    This is the onboarding case in #158: `openssl ca` read-modify-writes the
+    CA index and serial with no locking of its own, and #93 (handshake off the
+    accept loop) made two signings genuinely overlap for the first time. The
+    assertion is not "no crash": it is that every request got a certificate and
+    that the CA handed out N *distinct* serials — a duplicated serial is a
+    corrupt CA that still returns 200 to everybody.
+    """
+    machines = 8
+    port = free_port()
+    with tempfile.TemporaryDirectory(prefix="loam-signer-concurrent-") as work:
+        pki = make_ca(work)
+        csrs = [make_csr(work, index) for index in range(machines)]
+        child = start_signer(work, port, {"ENROLL_PKI_DIR": pki})
+        try:
+            results = [None] * machines
+            # A barrier, so the requests are actually simultaneous rather than
+            # merely started in a loop: whichever thread wins the race, they
+            # all reach `openssl ca` inside the same window.
+            gate = threading.Barrier(machines)
+
+            def run(index):
+                gate.wait()
+                results[index] = enroll(port, csrs[index])
+
+            threads = [
+                threading.Thread(target=run, args=(index,)) for index in range(machines)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=120)
+            assert all(not thread.is_alive() for thread in threads), (
+                "an enrollment thread never finished: a signing is wedged"
+            )
+
+            for index, result in enumerate(results):
+                assert result is not None, f"machine {index} got no response"
+                status, body = result
+                assert status == 200, (
+                    f"machine {index} was refused with {status}: {body[:200]!r}"
+                )
+                assert b"BEGIN CERTIFICATE" in body, (
+                    f"machine {index} got a 200 without a certificate: {body[:200]!r}"
+                )
+
+            serials = set()
+            for index, (_status, body) in enumerate(results):
+                certificate = os.path.join(work, f"issued-{index}.crt")
+                with open(certificate, "wb") as handle:
+                    handle.write(body)
+                serial = subprocess.run(
+                    ["openssl", "x509", "-noout", "-serial", "-in", certificate],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                serials.add(serial)
+            assert len(serials) == machines, (
+                f"{machines} concurrent signings produced {len(serials)} distinct "
+                f"serial(s): the CA index/serial was raced ({sorted(serials)})"
+            )
+
+            # And the CA's own record agrees: one valid entry per machine. A
+            # certificate handed out but never recorded cannot be revoked.
+            with open(os.path.join(pki, "index.txt"), encoding="utf-8") as handle:
+                entries = [line for line in handle if line.startswith("V")]
+            assert len(entries) == machines, (
+                f"the CA index holds {len(entries)} valid entries for "
+                f"{machines} issued certificates: the database lost a write"
+            )
+            print(f"ok: {machines} concurrent enrollments, {len(serials)} serials")
+        finally:
+            child.terminate()
+            child.wait(timeout=10)
+
+
+def check_signing_waits_for_the_ca_lock():
+    """The lock is real: a signing waits for a lock this test holds.
+
+    The concurrent case above proves the outcome is correct; this proves *how*.
+    Without it, a fix that happened to serialize for another reason (a global
+    interpreter detail, a slow CA) would pass unnoticed. The signer is given a
+    2s lock bound and the lock is held for longer, so the request must spend
+    that bound waiting and then be refused rather than signing regardless.
+    """
+    port = free_port()
+    with tempfile.TemporaryDirectory(prefix="loam-signer-lock-") as work:
+        pki = make_ca(work)
+        csr = make_csr(work, 0)
+        lock_path = os.path.join(pki, "ca.lock")
+        child = start_signer(
+            work,
+            port,
+            {"ENROLL_PKI_DIR": pki, "ENROLL_CA_LOCK_TIMEOUT_SECONDS": "2"},
+        )
+        held = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            started = time.monotonic()
+            status, body = enroll(port, csr)
+            elapsed = time.monotonic() - started
+            assert status == 500, (
+                f"a signing that cannot take the lock must be refused, got "
+                f"{status}: {body[:200]!r}"
+            )
+            assert elapsed >= 2.0, (
+                f"refused after {elapsed:.2f}s against a 2s lock bound: the "
+                "signing never waited for the lock at all"
+            )
+            assert elapsed < 20.0, f"refused, but only after {elapsed:.1f}s"
+            # The CA must be untouched: the refusal happened before any write.
+            with open(os.path.join(pki, "index.txt"), encoding="utf-8") as handle:
+                assert handle.read().strip() == "", (
+                    "a refused signing wrote to the CA index anyway"
+                )
+            print(f"ok: signing waited {elapsed:.2f}s for the CA lock, then refused")
+        finally:
+            fcntl.flock(held, fcntl.LOCK_UN)
+            os.close(held)
+            child.terminate()
+            child.wait(timeout=10)
+
+
 def main():
     port = free_port()
     with tempfile.TemporaryDirectory(prefix="loam-signer-test-") as work:
@@ -278,6 +462,8 @@ def main():
             child.terminate()
             child.wait(timeout=10)
     check_bounds_drop_a_silent_client()
+    check_signing_waits_for_the_ca_lock()
+    check_concurrent_enrollments_are_serialized()
     return 0
 
 

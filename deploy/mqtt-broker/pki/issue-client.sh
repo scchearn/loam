@@ -43,6 +43,20 @@ extendedKeyUsage = clientAuth
 subjectAltName = ${san}
 EOF
 
+# Serialize with the auto-enrollment signer, which takes this same lock around
+# its own `openssl ca` (enroll/signer.py). The CA index and serial are shared
+# mutable state and `openssl ca` locks neither: an issuance overlapping an
+# enrollment can hand out a duplicate serial and lose an index write, with both
+# sides reporting success (#158). flock(1) is util-linux and present on the
+# hosts this deploy targets; elsewhere issuance still works, unserialized, and
+# says so rather than pretending it is protected.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>>"$PKI_DIR/ca.lock"
+  flock 9
+else
+  echo "warning: flock unavailable; CA writes are not serialized against the enrollment signer" >&2
+fi
+
 openssl ca -config "$PKI_DIR/openssl.cnf" -batch -notext \
   -in "$csr" -out "$crt" -extfile "$ext" -extensions v3_client
 rm -f "$csr" "$ext"
