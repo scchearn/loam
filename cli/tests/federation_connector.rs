@@ -359,6 +359,21 @@ fn list_on_a_fresh_machine_reports_an_empty_inventory_and_creates_nothing() {
         stdout.contains("no federation enrollments") && stdout.contains("federation connect"),
         "the empty inventory names the command that fills it; got: {stdout}"
     );
+    // The empty array is the contract a --json consumer leans on hardest: no
+    // enrollments must read as an empty inventory, never as an absent field or
+    // a refusal it has to special-case.
+    let json = loam(&config)
+        .args(["federation", "list", "--json"])
+        .output()
+        .expect("spawn list --json");
+    let json_stdout = String::from_utf8_lossy(&json.stdout);
+    assert!(json.status.success(), "{json_stdout}");
+    assert_eq!(
+        json_stdout.trim(),
+        "{\"schema\":1,\"enrollments\":[]}",
+        "an empty inventory is an empty array"
+    );
+
     assert!(
         !pinned_registry(&config).exists(),
         "a read-only inventory must not create the registry"
