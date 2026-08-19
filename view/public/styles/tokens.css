@@ -1,0 +1,103 @@
+/*
+ * Loam View design tokens.
+ *
+ * Every value below is transcribed verbatim from raw/DESIGN.md, which is the
+ * canonical design system. Colours are authored in OKLCH (the source of truth).
+ * mockups/loam-view.html is reference evidence only; where it disagreed with
+ * DESIGN.md, DESIGN.md won (notably --accent, which is 74% lightness here, not
+ * the mockup's 72%, and --focus-ring, which DESIGN.md pins to accent).
+ *
+ * This is the only stylesheet allowed to contain colour literals. Components
+ * must reference these custom properties so a token change moves the whole app.
+ */
+
+:root {
+  color-scheme: dark; /* DESIGN.md color_scheme: dark — dark theme only */
+
+  /* Surfaces (dark, cool) */
+  --surface-app: oklch(16% 0.004 260);
+  --surface-app-raised: oklch(20% 0.004 260);
+  --surface-app-active: oklch(25% 0.005 260);
+  --surface-canvas: oklch(16.5% 0.004 260);
+  --surface-card: oklch(20% 0.004 260);
+  --surface-inset: oklch(23.5% 0.005 260);
+  --surface-critical: oklch(24% 0.05 25);
+
+  /* Ink (text) */
+  --ink-primary: oklch(96% 0 0);
+  --ink-secondary: oklch(70% 0.004 260);
+  --ink-tertiary: oklch(56% 0.004 260);
+  --ink-chrome: oklch(94% 0 0);
+  --ink-chrome-muted: oklch(64% 0.004 260);
+  --ink-muted: oklch(70% 0.006 260);
+
+  /* Borders / rules (white-alpha) */
+  --border: oklch(100% 0 0 / 0.09);
+  --border-faint: oklch(100% 0 0 / 0.06);
+  --border-chrome: oklch(100% 0 0 / 0.09);
+  --border-critical: oklch(40% 0.09 25 / 0.5);
+
+  /* Accent (single, restrained brand green) */
+  --accent: oklch(74% 0.15 158);
+  --accent-bright: oklch(76% 0.15 158);
+  --accent-soft: oklch(34% 0.06 158);
+
+  /* Semantic status */
+  --state-healthy: oklch(74% 0.14 158);
+  --state-watch: oklch(80% 0.13 82);
+  --state-drift: oklch(66% 0.18 25);
+  --state-muted: oklch(60% 0.006 260);
+
+  /* Graph (Atlas) node + edge kinds */
+  --node-code: oklch(68% 0.11 244);
+  --node-concept: oklch(74% 0.14 158);
+  --node-work: oklch(72% 0.13 55);
+  --node-memory: oklch(74% 0.09 80);
+  --edge-explicit: oklch(66% 0.09 247);
+  --edge-derived: oklch(72% 0.11 70);
+
+  /* Overlay ground. DESIGN.md: elevation is reserved for overlays and the
+     Inspector sits behind a "dimming scrim"; both are pure black at alpha. */
+  --scrim: oklch(0% 0 0 / 0.55);
+  --shadow-overlay: 0 8px 22px oklch(0% 0 0 / 0.55);
+
+  /* Type — system stacks only, no external fonts */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+
+  /* Spacing — 0.25rem base grid */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+
+  /* Borders */
+  --rule: 1px;
+
+  /* Radii */
+  --radius-sm: 7px;
+  --radius: 10px;
+  --radius-lg: 14px;
+
+  /* Layout */
+  --nav-width: 3.5rem;
+  --topbar-height: 3.5rem;
+  --inspector-width: 24rem;
+  --content-max-width: 1440px;
+  --content-block-padding: var(--space-6);
+  --content-inline-padding: clamp(1.25rem, 2.5vw, 2.25rem);
+  --band-gap: var(--space-8);
+  --card-row-min-col: 16rem;
+  --dot-grid: 22px;
+
+  /* Motion */
+  --motion-fast: 140ms;
+
+  /* Focus — DESIGN.md focus_ring: 2px solid accent, 3px offset */
+  --focus-ring: 2px solid var(--accent);
+  --focus-ring-offset: 3px;
+}
