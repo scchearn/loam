@@ -37,7 +37,7 @@ Require delegated workers to use one of these on the shared thread:
 
 Before launching workers:
 
-1. Check `hcom` availability. If unavailable, execute inline and log the fallback.
+1. Read hcom availability from the `hcom:` line in the injected `## Workspace state` block — do not probe for the binary. If it says `not installed`, execute inline and log the fallback.
 2. Inspect any requested worktree or branch.
 3. Reuse an existing worktree only when it is on the expected branch and safe to reuse.
 4. If the worktree exists on a different branch, or contains conflicting unexpected changes, stop and ask the user.

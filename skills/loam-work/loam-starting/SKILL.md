@@ -3,7 +3,7 @@ name: loam::starting
 description: "Use when beginning or resuming a plan file, including mixed local and hcom-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
 allowed-tools: Read Write Edit Glob Grep Bash WebFetch
 metadata:
-  version: "2.5.0"
+  version: "2.6.0"
   author: scchearn
   argument-hint: plans/<slug>.md [T3 | T3,T5,T7 | T3-T7]
 ---
@@ -106,7 +106,7 @@ If no wiki exists, skip all wiki features and leave `Wiki updates: none` in hand
 
 If the plan contains `## Execution groups`, treat each wave as an ordering boundary. All tasks in an earlier wave must complete before later waves start. Without hcom, run tasks sequentially in listed order. With hcom available, tasks within the current wave may be dispatched concurrently when their dependencies are satisfied.
 
-Check whether `hcom` is available only when a current wave has more than one runnable task or when constraint labels require review/isolation. Keep this session as the hub.
+hcom availability comes from the `hcom:` line in the injected `## Workspace state` block (reuse contract in `loam::using`) — read it, do not probe for the binary. Consult it only when a current wave has more than one runnable task or when constraint labels require review/isolation. Keep this session as the hub.
 
 Constraint resolution:
 

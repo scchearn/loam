@@ -3,7 +3,7 @@ name: loam::setting-goals
 description: "Create, review, and manage first-class goal artifacts that turn a broad ambition into an externally verifiable outcome. Goals are optional, long-lived workflow artifacts stored at goals/<slug>.md. They own intent, a validation contract, lifecycle, concise review evidence, and linked work. Use when the user wants to set a goal, review a goal, pause or reactivate a goal, achieve or abandon a goal, or change what a goal means. Not for specs, plans, memory, or checkpoints."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: scchearn
   argument-hint: "[goal path or topic]"
 ---
@@ -102,7 +102,7 @@ An explicit review runs the validation procedure and records the outcome. Review
 ### Independent-review procedure
 
 When the contract names an independent-review procedure (for visual or subjective goals):
-1. Delegate through the host harness's native subagent/Task mechanism so a reviewer distinct from the worker receives the goal contract and observable result; when using hcom, load `using-hcom` and delegate there.
+1. Delegate through the host harness's native subagent/Task mechanism so a reviewer distinct from the worker receives the goal contract and observable result; when the injected `## Workspace state` block reports `hcom: ready`, load `using-hcom` and delegate there instead — read that line rather than probing, and fall back to the native mechanism when it reports `not installed`.
 2. The reviewer returns a rubric-based finding.
 3. Record only the concise result and useful evidence reference. Do not copy the reviewer's full output.
 4. If no distinct agent is available, record the review as blocked; the worker must not substitute self-assessment.
