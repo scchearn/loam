@@ -87,16 +87,22 @@ async function isExecutable(path, platform) {
 }
 
 // Resolve a tool already on PATH to an ABSOLUTE path, without spawning `which`.
-// Returns null when not found — the caller then installs into the managed prefix.
-export async function resolvePathTool(binName, { platform = process.platform, env = process.env } = {}) {
-  const dirs = (env.PATH || '').split(delimiter).filter(Boolean);
+// `extraDirs` are non-PATH install sites an entry declares (a detection-only
+// tool's installer target, e.g. hcom's ~/.local/bin, which a non-login shell may
+// not have on PATH); they are searched AFTER PATH, so a PATH copy always wins.
+// Returns { path, source } or null — the caller then installs, or refuses.
+export async function resolvePathTool(binName, { platform = process.platform, env = process.env, extraDirs = [] } = {}) {
+  const dirs = [
+    ...(env.PATH || '').split(delimiter).filter(Boolean).map((path) => ({ path, source: 'PATH' })),
+    ...extraDirs.filter(Boolean).map((path) => ({ path, source: 'install site' })),
+  ];
   const names = platform === 'win32'
     ? [`${binName}.cmd`, `${binName}.exe`, `${binName}.bat`, binName]
     : [binName];
   for (const dir of dirs) {
     for (const name of names) {
-      const candidate = join(dir, name);
-      if (await isExecutable(candidate, platform)) return candidate;
+      const candidate = join(dir.path, name);
+      if (await isExecutable(candidate, platform)) return { path: candidate, source: dir.source };
     }
   }
   return null;
@@ -112,18 +118,21 @@ async function healthCheck({ binPath, healthArgs, runner, platform, timeoutMs })
   return { ok: true, version: `${result.stdout || ''}${result.stderr || ''}`.trim() };
 }
 
-// Resolve a tool for an integration: managed copy first, then PATH. Returns
-// { present, managed, path, version } or { present:false }.
-export async function resolveTool({ globalRoot, id, binName, healthArgs = ['--version'], runner = defaultRunner, platform = process.platform, timeoutMs, env = process.env } = {}) {
+// Resolve a tool for an integration: managed copy first, then PATH, then the
+// entry's declared install sites. A resolved binary is only reported present
+// once its health check passes — present-but-broken is not usable, and reporting
+// it as present would register an MCP against a binary that cannot answer.
+// Returns { present, managed, source, path, version } or { present:false }.
+export async function resolveTool({ globalRoot, id, binName, healthArgs = ['--version'], runner = defaultRunner, platform = process.platform, timeoutMs, env = process.env, extraDirs = [] } = {}) {
   const managed = managedBinPath(globalRoot, id, binName, platform);
   if (await isExecutable(managed, platform)) {
     const health = await healthCheck({ binPath: managed, healthArgs, runner, platform, timeoutMs });
-    if (health.ok) return { present: true, managed: true, path: managed, version: health.version };
+    if (health.ok) return { present: true, managed: true, source: 'loam-managed', path: managed, version: health.version };
   }
-  const onPath = await resolvePathTool(binName, { platform, env });
-  if (onPath) {
-    const health = await healthCheck({ binPath: onPath, healthArgs, runner, platform, timeoutMs });
-    if (health.ok) return { present: true, managed: false, path: onPath, version: health.version };
+  const found = await resolvePathTool(binName, { platform, env, extraDirs });
+  if (found) {
+    const health = await healthCheck({ binPath: found.path, healthArgs, runner, platform, timeoutMs });
+    if (health.ok) return { present: true, managed: false, source: found.source, path: found.path, version: health.version };
   }
   return { present: false };
 }

@@ -7,12 +7,24 @@ import { readLedger, recordIntegration, clearIntegration, ownedRecord } from './
 import { confirmAction, stepDone, stepDetail, stepSkip } from '../wizard.mjs';
 
 // Shared enable/verify/disable engine for catalog entries. An entry is data:
-//   { id, label, capability, egress, mcpName, tool?, descriptor, caches? }
-//   tool:       { pkg, binName, healthArgs } | undefined (remote-only, e.g. grep)
+//   { id, label, capability, egress, mcpName?, tool?, descriptor?, caches? }
+//   tool:       { pkg, binName, healthArgs } installable Node tool (e.g. qmd)
+//               | { binName, healthArgs, dirs, install } DETECTION-ONLY (e.g. hcom)
+//               | undefined (remote-only, e.g. grep)
 //   descriptor: object (remote) | (toolPath) => object (local, e.g. qmd)
 //   caches:     [{ label, path: (home) => absPath }]  large derived artifacts
 //
-// grep and qmd are thin wrappers over this engine (catalog.mjs).
+// Two independent lanes, each switched by the data:
+//   MCP lane   — on when `mcpName` is set. Off means loam registers no MCP for
+//                this entry, so there is no harness to target, nothing to
+//                deregister, and doctor reports it as not applicable.
+//   tool lane  — `tool.pkg` means loam may install it into the managed prefix;
+//                a tool WITHOUT `pkg` is detection-only: loam never installs it
+//                (its real installers are brew/OS scripts/PyPI, outside the npm
+//                lane and outside setup's egress consent), so enable either
+//                finds it or refuses with the install recipe.
+//
+// grep, qmd and hcom are thin wrappers over this engine (catalog.mjs).
 
 // Which harnesses to register into: the ones loam actually configured, filtered
 // to the four MCP-capable harnesses; falls back to every detected non-absent
@@ -57,8 +69,11 @@ export async function enableIntegration(entry, ctx) {
   const { discovery, dryRun, output } = ctx;
   const globalRoot = discovery.globalRoot;
   const home = discovery.home;
-  const harnesses = targetHarnesses(ctx);
-  if (!harnesses.length) {
+  const usesMcp = Boolean(entry.mcpName);
+  // An entry with no MCP lane needs no harness, so the missing-harness refusal
+  // must not fire on it — it would refuse an entry that has nothing to register.
+  const harnesses = usesMcp ? targetHarnesses(ctx) : [];
+  if (usesMcp && !harnesses.length) {
     return { ready: false, category: 'no_target_harness', detail: 'no configured harness to register the MCP into' };
   }
 
@@ -66,7 +81,33 @@ export async function enableIntegration(entry, ctx) {
   //    prefix only when absent. Install/verify BEFORE any MCP registration.
   let toolPath = null;
   let toolRecord = null;
-  if (entry.tool) {
+  if (entry.tool && !entry.tool.pkg) {
+    // Detection-only: resolve, never install. Absence is a typed refusal with
+    // the per-OS recipes printed — the user installs it, then re-runs enable.
+    const resolved = await resolveTool({
+      globalRoot,
+      id: entry.id,
+      binName: entry.tool.binName,
+      healthArgs: entry.tool.healthArgs,
+      runner: ctx.toolRunner,
+      platform: discovery.platform,
+      env: ctx.env,
+      extraDirs: entry.tool.dirs?.(home, ctx.env || process.env) || [],
+    });
+    if (!resolved.present) {
+      for (const recipe of entry.tool.install || []) {
+        stepDetail(output, `${recipe.label}: ${recipe.command}`);
+      }
+      return {
+        ready: false,
+        category: 'tool-not-installed',
+        detail: `${entry.tool.binName} is not installed — loam detects it but never installs it; install it with one of the commands above, then re-run this command`,
+      };
+    }
+    toolPath = resolved.path;
+    toolRecord = { managed: false, pkg: null, path: resolved.path };
+    stepDetail(output, `${entry.tool.binName} found (${resolved.source}) → ${resolved.path}`);
+  } else if (entry.tool) {
     if (dryRun) {
       // Preview only — no resolution spawn, no install, no download.
       toolPath = managedBinPath(globalRoot, entry.id, entry.tool.binName, discovery.platform);
@@ -108,6 +149,7 @@ export async function enableIntegration(entry, ctx) {
   const owned = ownedRecord(ledger, entry.id);
   const mcpRecord = {};
   const failures = [];
+  if (!usesMcp) stepDetail(output, `${entry.id} registers no MCP server — detection only`);
   for (const harness of harnesses) {
     const isOwned = owned?.mcp?.[harness] === entry.mcpName;
     const detected = await detectMcpEntry({ harness, home, name: entry.mcpName });
@@ -143,14 +185,24 @@ export async function enableIntegration(entry, ctx) {
 export async function verifyIntegration(entry, ctx) {
   const { discovery } = ctx;
   const home = discovery.home;
-  const harnesses = targetHarnesses(ctx);
   const registered = {};
-  for (const harness of harnesses) {
-    registered[harness] = (await detectMcpEntry({ harness, home, name: entry.mcpName })).present;
+  if (entry.mcpName) {
+    for (const harness of targetHarnesses(ctx)) {
+      registered[harness] = (await detectMcpEntry({ harness, home, name: entry.mcpName })).present;
+    }
   }
   let tool = { present: true, managed: false };
   if (entry.tool) {
-    tool = await resolveTool({ globalRoot: discovery.globalRoot, id: entry.id, binName: entry.tool.binName, healthArgs: entry.tool.healthArgs, runner: ctx.toolRunner, platform: discovery.platform, env: ctx.env });
+    tool = await resolveTool({
+      globalRoot: discovery.globalRoot,
+      id: entry.id,
+      binName: entry.tool.binName,
+      healthArgs: entry.tool.healthArgs,
+      runner: ctx.toolRunner,
+      platform: discovery.platform,
+      env: ctx.env,
+      extraDirs: entry.tool.dirs?.(home, ctx.env || process.env) || [],
+    });
   }
   return { ready: true, id: entry.id, tool, registered };
 }
@@ -170,7 +222,7 @@ export async function disableIntegration(entry, ctx) {
   // ledger-as-ownership doctrine forbids. Report a success no-op and leave every
   // config untouched, surfacing any same-name entries as user-owned.
   if (!owned) {
-    for (const harness of targetHarnesses(ctx)) {
+    for (const harness of (entry.mcpName ? targetHarnesses(ctx) : [])) {
       if ((await detectMcpEntry({ harness, home, name: entry.mcpName })).present) {
         stepDetail(output, `${harness}: an existing ${entry.mcpName} MCP is user-owned — left untouched`);
       }
@@ -198,10 +250,14 @@ export async function disableIntegration(entry, ctx) {
   }
 
   // Remove the tool only if loam installed it (managed); a pre-existing PATH tool
-  // is never touched.
+  // is never touched. For a detection-only entry that is the whole story: loam
+  // created nothing but the ledger record, so disable removes nothing but the
+  // ledger record — the tool, its config and its live state stay as they are.
   if (owned?.tool?.managed) {
     await removeManagedTool({ globalRoot, id: entry.id });
     stepDone(output, `removed the loam-managed ${entry.tool?.binName || 'tool'}`);
+  } else if (entry.tool && !entry.tool.pkg) {
+    stepDetail(output, `${entry.tool.binName} was detected, never installed by loam — leaving it and its data untouched`);
   }
 
   // Large derived caches: offered with size shown, default KEEP (expensive to

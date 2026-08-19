@@ -11,6 +11,9 @@ import { enableIntegration, disableIntegration, verifyIntegration } from './regi
 //   id         string   stable, unique, kebab-case identifier (the --integration value)
 //   label      string   human name for wizard copy
 //   capability string   the loam capability it serves (e.g. 'code-search')
+//   mcpName    string?  present = loam registers an MCP server for this entry
+//   tool       object?  present = this entry has a companion binary; a tool with
+//                       `pkg` is installable, one without is DETECTION-ONLY
 //   enable     async (ctx) => { ready, category?, detail?, registered? }
 //   disable    async (ctx) => { ready, category?, detail?, leftovers?, caches? }
 //   verify     async (ctx) => { ready, tool, registered }
@@ -39,6 +42,42 @@ export const CATALOG = [
     egress: true,
     mcpName: 'grep',
     descriptor: { transport: 'remote', url: 'https://mcp.grep.app' },
+  }),
+  makeEntry({
+    // Detection-only: a companion tool, no MCP lane, and loam never installs it.
+    // hcom is a Rust binary distributed by brew, per-OS installer scripts and
+    // PyPI — none of which installNodeTool()'s npm lane can drive, and piping an
+    // installer script from setup would cross the egress-consent line. So enable
+    // detects and records, or refuses with the recipe; the user installs.
+    //
+    // No `mcpName`: hcom ships no MCP server command (checked against 0.7.25),
+    // so there is nothing stable for loam to register. The lane is data-switched,
+    // so the day hcom ships one this entry gains two fields and nothing else.
+    //
+    // No `caches` either: ~/.hcom is message history and live agent state — user
+    // data, not a derived cache like qmd's models — so disable never offers it.
+    id: 'hcom',
+    label: 'hcom agent messaging',
+    capability: 'agent-messaging',
+    egress: false,
+    tool: {
+      binName: 'hcom',
+      // `hcom version` is not a command; `--version` is the health check.
+      healthArgs: ['--version'],
+      // Install sites off PATH. Both official installers target ~/.local/bin on
+      // every OS (the PowerShell one included), and HCOM_INSTALL_DIR overrides
+      // it — flat for the default layout, `bin/` for the prefixed one.
+      dirs: (home, env = {}) => [
+        ...(env.HCOM_INSTALL_DIR ? [join(env.HCOM_INSTALL_DIR, 'bin'), env.HCOM_INSTALL_DIR] : []),
+        join(home, '.local', 'bin'),
+      ],
+      install: [
+        { label: 'macOS (Homebrew)', command: 'brew install aannoo/hcom/hcom' },
+        { label: 'macOS, Linux, Termux, WSL', command: 'curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh' },
+        { label: 'Windows (PowerShell)', command: 'irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex' },
+        { label: 'Python packaging', command: 'uv tool install hcom   # or: pip install hcom' },
+      ],
+    },
   }),
   makeEntry({
     // Local Node tool + local stdio MCP. Fully local, no egress. First query
@@ -76,5 +115,11 @@ export function isValidCatalogEntry(entry) {
   for (const method of CATALOG_ENTRY_CONTRACT.methods) {
     if (typeof entry[method] !== 'function') return false;
   }
-  return true;
+  // An entry has to DO something: register an MCP (mcpName + descriptor) or
+  // carry a companion tool (tool.binName), or both. Neither means enable would
+  // record an empty ledger entry and report success — the silent no-op the
+  // engine exists to prevent.
+  const mcpLane = Boolean(entry.mcpName) && entry.descriptor != null;
+  const toolLane = Boolean(entry.tool?.binName);
+  return mcpLane || toolLane;
 }
