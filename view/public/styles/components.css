@@ -1169,6 +1169,9 @@ code,
 
 /* ---------- Empty state (an honest gap, never a blank panel) ---------- */
 
+/* The no-snapshot panel is not a routed area, so it needs its own reveal. */
+.view.unreadable:not([hidden]) { display: block; }
+
 .view-empty {
   margin: var(--space-4) 0 0;
   padding: var(--space-6);

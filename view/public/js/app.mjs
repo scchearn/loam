@@ -23,7 +23,11 @@ export function routeFromHash(hash, current = DEFAULT_ROUTE) {
   // it was, so Back returns to the originating view rather than to Pulse.
   if (value.startsWith('#/reader/')) return current;
   const candidate = value.replace(/^#\/?/, '');
-  return ROUTES.includes(candidate) ? candidate : DEFAULT_ROUTE;
+  if (ROUTES.includes(candidate)) return candidate;
+  // An in-document anchor — the skip link's `#workspace`, or anything a human
+  // pastes — is not a route. Falling back to Pulse here would throw away the
+  // view the first tab stop was supposed to skip into.
+  return value.startsWith('#/') || value === '' ? DEFAULT_ROUTE : current;
 }
 
 /** `2026-07-17T15:30:00+02:00` -> `2026-07-17 15:30`. Workspace-local, no locale guessing. */
@@ -32,7 +36,7 @@ function shortTimestamp(value) {
   return match ? `${match[1]} ${match[2]}` : 'unknown';
 }
 
-function renderChrome(doc, snapshot) {
+function renderChrome(doc, snapshot, error) {
   const workspace = snapshot?.workspace ?? {};
   const git = workspace.git ?? {};
 
@@ -44,9 +48,30 @@ function renderChrome(doc, snapshot) {
   doc.querySelector('[data-workspace-context]').textContent = context.join(' · ');
 
   const qmd = snapshot?.capabilities?.qmd?.state ?? 'unknown';
-  doc.querySelector('[data-freshness]').textContent =
-    `Snapshot ${shortTimestamp(snapshot?.generated_at)} · qmd ${qmd}`;
-  doc.querySelector('[data-freshness-dot]').dataset.state = qmd;
+  // The chip states what is on screen. A failed read leaves a stale snapshot
+  // showing, and saying only when it was taken would read as current.
+  const freshness = !snapshot
+    ? 'No snapshot'
+    : `Snapshot ${shortTimestamp(snapshot.generated_at)} · qmd ${qmd}${error ? ' · stale' : ''}`;
+  doc.querySelector('[data-freshness]').textContent = freshness;
+  doc.querySelector('[data-freshness-dot]').dataset.state = error ? 'stale' : qmd;
+}
+
+/** One period, wherever the reason came from. */
+function sentence(reason) {
+  const text = String(reason ?? '').trim();
+  return /[.!?]$/.test(text) ? text : `${text}.`;
+}
+
+/**
+ * A raw fetch string ("Failed to fetch", "HTTP 500") names neither what broke
+ * nor what is still on screen. The notice says both, plus the way out.
+ */
+export function noticeMessage(error, snapshot) {
+  if (!error) return '';
+  if (!snapshot) return `Could not read the snapshot: ${sentence(error)} Press Refresh to retry.`;
+  return `Refresh failed: ${sentence(error)} Showing the snapshot from `
+    + `${shortTimestamp(snapshot.generated_at)}. Press Refresh to retry.`;
 }
 
 function renderNotice(doc, message) {
@@ -55,9 +80,9 @@ function renderNotice(doc, message) {
   notice.classList.toggle('is-visible', Boolean(message));
 }
 
-function renderRoute(doc, route) {
+function renderRoute(doc, route, readable = true) {
   for (const view of doc.querySelectorAll('[data-view]')) {
-    view.classList.toggle('is-active', view.dataset.view === route);
+    view.classList.toggle('is-active', readable && view.dataset.view === route);
   }
   for (const button of doc.querySelectorAll('[data-route]')) {
     const active = button.dataset.route === route;
@@ -71,9 +96,27 @@ export async function boot(doc = globalThis.document) {
   let route = routeFromHash(win.location?.hash);
 
   function render() {
-    renderChrome(doc, state.snapshot);
-    renderNotice(doc, state.error);
-    renderRoute(doc, route);
+    // A refresh failure keeps the previous snapshot, so this stays true and the
+    // views keep rendering it; only a workspace that was never read is degraded.
+    const readable = Boolean(state.snapshot);
+    renderChrome(doc, state.snapshot, state.error);
+    renderNotice(doc, noticeMessage(state.error, state.snapshot));
+    renderRoute(doc, route, readable);
+
+    const unreadable = doc.querySelector('[data-unreadable]');
+    if (unreadable) unreadable.hidden = readable;
+    if (!readable) {
+      const reason = doc.querySelector('[data-unreadable-reason]');
+      if (reason) {
+        reason.textContent = state.error
+          ? `Could not read the snapshot: ${sentence(state.error)} Press Refresh to retry.`
+          : 'Reading the workspace…';
+      }
+      // Never hand the areas a null snapshot: each one would render its own
+      // "this workspace has none of X" over data nobody has read.
+      return;
+    }
+
     // Area views (Pulse, Atlas, Work Stream, Chronicle, Stewardship) subscribe
     // to this instead of importing the shell.
     // The document's own CustomEvent constructor: a host-realm event is not a

@@ -92,6 +92,36 @@ describe('app shell routing', () => {
     assert.equal(routeFromHash(''), 'pulse');
     assert.equal(routeFromHash(undefined), 'pulse');
   });
+
+  it('keeps the current view when the hash is an in-document anchor', async () => {
+    // The skip link points at #workspace. Treating that as a route would throw
+    // away the view the very first tab stop is supposed to skip into.
+    assert.equal(routeFromHash('#workspace', 'atlas'), 'atlas');
+    assert.equal(routeFromHash('#some-heading', 'chronicle'), 'chronicle');
+    assert.equal(routeFromHash('#/reader/wiki%2Findex.md', 'stewardship'), 'stewardship');
+
+    const { doc, dom } = await mountShell({ routes: okSnapshot(), hash: '#/atlas' });
+    const win = dom.window;
+    assert.equal(doc.querySelector('.view.is-active').dataset.view, 'atlas');
+    win.location.hash = '#workspace';
+    win.dispatchEvent(new win.HashChangeEvent('hashchange'));
+    assert.equal(win.location.hash, '#workspace');
+    assert.equal(
+      doc.querySelector('.view.is-active').dataset.view,
+      'atlas',
+      'skipping to content must not reset the route',
+    );
+  });
+
+  it('keeps the skip link inside the shell so a modal can inert it', async () => {
+    const { doc } = await mountShell({ routes: okSnapshot() });
+    const skip = doc.querySelector('.skip-link');
+    assert.ok(skip, 'the skip link must exist');
+    assert.ok(
+      doc.querySelector('[data-app-shell]').contains(skip),
+      'a skip link outside the shell stays reachable from an open Inspector or Reader',
+    );
+  });
 });
 
 describe('topbar chrome', () => {
@@ -105,6 +135,51 @@ describe('topbar chrome', () => {
       'Snapshot 2026-07-17 15:30 · qmd absent',
     );
     assert.equal(doc.querySelector('[data-freshness-dot]').dataset.state, 'absent');
+  });
+});
+
+describe('a workspace that could not be read', () => {
+  it('says so once instead of letting every area invent an empty workspace', async () => {
+    const { doc } = await mountShell({
+      routes: { '/api/snapshot': () => jsonResponse({ error: 'unreadable', message: 'permission denied' }, 500) },
+    });
+
+    const panel = doc.querySelector('[data-unreadable]');
+    assert.equal(panel.hidden, false, 'the no-snapshot panel must be shown');
+    assert.match(doc.querySelector('[data-unreadable-reason]').textContent, /Press Refresh to retry\.$/);
+    assert.match(doc.querySelector('[data-unreadable-reason]').textContent, /unreadable: permission denied/);
+
+    assert.equal(
+      doc.querySelectorAll('.view.is-active').length,
+      0,
+      'no area may claim this workspace has none of its material when nothing was read',
+    );
+    for (const mount of doc.querySelectorAll('[data-mount]')) {
+      assert.equal(mount.textContent.trim(), '', `${mount.dataset.mount} rendered over a snapshot nobody read`);
+    }
+
+    assert.equal(doc.querySelector('[data-freshness]').textContent, 'No snapshot');
+    assert.match(doc.querySelector('[data-notice]').textContent, /^Could not read the snapshot: /);
+  });
+
+  it('hides the panel and renders the areas once a snapshot arrives', async () => {
+    let fail = true;
+    const { doc } = await mountShell({
+      routes: {
+        '/api/snapshot': () => (fail
+          ? jsonResponse({ error: 'unreadable', message: 'permission denied' }, 500)
+          : jsonResponse(snapshot)),
+        '/api/refresh': () => { fail = false; return { ok: true, status: 204, json: async () => null }; },
+      },
+    });
+    assert.equal(doc.querySelector('[data-unreadable]').hidden, false);
+
+    doc.querySelector('[data-refresh]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(doc.querySelector('[data-unreadable]').hidden, true);
+    assert.equal(doc.querySelector('.view.is-active').dataset.view, 'pulse');
+    assert.equal(doc.querySelector('[data-notice]').classList.contains('is-visible'), false);
   });
 });
 
@@ -124,12 +199,27 @@ describe('refresh', () => {
 
     const notice = doc.querySelector('[data-notice]');
     assert.ok(notice.classList.contains('is-visible'), 'the failure must be visible');
-    assert.match(notice.textContent, /refresh_failed: loam state --view exited with code 1/);
+    // Not a bare fetch string: what failed, what is still on screen, and the way out.
+    assert.equal(
+      notice.textContent,
+      'Refresh failed: refresh_failed: loam state --view exited with code 1. '
+      + 'Showing the snapshot from 2026-07-17 15:30. Press Refresh to retry.',
+    );
 
     // The prior snapshot survived: chrome still reads the workspace it had.
     assert.equal(state.snapshot.workspace.name, 'loam');
     assert.equal(doc.querySelector('[data-workspace-name]').textContent, 'loam');
-    assert.equal(doc.querySelector('[data-freshness]').textContent, 'Snapshot 2026-07-17 15:30 · qmd absent');
+    assert.equal(
+      doc.querySelector('[data-freshness]').textContent,
+      'Snapshot 2026-07-17 15:30 · qmd absent · stale',
+      'the chip must not present a stale snapshot as current',
+    );
+    assert.equal(doc.querySelector('[data-freshness-dot]').dataset.state, 'stale');
+    assert.equal(
+      doc.querySelector('.view.is-active').dataset.view,
+      'pulse',
+      'a failed refresh keeps rendering the snapshot it still has',
+    );
     assert.equal(refreshButton.disabled, false, 'Refresh must be usable again after a failure');
     assert.equal(calls.filter((call) => call.pathname === '/api/refresh').length, 1);
   });

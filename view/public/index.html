@@ -10,8 +10,6 @@
   <script type="module" src="/js/main.mjs"></script>
 </head>
 <body>
-  <a class="skip-link" href="#workspace">Skip to content</a>
-
   <svg width="0" height="0" class="sprite" aria-hidden="true" focusable="false">
     <defs>
       <symbol id="i-pulse" viewBox="0 0 256 256"><path d="M240,128a8,8,0,0,1-8,8H204.94l-37.78,75.58A8,8,0,0,1,160,216h-.4a8,8,0,0,1-7.08-5.14L95.35,60.76,63.28,131.31A8,8,0,0,1,56,136H24a8,8,0,0,1,0-16H50.85L88.72,36.69a8,8,0,0,1,14.76.46l57.51,151,31.85-63.71A8,8,0,0,1,200,120h32A8,8,0,0,1,240,128Z"/></symbol>
@@ -33,6 +31,10 @@
   </svg>
 
   <div class="app-shell" data-app-shell>
+    <!-- Inside the shell, not beside it: the Inspector and Reader make the shell
+         inert, and a skip link outside it would stay reachable from a modal. -->
+    <a class="skip-link" href="#workspace">Skip to content</a>
+
     <header class="topbar">
       <div class="brand">
         <img src="/loam.svg" alt="Loam" width="36" height="36">
@@ -89,6 +91,19 @@
 
     <main class="workspace" id="workspace" tabindex="-1">
       <p class="notice" data-notice role="status"></p>
+
+      <!-- Shown instead of the areas when there is no snapshot to render. An
+           area's own empty state means "this workspace has none of X"; with no
+           snapshot at all that would be a fabricated claim. -->
+      <section class="view unreadable" data-unreadable hidden aria-labelledby="unreadable-title">
+        <div class="view-top">
+          <div class="view-top-main">
+            <h1 class="view-title" id="unreadable-title">No snapshot</h1>
+            <p class="view-subtitle">Nothing has been read from this workspace yet.</p>
+          </div>
+        </div>
+        <p class="view-empty" data-unreadable-reason></p>
+      </section>
 
       <section class="view" data-view="pulse" aria-labelledby="pulse-title">
         <div class="view-top">
