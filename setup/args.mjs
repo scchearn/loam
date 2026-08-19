@@ -18,6 +18,13 @@ export function parseArgs(argv) {
   const command = requestedCommand === 'install' ? 'setup' : requestedCommand;
   if (command === 'help') return { command: 'help' };
   if (command === 'version') return { command: 'version' };
+  if (command === 'view') {
+    const rest = args.slice(1);
+    const flag = rest.find((value) => value.startsWith('--'));
+    if (flag) throw new UsageError(`unknown option: ${flag}`);
+    if (rest.length > 1) throw new UsageError('view accepts at most one workspace-root argument');
+    return { command: 'view', workspace: rest[0] };
+  }
   if (command !== 'setup' && command !== 'update' && command !== 'doctor' && command !== 'uninstall') {
     throw new UsageError(`unknown command: ${requestedCommand}`);
   }

@@ -21,6 +21,7 @@
     "hooks",
     "plugins",
     "skills",
+    "view",
     ".agents",
     ".opencode",
     ".claude-plugin",

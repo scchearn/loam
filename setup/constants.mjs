@@ -27,6 +27,7 @@ Usage:
   npx @scchearn/loam doctor
   npx @scchearn/loam uninstall
   npx @scchearn/loam uninstall --yes
+  npx @scchearn/loam view [workspace-root]
   npx @scchearn/loam --help
   npx @scchearn/loam --version
 
@@ -36,6 +37,8 @@ Commands:
   update      Refresh Loam skills, runtime, integrations, and marketplace plugins.
   doctor      Check the global Loam installation without changing it.
   uninstall   Remove global Loam skills, runtime, integration, and hook entries.
+  view        Launch the local read-only Loam View at the given workspace root
+              (default: current directory).
 
 Options:
   --yes       Accept changes without interactive confirmation.
