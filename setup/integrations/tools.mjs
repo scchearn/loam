@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { access, mkdir, rm, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { delimiter, isAbsolute, join } from 'node:path';
 
 // Production-grade companion-tool install (spec: loam-optional-integrations).
 // Node/npx is guaranteed but the package manager, global-install permissions,
@@ -91,11 +91,16 @@ async function isExecutable(path, platform) {
 // tool's installer target, e.g. hcom's ~/.local/bin, which a non-login shell may
 // not have on PATH); they are searched AFTER PATH, so a PATH copy always wins.
 // Returns { path, source } or null — the caller then installs, or refuses.
+//
+// Only ABSOLUTE directories are searched. A relative one — the empty element in
+// `PATH=/usr/bin:`, or a relative HCOM_INSTALL_DIR — makes `join` produce a
+// relative candidate, which resolves against the process CWD; that is how a
+// binary checked into a cloned repository gets found and then run.
 export async function resolvePathTool(binName, { platform = process.platform, env = process.env, extraDirs = [] } = {}) {
   const dirs = [
-    ...(env.PATH || '').split(delimiter).filter(Boolean).map((path) => ({ path, source: 'PATH' })),
-    ...extraDirs.filter(Boolean).map((path) => ({ path, source: 'install site' })),
-  ];
+    ...(env.PATH || '').split(delimiter).map((path) => ({ path, source: 'PATH' })),
+    ...extraDirs.map((path) => ({ path, source: 'install site' })),
+  ].filter((dir) => dir.path && isAbsolute(dir.path));
   const names = platform === 'win32'
     ? [`${binName}.cmd`, `${binName}.exe`, `${binName}.bat`, binName]
     : [binName];

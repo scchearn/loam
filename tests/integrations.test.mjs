@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { test } from 'node:test';
 
 import { catalogEntry } from '../setup/integrations/catalog.mjs';
@@ -402,6 +402,31 @@ test('enabling hcom found on PATH records it as unmanaged and registers no MCP',
   // The ledger records ownership of exactly nothing but the record itself.
   const ledger = await readLedger(fx.globalRoot);
   assert.deepEqual(ledger.integrations.hcom, { mcp: {}, tool: { managed: false, pkg: null, path: binPath } });
+});
+
+test('a relative install site is never searched, so nothing resolves out of the CWD', async () => {
+  // Same class as the Rust ladder's: an empty element in PATH, or a relative
+  // HCOM_INSTALL_DIR, makes join() produce a relative candidate that is stat'd
+  // against the process CWD — a binary in whatever repository is checked out.
+  const fx = await installedHome();
+  const cwd = process.cwd();
+  try {
+    const bait = await mkdtemp(join(tmpdir(), 'loam-relative-bait-'));
+    await fakeHcom(join(bait, 'rel', 'bin'));
+    await fakeHcom(bait);
+    process.chdir(bait);
+    const tool = hcomRunner();
+    const result = await catalogEntry('hcom').enable(ctxFor(fx, outputCapture(), {
+      toolRunner: tool.runner,
+      // A trailing delimiter leaves an empty element; HCOM_INSTALL_DIR is relative.
+      env: { PATH: `${join(fx.home, 'nowhere')}${delimiter}`, HCOM_INSTALL_DIR: 'rel' },
+    }));
+    assert.equal(result.ready, false, 'a relative candidate must never resolve');
+    assert.equal(result.category, 'tool-not-installed');
+    assert.equal(tool.calls.length, 0, 'nothing relative may even be health-checked');
+  } finally {
+    process.chdir(cwd);
+  }
 });
 
 test('a chatty version answer is reduced to one short line', async () => {

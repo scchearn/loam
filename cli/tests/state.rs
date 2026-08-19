@@ -378,3 +378,58 @@ echo 'hcom 0.7.25'
     // second is not one the briefing should promise.
     assert!(stdout.contains(r#""hcom_ready":false"#), "{stdout}");
 }
+
+#[test]
+#[cfg(unix)]
+fn a_binary_sitting_in_the_workspace_is_never_resolved_or_run() {
+    // The hook runs with CWD set to the workspace, so any rung that produces a
+    // RELATIVE candidate turns "detect hcom" into "execute a file out of the
+    // repository someone just cloned". Two env shapes produce one: an empty
+    // element in PATH (`PATH=/usr/bin:`, a common shell-rc accident) resolves the
+    // bare name, and an empty HOME resolves `.local/bin/<name>`. Both are stat'd
+    // against the CWD unless the ladder insists on absolute directories.
+    // One workspace per shape: the bait has to be reachable ONLY through the
+    // relative candidate, or an absolute rung would answer and prove nothing.
+    let empty_home = temporary_workspace();
+
+    // `PATH=/usr/bin:` — the empty element resolves the bare name against CWD.
+    let bare = temporary_workspace();
+    let bare_marker = bare.join("spawned");
+    fake_hcom(&bare, &bare_marker, 0);
+
+    // `HOME=""` — `.local/bin/<name>` is relative, so it lands under CWD too.
+    let under_home = temporary_workspace();
+    let home_marker = under_home.join("spawned");
+    fake_hcom(&under_home.join(".local/bin"), &home_marker, 0);
+
+    for (label, workspace, marker, path, home) in [
+        (
+            "an empty PATH element",
+            &bare,
+            &bare_marker,
+            "/usr/bin:",
+            empty_home.to_str().unwrap(),
+        ),
+        ("an empty HOME", &under_home, &home_marker, "/usr/bin", ""),
+    ] {
+        let output = state_command(workspace)
+            .current_dir(workspace)
+            .env("PATH", path)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .output()
+            .expect("loam should run");
+        let stdout = String::from_utf8(output.stdout).expect("state output should be UTF-8");
+        assert!(
+            stdout.contains(r#""hcom_ready":false"#),
+            "{label} resolved a workspace file as hcom: {stdout}"
+        );
+        assert!(
+            !marker.exists(),
+            "{label} ran a workspace file — the ladder must never spawn a relative candidate"
+        );
+    }
+    for workspace in [&empty_home, &bare, &under_home] {
+        fs::remove_dir_all(workspace).expect("temporary workspace should be removed");
+    }
+}

@@ -282,6 +282,15 @@ fn hcom_answers_its_version(binary: &Path) -> bool {
 
 /// The hcom binary as an absolute path, or `None` when no install site holds an
 /// executable of that name. Stat-only: never spawns, never trusts a bare name.
+///
+/// Only absolute directories are searched, and that is load-bearing rather than
+/// tidy. `split_paths` yields an EMPTY component for an empty `PATH` and for the
+/// empty element in `PATH=/usr/bin:` — a trailing colon is a common shell-rc
+/// accident — and joining a name onto an empty path gives the bare relative
+/// `hcom`, which `fs::metadata` resolves against the process CWD. The hook runs
+/// with CWD set to the workspace, so without this filter a checked-in `hcom` in
+/// a cloned repository would be stat'd and then run at session start. `HOME=""`
+/// and a relative `HCOM_INSTALL_DIR` reach the same place by the same route.
 fn resolve_hcom_binary() -> Option<PathBuf> {
     let name = if cfg!(windows) { "hcom.exe" } else { "hcom" };
     let mut directories = std::env::var_os("PATH")
@@ -299,6 +308,7 @@ fn resolve_hcom_binary() -> Option<PathBuf> {
     }
     directories
         .into_iter()
+        .filter(|directory| directory.is_absolute())
         .map(|directory| directory.join(name))
         .find(|candidate| is_executable_file(candidate))
 }
