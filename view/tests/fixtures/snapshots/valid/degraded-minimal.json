@@ -1,0 +1,48 @@
+{
+  "profile": "loam-view",
+  "schema_version": 1,
+  "generated_at": "2026-08-01T09:15:30+02:00",
+  "status": "degraded",
+  "workspace": {
+    "root": "/home/sam/work/loam",
+    "name": "loam",
+    "platform": "linux",
+    "git": {
+      "state": "unavailable",
+      "branch": null,
+      "dirty": null,
+      "changed_count": null
+    }
+  },
+  "capabilities": {
+    "wiki": { "state": "ready", "required": true, "reason": null, "evidence": null },
+    "code_graph": { "state": "degraded", "required": false, "reason": "codegraph probe timed out", "evidence": null },
+    "goals": { "state": "ready", "required": false, "reason": null, "evidence": null },
+    "work": { "state": "ready", "required": false, "reason": null, "evidence": null },
+    "checkpoints": { "state": "ready", "required": false, "reason": null, "evidence": null },
+    "git": { "state": "unavailable", "required": false, "reason": "git binary not found", "evidence": null },
+    "qmd": { "state": "unknown", "required": false, "reason": "qmd status command failed", "evidence": null },
+    "search_corpus": { "state": "ready", "required": true, "reason": null, "evidence": null }
+  },
+  "artifacts": [],
+  "relationships": [],
+  "events": [],
+  "metrics": {
+    "wiki.knowledge_pages": { "value": 0, "unit": "count", "state": "ready", "evidence": null },
+    "code.coverage_percent": { "value": null, "unit": "percent", "state": "unavailable", "evidence": null }
+  },
+  "signals": [
+    {
+      "id": "snapshot-integrity",
+      "state": "unknown",
+      "message": "codegraph probe degraded; coverage unavailable this snapshot.",
+      "evidence": null,
+      "command": null
+    }
+  ],
+  "hints": [],
+  "probes": [
+    { "id": "codegraph", "state": "timeout", "duration_ms": 60000, "message": "codegraph snapshot exceeded 60s budget" },
+    { "id": "git", "state": "error", "duration_ms": 5.2, "message": "git binary not found on PATH" }
+  ]
+}

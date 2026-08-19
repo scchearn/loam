@@ -1,0 +1,275 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loam.dev/schema/loam-view/snapshot-v1.schema.json",
+  "title": "Loam View Snapshot v1",
+  "description": "Loam State --view profile snapshot contract. schema_version is pinned to 1; any other value must be rejected by consumers.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "profile",
+    "schema_version",
+    "generated_at",
+    "status",
+    "workspace",
+    "capabilities",
+    "artifacts",
+    "relationships",
+    "events",
+    "metrics",
+    "signals",
+    "hints",
+    "probes"
+  ],
+  "properties": {
+    "profile": { "const": "loam-view" },
+    "schema_version": { "const": 1 },
+    "generated_at": { "$ref": "#/$defs/timestamp" },
+    "status": { "enum": ["ready", "degraded", "not-configured"] },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "name", "platform", "git"],
+      "properties": {
+        "root": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "minLength": 1 },
+        "git": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "branch", "dirty", "changed_count"],
+          "properties": {
+            "state": { "type": "string", "minLength": 1 },
+            "branch": { "type": ["string", "null"] },
+            "dirty": { "type": ["boolean", "null"] },
+            "changed_count": { "type": ["integer", "null"], "minimum": 0 }
+          }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wiki",
+        "code_graph",
+        "goals",
+        "work",
+        "checkpoints",
+        "git",
+        "qmd",
+        "search_corpus"
+      ],
+      "properties": {
+        "wiki": { "$ref": "#/$defs/capability" },
+        "code_graph": { "$ref": "#/$defs/capability" },
+        "goals": { "$ref": "#/$defs/capability" },
+        "work": { "$ref": "#/$defs/capability" },
+        "checkpoints": { "$ref": "#/$defs/capability" },
+        "git": { "$ref": "#/$defs/capability" },
+        "qmd": { "$ref": "#/$defs/capability" },
+        "search_corpus": { "$ref": "#/$defs/capability" }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifact" }
+    },
+    "relationships": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/relationship" }
+    },
+    "events": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/event" }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/metric" }
+    },
+    "signals": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/signal" }
+    },
+    "hints": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/hint" }
+    },
+    "probes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/probe" }
+    }
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "description": "RFC 3339 timestamp with a numeric UTC offset (not Z).",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?[+-]\\d{2}:\\d{2}$"
+    },
+    "nullableTimestamp": {
+      "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "required", "reason", "evidence"],
+      "properties": {
+        "state": { "enum": ["ready", "absent", "unavailable", "degraded", "unknown"] },
+        "required": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] },
+        "evidence": { "type": ["object", "null"] }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "path",
+        "kind",
+        "title",
+        "lifecycle_status",
+        "created_at",
+        "updated_at",
+        "captured_at",
+        "content_hash",
+        "bytes",
+        "attributes",
+        "parse_errors"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "kind": {
+          "enum": [
+            "wiki-index",
+            "wiki-schema",
+            "topic",
+            "entity",
+            "concept",
+            "analysis",
+            "code",
+            "checkpoint",
+            "goal",
+            "spec",
+            "plan",
+            "guidance",
+            "wiki-other"
+          ]
+        },
+        "title": { "type": ["string", "null"] },
+        "lifecycle_status": { "type": ["string", "null"] },
+        "created_at": { "$ref": "#/$defs/nullableTimestamp" },
+        "updated_at": { "$ref": "#/$defs/nullableTimestamp" },
+        "captured_at": { "$ref": "#/$defs/nullableTimestamp" },
+        "content_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "attributes": { "type": "object" },
+        "parse_errors": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "evidenceLocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "line", "section", "field", "content_hash"],
+      "properties": {
+        "path": { "type": ["string", "null"] },
+        "line": { "type": ["integer", "null"], "minimum": 1 },
+        "section": { "type": ["string", "null"] },
+        "field": { "type": ["string", "null"] },
+        "content_hash": {
+          "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{64}$" }, { "type": "null" }]
+        }
+      }
+    },
+    "relationship": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "from", "to", "kind", "origin", "evidence", "rule"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "from": { "type": "string", "minLength": 1 },
+        "to": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 },
+        "origin": { "enum": ["explicit", "derived"] },
+        "evidence": { "$ref": "#/$defs/evidenceLocation" },
+        "rule": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "version", "generated_at", "confidence"],
+              "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "version": { "type": "string", "minLength": 1 },
+                "generated_at": { "$ref": "#/$defs/timestamp" },
+                "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "occurred_at", "kind", "title", "artifact_id", "strength", "evidence"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "occurred_at": { "$ref": "#/$defs/timestamp" },
+        "kind": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "artifact_id": { "type": ["string", "null"] },
+        "strength": { "enum": ["strong", "source"] },
+        "evidence": { "$ref": "#/$defs/evidenceLocation" }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "unit", "state", "evidence"],
+      "properties": {
+        "value": { "type": ["number", "string", "boolean", "null"] },
+        "unit": { "type": ["string", "null"] },
+        "state": { "enum": ["ready", "unknown", "unavailable"] },
+        "evidence": { "type": ["object", "array", "null"] }
+      }
+    },
+    "signal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "state", "message", "evidence", "command"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "state": { "enum": ["healthy", "watch", "critical", "unknown", "unavailable"] },
+        "message": { "type": "string" },
+        "evidence": { "type": ["object", "array", "null"] },
+        "command": { "type": ["string", "null"] }
+      }
+    },
+    "hint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "group", "severity", "message", "command", "evidence"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "group": { "type": "string", "minLength": 1 },
+        "severity": { "enum": ["info", "warn", "action"] },
+        "message": { "type": "string", "minLength": 1 },
+        "command": { "type": ["string", "null"] },
+        "evidence": { "type": ["object", "array", "null"] }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "state", "duration_ms", "message"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "state": { "type": "string", "minLength": 1 },
+        "duration_ms": { "type": "number", "minimum": 0 },
+        "message": { "type": ["string", "null"], "maxLength": 500 }
+      }
+    }
+  }
+}

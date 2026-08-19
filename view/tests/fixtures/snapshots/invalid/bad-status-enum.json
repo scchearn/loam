@@ -1,0 +1,233 @@
+{
+  "profile": "loam-view",
+  "schema_version": 1,
+  "generated_at": "2026-07-17T15:30:00+02:00",
+  "status": "unknown",
+  "workspace": {
+    "root": "/home/sam/work/loam",
+    "name": "loam",
+    "platform": "linux",
+    "git": {
+      "state": "clean",
+      "branch": "main",
+      "dirty": false,
+      "changed_count": 0
+    }
+  },
+  "capabilities": {
+    "wiki": {
+      "state": "ready",
+      "required": true,
+      "reason": null,
+      "evidence": null
+    },
+    "code_graph": {
+      "state": "ready",
+      "required": false,
+      "reason": null,
+      "evidence": {
+        "path": "wiki/code"
+      }
+    },
+    "goals": {
+      "state": "ready",
+      "required": false,
+      "reason": null,
+      "evidence": null
+    },
+    "work": {
+      "state": "ready",
+      "required": false,
+      "reason": null,
+      "evidence": null
+    },
+    "checkpoints": {
+      "state": "ready",
+      "required": false,
+      "reason": null,
+      "evidence": null
+    },
+    "git": {
+      "state": "ready",
+      "required": false,
+      "reason": null,
+      "evidence": null
+    },
+    "qmd": {
+      "state": "absent",
+      "required": false,
+      "reason": "no qmd config found",
+      "evidence": null
+    },
+    "search_corpus": {
+      "state": "ready",
+      "required": true,
+      "reason": null,
+      "evidence": null
+    }
+  },
+  "artifacts": [
+    {
+      "id": "wiki/code/example-service.md",
+      "path": "wiki/code/example-service.md",
+      "kind": "code",
+      "title": "exampleService",
+      "lifecycle_status": null,
+      "created_at": "2026-07-01T09:00:00+02:00",
+      "updated_at": "2026-07-15T10:00:00+02:00",
+      "captured_at": null,
+      "content_hash": "8dc3487bdfb8cf1199001ad3fb0d7447ec2402583005cbf82990209931e1ea24",
+      "bytes": 842,
+      "attributes": {
+        "source_path": "src/example-service.js",
+        "ingested_at": "1752570000",
+        "source_size": 512,
+        "source_hash": "24aa1b6f9c0e3f4b7a2d9e1c8f5b6a3d2e1f0c9b8a7d6e5f4c3b2a1908070605",
+        "source_exists": true
+      },
+      "parse_errors": []
+    },
+    {
+      "id": "goals/example-goal.md",
+      "path": "goals/example-goal.md",
+      "kind": "goal",
+      "title": "Example Goal",
+      "lifecycle_status": "active",
+      "created_at": "2026-06-01T08:00:00+02:00",
+      "updated_at": "2026-07-10T08:00:00+02:00",
+      "captured_at": null,
+      "content_hash": "98f48dcef4ea63241d580a573d48d3b4dc8f6e24f89e5e644d0678757ae9642f",
+      "bytes": 1200,
+      "attributes": {
+        "linked_specs": [
+          "specs/example-spec.md"
+        ],
+        "linked_plans": [
+          "plans/example-plan.md"
+        ]
+      },
+      "parse_errors": []
+    }
+  ],
+  "relationships": [
+    {
+      "id": "f6860029f30f8c3a55d27d558550e22762784ab02bdc0b07021454d8c73c91e2",
+      "from": "goals/example-goal.md",
+      "to": "specs/example-spec.md",
+      "kind": "goal-linked-spec",
+      "origin": "derived",
+      "evidence": {
+        "path": "goals/example-goal.md",
+        "line": 12,
+        "section": "Linked work",
+        "field": "specs",
+        "content_hash": "98f48dcef4ea63241d580a573d48d3b4dc8f6e24f89e5e644d0678757ae9642f"
+      },
+      "rule": {
+        "id": "goal-linked-work",
+        "version": "1",
+        "generated_at": "2026-07-17T15:30:00+02:00",
+        "confidence": 1
+      }
+    },
+    {
+      "id": "42ce0a929763fe8c71d16e268fc74030fafd7b3504d7364a22a72f3083a39e74",
+      "from": "wiki/topics/example-topic.md",
+      "to": "wiki/code/example-service.md",
+      "kind": "wikilink",
+      "origin": "explicit",
+      "evidence": {
+        "path": "wiki/topics/example-topic.md",
+        "line": 5,
+        "section": null,
+        "field": null,
+        "content_hash": "df5468228c97a571cfec38d32bba625f607d45bab38f83dbeab77eefdf9c0c21"
+      },
+      "rule": null
+    }
+  ],
+  "events": [
+    {
+      "id": "checkpoint-2026-08-01-1200",
+      "occurred_at": "2026-08-01T12:00:00+02:00",
+      "kind": "checkpoint-captured",
+      "title": "Checkpoint captured: example workstream",
+      "artifact_id": "wiki/checkpoints/checkpoint-2026-08-01-1200.md",
+      "strength": "strong",
+      "evidence": {
+        "path": "wiki/checkpoints/checkpoint-2026-08-01-1200.md",
+        "line": 1,
+        "section": null,
+        "field": "Captured",
+        "content_hash": "7016e77dc72f05f3dfe13a0b1dd3369d44ec7b30a4a7ac4b7b425d394222d085"
+      }
+    }
+  ],
+  "metrics": {
+    "wiki.knowledge_pages": {
+      "value": 3,
+      "unit": "count",
+      "state": "ready",
+      "evidence": null
+    },
+    "code.coverage_percent": {
+      "value": 66.3,
+      "unit": "percent",
+      "state": "ready",
+      "evidence": {
+        "candidates": 365,
+        "current": 242
+      }
+    },
+    "checkpoints.latest_at": {
+      "value": "2026-08-01T12:00:00+02:00",
+      "unit": null,
+      "state": "ready",
+      "evidence": null
+    }
+  },
+  "signals": [
+    {
+      "id": "code-graph-drift",
+      "state": "healthy",
+      "message": "No stale, new, or orphan code pages.",
+      "evidence": null,
+      "command": null
+    },
+    {
+      "id": "memory-lint",
+      "state": "watch",
+      "message": "No lint marker found in wiki/log.md.",
+      "evidence": {
+        "path": "wiki/log.md"
+      },
+      "command": "/loam::linting-memory"
+    }
+  ],
+  "hints": [
+    {
+      "kind": "lint-stale",
+      "group": "memory",
+      "severity": "warn",
+      "message": "wiki/log.md has no lint-check marker.",
+      "command": "/loam::linting-memory",
+      "evidence": {
+        "path": "wiki/log.md"
+      }
+    }
+  ],
+  "probes": [
+    {
+      "id": "codegraph",
+      "state": "ok",
+      "duration_ms": 42.5,
+      "message": null
+    },
+    {
+      "id": "qmd",
+      "state": "skipped",
+      "duration_ms": 0,
+      "message": "no qmd config found"
+    }
+  ]
+}
