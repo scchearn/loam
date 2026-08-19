@@ -117,16 +117,34 @@ impl EnrollmentFailure {
     /// is exactly the situation #94 was reported from. Every value here is one
     /// of this module's own strings or a `Debug` of a crypto/IO error; no
     /// token, key, or certificate byte reaches it.
-    pub fn detail(&self) -> Option<(&'static str, &str)> {
+    pub fn detail(&self) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
         match self {
             EnrollmentFailure::LocalCrypto { operation, detail }
             | EnrollmentFailure::TlsSetupFailed { operation, detail }
             | EnrollmentFailure::IdentityStoreFailed { operation, detail } => {
-                Some((*operation, detail))
+                Some((*operation, detail.into()))
             }
-            EnrollmentFailure::TrustAnchorsUnresolved { source, detail } => Some((*source, detail)),
-            EnrollmentFailure::SignerUrlInvalid { detail } => Some(("signer-url", detail)),
-            EnrollmentFailure::SignerTimeout { stage } => Some(("timeout-stage", stage)),
+            EnrollmentFailure::TrustAnchorsUnresolved { source, detail } => {
+                Some((*source, detail.into()))
+            }
+            EnrollmentFailure::SignerUrlInvalid { detail } => {
+                Some(("signer-url", (*detail).into()))
+            }
+            // The stage alone is a label; the operator on the slow link needs
+            // the knob (#159). The bound reported is the one actually in force,
+            // so an already-raised value is echoed back rather than the default
+            // being claimed twice.
+            EnrollmentFailure::SignerTimeout { stage } => Some((
+                "timeout-stage",
+                format!(
+                    "{stage} exceeded the {}s bound; raise it with LOAM_ENROLL_TIMEOUT_SECONDS \
+                     ({}..={} seconds, default {DEFAULT_ENROLL_TIMEOUT_SECONDS})",
+                    enroll_timeout().as_secs(),
+                    ENROLL_TIMEOUT_BOUNDS.start(),
+                    ENROLL_TIMEOUT_BOUNDS.end(),
+                )
+                .into(),
+            )),
             EnrollmentFailure::BadToken
             | EnrollmentFailure::SignerUnreachable
             | EnrollmentFailure::MalformedSignerResponse
@@ -396,6 +414,12 @@ fn pem_armor(label: &str, der: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The default per-operation deadline, and the range `LOAM_ENROLL_TIMEOUT_SECONDS`
+/// may set it to. Named constants because the `signer-timeout` refusal quotes
+/// them back to the operator: the refusal and the knob cannot drift apart.
+const DEFAULT_ENROLL_TIMEOUT_SECONDS: u64 = 10;
+const ENROLL_TIMEOUT_BOUNDS: std::ops::RangeInclusive<u64> = 1..=300;
+
 /// Per-operation network deadline for the enrollment exchange: the TCP
 /// connect, and every read and write once connected. Ten seconds by default;
 /// `LOAM_ENROLL_TIMEOUT_SECONDS` (1..=300) raises it for a genuinely slow link
@@ -405,12 +429,11 @@ fn pem_armor(label: &str, der: &[u8]) -> Vec<u8> {
 /// connection and then stalls — exactly the production wedge in #93 — hung
 /// enrollment forever with no output.
 fn enroll_timeout() -> Duration {
-    const DEFAULT_SECONDS: u64 = 10;
     let seconds = std::env::var("LOAM_ENROLL_TIMEOUT_SECONDS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| (1..=300).contains(seconds))
-        .unwrap_or(DEFAULT_SECONDS);
+        .filter(|seconds| ENROLL_TIMEOUT_BOUNDS.contains(seconds))
+        .unwrap_or(DEFAULT_ENROLL_TIMEOUT_SECONDS);
     Duration::from_secs(seconds)
 }
 
@@ -750,7 +773,38 @@ mod tests {
     fn local_crypto_failure_has_a_distinct_code_and_detail() {
         let failure = local_crypto_failure("csr-sign", ring::error::Unspecified);
         assert_eq!(failure.code(), "local-crypto-failure");
-        assert_eq!(failure.detail(), Some(("csr-sign", "Unspecified")));
+        let (operation, detail) = failure.detail().expect("a local failure carries a detail");
+        assert_eq!((operation, detail.as_ref()), ("csr-sign", "Unspecified"));
+    }
+
+    /// #159: the refusal named the stage the exchange died at but not
+    /// `LOAM_ENROLL_TIMEOUT_SECONDS`, the one knob that raises the bound — a
+    /// label where every other refusal in this module is a recipe. The
+    /// operator who hits it is on a slow link and needs the knob, not the
+    /// name of the phase.
+    #[test]
+    fn the_signer_timeout_refusal_names_the_knob_that_raises_the_bound() {
+        let failure = EnrollmentFailure::SignerTimeout { stage: "connect" };
+        let (operation, detail) = failure.detail().expect("a timeout carries a detail");
+        assert_eq!(operation, "timeout-stage");
+        assert!(detail.contains("connect"), "the stage survives: {detail}");
+        assert!(
+            detail.contains("LOAM_ENROLL_TIMEOUT_SECONDS"),
+            "the refusal must name the knob: {detail}"
+        );
+        assert!(
+            detail.contains(&format!("default {DEFAULT_ENROLL_TIMEOUT_SECONDS}")),
+            "the refusal must name the default: {detail}"
+        );
+        assert!(
+            detail.contains("1..=300"),
+            "the refusal must name the accepted range, or a rejected value \
+             silently keeps the default: {detail}"
+        );
+        assert!(
+            detail.contains(&format!("{}s bound", enroll_timeout().as_secs())),
+            "the refusal must quote the bound actually in force: {detail}"
+        );
     }
 
     /// #94: the pre-network failures used to share `signer-unreachable` with
