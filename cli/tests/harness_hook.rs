@@ -513,6 +513,21 @@ fn an_unwritable_ledger_never_fails_the_hook() {
     );
 }
 
+/// A stand-in hcom at `<directory>/hcom`, resolvable by stat. The probe reaches
+/// it by stat alone when the launcher marker is set, so this never has to run —
+/// on Windows the ladder wants `hcom.exe` and only that the path is a file.
+fn stub_hcom(directory: &Path) {
+    std::fs::create_dir_all(directory).unwrap();
+    let name = if cfg!(windows) { "hcom.exe" } else { "hcom" };
+    let path = directory.join(name);
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 #[test]
 fn the_briefing_reports_hcom_readiness_both_ways() {
     // The injected answer skills read instead of shelling out to `which hcom`.
@@ -521,13 +536,26 @@ fn the_briefing_reports_hcom_readiness_both_ways() {
     let stdin = format!(r#"{{"cwd":"{}"}}"#, json_path(&root));
     let harness = loam::json::parse(r#"{"id":"claude","key":"additionalContext"}"#).unwrap();
 
+    // Both halves pin PATH and HOME to fixtures. Reading the real ones would let
+    // the developer's own hcom decide the answer — which is exactly how this
+    // test passed locally while failing in CI once the launcher marker stopped
+    // being believed on its own.
+    let ready_home = temp_root("hcom-ready");
+    let bin = ready_home.join("bin");
+    stub_hcom(&bin);
     let ready = run_hook_full(
         "claude",
         stdin.as_bytes(),
         &global_root,
         &skills_root,
         None,
-        &[("HCOM_TOOL", "claude")],
+        &[
+            ("HCOM_TOOL", "claude"),
+            ("HCOM_INSTALL_DIR", ""),
+            ("PATH", bin.to_str().unwrap()),
+            ("HOME", ready_home.to_str().unwrap()),
+            ("USERPROFILE", ready_home.to_str().unwrap()),
+        ],
     );
     assert_eq!(ready.status, 0, "{}", ready.stderr);
     let body = body_of(&harness, &ready.stdout);

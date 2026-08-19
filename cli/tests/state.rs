@@ -353,7 +353,7 @@ fn a_wedged_hcom_binary_cannot_hold_session_start_hostage() {
         &path,
         "#!/bin/sh
 PATH=/usr/bin:/bin
-sleep 30
+exec sleep 30
 echo 'hcom 0.7.25'
 ",
     )
