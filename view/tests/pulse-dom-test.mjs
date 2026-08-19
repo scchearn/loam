@@ -308,7 +308,9 @@ describe('Pulse honest unknown and unavailable rendering', () => {
   it('shows honest empty states with exact next actions on a sparse workspace', async () => {
     const { mount: root } = await mount(sparse);
 
-    assert.equal(tileValue(root, 'posture'), 'Unknown');
+    // T6 landed the top-level posture field: the sparse fixture now carries
+    // "not-configured", which outranks the pre-posture "Unknown" fallback.
+    assert.equal(tileValue(root, 'posture'), 'Not configured');
     assert.equal(tileValue(root, 'coverage'), '—');
 
     const card = cardFor(root, 'no-memory');
