@@ -25,8 +25,8 @@ If the user wants a new collection:
 1. Choose a collection name. Recommended default: `<workspace-slug>-<wiki-root-name>`.
 2. Run `qmd collection add <wiki root> --name <collection-name>`.
 3. Add `ignore: [".archive/**"]` to the per-collection qmd config so archived pages stay out of retrieval.
-4. Run `qmd update -c <collection-name>` to index the wiki files.
-5. Run `qmd embed` if vector search is desired (requires a local embedding model).
+4. Run `qmd update -c <collection-name>` to index the wiki files; report its outcome.
+5. Run `qmd embed -c <collection-name>` after the update (requires a local embedding model); report its outcome separately. If either command fails, report that failure without rolling back the wiki scaffold.
 
 Example collection config:
 

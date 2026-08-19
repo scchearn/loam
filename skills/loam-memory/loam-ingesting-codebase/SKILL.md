@@ -3,7 +3,7 @@ name: loam::ingesting-codebase
 description: "Ingest a codebase into memory as code pages connected by wiki links. Walks the tree, classifies each code file by role, applies a role template, and writes a code page per meaningful unit under <wiki root>/code/. Resumable: skips files already ingested and current. Not for prose documents; use /loam::adding-to-memory for those."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.7.0"
+  version: "1.7.1"
   author: scchearn
   argument-hint: <codebase root path> [--ref <commit>]
 ---
@@ -38,7 +38,7 @@ If `exists` is false, stop and recommend:
 /loam::scaffolding-wiki <topic or wiki goal>
 ```
 
-If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. Use `wiki_root` from the resolved state as the wiki root. Do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh (`qmd update -c <collection>`). The skill works fully without qmd; it only accelerates post-ingest discovery.
+If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. Use `wiki_root` from the resolved state as the wiki root. Do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh (`qmd update -c <collection>` then `qmd embed -c <collection>`). The skill works fully without qmd; it only accelerates post-ingest discovery.
 
 A `code_ingest_pending` hint, when present, previews the work set; Step 2 remains authoritative when fast injected state omits that hint.
 
@@ -235,7 +235,7 @@ Capture: root path, files ingested (count), files re-summarized (count), skipped
 
 ### Refresh qmd
 
-If qmd was ready and you wrote to the wiki, run `qmd update -c <collection> 2>/dev/null`. If refresh fails, report it but do not roll back wiki edits.
+If qmd was ready and you wrote to the wiki, run `qmd update -c <collection>` then `qmd embed -c <collection>`; report both outcomes separately. If either fails, report it but do not roll back wiki edits.
 
 ---
 

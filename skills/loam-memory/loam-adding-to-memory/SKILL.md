@@ -3,7 +3,7 @@ name: loam::adding-to-memory
 description: "Read a local source file or synthesize conversation context, then integrate admitted content directly into topic, entity, concept, and analysis pages in existing memory (the wiki substrate). Use this when the user wants to add a source to the wiki, add a document, ingest a local note, transcript, article, report, or PDF, or explicitly preserve the current conversation as a topic note. For session-learning routing across wiki, guidance, checkpoint, task annotation, or discard, use /loam::learning-from-session. Must not ingest a goal wholesale; admit only independently reusable findings."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.5.1"
+  version: "1.5.2"
   author: scchearn
   argument-hint: <local source path | topic or summary from chat>
 ---
@@ -151,7 +151,7 @@ Capture: the source path or conversation topic, pages created or updated, import
 
 ### D. Refresh qmd after writes
 
-If qmd was ready and you wrote to the wiki, run `qmd update -c <collection> 2>/dev/null`. If refresh fails, report it but do not roll back wiki edits.
+If qmd was ready and you wrote to the wiki, run `qmd update -c <collection>` then `qmd embed -c <collection>`; report both outcomes separately. If either fails, report it but do not roll back wiki edits.
 
 ---
 

@@ -1,5 +1,5 @@
 # Repository gates: contract tests, curation, version agreement on changes, and
-# a daily strict check that every CLI_VERSION still resolves. Rust workspace
+# a daily strict check that the package-baked RUNTIME_VERSION still resolves. Rust workspace
 # checks live in cli.yml, which is path-filtered to the runtime lane.
 name: ci
 

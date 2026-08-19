@@ -3,7 +3,7 @@ name: loam::checkpointing
 description: "Use when pausing, shutting down, handing off, or context-switching active work and future sessions need a compact resumable checkpoint derived from the current session context. Writes a small checkpoint note under wiki/checkpoints/ and then optionally records the user's intended return step. Not for durable learnings capture, wiki correction, or source ingestion."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.3.0"
+  version: "1.3.1"
   author: scchearn
   argument-hint: "[optional intended return]"
 ---
@@ -96,7 +96,6 @@ When relevant, capture as pointers inside the workstream:
 - delegated work not yet returned, described by task ("a reviewer was auditing X") — never by delegate name
 - files edited but unfinished this session
 - flag session-local or `/tmp` pointers `(volatile)`
-- open `hcom listen` / `events sub` state goes in `Status: waiting` + `Blocker` (record the awaited condition, not the subscription); when the injected `hcom:` line reports `not installed` there is no such state to record — omit the pointer rather than probing for one
 - the controlling goal path (`goals/<slug>.md`) when work is goal-backed — point to the path only, never copy goal state into the checkpoint
 - run `<native-runtime-command> checkpoint state [--window MIN]` to get a pre-filtered digest of recently-touched files; select from its output rather than re-querying inline. If the native runtime reports unavailable, stop and report `npx @scchearn/loam setup`.
 - relative pointer paths must be unambiguous from the workspace root; when the workspace has multiple top-level subprojects with similar directory structure, prefix with the subproject name (e.g., `aenon-local-business-website-pipeline/workflows/x.ts`, not just `workflows/x.ts`)

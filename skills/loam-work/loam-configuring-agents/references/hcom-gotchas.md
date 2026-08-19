@@ -8,7 +8,6 @@
 - Never hardcode generated agent names.
 - Always parse launch output for the actual names.
 - Always use `hcom kill` for cleanup, not `stop`.
-- Always use `--go` on launch and kill in scripted flows.
 - For OpenCode launch examples, prefer `HCOM_OPENCODE_ARGS="--model <provider/model>"` and `--headless` unless the user asked for another runtime or a visible terminal.
 - Always resolve models from `opencode models` and record provider-qualified IDs.
 - If the same family appears under multiple providers, surface the top exact IDs and choose one explicit assumption.
