@@ -32,6 +32,50 @@ test('doctor reports missing installation without changing the home', async () =
   await assert.rejects(() => stat(join(home, '.agents')));
 });
 
+test('doctor distinguishes an invalid install.json from a missing one', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-doctor-invalid-home-'));
+  const workspace = await mkdtemp(join(tmpdir(), 'loam-doctor-invalid-workspace-'));
+  const globalRoot = join(home, '.agents', 'loam');
+  await mkdir(globalRoot, { recursive: true });
+  // Present but unreadable/invalid: schema_version 2 is rejected by validateInstallMetadata.
+  await writeFile(join(globalRoot, 'install.json'), JSON.stringify({ schema_version: 2 }));
+
+  let output = '';
+  const code = await runDoctor({
+    home,
+    workspace,
+    packageRoot,
+    runner: async () => ({ code: 0, stdout: '[]', stderr: '' }),
+    output: { write: (value) => { output += value; } },
+    errorOutput: { write: (value) => { output += value; } },
+  });
+
+  assert.equal(code, 1, output);
+  // The real validation reason must surface, not a bare "missing" category.
+  assert.match(output, /Install metadata: failed \(unsupported install metadata schema\)/);
+  assert.doesNotMatch(output, /install_metadata_missing/);
+  // A present-but-invalid file is a real problem — do not tell the user to run setup.
+  assert.doesNotMatch(output, /loam setup/);
+});
+
+test('doctor points a missing install at loam setup', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-doctor-hint-home-'));
+  const workspace = await mkdtemp(join(tmpdir(), 'loam-doctor-hint-workspace-'));
+  let output = '';
+  const code = await runDoctor({
+    home,
+    workspace,
+    packageRoot,
+    runner: async () => ({ code: 0, stdout: '[]', stderr: '' }),
+    output: { write: (value) => { output += value; } },
+    errorOutput: { write: (value) => { output += value; } },
+  });
+
+  assert.equal(code, 1, output);
+  assert.match(output, /Install metadata: failed \(install_metadata_missing\)/);
+  assert.match(output, /loam setup/);
+});
+
 test('doctor reports installed plugin and CLI versions', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-doctor-ready-home-'));
   const workspace = await mkdtemp(join(tmpdir(), 'loam-doctor-ready-workspace-'));

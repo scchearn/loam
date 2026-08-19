@@ -33,10 +33,12 @@ export async function runDoctor(options = {}) {
     });
 
     output.write('Loam Doctor\n');
-    report(output, 'Install metadata', result.install ? { ready: true } : { ready: false, category: 'install_metadata_missing' });
+    report(output, 'Install metadata', result.installReadiness || (result.install ? { ready: true } : { ready: false, category: 'install_metadata_missing' }));
     if (result.install) {
       output.write(`  Plugin version: ${result.install.plugin_version}\n`);
       output.write(`  CLI version: ${result.install.runtime_version}\n`);
+    } else if (result.installReadiness?.category === 'install_metadata_missing') {
+      output.write("  Fix: run 'loam setup' to initialize the install metadata.\n");
     }
     report(output, 'Global skills', result.skills);
     report(output, 'Native runtime', result.runtime);
