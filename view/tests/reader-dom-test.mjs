@@ -38,6 +38,8 @@ const DOCUMENTS = {
       '',
       'Links to [[Beta]] and [[Nowhere]] and [one](./code/one.md).',
       '',
+      'Also [escape](../../etc/passwd.md), [gone](./gone.md), and [[Beta#Detail]].',
+      '',
       '## Detail',
       '',
       'Body text.',
@@ -163,6 +165,27 @@ describe('reader surface', () => {
     assert.ok(/unresolved/i.test(broken.textContent));
     const relative = [...doc.querySelectorAll('[data-reader-doc] a')].find((a) => a.textContent === 'one');
     assert.equal(relative.getAttribute('href'), '#/reader/wiki%2Fcode%2Fone.md');
+  });
+
+  it('marks out-of-root and missing document links as broken, with the reason in text', async () => {
+    const { dom, doc } = mount();
+    await announce(dom, { path: 'wiki/alpha.md' });
+
+    const broken = [...doc.querySelectorAll('[data-reader-doc] .wikilink.is-broken')];
+    const escaping = broken.find((node) => node.textContent.startsWith('escape'));
+    assert.ok(escaping, 'an out-of-root link is never offered as a link');
+    assert.match(escaping.textContent, /leaves the workspace/);
+    const missing = broken.find((node) => node.textContent.startsWith('gone'));
+    assert.match(missing.textContent, /missing document/);
+    assert.equal(doc.querySelector('[data-reader-doc] a[href*="passwd"]'), null);
+  });
+
+  it('carries a wikilink heading fragment into the reader route', async () => {
+    const { dom, doc } = mount();
+    await announce(dom, { path: 'wiki/alpha.md' });
+    const link = [...doc.querySelectorAll('[data-reader-doc] a.wikilink')]
+      .find((a) => a.getAttribute('href').includes('%23') || a.getAttribute('href').includes('#detail'));
+    assert.equal(link.getAttribute('href'), '#/reader/wiki%2Fbeta.md#detail');
   });
 
   it('navigates between documents through hash history, re-reading each time', async () => {

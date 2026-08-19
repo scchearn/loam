@@ -136,15 +136,29 @@ export function readerHref(path) {
   return `#/reader/${encodeURIComponent(target)}${fragment ? `#${fragment}` : ''}`;
 }
 
-/** Resolve `../x.md` against the directory of the document being read. */
+/**
+ * Resolve `../x.md` against the directory of the document being read. Returns
+ * null when the link climbs out of the workspace root: an escaping path is a
+ * broken link to show, never a path to normalize and follow.
+ */
 export function resolveRelative(basePath, href) {
   const segments = String(basePath ?? '').split('/').slice(0, -1);
   for (const part of String(href).split('/')) {
     if (part === '' || part === '.') continue;
-    if (part === '..') segments.pop();
-    else segments.push(part);
+    if (part === '..') {
+      if (segments.length === 0) return null;
+      segments.pop();
+    } else {
+      segments.push(part);
+    }
   }
-  return segments.join('/');
+  return segments.join('/') || null;
+}
+
+/** One shape for every unavailable link: visible text, plus the reason in text. */
+function brokenLink(label, target, reason) {
+  return `<span class="wikilink is-broken" title="${escapeHtml(target)}">${label}` +
+    `<span class="wikilink-note"> (${escapeHtml(reason)})</span></span>`;
 }
 
 function isInternalDocument(href) {
@@ -261,13 +275,12 @@ export function createRenderer({ window: win = globalThis.window, resolve = () =
           return { type: 'wikilink', raw: match[0], target, label: (match[2] ?? target).trim() };
         },
         renderer(token) {
-          const hit = resolve(token.target);
+          const [target, fragment] = token.target.split('#');
+          const hit = resolve(target);
           const label = escapeHtml(token.label);
-          if (!hit?.path) {
-            return `<span class="wikilink is-broken" title="${escapeHtml(token.target)}">${label}` +
-              `<span class="wikilink-note"> (unresolved link)</span></span>`;
-          }
-          return `<a class="wikilink is-resolved" href="${escapeHtml(readerHref(hit.path))}">${label}</a>`;
+          if (!hit?.path) return brokenLink(label, token.target, 'unresolved link');
+          const href = readerHref(fragment ? `${hit.path}#${slugify(fragment)}` : hit.path);
+          return `<a class="wikilink is-resolved" href="${escapeHtml(href)}">${label}</a>`;
         },
       }],
       renderer: {
@@ -284,8 +297,15 @@ export function createRenderer({ window: win = globalThis.window, resolve = () =
           const href = String(token.href ?? '').trim();
           const title = token.title ? ` title="${escapeHtml(token.title)}"` : '';
           if (isInternalDocument(href)) {
-            const path = resolveRelative(basePath, href);
-            return `<a class="md-link is-document" href="${escapeHtml(readerHref(path))}"${title}>${text}</a>`;
+            const [target, fragment] = href.split('#');
+            const path = resolveRelative(basePath, target);
+            // Same treatment as a wikilink: out-of-root and missing documents
+            // are shown as broken rather than offered as working links.
+            if (!path) return brokenLink(text, href, 'link leaves the workspace');
+            const hit = resolve(path);
+            if (!hit?.path) return brokenLink(text, href, 'missing document');
+            const readerTarget = readerHref(fragment ? `${hit.path}#${fragment}` : hit.path);
+            return `<a class="md-link is-document" href="${escapeHtml(readerTarget)}"${title}>${text}</a>`;
           }
           if (href.startsWith('#')) return `<a class="md-link" href="${escapeHtml(href)}"${title}>${text}</a>`;
           if (EXTERNAL_URI_REGEXP.test(href)) {
