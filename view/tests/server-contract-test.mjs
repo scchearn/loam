@@ -163,11 +163,30 @@ test('GET /api/snapshot returns the current snapshot', async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-test('GET /api/search returns 503 until the search index ships', async () => {
+test('GET /api/search returns 503 when the search index is unavailable', async () => {
   const { root } = await makeWorkspace();
-  await withServer({ workspaceRoot: root, initialSnapshot: baseSnapshot(root) }, async (baseUrl) => {
+  await withServer({
+    workspaceRoot: root,
+    initialSnapshot: baseSnapshot(root),
+    buildSearchIndex: async () => { throw new Error('index build exploded'); },
+  }, async (baseUrl) => {
     const res = await rawJson(baseUrl, '/api/search?q=hello');
     assert.equal(res.status, 503);
+  });
+  await rm(root, { recursive: true, force: true });
+});
+
+test('GET /api/search returns deterministic results from the default index built at startup', async () => {
+  const { root, path, content } = await makeWorkspace();
+  const snapshot = baseSnapshot(root, [artifactFor(path, content)]);
+  await withServer({ workspaceRoot: root, initialSnapshot: snapshot }, async (baseUrl) => {
+    const res = await rawJson(baseUrl, '/api/search?q=hello');
+    assert.equal(res.status, 200);
+    assert.equal(res.json.results.length, 1);
+    assert.equal(res.json.results[0].path, path);
+
+    const short = await rawJson(baseUrl, '/api/search?q=h');
+    assert.equal(short.status, 400);
   });
   await rm(root, { recursive: true, force: true });
 });
