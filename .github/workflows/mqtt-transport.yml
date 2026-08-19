@@ -26,12 +26,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # openssl and python3 are preinstalled on this image; only mosquitto is
-      # missing. The timeout/retry options bound a stalled mirror connection
-      # (observed: a runner placed in a region with a broken azure.archive
-      # alias fell back to the global archive, which stalled mid-download and
-      # ate the whole 15-minute job timeout).
+      # missing. Runners in some regions hit a broken azure.archive mirror
+      # alias and the fallback archive connection can stall indefinitely —
+      # apt's Acquire::Timeout options observably do NOT bound that stall, so
+      # the bound is an unconditional shell `timeout` with retries. The first
+      # attempt skips `apt-get update` entirely (the image's baked package
+      # lists are days old at most); update only runs as recovery between
+      # attempts in case a list is stale.
       - name: Install Mosquitto
-        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends mosquitto
+        run: |
+          for attempt in 1 2 3; do
+            timeout 180 sudo apt-get install -y --no-install-recommends mosquitto && exit 0
+            echo "attempt ${attempt} failed; refreshing lists and retrying"
+            timeout 180 sudo apt-get update || true
+          done
+          echo "mosquitto install failed after 3 bounded attempts" >&2
+          exit 1
       - name: Install Rust
         run: rustup toolchain install 1.94.1 --profile minimal
       # The auto-enrollment tier: the runtime's CSR signed by a real `openssl
