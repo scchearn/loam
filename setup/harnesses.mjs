@@ -172,14 +172,43 @@ export function renderOpenCodePlugin(source, runtimePath) {
   return source.replaceAll(RUNTIME_PATH_SLOT, JSON.stringify(resolve(runtimePath)));
 }
 
-export function nativeHookEntry(runtimePath, harness, event, { async: isAsync = false, timeout } = {}) {
+// Cursor's hooks.json takes the command as ONE shell string: its per-script
+// schema is `command`/`type`/`timeout`/`loop_limit`/`failClosed`/`matcher` —
+// there is no `args` and no `async` (cursor.com/docs/hooks; every published
+// ~/.cursor/hooks.json in the wild uses the single-string form). The
+// args-array form we emitted was accepted as JSON and then ignored, so the
+// registration ran the bare runtime with no subcommand: the same silent
+// failure #133 was for Claude/Codex, which #134 fixed for those two and left
+// here (#135).
+//
+// The runtime path is JSON-quoted, so a path with a space survives the shell
+// and the ownership matcher can read it back out with JSON.parse.
+export function nativeHookCommand(runtimePath, harness, event) {
+  return `${JSON.stringify(resolve(runtimePath))} hook ${harness} --event ${event}`;
+}
+
+export function nativeHookEntry(runtimePath, harness, event, { timeout } = {}) {
   return {
     type: 'command',
-    command: resolve(runtimePath),
-    args: ['hook', harness, '--event', event],
-    async: isAsync,
+    command: nativeHookCommand(runtimePath, harness, event),
     ...(timeout ? { timeout } : {}),
   };
+}
+
+const RUNTIME_EXECUTABLES = new Set(['loam', 'loam.exe']);
+
+// The runtime path inside one of our native hook commands, in either form:
+// the current `"<runtime>" hook <harness> --event <event>` string, or the
+// pre-#135 args-array entry, which is still recognized so an update replaces
+// it instead of stacking a second registration beside it.
+function nativeHookRuntimePath(item) {
+  if (typeof item?.command !== 'string') return null;
+  const quoted = /^("(?:[^"\\]|\\.)*")\s+hook\s/.exec(item.command);
+  if (quoted) {
+    try { return JSON.parse(quoted[1]); } catch { return null; }
+  }
+  if (Array.isArray(item.args) && item.args[0] === 'hook') return item.command;
+  return null;
 }
 
 // #137: the marketplace plugin CARRIES its native-event hooks (self-resolving
@@ -242,10 +271,22 @@ function hookEntry(command, { async = false, timeout } = {}) {
 // update removes the shim it replaces instead of stacking beside it.
 export function isOwnedNativeHook(item, globalRoot) {
   if (Array.isArray(item?.hooks)) return item.hooks.some((hook) => isOwnedNativeHook(hook, globalRoot));
-  if (item?.type !== 'command' || typeof item.command !== 'string') return false;
-  if (!Array.isArray(item.args) || item.args[0] !== 'hook') return false;
-  const relativePath = relative(resolve(globalRoot), resolve(item.command));
-  return Boolean(relativePath) && !relativePath.startsWith('..') && !isAbsolute(relativePath);
+  if (item?.type !== 'command') return false;
+  const runtimePath = nativeHookRuntimePath(item);
+  if (!runtimePath) return false;
+  const resolved = resolve(runtimePath);
+  const relativePath = relative(resolve(globalRoot), resolved);
+  if (Boolean(relativePath) && !relativePath.startsWith('..') && !isAbsolute(relativePath)) return true;
+  // The staged runtime lives in the config-dir runtime store, not under the
+  // global root, and that store is versioned:
+  // `<config>/runtime/<version>/<target>/loam`. Recognizing ownership by the
+  // global root alone therefore matched none of our own registrations, so
+  // every setup run appended one more and left the previous entries — by then
+  // pointing at runtime versions that had already been deleted — behind.
+  // Observed on a machine running the cursor lane: four sessionStart entries,
+  // three of them naming a runtime that no longer exists. A `hook` read of an
+  // executable named `loam` is our registration wherever it was staged from.
+  return RUNTIME_EXECUTABLES.has(basename(resolved));
 }
 
 export function isOwnedCommand(item, globalRoot, assetName) {
@@ -374,6 +415,10 @@ async function installCursor({ home, globalRoot, runtimePath }) {
     filePath,
     update: (config) => ({
       ...config,
+      // hooks.json is a versioned schema and 1 is the only version Cursor
+      // currently reads; a file without it is a file Cursor may not load. An
+      // explicit version the user already set is left alone.
+      version: config.version ?? 1,
       hooks: {
         ...(config.hooks || {}),
         sessionStart: mergeCursorHooks(
