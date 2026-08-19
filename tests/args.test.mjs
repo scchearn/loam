@@ -153,3 +153,12 @@ test('invalid setup arguments expose the public usage status', () => {
     return true;
   });
 });
+
+test('the shipped view command carries the workspace root and --no-open', () => {
+  assert.deepEqual(parseArgs(['view']), { command: 'view', workspace: undefined, open: true });
+  assert.deepEqual(parseArgs(['view', '/ws']), { command: 'view', workspace: '/ws', open: true });
+  // Harness agents background-spawn with --no-open and read the URL line.
+  assert.deepEqual(parseArgs(['view', '/ws', '--no-open']), { command: 'view', workspace: '/ws', open: false });
+  assert.throws(() => parseArgs(['view', '--nope']), UsageError);
+  assert.throws(() => parseArgs(['view', '/a', '/b']), UsageError);
+});

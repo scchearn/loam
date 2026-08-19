@@ -38,11 +38,12 @@ export function parseArgs(argv) {
   if (command === 'help') return { command: 'help' };
   if (command === 'version') return { command: 'version' };
   if (command === 'view') {
-    const rest = args.slice(1);
+    const rest = args.slice(1).filter((value) => value !== '--no-open');
+    const open = !args.slice(1).includes('--no-open');
     const flag = rest.find((value) => value.startsWith('--'));
     if (flag) throw new UsageError(`unknown option: ${flag}`);
     if (rest.length > 1) throw new UsageError('view accepts at most one workspace-root argument');
-    return { command: 'view', workspace: rest[0] };
+    return { command: 'view', workspace: rest[0], open };
   }
   if (!COMMANDS.has(command)) {
     throw new UsageError(`unknown command: ${command}`);
