@@ -471,7 +471,13 @@ fn connect_to_signer(
     let mut timed_out = false;
     for address in addresses {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        // Sub-millisecond is treated as spent, not clamped to. A duration that
+        // rounds to zero in the platform `timeval` makes `connect_timeout`
+        // report `InvalidInput`, which is correctly not a timeout — so the
+        // phase would have ended as `SignerUnreachable` and told the operator
+        // the signer is not there, when what happened is that it ran out of
+        // time. Narrow window, wrong answer.
+        if remaining < Duration::from_millis(1) {
             timed_out = true;
             break;
         }
@@ -542,10 +548,16 @@ pub fn request_signed_certificate(
     );
     // The TLS handshake happens here, on the first write, so a signer that
     // accepts the connection and never completes the handshake fails as a
-    // `request` timeout rather than hanging. The write timeout is rearmed by
-    // every partial write exactly as the read timeout is by every byte, so the
-    // ceiling is checked around this too — a peer that accepts the request one
-    // byte at a time is the same shape of stall as one that answers that way.
+    // `request` timeout rather than hanging.
+    //
+    // The body itself cannot drip: it is a few KiB against a socket send
+    // buffer of tens, so the kernel takes all of it in one go whether or not
+    // the peer ever reads. What can stretch is the handshake, whose flights
+    // each rearm the write timeout the same way a read is rearmed by every
+    // byte. Hence a check after rather than a manual write loop: there is no
+    // partial-write case to drive a loop with, and the check is what turns an
+    // overlong handshake into a typed timeout instead of a silently spent
+    // budget.
     let write_result = stream
         .write_all(request.as_bytes())
         .and_then(|()| stream.flush());
@@ -824,6 +836,21 @@ mod tests {
             started.elapsed() < enroll_timeout(),
             "a 1s budget spent {:?}; the attempt was not clamped to it",
             started.elapsed()
+        );
+
+        // A nearly-spent budget must still say "ran out of time", never "not
+        // there". Clamping to a sub-millisecond duration risks the platform
+        // rounding it to zero, which `connect_timeout` reports as
+        // `InvalidInput` — correctly not a timeout, and so an answer that
+        // blames a signer which is present and merely slow.
+        assert_eq!(
+            connect_to_signer(
+                "192.0.2.1",
+                8443,
+                Instant::now() + Duration::from_micros(200)
+            )
+            .expect_err("a black-holed address cannot connect"),
+            EnrollmentFailure::SignerTimeout { stage: "connect" }
         );
     }
 
