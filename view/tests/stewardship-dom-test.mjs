@@ -316,7 +316,9 @@ describe('Stewardship conservation-status tone', () => {
       /Needs review/,
     );
 
-    const withoutPosture = await mount(trustSnapshot());
+    // readyFull now carries the T6 top-level posture; drop it to exercise the fallback.
+    const { posture: _posture, ...postureless } = trustSnapshot();
+    const withoutPosture = await mount(postureless);
     assert.equal(withoutPosture.mount.querySelector('[data-stewardship-posture]').textContent, 'Unknown');
   });
 
