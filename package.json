@@ -40,5 +40,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1"
   }
 }
