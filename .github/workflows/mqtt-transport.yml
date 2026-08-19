@@ -25,8 +25,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Mosquitto and OpenSSL
-        run: sudo apt-get update && sudo apt-get install -y mosquitto openssl
+      # openssl and python3 are preinstalled on this image; only mosquitto is
+      # missing. The timeout/retry options bound a stalled mirror connection
+      # (observed: a runner placed in a region with a broken azure.archive
+      # alias fell back to the global archive, which stalled mid-download and
+      # ate the whole 15-minute job timeout).
+      - name: Install Mosquitto
+        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends mosquitto
       - name: Install Rust
         run: rustup toolchain install 1.94.1 --profile minimal
       # The auto-enrollment tier: the runtime's CSR signed by a real `openssl
