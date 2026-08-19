@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
-import { resolve } from 'node:path';
+import { access, constants } from 'node:fs/promises';
+import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { checkReadiness, invokeRuntime, safeDetail } from '../integration/runtime.mjs';
@@ -32,7 +33,23 @@ export function assertSupportedNode(version = process.version) {
 // Resolve and verify the installed native loam runtime the same way the
 // shared Node integration does (integration/runtime.mjs + integration/paths.mjs):
 // never a PATH lookup, never a project-local copy.
+// LOAM_NATIVE_BIN is the dev/test seam (same env name bin/check-release-resolution.sh
+// and the bump-release contract test use): an absolute path to a loam binary that
+// bypasses installed-runtime resolution entirely. It exists so this repo's own
+// checkout can drive View before the runtime it builds is installed globally.
 async function resolveRuntime({ home, env = process.env, platform = process.platform, arch = process.arch } = {}) {
+  const override = env.LOAM_NATIVE_BIN;
+  if (override) {
+    if (!isAbsolute(override)) {
+      throw new LaunchError(`LOAM_NATIVE_BIN must be an absolute path to a loam binary (got ${override}).`);
+    }
+    try {
+      await access(override, constants.X_OK);
+    } catch {
+      throw new LaunchError(`LOAM_NATIVE_BIN is not an executable file: ${override}`);
+    }
+    return { ready: true, runtimePath: override };
+  }
   const globalRoot = resolveGlobalRoot({ home, env });
   const skillsRoot = resolveSkillsRoot({ home, env });
   const readiness = await checkReadiness({ globalRoot, skillsRoot, platform, arch, env, home });
@@ -99,6 +116,7 @@ export async function launch({
   openBrowserFn = openBrowser,
   publicRoot,
   listen = true,
+  open = true,
 } = {}) {
   assertSupportedNode(nodeVersion);
   const workspaceRoot = resolve(workspace);
@@ -128,8 +146,10 @@ export async function launch({
   });
   const { port } = server.address();
   const url = `http://127.0.0.1:${port}/`;
-  output.write(`Loam View is running at ${url}\n`);
-  openBrowserFn(url, { platform, output });
+  // Parseable, first: a harness that background-spawns the launcher reads this
+  // line to learn the URL, and must not have to wait on the browser opener.
+  output.write(`Loam View: ${url}\n`);
+  if (open) openBrowserFn(url, { platform, output });
 
   await new Promise((resolveClose) => {
     const shutdown = () => server.close(() => resolveClose());
@@ -140,10 +160,26 @@ export async function launch({
   return { server, workspaceRoot };
 }
 
+export function parseArgs(argv = []) {
+  const positional = [];
+  let open = true;
+  for (const arg of argv) {
+    if (arg === '--no-open') open = false;
+    else if (arg === '--') continue;
+    else if (arg.startsWith('-')) throw new LaunchError(`Unknown option ${arg}. Usage: loam view [workspace-root] [--no-open]`);
+    else positional.push(arg);
+  }
+  if (positional.length > 1) {
+    throw new LaunchError('Too many arguments. Usage: loam view [workspace-root] [--no-open]');
+  }
+  return { workspace: positional[0], open };
+}
+
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : '';
 if (invokedPath === resolve(fileURLToPath(import.meta.url))) {
   try {
-    await launch({ workspace: process.argv[2] });
+    const { workspace, open } = parseArgs(process.argv.slice(2));
+    await launch({ workspace: workspace ?? process.cwd(), open });
   } catch (error) {
     process.stderr.write(`loam view: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = Number.isInteger(error?.exitCode) ? error.exitCode : 1;

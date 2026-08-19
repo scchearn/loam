@@ -353,8 +353,10 @@ a:focus-visible,
   position: relative;
   display: inline-grid;
   place-items: center;
-  width: 1.4rem;
-  height: 1.4rem;
+  /* 24px: the WCAG 2.5.8 minimum outright, so nothing here leans on the
+     spacing exception surviving the next layout change. */
+  width: 1.5rem;
+  height: 1.5rem;
   padding: 0;
   border: var(--rule) solid var(--border);
   border-radius: var(--radius-sm);
@@ -693,7 +695,13 @@ a:focus-visible,
   font: 400 0.85rem/1.4 var(--font-sans);
 }
 
-.overview-url { font-family: var(--font-mono); font-size: 0.8rem; }
+.overview-url {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  /* A workspace root is one unbreakable token; without this it runs off a
+     narrow viewport with nothing to scroll it back into view. */
+  overflow-wrap: anywhere;
+}
 
 /* ---------- Focus card (current return point) ---------- */
 
@@ -885,7 +893,7 @@ code,
   list-style: none;
 }
 
-.query-result button {
+.query-result .result-row {
   display: grid;
   grid-template-columns: 6rem minmax(0, 1fr);
   gap: var(--space-4);
@@ -895,10 +903,11 @@ code,
   background: transparent;
   color: var(--ink-chrome);
   text-align: left;
+  cursor: pointer;
 }
 
-.query-result button:hover,
-.query-result[aria-selected="true"] button { background: var(--surface-app-active); }
+.query-result:hover .result-row,
+.query-result[aria-selected="true"] .result-row { background: var(--surface-app-active); }
 
 .result-kind {
   color: var(--accent-bright);
@@ -1145,7 +1154,25 @@ code,
 
 .inspect-link:hover { color: var(--ink-primary); }
 
+/* WCAG 2.5.8: a standalone control needs a 24px target, and this type is set
+   small by design. A transparent overlay pays for the target without moving the
+   underline off the text or changing a single visible box. */
+.inspect-link { position: relative; }
+
+.inspect-link::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: 0;
+  left: 0;
+  height: 24px;
+  transform: translateY(-50%);
+}
+
 /* ---------- Empty state (an honest gap, never a blank panel) ---------- */
+
+/* The no-snapshot panel is not a routed area, so it needs its own reveal. */
+.view.unreadable:not([hidden]) { display: block; }
 
 .view-empty {
   margin: var(--space-4) 0 0;
@@ -1358,6 +1385,30 @@ code,
 
 .timeline-kind {
   color: var(--ink-tertiary);
+  font: 600 0.66rem/1 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.timeline-copy h4 {
+  margin: var(--space-2) 0;
+  color: var(--ink-primary);
+  font: 600 1.05rem/1.25 var(--font-sans);
+}
+
+.timeline-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  margin: 0;
+  gap: var(--space-2);
+  color: var(--ink-secondary);
+  font: 400 0.72rem/1.45 var(--font-mono);
+}
+
+.timeline-strength { color: var(--ink-tertiary); }
+.timeline-path { color: var(--ink-tertiary); overflow-wrap: anywhere; }
+
 /* ---------- Atlas (DESIGN.md §2 Graph Palette, §4 card, §5 dot-grid stage) ---------- */
 
 .atlas-layout {
@@ -1378,6 +1429,8 @@ code,
 
 /* Dot-grid texture: the "field/desk" surface DESIGN.md gives the Atlas stage. */
 .atlas-stage {
+  /* Cytoscape warns and disables its UI extensions on a static container. */
+  position: relative;
   min-height: 30rem;
   background-color: var(--surface-canvas);
   background-image: radial-gradient(var(--border-faint) 1px, transparent 1px);
@@ -1434,24 +1487,6 @@ code,
   text-transform: uppercase;
 }
 
-.timeline-copy h2 {
-  margin: var(--space-2) 0;
-  color: var(--ink-primary);
-  font: 600 1.05rem/1.25 var(--font-sans);
-}
-
-.timeline-evidence {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  margin: 0;
-  gap: var(--space-2);
-  color: var(--ink-secondary);
-  font: 400 0.72rem/1.45 var(--font-mono);
-}
-
-.timeline-strength { color: var(--ink-tertiary); }
-.timeline-path { color: var(--ink-tertiary); overflow-wrap: anywhere; }
 /* The kind cell is the coloured mark that carries node identity into the text
    alternative, holding the same graph palette the canvas draws with. The node
    name itself stays in ink: colour is the mark's job, not the label's. */
@@ -1628,10 +1663,17 @@ code,
   .nav-button { min-height: 4rem; font-size: 0.56rem; }
   .nav-glyph { display: none; }
 
-  .workspace { grid-column: 1; padding-bottom: 4rem; }
+  /* The rail is fixed across the bottom of the scrollport here, so the last
+     controls need room to sit above it, and scroll-into-view has to keep that
+     room clear — otherwise focus lands underneath the rail and neither the
+     control nor its ring is visible (WCAG 2.4.11 Focus Not Obscured). */
+  .workspace { grid-column: 1; padding-bottom: 5rem; }
+  .workspace :is(a, button, summary, input, select, textarea, [tabindex]) {
+    scroll-margin-bottom: 5rem;
+  }
   .view { padding: var(--space-6) var(--space-4) var(--space-12); }
 
-  .query-result button { grid-template-columns: 1fr; gap: var(--space-2); }
+  .query-result .result-row { grid-template-columns: 1fr; gap: var(--space-2); }
 
   /* DESIGN.md §5: card rows scroll horizontally; the timeline stacks. */
   .river { grid-auto-columns: minmax(14rem, 1fr); }

@@ -17,6 +17,7 @@
  * state it had without Reader needing to understand it.
  */
 
+import { closeInspector } from './inspector.mjs';
 import { createRenderer, isSafeDocumentPath, outlineOf, readFrontMatter, splitFrontMatter } from './markdown.mjs';
 import { refresh } from './store.mjs';
 
@@ -40,19 +41,36 @@ function slug(value) {
 }
 
 /**
- * Wikilink resolution against the snapshot inventory: basename or path match,
- * case-insensitive, and unique. An ambiguous target is treated as unresolved
- * rather than guessed — the spec makes ambiguity a diagnostic, not a redirect.
+ * Wikilink resolution against the snapshot inventory, case-insensitive and
+ * unique. An ambiguous target is treated as unresolved rather than guessed —
+ * the spec makes ambiguity a diagnostic, not a redirect.
+ *
+ * Targets are tried in tiers, most specific first, and the first tier that
+ * yields exactly one artifact wins. A tier that yields several stops the search:
+ * widening the net after an ambiguity would turn a diagnostic into a guess.
+ *
+ *   1. the target as written — full path, basename, or title
+ *   2. relative to the directory of the document doing the linking
+ *   3. relative to the wiki root, i.e. a trailing run of path segments —
+ *      `[[topics/greeting]]` from `wiki/index.md` is the normal Loam
+ *      convention and matches `wiki/topics/greeting.md`
  */
-export function resolverFor(snapshot) {
+export function resolverFor(snapshot, fromPath = '') {
   const artifacts = snapshot?.artifacts ?? [];
+  const dir = String(fromPath ?? '').split('/').slice(0, -1).join('/');
   return (target) => {
     const wanted = slug(target);
-    const matches = artifacts.filter((artifact) => {
-      const path = String(artifact.path ?? '');
-      return slug(path) === wanted || slug(path.split('/').pop()) === wanted || slug(artifact.title) === wanted;
-    });
-    return matches.length === 1 ? { path: matches[0].path, title: matches[0].title } : null;
+    if (!wanted) return null;
+    const tiers = [
+      (path, title) => slug(path) === wanted || slug(path.split('/').pop()) === wanted || slug(title) === wanted,
+      (path) => Boolean(dir) && slug(path) === slug(`${dir}/${target}`),
+      (path) => slug(path).endsWith(`/${wanted}`),
+    ];
+    for (const matches of tiers) {
+      const hits = artifacts.filter((artifact) => matches(String(artifact.path ?? ''), artifact.title));
+      if (hits.length) return hits.length === 1 ? { path: hits[0].path, title: hits[0].title } : null;
+    }
+    return null;
   };
 }
 
@@ -93,6 +111,8 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
   let expectedHash = null;
   /** Where Back returns to, and the opener's own payload, verbatim. */
   let returnContext = { hash: '', detail: null };
+  /** The control that opened Reader, so Back can hand the keyboard back to it. */
+  let invoker = null;
 
   function setStatus(message) {
     statusEl.textContent = message ?? '';
@@ -156,19 +176,58 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
 
   function show() {
     if (open) return;
+    // Reader is a full-screen surface: the Inspector it may have been opened
+    // from would otherwise float above it on its own higher layer.
+    closeInspector();
     open = true;
     surface.hidden = false;
     shell?.setAttribute('aria-hidden', 'true');
+    // aria-hidden alone would leave the shell's controls in the tab order while
+    // screen readers cannot see them; `inert` takes them out of both.
+    shell?.setAttribute('inert', '');
     doc.body.classList.add('reader-open');
+    // Move focus in immediately: the document may take a fetch to arrive, and
+    // an error path never renders an article to focus.
+    surface.focus?.();
   }
 
   function hide() {
     open = false;
     surface.hidden = true;
     shell?.removeAttribute('aria-hidden');
+    shell?.removeAttribute('inert');
     doc.body.classList.remove('reader-open');
     article.replaceChildren();
     currentPath = null;
+  }
+
+  /**
+   * Hand the keyboard back to where it came from. Leaving Reader changes the
+   * route, and the view underneath re-renders on that change — which detaches
+   * the very node that opened Reader — so the control is found again by the
+   * hook it carries, and only then focused, one task after the route settles.
+   * Callers run this *after* writing the route, so the hashchange task that
+   * triggers the re-render is already queued ahead of the focus task.
+   */
+  function restoreFocus() {
+    const target = invoker;
+    invoker = null;
+    const hook = ['inspect', 'path'].map((name) => [name, target?.dataset?.[name]]).find(([, value]) => value);
+    const settle = () => {
+      const workspace = doc.querySelector('#workspace');
+      const live = target?.isConnected
+        ? target
+        : hook && doc.querySelector(`[data-${hook[0]}="${CSS?.escape ? CSS.escape(hook[1]) : hook[1]}"]`);
+      (live ?? workspace)?.focus?.();
+      // A control the re-render replaced without leaving a hook, or one sitting
+      // inside a dialog that has since closed, refuses focus silently. The
+      // keyboard must never be stranded on <body> after leaving Reader.
+      if (!doc.activeElement || doc.activeElement === doc.body) workspace?.focus?.();
+    };
+    // A programmatic hash write delivers its hashchange as a task; this runs
+    // after it, so the re-rendered view is the one being focused into.
+    if (typeof win.setTimeout === 'function') win.setTimeout(settle, 0);
+    else settle();
   }
 
   async function loadDocument(path, fragment = '') {
@@ -211,7 +270,7 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
     const renderer = createRenderer({
       window: win,
       basePath: path,
-      resolve: resolverFor(getSnapshot()),
+      resolve: resolverFor(getSnapshot(), path),
     });
     // The only insertion point for document content: a sanitized fragment.
     article.replaceChildren(renderer.render(body));
@@ -230,8 +289,15 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
   function openPath(path, { detail = null, fragment = '' } = {}) {
     const hash = String(win.location?.hash ?? '');
     if (!open) {
-      // Remember exactly where the human was before Reader covered the shell.
+      // Closing the Inspector first hands focus back to the shell control that
+      // opened it, which is the control Back should return the keyboard to —
+      // an Inspector link would be inside a panel that is inert by then.
+      closeInspector();
+      // Remember exactly where the human was before Reader covered the shell —
+      // both the route and the control that sent them here, so Back restores
+      // the keyboard position as well as the view.
       returnContext = { hash, detail: detail?.return ?? detail?.context ?? detail ?? null };
+      invoker = doc.activeElement;
     }
     const target = `#/reader/${encodeURIComponent(path)}${fragment ? `#${fragment}` : ''}`;
     if (hash !== target) {
@@ -251,6 +317,7 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
     if (String(win.location?.hash ?? '') !== context.hash) win.location.hash = context.hash;
     const CustomEventCtor = doc.defaultView?.CustomEvent ?? CustomEvent;
     doc.dispatchEvent(new CustomEventCtor('loam:reader-closed', { detail: context.detail }));
+    restoreFocus();
   }
 
   backButton.addEventListener('click', back);
@@ -296,6 +363,7 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
       loadDocument(route.path, route.fragment);
     } else if (open) {
       hide();
+      restoreFocus();
     }
   }
 

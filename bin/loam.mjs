@@ -39,7 +39,7 @@ export async function main(argv = process.argv.slice(2), output = process.stdout
     }
     if (parsed.command === 'view') {
       const { launch } = await import('../view/launch.mjs');
-      await launch({ workspace: parsed.workspace, output, errorOutput });
+      await launch({ workspace: parsed.workspace, open: parsed.open, output, errorOutput });
       return EXIT_CODES.OK;
     }
   } catch (error) {

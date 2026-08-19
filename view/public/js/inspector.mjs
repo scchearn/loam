@@ -262,6 +262,9 @@ export function initInspector({ root = document, getSnapshot = () => null } = {}
 
     panel.classList.add('is-open');
     panel.setAttribute('aria-hidden', 'false');
+    // The closed panel stays in the layout (it slides out), so it must be inert
+    // or its controls keep taking Tab stops while invisible.
+    panel.removeAttribute('inert');
     scrim.classList.add('is-open');
     // Modality without layout change: the view beneath keeps its exact box.
     shell?.setAttribute('inert', '');
@@ -273,6 +276,7 @@ export function initInspector({ root = document, getSnapshot = () => null } = {}
     generation += 1;
     panel.classList.remove('is-open');
     panel.setAttribute('aria-hidden', 'true');
+    panel.setAttribute('inert', '');
     scrim.classList.remove('is-open');
     shell?.removeAttribute('inert');
     // Focus is restored only after the shell is interactive again.

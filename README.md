@@ -212,6 +212,26 @@ language, and the **Using** router matches it to the right skill.
 - "Audit the AGENTS.md": scores, prunes stale content, adds missing commands
 - "Set up loam" / "scaffold a knowledge base": creates the wiki structure
 
+## Loam View
+
+A local, read-only window onto one workspace: five areas over a single
+`loam state --view` snapshot — Pulse (what needs attention), Atlas (how things
+connect), Work Stream (why work exists and how far it got), Chronicle (how
+understanding changed), Stewardship (whether memory can be trusted).
+
+Ask your harness for it — "open loam view" — and the **Using** router
+background-spawns the launcher and hands you the URL. From a terminal:
+
+```bash
+npx @scchearn/loam view [workspace-root]
+```
+
+Requires Node.js >= 22. It is read-only, binds loopback only, and exports
+nothing; there is no flag to change any of that.
+
+See [Loam View](./docs/loam-view.md) for the full guide, including the
+background-spawn pattern for harness agents.
+
 ## Skill metrics
 
 Skills load into an agent's context window, so loam keeps each one small. A
@@ -236,7 +256,7 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::querying-memory | 530 | 105 | 175 | 1,586 |
 | loam::reviewing-memory | 510 | 113 | 137 | 1,787 |
 | loam::syncing-code-graph | 363 | 84 | 223 | 2,770 |
-| loam::using | 368 | 77 | 244 | 4,063 |
+| loam::using | 368 | 77 | 264 | 4,344 |
 | loam::amending-plan | 437 | 88 | 273 | 3,059 |
 | loam::checkpointing | 365 | 69 | 178 | 2,126 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,176 |
@@ -250,6 +270,7 @@ the skill runs. The table below shows how much space each skill uses against the
 ## Documentation
 
 - [Why loam](./WHY.md): why this exists, the rediscovery-cost problem and the substrate bet
+- [Loam View](./docs/loam-view.md): the local read-only workspace view, how to open it, and its boundaries
 
 ## License
 

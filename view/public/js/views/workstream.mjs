@@ -345,6 +345,8 @@ export function initWorkStream({ root = document } = {}) {
     if (!chains.length) {
       const empty = el('p', 'view-empty', 'No goals, specs, or plans are inventoried in this snapshot, so there is no work to trace.');
       empty.dataset.empty = 'work';
+      // Honest empty states name the move that would fill them.
+      empty.append(doc.createTextNode(' Start one with '), el('code', 'code-chip', '/loam::setting-goals'), doc.createTextNode(', then Refresh.'));
       mount.appendChild(empty);
       return;
     }

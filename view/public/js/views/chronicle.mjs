@@ -90,7 +90,7 @@ export function initChronicle({ root = document } = {}) {
       event.strength === 'strong' ? 'strong' : 'source',
     ));
     copy.appendChild(head);
-    copy.appendChild(el('h2', null, event.title || readable(event.kind)));
+    copy.appendChild(el('h4', null, event.title || readable(event.kind)));
 
     const evidence = event.evidence ?? {};
     const artifact = (shown.artifacts ?? []).find((entry) => entry.path === evidence.path);
@@ -134,6 +134,8 @@ export function initChronicle({ root = document } = {}) {
     if (!counted.length) {
       const empty = el('p', 'view-empty', 'No evidence-backed events in this snapshot. Chronicle reads recorded events only — lifecycle fields, log headings, checkpoints, goal reviews, and git commits. File modification times are not project history and are never turned into events.');
       empty.dataset.empty = 'chronicle';
+      // Honest empty states name the move that would fill them.
+      empty.append(doc.createTextNode(' Record one with '), el('code', 'code-chip', '/loam::checkpointing'), doc.createTextNode(', then Refresh.'));
       band.appendChild(empty);
       mount.appendChild(band);
       return;

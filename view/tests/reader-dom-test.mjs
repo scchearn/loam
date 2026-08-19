@@ -23,6 +23,7 @@ const SNAPSHOT = {
     { path: 'wiki/alpha.md', title: 'Alpha', kind: 'topic', content_hash: 'aaa' },
     { path: 'wiki/beta.md', title: 'Beta', kind: 'topic', content_hash: 'bbb' },
     { path: 'wiki/code/one.md', title: 'One', kind: 'code', content_hash: 'ccc' },
+    { path: 'wiki/root-relative.md', title: 'Root Relative', kind: 'topic', content_hash: 'ddd' },
   ],
 };
 
@@ -55,6 +56,13 @@ const DOCUMENTS = {
     snapshot_hash: 'bbb',
     changed_since_snapshot: true,
   },
+  // Targets written against the wiki root, the way loam's own pages write them.
+  'wiki/root-relative.md': {
+    content: '# Root Relative\n\nSee [[code/one|One]].\n',
+    content_hash: 'ddd',
+    snapshot_hash: 'ddd',
+    changed_since_snapshot: false,
+  },
 };
 
 function mount({ hash = '' } = {}) {
@@ -81,6 +89,9 @@ function mount({ hash = '' } = {}) {
   });
   return { dom, doc: dom.window.document, win: dom.window, reader, reads, refreshCount: () => refreshes };
 }
+
+/** Focus is restored one task after Back, so the re-rendered view is the target. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 /** The Query palette and Inspector both announce an open through an event. */
 function announce(dom, detail, name = 'loam:open-reader') {
@@ -114,6 +125,47 @@ describe('wikilink resolution', () => {
     assert.equal(resolve('Nowhere'), null);
     const ambiguous = resolverFor({ artifacts: [{ path: 'a/x.md' }, { path: 'b/x.md' }] });
     assert.equal(ambiguous('x'), null);
+  });
+
+  it('resolves a wiki-root-relative target, the normal Loam convention', () => {
+    const snapshot = {
+      artifacts: [
+        { path: 'wiki/index.md', title: 'Index' },
+        { path: 'wiki/topics/greeting.md', title: 'Greeting' },
+        { path: 'wiki/code/_index.md', title: 'Code graph' },
+      ],
+    };
+    const fromIndex = resolverFor(snapshot, 'wiki/index.md');
+    assert.deepEqual(fromIndex('topics/greeting'), { path: 'wiki/topics/greeting.md', title: 'Greeting' });
+    assert.deepEqual(fromIndex('code/_index'), { path: 'wiki/code/_index.md', title: 'Code graph' });
+  });
+
+  it('resolves a target written relative to the linking document', () => {
+    const snapshot = {
+      artifacts: [
+        { path: 'wiki/topics/greeting.md', title: 'Greeting' },
+        { path: 'wiki/topics/parting.md', title: 'Parting' },
+      ],
+    };
+    const fromGreeting = resolverFor(snapshot, 'wiki/topics/greeting.md');
+    assert.deepEqual(fromGreeting('parting'), { path: 'wiki/topics/parting.md', title: 'Parting' });
+  });
+
+  it('stops at the tier that is ambiguous instead of widening the net', () => {
+    const snapshot = { artifacts: [{ path: 'wiki/a/x.md' }, { path: 'wiki/b/x.md' }] };
+    assert.equal(resolverFor(snapshot, 'wiki/index.md')('x'), null);
+  });
+
+  it('renders a wiki-root-relative wikilink as a live link, not a broken one', async () => {
+    const { dom, doc } = mount({ hash: '' });
+    await announce(dom, { path: 'wiki/root-relative.md' });
+
+    const article = doc.querySelector('[data-reader-doc]');
+    assert.equal(article.querySelectorAll('.wikilink.is-broken').length, 0, 'the target is inventoried');
+    const link = article.querySelector('a.wikilink.is-resolved');
+    assert.ok(link, 'a resolved wikilink must be activatable');
+    assert.equal(link.getAttribute('href'), `#/reader/${encodeURIComponent('wiki/code/one.md')}`);
+    assert.equal(link.textContent, 'One');
   });
 });
 
@@ -230,6 +282,70 @@ describe('reader surface', () => {
     assert.equal(doc.querySelector('[data-reader]').hidden, true);
     assert.equal(doc.querySelector('[data-app-shell]').hasAttribute('aria-hidden'), false);
     assert.deepEqual(closed, [inspectorState], 'the opener state is handed back untouched');
+  });
+
+  it('takes the shell out of the tab order and moves focus into Reader', async () => {
+    const { dom, doc } = mount({ hash: '#/pulse' });
+    const shell = doc.querySelector('[data-app-shell]');
+    const invoker = doc.querySelector('[data-refresh]');
+    invoker.focus();
+
+    await announce(dom, { path: 'wiki/alpha.md' });
+    assert.equal(shell.hasAttribute('inert'), true, 'the covered shell must be inert, not just aria-hidden');
+    assert.ok(
+      doc.querySelector('[data-reader]').contains(doc.activeElement),
+      'focus must move inside Reader, not stay on the covered shell',
+    );
+
+    doc.querySelector('[data-reader-back]').click();
+    assert.equal(shell.hasAttribute('inert'), false, 'Back must hand the shell back');
+    await settle();
+    assert.equal(doc.activeElement, invoker, 'Back must restore focus to the control that opened Reader');
+  });
+
+  it('falls back to the workspace region when the opener can no longer take focus', async () => {
+    const { dom, doc } = mount({ hash: '#/pulse' });
+    const invoker = doc.querySelector('[data-refresh]');
+    invoker.focus();
+
+    await announce(dom, { path: 'wiki/alpha.md' });
+    // The opener is gone by the time Back runs — a re-render dropped it, or it
+    // lived in a dialog that has since closed.
+    invoker.remove();
+
+    doc.querySelector('[data-reader-back]').click();
+    await settle();
+    assert.notEqual(doc.activeElement, doc.body, 'the keyboard must never be stranded on <body>');
+    assert.equal(doc.activeElement, doc.querySelector('#workspace'));
+  });
+
+  it('closes the Inspector it was opened from and returns the keyboard to the shell', async () => {
+    const { dom, doc } = mount({ hash: '#/atlas' });
+    const { initInspector, openInspector } = await import('../public/js/inspector.mjs');
+    initInspector({ root: doc, getSnapshot: () => SNAPSHOT });
+
+    const invoker = doc.querySelector('[data-refresh]');
+    invoker.focus();
+    openInspector(SNAPSHOT.artifacts[0]);
+    const panel = doc.querySelector('[data-inspector]');
+    assert.equal(panel.classList.contains('is-open'), true);
+
+    await announce(dom, { path: 'wiki/alpha.md' });
+    assert.equal(panel.classList.contains('is-open'), false, 'a full-screen Reader must not leave the Inspector floating above it');
+
+    doc.querySelector('[data-reader-back]').click();
+    await settle();
+    assert.equal(doc.activeElement, invoker, 'Back returns to the shell control, not to a control inside the closed panel');
+  });
+
+  it('moves focus into Reader even when the document cannot be read', async () => {
+    const { dom, doc } = mount({ hash: '#/pulse' });
+    await announce(dom, { path: 'wiki/missing.md' });
+    assert.ok(
+      doc.querySelector('[data-reader]').contains(doc.activeElement),
+      'an error state must still be reachable by keyboard',
+    );
+    assert.match(doc.querySelector('[data-reader-status]').textContent, /could not be read/);
   });
 
   it('accepts the Query palette event name as the same contract', async () => {

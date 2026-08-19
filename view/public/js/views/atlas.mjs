@@ -56,6 +56,38 @@ const CLUSTER_BY_KIND = new Map(CLUSTERS.flatMap(({ id, kinds }) => kinds.map((k
 /** An endpoint we cannot classify is a memory-health question, so it lands there. */
 const UNKNOWN_CLUSTER = 'memory';
 
+/**
+ * What to say when a projection has no nodes. The map must never imply the
+ * project is empty when the real reason is that a capability is not set up, so
+ * the reason comes from the snapshot's own capability states and each one names
+ * the exact next action.
+ */
+export function emptyStateFor(snapshot, projection) {
+  const capability = (id) => snapshot?.capabilities?.[id]?.state ?? 'absent';
+  if (capability('wiki') !== 'ready') {
+    return {
+      message: 'Nothing to map: this workspace has no memory substrate yet, so there are no pages, concepts, or code pages to connect.',
+      command: '/loam::scaffolding-wiki <goal>',
+    };
+  }
+  if (projection === 'code' && capability('code_graph') !== 'ready') {
+    return {
+      message: 'Nothing to map in Code: this workspace has memory but no code graph, so no source file has a page to link.',
+      command: '/loam::ingesting-codebase',
+    };
+  }
+  if (projection === 'work' && capability('goals') !== 'ready' && capability('work') !== 'ready') {
+    return {
+      message: 'Nothing to map in Work: no goals, specs, or plans are inventoried in this snapshot.',
+      command: '/loam::setting-goals',
+    };
+  }
+  return {
+    message: 'This projection has no nodes. Memory exists, but nothing in it links to anything this projection shows — add wikilinks between pages, or try another projection.',
+    command: null,
+  };
+}
+
 /* ---------------------------------------------------------------- projection */
 
 /** Degree first, then path, so a projection is stable across renders. */
@@ -179,9 +211,15 @@ export function projectGraph(snapshot, { projection = 'architecture', focus = nu
  * rather than restating the palette here as sRGB literals that could drift from
  * tokens.css. A value the context will not take is dropped, never invented.
  */
-function canvasToken(doc, win) {
+export function canvasToken(doc, win) {
   const styles = win.getComputedStyle?.(doc.documentElement);
-  const context = doc.createElement('canvas').getContext('2d');
+  const canvas = doc.createElement('canvas');
+  canvas.width = 1;
+  canvas.height = 1;
+  const context = canvas.getContext?.('2d', { willReadFrequently: true });
+  // `copy` makes each fill replace the pixel outright, so a token's own alpha
+  // survives instead of compositing over whatever was painted before.
+  if (context) context.globalCompositeOperation = 'copy';
   return (name) => {
     const raw = styles?.getPropertyValue(name).trim() ?? '';
     if (!raw || !context) return '';
@@ -189,7 +227,17 @@ function canvasToken(doc, win) {
     // no token uses tells "parsed" and "rejected" apart.
     context.fillStyle = '#010101';
     context.fillStyle = raw;
-    return context.fillStyle === '#010101' ? '' : context.fillStyle;
+    if (context.fillStyle === '#010101') return '';
+    // Reading fillStyle back is no longer a conversion: a browser that supports
+    // OKLCH serialises `oklch(...)` straight back, and Cytoscape's own parser
+    // rejects it, which is how the palette silently fell back to defaults.
+    // Painting one pixel and reading it makes the browser do the OKLCH -> sRGB
+    // conversion for real, so the palette still comes from tokens.css alone.
+    context.fillRect(0, 0, 1, 1);
+    const [red, green, blue, alpha] = context.getImageData(0, 0, 1, 1).data;
+    return alpha === 255
+      ? `rgb(${red}, ${green}, ${blue})`
+      : `rgba(${red}, ${green}, ${blue}, ${Number((alpha / 255).toFixed(3))})`;
   };
 }
 
@@ -363,8 +411,13 @@ export function initAtlas({ root = document, getSnapshot = () => state.snapshot 
 
   parity.append(table, edgeHeading, edgeList, key);
   layout.append(map, parity);
-  band.append(head, layout);
-  mount.replaceChildren(band);
+
+  // Read before both the canvas and the parity table: an empty map states why
+  // it is empty rather than looking like a project with nothing in it.
+  const emptyNote = el('p', 'view-empty');
+  emptyNote.dataset.empty = 'atlas';
+  emptyNote.hidden = true;
+  band.append(head, emptyNote, layout);
 
   /* ---- per-render fills ---- */
 
@@ -461,6 +514,20 @@ export function initAtlas({ root = document, getSnapshot = () => state.snapshot 
     edgeList.replaceChildren(...items);
   }
 
+  function renderEmpty() {
+    if (view.nodes.length) {
+      emptyNote.hidden = true;
+      emptyNote.replaceChildren();
+      return;
+    }
+    const { message, command } = emptyStateFor(getSnapshot(), view.projection);
+    emptyNote.replaceChildren(doc.createTextNode(message));
+    if (command) {
+      emptyNote.append(doc.createTextNode(' Next: '), el('code', 'code-chip', command));
+    }
+    emptyNote.hidden = false;
+  }
+
   function renderScope() {
     const label = view.mode === 'overview'
       ? 'All clusters'
@@ -503,19 +570,32 @@ export function initAtlas({ root = document, getSnapshot = () => state.snapshot 
 
     cy.elements().remove();
     cy.add(graphElements(view));
+    // The container's real size is only known once the stylesheet has laid the
+    // card out, and compound cluster bounds settle after the layout runs — so
+    // measure first and fit after, or the map draws clipped past its own edges.
+    cy.resize?.();
     cy.layout(view.mode === 'overview'
       ? { name: 'cose', animate: false, randomize: false, padding: 24 }
       : { name: 'concentric', animate: false, padding: 24, concentric: (node) => (node.hasClass('seed') ? 2 : 1) })
       .run();
+    cy.fit?.(undefined, 24);
   }
 
   function render() {
+    // With nothing read, "no pages to connect" would be a claim about the
+    // workspace rather than about the snapshot. The shell says so once instead.
+    if (!getSnapshot()) {
+      mount.replaceChildren();
+      return;
+    }
+    if (!mount.contains(band)) mount.replaceChildren(band);
     view = projectGraph(getSnapshot(), chosen);
     // A focus that the current snapshot no longer resolves falls back to clusters.
     chosen.focus = view.focus;
     for (const button of filters.querySelectorAll('button')) {
       button.setAttribute('aria-pressed', String(button.dataset.projection === view.projection));
     }
+    renderEmpty();
     renderScope();
     renderTable();
     renderEdges();

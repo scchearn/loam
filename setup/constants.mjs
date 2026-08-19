@@ -57,7 +57,7 @@ Usage:
   npx @scchearn/loam setup [--federation enable|disable] [--integration <id>]... [--purge] [--yes] [--dry-run]
   npx @scchearn/loam doctor
   npx @scchearn/loam uninstall [--yes] [--purge]
-  npx @scchearn/loam view [workspace-root]
+  npx @scchearn/loam view [workspace-root] [--no-open]
   npx @scchearn/loam --help
   npx @scchearn/loam --version
 
@@ -74,6 +74,7 @@ Commands:
   uninstall   Remove global Loam skills, runtime, integration, and hook entries
               (preserves the federation profile; --purge destroys it).
   view        Launch the local read-only Loam View at the given workspace root
+              --no-open serves and prints the URL without opening a browser
               (default: current directory).
 
 Options:

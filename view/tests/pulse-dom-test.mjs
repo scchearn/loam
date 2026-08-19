@@ -164,6 +164,12 @@ describe('Pulse copy-prompt affordance', () => {
         controls[0].dataset.copyPrompt,
         `Run loam ${command} to address: ${message}`,
       );
+      // Identical names across a dozen controls would tell a screen-reader user
+      // nothing about which signal they are copying.
+      assert.equal(
+        controls[0].getAttribute('aria-label'),
+        `Copy a paste-ready prompt for your agent: ${message}`,
+      );
     }
   });
 
@@ -207,6 +213,9 @@ describe('Pulse briefing composition', () => {
 
     assert.ok(root.querySelector('[data-pulse-overview].panel-dotted'), 'dotted overview box');
     assert.ok(root.querySelector('[data-pulse-metrics]'), 'evidence-metrics band');
+    // The metrics row scrolls sideways and holds no control of its own, so it
+    // needs its own tab stop or the cards past the fold are keyboard-only dead.
+    assert.equal(root.querySelector('[data-pulse-metrics] .card-row').tabIndex, 0);
     assert.ok(root.querySelector('[data-pulse-advisor]'), 'advisor band');
     assert.ok(root.querySelector('[data-pulse-focus]'), 'current return point');
 

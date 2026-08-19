@@ -131,10 +131,15 @@ const CARD_TONE = { critical: 'critical', watch: 'warn' };
 /** A capability that simply is not set up reads as neutral, never as a fault. */
 const NEUTRAL_CAPABILITY = /^(absent|unconfigured|not-configured|unavailable|disabled)$/;
 
-/** Evidence is an object, an array of them, or null; only `path` is rendered. */
+/**
+ * Evidence is an object, an array of them, or null, and the producer also emits
+ * bare path strings (artifact-parse does); only paths are rendered.
+ */
 function evidencePaths(evidence) {
   const items = Array.isArray(evidence) ? evidence : [evidence];
-  return items.map((item) => item?.path).filter((path) => typeof path === 'string' && path);
+  return items
+    .map((item) => (typeof item === 'string' ? item : item?.path))
+    .filter((path) => typeof path === 'string' && path);
 }
 
 /** The findings this snapshot emitted, normalised to one card shape. */
@@ -306,9 +311,20 @@ export function renderStewardship(doc, snapshot, target) {
   grid.setAttribute('role', 'list');
   for (const row of rows) grid.append(card(doc, row, inventory));
 
-  const band = maker(doc)('section', 'band');
+  const el = maker(doc);
+  const band = el('section', 'band');
   band.setAttribute('aria-label', 'Trust signals');
-  band.append(grid);
+
+  // Every other band in the app carries a heading; without one, heading
+  // navigation files all twelve signals under Conservation status.
+  const head = el('header', 'band-head');
+  const title = el('h2', 'band-title');
+  const drag = el('span', 'drag', '⠿');
+  drag.setAttribute('aria-hidden', 'true');
+  title.append(drag, doc.createTextNode('Trust signals'));
+  head.append(title, el('span', 'pill', `${rows.length} signal${rows.length === 1 ? '' : 's'}`));
+
+  band.append(head, grid);
 
   target.replaceChildren(renderSummary(doc, snapshot, rows), band);
 }

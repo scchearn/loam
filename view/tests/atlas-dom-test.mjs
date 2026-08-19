@@ -17,7 +17,7 @@ import { JSDOM, VirtualConsole } from 'jsdom';
 import { boot } from '../public/js/app.mjs';
 import { initInspector } from '../public/js/inspector.mjs';
 import { state } from '../public/js/store.mjs';
-import { CLUSTERS, MAX_NODES, PROJECTIONS, initAtlas, projectGraph } from '../public/js/views/atlas.mjs';
+import { CLUSTERS, MAX_NODES, PROJECTIONS, canvasToken, emptyStateFor, initAtlas, projectGraph } from '../public/js/views/atlas.mjs';
 
 const PUBLIC_ROOT = new URL('../public/', import.meta.url);
 const html = await readFile(new URL('index.html', PUBLIC_ROOT), 'utf8');
@@ -132,7 +132,7 @@ function jsonResponse(body, status = 200) {
 }
 
 /** Boot the real shell, wire the Inspector as main.mjs does, then mount Atlas. */
-async function mount() {
+async function mount(served = snapshot) {
   // jsdom reports the missing canvas backend as a jsdomError; Atlas is expected
   // to fall back to a headless graph, so the noise is not a test signal.
   const virtualConsole = new VirtualConsole();
@@ -140,7 +140,7 @@ async function mount() {
   globalThis.document = dom.window.document;
   globalThis.fetch = async (url) => {
     const { pathname } = new URL(url, 'http://127.0.0.1:8000');
-    if (pathname === '/api/snapshot') return jsonResponse(snapshot);
+    if (pathname === '/api/snapshot') return jsonResponse(served);
     return jsonResponse({ error: 'not_found' }, 404);
   };
 
@@ -171,6 +171,115 @@ async function mount() {
 afterEach(() => {
   globalThis.fetch = realFetch;
   delete globalThis.document;
+});
+
+/* ---------- graph palette ---------- */
+
+describe('graph colours reach the canvas as sRGB', () => {
+  /**
+   * A stub 2D context that behaves like a modern browser's: it accepts OKLCH and
+   * serialises it straight back (which is exactly why reading `fillStyle` is not
+   * a conversion), and it paints a known pixel.
+   */
+  function stubDoc(tokens, pixel, { rejects = [] } = {}) {
+    let fillStyle = '';
+    const context = {
+      globalCompositeOperation: 'source-over',
+      // A real context silently ignores an unparseable assignment, leaving the
+      // previous value standing; that is what the sentinel check relies on.
+      get fillStyle() { return fillStyle; },
+      set fillStyle(value) { if (!rejects.includes(value)) fillStyle = value; },
+      fillRect() {},
+      getImageData: () => ({ data: pixel }),
+    };
+    const doc = { createElement: () => ({ getContext: () => context }), documentElement: {} };
+    const win = { getComputedStyle: () => ({ getPropertyValue: (name) => tokens[name] ?? '' }) };
+    return { token: canvasToken(doc, win), context };
+  }
+
+  it('converts an OKLCH token through a painted pixel, not through fillStyle', () => {
+    const { token, context } = stubDoc(
+      { '--node-code': 'oklch(68% 0.11 244)' },
+      [95, 165, 235, 255],
+    );
+    assert.equal(token('--node-code'), 'rgb(95, 165, 235)');
+    assert.equal(context.globalCompositeOperation, 'copy', 'the fill must replace, not composite');
+  });
+
+  it('keeps a token’s alpha', () => {
+    const { token } = stubDoc({ '--border': 'oklch(100% 0 0 / 0.09)' }, [255, 255, 255, 23]);
+    assert.equal(token('--border'), 'rgba(255, 255, 255, 0.09)');
+  });
+
+  it('drops a token the browser will not parse rather than inventing one', () => {
+    const { token } = stubDoc({ '--bogus': 'not-a-colour' }, [0, 0, 0, 255], { rejects: ['not-a-colour'] });
+    assert.equal(token('--bogus'), '', 'an unparseable token is dropped, never guessed');
+    assert.equal(token('--missing'), '');
+  });
+});
+
+/* ---------- honest empty states ---------- */
+
+describe('Atlas on a snapshot nobody could read', () => {
+  it('renders nothing rather than claiming the workspace has no substrate', async () => {
+    const { doc } = await mount(null);
+
+    const target = doc.querySelector('[data-mount="atlas"]');
+    assert.equal(
+      target.textContent.trim(),
+      '',
+      '"no pages to connect" is a claim about the workspace; with no snapshot it is unfounded',
+    );
+    assert.equal(target.querySelector('[data-empty="atlas"]'), null);
+  });
+});
+
+describe('an empty Atlas says why it is empty', () => {
+  const capabilities = (overrides = {}) => ({
+    wiki: { state: 'ready' },
+    code_graph: { state: 'absent' },
+    goals: { state: 'absent' },
+    work: { state: 'absent' },
+    ...overrides,
+  });
+
+  it('blames the missing capability, not the project, and names the next action', () => {
+    assert.match(
+      emptyStateFor({ capabilities: capabilities({ wiki: { state: 'absent' } }) }, 'architecture').command,
+      /scaffolding-wiki/,
+    );
+    assert.match(emptyStateFor({ capabilities: capabilities() }, 'code').command, /ingesting-codebase/);
+    assert.match(emptyStateFor({ capabilities: capabilities() }, 'work').command, /setting-goals/);
+
+    // Memory and a code graph both present: the honest reason is that nothing links.
+    const linked = emptyStateFor(
+      { capabilities: capabilities({ code_graph: { state: 'ready' } }) },
+      'code',
+    );
+    assert.equal(linked.command, null);
+    assert.match(linked.message, /links|projection/);
+  });
+
+  it('renders the reason above the map when a projection has no nodes', async () => {
+    const bare = {
+      ...snapshot,
+      capabilities: { ...snapshot.capabilities, wiki: { state: 'absent', required: true, reason: null, evidence: null } },
+      artifacts: [],
+      relationships: [],
+    };
+    const { doc } = await mount(bare);
+
+    const note = doc.querySelector('[data-empty="atlas"]');
+    assert.ok(note, 'an empty map must explain itself');
+    assert.equal(note.hidden, false);
+    assert.match(note.textContent, /no memory substrate/i);
+    assert.match(note.querySelector('code').textContent, /loam::scaffolding-wiki/);
+  });
+
+  it('hides the explanation as soon as the projection has nodes', async () => {
+    const { doc } = await mount();
+    assert.equal(doc.querySelector('[data-empty="atlas"]').hidden, true);
+  });
 });
 
 /* ---------- boundedness: the projection itself ---------- */

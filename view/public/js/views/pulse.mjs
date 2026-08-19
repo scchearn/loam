@@ -120,6 +120,10 @@ function renderOverview(doc, snapshot) {
   const search = el(doc, 'button', 'ghost-btn', 'Search ');
   search.type = 'button';
   search.dataset.pulseSearch = '';
+  // The glyph is the DESIGN.md label; the accessible name states the real
+  // bindings instead of a Mac-only symbol every platform would hear read out.
+  search.setAttribute('aria-label', 'Search');
+  search.setAttribute('aria-keyshortcuts', 'Control+K Meta+K');
   search.append(el(doc, 'kbd', null, '⌘K'));
   search.addEventListener('click', () => doc.querySelector('[data-query-open]')?.click());
   sub.append(search);
@@ -230,6 +234,10 @@ function renderMetrics(doc, snapshot) {
 
   const row = el(doc, 'div', 'card-row');
   row.setAttribute('role', 'list');
+  // This row scrolls horizontally and holds no control of its own, so without a
+  // tab stop a keyboard-only human cannot reach the cards past the fold. Newer
+  // Chrome focuses such scrollers by itself; this makes it true everywhere.
+  row.tabIndex = 0;
 
   for (const card of METRIC_CARDS) {
     const article = el(doc, 'article', 'metric-card');
@@ -281,10 +289,15 @@ function glyphFor(key) {
   return CATEGORY_GLYPH.find(([pattern]) => pattern.test(key))?.[1] ?? 'i-shield';
 }
 
-/** Evidence is an object, an array of them, or null; only `path` interests Pulse. */
+/**
+ * Evidence is an object, an array of them, or null, and the producer also emits
+ * bare path strings (artifact-parse does); only paths interest Pulse.
+ */
 function evidencePaths(evidence) {
   const items = Array.isArray(evidence) ? evidence : [evidence];
-  return items.map((item) => item?.path).filter((path) => typeof path === 'string' && path);
+  return items
+    .map((item) => (typeof item === 'string' ? item : item?.path))
+    .filter((path) => typeof path === 'string' && path);
 }
 
 /**

@@ -313,6 +313,17 @@ describe('Work Stream traceability river', () => {
   });
 });
 
+describe('Work Stream on a workspace with no work', () => {
+  it('says what is missing and names the next action', async () => {
+    const { workStream } = await mount(snapshotWith({ artifacts: [], relationships: [] }));
+
+    const empty = workStream.querySelector('[data-empty="work"]');
+    assert.ok(empty, 'an empty river must explain itself');
+    assert.match(text(empty), /No goals, specs, or plans/);
+    assert.match(empty.querySelector('code')?.textContent ?? '', /loam::setting-goals/);
+  });
+});
+
 describe('Chronicle evidence timeline', () => {
   it('groups events by day, newest first, with strong sources leading each group', async () => {
     const { chronicle } = await mount();
@@ -330,6 +341,23 @@ describe('Chronicle evidence timeline', () => {
       ['e-checkpoint', 'e-commit'],
       'a strong lifecycle event leads the day; the git commit follows it',
     );
+  });
+
+  it('nests event headings under their day group so the outline stays walkable', async () => {
+    const { chronicle } = await mount();
+
+    const levels = [...chronicle.querySelectorAll('h1, h2, h3, h4')].map((h) => Number(h.tagName[1]));
+    assert.ok(levels.length > 3);
+    for (const [index, level] of levels.entries()) {
+      if (index === 0) continue;
+      assert.ok(
+        level <= levels[index - 1] + 1,
+        `heading ${index} jumps from h${levels[index - 1]} to h${level}`,
+      );
+    }
+    const day = chronicle.querySelector('[data-day]');
+    assert.equal(day.querySelector('h3').className, 'timeline-day-label');
+    assert.ok(day.querySelector('[data-event] h4'), 'an event title sits below its day label');
   });
 
   it('labels git commits by source strength and links inventoried evidence into Reader', async () => {
@@ -358,6 +386,7 @@ describe('Chronicle evidence timeline', () => {
     const empty = chronicle.querySelector('[data-empty]');
     assert.ok(empty, 'an empty timeline says why it is empty');
     assert.match(text(empty), /modification time|mtime/i, 'and names the chronology it refuses to infer');
+    assert.match(empty.querySelector('code')?.textContent ?? '', /loam::checkpointing/, 'and names the next action');
   });
 
   it('reports the evidence mix honestly instead of a bare count', async () => {
