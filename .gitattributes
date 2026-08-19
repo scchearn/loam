@@ -3,3 +3,5 @@ tests/fixtures/harvest/**/*.txt text eol=lf
 tests/fixtures/harvest/**/*.json text eol=lf
 tests/fixtures/harvest/**/*.jsonl text eol=lf
 tests/fixtures/harvest/**/*.db -text
+cli/tests/fixtures/view/** text eol=lf
+cli/tests/fixtures/view/degraded/wiki/code/corrupt.md -text
