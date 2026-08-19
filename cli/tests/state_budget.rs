@@ -61,9 +61,17 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
         .expect("checkpoint");
     }
 
-    // The hcom probe's WORST case, deliberately: no launcher env marker to
+    // The hcom probe's worst case, deliberately: no launcher env marker to
     // short-circuit on, so the fixture pays the full ladder — directory
     // resolution plus one health-check spawn — inside the same budget.
+    //
+    // "Worst case" holds on unix only. The fake is a `#!/bin/sh` script named
+    // `hcom`, and the Rust ladder matches `hcom.exe` on Windows (see
+    // `hcom_readiness`), so the windows leg pays the stat walk and stops there.
+    // Measuring the spawn there too would mean committing a real `.exe` — a
+    // `.cmd` shim does not match the `.exe`-only rung — which is not worth a
+    // binary in the tree for a rung whose cost is bounded by
+    // `HCOM_HEALTH_TIMEOUT` anyway.
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("bin directory");
     let fake = bin.join("hcom");
@@ -114,6 +122,7 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
     assert!(!stdout.contains("code_ingest_pending"), "{stdout}");
     // The measured run really did walk the whole hcom ladder, spawn included —
     // a probe that silently stopped detecting would make this budget meaningless.
+    // Unix only, for the reason the fixture comment above gives.
     #[cfg(unix)]
     assert!(stdout.contains("\"hcom_ready\":true"), "{stdout}");
     assert!(

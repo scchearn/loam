@@ -206,9 +206,10 @@ fn fake_hcom(directory: &std::path::Path, marker: &std::path::Path, exit_code: u
 #[test]
 #[cfg(unix)]
 fn an_hcom_launched_session_reports_ready_without_spawning_anything() {
-    // The session-start budget guarantee: HCOM_TOOL answers the probe on its own,
-    // so the health check never runs. The fake on PATH exits non-zero — if the
-    // probe reached it, readiness would flip to false and the marker would exist.
+    // The session-start budget guarantee: HCOM_TOOL answers the probe once the
+    // binary has been confirmed by stat, so the health check never runs. The fake
+    // on PATH exits non-zero — if the probe reached it, readiness would flip to
+    // false and the marker would exist.
     let workspace = temporary_workspace();
     let bin = workspace.join("bin");
     let marker = workspace.join("spawned");
@@ -312,5 +313,68 @@ fn hcom_absent_from_every_install_site_is_not_installed() {
     fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
 
     // Present in the full aggregate too, not only the wiki-less fallback.
+    assert!(stdout.contains(r#""hcom_ready":false"#), "{stdout}");
+}
+
+#[test]
+fn an_hcom_marker_without_an_installed_hcom_is_not_ready() {
+    // HCOM_TOOL is an identity marker, not a liveness one: it survives in the
+    // environment after hcom is removed, and a user can export it from a shell
+    // rc. Believing it alone would put `hcom: ready` in front of every skill on
+    // a machine with no hcom, and they would all discover the truth at the first
+    // send — exactly what the injected line exists to prevent.
+    let workspace = temporary_workspace();
+    let output = state_command(&workspace)
+        .env("HCOM_TOOL", "claude")
+        .output()
+        .expect("loam should run");
+    let stdout = String::from_utf8(output.stdout).expect("state output should be UTF-8");
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert!(stdout.contains(r#""hcom_ready":false"#), "{stdout}");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_wedged_hcom_binary_cannot_hold_session_start_hostage() {
+    // The health check is the one spawn on the session-start path with no gate in
+    // front of it, so its cost has to be bounded by us rather than by the binary:
+    // a PATH entry on a stalled mount, or a shim waiting on a lock, would
+    // otherwise block the hook for as long as it likes. Unbound, this run takes
+    // as long as the fake sleeps — well past the five-second hook budget.
+    use std::os::unix::fs::PermissionsExt;
+    let workspace = temporary_workspace();
+    let bin = workspace.join("bin");
+    fs::create_dir_all(&bin).expect("bin directory should be created");
+    let path = bin.join("hcom");
+    // PATH is scrubbed to the fixture directory, so `sleep` has to be found the
+    // long way round — otherwise the fake exits instantly and proves nothing.
+    fs::write(
+        &path,
+        "#!/bin/sh
+PATH=/usr/bin:/bin
+sleep 30
+echo 'hcom 0.7.25'
+",
+    )
+    .expect("wedged hcom should be written");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("wedged hcom should be executable");
+
+    let started = std::time::Instant::now();
+    let output = state_command(&workspace)
+        .env("PATH", &bin)
+        .output()
+        .expect("loam should run");
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8(output.stdout).expect("state output should be UTF-8");
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+
+    assert!(
+        elapsed.as_secs() < 5,
+        "state --fast waited {elapsed:?} on a wedged hcom, past the hook budget"
+    );
+    // Expiry is not-ready, not "assume it works": a tool that cannot answer in a
+    // second is not one the briefing should promise.
     assert!(stdout.contains(r#""hcom_ready":false"#), "{stdout}");
 }

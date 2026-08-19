@@ -210,23 +210,74 @@ fn qmd_readiness(wiki_root: &Path, metadata_collection: &str) -> (bool, String) 
 /// on every session start under a hard hook budget (`cli/tests/state_budget.rs`)
 /// and this probe sits outside the wiki gate that short-circuits the qmd one:
 ///   1. `HCOM_TOOL` — hcom's launcher sets it for every session it starts, so an
-///      hcom-managed session answers without touching disk or spawning anything.
+///      hcom-managed session skips straight past the health check. The marker is
+///      an identity marker, not a liveness one: it outlives an hcom that was
+///      removed or broken, and a user who exports it from a shell rc would
+///      otherwise be told `ready` on a machine with no hcom at all. So the rung
+///      still confirms by stat — no spawn, which is the property it exists for.
 ///   2. Binary resolution by stat alone: PATH, then `HCOM_INSTALL_DIR` (and its
 ///      `bin/`), then `~/.local/bin`. brew, uv/pip and both official installers
 ///      land in one of those, on every OS.
 ///   3. `hcom --version` — the only subprocess in the ladder, reached only once a
 ///      binary actually exists. (`hcom version` is not a command.)
+///
+/// On Windows this ladder matches `hcom.exe` only, while the Node-side ladder in
+/// `setup/integrations/tools.mjs` also accepts `.cmd` and `.bat`. A hand-written
+/// `hcom.cmd` shim is therefore visible to `loam doctor` and to
+/// `--integration hcom` but not to this line. That is the adjudicated shape —
+/// every official installer produces the real executable — and it is recorded
+/// here so the next reader does not read the narrower rung as a bug.
 fn hcom_readiness() -> bool {
-    if std::env::var_os("HCOM_TOOL").is_some_and(|value| !value.is_empty()) {
-        return true;
-    }
     let Some(binary) = resolve_hcom_binary() else {
         return false;
     };
-    Command::new(binary)
+    if std::env::var_os("HCOM_TOOL").is_some_and(|value| !value.is_empty()) {
+        return true;
+    }
+    hcom_answers_its_version(&binary)
+}
+
+/// How long the health check waits for `hcom --version` before giving up. The
+/// hook budget is five seconds and this is the one spawn on the path with no
+/// gate in front of it, so a binary on a stalled network mount, blocked on a
+/// build lock, or behind a wrapper shim that waits on something must not be able
+/// to hold the whole session start hostage. A real answer is milliseconds.
+const HCOM_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const HCOM_HEALTH_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// `hcom --version`, bounded. Expiry counts as not-ready: a binary that cannot
+/// say its own version in a second is not one a skill should route work to, and
+/// the briefing promising otherwise is the failure this probe exists to prevent.
+/// `std` has no `wait_timeout`, so this is a `try_wait` poll loop — the same
+/// shape as `run_bounded` in `cli/src/service.rs`, without its scratch-file
+/// capture, because only the exit status is read here. On expiry the child is
+/// killed and reaped so no zombie is left behind.
+fn hcom_answers_its_version(binary: &Path) -> bool {
+    use std::process::Stdio;
+    let Ok(mut child) = Command::new(binary)
         .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + HCOM_HEALTH_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(HCOM_HEALTH_POLL);
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 /// The hcom binary as an absolute path, or `None` when no install site holds an
