@@ -259,6 +259,7 @@ function snapshotFor(root, artifacts) {
     schema_version: 1,
     generated_at: '2026-08-19T00:00:00+00:00',
     status: 'ready',
+    posture: 'healthy',
     workspace: { root, name: 'w', platform: 'linux', git: { state: 'clean', branch: 'main', dirty: false, changed_count: 0 } },
     capabilities: Object.fromEntries(CAPABILITY_KEYS.map((key) => [key, {
       state: REQUIRED.has(key) ? 'ready' : 'absent', required: REQUIRED.has(key), reason: null, evidence: null,

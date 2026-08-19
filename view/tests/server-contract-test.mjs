@@ -451,6 +451,8 @@ test('serves the pinned vendor modules under /vendor/ as their own static root',
   await rm(root, { recursive: true, force: true });
   await rm(publicRoot, { recursive: true, force: true });
   await rm(vendorRoot, { recursive: true, force: true });
+});
+
 test('serves the pinned vendor builds from the vendor root, not from public', async () => {
   const { root } = await makeWorkspace();
   await withServer({ workspaceRoot: root, initialSnapshot: baseSnapshot(root) }, async (baseUrl) => {
