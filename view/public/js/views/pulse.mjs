@@ -120,6 +120,10 @@ function renderOverview(doc, snapshot) {
   const search = el(doc, 'button', 'ghost-btn', 'Search ');
   search.type = 'button';
   search.dataset.pulseSearch = '';
+  // The glyph is the DESIGN.md label; the accessible name states the real
+  // bindings instead of a Mac-only symbol every platform would hear read out.
+  search.setAttribute('aria-label', 'Search');
+  search.setAttribute('aria-keyshortcuts', 'Control+K Meta+K');
   search.append(el(doc, 'kbd', null, '⌘K'));
   search.addEventListener('click', () => doc.querySelector('[data-query-open]')?.click());
   sub.append(search);
