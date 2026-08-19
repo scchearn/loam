@@ -268,6 +268,27 @@ describe('Stewardship evidence', () => {
     await flush();
     assert.equal(doc.querySelector('[data-inspector]').getAttribute('aria-hidden'), 'false');
   });
+
+  it('renders evidence the producer emits as bare path strings', async () => {
+    // `artifact-parse` emits `evidence: ["wiki/code/corrupt.md"]` — strings, not
+    // {path} objects. Dropping them silently loses the only pointer a degraded
+    // workspace has to the file that failed to parse.
+    const { mount: root } = await mount(trustSnapshot({
+      signals: [
+        {
+          id: 'artifact-parse',
+          state: 'watch',
+          message: '1 artifact(s) have malformed fields or timestamps.',
+          evidence: [INVENTORIED, 'wiki/code/corrupt.md'],
+          command: null,
+        },
+      ],
+    }));
+
+    const card = cardFor(root, 'artifact-parse');
+    assert.ok(card.querySelector(`[data-inspect="${INVENTORIED}"]`), 'an inventoried string path still opens the Inspector');
+    assert.equal(card.querySelector('code.code-chip')?.textContent, 'wiki/code/corrupt.md');
+  });
 });
 
 describe('Stewardship conservation-status tone', () => {

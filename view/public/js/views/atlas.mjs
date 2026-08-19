@@ -56,6 +56,38 @@ const CLUSTER_BY_KIND = new Map(CLUSTERS.flatMap(({ id, kinds }) => kinds.map((k
 /** An endpoint we cannot classify is a memory-health question, so it lands there. */
 const UNKNOWN_CLUSTER = 'memory';
 
+/**
+ * What to say when a projection has no nodes. The map must never imply the
+ * project is empty when the real reason is that a capability is not set up, so
+ * the reason comes from the snapshot's own capability states and each one names
+ * the exact next action.
+ */
+export function emptyStateFor(snapshot, projection) {
+  const capability = (id) => snapshot?.capabilities?.[id]?.state ?? 'absent';
+  if (capability('wiki') !== 'ready') {
+    return {
+      message: 'Nothing to map: this workspace has no memory substrate yet, so there are no pages, concepts, or code pages to connect.',
+      command: '/loam::scaffolding-wiki <goal>',
+    };
+  }
+  if (projection === 'code' && capability('code_graph') !== 'ready') {
+    return {
+      message: 'Nothing to map in Code: this workspace has memory but no code graph, so no source file has a page to link.',
+      command: '/loam::ingesting-codebase',
+    };
+  }
+  if (projection === 'work' && capability('goals') !== 'ready' && capability('work') !== 'ready') {
+    return {
+      message: 'Nothing to map in Work: no goals, specs, or plans are inventoried in this snapshot.',
+      command: '/loam::setting-goals',
+    };
+  }
+  return {
+    message: 'This projection has no nodes. Memory exists, but nothing in it links to anything this projection shows — add wikilinks between pages, or try another projection.',
+    command: null,
+  };
+}
+
 /* ---------------------------------------------------------------- projection */
 
 /** Degree first, then path, so a projection is stable across renders. */
@@ -363,7 +395,13 @@ export function initAtlas({ root = document, getSnapshot = () => state.snapshot 
 
   parity.append(table, edgeHeading, edgeList, key);
   layout.append(map, parity);
-  band.append(head, layout);
+
+  // Read before both the canvas and the parity table: an empty map states why
+  // it is empty rather than looking like a project with nothing in it.
+  const emptyNote = el('p', 'view-empty');
+  emptyNote.dataset.empty = 'atlas';
+  emptyNote.hidden = true;
+  band.append(head, emptyNote, layout);
   mount.replaceChildren(band);
 
   /* ---- per-render fills ---- */
@@ -461,6 +499,20 @@ export function initAtlas({ root = document, getSnapshot = () => state.snapshot 
     edgeList.replaceChildren(...items);
   }
 
+  function renderEmpty() {
+    if (view.nodes.length) {
+      emptyNote.hidden = true;
+      emptyNote.replaceChildren();
+      return;
+    }
+    const { message, command } = emptyStateFor(getSnapshot(), view.projection);
+    emptyNote.replaceChildren(doc.createTextNode(message));
+    if (command) {
+      emptyNote.append(doc.createTextNode(' Next: '), el('code', 'code-chip', command));
+    }
+    emptyNote.hidden = false;
+  }
+
   function renderScope() {
     const label = view.mode === 'overview'
       ? 'All clusters'
@@ -516,6 +568,7 @@ export function initAtlas({ root = document, getSnapshot = () => state.snapshot 
     for (const button of filters.querySelectorAll('button')) {
       button.setAttribute('aria-pressed', String(button.dataset.projection === view.projection));
     }
+    renderEmpty();
     renderScope();
     renderTable();
     renderEdges();

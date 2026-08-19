@@ -131,10 +131,15 @@ const CARD_TONE = { critical: 'critical', watch: 'warn' };
 /** A capability that simply is not set up reads as neutral, never as a fault. */
 const NEUTRAL_CAPABILITY = /^(absent|unconfigured|not-configured|unavailable|disabled)$/;
 
-/** Evidence is an object, an array of them, or null; only `path` is rendered. */
+/**
+ * Evidence is an object, an array of them, or null, and the producer also emits
+ * bare path strings (artifact-parse does); only paths are rendered.
+ */
 function evidencePaths(evidence) {
   const items = Array.isArray(evidence) ? evidence : [evidence];
-  return items.map((item) => item?.path).filter((path) => typeof path === 'string' && path);
+  return items
+    .map((item) => (typeof item === 'string' ? item : item?.path))
+    .filter((path) => typeof path === 'string' && path);
 }
 
 /** The findings this snapshot emitted, normalised to one card shape. */

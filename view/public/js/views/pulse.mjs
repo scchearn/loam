@@ -281,10 +281,15 @@ function glyphFor(key) {
   return CATEGORY_GLYPH.find(([pattern]) => pattern.test(key))?.[1] ?? 'i-shield';
 }
 
-/** Evidence is an object, an array of them, or null; only `path` interests Pulse. */
+/**
+ * Evidence is an object, an array of them, or null, and the producer also emits
+ * bare path strings (artifact-parse does); only paths interest Pulse.
+ */
 function evidencePaths(evidence) {
   const items = Array.isArray(evidence) ? evidence : [evidence];
-  return items.map((item) => item?.path).filter((path) => typeof path === 'string' && path);
+  return items
+    .map((item) => (typeof item === 'string' ? item : item?.path))
+    .filter((path) => typeof path === 'string' && path);
 }
 
 /**
