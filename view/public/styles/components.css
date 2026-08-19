@@ -942,3 +942,278 @@ code,
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---------- Reader (full-screen in-app document surface) ----------
+   DESIGN.md components.reader: own Back control, sticky "On this page" outline,
+   collapsible front matter, resolvable wikilinks green and broken ones red,
+   paths as code chips. Reader is exempt from --content-max-width: it keeps its
+   own reading measure. */
+
+.reader {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  background: var(--surface-canvas);
+  box-shadow: var(--shadow-overlay);
+  overflow: hidden;
+}
+
+.reader[hidden] { display: none; }
+
+body.reader-open { overflow: hidden; }
+
+.reader-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  min-height: var(--topbar-height);
+  padding: var(--space-2) var(--content-inline-padding);
+  border-bottom: var(--rule) solid var(--border-chrome);
+  background: var(--surface-app);
+}
+
+.reader-ident {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+  min-width: 0;
+}
+
+.reader-title {
+  margin: 0;
+  color: var(--ink-chrome);
+  font: 600 1.5rem/1.2 var(--font-sans);
+  letter-spacing: -0.02em;
+}
+
+.reader-path { color: var(--ink-chrome-muted); }
+
+.reader-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0;
+  padding: var(--space-2) var(--content-inline-padding);
+  border-bottom: var(--rule) solid var(--border-critical);
+  background: var(--surface-critical);
+  color: var(--ink-primary);
+  font: 400 0.82rem/1.4 var(--font-sans);
+}
+
+.reader-banner[hidden] { display: none; }
+
+.reader-body {
+  display: grid;
+  grid-template-columns: 15rem minmax(0, 1fr);
+  gap: var(--space-8);
+  padding: var(--content-block-padding) var(--content-inline-padding) var(--space-16);
+  overflow-y: auto;
+}
+
+.reader-outline {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  max-height: calc(100vh - var(--topbar-height) - var(--space-8));
+  padding-right: var(--space-2);
+  overflow-y: auto;
+}
+
+.reader-outline[hidden] { display: none; }
+
+.reader-outline .label {
+  margin: 0 0 var(--space-2);
+  color: var(--ink-tertiary);
+  font: 600 0.62rem/1 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.reader-outline-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-left: var(--rule) solid var(--border-faint);
+}
+
+.reader-outline-item a {
+  display: block;
+  padding: 0.2rem var(--space-3);
+  color: var(--ink-secondary);
+  font: 400 0.8rem/1.4 var(--font-sans);
+  text-decoration: none;
+}
+
+.reader-outline-item a:hover { color: var(--ink-primary); }
+.reader-outline-item[data-depth="3"] a { padding-left: var(--space-6); }
+.reader-outline-item[data-depth="4"] a,
+.reader-outline-item[data-depth="5"] a,
+.reader-outline-item[data-depth="6"] a { padding-left: var(--space-8); }
+
+.reader-main {
+  max-width: 46rem;
+  min-width: 0;
+}
+
+.reader-meta {
+  margin-bottom: var(--space-6);
+  padding: var(--space-3) var(--space-4);
+  border: var(--rule) solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-card);
+}
+
+.reader-meta[hidden] { display: none; }
+
+.reader-meta > summary {
+  color: var(--ink-tertiary);
+  font: 600 0.62rem/1 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.reader-meta-list {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-1) var(--space-4);
+  margin: var(--space-3) 0 0;
+}
+
+.reader-meta-list dt {
+  color: var(--ink-tertiary);
+  font: 500 0.7rem/1.4 var(--font-mono);
+}
+
+.reader-meta-list dd {
+  margin: 0;
+  color: var(--ink-secondary);
+  font: 400 0.82rem/1.4 var(--font-sans);
+  overflow-wrap: anywhere;
+}
+
+.reader-meta-error {
+  margin: var(--space-3) 0 0;
+  color: var(--state-drift);
+  font: 400 0.82rem/1.4 var(--font-sans);
+}
+
+.reader-doc {
+  color: var(--ink-secondary);
+  font: 400 0.92rem/1.6 var(--font-sans);
+}
+
+.reader-doc:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }
+
+.reader-doc h1,
+.reader-doc h2,
+.reader-doc h3,
+.reader-doc h4,
+.reader-doc h5,
+.reader-doc h6 {
+  margin: var(--space-8) 0 var(--space-3);
+  color: var(--ink-primary);
+  font-family: var(--font-sans);
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.reader-doc h1 { margin-top: 0; font-size: clamp(1.2rem, 1.5vw, 1.45rem); letter-spacing: -0.008em; }
+.reader-doc h2 { font-size: 1.15rem; }
+.reader-doc h3 { font-size: 1rem; }
+.reader-doc h4,
+.reader-doc h5,
+.reader-doc h6 { font-size: 0.92rem; }
+
+.reader-doc p,
+.reader-doc ul,
+.reader-doc ol,
+.reader-doc blockquote,
+.reader-doc table { margin: 0 0 var(--space-4); }
+
+.reader-doc ul,
+.reader-doc ol { padding-left: var(--space-6); }
+
+.reader-doc li { margin-bottom: var(--space-1); }
+
+.reader-doc blockquote {
+  padding: var(--space-2) var(--space-4);
+  border-left: 2px solid var(--border);
+  color: var(--ink-tertiary);
+}
+
+.reader-doc pre {
+  margin: 0 0 var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border: var(--rule) solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-inset);
+  overflow-x: auto;
+}
+
+.reader-doc pre code {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 0.8rem;
+}
+
+.reader-doc table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.reader-doc th,
+.reader-doc td {
+  padding: var(--space-2) var(--space-3);
+  border: var(--rule) solid var(--border);
+  text-align: left;
+}
+
+.reader-doc th { color: var(--ink-primary); font-weight: 600; }
+
+.reader-doc hr { border: 0; border-top: var(--rule) solid var(--border); margin: var(--space-8) 0; }
+
+.reader-doc svg { max-width: 100%; height: auto; color: var(--ink-secondary); }
+
+.reader-doc a { color: var(--accent); text-decoration: none; }
+.reader-doc a:hover { text-decoration: underline; }
+
+/* Link health: colour carries the state, and the note carries it in text too,
+   so the encoding is never colour-alone. */
+.reader-doc .wikilink.is-resolved { color: var(--accent); }
+
+.reader-doc .wikilink.is-broken,
+.reader-doc .md-link.is-blocked {
+  color: var(--state-drift);
+  text-decoration: line-through;
+  text-decoration-color: var(--border-critical);
+}
+
+.reader-doc .wikilink-note,
+.reader-doc .md-link-note {
+  font: 500 0.62rem/1 var(--font-mono);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  text-decoration: none;
+}
+
+.reader-doc .md-image {
+  display: inline-block;
+  padding: 0.05rem 0.3rem;
+  border: var(--rule) dashed var(--border);
+  border-radius: 5px;
+  color: var(--ink-tertiary);
+  font: 0.78em var(--font-mono);
+}
+
+.reader-status { margin-bottom: var(--space-4); }
+
+@media (max-width: 72rem) {
+  .reader-body { grid-template-columns: minmax(0, 1fr); }
+  .reader-outline { position: static; max-height: none; }
+}

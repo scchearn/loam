@@ -395,3 +395,17 @@ test('serves static files with immutable caching, and index.html with no-store',
   await rm(root, { recursive: true, force: true });
   await rm(publicRoot, { recursive: true, force: true });
 });
+
+test('serves the pinned vendor builds from the vendor root, not from public', async () => {
+  const { root } = await makeWorkspace();
+  await withServer({ workspaceRoot: root, initialSnapshot: baseSnapshot(root) }, async (baseUrl) => {
+    const purify = await rawRequest(baseUrl, '/vendor/dompurify/purify.es.mjs');
+    assert.equal(purify.status, 200);
+    assert.equal(purify.headers['content-type'], 'text/javascript; charset=utf-8');
+    assert.match(purify.body, /DOMPurify/);
+
+    const traversal = await rawRequest(baseUrl, '/vendor/../server/server.mjs');
+    assert.ok([400, 404].includes(traversal.status));
+  });
+  await rm(root, { recursive: true, force: true });
+});

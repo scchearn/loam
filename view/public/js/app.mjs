@@ -11,13 +11,18 @@
  */
 
 import { initQuery } from './query.mjs';
+import { initReader } from './reader.mjs';
 import { load, refresh, state } from './store.mjs';
 
 const ROUTES = ['pulse', 'atlas', 'work-stream', 'chronicle', 'stewardship'];
 const DEFAULT_ROUTE = 'pulse';
 
-export function routeFromHash(hash) {
-  const candidate = String(hash ?? '').replace(/^#\/?/, '');
+export function routeFromHash(hash, current = DEFAULT_ROUTE) {
+  const value = String(hash ?? '');
+  // Reader is an overlay, not an area: its route leaves the view underneath as
+  // it was, so Back returns to the originating view rather than to Pulse.
+  if (value.startsWith('#/reader/')) return current;
+  const candidate = value.replace(/^#\/?/, '');
   return ROUTES.includes(candidate) ? candidate : DEFAULT_ROUTE;
 }
 
@@ -79,7 +84,7 @@ export async function boot(doc = globalThis.document) {
   }
 
   win.addEventListener?.('hashchange', () => {
-    route = routeFromHash(win.location?.hash);
+    route = routeFromHash(win.location?.hash, route);
     render();
   });
 
@@ -107,6 +112,7 @@ export async function boot(doc = globalThis.document) {
   });
 
   initQuery({ root: doc, getSnapshot: () => state.snapshot });
+  initReader({ root: doc, getSnapshot: () => state.snapshot });
 
   render();
   try {

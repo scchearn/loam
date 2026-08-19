@@ -85,6 +85,7 @@ function errorStatus(error) {
 export function createServer({
   workspaceRoot,
   publicRoot = fileURLToPath(new URL('../public/', import.meta.url)),
+  vendorRoot = fileURLToPath(new URL('../vendor/', import.meta.url)),
   initialSnapshot,
   refreshProducer,
   buildSearchIndex,
@@ -205,10 +206,14 @@ export function createServer({
   }
 
   async function handleStatic(req, res, pathname) {
-    const relative = pathname === '/' ? '/index.html' : pathname;
+    // The pinned vendor builds live beside `public/`, not inside it, so they are
+    // served from their own root rather than copied or symlinked.
+    const isVendor = pathname.startsWith('/vendor/');
+    const root = isVendor ? vendorRoot : publicRoot;
+    const relative = isVendor ? pathname.slice('/vendor'.length) : (pathname === '/' ? '/index.html' : pathname);
     let target;
     try {
-      target = assertInside(publicRoot, join(publicRoot, decodeURIComponent(relative)), 'static path');
+      target = assertInside(root, join(root, decodeURIComponent(relative)), 'static path');
     } catch {
       return sendJson(res, 400, { error: 'invalid_path' });
     }

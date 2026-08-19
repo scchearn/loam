@@ -140,6 +140,39 @@
     </main>
   </div>
 
+  <section class="reader" data-reader hidden aria-labelledby="reader-title">
+    <header class="reader-bar">
+      <button class="ghost-btn reader-back" type="button" data-reader-back>
+        <svg class="icon" aria-hidden="true"><use href="#i-book"/></svg>Back
+      </button>
+      <div class="reader-ident">
+        <h1 class="reader-title" id="reader-title" data-reader-title>Document</h1>
+        <code class="code-chip reader-path" data-reader-path></code>
+      </div>
+    </header>
+
+    <p class="reader-banner" data-reader-banner hidden role="status">
+      <span data-reader-banner-text></span>
+      <button class="ghost-btn" type="button" data-reader-refresh>Refresh</button>
+    </p>
+
+    <div class="reader-body">
+      <nav class="reader-outline" data-reader-outline aria-labelledby="reader-outline-title" hidden>
+        <p class="label" id="reader-outline-title">On this page</p>
+        <ul class="reader-outline-list" data-reader-outline-list></ul>
+      </nav>
+
+      <div class="reader-main">
+        <p class="notice reader-status" data-reader-status role="status"></p>
+        <details class="reader-meta" data-reader-frontmatter hidden>
+          <summary>Front matter</summary>
+          <dl class="reader-meta-list" data-reader-frontmatter-body></dl>
+        </details>
+        <article class="reader-doc" data-reader-doc tabindex="-1"></article>
+      </div>
+    </div>
+  </section>
+
   <dialog class="query-dialog" data-query-dialog aria-labelledby="query-title">
     <div class="dialog-head">
       <h2 id="query-title">Query</h2>
