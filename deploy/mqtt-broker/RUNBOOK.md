@@ -59,6 +59,14 @@ mTLS cert — the machine mints its own keypair + CSR, nothing travels by hand:
   history rather than diverging. OpenSSL also needs directory write access for
   its temporary/backup database files; the signer ACL grants that on `${PKI_DIR}`
   while the CA private directory remains inaccessible.
+- Serializes every `openssl ca` write on `${PKI_DIR}/ca.lock` (provisioned
+  `0600 root:root` with an ACL for the signer user). `openssl ca` locks nothing
+  of its own, so two overlapping writes can issue the same serial and lose an
+  index entry while both report success. The signer takes the lock, and so do
+  `pki/issue-client.sh` and `pki/revoke-client.sh` — issuing by hand during an
+  onboarding burst is exactly when the two would collide. A signing that cannot
+  take the lock within `ENROLL_CA_LOCK_TIMEOUT_SECONDS` (default 30) is refused
+  rather than written unserialized.
 - Binds `ENROLL_BIND_ADDRESS` (default `0.0.0.0` — the port is public);
   rate-limits per client (default 10 per 60s against the spec's
   brute-force-on-public-port threat); verifies the password in constant time;

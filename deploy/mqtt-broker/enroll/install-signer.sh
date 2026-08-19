@@ -90,6 +90,16 @@ prepare_ca_database() {
   setfacl -m "u:${ENROLL_USER}:rw" "$PKI_DIR/index.txt" "$PKI_DIR/serial"
   setfacl -m "u:${ENROLL_USER}:rwx" "$PKI_DIR/newcerts"
   setfacl -m "u:${ENROLL_USER}:r" "$PKI_DIR/crlnumber"
+  # The CA lock every `openssl ca` write takes (enroll/signer.py,
+  # pki/issue-client.sh, pki/revoke-client.sh). Created and granted HERE
+  # because the directory ACL above is an access ACL, not a default one
+  # (`-m`, not `-d`), so a file created in $PKI_DIR inherits nothing: whoever
+  # signs first would own the lock's mode. A root-run manual issuance creating
+  # it first would leave the signer unable to open it, and the lock fails
+  # closed — every later enrollment refused, permanently. Provisioning it up
+  # front takes creation order out of the picture.
+  [ -e "$PKI_DIR/ca.lock" ] || install -m 600 -o root -g root /dev/null "$PKI_DIR/ca.lock"
+  setfacl -m "u:${ENROLL_USER}:rw" "$PKI_DIR/ca.lock"
 }
 
 # Install the certbot deploy hook: whenever certbot renews the server cert
@@ -187,7 +197,7 @@ EOF
     rm -f "$UNIT" /etc/systemd/system/loam-enroll-signer.service.d/env.conf
     rm -f "$DEPLOY_HOOK"
     if command -v setfacl >/dev/null 2>&1; then
-      setfacl -x "u:${ENROLL_USER}" "$PKI_DIR" "$PKI_DIR/index.txt" "$PKI_DIR/serial" "$PKI_DIR/newcerts" "$PKI_DIR/crlnumber" 2>/dev/null || true
+      setfacl -x "u:${ENROLL_USER}" "$PKI_DIR" "$PKI_DIR/index.txt" "$PKI_DIR/serial" "$PKI_DIR/newcerts" "$PKI_DIR/crlnumber" "$PKI_DIR/ca.lock" 2>/dev/null || true
     fi
     systemctl daemon-reload
     rm -rf "$ENROLL_DIR"

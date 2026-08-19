@@ -425,6 +425,43 @@ def check_signing_waits_for_the_ca_lock():
             child.wait(timeout=10)
 
 
+def check_signing_works_with_a_lock_it_cannot_write():
+    """A lock file the signer may not WRITE must still be usable.
+
+    install-signer.sh provisions `ca.lock` with an ACL for the signer user, but
+    a lock file left behind by a root-run `pki/issue-client.sh` is root-owned,
+    and the lock fails closed — so demanding write access would turn a routine
+    manual issuance into permanently refused enrollments. `flock(2)` needs only
+    an open descriptor, so the lock is opened read-only. A 0444 lock file is
+    that situation for a non-root signer.
+    """
+    port = free_port()
+    with tempfile.TemporaryDirectory(prefix="loam-signer-ro-lock-") as work:
+        pki = make_ca(work)
+        csr = make_csr(work, 0)
+        lock_path = os.path.join(pki, "ca.lock")
+        with open(lock_path, "w", encoding="ascii"):
+            pass
+        os.chmod(lock_path, 0o444)
+        if os.access(lock_path, os.W_OK):
+            # Running as root, which ignores the mode: the case cannot be
+            # staged here, and passing would mean nothing.
+            print("skipped: read-only CA lock case needs a non-root signer")
+            return
+        child = start_signer(work, port, {"ENROLL_PKI_DIR": pki})
+        try:
+            status, body = enroll(port, csr)
+            assert status == 200, (
+                f"a read-only lock file must not block signing, got {status}: "
+                f"{body[:200]!r}"
+            )
+            assert b"BEGIN CERTIFICATE" in body, f"{body[:200]!r}"
+            print("ok: signed while holding a lock file it cannot write")
+        finally:
+            child.terminate()
+            child.wait(timeout=10)
+
+
 def main():
     port = free_port()
     with tempfile.TemporaryDirectory(prefix="loam-signer-test-") as work:
@@ -463,6 +500,7 @@ def main():
             child.wait(timeout=10)
     check_bounds_drop_a_silent_client()
     check_signing_waits_for_the_ca_lock()
+    check_signing_works_with_a_lock_it_cannot_write()
     check_concurrent_enrollments_are_serialized()
     return 0
 

@@ -144,6 +144,12 @@ def ca_lock(config: Config):
     properly, and so does any other process (a manual `pki/issue-client.sh`)
     that takes the same lock.
 
+    Opened read-only: `flock(2)` needs no write access to the file, only an
+    open descriptor. The lock is provisioned by install-signer.sh with an ACL
+    for this user, but a lock file created by a root-run manual issuance is
+    root-owned, and asking for write access there would refuse every later
+    enrollment over a file this service never writes a byte to.
+
     Non-blocking with a bounded poll rather than a blocking `LOCK_EX`: nothing
     can interrupt a thread parked in flock (the connection reaper shuts sockets
     down, which does not touch it), so an unbounded wait would turn one wedged
@@ -153,7 +159,7 @@ def ca_lock(config: Config):
     try:
         # O_CREAT, not "w": truncation would race another holder pointlessly,
         # and the file's contents are irrelevant — only the lock on it matters.
-        handle = os.open(config.ca_lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+        handle = os.open(config.ca_lock_file, os.O_RDONLY | os.O_CREAT, 0o600)
     except OSError as error:
         # Fail closed. Signing anyway is exactly the unserialized write this
         # exists to prevent, and it would be invisible in the response.
