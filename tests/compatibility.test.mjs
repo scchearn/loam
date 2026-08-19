@@ -12,9 +12,7 @@ import { assertPackageAssets } from '../setup/package-check.mjs';
 const execFileAsync = promisify(execFile);
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 const loaderPath = join(packageRoot, '.opencode', 'plugins', 'loam.js');
-const hookPath = join(packageRoot, 'hooks', 'session-start.mjs');
 const marketplaceRoot = join(packageRoot, 'plugins', 'loam-adapter');
-const marketplaceHookPath = join(marketplaceRoot, 'hooks', 'session-start.mjs');
 const marketplaceStopPath = join(marketplaceRoot, 'hooks', 'stop.mjs');
 const marketplaceSubagentStartPath = join(marketplaceRoot, 'hooks', 'subagent-start.mjs');
 const marketplaceSubagentStopPath = join(marketplaceRoot, 'hooks', 'subagent-stop.mjs');
@@ -22,7 +20,7 @@ const codexStopPath = join(packageRoot, 'adapters', 'codex-stop.mjs');
 const ingestWorkerPath = join(packageRoot, 'adapters', 'ingest-worker.mjs');
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
-async function runHook(env, payload = {}, path = hookPath) {
+async function runHook(env, payload = {}, path = marketplaceStopPath) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path], {
       cwd: packageRoot,
@@ -59,7 +57,7 @@ test('missing adapter in an existing clone returns setup recovery instead of a l
     const plugin = await loaded.LoamPlugin({ directory: clone });
     const output = { messages: [{ info: { role: 'user' }, parts: [{ type: 'text', text: 'hello' }] }] };
     await plugin['experimental.chat.messages.transform']({}, output);
-    assert.match(output.messages[0].parts[0].text, /npx @scchearn\/loam setup/);
+    assert.match(output.messages[0].parts[0].text, /npx @scchearn\/loam install/);
   } finally {
     await rm(clone, { recursive: true, force: true });
   }
@@ -107,100 +105,67 @@ test('publication guard rejects a package fixture missing the shared integration
   }
 });
 
-test('packaged session hook emits valid Claude, Cursor, and default envelopes', async () => {
-  for (const [env, field] of [
-    [{ CLAUDE_PLUGIN_ROOT: packageRoot }, 'hookSpecificOutput'],
-    [{ CURSOR_PLUGIN_ROOT: packageRoot }, 'additional_context'],
-    [{ COPILOT_CLI: '1' }, 'additionalContext'],
-  ]) {
-    const result = await runHook(env, { cwd: join(packageRoot, 'workspace') });
-    assert.equal(result.code, 0, result.stderr);
-    const parsed = JSON.parse(result.stdout);
-    assert.ok(parsed[field]);
-    const context = field === 'hookSpecificOutput' ? parsed[field].additionalContext : parsed[field];
-    assert.match(context, /<LOAM_IMPORTANT>/);
-    assert.match(context, /npx @scchearn\/loam setup/);
-  }
-});
-
-test('thin marketplace adapter contains no skills and emits Claude and Codex envelopes', async () => {
+test('thin marketplace adapter carries no skills and the harness-native federation surface', async () => {
   const claude = JSON.parse(await readFile(join(marketplaceRoot, '.claude-plugin', 'plugin.json'), 'utf8'));
   const codex = JSON.parse(await readFile(join(marketplaceRoot, '.codex-plugin', 'plugin.json'), 'utf8'));
   const adapter = await import(pathToFileURL(join(marketplaceRoot, 'adapter.mjs')).href);
 
   assert.equal('skills' in claude, false);
   assert.equal('skills' in codex, false);
+  // Claude finds `hooks/hooks.json` by convention; Codex names it explicitly.
+  // Either way the file setup rewrites is the same one.
   assert.equal('hooks' in claude, false);
-  assert.equal('hooks' in codex, false);
+  assert.equal(codex.hooks, './hooks/hooks.json');
 
-  const calls = [];
-  const codexAdapter = adapter.createMarketplaceAdapter({
-    harness: 'codex',
-    getContext: async (input) => {
-      calls.push(input);
-      return 'codex context';
-    },
-  });
-  assert.deepEqual(await codexAdapter({ cwd: '/workspace' }), {
-    hookSpecificOutput: {
-      hookEventName: 'SessionStart',
-      additionalContext: 'codex context',
-    },
-  });
-  assert.equal(calls[0].harness, 'codex');
-
-  for (const env of [
-    { CLAUDE_PLUGIN_ROOT: marketplaceRoot },
-    { PLUGIN_ROOT: marketplaceRoot, CLAUDE_PLUGIN_ROOT: marketplaceRoot },
-  ]) {
-    const result = await runHook(env, { cwd: join(packageRoot, 'workspace') }, marketplaceHookPath);
-    assert.equal(result.code, 0, result.stderr);
-    const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.hookSpecificOutput.hookEventName, 'SessionStart');
-    assert.match(parsed.hookSpecificOutput.additionalContext, /<LOAM_IMPORTANT>/);
-    assert.match(parsed.hookSpecificOutput.additionalContext, /npx @scchearn\/loam setup/);
+  // harness-native-wake: the shipped plugin now carries the federation surface
+  // itself (SessionStart render+register, per-turn drain, Stop-hook wake) so a
+  // marketplace-only install — no `npx install` staging native hooks — still
+  // gets it. The bodies still come only from the runtime's `hook <harness>`
+  // renderer; the adapter just spawns it and wraps the wake body.
+  assert.equal(typeof adapter.handleMarketplaceStop, 'function');
+  assert.equal(typeof adapter.handleMarketplaceSessionStart, 'function');
+  assert.equal(typeof adapter.handleMarketplaceUserPromptSubmit, 'function');
+  assert.equal(typeof adapter.pollWake, 'function');
+  for (const retired of ['createMarketplaceAdapter', 'createClaudeAdapter', 'handleMarketplaceHook', 'handleClaudeHook']) {
+    assert.equal(retired in adapter, false, `${retired} must be retired`);
   }
 });
 
-test('Codex marketplace adapter falls back to the legacy Claude integration harness', async () => {
-  const fixture = await mkdtemp(join(tmpdir(), 'loam-codex-legacy-integration-'));
-  const integrationPath = join(fixture, 'loam.mjs');
-  await writeFile(integrationPath, `
-export async function runIntegration(argv, { output }) {
-  const harness = argv[argv.indexOf('--harness') + 1];
-  if (harness === 'codex') throw new Error('unsupported harness: codex');
-  output.write('<LOAM_IMPORTANT>legacy integration</LOAM_IMPORTANT>');
-  return 0;
-}
-`);
-  try {
-    const adapter = await import(`${pathToFileURL(join(marketplaceRoot, 'adapter.mjs')).href}?legacy=${Date.now()}`);
-    const output = await adapter.createMarketplaceAdapter({ harness: 'codex', integrationPath })({ cwd: '/workspace' });
-    assert.equal(output.hookSpecificOutput.additionalContext, '<LOAM_IMPORTANT>legacy integration</LOAM_IMPORTANT>');
-  } finally {
-    await rm(fixture, { recursive: true, force: true });
-  }
-});
-
-test('plugin manifests point at the packaged Node hook entry', async () => {
+test('plugin manifests carry skills only and register no Node hook entry', async () => {
   const claude = JSON.parse(await readFile(join(packageRoot, '.claude-plugin', 'plugin.json'), 'utf8'));
   const cursor = JSON.parse(await readFile(join(packageRoot, '.cursor-plugin', 'plugin.json'), 'utf8'));
-  const claudeHooks = JSON.parse(await readFile(join(packageRoot, 'hooks', 'hooks.json'), 'utf8'));
-  const cursorHooks = JSON.parse(await readFile(join(packageRoot, 'hooks', 'hooks-cursor.json'), 'utf8'));
 
-  assert.equal(claude.hooks, './hooks/hooks.json');
-  assert.equal(cursor.hooks, './hooks/hooks-cursor.json');
-  const claudeSessionStart = claudeHooks.hooks.SessionStart[0].hooks[0];
-  assert.equal(claudeSessionStart.command, 'node');
-  assert.match(claudeSessionStart.args[0], /session-start\.mjs/);
-  assert.match(cursorHooks.hooks.sessionStart[0].command, /session-start\.mjs/);
+  // Hook registration moved to setup, the only party that knows the version-
+  // and target-qualified private runtime path.
+  assert.equal('hooks' in claude, false);
+  assert.equal('hooks' in cursor, false);
+  assert.ok(Array.isArray(claude.skills) && claude.skills.length > 0);
+  await assert.rejects(() => readFile(join(packageRoot, 'hooks', 'hooks.json'), 'utf8'));
 });
 
-test('marketplace plugin owns SessionStart and Stop for Claude and Codex', async () => {
+test('marketplace plugin ships the harness-native federation hooks plus the ingestion Stop', async () => {
   const hooks = JSON.parse(await readFile(join(marketplaceRoot, 'hooks', 'hooks.json'), 'utf8'));
+  // harness-native-wake: the shipped plugin carries the three federation hooks
+  // itself as self-resolving node shims (the runtime path is unknown at
+  // marketplace-install time, so a native baked-path entry is impossible here).
   assert.match(hooks.hooks.SessionStart[0].hooks[0].command, /session-start\.mjs/);
+  assert.match(hooks.hooks.UserPromptSubmit[0].hooks[0].command, /user-prompt-submit\.mjs/);
+  // Two Stop entries: the fast ingestion boundary and the long-poll wake. Claude
+  // and Codex run every matching Stop hook, so they coexist without either
+  // suppressing the other.
   assert.match(hooks.hooks.Stop[0].hooks[0].command, /stop\.mjs/);
-  assert.equal(hooks.hooks.Stop[0].hooks[0].timeout, 90);
+  const wakeEntry = hooks.hooks.Stop[1].hooks[0];
+  assert.match(wakeEntry.command, /wake\.mjs/);
+  // wake-async (#141): on Claude the wake runs asyncRewake — off the visible Stop
+  // pipeline, waking on exit 2 — so an idle session shows no held "running stop
+  // hooks" spinner. The timeout is the deliberate 1h idle-wake window / harness
+  // ceiling, not the old 14520s dev-era arming value.
+  assert.equal(wakeEntry.asyncRewake, true, 'the wake entry runs asyncRewake, not a synchronous hold');
+  // The harness ceiling is STRICTLY above the internal 1h wake budget (3600s) so
+  // the poller's own deadline fires first and drops its wake_ref before the reaper.
+  assert.equal(wakeEntry.timeout, 3660, 'the harness timeout sits a margin above the 1h budget');
+  assert.equal(typeof wakeEntry.rewakeMessage, 'string');
+  assert.equal(typeof wakeEntry.rewakeSummary, 'string');
 
   const stop = await import(pathToFileURL(marketplaceStopPath).href);
   const calls = [];

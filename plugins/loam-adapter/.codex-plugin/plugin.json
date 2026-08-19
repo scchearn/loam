@@ -1,7 +1,8 @@
 {
   "name": "loam",
-  "version": "0.12.0",
-  "description": "Auto-updating session adapter for canonical Loam goals, planning, memory, and checkpoint skills.",
+  "version": "1.0.0-next.23",
+  "description": "Session adapter for canonical Loam goals, planning, memory, and checkpoint skills. Session context is served by the private native runtime; setup registers it.",
+  "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "loam",
     "shortDescription": "Load Loam context for globally installed skills",

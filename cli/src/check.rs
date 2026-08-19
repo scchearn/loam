@@ -12,14 +12,15 @@
 //!   nothing else notices when it drifts: `npm ci` validates dependency
 //!   resolution, not the package's own version field.
 //! - **runtime** (`cli/Cargo.toml`, the `loam` package in `Cargo.lock`,
-//!   `skills/loam-using/scripts/CLI_VERSION`) — what the launcher downloads.
-//!   Released as a `cli-v<version>` tag, and only `cli-v*` triggers the dist
-//!   build. `Cargo.lock` is gated because locked CI builds refuse stale package
-//!   metadata.
+//!   `setup/constants.mjs` `RUNTIME_VERSION`) — what the setup layer resolves
+//!   and bakes into the install. Released as a `cli-v<version>` tag, and only
+//!   `cli-v*` triggers the dist build. `Cargo.lock` is gated because locked CI
+//!   builds refuse stale package metadata.
 //!
-//! `CLI_VERSION` is not merely compared: the launcher interpolates it into the
-//! release URL and the on-disk runtime path, so it must name a published
-//! `cli-v<version>` release. That is the constraint the runtime group protects.
+//! `RUNTIME_VERSION` is the package-baked constant the setup layer resolves the
+//! runtime target from (channel routing plus the config-dir ledger), so it must
+//! name a published `cli-v<version>` release. That is the constraint the runtime
+//! group protects. (The retired skills-tree `CLI_VERSION` coupling is gone.)
 //!
 //! Network manifest resolution deliberately stays in
 //! `bin/check-release-resolution.sh`: a pre-commit gate must never depend on a
@@ -34,7 +35,7 @@ const PLUGIN_REFERENCE: &str = "package.json";
 const PLUGIN_LOCK: &str = "package-lock.json";
 const RUNTIME_REFERENCE: &str = "cli/Cargo.toml";
 const RUNTIME_LOCK: &str = "Cargo.lock";
-const CLI_VERSION_FILE: &str = "skills/loam-using/scripts/CLI_VERSION";
+const RUNTIME_VERSION_FILE: &str = "setup/constants.mjs";
 
 pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     match args.next().as_deref() {
@@ -155,7 +156,7 @@ fn check_domain(root: &Path, domain: Domain) -> bool {
         ),
         Domain::Runtime => (
             RUNTIME_REFERENCE,
-            vec![read_cargo_lock_version(root), read_cli_version(root)],
+            vec![read_cargo_lock_version(root), read_runtime_version(root)],
         ),
     };
 
@@ -303,14 +304,34 @@ fn read_cargo_lock_version(root: &Path) -> Result<(String, String), String> {
     Err(format!("{RUNTIME_LOCK} has no loam package entry"))
 }
 
-fn read_cli_version(root: &Path) -> Result<(String, String), String> {
-    let content = fs::read_to_string(root.join(CLI_VERSION_FILE))
-        .map_err(|error| format!("cannot read {CLI_VERSION_FILE}: {error}"))?;
-    let value = content.trim();
-    if value.is_empty() {
-        return Err(format!("{CLI_VERSION_FILE} is empty"));
+/// The `RUNTIME_VERSION` string constant exported from `setup/constants.mjs` —
+/// the package-baked runtime target. Parsed literally (`export const
+/// RUNTIME_VERSION = '<value>';`) so the offline gate needs no JS runtime.
+fn read_runtime_version(root: &Path) -> Result<(String, String), String> {
+    const LABEL: &str = "setup/constants.mjs RUNTIME_VERSION";
+    let content = fs::read_to_string(root.join(RUNTIME_VERSION_FILE))
+        .map_err(|error| format!("cannot read {RUNTIME_VERSION_FILE}: {error}"))?;
+    for line in content.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("export const RUNTIME_VERSION") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = rest
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .trim_matches(['\'', '"']);
+        if value.is_empty() {
+            return Err(format!("{RUNTIME_VERSION_FILE} RUNTIME_VERSION is empty"));
+        }
+        return Ok((LABEL.to_owned(), value.to_owned()));
     }
-    Ok((CLI_VERSION_FILE.to_owned(), value.to_owned()))
+    Err(format!(
+        "{RUNTIME_VERSION_FILE} has no RUNTIME_VERSION export"
+    ))
 }
 
 #[cfg(test)]

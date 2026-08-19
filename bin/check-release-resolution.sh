@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# check-release-resolution.sh — strict verification that the CLI_VERSION every
-# copied launcher requests actually resolves to a published runtime manifest.
+# check-release-resolution.sh — strict verification that the package-baked
+# RUNTIME_VERSION actually resolves to a published runtime manifest.
 #
-# This gate is about the RUNTIME only. `CLI_VERSION` is the version the copied
-# launcher requests, and runtime releases are tagged `cli-v<version>`, so that
-# is the release this resolves against. Plugin releases (`v<version>`) publish
-# no runtime and are deliberately out of scope here.
+# This gate is about the RUNTIME only. `RUNTIME_VERSION` (setup/constants.mjs)
+# is the target the runtime install requests, and runtime releases are tagged
+# `cli-v<version>`, so that is the release this resolves against. Plugin
+# releases (`v<version>`) publish no runtime and are deliberately out of scope.
 #
 # Version agreement itself is `loam check versions --runtime`, with no python3
 # dependency. This script keeps the network half, which must never become a
@@ -26,7 +26,10 @@ fail() { echo "release resolution: FAIL: $1" >&2; exit 1; }
 
 "$LOAM" check versions "$ROOT" --runtime || exit 1
 
-runtime_version=$(tr -d ' \t\r\n' < "$ROOT/skills/loam-using/scripts/CLI_VERSION")
+# The runtime target is the package-baked RUNTIME_VERSION constant, not the
+# skills-tree CLI_VERSION — a stale skills copy can never mis-route resolution.
+runtime_version=$(sed -n "s/.*RUNTIME_VERSION[[:space:]]*=[[:space:]]*'\([^']*\)'.*/\1/p" "$ROOT/setup/constants.mjs" | head -1)
+[[ -n "$runtime_version" ]] || fail "cannot read RUNTIME_VERSION from setup/constants.mjs"
 
 if [[ "${1:-}" == "--versions-only" ]]; then
   exit 0
@@ -34,7 +37,7 @@ fi
 
 manifest_url="$RELEASE_BASE/cli-v$runtime_version/loam-runtime-manifest.json"
 manifest=$(curl --fail --silent --show-error --location --max-time 60 "$manifest_url" 2>&1) || {
-  echo "release resolution: PENDING: CLI_VERSION $runtime_version has no published runtime manifest" >&2
+  echo "release resolution: PENDING: RUNTIME_VERSION $runtime_version has no published runtime manifest" >&2
   echo "release resolution: expected $manifest_url" >&2
   exit 2
 }

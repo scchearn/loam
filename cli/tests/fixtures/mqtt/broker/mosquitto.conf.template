@@ -1,0 +1,32 @@
+per_listener_settings true
+persistence true
+persistence_location @PERSISTENCE@
+persistence_file mosquitto.db
+autosave_interval 1
+autosave_on_changes true
+log_dest stdout
+log_type all
+connection_messages true
+max_packet_size 400000
+max_queued_messages 32
+max_queued_bytes 1048576
+
+listener @PASSWORD_PORT@ 127.0.0.1
+protocol mqtt
+cafile @CA_CERT@
+certfile @SERVER_CERT@
+keyfile @SERVER_KEY@
+require_certificate false
+allow_anonymous false
+password_file @PASSWORD_FILE@
+acl_file @ACL_FILE@
+
+listener @MTLS_PORT@ 127.0.0.1
+protocol mqtt
+cafile @CA_CERT@
+certfile @SERVER_CERT@
+keyfile @SERVER_KEY@
+require_certificate true
+use_identity_as_username true
+allow_anonymous false
+acl_file @ACL_FILE@

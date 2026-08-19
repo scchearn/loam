@@ -52,36 +52,37 @@ function runClosedStdin(command, args, options = {}) {
   });
 }
 
-test('packed setup is offline, direct-native, and preserves the legacy entry', async () => {
+test('packed install is offline, direct-native, and preserves the legacy entry', async () => {
   const fixture = await packedRoot();
   const home = await mkdtemp(join(tmpdir(), 'loam-packaged-home-'));
   const workspace = await mkdtemp(join(tmpdir(), 'loam-packaged-workspace-'));
   try {
     const env = { ...process.env, HOME: home, USERPROFILE: home };
-    const dryRun = await execFileAsync(process.execPath, [join(fixture.root, 'bin', 'loam.mjs'), 'setup', '--dry-run', '--yes'], {
+    const dryRun = await execFileAsync(process.execPath, [join(fixture.root, 'bin', 'loam.mjs'), 'install', '--dry-run', '--yes'], {
       cwd: workspace,
       env,
     });
     assert.match(`${dryRun.stdout}${dryRun.stderr}`, /dry.?run/i);
     await assert.rejects(() => readdir(join(home, '.agents')));
 
-    const update = await execFileAsync(process.execPath, [join(fixture.root, 'bin', 'loam.mjs'), 'update', '--dry-run'], {
-      cwd: workspace,
-      env,
-    });
-    assert.match(`${update.stdout}${update.stderr}`, /Loam Update \(dry-run\)/);
+    // update on a machine with no install refuses with a hint to `install`
+    // (the verb split: update bumps an EXISTING install, never a first install).
+    const update = await execFileAsync(
+      process.execPath,
+      [join(fixture.root, 'bin', 'loam.mjs'), 'update', '--dry-run'],
+      { cwd: workspace, env },
+    ).then(() => { throw new Error('update should have refused without an install'); }, (error) => error);
+    assert.equal(update.code, 1);
+    assert.match(`${update.stdout}${update.stderr}`, /No Loam installation found/);
     await assert.rejects(() => readdir(join(home, '.agents')));
 
     const integration = await readFile(join(fixture.root, 'integration', 'loam.mjs'), 'utf8');
     assert.doesNotMatch(integration, /run --|command === ['"]run['"]/);
     assert.match(integration, /status/);
-    assert.match(integration, /hook/);
-
-    const context = await import(pathToFileURL(join(fixture.root, 'integration', 'context.mjs')).href);
-    assert.equal(
-      context.formatNativeRuntimeCommand(String.raw`C:\Users\Sam User\.agents\loam\bin\loam.exe`, 'win32'),
-      String.raw`& 'C:\Users\Sam User\.agents\loam\bin\loam.exe'`,
-    );
+    // The harness read path is the native runtime now; the packed integration
+    // must not ship a `hook` command or the retired context renderer.
+    assert.doesNotMatch(integration, /command === 'hook'/);
+    await assert.rejects(() => readFile(join(fixture.root, 'integration', 'context.mjs')));
 
     const legacy = await import(pathToFileURL(join(fixture.root, '.opencode', 'plugins', 'loam.js')).href);
     assert.equal(typeof legacy.LoamPlugin, 'function');
@@ -92,7 +93,7 @@ test('packed setup is offline, direct-native, and preserves the legacy entry', a
   }
 });
 
-test('packed setup --yes exits at a controlled Skills CLI failure with closed stdin', async () => {
+test('packed install --yes exits at a controlled Skills CLI failure with closed stdin', async () => {
   const fixture = await packedRoot();
   const home = await mkdtemp(join(tmpdir(), 'loam-closed-stdin-home-'));
   const workspace = await mkdtemp(join(tmpdir(), 'loam-closed-stdin-workspace-'));
@@ -112,7 +113,7 @@ process.exit(1);
     const started = Date.now();
     const result = await runClosedStdin(
       process.execPath,
-      [join(fixture.root, 'bin', 'loam.mjs'), 'setup', '--yes'],
+      [join(fixture.root, 'bin', 'loam.mjs'), 'install', '--yes'],
       {
         cwd: workspace,
         env: {
@@ -172,7 +173,11 @@ test('packed marketplaces expose loam:ingestor, the loam_ingestor profile, and s
     assert.match(codexAgent, /^description = "[^"\r\n]+"$/mu);
     assert.match(codexAgent, /^developer_instructions = """$/mu);
     assert.doesNotMatch(codexAgent, /^(?:model|model_reasoning_effort|sandbox_mode)\s*=/mu);
+    // harness-native-wake: the plugin now ships the federation hooks itself, so a
+    // marketplace-only install gets SessionStart render, per-turn drain, and wake.
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'session-start.mjs'), 'utf8'));
+    await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'user-prompt-submit.mjs'), 'utf8'));
+    await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'wake.mjs'), 'utf8'));
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'stop.mjs'), 'utf8'));
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'subagent-start.mjs'), 'utf8'));
     await assert.doesNotReject(() => readFile(join(adapterRoot, 'hooks', 'subagent-stop.mjs'), 'utf8'));

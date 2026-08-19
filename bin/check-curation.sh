@@ -28,7 +28,7 @@ fi
 
 package_name="$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).name")"
 [ "$package_name" = '@scchearn/loam' ] || fail "package identity must be @scchearn/loam, got $package_name"
-grep -Fq 'npx @scchearn/loam setup' README.md || fail 'README.md must document the public setup command'
+grep -Fq 'npx @scchearn/loam install' README.md || fail 'README.md must document the public install command'
 node setup/package-check.mjs >/dev/null || fail 'package asset check failed'
 
 for workflow in .github/workflows/*.yml; do

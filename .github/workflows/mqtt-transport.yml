@@ -1,0 +1,80 @@
+name: mqtt-transport
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - cli/**
+      - .github/workflows/mqtt-transport.yml
+  push:
+    branches: [federation]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - cli/**
+      - .github/workflows/mqtt-transport.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-broker:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # openssl and python3 are preinstalled on this image; only mosquitto is
+      # missing. Runners in some regions hit a broken azure.archive mirror
+      # alias and the fallback archive connection can stall indefinitely —
+      # apt's Acquire::Timeout options observably do NOT bound that stall, so
+      # the bound is an unconditional shell `timeout` with retries. The first
+      # attempt skips `apt-get update` entirely (the image's baked package
+      # lists are days old at most); update only runs as recovery between
+      # attempts in case a list is stale.
+      - name: Install Mosquitto
+        run: |
+          for attempt in 1 2 3; do
+            timeout 180 sudo apt-get install -y --no-install-recommends mosquitto && exit 0
+            echo "attempt ${attempt} failed; refreshing lists and retrying"
+            timeout 180 sudo apt-get update || true
+          done
+          echo "mosquitto install failed after 3 bounded attempts" >&2
+          exit 1
+      - name: Install Rust
+        run: rustup toolchain install 1.94.1 --profile minimal
+      # The auto-enrollment tier: the runtime's CSR signed by a real `openssl
+      # ca`, and `request_signed_certificate` driven over real TLS against the
+      # deployment's signer contract as a subprocess. It was gated on
+      # LOAM_MQTT_TEST and then run by nothing, so the enrollment path's only
+      # end-to-end coverage never gated anything. Needs openssl (installed
+      # above) and python3 (preinstalled on this runner). Cheapest job here at
+      # ~2s, so it goes first and fails fast.
+      - name: Run the auto-enrollment signer tier
+        env:
+          LOAM_MQTT_TEST: "1"
+        run: cargo +1.94.1 test --locked --test enrollment_auto -- --ignored --test-threads=1
+      - name: Run the isolated MQTT 5 broker contract
+        env:
+          LOAM_MQTT_TEST: "1"
+        run: cargo +1.94.1 test --locked --test mqtt_transport -- --ignored --test-threads=1 broker_contract
+      - name: Run the connector enrollment round trip and its No Local control
+        env:
+          LOAM_MQTT_TEST: "1"
+        run: cargo +1.94.1 test --locked --test mqtt_connector -- --ignored --test-threads=1
+      # The two-instance federation proof points the resolver at per-test
+      # fixtures through process-global env vars, so it must run single-threaded
+      # like every sibling tier or concurrent tests clobber each other's roster.
+      - name: Run the two-instance federation operational proof against a real broker
+        env:
+          LOAM_MQTT_TEST: "1"
+        run: cargo +1.94.1 test --locked --test mqtt_operational -- --ignored --test-threads=1
+      # This lane has a real broker but no installed harness, so it
+      # runs the real-broker half of the e2e suite and never claims harness
+      # compatibility: `bin/real-harness-suite.sh` stays local and opt-in behind
+      # LOAM_REAL_HARNESS=1, and ci.yml keeps its fakes-only tier untouched.
+      - name: Run the harness e2e suite against a real broker
+        env:
+          LOAM_MQTT_TEST: "1"
+        run: cargo +1.94.1 test --locked --test mqtt_harness -- --ignored --test-threads=1

@@ -8,14 +8,20 @@ on:
       - cli/**
       - dist-workspace.toml
       - .github/workflows/cli.yml
+      - .github/scripts/**
+      # Native connector lifecycle delegation lives in packaged setup; a change
+      # here must dispatch the real per-platform service smokes (T12).
+      - setup/**
   push:
-    branches: [main]
+    branches: [main, federation]
     paths:
       - Cargo.toml
       - Cargo.lock
       - cli/**
       - dist-workspace.toml
       - .github/workflows/cli.yml
+      - .github/scripts/**
+      - setup/**
   workflow_dispatch:
 
 permissions:
@@ -60,6 +66,72 @@ jobs:
           path: ${{ matrix.binary }}
           if-no-files-found: error
           retention-days: 7
+
+  # Prove the dormant per-user service definition installs, is
+  # observable, and uninstalls on the real native managers (systemd --user,
+  # macOS LaunchAgent via launchctl, Windows Task Scheduler via schtasks). No
+  # `if:` draft guard, so this dispatches on draft PRs too. The enrolled-start
+  # smoke (observed running process) is a fast follow once this is green.
+  service-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            binary: target/release/loam
+            run: bash .github/scripts/linux-service-smoke.sh target/release/loam
+          - os: macos-14
+            binary: target/release/loam
+            run: bash .github/scripts/macos-service-smoke.sh target/release/loam
+          - os: windows-2022
+            binary: target/release/loam.exe
+            run: pwsh .github/scripts/windows-service-smoke.ps1 target/release/loam.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - run: cargo +1.94.1 build --release --locked --package loam
+      - name: Dormant service lifecycle smoke
+        run: ${{ matrix.run }}
+
+  # The Windows named-pipe endpoint's owner proof. The in-process
+  # tests (`--test ipc_owner`) run inside `build` on windows-2022; this job adds
+  # the one thing they cannot do — a second local user, in its own logon session,
+  # being denied at pipe open while the owning session round-trips a frame.
+  windows-ipc-owner:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - name: Named-pipe owner smoke (alternate-user denial)
+        run: pwsh .github/scripts/windows-ipc-owner-smoke.ps1
+
+  # The Unix domain-socket endpoint's owner proof, and the mirror of
+  # the Windows job above. The in-process tests cover the positive path and the
+  # path-safety rules; this job adds the one thing they cannot do — a real second
+  # account being refused, first by the 0700 directory and then, once the owner
+  # relaxes the path so the peer can actually reach the socket, by the
+  # SO_PEERCRED/getpeereid credential proof itself, before the parser runs.
+  #
+  # Both platforms run because `peer_euid` is two different hand-declared FFI
+  # implementations and only the comparison is shared: a mis-declared
+  # `getpeereid` could return a false-matching euid that the macOS positive
+  # control cannot distinguish from a correct one. One script, so the two
+  # runners assert identically rather than merely analogously.
+  unix-ipc-owner:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - name: Unix socket owner smoke (cross-user denial)
+        run: bash .github/scripts/unix-ipc-owner-smoke.sh
 
   dist-plan:
     runs-on: ubuntu-22.04

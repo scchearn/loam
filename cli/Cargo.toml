@@ -1,6 +1,6 @@
 [package]
 name = "loam"
-version = "0.10.0"
+version = "0.11.0-next.20"
 edition = "2021"
 publish = false
 repository = "https://github.com/scchearn/loam"
@@ -11,4 +11,9 @@ dist = true
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 pulldown-cmark = { version = "0.12", default-features = false }
+ring = "0.17.14"
+rumqttc = { version = "=0.25.1", default-features = false, features = ["use-rustls-no-provider"] }
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2.2.0"
+webpki-roots = "1.0.9"

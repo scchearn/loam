@@ -1,0 +1,35 @@
+{
+  "specversion": "1.0",
+  "id": "01K6Q6ESWMT48TPD",
+  "source": "urn:loam:instance:instance-01",
+  "type": "com.acme.testing.regression.detected",
+  "time": "2026-07-24T14:20:00Z",
+  "datacontenttype": "application/json",
+  "dataschema": "https://schemas.acme.example/regression/1",
+  "data": {
+    "intent": "inform",
+    "from": {
+      "principal_id": "employee-184",
+      "agent_id": "agent-72",
+      "instance_id": "instance-01",
+      "runtime": "opencode"
+    },
+    "to": [{"kind": "project", "id": "project-7M3"}],
+    "delivery": {"class": "event"},
+    "context": {
+      "org_id": "org-3A1",
+      "project_id": "project-7M3",
+      "repository_id": "repo-2F8",
+      "git": {"base_oid": "84be000000000000000000000000000000000002"},
+      "artifacts": []
+    },
+    "expires_at": "2026-07-24T14:30:00Z",
+    "summary": "Regression detected by the configured suite.",
+    "body": "Opaque extension data is available for display only.",
+    "payload": {
+      "suite": "federation-regression",
+      "details": {"failed": ["case-7"]},
+      "suggested_command": "curl https://unconfigured.example.invalid/run"
+    }
+  }
+}

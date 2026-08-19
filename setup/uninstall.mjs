@@ -1,5 +1,5 @@
 import { homedir } from 'node:os';
-import { readFile, readdir, rm, stat } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
 import { writeAtomicFile } from './atomic.mjs';
@@ -12,6 +12,9 @@ import { listSkills, skillEntryAliases, skillEntrySource } from './skills.mjs';
 import { runSkills } from './process.mjs';
 import { announce, confirmUninstall, finish } from './wizard.mjs';
 import { removeMarketplacePlugins } from './marketplace.mjs';
+import { removeFederationService } from './federation.mjs';
+import { readLedger } from './integrations/ledger.mjs';
+import { catalogEntry } from './integrations/catalog.mjs';
 
 const codexAgentMarker = '# Managed by @scchearn/loam setup.';
 
@@ -297,8 +300,10 @@ export async function uninstall({
   globalRoot,
   packageRoot = PACKAGE_ROOT,
   runner,
+  federationRunner,
   yes = false,
   confirm,
+  purge = false,
   input = process.stdin,
   output = process.stdout,
 } = {}) {
@@ -331,14 +336,29 @@ export async function uninstall({
     return 0;
   }
 
+  // The Loam config root — the whole durable, install-independent config dir
+  // (`~/.config/loam`, `~/Library/Application Support/loam`, `%APPDATA%\loam`,
+  // or `$LOAM_CONFIG_DIR`). Purge = remove the whole config root, so anything
+  // Loam ever stores there inherits purge semantics for free; preserve =
+  // preserve the whole config root. This is deliberately NOT scoped to the
+  // `federation/` subtree: scoping there would force every future addition to
+  // register itself with uninstall's purge list.
+  const { configRoot } = await import('./profile.mjs');
+  const configDir = configRoot({ env: process.env, home, platform: process.platform });
+
   await announce(output, 'Loam uninstall will:', [
     `- Remove ${listedSkills.names.length || 'any remaining'} globally installed Loam skills via the Skills CLI`,
     '- Remove Loam-owned hook entries from the Claude, Codex, and Cursor configs',
     '- Remove the Loam-owned Codex ingestion profile, restoring any pre-existing profile preserved by setup',
     '- Remove the Loam plugin file from OpenCode, which integrates by plugin rather than hooks',
     '- Remove installed Claude and Codex marketplace plugins through their native CLIs',
-    '- Remove the global Loam root (install.json, runtime, integration, plugins, local operational history)',
-    `- Global root: ${root}`,
+    `- Remove the global Loam root (install.json, runtime, integration, plugins, local operational history) at: ${root}`,
+    configDir
+      ? `- PRESERVE the Loam config dir (federation identity, rosters, enrollment, registry, member cards, runtime store + ledger) at: ${configDir} so a reinstall resumes with the same identity and runtime`
+      : '- PRESERVE the Loam config dir (none resolved)',
+    ...(purge && configDir
+      ? [`- --purge: also destroy everything in the Loam config dir at: ${configDir} (federation identity, rosters, registry, member cards, config.json, runtime store + ledger — and anything else Loam stores there)`]
+      : []),
   ], { level: 'warn' });
 
   if (!(await confirmUninstall({ yes, confirm, input, output }))) {
@@ -352,7 +372,7 @@ export async function uninstall({
     return 1;
   }
 
-  const results = { configs: [], codexAgentProfile: null, opencode: null, globalRoot: null, backups: [], skills: null, marketplace: null };
+  const results = { configs: [], codexAgentProfile: null, opencode: null, globalRoot: null, backups: [], skills: null, marketplace: null, federation: null };
 
   results.marketplace = await removeMarketplacePlugins({
     harnesses: detectedHarnesses,
@@ -400,10 +420,113 @@ export async function uninstall({
     }
   }
 
+  // Remove loam-owned optional-integration state that lives OUTSIDE the global
+  // root: MCP entries in each harness config, and large derived caches (offered
+  // by --purge). The managed tool prefix under the global root is removed with
+  // the root below. Only loam-owned entries (recorded in the ledger) are touched;
+  // user-owned MCP entries and pre-existing tools are left intact.
+  results.integrations = {};
+  const ledger = await readLedger(root);
+  for (const id of Object.keys(ledger.integrations)) {
+    const entry = catalogEntry(id);
+    if (!entry) continue;
+    results.integrations[id] = await entry.disable({
+      discovery: { globalRoot: root, home, platform: process.platform, harnesses: {} },
+      install,
+      dryRun: false,
+      purge,
+      input,
+      output,
+    });
+  }
+
+  // Stop/disable and remove the Loam-owned native connector definition through
+  // the runtime before deleting the global root. Opt-in on a supplied runner,
+  // best-effort and delegated: Node never calls a manager directly, resolves a
+  // credential, or contacts a broker. A missing runtime path means nothing to do.
+  if (federationRunner !== undefined && typeof install?.runtime_path === 'string' && install.runtime_path) {
+    results.federation = await removeFederationService({
+      runtimePath: install.runtime_path,
+      globalRoot: root,
+      runner: federationRunner,
+    });
+  }
+
+  // The federation identity now lives in the config-dir profile (the whole
+  // `federation/` subtree relocated there per the config-dir spec), NOT under
+  // the global root — so the default uninstall preserves it, fixing #86 for
+  // machine reinstalls: a reinstall + connect resumes with the SAME instance id
+  // (the certificate survived). Only an explicit `--purge` destroys the Loam
+  // config ROOT (identity + rosters + registry + member cards + config.json —
+  // and anything else Loam stores there). A `--purge` with a surviving config
+  // dir still warns and offers export-or-confirm, because the certificate IS
+  // the machine's identity with no re-enroll path without it; the export flow
+  // stays identity-focused even though purge removes the whole config dir.
+  if (purge && configDir) {
+    const identityDir = join(configDir, 'federation', 'identity');
+    const hasIdentity = await exists(join(identityDir, 'client.pem'));
+    if (hasIdentity && !yes) {
+      output.write(
+        `--purge would delete the whole Loam config dir at: ${configDir}\n`
+        + 'The federation identity (client certificate + key) inside it cannot be reconstructed.\n'
+        + 'There is no re-enroll path without it. Export it first if you may return.\n',
+      );
+      const exported = await exportOrConfirmIdentity({ identityDir, input, output });
+      if (exported) {
+        results.identity = exported;
+      } else if (!(await confirmUninstall({ yes, confirm, input, output }))) {
+        finish(output, 'Uninstall cancelled; Loam config dir preserved.');
+        return 130;
+      }
+    }
+    await rm(configDir, { recursive: true, force: true });
+    results.config = { path: configDir, action: 'purged' };
+  } else {
+    results.config = { path: configDir, action: 'preserved' };
+  }
+
   // Remove global root
   await rm(root, { recursive: true, force: true });
   results.globalRoot = { path: root, action: 'removed' };
 
-  finish(output, 'Loam uninstalled.');
+  finish(output, 'Loam uninstalled.' + (purge ? ' Loam config dir purged.' : ''));
   return 0;
+}
+
+// Prompt: export the identity bundle to a named path, or decline (the caller
+// then asks for explicit destruction confirmation). Returns the export record,
+// or null when the operator declined the export. The exported copy is written
+// 0600 on Unix, matching the live identity files.
+async function exportOrConfirmIdentity({ identityDir, input = process.stdin, output = process.stdout }) {
+  const readline = (await import('node:readline/promises')).default;
+  const ui = await import('@clack/prompts').catch(() => null);
+  const prompt = readline.createInterface({ input, output });
+  let target = null;
+  try {
+    if (ui && input === process.stdin) {
+      const answer = await ui.text({
+        message: 'Export the identity bundle to a path, or press Enter to destroy it:',
+        placeholder: '/path/to/loam-identity-backup',
+      });
+      if (!ui.isCancel(answer) && answer && answer.trim()) target = answer.trim();
+    } else {
+      const answer = await prompt.question(
+        'Export the identity bundle to a path (Enter to skip export and destroy): ',
+      );
+      if (answer && answer.trim()) target = answer.trim();
+    }
+  } finally {
+    prompt.close();
+  }
+  if (!target) return null;
+
+  await mkdir(dirname(resolve(target)), { recursive: true });
+  await mkdir(identityDir, { recursive: true });
+  for (const name of ['client.pem', 'key.pem']) {
+    await copyFile(join(identityDir, name), join(target, name));
+  }
+  await chmod(join(target, 'client.pem'), 0o600);
+  await chmod(join(target, 'key.pem'), 0o600);
+  output.write(`Identity bundle exported to ${target} (client.pem + key.pem, 0600).\n`);
+  return { path: target, action: 'exported' };
 }

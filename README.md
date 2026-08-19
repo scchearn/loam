@@ -22,14 +22,48 @@ sessions build on each other instead of starting from scratch.
 ## Install
 
 ```bash
-npx @scchearn/loam setup
+npx @scchearn/loam install
 ```
 
-That's it. Setup installs the skills and a small native helper globally (once,
-not per project), automatically configures detected OpenCode and Cursor
+That's it. `install` installs the skills and a small native helper globally
+(once, not per project), automatically configures detected OpenCode and Cursor
 integrations, and offers to install the Loam marketplace plugin for detected
-Claude Code and Codex installations. Those marketplace plugins own their
-`SessionStart` and `Stop` hooks; setup never adds duplicate user hooks.
+Claude Code and Codex installations. It points each harness's session hooks
+straight at the private native helper and owns that registration; it never adds
+duplicate user hooks. Re-running `install` repairs a damaged install at the same
+version; on a healthy install it is a fast no-op.
+
+Loam has three verbs, one job each:
+
+| Verb | Job |
+| ---- | --- |
+| `install` | First-time installation; re-run repairs a same-version install. |
+| `update`  | Bump an existing install to this version, and nothing else. |
+| `setup`   | Configure an existing install: federation, integrations, harnesses. |
+
+### Collaboration compatibility
+
+Loam's federated collaboration features are advertised per harness, and only
+after every row of the compatibility matrix has been observed passing against
+that harness's released version.
+
+| Harness | Collaboration state in a session |
+| ------- | -------------------------------- |
+| Claude Code | **automatically compatible** — injected at session start and refreshed at the next prompt |
+| Codex CLI | **automatically compatible** — injected on the first turn of a session, once Codex's one-time hook-trust review has approved the Loam hook |
+| OpenCode | **automatically compatible** — prepended to the first user message of a session by the in-process plugin |
+| Cursor | **withheld — not installed/evaluated**; CLI retrieval only |
+
+Withheld means exactly that: the claim is not made, and no shim, bridge, or
+polling fallback was added to simulate one. A withheld harness still gets the
+full skill set and the baseline Loam context — only the automatic collaboration
+claim is withheld, and collaboration state remains reachable from the CLI.
+
+Codex runs its `SessionStart` hooks on the first turn rather than before it, so
+the context arrives with your first message rather than ahead of it. Codex also
+gates every hook behind a one-time trust review and truncates long hook output
+in model context; the framing, the workspace state, and the federation section
+survive, and part of the skill body may be elided.
 
 Use `--yes` to configure every detected harness without prompting, or
 `--dry-run` to preview without downloads or mutation. Nothing is added to your
@@ -51,11 +85,33 @@ To remove everything loam installed:
 npx @scchearn/loam uninstall
 ```
 
-`install` is an alias for `setup`; `doctor` checks the installation without
-changing it. `uninstall` also removes Loam's globally installed skills.
+`setup` configures an existing install (enable/disable federation and optional
+integrations, select harnesses) without touching versions; `doctor` checks the
+installation without changing it. `uninstall` also removes Loam's globally
+installed skills.
 
 For agent-specific setup notes, see [`.opencode/INSTALL.md`](./.opencode/INSTALL.md)
 and [`.codex/INSTALL.md`](./.codex/INSTALL.md).
+
+### Optional integrations
+
+Loam skills are better with companion tools — code search for API verification,
+markdown search over the wiki — but never require them (a skill degrades
+gracefully when the tool is absent). They are opt-in, off by default, and
+managed by the configurator:
+
+```bash
+npx @scchearn/loam setup --integration grep          # grep.app code search (remote MCP; queries egress to a public-repo index)
+npx @scchearn/loam setup --integration qmd           # QMD markdown search (local Node tool + local MCP; no egress)
+npx @scchearn/loam setup --disable-integration qmd   # symmetric disable: deregister everywhere + remove the loam-managed tool
+```
+
+Enabling installs any needed tool into a loam-managed prefix, verifies it, then
+registers the MCP into each configured harness (Claude Code, Codex, OpenCode,
+Cursor) using the tool's absolute path. Disable reverses every step and verifies
+absence; `--purge` also removes large derived caches (e.g. QMD's ~2–3GB model
+cache, kept by default). Loam never touches a user-owned MCP entry or a tool it
+did not install.
 
 ### Background session harvest
 
@@ -188,7 +244,7 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::resuming | 376 | 77 | 142 | 1,807 |
 | loam::setting-goals | 473 | 101 | 184 | 1,850 |
 | loam::starting | 166 | 34 | 357 | 4,991 |
-| loam::writing-spec | 332 | 66 | 252 | 2,892 |
+| loam::writing-spec | 332 | 66 | 253 | 3,002 |
 <!-- END skill-metrics -->
 
 ## Documentation

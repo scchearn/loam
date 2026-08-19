@@ -3,13 +3,9 @@
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 
-import { formatContext } from './context.mjs';
-import { readSkillContent } from './metadata.mjs';
 import { resolveGlobalRoot, resolveSkillsRoot } from './paths.mjs';
 import { probeState } from './runtime.mjs';
 import { ingestStatus } from './ingest.mjs';
-
-const HARNESS_IDS = new Set(['opencode', 'claude', 'codex', 'cursor']);
 
 function parseArgs(argv) {
   const [command, ...rest] = argv;
@@ -24,20 +20,9 @@ function parseArgs(argv) {
     }
     return { command, workspace: resolve(workspace), jsonOutput };
   }
-  if (command === 'hook') {
-    let harness;
-    let workspace;
-    for (let index = 0; index < rest.length; index += 1) {
-      const flag = rest[index];
-      if (flag === '--harness') harness = rest[++index];
-      else if (flag === '--workspace') workspace = rest[++index];
-      else throw new Error(`unknown integration option: ${flag}`);
-    }
-    if (!HARNESS_IDS.has(harness)) throw new Error(`unsupported harness: ${harness || '(missing)'}`);
-    if (!workspace) throw new Error('hook requires --workspace');
-    return { command, harness, workspace: resolve(workspace) };
-  }
-  throw new Error('usage: loam.mjs status | hook --harness <id> --workspace <path>');
+  // `hook` is gone: the harness read path is the native `loam hook <harness>`
+  // command, which setup writes into each harness registration directly.
+  throw new Error('usage: loam.mjs status | ingest-status --workspace <path> [--json]');
 }
 
 function publicStatus(result) {
@@ -60,47 +45,20 @@ export async function runIntegration(argv = process.argv.slice(2), options = {})
     return 0;
   }
 
-  if (parsed.command === 'status') {
-    const result = await probeState({
-      globalRoot,
-      skillsRoot,
-      target,
-      platform: options.platform,
-      arch: options.arch,
-      env,
-      workspace: options.workspace || process.cwd(),
-      timeoutMs: options.timeoutMs,
-      runner: options.runner,
-      install: options.install,
-    });
-    output.write(`${JSON.stringify(publicStatus(result))}\n`);
-    return result.ready ? 0 : 1;
-  }
-
   const result = await probeState({
     globalRoot,
     skillsRoot,
     target,
     platform: options.platform,
     arch: options.arch,
-    workspace: parsed.workspace,
+    env,
+    workspace: options.workspace || process.cwd(),
     timeoutMs: options.timeoutMs,
     runner: options.runner,
     install: options.install,
   });
-  const skillContent = result.skillContent || (await readSkillContent({ skillsRoot }).catch(() => ''));
-  output.write(
-    `${formatContext({
-      skillContent,
-      pluginVersion: result.install?.plugin_version,
-      runtimePath: result.runtimePath,
-      platform: options.platform,
-      workspace: parsed.workspace,
-      state: result.ready ? result.state : undefined,
-      unavailable: result.ready ? undefined : result,
-    })}\n`,
-  );
-  return 0;
+  output.write(`${JSON.stringify(publicStatus(result))}\n`);
+  return result.ready ? 0 : 1;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {

@@ -1,0 +1,65 @@
+[
+  {
+    "name": "organization_audience_remains_valid",
+    "expected": "ok",
+    "base": "work-state",
+    "topic": "loam/v1/org-3A1/project-7M3/state/instance-01/activity-01K6Q5",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "org", "id": "org-3A1"}]}]
+  },
+  {
+    "name": "project_audience_remains_valid",
+    "expected": "ok",
+    "base": "work-state",
+    "topic": "loam/v1/org-3A1/project-7M3/state/instance-01/activity-01K6Q5",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "project", "id": "project-7M3"}]}]
+  },
+  {
+    "name": "agent_recipient",
+    "expected": "ok",
+    "base": "message",
+    "topic": "loam/v1/org-3A1/project-7M3/inbox/agent/shared-42/instance-01/01K6Q6ESWMT48TPC",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "agent", "id": "shared-42"}]}]
+  },
+  {
+    "name": "principal_recipient_with_colliding_id",
+    "expected": "ok",
+    "base": "message",
+    "topic": "loam/v1/org-3A1/project-7M3/inbox/principal/shared-42/instance-01/01K6Q6ESWMT48TPC",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "principal", "id": "shared-42"}]}]
+  },
+  {
+    "name": "instance_recipient_with_colliding_id",
+    "expected": "ok",
+    "base": "message",
+    "topic": "loam/v1/org-3A1/project-7M3/inbox/instance/shared-42/instance-01/01K6Q6ESWMT48TPC",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "instance", "id": "shared-42"}]}]
+  },
+  {
+    "name": "colliding_agent_cannot_enter_principal_inbox",
+    "expected": "recipient_kind_mismatch",
+    "base": "message",
+    "topic": "loam/v1/org-3A1/project-7M3/inbox/principal/shared-42/instance-01/01K6Q6ESWMT48TPC",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "agent", "id": "shared-42"}]}]
+  },
+  {
+    "name": "colliding_principal_cannot_enter_instance_inbox",
+    "expected": "recipient_kind_mismatch",
+    "base": "message",
+    "topic": "loam/v1/org-3A1/project-7M3/inbox/instance/shared-42/instance-01/01K6Q6ESWMT48TPC",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "principal", "id": "shared-42"}]}]
+  },
+  {
+    "name": "unknown_topic_recipient_kind",
+    "expected": "unknown_recipient_kind",
+    "base": "message",
+    "topic": "loam/v1/org-3A1/project-7M3/inbox/team/shared-42/instance-01/01K6Q6ESWMT48TPC",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "agent", "id": "shared-42"}]}]
+  },
+  {
+    "name": "former_untyped_shape",
+    "expected": "malformed_topic",
+    "base": "message",
+    "topic": "loam/v1/org-3A1/project-7M3/inbox/shared-42/instance-01/01K6Q6ESWMT48TPC",
+    "patches": [{"op": "set", "path": ["data", "to"], "value": [{"kind": "agent", "id": "shared-42"}]}]
+  }
+]

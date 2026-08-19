@@ -3,9 +3,9 @@ import { join, resolve } from 'node:path';
 
 import { PACKAGE_ROOT, PACKAGE_VERSION } from './constants.mjs';
 import { detectHarnesses } from './harnesses.mjs';
+import { federationDefinitionExists } from './federation.mjs';
 import { detectLegacyProject, isOwnedLegacyMarker, LEGACY_MARKERS } from './migration.mjs';
 import { loadSkillInventory } from './inventory.mjs';
-import { readRequiredVersion } from '../integration/metadata.mjs';
 import { detectTarget } from './target.mjs';
 
 async function exists(path) {
@@ -54,15 +54,31 @@ export async function discover({
   const resolvedWorkspace = resolve(workspace);
   const globalRoot = join(resolvedHome, '.agents', 'loam');
   const skillsRoot = join(resolvedHome, '.agents', 'skills');
-  let requiredVersion = '';
-  try {
-    requiredVersion = await readRequiredVersion({ skillsRoot });
-  } catch {}
-
+  // The durable federation profile root in the config dir (survives uninstall),
+  // resolved with the same ladder the runtime uses; `null` when no config basis
+  // resolves. Setup never writes it; uninstall preserves it (and `--purge`
+  // destroys it).
+  const { profileRoot, configRoot } = await import('./profile.mjs');
+  const federationProfileRoot = profileRoot({
+    env: process.env,
+    home: resolvedHome,
+    platform,
+  });
+  // The durable config-dir loam root. With the global root these are the roots
+  // the legacy-project sweep must never treat as a removable project (#125):
+  // run from $HOME, <workspace>/.agents/loam resolves ONTO the global install.
+  const loamConfigRoot = configRoot({ env: process.env, home: resolvedHome, platform });
+  const protectedRoots = [globalRoot, loamConfigRoot].filter(Boolean);
+  // Whether federation was already enabled here (a file-based service definition
+  // exists) BEFORE this run. Captured up front so the post-setup verify can fail
+  // if the definition vanished mid-transaction (#125 — the enrollment-state wipe
+  // deleted the plist; verify passed over the gutted tree because it never
+  // asserted this). win32's Task Scheduler definition is out of scope (#100).
+  const { exists: federationEnabled } = await federationDefinitionExists({ globalRoot, platform });
   const sourceRepository = resolvedWorkspace === resolve(packageRoot);
   const hasEvidence = !sourceRepository && await hasLegacyEvidence(resolvedWorkspace, packageRoot);
   const legacy = hasEvidence
-    ? await detectLegacyProject({ workspace: resolvedWorkspace, packageRoot, runner })
+    ? await detectLegacyProject({ workspace: resolvedWorkspace, packageRoot, protectedRoots, runner })
     : { workspace: resolvedWorkspace, ready: true, needed: false, skillNames: [], paths: [], markers: [], unsafe: [] };
 
   return {
@@ -72,10 +88,13 @@ export async function discover({
     workspace: resolvedWorkspace,
     globalRoot,
     skillsRoot,
+    federationProfileRoot,
+    configRoot: loamConfigRoot,
+    protectedRoots,
+    federationEnabled,
     target: target || detectTarget({ platform, arch }),
     platform,
     arch,
-    requiredVersion,
     node: process.version,
     npm: process.env.npm_execpath || 'npx',
     harnesses: await detectHarnesses({ home: resolvedHome, pluginVersion: PACKAGE_VERSION }),

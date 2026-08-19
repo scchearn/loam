@@ -1,0 +1,10 @@
+[
+  {"name": "ready_only", "expected": "provisional"},
+  {"name": "unreachable_published", "expected": "unreachable"},
+  {"name": "allowed_ref_published", "expected": "verified"},
+  {"name": "disallowed_ref", "expected": "unreachable"},
+  {"name": "fetch_failure", "expected": "git_failure"},
+  {"name": "dropped_hint", "expected": "same_reconciliation"},
+  {"name": "dirty_handoff", "expected": "dirty"},
+  {"name": "unfetchable_handoff", "expected": "git_failure"}
+]

@@ -9,6 +9,16 @@ import { installHarnesses, detectHarnesses } from '../setup/harnesses.mjs';
 import { uninstall } from '../setup/uninstall.mjs';
 import { childIdentity } from '../integration/ingest-process.mjs';
 import { confirmUninstall } from '../setup/wizard.mjs';
+import { readLedger, runtimeStorePath, writeLedger } from '../integration/ledger.mjs';
+
+// Seed the config-dir runtime store + ledger the way an install leaves them.
+async function seedRuntimeStore(configDir, { version = '0.9.1', target = 'x86_64-unknown-linux-musl' } = {}) {
+  const store_path = runtimeStorePath({ version, target, root: configDir });
+  await mkdir(join(configDir, 'runtime', version, target), { recursive: true });
+  await writeFile(store_path, 'fake runtime\n');
+  await writeLedger({ channel: 'latest', target: version, sha256: 'a'.repeat(64), store_path }, { root: configDir });
+  return store_path;
+}
 
 function skillsRunner({ installed = true, calls = [] } = {}) {
   let active = installed;
@@ -29,6 +39,26 @@ function skillsRunner({ installed = true, calls = [] } = {}) {
   };
 }
 
+// Pin the config-dir resolution into the fixture home for the duration of a
+// test. `uninstall()` resolves the Loam config root through the environment
+// (LOAM_CONFIG_DIR -> XDG_CONFIG_HOME -> platform default), and CI sets
+// XDG_CONFIG_HOME, so without pinning, the purge/preserve assertions resolve
+// outside the fixture home and the asserted directory survives (or is missed)
+// regardless of what uninstall actually did. LOAM_CONFIG_DIR is the first rung,
+// so pointing it at the fixture's config dir makes the resolution deterministic
+// and env-hermetic. The previous value is restored afterwards, matching the
+// save/restore pattern used elsewhere in this suite.
+async function withPinnedConfigDir(configDir, fn) {
+  const previous = process.env.LOAM_CONFIG_DIR;
+  process.env.LOAM_CONFIG_DIR = configDir;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.LOAM_CONFIG_DIR;
+    else process.env.LOAM_CONFIG_DIR = previous;
+  }
+}
+
 async function readyFixture({ codexProfile } = {}) {
   const home = await mkdtemp(join(tmpdir(), 'loam-uninstall-'));
   const globalRoot = join(home, '.agents', 'loam');
@@ -42,14 +72,15 @@ async function readyFixture({ codexProfile } = {}) {
     await writeFile(join(home, '.codex', 'agents', 'loam_ingestor.toml'), codexProfile);
   }
   await writeFile(join(home, '.agents', 'skills', 'loam-using', 'SKILL.md'), '# using\n');
+  const runtimePath = join(globalRoot, 'bin', '0.9.1', 'x86_64-unknown-linux-musl', 'loam');
   const detected = await detectHarnesses({ home });
-  const installed = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', detected });
+  const installed = await installHarnesses({ home, globalRoot, pluginVersion: '0.8.3', runtimePath, detected });
   const install = {
     schema_version: 1,
     plugin_version: '0.8.3',
     runtime_version: '0.9.1',
     target: 'x86_64-unknown-linux-musl',
-    runtime_path: join(globalRoot, 'bin', '0.9.1', 'x86_64-unknown-linux-musl', 'loam'),
+    runtime_path: runtimePath,
     runtime_sha256: 'a'.repeat(64),
     adapter_root: installed.versionRoot,
     integration_path: join(globalRoot, 'integration', 'loam.mjs'),
@@ -83,12 +114,17 @@ test('uninstall removes the global root, skills, adapter, and Loam-owned hooks; 
   const claudePath = join(home, '.claude', 'settings.json');
   const codexPath = join(home, '.codex', 'hooks.json');
   const cursorPath = join(home, '.cursor', 'hooks.json');
+  // Both registration generations: the retired Node shim a previous install
+  // left in user config, and the native `hook` command this one writes.
+  const legacyClaude = { type: 'command', command: 'node', args: [join(globalRoot, 'plugins', 'old', 'claude-session-start.mjs')] };
+  const nativeClaude = { type: 'command', command: install.runtime_path, args: ['hook', 'claude', '--event', 'SessionStart'] };
+  const legacyCodexSession = { type: 'command', command: `node ${JSON.stringify(join(globalRoot, 'plugins', 'old', 'codex-session-start.mjs'))}` };
   const claude = { hooks: {
-    SessionStart: [{ hooks: [{ type: 'command', command: 'node', args: [installed.claude.path] }] }],
+    SessionStart: [{ hooks: [legacyClaude, nativeClaude] }],
     Stop: [],
   } };
   const codex = { hooks: {
-    SessionStart: [{ hooks: [{ type: 'command', command: `node ${JSON.stringify(installed.codex.sessionPath)}` }] }],
+    SessionStart: [{ hooks: [legacyCodexSession] }],
     Stop: [{ hooks: [{ type: 'command', command: `node ${JSON.stringify(installed.codex.stopPath)}` }] }],
   } };
   const cursor = JSON.parse(await readFile(cursorPath, 'utf8'));
@@ -132,10 +168,11 @@ test('uninstall removes the global root, skills, adapter, and Loam-owned hooks; 
   assert.deepEqual(codexSessionHooks[0], unrelatedCodexSession, 'unrelated codex SessionStart hook preserved');
   assert.deepEqual(codexStopHooks[0], unrelatedCodexStop, 'unrelated codex Stop hook preserved');
   assert.deepEqual(cursorHooks[0], unrelatedCursor, 'unrelated cursor hook preserved');
-  assert.equal(claudeHooks.filter((h) => h.command === 'node' && h.args?.[0] === installed.claude.path).length, 0, 'loam claude hook removed');
-  assert.equal(codexSessionHooks.filter((h) => h.command === `node ${JSON.stringify(installed.codex.sessionPath)}`).length, 0, 'loam codex SessionStart hook removed');
+  assert.equal(claudeHooks.length, 1, 'both the legacy shim and the native claude hook removed');
+  assert.equal(codexSessionHooks.filter((h) => h.command === legacyCodexSession.command).length, 0, 'loam codex SessionStart hook removed');
   assert.equal(codexStopHooks.filter((h) => h.command === `node ${JSON.stringify(installed.codex.stopPath)}`).length, 0, 'loam codex Stop hook removed');
-  assert.equal(cursorHooks.filter((h) => h.command === 'node' && h.args?.[0] === installed.cursor.path).length, 0, 'loam cursor hook removed');
+  assert.equal(cursorHooks.length, 1, 'the native cursor hook removed');
+  assert.equal(cursorHooks.filter((h) => h.command === install.runtime_path).length, 0, 'no native runtime command survives uninstall');
 });
 
 test('uninstall restores a Codex profile preserved during setup', async () => {
@@ -149,6 +186,105 @@ test('uninstall restores a Codex profile preserved during setup', async () => {
   assert.equal(code, 0);
   assert.equal(await readFile(profilePath, 'utf8'), original);
   assert.equal(await exists(`${profilePath}.loam-backup`), false);
+});
+
+test('uninstall preserves the Loam config dir by default (#86)', async () => {
+  const { home, globalRoot } = await readyFixture();
+  // The durable profile now lives in the config root, not under the global root.
+  const configDir = join(home, '.config', 'loam');
+  const identityDir = join(configDir, 'federation', 'identity');
+  await mkdir(identityDir, { recursive: true });
+  await writeFile(join(identityDir, 'client.pem'), 'cert');
+  await writeFile(join(identityDir, 'key.pem'), 'key');
+  await writeFile(join(configDir, 'anything-else.json'), '{}');
+  const storePath = await seedRuntimeStore(configDir);
+
+  let output = '';
+  const code = await withPinnedConfigDir(configDir, () => uninstall({
+    home,
+    globalRoot,
+    yes: true,
+    runner: skillsRunner(),
+    output: { write: (chunk) => { output += chunk; } },
+  }));
+  assert.equal(code, 0);
+  assert.equal(await exists(globalRoot), false, 'the install is removed');
+  assert.equal(await exists(join(identityDir, 'client.pem')), true, 'the identity survives a default uninstall');
+  assert.equal(await exists(join(configDir, 'anything-else.json')), true, 'the whole config dir survives a default uninstall');
+  // The runtime store + ledger survive, and a later install rehydrates from them.
+  assert.equal(await exists(storePath), true, 'the runtime store binary survives a default uninstall');
+  const rehydrated = await withPinnedConfigDir(configDir, () => readLedger({ env: { LOAM_CONFIG_DIR: configDir } }));
+  assert.equal(rehydrated?.target, '0.9.1', 'the ledger survives and rehydrates on reinstall');
+  assert.match(output, /PRESERVE the Loam config dir/i);
+  assert.match(output, /runtime store \+ ledger/i);
+});
+
+test('uninstall --purge destroys the whole Loam config dir with an explicit confirm (#86)', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const configDir = join(home, '.config', 'loam');
+  const identityDir = join(configDir, 'federation', 'identity');
+  await mkdir(identityDir, { recursive: true });
+  await writeFile(join(identityDir, 'client.pem'), 'cert');
+  await writeFile(join(identityDir, 'key.pem'), 'key');
+  await writeFile(join(configDir, 'anything-else.json'), '{}');
+  const storePath = await seedRuntimeStore(configDir);
+
+  let output = '';
+  // `yes: true` IS the explicit confirmation: no export prompt, the config dir
+  // goes with the install, and the warning still names the identity.
+  const code = await withPinnedConfigDir(configDir, () => uninstall({
+    home,
+    globalRoot,
+    yes: true,
+    purge: true,
+    runner: skillsRunner(),
+    output: { write: (chunk) => { output += chunk; } },
+  }));
+  assert.equal(code, 0);
+  assert.equal(await exists(globalRoot), false);
+  assert.equal(await exists(configDir), false, '--purge destroys the whole config dir');
+  assert.equal(await exists(join(identityDir, 'client.pem')), false, '--purge destroys the identity');
+  assert.equal(await exists(storePath), false, '--purge destroys the runtime store + ledger');
+  assert.match(output, /federation identity/);
+  assert.match(output, /runtime store \+ ledger/i);
+});
+
+test('uninstall --purge prompts export-or-confirm and preserves the install and config dir when the operator declines (#86)', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const configDir = join(home, '.config', 'loam');
+  const identityDir = join(configDir, 'federation', 'identity');
+  await mkdir(identityDir, { recursive: true });
+  await writeFile(join(identityDir, 'client.pem'), 'cert');
+  await writeFile(join(identityDir, 'key.pem'), 'key');
+  await writeFile(join(configDir, 'anything-else.json'), '{}');
+
+  let output = '';
+  const prompts = [];
+  const readlineLike = {
+    isTTY: false,
+    question: async (text) => {
+      prompts.push(text);
+      // First the export-path prompt (decline), then the destruction confirm (decline).
+      return prompts.length === 1 ? '\n' : 'n\n';
+    },
+    close: () => {},
+    on: () => {},
+  };
+  const code = await withPinnedConfigDir(configDir, () => uninstall({
+    home,
+    globalRoot,
+    yes: false,
+    purge: true,
+    confirm: undefined,
+    runner: skillsRunner(),
+    output: { write: (chunk) => { output += chunk; } },
+    input: readlineLike,
+  }));
+  assert.equal(code, 130, 'declining both prompts cancels the uninstall');
+  assert.equal(await exists(join(identityDir, 'client.pem')), true, 'the identity survives a declined purge');
+  assert.equal(await exists(configDir), true, 'the whole config dir survives a declined purge');
+  assert.equal(await exists(globalRoot), true, 'the install survives a declined purge (uninstall cancelled)');
+  assert.match(output, /federation identity/);
 });
 
 test('uninstall preserves a Codex profile the user replaced after setup', async () => {
@@ -432,4 +568,32 @@ test('uninstall blocks while a background worker lease is live', async () => {
 
   assert.equal(code, 1);
   assert.equal(await exists(globalRoot), true);
+});
+
+test('uninstall removes loam-owned integration MCP entries and leaves user-owned ones', async () => {
+  const { home, globalRoot } = await readyFixture();
+  // A loam-owned grep MCP + a user-owned one, recorded in the ledger as ours=grep only.
+  await writeFile(join(home, '.claude.json'), JSON.stringify({
+    mcpServers: {
+      grep: { type: 'http', url: 'https://mcp.grep.app' },
+      mine: { type: 'http', url: 'https://user.example/mine' },
+    },
+  }));
+  await writeFile(join(globalRoot, 'integrations.json'), JSON.stringify({
+    integrations: { grep: { mcp: { claude: 'grep' }, tool: null } },
+  }));
+
+  const code = await uninstall({
+    home,
+    globalRoot,
+    yes: true,
+    runner: skillsRunner(),
+    output: { write: () => {} },
+  });
+  assert.equal(code, 0);
+  // .claude.json survives (it's outside the global root); loam-owned grep gone,
+  // user-owned mine preserved.
+  const claudeJson = JSON.parse(await readFile(join(home, '.claude.json'), 'utf8'));
+  assert.equal(claudeJson.mcpServers.grep, undefined, 'loam-owned grep MCP removed');
+  assert.deepEqual(claudeJson.mcpServers.mine, { type: 'http', url: 'https://user.example/mine' }, 'user-owned MCP preserved');
 });

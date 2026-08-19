@@ -1,4 +1,4 @@
-const RECOVERY_CONTEXT = '<LOAM_IMPORTANT>\nYou have loam.\nLoam is unavailable. Recovery: npx @scchearn/loam setup\n</LOAM_IMPORTANT>';
+const RECOVERY_CONTEXT = '<LOAM_IMPORTANT>\nLoam is installed for this workspace, but its runtime failed to load for this session, so the loam memory, goals, plans, and checkpoint skills are unavailable right now.\nTo repair it, run: npx @scchearn/loam install\nThen start a new session.\n</LOAM_IMPORTANT>';
 
 async function loadAdapter() {
   try {

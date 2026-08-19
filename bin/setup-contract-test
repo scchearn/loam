@@ -22,34 +22,83 @@ EXPECTED_VERSION="$(node -p "require('$PACKED_ROOT/package.json').version")"
 }
 
 node "$PACKED_ROOT/bin/loam.mjs" --help >/dev/null
-DRY_RUN_OUTPUT="$(cd "$WORKSPACE" && node "$PACKED_ROOT/bin/loam.mjs" setup --dry-run --yes 2>&1)"
+
+# Verb split: install is the first-time/repair verb; its dry-run previews without
+# creating a global root.
+DRY_RUN_OUTPUT="$(cd "$WORKSPACE" && node "$PACKED_ROOT/bin/loam.mjs" install --dry-run --yes 2>&1)"
 printf '%s\n' "$DRY_RUN_OUTPUT" | grep -Eiq 'dry.?run' || {
-  printf 'FAIL: packed dry-run did not report preview mode\n' >&2
+  printf 'FAIL: packed install dry-run did not report preview mode\n' >&2
   exit 1
 }
 [[ ! -e "$HOME_ROOT/.agents/loam" ]] || {
-  printf 'FAIL: packed dry-run created a global Loam root\n' >&2
+  printf 'FAIL: packed install dry-run created a global Loam root\n' >&2
   exit 1
 }
 
-grep -Fq 'Native runtime command' "$PACKED_ROOT/integration/context.mjs" || {
-  printf 'FAIL: packed context lacks the native runtime command contract\n' >&2
+# update refuses on a machine with no install and points to install.
+UPDATE_OUTPUT="$(cd "$WORKSPACE" && node "$PACKED_ROOT/bin/loam.mjs" update 2>&1)" && {
+  printf 'FAIL: update with no install should exit non-zero\n' >&2
   exit 1
 }
+printf '%s\n' "$UPDATE_OUTPUT" | grep -Eiq 'No Loam installation found' || {
+  printf 'FAIL: update with no install did not point to install\n' >&2
+  exit 1
+}
+
+# setup is the configurator; with no install it guides to install and creates nothing.
+SETUP_OUTPUT="$(cd "$WORKSPACE" && node "$PACKED_ROOT/bin/loam.mjs" setup --federation enable --dry-run 2>&1)" || true
+printf '%s\n' "$SETUP_OUTPUT" | grep -Eiq 'install' || {
+  printf 'FAIL: packed setup with no install did not guide to install\n' >&2
+  exit 1
+}
+[[ ! -e "$HOME_ROOT/.agents/loam" ]] || {
+  printf 'FAIL: packed setup grace path created a global Loam root\n' >&2
+  exit 1
+}
+
+# The shared Node session integration is retired: the packed tree must not ship
+# the context renderer or the shared session hook, and the integration must not
+# serve a `hook` command at any spelling. The plugin-scoped session hook is NOT
+# retired -- the static plugin carries self-resolving federation shims for the
+# marketplace-only install (harness-native-wake spec); see the positive check below.
+for RETIRED in integration/context.mjs hooks/session-start.mjs hooks/hooks.json; do
+  [[ ! -e "$PACKED_ROOT/$RETIRED" ]] || {
+    printf 'FAIL: packed tree still ships the retired %s\n' "$RETIRED" >&2
+    exit 1
+  }
+done
+
+# The static plugin ships the federation delivery lane itself so a marketplace-only
+# install (no npx/renderPluginHooks staging) still gets SessionStart restore,
+# per-turn drain, and idle wake. Guard the contract in the new direction.
+for SHIM in session-start.mjs user-prompt-submit.mjs wake.mjs; do
+  [[ -e "$PACKED_ROOT/plugins/loam-adapter/hooks/$SHIM" ]] || {
+    printf 'FAIL: packed plugin is missing the federation shim %s\n' "$SHIM" >&2
+    exit 1
+  }
+done
 if grep -Fq 'run --' "$PACKED_ROOT/integration/loam.mjs"; then
   printf 'FAIL: packed integration retains the public run proxy\n' >&2
   exit 1
 fi
+(cd "$WORKSPACE" && node "$PACKED_ROOT/integration/loam.mjs" hook --harness claude --workspace "$WORKSPACE" >/dev/null 2>&1) && {
+  printf 'FAIL: packed integration still serves the retired hook command\n' >&2
+  exit 1
+}
+# Positive control for the line above: the same entry point still answers
+# `status`, so the refusal is a retirement and not a broken module.
+(cd "$WORKSPACE" && node "$PACKED_ROOT/integration/loam.mjs" status >/dev/null 2>&1) || true
+STATUS_ERR="$(cd "$WORKSPACE" && node "$PACKED_ROOT/integration/loam.mjs" status 2>&1 >/dev/null || true)"
+[[ -z "$STATUS_ERR" ]] || {
+  printf 'FAIL: packed integration cannot serve status: %s\n' "$STATUS_ERR" >&2
+  exit 1
+}
 
-HOOK_OUTPUT="$(cd "$WORKSPACE" && printf '{}' | CLAUDE_PLUGIN_ROOT="$PACKED_ROOT" node "$PACKED_ROOT/hooks/session-start.mjs")"
-HOOK_OUTPUT="$HOOK_OUTPUT" python3 - <<'PY'
-import json
-import os
-
-payload = json.loads(os.environ['HOOK_OUTPUT'])
-context = payload['hookSpecificOutput']['additionalContext']
-assert '<LOAM_IMPORTANT>' in context
-assert 'npx @scchearn/loam setup' in context
-PY
+# The OpenCode plugin carries the runtime slot setup fills at stage time — no
+# session-time resolution of the version-qualified runtime path.
+grep -Fq '__LOAM_RUNTIME_PATH__' "$PACKED_ROOT/adapters/opencode.mjs" || {
+  printf 'FAIL: packed OpenCode adapter has no staged runtime slot\n' >&2
+  exit 1
+}
 
 printf 'OK: packaged setup contract passed\n'

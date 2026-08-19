@@ -121,11 +121,19 @@ fn state_fast_without_wiki_returns_minimal_fallback() {
         "loam failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // The runtime self-reports its compiled version as the first key (T1); derive
+    // it from the crate version rather than hard-coding, so a bump stays green.
+    let body = r#"{"wiki_root":"","exists":false,"qmd_ready":false,"latest_checkpoint":null,"recent_checkpoints":[],"checkpoint_count":0,"git_status":null,"drift_count":null,"hints":[{"kind":"memory_missing","group":"maintenance","severity":"info","message":"No memory substrate found; scaffold a wiki to begin.","command":"/loam::scaffolding-wiki <goal>","evidence":{}}]}"#;
+    let expected = format!(
+        "{{\"version\":\"{}\",{}",
+        env!("CARGO_PKG_VERSION"),
+        &body[1..]
+    );
     assert_eq!(
         String::from_utf8(output.stdout)
             .expect("state output should be UTF-8")
             .trim(),
-        r#"{"wiki_root":"","exists":false,"qmd_ready":false,"latest_checkpoint":null,"recent_checkpoints":[],"checkpoint_count":0,"git_status":null,"drift_count":null,"hints":[{"kind":"memory_missing","group":"maintenance","severity":"info","message":"No memory substrate found; scaffold a wiki to begin.","command":"/loam::scaffolding-wiki <goal>","evidence":{}}]}"#
+        expected
     );
 }
 

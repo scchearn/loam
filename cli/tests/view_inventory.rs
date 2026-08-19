@@ -347,7 +347,11 @@ fn view_inventory_default_and_fast_outputs_are_unchanged_by_the_view_wiring() {
     // leak in, and the legacy top-level shape is exactly as before.
     for stdout in [&default_stdout, &fast_stdout] {
         assert!(!stdout.contains("\"profile\":\"loam-view\""), "{stdout}");
-        assert!(stdout.starts_with("{\"wiki_root\":"), "{stdout}");
+        // The federation lane's channel-ledger work made `version` the leading
+        // key of the legacy aggregate; the contract here is only that no
+        // snapshot-v1 fields leak in and the legacy keys stay present.
+        assert!(stdout.starts_with("{\"version\":"), "{stdout}");
+        assert!(stdout.contains("\"wiki_root\":"), "{stdout}");
         assert!(stdout.contains("\"qmd_ready\":"), "{stdout}");
     }
 }
