@@ -103,6 +103,7 @@ managed by the configurator:
 ```bash
 npx @scchearn/loam setup --integration grep          # grep.app code search (remote MCP; queries egress to a public-repo index)
 npx @scchearn/loam setup --integration qmd           # QMD markdown search (local Node tool + local MCP; no egress)
+npx @scchearn/loam setup --integration hcom          # hcom agent messaging (detected, never installed; no MCP)
 npx @scchearn/loam setup --disable-integration qmd   # symmetric disable: deregister everywhere + remove the loam-managed tool
 ```
 
@@ -112,6 +113,24 @@ Cursor) using the tool's absolute path. Disable reverses every step and verifies
 absence; `--purge` also removes large derived caches (e.g. QMD's ~2–3GB model
 cache, kept by default). Loam never touches a user-owned MCP entry or a tool it
 did not install.
+
+hcom is detection-only. It ships as a native binary through its own installers,
+so Loam looks for it (on `PATH`, under `HCOM_INSTALL_DIR`, then in
+`~/.local/bin`) and never installs it. If it is missing, enabling prints the
+recipe for your platform:
+
+```bash
+brew install aannoo/hcom/hcom                                                                    # macOS (Homebrew)
+curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh         # macOS, Linux, Termux, WSL
+irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex              # Windows (PowerShell)
+uv tool install hcom                                                                             # or: pip install hcom
+```
+
+Once it is installed, every session's opening briefing carries an `hcom: ready`
+line and the skills that can delegate or coordinate use it; without it they take
+their normal single-session path. Disabling hcom removes Loam's record of it and
+nothing else — your `~/.hcom` data and any running agents are never touched, not
+even with `--purge`.
 
 ### Background session harvest
 
