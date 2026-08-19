@@ -733,6 +733,29 @@ fn installed_layout(label: &str) -> (PathBuf, PathBuf) {
     (root, executable)
 }
 
+/// Run a command whose program was just copied into place.
+///
+/// Copying an executable and executing it immediately is racy on Linux under a
+/// threaded test harness: while the copy's write descriptor is open, another
+/// test's spawn forks and the child inherits it, and `execve` on the fresh
+/// copy then fails ETXTBSY until that child reaches its own exec and the
+/// descriptor closes. The window is microseconds wide and shows up as
+/// `Text file busy` in maybe one run in ten; the only correct response is to
+/// try again. Any other spawn error fails immediately, so a real one is not
+/// buried under a second of retries.
+fn output_installed(command: &mut Command) -> std::process::Output {
+    for _ in 0..100 {
+        match command.output() {
+            Ok(output) => return output,
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("spawn installed loam: {error}"),
+        }
+    }
+    panic!("the freshly copied runtime stayed busy for a second")
+}
+
 /// The install-layout target directory for the host. The probe only checks the
 /// name against its supported set, but naming the host's own target keeps the
 /// fixture honest about the layout an install would actually produce.
@@ -758,14 +781,14 @@ fn host_target() -> &'static str {
 #[test]
 fn bare_status_uses_the_installed_global_root() {
     let (root, executable) = installed_layout("status-installed-root");
-    let output = Command::new(&executable)
-        .args(["federation", "status", "--json"])
-        // Rung 1 of the registry ladder: hermetic, and never the developer's
-        // own store.
-        .env("LOAM_CONFIG_DIR", root.join("config"))
-        .stdin(Stdio::null())
-        .output()
-        .expect("spawn installed loam");
+    let output = output_installed(
+        Command::new(&executable)
+            .args(["federation", "status", "--json"])
+            // Rung 1 of the registry ladder: hermetic, and never the
+            // developer's own store.
+            .env("LOAM_CONFIG_DIR", root.join("config"))
+            .stdin(Stdio::null()),
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
@@ -803,14 +826,14 @@ fn bare_disconnect_uses_the_installed_global_root() {
     // The workspace key is a Git physical identity; a bare directory is refused
     // before the root ever matters.
     git(&["init", "--quiet", workspace.to_str().unwrap()], None);
-    let output = Command::new(&executable)
-        .args(["federation", "disconnect"])
-        .arg(&workspace)
-        .arg("--json")
-        .env("LOAM_CONFIG_DIR", root.join("config"))
-        .stdin(Stdio::null())
-        .output()
-        .expect("spawn installed loam");
+    let output = output_installed(
+        Command::new(&executable)
+            .args(["federation", "disconnect"])
+            .arg(&workspace)
+            .arg("--json")
+            .env("LOAM_CONFIG_DIR", root.join("config"))
+            .stdin(Stdio::null()),
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
@@ -862,7 +885,7 @@ fn bare_connect_with_token_uses_the_installed_global_root() {
     // The token/auto-enroll path reads the git identity; pin it so this resolves
     // on CI (no ambient global gitconfig) and reaches the signer contact.
     pin_git_identity(&mut command);
-    let output = command.output().expect("spawn installed loam");
+    let output = output_installed(&mut command);
     let code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
