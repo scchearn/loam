@@ -193,6 +193,15 @@ fn scan_file(relative: &str, path: &Path, offset: &str) -> Vec<String> {
                         "missing_offset",
                         &format!("add {offset}"),
                     ));
+                } else if has_noncanonical_offset(value) {
+                    findings.push(finding(
+                        relative,
+                        line_number,
+                        field,
+                        value,
+                        "noncanonical_offset",
+                        "use ±HH:MM",
+                    ));
                 }
             }
         }
@@ -215,6 +224,15 @@ fn scan_file(relative: &str, path: &Path, offset: &str) -> Vec<String> {
                     value,
                     "missing_offset",
                     &format!("add {offset}"),
+                ));
+            } else if has_noncanonical_offset(value) {
+                findings.push(finding(
+                    relative,
+                    line_number,
+                    "Captured",
+                    value,
+                    "noncanonical_offset",
+                    "use ±HH:MM",
                 ));
             }
         }
@@ -298,6 +316,33 @@ fn is_bare_timestamp(value: &str) -> bool {
         && bytes[index + 2] == b':'
         && bytes[index + 3].is_ascii_digit()
         && bytes[index + 4].is_ascii_digit()
+}
+
+/// A canonical base timestamp followed by an unambiguous `±HHMM` offset (no
+/// colon), e.g. `2026-08-10 09:00 +0200`. Distinct from `is_bare_timestamp`
+/// (no offset at all) and `has_legacy_tz` (a named zone label); the fix here
+/// preserves the numeric offset rather than substituting the local one.
+fn has_noncanonical_offset(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 22
+        && is_timestamp_base(&value[..16])
+        && bytes[16] == b' '
+        && matches!(bytes[17], b'+' | b'-')
+        && bytes[18..22].iter().all(u8::is_ascii_digit)
+}
+
+/// `2026-08-10 09:00 +0200` -> `2026-08-10 09:00 +02:00`: inserts the colon
+/// without touching the sign or digits, so the original offset survives.
+fn insert_offset_colon(value: &str) -> Option<String> {
+    has_noncanonical_offset(value).then(|| {
+        format!(
+            "{} {}{}:{}",
+            &value[..16],
+            &value[17..18],
+            &value[18..20],
+            &value[20..22]
+        )
+    })
 }
 
 fn is_timestamp_base(value: &str) -> bool {
@@ -392,6 +437,9 @@ fn normalize_line(line: &str, offset: &str) -> String {
     for field in TZ_FIELDS {
         let prefix = format!("{field}: ");
         if let Some(value) = line.strip_prefix(&prefix) {
+            if let Some(fixed) = insert_offset_colon(value) {
+                return format!("{prefix}{fixed}");
+            }
             if let Some(base) = canonical_base(value) {
                 return format!("{prefix}{base} {offset}");
             }
@@ -399,6 +447,9 @@ fn normalize_line(line: &str, offset: &str) -> String {
     }
 
     if let Some(value) = line.strip_prefix("- Captured: ") {
+        if let Some(fixed) = insert_offset_colon(value) {
+            return format!("- Captured: {fixed}");
+        }
         if let Some(base) = canonical_base(value) {
             return format!("- Captured: {base} {offset}");
         }
@@ -459,7 +510,59 @@ fn json_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::default_offset;
+    use super::{default_offset, fix_file, has_noncanonical_offset, normalize_line, scan_file};
+
+    #[test]
+    fn noncanonical_offset_is_detected_without_touching_missing_offset_or_legacy_tz() {
+        assert!(has_noncanonical_offset("2026-08-10 09:00 +0200"));
+        assert!(has_noncanonical_offset("2026-08-10 09:00 -0530"));
+        assert!(!has_noncanonical_offset("2026-08-10 09:00 +02:00"));
+        assert!(!has_noncanonical_offset("2026-08-10 09:00"));
+        assert!(!has_noncanonical_offset("2026-08-10 09:00 SAST"));
+    }
+
+    #[test]
+    fn normalize_line_inserts_the_colon_and_preserves_the_original_offset() {
+        assert_eq!(
+            normalize_line("created_at: 2026-08-10 09:00 +0200", "+05:00"),
+            "created_at: 2026-08-10 09:00 +02:00",
+        );
+        assert_eq!(
+            normalize_line("- Captured: 2026-08-10 09:00 -0530", "+02:00"),
+            "- Captured: 2026-08-10 09:00 -05:30",
+        );
+    }
+
+    #[test]
+    fn scan_file_reports_a_noncanonical_offset_finding_with_a_self_fixing_command() {
+        let dir = std::env::temp_dir().join(format!(
+            "loam-datecheck-noncanonical-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let path = dir.join("page.md");
+        std::fs::write(
+            &path,
+            "---\ncreated_at: 2026-08-10 09:00 +0200\n---\n\n# Page\n",
+        )
+        .expect("fixture file should be written");
+
+        let findings = scan_file("page.md", &path, "+05:00");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("\"issue\":\"noncanonical_offset\""));
+        assert!(findings[0].contains("\"fix\":\"use \u{b1}HH:MM\""));
+
+        assert!(fix_file(&path, "+05:00"));
+        let after = std::fs::read_to_string(&path).expect("fixed file should be readable");
+        assert!(
+            after.contains("created_at: 2026-08-10 09:00 +02:00"),
+            "{after}"
+        );
+        assert!(scan_file("page.md", &path, "+05:00").is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn default_offset_matches_the_local_zone_in_hh_mm_form() {
