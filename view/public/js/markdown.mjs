@@ -161,6 +161,33 @@ function brokenLink(label, target, reason) {
     `<span class="wikilink-note"> (${escapeHtml(reason)})</span></span>`;
 }
 
+const READER_HREF_PREFIX = '#/reader/';
+
+/**
+ * A workspace-relative document path and nothing else: no traversal, no
+ * absolute or scheme-bearing form, no separators the server would read
+ * differently from us.
+ */
+export function isSafeDocumentPath(path) {
+  const value = String(path ?? '');
+  if (!value || value.length > 1024) return false;
+  if (/[\u0000-\u001f\\]/.test(value)) return false;
+  if (value.startsWith('/') || /^[a-z][a-z0-9+.-]*:/i.test(value)) return false;
+  return !value.split('/').some((segment) => segment === '' || segment === '.' || segment === '..');
+}
+
+/** The path a `#/reader/...` href asks for, or null when it is not one. */
+export function readerHrefPath(href) {
+  const value = String(href ?? '');
+  if (!value.toLowerCase().startsWith(READER_HREF_PREFIX)) return null;
+  const [target] = value.slice(READER_HREF_PREFIX.length).split('#');
+  try {
+    return decodeURIComponent(target);
+  } catch {
+    return '';
+  }
+}
+
 function isInternalDocument(href) {
   return /^[^:#?]*\.md(?:#[^#]*)?$/i.test(href);
 }
@@ -199,7 +226,7 @@ export function readFrontMatter(yamlText, { maxDepth = MAX_FRONT_MATTER_DEPTH } 
       }
     }
     const data = load(source, { schema: FAILSAFE_SCHEMA });
-    if (data === null || typeof data !== 'object') {
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) {
       return { data: null, error: 'front matter is not a mapping' };
     }
     return { data, error: null };
@@ -219,6 +246,13 @@ export function readFrontMatter(yamlText, { maxDepth = MAX_FRONT_MATTER_DEPTH } 
  */
 export function createRenderer({ window: win = globalThis.window, resolve = () => null, basePath = '' } = {}) {
   const purify = createDOMPurify(win);
+  /**
+   * Reader targets this render vouched for. The renderer emits a `#/reader/...`
+   * href only after the resolver admitted the path, so the sanitizer can hold
+   * every anchor — including raw-HTML ones the renderer never saw — to exactly
+   * that list.
+   */
+  let vouchedReaderHrefs = new Set();
 
   purify.addHook('afterSanitizeAttributes', (node) => {
     if (typeof node.getAttribute !== 'function') return;
@@ -249,14 +283,27 @@ export function createRenderer({ window: win = globalThis.window, resolve = () =
     if (EXTERNAL_URI_REGEXP.test(href)) {
       node.setAttribute('rel', 'noopener noreferrer');
       node.setAttribute('target', '_blank');
-    } else if (!href.startsWith('#')) {
-      node.removeAttribute('href');
+      return;
     }
+    if (!href.startsWith('#')) {
+      node.removeAttribute('href');
+      return;
+    }
+    // Raw-HTML anchors never pass through the renderer, so the resolver gate on
+    // `#/reader/...` targets is applied here too: a document may not hand the
+    // Reader a path this render did not resolve.
+    if (readerHrefPath(href) !== null && !vouchedReaderHrefs.has(href)) node.removeAttribute('href');
   });
 
   /** The only sanitization entry point. Returns a fragment, never a string. */
   function sanitize(html) {
     return purify.sanitize(String(html ?? ''), SANITIZER_CONFIG);
+  }
+
+  /** Record a Reader target this render resolved, and hand it back. */
+  function vouch(href) {
+    vouchedReaderHrefs.add(href);
+    return href;
   }
 
   function markedFor() {
@@ -279,7 +326,7 @@ export function createRenderer({ window: win = globalThis.window, resolve = () =
           const hit = resolve(target);
           const label = escapeHtml(token.label);
           if (!hit?.path) return brokenLink(label, token.target, 'unresolved link');
-          const href = readerHref(fragment ? `${hit.path}#${slugify(fragment)}` : hit.path);
+          const href = vouch(readerHref(fragment ? `${hit.path}#${slugify(fragment)}` : hit.path));
           return `<a class="wikilink is-resolved" href="${escapeHtml(href)}">${label}</a>`;
         },
       }],
@@ -304,8 +351,16 @@ export function createRenderer({ window: win = globalThis.window, resolve = () =
             if (!path) return brokenLink(text, href, 'link leaves the workspace');
             const hit = resolve(path);
             if (!hit?.path) return brokenLink(text, href, 'missing document');
-            const readerTarget = readerHref(fragment ? `${hit.path}#${fragment}` : hit.path);
+            const readerTarget = vouch(readerHref(fragment ? `${hit.path}#${fragment}` : hit.path));
             return `<a class="md-link is-document" href="${escapeHtml(readerTarget)}"${title}>${text}</a>`;
+          }
+          const readerPath = readerHrefPath(href);
+          if (readerPath !== null) {
+            // A hand-written `#/reader/...` link is a document link like any
+            // other and passes the same resolver gate, not the fragment branch.
+            const hit = isSafeDocumentPath(readerPath) ? resolve(readerPath) : null;
+            if (hit?.path !== readerPath) return brokenLink(text, href, 'unresolved link');
+            return `<a class="md-link is-document" href="${escapeHtml(vouch(href))}"${title}>${text}</a>`;
           }
           if (href.startsWith('#')) return `<a class="md-link" href="${escapeHtml(href)}"${title}>${text}</a>`;
           if (EXTERNAL_URI_REGEXP.test(href)) {
@@ -331,6 +386,7 @@ export function createRenderer({ window: win = globalThis.window, resolve = () =
    */
   function render(markdown) {
     const { body } = splitFrontMatter(markdown);
+    vouchedReaderHrefs = new Set();
     return sanitize(markedFor().parse(body, { async: false }));
   }
 

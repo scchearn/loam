@@ -112,7 +112,6 @@ export async function boot(doc = globalThis.document) {
   });
 
   initQuery({ root: doc, getSnapshot: () => state.snapshot });
-  initReader({ root: doc, getSnapshot: () => state.snapshot });
 
   render();
   try {
@@ -122,5 +121,8 @@ export async function boot(doc = globalThis.document) {
     // retry with Refresh instead of staring at a blank page.
   }
   render();
+  // After the snapshot, never before: Reader admits a path only if the
+  // inventory lists it, and a deep link must be checked against a real one.
+  initReader({ root: doc, getSnapshot: () => state.snapshot });
   return { render, route: () => route };
 }

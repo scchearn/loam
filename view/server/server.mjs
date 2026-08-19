@@ -4,7 +4,7 @@ import { createServer as createHttpServer } from 'node:http';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { assertInside } from '../../integration/paths.mjs';
+import { assertInside, assertPhysicalInside } from '../../integration/paths.mjs';
 import { safeDetail } from '../../integration/runtime.mjs';
 import { buildSearchIndex as defaultBuildSearchIndex, search as runSearch } from './search.mjs';
 import { validateSnapshot } from './validate-snapshot.mjs';
@@ -225,6 +225,15 @@ export function createServer({
       return sendJson(res, 404, { error: 'not_found' });
     }
     if (!info.isFile()) return sendJson(res, 404, { error: 'not_found' });
+
+    // Lexical bounding is not enough on its own: a symlink planted inside a
+    // served root would otherwise be read through. Resolve both ends and check
+    // the physical path as well.
+    try {
+      await assertPhysicalInside(root, target, 'static path');
+    } catch {
+      return sendJson(res, 400, { error: 'invalid_path' });
+    }
 
     const body = await readFile(target);
     const isIndex = relative === '/index.html';

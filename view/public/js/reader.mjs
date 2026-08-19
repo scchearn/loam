@@ -17,7 +17,7 @@
  * state it had without Reader needing to understand it.
  */
 
-import { createRenderer, outlineOf, readFrontMatter, splitFrontMatter } from './markdown.mjs';
+import { createRenderer, isSafeDocumentPath, outlineOf, readFrontMatter, splitFrontMatter } from './markdown.mjs';
 import { refresh } from './store.mjs';
 
 const READER_PREFIX = '#/reader/';
@@ -54,6 +54,17 @@ export function resolverFor(snapshot) {
     });
     return matches.length === 1 ? { path: matches[0].path, title: matches[0].title } : null;
   };
+}
+
+/**
+ * The Reader's own admission gate: a path is opened only when the snapshot
+ * inventory lists it verbatim. The server checks the same thing, but the check
+ * belongs here too — nothing should be able to hand `/api/document` a path the
+ * read model never vouched for.
+ */
+export function isInventoried(snapshot, path) {
+  if (!isSafeDocumentPath(path)) return false;
+  return (snapshot?.artifacts ?? []).some((artifact) => artifact.path === path);
 }
 
 export function initReader({ root = document, getSnapshot = () => null, refreshSnapshot = refresh } = {}) {
@@ -167,6 +178,14 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
     pathEl.textContent = path;
     setBanner('');
     setStatus('Reading…');
+
+    if (!isInventoried(getSnapshot(), path)) {
+      article.replaceChildren();
+      renderOutline();
+      metaEl.hidden = true;
+      setStatus('This document could not be read: not_inventoried — no artifact with that path is in the current snapshot.');
+      return null;
+    }
 
     let payload;
     try {

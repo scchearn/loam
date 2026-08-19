@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
+import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -81,6 +82,31 @@ function rawRequest(baseUrl, path, { method = 'GET', headers = {}, body } = {}) 
     req.on('error', rejectPromise);
     if (body !== undefined) req.write(body);
     req.end();
+  });
+}
+
+/**
+ * A literal request line, written straight to the socket.
+ *
+ * `rawRequest` builds its target with `new URL()`, which normalises `..` and
+ * percent-encoded separators away before anything is sent — so the traversal
+ * cases below would never reach the server through it. This sends exactly the
+ * bytes given. (Technique from the T13 independent review.)
+ */
+function socketGet(baseUrl, requestTarget, host) {
+  const { port, host: defaultHost } = new URL(baseUrl);
+  return new Promise((resolvePromise) => {
+    const socket = connect(Number(port), '127.0.0.1', () => {
+      socket.write(`GET ${requestTarget} HTTP/1.1\r\nHost: ${host ?? defaultHost}\r\nConnection: close\r\n\r\n`);
+    });
+    const chunks = [];
+    socket.on('data', (chunk) => chunks.push(chunk));
+    socket.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      const [head, ...rest] = raw.split('\r\n\r\n');
+      resolvePromise({ status: Number(head.split(' ')[1]), body: rest.join('\r\n\r\n') });
+    });
+    socket.on('error', () => resolvePromise({ status: 0, body: '' }));
   });
 }
 
@@ -406,6 +432,48 @@ test('serves the pinned vendor builds from the vendor root, not from public', as
 
     const traversal = await rawRequest(baseUrl, '/vendor/../server/server.mjs');
     assert.ok([400, 404].includes(traversal.status));
+  });
+  await rm(root, { recursive: true, force: true });
+});
+
+test('static and document routes refuse traversal that never passes through URL normalisation', async () => {
+  const { root, path, content } = await makeWorkspace();
+  const snapshot = baseSnapshot(root, [artifactFor(path, content)]);
+  await withServer({ workspaceRoot: root, initialSnapshot: snapshot }, async (baseUrl) => {
+    for (const target of [
+      '/vendor/../server/server.mjs',
+      '/vendor/..%2f..%2fserver%2fserver.mjs',
+      '/vendor/%2e%2e/%2e%2e/server/server.mjs',
+      '/vendor/..\\..\\server\\server.mjs',
+      '/%2e%2e/%2e%2e/etc/passwd',
+      '/../server/server.mjs',
+    ]) {
+      const res = await socketGet(baseUrl, target);
+      assert.ok([400, 404].includes(res.status), `${target} answered ${res.status}`);
+      assert.ok(!res.body.includes('createServer'), `${target} leaked server source`);
+    }
+
+    const vendored = await socketGet(baseUrl, '/vendor/dompurify/purify.es.mjs');
+    assert.equal(vendored.status, 200, 'the vendor route still serves its own root');
+
+    for (const query of [
+      'path=../../etc/passwd',
+      'path=%2e%2e%2f%2e%2e%2fetc%2fpasswd',
+      'path=/etc/passwd',
+      'path=wiki/../wiki/index.md',
+    ]) {
+      const res = await socketGet(baseUrl, `/api/document?${query}`);
+      assert.equal(res.status, 400, `${query} answered ${res.status}`);
+      assert.match(res.body, /not_inventoried|outside_root/);
+    }
+
+    const inventoried = await socketGet(baseUrl, `/api/document?path=${path}`);
+    assert.equal(inventoried.status, 200);
+
+    for (const host of ['evil.example.com', '127.0.0.1 evil.example.com', '127.0.0.1@evil.example.com']) {
+      const res = await socketGet(baseUrl, '/api/snapshot', host);
+      assert.equal(res.status, 400, `Host: ${host} was accepted`);
+    }
   });
   await rm(root, { recursive: true, force: true });
 });

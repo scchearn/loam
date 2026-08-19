@@ -165,22 +165,22 @@ describe('hostile link targets', () => {
     }
   });
 
-  it('REVIEW NOTE: a plain `#/reader/...` fragment link skips the resolver gate', async () => {
-    // `[go](#/reader/..%2F..%2Fetc%2Fpasswd)` is not a wikilink and not an
-    // internal `.md` link, so it takes the fragment branch and stays clickable.
-    // Following it hands an out-of-root path to `/api/document`; the server's
-    // inventory check is what refuses it (see the server test below). Recorded
-    // here so the behaviour cannot change silently.
+  it('closes the resolver gate on plain `#/reader/...` links, in markdown and raw HTML alike', async () => {
+    // Was a review finding: `[go](#/reader/..%2F..%2Fetc%2Fpasswd)` is neither a
+    // wikilink nor an internal `.md` link, so it took the fragment branch and
+    // stayed clickable, handing an out-of-root path to the API. Now the renderer
+    // resolves such a target like any other document link, and the sanitizer
+    // strips the href of any anchor this render did not vouch for.
     const { host } = await renderFixture('wikilink-targets');
-    const escaping = [...host.querySelectorAll('a[href^="#/reader/"]')]
-      .map((a) => a.getAttribute('href'))
-      .filter((href) => decodeURIComponent(href.slice('#/reader/'.length)).includes('..'));
-    assert.equal(escaping.length, 2, 'both the markdown and raw-HTML forms stay clickable today');
-    for (const href of escaping) {
-      const route = readerRoute(href);
-      assert.ok(route, 'the route parses');
-      assert.ok(route.path.includes('..'), 'and carries a traversing path to the API');
+    for (const anchor of host.querySelectorAll('a[href^="#/reader/"]')) {
+      const href = anchor.getAttribute('href');
+      const path = decodeURIComponent(href.slice('#/reader/'.length));
+      assert.ok(!path.includes('..'), `a traversing reader href survived: ${path}`);
+      assert.equal(readerRoute(href)?.path, 'wiki/alpha-page.md');
     }
+    // The refused links stay visible as text — never silently dropped.
+    assert.ok(host.textContent.includes('reader route'));
+    assert.ok(host.textContent.includes('raw reader route'));
   });
 
   it('the snapshot resolver never returns a path it was not given by the snapshot', () => {
@@ -233,12 +233,12 @@ describe('front matter: tags the alias check would otherwise shadow', () => {
     assert.equal(result.data.b, 'true');
   });
 
-  it('REVIEW NOTE: a top-level sequence passes the "is a mapping" guard', () => {
-    // `typeof [] === 'object'`, so a list-shaped front matter is accepted and
-    // rendered by `renderFrontMatter` as numeric keys. Display-only, but wrong.
+  it('refuses a top-level sequence: front matter is a mapping or it is nothing', () => {
+    // Was a review finding: `typeof [] === 'object'`, so a list-shaped front
+    // matter passed the guard and rendered as numeric keys.
     const result = readFrontMatter('- a\n- b\n');
-    assert.deepEqual(result.data, ['a', 'b']);
-    assert.equal(result.error, null);
+    assert.equal(result.data, null);
+    assert.match(result.error, /mapping/);
   });
 
   it('REVIEW NOTE: a leading thematic break is eaten as front matter', () => {
@@ -361,9 +361,9 @@ test('static and document routes refuse un-normalised traversal', async (t) => {
     assert.equal(res.status, 400, `Host: ${host} was accepted`);
   }
 
-  // REVIEW NOTE: `assertInside` is lexical, so a symlink planted inside a served
-  // root reads through it. Both roots ship with the tool, so this is a hardening
-  // gap rather than an exploitable path; `assertPhysicalInside` already exists.
+  // Was a review finding: `assertInside` is lexical, so a symlink planted inside
+  // a served root was read through it. The static routes now bound the physical
+  // path too (`assertPhysicalInside`), so the link is refused.
   let symlinked = false;
   try {
     await symlink(secret, join(publicRoot, 'escape.html'));
@@ -371,7 +371,7 @@ test('static and document routes refuse un-normalised traversal', async (t) => {
   } catch { /* not supported here */ }
   if (symlinked) {
     const res = await rawGet(port, '/escape.html');
-    assert.equal(res.status, 200);
-    assert.match(res.body, /SECRET/, 'documented: the static route follows symlinks out of its root');
+    assert.equal(res.status, 400, 'a symlink out of the static root is refused');
+    assert.ok(!res.body.includes('SECRET'), 'and leaks nothing from outside the root');
   }
 });
