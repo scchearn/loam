@@ -1,111 +1,111 @@
-# Credential resolution contract (seam A / T12)
+# Credential and trust resolution
 
-Authority for how the connector-side resolver turns an enrollment's `credential_ref`
-and `ca_ref` into broker credentials. The **provisioning side** (this deployment,
-`resolve-credentials.sh`) *stores* the material; the **connector side** (tula) *looks
-it up*. Both halves MUST use the identical lookup below or they silently disagree.
+This document describes what the current runtime reads when it turns an
+enrollment into a live MQTT session. The important distinction is between the
+broker's two TLS directions:
 
-## Load-bearing invariant
+- the broker verifies **client certificates** with the organization's private
+  CA;
+- the client verifies the broker's **server certificate**, normally a public
+  Let's Encrypt certificate, with public trust roots.
 
-The secret-service lookup keys ARE the enrollment's stored `credential_ref` and
-`ca_ref` values, used **verbatim** (byte-for-byte, no normalization, no re-derivation).
-Provisioning stores under exactly those strings; the connector reads those strings off
-`EnrolledRow` and looks them up. A normalized or re-derived key = silent
-`credentials-unresolved`.
+The current `loam federation connect --token` path stores the machine identity
+locally. It does not put a password or a private key in the enrollment row.
 
-## A.1 — Material shape (auth model)
+## Local identity bundle
 
-**mTLS is the SOLE authentication mechanism. There is no password.**
+The runtime reads two files from the configured federation identity directory:
 
-- The broker runs `require_certificate true` + `use_identity_as_username true`
-  (see `mosquitto.conf`): the broker derives the MQTT **username from the client
-  cert CN** and there is **no password check**.
-- Therefore: `MqttSession.username` = the client-cert **CN** (== `principal_id`,
-  see INSTANCE-ID-CONTRACT.md §C.10); `MqttSession.password` = **empty/unused**.
-  The broker ignores whatever password is sent. **Recommendation to tula:** make
-  `username`/`password` optional; if they must stay non-optional, set
-  `username = <cert CN>` and `password = ""`. Neither is looked up from the secret
-  service — the username is read from the resolved client cert's subject CN.
-- The looked-up material is exactly: the **client cert + client key** (via
-  `credential_ref`) and the **server-verification trust** (via `ca_ref`). See A.4.
-
-## A.2 — Lookup mechanism (exact argv the connector reproduces)
-
-Backend is selected by **OS at runtime** (see A.5), not by the ref's scheme. The
-service label is `SECRET_SERVICE_LABEL` (default `loam-federation`). The ref string
-is the lookup selector.
-
-**Linux (libsecret / Secret Service):**
-```sh
-# retrieve (connector does this) — secret is written to stdout, never argv:
-secret-tool lookup service loam-federation ref "<credential_ref>"
-secret-tool lookup service loam-federation ref "<ca_ref>"          # only if ca_ref present
+```text
+<profile>/identity/client.pem
+<profile>/identity/key.pem
 ```
 
-**macOS (Keychain):**
-```sh
-# retrieve (connector does this) — -w prints only the secret to stdout:
-security find-generic-password -s loam-federation -a "<credential_ref>" -w
-security find-generic-password -s loam-federation -a "<ca_ref>" -w   # only if ca_ref present
-```
+`LOAM_FEDERATION_IDENTITY_DIR` overrides the directory directly. Otherwise the
+profile follows the same configuration ladder as the registry and roster:
+`LOAM_CONFIG_DIR`, the platform config directory, `LOAM_HOME`, then the legacy
+`~/.agents/loam` location.
 
-Attribute mapping is fixed: Linux `service=loam-federation`, `ref=<the ref string>`;
-macOS `-s loam-federation` (service), `-a <the ref string>` (account). Retrieval on
-both platforms outputs the secret to **stdout** and never places it in argv.
+On Unix, the runtime enforces mode `0700` on the directory and `0600` on both
+files whenever it reads them. A missing bundle is reported as
+`credentials-unresolved` with `identity-required`; a malformed certificate,
+unsupported key, or certificate/key mismatch names the corresponding input.
 
-(Provisioning side stores with `secret-tool store --label "loam-federation:<ref>"
-service loam-federation ref "<ref>"` on Linux and `security add-generic-password -U
--s loam-federation -a "<ref>" -w "<blob>"` on macOS. The macOS store passes the blob
-in argv — provisioning-time only, on the operator's trusted machine; retrieval is
-argv-safe.)
+The key reader accepts the forms commonly produced by OpenSSL and by this
+repository's scripts:
 
-## A.3 — Ref syntax
+- PKCS#8 (`BEGIN PRIVATE KEY`);
+- SEC1 EC (`BEGIN EC PRIVATE KEY`), including an optional EC parameters block;
+- PKCS#1 RSA (`BEGIN RSA PRIVATE KEY`).
 
-`credential_ref` and `ca_ref` are **opaque verbatim lookup keys**. The resolver does
-**not** parse a scheme. A `vault://…` prefix (or any prefix) is part of the opaque
-key string, not a routing directive; the backend is chosen by OS, not by scheme.
-Accept **any** ref string. (v1 deliberately does not implement scheme-based backend
-routing; if introduced later it is additive and must keep the verbatim-key invariant.)
+The certificate must be first-class PEM, and the private key must match its
+public key. A mismatch is `key-cert-mismatch`; an unusable key is
+`key-format-unsupported`; a bad certificate is `certificate-malformed`.
 
-## A.4 — Encoding
+The auto-enrollment signer receives the CSR, not this private key. The private
+key is generated and stored on the joining machine.
 
-- Format: **PEM** (text) throughout.
-- `credential_ref` → **one** lookup returning a single PEM blob = the **client
-  certificate PEM followed by the client private key PEM**, concatenated (cert
-  first, then key). The resolver splits on the PEM boundary
-  (`-----END CERTIFICATE-----` / `-----BEGIN … PRIVATE KEY-----`). One ref, one
-  lookup — matches C's single `credential_ref`.
-- `ca_ref` → the **server-verification** CA PEM. **Important:** this is the trust
-  anchor the client uses to verify the **broker's server cert**, which is issued by
-  **Let's Encrypt** (public). It is NOT the org CA (the org CA lives only on the
-  broker as `cafile` to verify *clients*).
-  - **`ca_ref` absent ⇒ use platform system/public roots** (correct and expected for
-    the LE server cert). The connector should treat this as "verify against the
-    system trust store" — populate `MqttSession.ca_certificate` as empty/None to
-    signal system roots. **Recommendation to tula:** make `ca_certificate` optional,
-    or interpret empty as system roots.
-  - **`ca_ref` present ⇒ pin** that CA PEM for server verification (for a future
-    private-CA server-cert variant). Not used in the example.org/LE deployment.
-- Max two lookups per node (`credential_ref`, optional `ca_ref`).
+## Server trust
 
-## A.5 — Cross-platform (make-or-break: Linux laptop ↔ MacBook)
+When an enrollment has no `ca_ref` (the normal `connect` path), the runtime
+uses its bundled Mozilla roots. If `SSL_CERT_FILE` is set, that file is an
+explicit override and must contain a readable PEM trust bundle; an unreadable,
+empty, or certificate-free file produces `trust-anchors-unresolved` during
+automatic enrollment or `ca-unresolved` while opening a stored session.
 
-Both backends are first-class and named. The resolver and the connector select by OS:
+When `ca_ref` is present, the current runtime treats it as a path to a PEM trust
+file and reads that file directly. It is not a secret-service selector in the
+current connector. A blank or unusable path is refused rather than silently
+falling back to public roots.
 
-| OS | Backend | Store | Retrieve |
-| -- | ------- | ----- | -------- |
-| Linux | Secret Service (libsecret) | `secret-tool store …` | `secret-tool lookup service loam-federation ref "<ref>"` |
-| macOS | Keychain | `security add-generic-password -U -s loam-federation -a "<ref>" -w "<blob>"` | `security find-generic-password -s loam-federation -a "<ref>" -w` |
+For the production broker described in
+[`BROKER-SETUP.md`](BROKER-SETUP.md), the server certificate is issued by
+Let's Encrypt, so omitting `ca_ref` is expected. The organization's private CA
+belongs in Mosquitto's `cafile` to verify client certificates; it should not be
+copied into client trust settings merely because it signs those clients.
 
-The MacBook node uses Keychain; the Linux laptop uses libsecret. A resolver that
-implements only one is a one-node deployment — both are required. Selection is by
-`uname` (`Darwin` ⇒ Keychain, else Secret Service); an override env
-`LOAM_SECRET_BACKEND=secret-tool|security` is honored for testing.
+## MQTT authentication
 
-## Summary for tula's struct
+Provisioned sessions use mutual TLS only:
 
-- `username` = client-cert CN (== principal_id); `password` unused (prefer optional).
-- `client_authentication` = (cert, key) split from the single `credential_ref` PEM blob.
-- `ca_certificate` = system roots when `ca_ref` absent (prefer optional/empty-means-system);
-  pinned PEM when present.
-- lookup keys = `credential_ref` / `ca_ref` verbatim; backend by OS (libsecret / Keychain).
+- the broker requires a client certificate;
+- `use_identity_as_username true` makes the certificate CN the authenticated
+  MQTT username;
+- the runtime sends no username/password pair for a provisioned session;
+- the client id is the bare enrolled instance id, because the ACL scopes origin
+  writes through `%c`.
+
+The enrollment password is used only for the HTTPS signer during automatic
+enrollment. It is not the MQTT password. See
+[INSTANCE-ID-CONTRACT.md](INSTANCE-ID-CONTRACT.md) and
+[IDENTITY-CONTRACT.md](IDENTITY-CONTRACT.md) for the values bound into the
+certificate and client id.
+
+## Manual helper and compatibility note
+
+[`resolve-credentials.sh`](../../deploy/mqtt-broker/resolve-credentials.sh)
+can store a certificate-plus-key PEM blob in Secret Service or macOS Keychain
+for manual integrations. Its `credential_ref` terminology belongs to that
+helper's compatibility surface. The current Loam runtime does not look up
+`credential_ref`; it reads `client.pem` and `key.pem` from the profile above.
+
+If another integration uses the helper, preserve its exact opaque reference
+string and the `service=loam-federation`/Keychain service label it documents.
+Do not infer that helper's storage format into a new `loam federation connect`
+descriptor.
+
+## Failure map
+
+| Refusal | Meaning | Repair |
+| --- | --- | --- |
+| `identity-required` | `client.pem` or `key.pem` is missing or cannot be read. | Check the profile path and private permissions; rerun automatic enrollment if the machine has no certificate. |
+| `certificate-malformed` | The client certificate PEM or its subject cannot be parsed. | Restore a complete org-CA-signed client certificate. |
+| `key-format-unsupported` | The private key is not a supported PEM encoding or cannot be loaded. | Use a PKCS#8, SEC1, or PKCS#1 private key and keep its matching certificate. |
+| `key-cert-mismatch` | The two files are valid but are not a pair. | Replace them with the certificate and key created by the same enrollment. |
+| `ca-unresolved` | The session could not build server trust. | Repair/remove the stale `SSL_CERT_FILE` or fix the `ca_ref` PEM path. |
+| `trust-anchors-unresolved` | The signer client failed to build trust before dialing. | Read the detail for the exact file and repair it; this is a local trust-store problem, not proof that the signer is down. |
+| `endpoint-malformed` | The stored endpoint is not a valid `mqtts://host:port` authority. | Reconnect with the broker FQDN and TLS port. |
+
+The read-only `status` and `list` commands do not resolve credentials and do
+not make a broker connection. A row saying that a past probe verified
+authentication is historical evidence, not a current session observation.

@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate) and goal artifacts. Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, consolidate a legacy root `overview.md` into `index.md`, or health-check goal artifacts. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.11.0"
+  version: "1.11.1"
   author: scchearn
   argument-hint: [wiki root, goal path, or focus area]
 ---
@@ -251,7 +251,7 @@ If drift is found:
 
 ### Refresh qmd after writes
 
-If qmd was ready and you wrote to the wiki, run `qmd update -c <collection> 2>/dev/null`. If refresh fails, report it but do not roll back wiki edits.
+After wiki writes, run `qmd update -c <collection>` then `qmd embed -c <collection>`; report both outcomes separately and retain wiki edits if either fails.
 
 ---
 
