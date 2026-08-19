@@ -571,10 +571,15 @@ export function initAtlas({ root = document, getSnapshot = () => state.snapshot 
 
     cy.elements().remove();
     cy.add(graphElements(view));
+    // The container's real size is only known once the stylesheet has laid the
+    // card out, and compound cluster bounds settle after the layout runs — so
+    // measure first and fit after, or the map draws clipped past its own edges.
+    cy.resize?.();
     cy.layout(view.mode === 'overview'
       ? { name: 'cose', animate: false, randomize: false, padding: 24 }
       : { name: 'concentric', animate: false, padding: 24, concentric: (node) => (node.hasClass('seed') ? 2 : 1) })
       .run();
+    cy.fit?.(undefined, 24);
   }
 
   function render() {

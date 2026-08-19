@@ -230,6 +230,10 @@ function renderMetrics(doc, snapshot) {
 
   const row = el(doc, 'div', 'card-row');
   row.setAttribute('role', 'list');
+  // This row scrolls horizontally and holds no control of its own, so without a
+  // tab stop a keyboard-only human cannot reach the cards past the fold. Newer
+  // Chrome focuses such scrollers by itself; this makes it true everywhere.
+  row.tabIndex = 0;
 
   for (const card of METRIC_CARDS) {
     const article = el(doc, 'article', 'metric-card');

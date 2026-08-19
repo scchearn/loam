@@ -207,6 +207,9 @@ describe('Pulse briefing composition', () => {
 
     assert.ok(root.querySelector('[data-pulse-overview].panel-dotted'), 'dotted overview box');
     assert.ok(root.querySelector('[data-pulse-metrics]'), 'evidence-metrics band');
+    // The metrics row scrolls sideways and holds no control of its own, so it
+    // needs its own tab stop or the cards past the fold are keyboard-only dead.
+    assert.equal(root.querySelector('[data-pulse-metrics] .card-row').tabIndex, 0);
     assert.ok(root.querySelector('[data-pulse-advisor]'), 'advisor band');
     assert.ok(root.querySelector('[data-pulse-focus]'), 'current return point');
 

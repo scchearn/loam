@@ -250,6 +250,24 @@ describe('reader surface', () => {
     assert.equal(doc.activeElement, invoker, 'Back must restore focus to the control that opened Reader');
   });
 
+  it('closes the Inspector it was opened from and returns the keyboard to the shell', async () => {
+    const { dom, doc } = mount({ hash: '#/atlas' });
+    const { initInspector, openInspector } = await import('../public/js/inspector.mjs');
+    initInspector({ root: doc, getSnapshot: () => SNAPSHOT });
+
+    const invoker = doc.querySelector('[data-refresh]');
+    invoker.focus();
+    openInspector(SNAPSHOT.artifacts[0]);
+    const panel = doc.querySelector('[data-inspector]');
+    assert.equal(panel.classList.contains('is-open'), true);
+
+    await announce(dom, { path: 'wiki/alpha.md' });
+    assert.equal(panel.classList.contains('is-open'), false, 'a full-screen Reader must not leave the Inspector floating above it');
+
+    doc.querySelector('[data-reader-back]').click();
+    assert.equal(doc.activeElement, invoker, 'Back returns to the shell control, not to a control inside the closed panel');
+  });
+
   it('moves focus into Reader even when the document cannot be read', async () => {
     const { dom, doc } = mount({ hash: '#/pulse' });
     await announce(dom, { path: 'wiki/missing.md' });

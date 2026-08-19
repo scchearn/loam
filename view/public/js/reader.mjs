@@ -17,6 +17,7 @@
  * state it had without Reader needing to understand it.
  */
 
+import { closeInspector } from './inspector.mjs';
 import { createRenderer, isSafeDocumentPath, outlineOf, readFrontMatter, splitFrontMatter } from './markdown.mjs';
 import { refresh } from './store.mjs';
 
@@ -158,6 +159,9 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
 
   function show() {
     if (open) return;
+    // Reader is a full-screen surface: the Inspector it may have been opened
+    // from would otherwise float above it on its own higher layer.
+    closeInspector();
     open = true;
     surface.hidden = false;
     shell?.setAttribute('aria-hidden', 'true');
@@ -242,6 +246,10 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
   function openPath(path, { detail = null, fragment = '' } = {}) {
     const hash = String(win.location?.hash ?? '');
     if (!open) {
+      // Closing the Inspector first hands focus back to the shell control that
+      // opened it, which is the control Back should return the keyboard to —
+      // an Inspector link would be inside a panel that is inert by then.
+      closeInspector();
       // Remember exactly where the human was before Reader covered the shell —
       // both the route and the control that sent them here, so Back restores
       // the keyboard position as well as the view.
