@@ -843,6 +843,205 @@ code,
 
 .query-empty.is-visible { display: block; }
 
+/* ---------- Inspector (DESIGN.md §4 "inspector", §5 top-level overlay) ----------
+ *
+ * Full-height right-side modal side sheet. Both the panel and its scrim are
+ * fixed and live outside .app-shell, so the dashboard or graph beneath keeps its
+ * exact box while the Inspector is open — no rule in this file may size, move,
+ * or re-column .app-shell from Inspector state.
+ */
+
+.inspector-scrim {
+  position: fixed;
+  z-index: 38;
+  inset: 0;
+  background: var(--scrim);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--motion-fast) linear;
+}
+
+.inspector-scrim.is-open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.inspector {
+  position: fixed;
+  z-index: 40;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(var(--inspector-width), 100vw);
+  overflow-y: auto;
+  border-left: var(--rule) solid var(--border-chrome);
+  background: var(--surface-app-raised);
+  box-shadow: var(--shadow-overlay);
+  color: var(--ink-chrome);
+  opacity: 0;
+  transform: translateX(100%);
+  pointer-events: none;
+  transition: transform var(--motion-fast) ease, opacity var(--motion-fast) linear;
+}
+
+.inspector.is-open {
+  opacity: 1;
+  transform: translateX(0);
+  pointer-events: auto;
+}
+
+.inspector-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: var(--topbar-height);
+  padding: 0 var(--space-2) 0 var(--space-6);
+  border-bottom: var(--rule) solid var(--border-chrome);
+  background: var(--surface-app-raised);
+}
+
+.inspector-head span {
+  color: var(--ink-chrome-muted);
+  font: 600 0.65rem/1 var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.inspector-body { padding: var(--space-6); }
+
+/* The kind is the one place a node's colour appears: a rule under the label. */
+.inspector-kind {
+  display: inline-block;
+  margin-bottom: var(--space-3);
+  padding-bottom: var(--space-2);
+  border-bottom: 0.15rem solid var(--node-memory);
+  color: var(--ink-chrome-muted);
+  font: 600 0.62rem/1 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.inspector-kind[data-kind="code"] { border-bottom-color: var(--node-code); }
+.inspector-kind[data-kind="topic"],
+.inspector-kind[data-kind="entity"],
+.inspector-kind[data-kind="concept"],
+.inspector-kind[data-kind="analysis"] { border-bottom-color: var(--node-concept); }
+.inspector-kind[data-kind="goal"],
+.inspector-kind[data-kind="spec"],
+.inspector-kind[data-kind="plan"] { border-bottom-color: var(--node-work); }
+.inspector-kind[data-kind="relationship"] { border-bottom-color: var(--edge-derived); }
+
+.inspector-title {
+  margin: 0 0 var(--space-4);
+  overflow-wrap: anywhere;
+  color: var(--ink-chrome);
+  font: 600 clamp(1.2rem, 1.5vw, 1.45rem)/1.25 var(--font-sans);
+  letter-spacing: -0.008em;
+}
+
+.inspector-summary {
+  margin: 0;
+  color: var(--ink-chrome);
+  font: 400 0.92rem/1.55 var(--font-sans);
+}
+
+/* A missing summary is stated, not styled to look like one. */
+.inspector-summary[data-present="false"] {
+  color: var(--ink-chrome-muted);
+  font-style: italic;
+}
+
+/* Evidence voice: everything below a section heading is monospace by default,
+   so a Reader link sits on the same line as the path it replaces. */
+.inspector-section {
+  margin-top: var(--space-6);
+  padding-top: var(--space-4);
+  border-top: var(--rule) solid var(--border-chrome);
+  color: var(--ink-chrome-muted);
+  font: 400 0.72rem/1.55 var(--font-mono);
+}
+
+.inspector-section h3 {
+  margin: 0 0 var(--space-3);
+  color: var(--accent-bright);
+  font: 600 0.62rem/1 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* Evidence voice: paths, timestamps, and provenance are monospace. */
+.inspector-path,
+.inspector-freshness {
+  display: block;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink-chrome-muted);
+  font: 400 0.72rem/1.55 var(--font-mono);
+}
+
+.inspector-path + .inspector-path,
+.file-link + .inspector-path { margin-top: var(--space-2); }
+
+/* Inside a row, an unresolvable path sits on the label's line, not below it. */
+.relationship-list .inspector-path,
+.evidence-list .inspector-path { display: inline; }
+
+.relationship-list,
+.evidence-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.relationship-list li,
+.evidence-list li {
+  padding: var(--space-3) 0;
+  border-bottom: var(--rule) solid var(--border-faint);
+  overflow-wrap: anywhere;
+  color: var(--ink-chrome-muted);
+  font: 400 0.72rem/1.45 var(--font-mono);
+}
+
+.relationship-list li:last-child,
+.evidence-list li:last-child { border-bottom: 0; }
+
+.relationship-list strong {
+  display: inline-block;
+  min-width: 5rem;
+  color: var(--ink-chrome);
+  font-weight: 600;
+}
+
+.evidence-mode {
+  display: inline-block;
+  min-width: 4.75rem;
+  color: var(--accent-bright);
+  text-transform: uppercase;
+}
+
+.evidence-kind { color: var(--ink-chrome); }
+
+/* Reader entry point: a Loam Markdown reference View can actually open. */
+.file-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  border-bottom: var(--rule) solid var(--accent-soft);
+  background: none;
+  color: var(--accent-bright);
+  font: inherit;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.file-link:hover {
+  border-bottom-color: var(--accent-bright);
+  color: var(--ink-chrome);
+}
+
 /* ---------- Icons (Phosphor regular, inline sprite, currentColor, em-sized) ---------- */
 
 .icon {
@@ -932,6 +1131,9 @@ code,
   .view { padding: var(--space-6) var(--space-4) var(--space-12); }
 
   .query-result button { grid-template-columns: 1fr; gap: var(--space-2); }
+
+  /* DESIGN.md §5: overlays go full-width on mobile. */
+  .inspector { width: 100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {
