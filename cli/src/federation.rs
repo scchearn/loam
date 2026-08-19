@@ -339,14 +339,23 @@ fn enrollment_table(rows: &[enrollment::EnrolledRow]) -> String {
         return "no federation enrollments; `loam federation connect <workspace> <broker>` joins one\n"
             .to_owned();
     }
+    // Every cell is registry data and prints to the operator's terminal;
+    // scrubbing control characters keeps a hostile value (say, a workspace
+    // path carrying an escape sequence) from driving the terminal (#161).
+    let scrub = |value: &str| -> String {
+        value
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect()
+    };
     let cells: Vec<[String; 4]> = rows
         .iter()
         .map(|row| {
             [
-                format!("{}/{}", row.org_id, row.project_id),
-                row.display_path.clone(),
-                row.broker_endpoint.clone(),
-                row.capabilities.verified_at.clone(),
+                scrub(&format!("{}/{}", row.org_id, row.project_id)),
+                scrub(&row.display_path),
+                scrub(&row.broker_endpoint),
+                scrub(&row.capabilities.verified_at),
             ]
         })
         .collect();
@@ -2164,6 +2173,49 @@ fn emit_round_trip(
     let mut connection = crate::ipc::windows::connect(&name)?;
     crate::ipc::write_frame(&mut connection, request, config)?;
     crate::ipc::read_frame(&mut connection, config)
+}
+
+#[cfg(test)]
+mod table_tests {
+    //! The `list` table prints registry data to the operator's terminal, so a
+    //! control character in any cell must render inert (#161).
+
+    use super::*;
+
+    #[test]
+    fn control_characters_in_registry_data_render_as_spaces() {
+        let row = enrollment::EnrolledRow {
+            identity_key: "unix:1:2".into(),
+            org_id: "acme".into(),
+            project_id: "loam".into(),
+            repository_id: "repo-1".into(),
+            descriptor_digest: "digest-1".into(),
+            display_path: "/tmp/evil\u{1b}[2Jpath\u{7}".into(),
+            instance_id: "instance-1".into(),
+            broker_profile: "default".into(),
+            broker_endpoint: "mqtts://broker.example:8883".into(),
+            tls_server_name: "broker.example".into(),
+            ca_ref: None,
+            commit: "commit-1".into(),
+            capabilities: enrollment::CapabilityRecord {
+                authentication: true,
+                publish: true,
+                subscribe: true,
+                self_receive: true,
+                verified_at: "2026-08-19T00:00:00Z".into(),
+            },
+            remotes: Vec::new(),
+        };
+        let table = enrollment_table(std::slice::from_ref(&row));
+        assert!(
+            !table.chars().any(|c| c.is_control() && c != '\n'),
+            "table leaks control characters: {table:?}"
+        );
+        assert!(
+            table.contains("/tmp/evil [2Jpath"),
+            "scrub replaces with spaces rather than deleting: {table:?}"
+        );
+    }
 }
 
 #[cfg(test)]
