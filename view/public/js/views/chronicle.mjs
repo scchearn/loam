@@ -90,7 +90,7 @@ export function initChronicle({ root = document } = {}) {
       event.strength === 'strong' ? 'strong' : 'source',
     ));
     copy.appendChild(head);
-    copy.appendChild(el('h2', null, event.title || readable(event.kind)));
+    copy.appendChild(el('h4', null, event.title || readable(event.kind)));
 
     const evidence = event.evidence ?? {};
     const artifact = (shown.artifacts ?? []).find((entry) => entry.path === evidence.path);

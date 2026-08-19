@@ -1364,7 +1364,7 @@ code,
   text-transform: uppercase;
 }
 
-.timeline-copy h2 {
+.timeline-copy h4 {
   margin: var(--space-2) 0;
   color: var(--ink-primary);
   font: 600 1.05rem/1.25 var(--font-sans);

@@ -343,6 +343,23 @@ describe('Chronicle evidence timeline', () => {
     );
   });
 
+  it('nests event headings under their day group so the outline stays walkable', async () => {
+    const { chronicle } = await mount();
+
+    const levels = [...chronicle.querySelectorAll('h1, h2, h3, h4')].map((h) => Number(h.tagName[1]));
+    assert.ok(levels.length > 3);
+    for (const [index, level] of levels.entries()) {
+      if (index === 0) continue;
+      assert.ok(
+        level <= levels[index - 1] + 1,
+        `heading ${index} jumps from h${levels[index - 1]} to h${level}`,
+      );
+    }
+    const day = chronicle.querySelector('[data-day]');
+    assert.equal(day.querySelector('h3').className, 'timeline-day-label');
+    assert.ok(day.querySelector('[data-event] h4'), 'an event title sits below its day label');
+  });
+
   it('labels git commits by source strength and links inventoried evidence into Reader', async () => {
     const { chronicle, readerEvents } = await mount();
 
