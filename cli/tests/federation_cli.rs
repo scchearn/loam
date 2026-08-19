@@ -30,6 +30,12 @@ fn run_connect(workspace: Option<&Path>, broker: &str, extra: &[&str]) -> (i32, 
     command.arg(broker);
     command.args(extra);
     command
+        // The org is configuration, never inferred from the remote. These
+        // tests are about everything downstream of that, so they pin the org
+        // rung explicitly: it keeps a developer's real config.json out of the
+        // run and makes each test state which org it federates under.
+        // `scope_resolution` below owns the ladder itself.
+        .env("LOAM_FEDERATION_ORG", "acme")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -61,6 +67,8 @@ fn run_connect_pinned(
     command.args(extra);
     command
         .env("LOAM_CONFIG_DIR", root)
+        // See `run_connect`: the org rung is pinned, not inferred.
+        .env("LOAM_FEDERATION_ORG", "acme")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -108,16 +116,30 @@ fn connect_rejects_a_plaintext_broker_endpoint() {
 #[test]
 fn connect_rejects_a_malformed_project_override() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let (code, stdout, _stderr) = run_connect(
-        Some(&workspace),
-        "mqtts://broker.example:8883",
-        &["--project", "no-slash", "--json"],
-    );
-    assert_eq!(code, 65);
-    assert!(
-        stdout.contains("descriptor_invalid_field"),
-        "expected typed code, got: {stdout}"
-    );
+    // Both halves get the same gate the config and inferred rungs pass.
+    // `--project` is the rung an operator types, so it is the likeliest to
+    // carry a stray character, and nothing downstream re-checks it: a control
+    // character here would become a broker topic segment.
+    for override_value in [
+        "no-slash",
+        "/project",
+        "org/",
+        "org/pro/ject",
+        "ac\tme/project",
+        "org/pro\nject",
+        "org/pro\u{7f}ject",
+    ] {
+        let (code, stdout, _stderr) = run_connect(
+            Some(&workspace),
+            "mqtts://broker.example:8883",
+            &["--project", override_value, "--json"],
+        );
+        assert_eq!(code, 65, "`{override_value:?}` must be refused: {stdout}");
+        assert!(
+            stdout.contains("descriptor_invalid_field"),
+            "expected typed code for {override_value:?}, got: {stdout}"
+        );
+    }
 }
 
 // Skipped on Windows: this full-flow federation-connect integration test has
@@ -225,8 +247,8 @@ fn full_happy_path_validates_against_hermetic_repos() {
 // there (never compiled before the cfg-gate fix). See #121.
 #[cfg(not(windows))]
 #[test]
-fn connect_infers_org_and_project_from_the_remote_url() {
-    let root = temp_dir("infer");
+fn the_org_comes_from_configuration_and_the_project_from_the_remote() {
+    let root = temp_dir("scope-ladder");
     let origin = root.join("acme").join("loam.git");
     std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
     let work = root.join("work");
@@ -292,25 +314,100 @@ fn connect_infers_org_and_project_from_the_remote_url() {
         None,
     );
 
-    let (code, stdout, _stderr) =
-        run_connect(Some(&work), "mqtts://broker.example:8883", &["--json"]);
-    assert_eq!(code, 0, "{stdout}");
+    // The remote is `<root>/acme/loam.git`, so the old inference would have
+    // read org `acme` from it. It must not: on a real laptop that yielded the
+    // repository host's account for every workspace, which is an org the
+    // broker's ACL denies — silently, as denied subscribes long after connect.
+    let profile = root.join("profile");
+    let connect = |env: &[(&str, &str)], extra: &[&str]| -> (i32, String, String) {
+        let mut command = Command::new(binary());
+        command
+            .arg("federation")
+            .arg("connect")
+            .arg(&work)
+            .arg("mqtts://broker.example:8883")
+            .args(extra)
+            .arg("--json")
+            // Pinned so the ladder under test is the only source of an org and
+            // the developer's real config.json cannot answer for it.
+            .env("LOAM_CONFIG_DIR", &profile)
+            .env_remove("LOAM_FEDERATION_ORG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let output = command.output().expect("spawn loam");
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+
+    // Rung 4: nothing configured. A refusal, not a guess — and a recipe.
+    let (code, stdout, stderr) = connect(&[], &[]);
+    assert_eq!(
+        code, 64,
+        "an unconfigured org must refuse: {stdout} {stderr}"
+    );
     assert!(
-        stdout.contains("\"org_id\":\"acme\"") && stdout.contains("\"project_id\":\"loam\""),
-        "org/project must be inferred from the remote path: {stdout}"
+        stdout.contains("\"code\":\"federation_org_unconfigured\""),
+        "the refusal must be typed: {stdout}"
+    );
+    let config_path = profile.join("config.json");
+    let config_path = config_path.to_str().unwrap();
+    for expected in [config_path, "LOAM_FEDERATION_ORG", "--project"] {
+        assert!(
+            stdout.contains(expected),
+            "the refusal must name every way to fix it, missing {expected}: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("\"org_id\":\"acme\""),
+        "the remote's path must never become the org: {stdout}"
     );
 
-    // The override wins over the remote inference.
-    let (code, stdout, _stderr) = run_connect(
-        Some(&work),
-        "mqtts://broker.example:8883",
-        &["--project", "other-org/other-project", "--json"],
+    // Rung 3: the durable machine setting. The project still comes from the
+    // remote, which is the whole point of keeping that half inferred.
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(config_path, "{\"org\": \"real-org\"}\n").unwrap();
+    let (code, stdout, stderr) = connect(&[], &[]);
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert!(
+        stdout.contains("\"org_id\":\"real-org\"") && stdout.contains("\"project_id\":\"loam\""),
+        "org from config.json, project from the remote: {stdout}"
+    );
+
+    // Rung 2: the environment beats the file.
+    let (code, stdout, _stderr) = connect(&[("LOAM_FEDERATION_ORG", "env-org")], &[]);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.contains("\"org_id\":\"env-org\"") && stdout.contains("\"project_id\":\"loam\""),
+        "LOAM_FEDERATION_ORG must outrank config.json: {stdout}"
+    );
+
+    // Rung 1: `--project` beats both, and supplies the project too.
+    let (code, stdout, _stderr) = connect(
+        &[("LOAM_FEDERATION_ORG", "env-org")],
+        &["--project", "other-org/other-project"],
     );
     assert_eq!(code, 0, "{stdout}");
     assert!(
         stdout.contains("\"org_id\":\"other-org\"")
             && stdout.contains("\"project_id\":\"other-project\""),
-        "the --project override must win: {stdout}"
+        "the --project override must win over both: {stdout}"
+    );
+
+    // A blank setting is not a setting: it must fall through, not become an
+    // empty org that publishes to `loam/v1//<project>`.
+    std::fs::write(config_path, "{\"org\": \"   \"}\n").unwrap();
+    let (code, stdout, _stderr) = connect(&[("LOAM_FEDERATION_ORG", "  ")], &[]);
+    assert_eq!(code, 64, "a blank org must refuse: {stdout}");
+    assert!(
+        stdout.contains("\"code\":\"federation_org_unconfigured\""),
+        "{stdout}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -413,7 +510,7 @@ fn commit_reachability_is_not_required() {
     assert_eq!(code, 0, "{stdout}");
     assert!(
         stdout.contains("\"org_id\":\"acme\"") && stdout.contains("\"project_id\":\"loam\""),
-        "org/project must be inferred from the remote path: {stdout}"
+        "the project must come from the remote path and the org from configuration: {stdout}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -452,6 +549,124 @@ fn connect_rejects_an_unreadable_token_file() {
         "an unreadable token file is a usage error: {stderr}"
     );
     assert!(stderr.contains("cannot read --token-file"), "got: {stderr}");
+}
+
+/// #94: auto-enrollment failing *before* the network as `signer-unreachable`.
+///
+/// The pre-network steps are local file and environment work, and folding them
+/// into the network refusal sent the investigation to DNS, firewalls, and the
+/// broker host while the signer's journal stayed empty. Each must now name
+/// itself. These run on every platform, macos-14 included — the one the report
+/// came from.
+fn connect_with_token(root: &Path, env: &[(&str, &str)], extra: &[&str]) -> (i32, String, String) {
+    let mut command = Command::new(binary());
+    command
+        .arg("federation")
+        .arg("connect")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg("mqtts://broker.example:8883")
+        .arg("--global-root")
+        .arg(root)
+        .arg("--token")
+        .arg("secret")
+        .arg("--json")
+        .args(extra)
+        .env("LOAM_CONFIG_DIR", root)
+        .env("LOAM_FEDERATION_ORG", "acme")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    pin_git_identity(&mut command);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("spawn loam");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn an_unusable_ssl_cert_file_names_the_trust_store_not_the_signer() {
+    // The most likely shape of #94: a shell that exports SSL_CERT_FILE (a
+    // Homebrew or certifi setup does, and macOS is where those are common)
+    // pointing at a file that is gone. Trust anchors are built before anything
+    // is dialled, so the signer never sees the attempt — which is exactly the
+    // reported symptom, an empty signer journal.
+    let root = temp_dir("autoenroll-trust");
+    std::fs::create_dir_all(&root).unwrap();
+    let empty = root.join("empty-bundle.pem");
+    std::fs::write(&empty, "").unwrap();
+    let junk = root.join("junk-bundle.pem");
+    std::fs::write(&junk, "not a certificate\n").unwrap();
+
+    // Three faults, three fixes, three reasons. One reason for all of them was
+    // the dead end: "the CA did not resolve" does not say whether the path is
+    // wrong, the file is empty, or the contents are not certificates.
+    for (path, expected) in [
+        (root.join("no-such-bundle.pem"), "ca-file-unreadable"),
+        (empty, "ca-file-empty"),
+        (junk, "ca-no-trusted-certificate"),
+    ] {
+        let (code, stdout, stderr) =
+            connect_with_token(&root, &[("SSL_CERT_FILE", path.to_str().unwrap())], &[]);
+        assert_eq!(code, 69, "{stdout} {stderr}");
+        assert!(
+            stdout.contains("trust-anchors-unresolved"),
+            "an unresolvable trust store must name itself: {stdout}"
+        );
+        assert!(
+            !stdout.contains("signer-unreachable"),
+            "a local trust-store failure must not read as a network one: {stdout}"
+        );
+        // The detail names the rung that answered, what was wrong with it,
+        // and which file — together the whole fix instruction. Without the
+        // file the operator still has to work out which `SSL_CERT_FILE` a
+        // shell had exported, which is most of the debugging.
+        let named = path.to_str().unwrap();
+        let encoded = json_needle(named);
+        assert!(
+            stdout.contains("ssl-cert-file")
+                && stdout.contains(expected)
+                && stdout.contains(&encoded),
+            "the detail must name the rung, `{expected}`, and `{named}`: {stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_signer_url_that_cannot_be_dialled_is_not_an_unreachable_signer() {
+    // A typo in LOAM_FEDERATION_SIGNER is a local mistake with a local fix.
+    let root = temp_dir("autoenroll-url");
+    let (code, stdout, stderr) = connect_with_token(
+        &root,
+        &[("LOAM_FEDERATION_SIGNER", "http://signer.example/v1/enroll")],
+        &[],
+    );
+    assert_eq!(code, 69, "{stdout} {stderr}");
+    assert!(
+        stdout.contains("signer-url-invalid") && stdout.contains("not-https"),
+        "a non-HTTPS signer URL must name itself: {stdout}"
+    );
+    assert!(!stdout.contains("signer-unreachable"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_genuinely_unreachable_signer_still_reads_as_unreachable() {
+    // The control for the two above: splitting the local failures out must not
+    // have taken the network refusal with it.
+    let root = temp_dir("autoenroll-still-unreachable");
+    let (code, stdout, stderr) = connect_with_token(&root, &[], &[]);
+    assert_eq!(code, 69, "{stdout} {stderr}");
+    assert!(
+        stdout.contains("signer-unreachable") || stdout.contains("signer-timeout"),
+        "a broker host that does not resolve is still a network refusal: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -521,6 +736,8 @@ fn bare_connect_with_token_uses_the_installed_global_root() {
             "--json",
         ])
         .env("LOAM_CONFIG_DIR", &root)
+        // See `run_connect`: the org is configuration and never inferred.
+        .env("LOAM_FEDERATION_ORG", "acme")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -591,6 +808,8 @@ fn connect_with_token_missing_git_identity_names_the_typed_refusal() {
         .arg("secret")
         .arg("--json")
         .env("LOAM_CONFIG_DIR", &root)
+        // See `run_connect`: the org is configuration and never inferred.
+        .env("LOAM_FEDERATION_ORG", "acme")
         .env("HOME", empty_home())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -626,6 +845,35 @@ fn temp_dir(label: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// A filesystem path as it appears inside JSON output.
+///
+/// On Windows the path separator is the JSON escape character, so a raw path
+/// never appears verbatim in a JSON body even when the runtime named it
+/// correctly. An assertion that compared the raw path passed on both Unix
+/// runners and failed only on windows-2022, where the behaviour was right and
+/// the test was wrong. Every path asserted against JSON output goes through
+/// here so that cannot happen twice.
+fn json_needle(path: &str) -> String {
+    path.replace('\\', "\\\\")
+}
+
+/// The helper has to agree with the encoder it is standing in for. Checked on
+/// every platform, not just the one that produces paths needing it: the
+/// encoder is the same everywhere, so a Unix run catches a wrong helper before
+/// windows-2022 has to.
+#[test]
+fn json_needle_matches_what_the_runtime_encodes() {
+    let path = "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\bundle.pem";
+    let encoded = loam::json::Value::String(path.to_owned()).to_json();
+    assert!(
+        encoded.contains(&json_needle(path)),
+        "needle {} does not occur in {encoded}",
+        json_needle(path)
+    );
+    // And the raw path does not, which is the trap this exists for.
+    assert!(!encoded.contains(path), "{encoded}");
 }
 
 /// Inject a deterministic git identity into a spawned command's environment.

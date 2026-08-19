@@ -427,6 +427,67 @@ fn request_signed_certificate_refuses_a_wrong_token() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// The #93 wedge, seen from the client: a signer that accepts the connection
+/// and then says nothing. Before the bounded deadlines this hung forever with
+/// no output; now it is a typed refusal that names the stage it died at.
+///
+/// Deliberately not gated on `LOAM_MQTT_TEST`: it needs no openssl, no python,
+/// and no CA, so the anti-hang property is proven on every platform on every
+/// run. It costs one per-operation deadline (10s) of wall clock, in parallel
+/// with the rest of the suite.
+#[test]
+fn request_signed_certificate_times_out_against_a_signer_that_never_answers() {
+    use std::io::Read;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a stalling listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let stall = std::thread::spawn(move || {
+        // Accept and hold. Never write a byte, so the TLS handshake the client
+        // starts on its first write is never answered.
+        if let Ok((mut accepted, _)) = listener.accept() {
+            let mut sink = [0u8; 1024];
+            let _ = accepted.read(&mut sink);
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    });
+
+    let (_key_pem, csr_pem) = loam::enrollment_auto::generate_keypair_and_csr(
+        "ada@example.org",
+        "Ada Lovelace",
+        "01ARZ3NDEKTSV4RRFFQ69G5FBX",
+    )
+    .expect("the runtime should generate a keypair and CSR");
+
+    let started = Instant::now();
+    let error = loam::enrollment_auto::request_signed_certificate(
+        &format!("https://127.0.0.1:{port}/v1/enroll"),
+        "shared-enroll-secret",
+        &csr_pem,
+        &rustls::RootCertStore::empty(),
+    )
+    .expect_err("a signer that never answers must be a typed refusal, not a hang");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        error,
+        loam::enrollment_auto::EnrollmentFailure::SignerTimeout { stage: "request" },
+        "a stalled handshake must be a timeout naming its stage, not signer-unreachable"
+    );
+    assert_eq!(error.code(), "signer-timeout");
+    // The bound must actually be the bound: neither an instant failure that
+    // would mean no connection was attempted, nor an unbounded wait.
+    assert!(
+        elapsed >= Duration::from_secs(5),
+        "failed in {elapsed:?}, too fast to be the deadline expiring"
+    );
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "took {elapsed:?}; the deadline did not bound the exchange"
+    );
+
+    drop(stall);
+}
+
 #[test]
 #[ignore = "requires LOAM_MQTT_TEST=1, real openssl, and python3"]
 fn request_signed_certificate_reports_an_unreachable_signer() {

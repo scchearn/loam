@@ -72,28 +72,58 @@ const FORBIDDEN_FRAGMENTS: &[&str] = &[
 /// to a stable JSON code and a sysexits process class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnrollmentError {
-    TooLarge { bytes: usize },
+    TooLarge {
+        bytes: usize,
+    },
     NotUtf8,
     InvalidJson(String),
-    NotAnObject { at: &'static str },
-    DuplicateField { key: String },
-    UnknownField { key: String },
-    ForbiddenField { key: String },
-    MissingField { key: &'static str },
+    NotAnObject {
+        at: &'static str,
+    },
+    DuplicateField {
+        key: String,
+    },
+    UnknownField {
+        key: String,
+    },
+    ForbiddenField {
+        key: String,
+    },
+    MissingField {
+        key: &'static str,
+    },
     UnsupportedSchema,
-    InvalidField { field: &'static str },
+    InvalidField {
+        field: &'static str,
+    },
     InvalidEndpoint,
     InvalidCommit,
     TooManyRemotes,
     TooFewRemotes,
-    TooManyRefs { remote: String },
-    TooFewRefs { remote: String },
-    InvalidRef { value: String },
+    TooManyRefs {
+        remote: String,
+    },
+    TooFewRefs {
+        remote: String,
+    },
+    InvalidRef {
+        value: String,
+    },
     WorkspaceNotGit,
     WorkspaceNotUtf8,
-    RemoteNotConfigured { remote: String },
-    CredentialBearingRemote { remote: String },
+    RemoteNotConfigured {
+        remote: String,
+    },
+    CredentialBearingRemote {
+        remote: String,
+    },
     GitUnavailable,
+    /// No federation org is configured, and this machine will not guess one.
+    /// Carries the `config.json` path the operator should write, so the
+    /// diagnostic is a recipe rather than a complaint.
+    FederationOrgUnconfigured {
+        config_path: String,
+    },
 }
 
 impl EnrollmentError {
@@ -122,6 +152,7 @@ impl EnrollmentError {
             EnrollmentError::RemoteNotConfigured { .. } => "remote_not_configured",
             EnrollmentError::CredentialBearingRemote { .. } => "credential_bearing_remote",
             EnrollmentError::GitUnavailable => "git_unavailable",
+            EnrollmentError::FederationOrgUnconfigured { .. } => "federation_org_unconfigured",
         }
     }
 
@@ -130,6 +161,9 @@ impl EnrollmentError {
     pub fn sysexit(&self) -> i32 {
         match self {
             EnrollmentError::GitUnavailable => 69,
+            // The operator has to supply something the machine cannot know.
+            // That is the usage class, and `--project` is the usage fix.
+            EnrollmentError::FederationOrgUnconfigured { .. } => 64,
             _ => 65,
         }
     }
@@ -204,6 +238,20 @@ impl std::fmt::Display for EnrollmentError {
                 write!(f, "remote `{remote}` URL embeds credentials")
             }
             EnrollmentError::GitUnavailable => write!(f, "git is unavailable"),
+            EnrollmentError::FederationOrgUnconfigured { config_path } => {
+                // A complete recipe, not a complaint: the org is the one fact
+                // the machine cannot derive, and guessing it from the git
+                // remote is what every real broker's ACL denies.
+                write!(
+                    f,
+                    "no federation org configured. The org is not inferred from \
+                     the git remote — a repository's host account is not the org \
+                     whose broker you connect to. Set it one of three ways:\n  \
+                     1. write {config_path} as: {{\"org\": \"<org>\"}}\n  \
+                     2. export LOAM_FEDERATION_ORG=<org>\n  \
+                     3. pass --project <org>/<project> to this command"
+                )
+            }
         }
     }
 }

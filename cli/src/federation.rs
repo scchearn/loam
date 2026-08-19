@@ -27,7 +27,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         _ => {
             eprintln!(
                 "Usage:\n  \
-                 loam federation connect <workspace> <broker> [--project org/project] [--global-root <path>] [--token <password>|--token-file <path>] [--json]\n  \
+                 loam federation connect <workspace> <broker> [--project org/project] [--global-root <path>] [--token <password>|--token-file <path>] [--json]\n    \
+                 the org comes from LOAM_FEDERATION_ORG or `org` in <profile>/config.json; --project overrides both and names the project too\n  \
                  loam federation disconnect <workspace> --global-root <path> [--json]\n  \
                  loam federation status [<workspace>] --global-root <path> [--json]\n  \
                  loam federation emit [<workspace>] --global-root <path> [--json]   (reads one operation on stdin)\n  \
@@ -596,28 +597,35 @@ fn connect(mut args: impl Iterator<Item = String>) -> i32 {
                 if identity_root.is_none() {
                     if let Err(failure) = auto_enroll(&enrolled, &token, &root) {
                         let code = format!("enrollment: {}", failure.code());
+                        // The detail is what turns `signer-unreachable` from a
+                        // dead end into a diagnosis. Printed in release too:
+                        // the report this exists for came from an operator
+                        // running the published binary.
+                        let detail = failure
+                            .detail()
+                            .map(|(operation, detail)| format!("{operation}: {detail}"));
                         if json_output {
+                            let mut error_fields =
+                                vec![("code".into(), Value::String(code.clone()))];
+                            if let Some(detail) = &detail {
+                                error_fields.push(("detail".into(), Value::String(detail.clone())));
+                            }
                             println!(
                                 "{}",
                                 Value::Object(vec![
                                     ("schema".into(), Value::Number("1".into())),
                                     ("status".into(), Value::String("error".into())),
-                                    (
-                                        "error".into(),
-                                        Value::Object(vec![(
-                                            "code".into(),
-                                            Value::String(code.clone())
-                                        )]),
-                                    ),
+                                    ("error".into(), Value::Object(error_fields)),
                                 ])
                                 .to_json()
                             );
                         } else {
-                            eprintln!("federation connect: {code}");
-                        }
-                        #[cfg(debug_assertions)]
-                        if let Some((operation, detail)) = failure.debug_detail() {
-                            eprintln!("federation connect: local crypto {operation}: {detail}");
+                            match &detail {
+                                Some(detail) => {
+                                    eprintln!("federation connect: {code} ({detail})")
+                                }
+                                None => eprintln!("federation connect: {code}"),
+                            }
                         }
                         return 69;
                     }
@@ -658,27 +666,52 @@ fn auto_enroll(
         })
         .unwrap_or_default();
     let url = crate::enrollment_auto::signer_url(host);
+    // Which rung answered decides what the operator has to go and fix, and it
+    // is the fact that was missing when this failed on a laptop: an
+    // `SSL_CERT_FILE` the shell had exported, pointing at a file that no longer
+    // existed, is indistinguishable from the outside from a broker that is
+    // down. Both the rung and the specific fault come from the resolver, which
+    // owns the ladder — deriving them here would mean reporting the old
+    // precedence the day the ladder changed.
     let trust = crate::provisioning::resolve_trust_anchors(
         enrolled.ca_ref.as_deref(),
         std::env::var("SSL_CERT_FILE").ok().as_deref(),
     )
-    .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    .map_err(|failure| EnrollmentFailure::TrustAnchorsUnresolved {
+        source: failure.source,
+        // The file, not only the fault: `ca-file-empty` does not say which
+        // `SSL_CERT_FILE` a shell had exported, and working that out is most
+        // of the debugging this refusal exists to save.
+        detail: failure.described(),
+    })?;
     let certificate =
         crate::enrollment_auto::request_signed_certificate(&url, token, &csr_pem, &trust)?;
 
-    let identity_root = crate::provisioning::configured_identity_root()
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
-    crate::provisioning::store_identity_bundle(&identity_root, &certificate, &key_pem)
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    // Past this point the signer has already issued a certificate. A failure
+    // here loses it, so it must never read as "the signer could not be
+    // reached" — it is the local disk, and the fix is local.
+    let identity_root = crate::provisioning::configured_identity_root().map_err(|reason| {
+        EnrollmentFailure::IdentityStoreFailed {
+            operation: "identity-root",
+            detail: reason.to_owned(),
+        }
+    })?;
+    crate::provisioning::store_identity_bundle(&identity_root, &certificate, &key_pem).map_err(
+        |reason| EnrollmentFailure::IdentityStoreFailed {
+            operation: "store-bundle",
+            detail: reason.to_owned(),
+        },
+    )?;
 
     let _ = root;
     Ok(())
 }
 
-/// Build the validated enrollment from the one-command surface: org/project
-/// inferred from the workspace's git remote URL (overridable), the broker
-/// endpoint validated, and the physical-identity + remote-digest proof run
-/// exactly as the descriptor path did. No commit is read or proven.
+/// Build the validated enrollment from the one-command surface: the scope
+/// resolved by [`resolve_scope`] (org from configuration, project from the
+/// workspace's git remote), the broker endpoint validated, and the
+/// physical-identity + remote-digest proof run exactly as the descriptor path
+/// did. No commit is read or proven.
 fn validate_connect(
     workspace: &std::path::Path,
     broker: &str,
@@ -697,10 +730,7 @@ fn validate_connect(
     {
         return Err(EnrollmentError::InvalidEndpoint);
     }
-    let (org_id, project_id) = match project_override {
-        Some(scope) => split_scope(scope)?,
-        None => infer_scope(workspace)?,
-    };
+    let (org_id, project_id) = resolve_scope(workspace, project_override)?;
     let descriptor = enrollment::Descriptor {
         repository_id: format!("{org_id}/{project_id}"),
         org_id,
@@ -727,20 +757,101 @@ fn validate_connect(
 }
 
 /// Split a `--project org/project` value into its two atoms.
+///
+/// Both halves go through [`validate_scope_part`], the same gate the config
+/// and inferred rungs pass. This is the rung an operator actually types, so it
+/// is the one most likely to carry a stray character — and nothing downstream
+/// re-checks it: `validate_enrollment`'s bounded-id rules run on the JSON
+/// parse path, not on a `Descriptor` built here.
 fn split_scope(scope: &str) -> Result<(String, String), EnrollmentError> {
     let (org, project) = scope
         .split_once('/')
         .ok_or(EnrollmentError::InvalidField { field: "project" })?;
-    if org.is_empty() || project.is_empty() || org.contains('/') || project.contains('/') {
-        return Err(EnrollmentError::InvalidField { field: "project" });
-    }
+    validate_scope_part(org, "org_id")?;
+    validate_scope_part(project, "project")?;
     Ok((org.to_owned(), project.to_owned()))
 }
 
-/// Infer org/project from the workspace's `origin` remote URL path. The last
-/// two path segments of the repository path are the org and the project:
-/// `git@github.com:acme/loam.git` → `acme`/`loam`.
-fn infer_scope(workspace: &std::path::Path) -> Result<(String, String), EnrollmentError> {
+/// Which org and project this workspace federates under.
+///
+/// Precedence, first wins:
+///
+/// 1. `--project <org>/<project>` — the explicit override, supplying both.
+/// 2. `LOAM_FEDERATION_ORG` — the org, for CI and unattended installs.
+/// 3. `org` in the profile's `config.json` — the durable machine setting.
+/// 4. nothing. The org is *not* inferred, and an unconfigured machine is
+///    refused with a recipe rather than connected to a guess.
+///
+/// The project keeps coming from the workspace's `origin` remote unless
+/// `--project` names both: the repository *is* the project, one org holds many,
+/// and that is also the shape of the broker's topics
+/// (`loam/v1/<org>/<project>/...`). The org does not, because it is a property
+/// of the operator/org relationship rather than of where a repository happens
+/// to be hosted — inferring it yielded the host account for every repo on a
+/// real laptop, which is an org the broker's ACL denies. That failure is
+/// invisible at connect time and only shows up as denied subscribes, so
+/// falling back to the inference would preserve the exact footgun this
+/// resolution exists to remove.
+fn resolve_scope(
+    workspace: &std::path::Path,
+    project_override: Option<&str>,
+) -> Result<(String, String), EnrollmentError> {
+    if let Some(scope) = project_override {
+        return split_scope(scope);
+    }
+    let project_id = infer_project(workspace)?;
+    let org_id = configured_org()?;
+    validate_scope_part(&org_id, "org_id")?;
+    Ok((org_id, project_id))
+}
+
+/// The org from the environment, then from `config.json`. `Err` when neither
+/// names one, carrying the path an operator should write.
+fn configured_org() -> Result<String, EnrollmentError> {
+    let present = |value: String| {
+        let trimmed = value.trim().to_owned();
+        (!trimmed.is_empty()).then_some(trimmed)
+    };
+    if let Some(org) = std::env::var("LOAM_FEDERATION_ORG").ok().and_then(present) {
+        return Ok(org);
+    }
+    // A malformed `config.json` is deliberately not fatal here: the org is
+    // absent either way, and the recipe below is the more useful thing to say
+    // than a parse complaint about a file the operator may not know exists.
+    if let Ok(Some(config)) = crate::provisioning::read_configured_config() {
+        if let Some(org) = config
+            .get("org")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .and_then(present)
+        {
+            return Ok(org);
+        }
+    }
+    Err(EnrollmentError::FederationOrgUnconfigured {
+        config_path: crate::provisioning::configured_config_path()
+            .map(|path| path.display().to_string())
+            // No profile resolves at all, so there is nowhere to write. Name
+            // the file rather than an empty string; the other two rungs in the
+            // message still work.
+            .unwrap_or_else(|_| "config.json".to_owned()),
+    })
+}
+
+/// Reject an org or project that could not be one: the value becomes a topic
+/// segment, and a slash or an empty string there would silently re-scope every
+/// message this machine publishes.
+fn validate_scope_part(value: &str, field: &'static str) -> Result<(), EnrollmentError> {
+    if value.is_empty() || value.contains('/') || value.chars().any(char::is_control) {
+        return Err(EnrollmentError::InvalidField { field });
+    }
+    Ok(())
+}
+
+/// The project id from the workspace's `origin` remote: the last path segment
+/// of the URL, which is the repository name. See [`resolve_scope`] for why the
+/// org is not read from the segment before it.
+fn infer_project(workspace: &std::path::Path) -> Result<String, EnrollmentError> {
     let path_str = workspace
         .to_str()
         .ok_or(EnrollmentError::WorkspaceNotUtf8)?;
@@ -769,17 +880,12 @@ fn infer_scope(workspace: &std::path::Path) -> Result<(String, String), Enrollme
         .map(|(_, rest)| rest)
         .unwrap_or(&url);
     let path = path.trim_end_matches(".git").trim_end_matches('/');
-    let mut segments = path.split('/').filter(|s| !s.is_empty());
-    let project = segments
-        .next_back()
+    let project = path
+        .split('/')
+        .rfind(|segment| !segment.is_empty())
         .ok_or(EnrollmentError::InvalidField { field: "project" })?;
-    let org = segments
-        .next_back()
-        .ok_or(EnrollmentError::InvalidField { field: "org_id" })?;
-    if org.is_empty() || project.is_empty() {
-        return Err(EnrollmentError::InvalidField { field: "project" });
-    }
-    Ok((org.to_owned(), project.to_owned()))
+    validate_scope_part(project, "project")?;
+    Ok(project.to_owned())
 }
 
 /// Drive the transactional connect from the CLI: derive the connector's
@@ -899,6 +1005,11 @@ fn orchestrate_cli(
             0
         }
         Err(error) => {
+            // Rendering belongs to `connect_error_json`/`connect_error_line`,
+            // which already emit the code plus the failing stage's own reason.
+            // #95 adds a reason where there was none: a `key.pem` that is not
+            // the key in `client.pem` used to report `connect_probe_failed`
+            // and nothing more. It flows through these renderers unchanged.
             if json_output {
                 println!("{}", connect_error_json(&error).to_json());
             } else {

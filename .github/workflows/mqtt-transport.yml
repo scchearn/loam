@@ -29,6 +29,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y mosquitto openssl
       - name: Install Rust
         run: rustup toolchain install 1.94.1 --profile minimal
+      # The auto-enrollment tier: the runtime's CSR signed by a real `openssl
+      # ca`, and `request_signed_certificate` driven over real TLS against the
+      # deployment's signer contract as a subprocess. It was gated on
+      # LOAM_MQTT_TEST and then run by nothing, so the enrollment path's only
+      # end-to-end coverage never gated anything. Needs openssl (installed
+      # above) and python3 (preinstalled on this runner). Cheapest job here at
+      # ~2s, so it goes first and fails fast.
+      - name: Run the auto-enrollment signer tier
+        env:
+          LOAM_MQTT_TEST: "1"
+        run: cargo +1.94.1 test --locked --test enrollment_auto -- --ignored --test-threads=1
       - name: Run the isolated MQTT 5 broker contract
         env:
           LOAM_MQTT_TEST: "1"

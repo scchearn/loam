@@ -32,7 +32,7 @@ dryrun() {
     resolve-credentials.sh provision-peer-roster.sh provision-instance-id.sh
     certbot-deploy-hook.sh pki/init-ca.sh pki/issue-client.sh pki/revoke-client.sh
     pki/obtain-server-cert.sh pki/selfcheck.sh
-    enroll/signer.py enroll/install-signer.sh enroll/loam-enroll-signer.service
+    enroll/signer.py enroll/test_signer.py enroll/install-signer.sh enroll/loam-enroll-signer.service
     RESOLUTION-CONTRACT.md ROSTER-CONTRACT.md INSTANCE-ID-CONTRACT.md IDENTITY-CONTRACT.md ACCEPTANCE.md"
   local f
   for f in $need; do
@@ -53,6 +53,9 @@ dryrun() {
   "$HERE/resolve-credentials.sh" selfcheck >/dev/null 2>&1 || { echo "selfcheck: resolve"; ok=0; }
   "$HERE/provision-peer-roster.sh" selfcheck >/dev/null 2>&1 || { echo "selfcheck: roster"; ok=0; }
   "$HERE/provision-instance-id.sh" selfcheck >/dev/null 2>&1 || { echo "selfcheck: instance-id"; ok=0; }
+  # The signer's availability contract: it must keep serving behind a stalled
+  # client. Needs python3 + openssl, both already required by this tree.
+  python3 "$HERE/enroll/test_signer.py" >/dev/null 2>&1 || { echo "selfcheck: enroll-signer"; ok=0; }
   [ "$ok" -eq 1 ] && { echo "DRYRUN GREEN"; return 0; } || { echo "DRYRUN RED"; return 1; }
 }
 

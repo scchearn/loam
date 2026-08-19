@@ -181,21 +181,108 @@ pub fn split_credential(blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'static str>
 pub fn resolve_trust_anchors(
     ca_ref: Option<&str>,
     ssl_cert_file: Option<&str>,
-) -> Result<rustls::RootCertStore, &'static str> {
+) -> Result<rustls::RootCertStore, TrustFailure> {
     match ca_ref {
         // Present but blank is a malformed reference, not an absent one. Reading
         // it as "no CA pinned" would turn a typo into a silently wider trust
         // decision — the same downgrade an unresolvable reference is refused for.
-        Some(reference) if reference.trim().is_empty() => Err(reason::CA_UNRESOLVED),
-        Some(reference) => {
-            let bytes = std::fs::read(reference.trim()).map_err(|_| reason::CA_UNRESOLVED)?;
-            if bytes.is_empty() {
-                return Err(reason::CA_UNRESOLVED);
-            }
-            build_root_store(&bytes)
+        Some(reference) if reference.trim().is_empty() => {
+            Err(TrustFailure::new(CA_REF, reason::CA_REF_BLANK))
         }
+        Some(reference) => read_trust_file(CA_REF, reference.trim()),
         None => bundled_trust_anchors(ssl_cert_file),
     }
+}
+
+/// The rung names a [`TrustFailure`] reports. They are derived here, beside the
+/// ladder itself, because a caller that re-derived the precedence would keep
+/// reporting the old one the day the ladder changed. There is no name for the
+/// bundled rung: the roots are compiled in, so it has no way to fail.
+const CA_REF: &str = "ca-ref";
+const SSL_CERT_FILE: &str = "ssl-cert-file";
+
+/// Which trust rung answered, and what specifically went wrong on it.
+///
+/// One reason for every trust failure was the whole diagnosis an operator got,
+/// and "the CA did not resolve" does not say whether the path is wrong, the
+/// file is empty, or the contents are not certificates — three different fixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustFailure {
+    /// `ca-ref` or `ssl-cert-file` — the two rungs that read a file. The
+    /// bundled rung is compiled in and cannot fail.
+    pub source: &'static str,
+    /// One of the `reason::CA_*` constants.
+    pub reason: &'static str,
+    /// The file the rung named, when it named one. An operator debugging a
+    /// stale `SSL_CERT_FILE` should not have to reconstruct which file the
+    /// shell had exported — that reconstruction is most of the work.
+    pub path: Option<String>,
+}
+
+impl TrustFailure {
+    fn new(source: &'static str, reason: &'static str) -> Self {
+        Self {
+            source,
+            reason,
+            path: None,
+        }
+    }
+
+    fn at(source: &'static str, reason: &'static str, path: &str) -> Self {
+        Self {
+            source,
+            reason,
+            path: Some(path.to_owned()),
+        }
+    }
+
+    /// The reason together with the file it is about, for a diagnostic that
+    /// shows detail. `ca-file-empty` on its own does not say which file, and
+    /// finding that out is most of the debugging.
+    pub fn described(&self) -> String {
+        match &self.path {
+            // Colon-separated rather than parenthesised: the caller already
+            // wraps the whole detail in parentheses, and nesting them reads
+            // worse than the flat `rung: fault: file` the reader ends up with.
+            Some(path) => format!("{}: {path}", self.reason),
+            None => self.reason.to_owned(),
+        }
+    }
+
+    /// The reason the *session-credential* surface reports.
+    ///
+    /// `credentials-unresolved / ca-unresolved` is what that path has said for
+    /// every trust failure since it existed, and the connector's reason strings
+    /// are a tested IPC contract that does not move. So it keeps saying exactly
+    /// that, deliberately and in one place. The specific [`TrustFailure::reason`]
+    /// and [`TrustFailure::path`] are additive: they reach the enrollment
+    /// diagnostic, which is new, and nothing else.
+    ///
+    /// That means this surface names neither the fault nor the file, and that
+    /// is a constraint rather than an oversight: `SessionState::CredentialsUnresolved`
+    /// carries one `&'static str` and no detail channel, so saying more here
+    /// would mean either moving a pinned reason or widening that state — a
+    /// change this slice deliberately does not make. An operator who lands on
+    /// `ca-unresolved` gets the full diagnosis, path included, from
+    /// `federation connect`, which resolves the same anchors through the
+    /// enrollment path.
+    pub fn credential_reason(&self) -> &'static str {
+        reason::CA_UNRESOLVED
+    }
+}
+
+/// Read one named trust file into a root store, naming which of the three ways
+/// it can fail happened.
+fn read_trust_file(
+    source: &'static str,
+    path: &str,
+) -> Result<rustls::RootCertStore, TrustFailure> {
+    let bytes = std::fs::read(path)
+        .map_err(|_| TrustFailure::at(source, reason::CA_FILE_UNREADABLE, path))?;
+    if bytes.is_empty() {
+        return Err(TrustFailure::at(source, reason::CA_FILE_EMPTY, path));
+    }
+    build_root_store(&bytes).map_err(|reason| TrustFailure::at(source, reason, path))
 }
 
 /// The no-`ca_ref` trust path: `SSL_CERT_FILE` first, then the bundled Mozilla
@@ -203,16 +290,74 @@ pub fn resolve_trust_anchors(
 /// become "trust nothing".
 fn bundled_trust_anchors(
     ssl_cert_file: Option<&str>,
-) -> Result<rustls::RootCertStore, &'static str> {
+) -> Result<rustls::RootCertStore, TrustFailure> {
     if let Some(path) = ssl_cert_file.map(str::trim).filter(|v| !v.is_empty()) {
-        let bytes = std::fs::read(path).map_err(|_| reason::CA_UNRESOLVED)?;
-        if !bytes.is_empty() {
-            return build_root_store(&bytes);
-        }
+        // A set override is honoured or refused, never quietly skipped. An
+        // empty file used to fall through to the bundle, which is the same
+        // silent widening the blank `ca_ref` above is refused for: the operator
+        // pinned trust and got a hundred Mozilla roots instead.
+        return read_trust_file(SSL_CERT_FILE, path);
     }
     Ok(rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     })
+}
+
+/// Build the mTLS client configuration for one session, naming *which input*
+/// failed instead of folding every credential problem into one reason.
+///
+/// Key encoding is deliberately permissive. The identity layout contract says
+/// PKCS#8, but every natural path an operator or an older script takes
+/// produces something else:
+///
+/// * PKCS#8 — `BEGIN PRIVATE KEY`, what this runtime's own auto-enrollment
+///   writes and what `openssl pkcs8 -topk8` produces;
+/// * SEC1 — `BEGIN EC PRIVATE KEY`, the default output of
+///   `openssl ecparam -genkey` on OpenSSL and on the LibreSSL that ships with
+///   macOS, optionally preceded by an `EC PARAMETERS` block;
+/// * PKCS#1 — `BEGIN RSA PRIVATE KEY`, what `openssl genrsa` emits before
+///   OpenSSL 3, which is what this repository's own `pki/issue-client.sh`
+///   calls.
+///
+/// All three are accepted: refusing them bought nothing but debugging time,
+/// and the last of them would have meant refusing identities minted by this
+/// project's own tooling. A key that still cannot be used gets a reason that
+/// names the actual problem.
+pub fn build_client_config(
+    roots: &rustls::RootCertStore,
+    client_auth: Option<(&[u8], &[u8])>,
+) -> Result<rustls::ClientConfig, &'static str> {
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots.clone());
+    let Some((certificate_pem, key_pem)) = client_auth else {
+        return Ok(builder.with_no_client_auth());
+    };
+    let mut certificate_reader = std::io::Cursor::new(certificate_pem);
+    let certificates = rustls_pemfile::certs(&mut certificate_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| reason::CERTIFICATE_MALFORMED)?;
+    if certificates.is_empty() {
+        return Err(reason::CERTIFICATE_MALFORMED);
+    }
+    let mut key_reader = std::io::Cursor::new(key_pem);
+    // `private_key` takes the first PKCS#8, SEC1, or PKCS#1 block and steps
+    // over anything else in the file, which is what makes the `EC PARAMETERS`
+    // preamble harmless.
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|_| reason::KEY_FORMAT_UNSUPPORTED)?
+        .ok_or(reason::KEY_FORMAT_UNSUPPORTED)?;
+    builder
+        .with_client_auth_cert(certificates, key)
+        .map_err(|error| match error {
+            // rustls compares the key's public half against the certificate's
+            // SubjectPublicKeyInfo. That is a mismatched pair, not a bad
+            // encoding, and it is the one an operator is most likely to have
+            // made by hand.
+            rustls::Error::InconsistentKeys(_) => reason::KEY_CERT_MISMATCH,
+            // Everything else at this point is the key provider refusing to
+            // load the bytes: a parseable container around something that is
+            // not a usable key.
+            _ => reason::KEY_FORMAT_UNSUPPORTED,
+        })
 }
 
 pub fn build_root_store(pem: &[u8]) -> Result<rustls::RootCertStore, &'static str> {
@@ -223,7 +368,7 @@ pub fn build_root_store(pem: &[u8]) -> Result<rustls::RootCertStore, &'static st
     let mut store = rustls::RootCertStore::empty();
     store.add_parsable_certificates(der_certs);
     if store.is_empty() {
-        return Err(reason::CA_UNRESOLVED);
+        return Err(reason::CA_NO_TRUSTED_CERTIFICATE);
     }
     Ok(store)
 }
@@ -274,8 +419,10 @@ pub fn resolve_credentials(
     let key = std::fs::read(&key_path).map_err(|_| credentials(reason::IDENTITY_REQUIRED))?;
     harden_identity_permissions(identity_root, &certificate_path, &key_path)
         .map_err(ProvisionFailure::Credentials)?;
-    let certificate_authority =
-        resolve_trust_anchors(ca_ref, ssl_cert_file).map_err(ProvisionFailure::Credentials)?;
+    // The session-credential surface keeps reporting `ca-unresolved`; see
+    // `TrustFailure::credential_reason`.
+    let certificate_authority = resolve_trust_anchors(ca_ref, ssl_cert_file)
+        .map_err(|failure| ProvisionFailure::Credentials(failure.credential_reason()))?;
     Ok(CredentialMaterial {
         certificate,
         key,
@@ -1518,13 +1665,8 @@ fn parse_member_card(text: &str) -> Result<MemberCard, &'static str> {
 /// empty is read as `None` (all defaults); a present, malformed `config.json`
 /// is an explicit error so a human edit that broke the file is surfaced, not
 /// silently ignored.
-pub fn read_config(mut root: &std::path::Path) -> Result<Option<crate::json::Value>, &'static str> {
-    // `resolve` paths point inside the profile; `config.json` sits at the
-    // profile root.
-    if root.file_name() == Some(std::ffi::OsStr::new("federation")) {
-        root = root.parent().unwrap_or(root);
-    }
-    let path = root.join("config.json");
+pub fn read_config(root: &std::path::Path) -> Result<Option<crate::json::Value>, &'static str> {
+    let path = config_path(root);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Ok(None);
     };
@@ -1534,6 +1676,32 @@ pub fn read_config(mut root: &std::path::Path) -> Result<Option<crate::json::Val
     crate::json::parse(&text)
         .map(Some)
         .map_err(|_| reason::ROSTER_MALFORMED)
+}
+
+/// Where `config.json` sits for a given profile path. `resolve` paths point
+/// inside the profile (`<...>/federation`); the config file sits one level up
+/// beside it, so both spellings resolve to the same file.
+pub fn config_path(root: &std::path::Path) -> std::path::PathBuf {
+    let root = if root.file_name() == Some(std::ffi::OsStr::new("federation")) {
+        root.parent().unwrap_or(root)
+    } else {
+        root
+    };
+    root.join("config.json")
+}
+
+/// This machine's `config.json` path, resolved through the same profile ladder
+/// as the identity and roster roots. Named separately from [`read_config`]
+/// because a diagnostic that tells an operator to write the file has to be able
+/// to say where.
+pub fn configured_config_path() -> Result<std::path::PathBuf, &'static str> {
+    configured_profile_root().map(|profile| config_path(&profile))
+}
+
+/// This machine's `config.json`, or `None` when there is none to read.
+pub fn read_configured_config() -> Result<Option<crate::json::Value>, &'static str> {
+    let profile = configured_profile_root()?;
+    read_config(&profile)
 }
 
 // ---------------------------------------------------------------------------
@@ -3034,30 +3202,88 @@ mod tests {
             "the override branch is the file's roots, never the bundle"
         );
 
+        // Each way a trust rung can fail names itself, because the fixes
+        // differ: a wrong path, a file with nothing in it, and a file that
+        // holds something other than certificates are three different jobs.
+        // The rung comes from the resolver, so a caller reporting it cannot
+        // drift out of step with the precedence it describes.
+        //
         // A named CA that resolves to nothing is a refusal, never a silent
         // downgrade to the bundle — that downgrade would turn a pinning
         // failure into a quietly wider trust decision.
-        assert!(matches!(
-            resolve_trust_anchors(Some("/nonexistent/loam/ca.pem"), None),
-            Err(reason::CA_UNRESOLVED)
-        ));
+        let failure = resolve_trust_anchors(Some("/nonexistent/loam/ca.pem"), None).unwrap_err();
+        assert_eq!(
+            (failure.source, failure.reason),
+            ("ca-ref", reason::CA_FILE_UNREADABLE)
+        );
 
         // A present-but-blank reference is malformed, not absent: reading it as
         // "no CA pinned" would turn a typo into a silently wider trust decision.
-        assert!(matches!(
-            resolve_trust_anchors(Some("   "), None),
-            Err(reason::CA_UNRESOLVED)
-        ));
+        let failure = resolve_trust_anchors(Some("   "), None).unwrap_err();
+        assert_eq!(
+            (failure.source, failure.reason),
+            ("ca-ref", reason::CA_REF_BLANK)
+        );
 
         // An empty trust file is not a trust store: it would build a root store
         // that refuses every connection, which is a broken session rather than
         // a resolved one.
         let empty = directory.join("empty.pem");
         std::fs::write(&empty, "").expect("empty trust file is writable");
-        assert!(matches!(
-            resolve_trust_anchors(Some(&empty.to_string_lossy()), None),
-            Err(reason::CA_UNRESOLVED)
-        ));
+        let failure = resolve_trust_anchors(Some(&empty.to_string_lossy()), None).unwrap_err();
+        assert_eq!(
+            (failure.source, failure.reason),
+            ("ca-ref", reason::CA_FILE_EMPTY)
+        );
+
+        // Bytes that are not certificates: the path and the content are both
+        // there, and neither is the problem the operator has.
+        let junk = directory.join("junk.pem");
+        std::fs::write(&junk, "not a certificate\n").expect("junk trust file is writable");
+        let failure = resolve_trust_anchors(Some(&junk.to_string_lossy()), None).unwrap_err();
+        assert_eq!(
+            (failure.source, failure.reason),
+            ("ca-ref", reason::CA_NO_TRUSTED_CERTIFICATE)
+        );
+
+        // The same three faults on the SSL_CERT_FILE rung report that rung.
+        // An empty override used to fall through to the bundled roots, which
+        // is the silent widening the blank `ca_ref` case above is refused for.
+        for (path, expected) in [
+            ("/nonexistent/loam/bundle.pem", reason::CA_FILE_UNREADABLE),
+            (empty.to_string_lossy().as_ref(), reason::CA_FILE_EMPTY),
+            (
+                junk.to_string_lossy().as_ref(),
+                reason::CA_NO_TRUSTED_CERTIFICATE,
+            ),
+        ] {
+            let failure = resolve_trust_anchors(None, Some(path)).unwrap_err();
+            assert_eq!(
+                (failure.source, failure.reason),
+                ("ssl-cert-file", expected)
+            );
+            // The detail has to say which file, not only that a file failed.
+            assert_eq!(failure.path.as_deref(), Some(path));
+            assert!(
+                failure.described().contains(path),
+                "{}",
+                failure.described()
+            );
+        }
+
+        // Whatever the specific fault, the session-credential surface keeps
+        // reporting the one reason it has always reported. The new ones are
+        // additive, for the enrollment diagnostic, and do not move this.
+        for failure in [
+            TrustFailure::new("ca-ref", reason::CA_REF_BLANK),
+            TrustFailure::at(
+                "ssl-cert-file",
+                reason::CA_NO_TRUSTED_CERTIFICATE,
+                "/tmp/x.pem",
+            ),
+        ] {
+            assert_eq!(failure.credential_reason(), reason::CA_UNRESOLVED);
+        }
 
         let _ = std::fs::remove_dir_all(directory);
     }

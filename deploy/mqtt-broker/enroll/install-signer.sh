@@ -166,6 +166,13 @@ Environment=ENROLL_OPENSSL_CONFIG=${ENROLL_DIR}/ca/openssl.cnf
 Environment=ENROLL_BIND_ADDRESS=0.0.0.0
 Environment=ENROLL_RATE_LIMIT=10
 Environment=ENROLL_RATE_WINDOW_SECONDS=60
+# Idle timeout: the longest any single socket operation may block, including
+# the TLS handshake, so a client that connects and stalls cannot hold a worker
+# thread open. Every byte rearms it, so it is not on its own a bound.
+Environment=ENROLL_CONNECTION_TIMEOUT_SECONDS=10
+# Ceiling on the whole connection, which is the bound: it stops a client that
+# dribbles bytes just fast enough to keep the idle timeout alive.
+Environment=ENROLL_CONNECTION_MAX_SECONDS=30
 EOF
     systemctl daemon-reload
     systemctl enable loam-enroll-signer.service

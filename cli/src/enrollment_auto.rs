@@ -19,6 +19,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 /// OID 2.5.4.3 `id-at-commonName`, as DER content bytes. Mirrors the reader.
 const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
@@ -48,12 +49,47 @@ pub enum EnrollmentFailure {
     BadToken,
     /// The signer could not be reached (DNS, connect, TLS, or empty reply).
     SignerUnreachable,
+    /// The signer was reachable but the exchange exceeded its deadline: the
+    /// connect, the TLS handshake, or a read/write stalled. Distinct from
+    /// [`EnrollmentFailure::SignerUnreachable`] because the operator response
+    /// differs — a wedged or overloaded signer is not a missing one — and
+    /// because the alternative is the silent hang this class of bug keeps
+    /// producing. `stage` names where the deadline expired.
+    SignerTimeout { stage: &'static str },
     /// The signer replied 2xx but the body is not one parseable certificate.
     MalformedSignerResponse,
     /// The machine has no git identity to name the CSR subject with.
     GitIdentityRequired,
     /// Local cryptography failed before the signer was contacted.
     LocalCrypto {
+        operation: &'static str,
+        detail: String,
+    },
+    /// The trust anchors for verifying the *signer's* certificate could not be
+    /// built. Nothing has been dialled: this is a local file or environment
+    /// problem, and reporting it as an unreachable signer sent operators to
+    /// look at DNS, firewalls, and the broker host instead of at
+    /// `SSL_CERT_FILE`. `source` names the rung that was in play.
+    TrustAnchorsUnresolved {
+        source: &'static str,
+        /// The `reason::CA_*` constant, plus the file it is about when the
+        /// rung named one.
+        detail: String,
+    },
+    /// The signer URL is not one this client can dial — not HTTPS, no host, or
+    /// a host TLS cannot name. A typo in `LOAM_FEDERATION_SIGNER` or in the
+    /// broker endpoint, never a network condition.
+    SignerUrlInvalid { detail: &'static str },
+    /// The local TLS client could not be built, or a socket option was
+    /// refused. A platform or build problem on *this* machine.
+    TlsSetupFailed {
+        operation: &'static str,
+        detail: String,
+    },
+    /// The machine's identity directory could not be resolved, or the issued
+    /// bundle could not be written to it. The certificate may already have
+    /// been signed: the signer did its job and the local disk did not.
+    IdentityStoreFailed {
         operation: &'static str,
         detail: String,
     },
@@ -64,16 +100,37 @@ impl EnrollmentFailure {
         match self {
             EnrollmentFailure::BadToken => "bad-token",
             EnrollmentFailure::SignerUnreachable => "signer-unreachable",
+            EnrollmentFailure::SignerTimeout { .. } => "signer-timeout",
             EnrollmentFailure::MalformedSignerResponse => "malformed-signer-response",
             EnrollmentFailure::GitIdentityRequired => "git-identity-required",
             EnrollmentFailure::LocalCrypto { .. } => "local-crypto-failure",
+            EnrollmentFailure::TrustAnchorsUnresolved { .. } => "trust-anchors-unresolved",
+            EnrollmentFailure::SignerUrlInvalid { .. } => "signer-url-invalid",
+            EnrollmentFailure::TlsSetupFailed { .. } => "tls-setup-failed",
+            EnrollmentFailure::IdentityStoreFailed { .. } => "identity-store-failed",
         }
     }
 
-    pub(crate) fn debug_detail(&self) -> Option<(&'static str, &str)> {
+    /// The one extra fact behind a code: which local step failed and what it
+    /// said. Printed in release builds, not only under `debug_assertions` —
+    /// the whole point is diagnosing the shipped binary an operator ran, which
+    /// is exactly the situation #94 was reported from. Every value here is one
+    /// of this module's own strings or a `Debug` of a crypto/IO error; no
+    /// token, key, or certificate byte reaches it.
+    pub fn detail(&self) -> Option<(&'static str, &str)> {
         match self {
-            EnrollmentFailure::LocalCrypto { operation, detail } => Some((*operation, detail)),
-            _ => None,
+            EnrollmentFailure::LocalCrypto { operation, detail }
+            | EnrollmentFailure::TlsSetupFailed { operation, detail }
+            | EnrollmentFailure::IdentityStoreFailed { operation, detail } => {
+                Some((*operation, detail))
+            }
+            EnrollmentFailure::TrustAnchorsUnresolved { source, detail } => Some((*source, detail)),
+            EnrollmentFailure::SignerUrlInvalid { detail } => Some(("signer-url", detail)),
+            EnrollmentFailure::SignerTimeout { stage } => Some(("timeout-stage", stage)),
+            EnrollmentFailure::BadToken
+            | EnrollmentFailure::SignerUnreachable
+            | EnrollmentFailure::MalformedSignerResponse
+            | EnrollmentFailure::GitIdentityRequired => None,
         }
     }
 }
@@ -339,6 +396,106 @@ fn pem_armor(label: &str, der: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Per-operation network deadline for the enrollment exchange: the TCP
+/// connect, and every read and write once connected. Ten seconds by default;
+/// `LOAM_ENROLL_TIMEOUT_SECONDS` (1..=300) raises it for a genuinely slow link
+/// and lets the regression tests prove the bound without waiting for it.
+///
+/// Without these the exchange had no bound at all: a signer that accepts the
+/// connection and then stalls — exactly the production wedge in #93 — hung
+/// enrollment forever with no output.
+fn enroll_timeout() -> Duration {
+    const DEFAULT_SECONDS: u64 = 10;
+    let seconds = std::env::var("LOAM_ENROLL_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| (1..=300).contains(seconds))
+        .unwrap_or(DEFAULT_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+/// A read/write deadline alone still admits a slow drip: each successful byte
+/// rearms it. This ceiling bounds the whole exchange, so the worst case is a
+/// small multiple of the per-operation deadline rather than the header and
+/// body size caps divided by one byte per timeout.
+fn exchange_deadline() -> Instant {
+    Instant::now() + enroll_timeout() * 3
+}
+
+fn is_timeout(error: &std::io::Error) -> bool {
+    // A socket read/write deadline surfaces as WouldBlock on Unix and TimedOut
+    // on Windows; `connect_timeout` reports TimedOut everywhere.
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Map a transport error to a refusal that says which of the two happened: a
+/// signer that is not there, or a signer that is there and not answering.
+fn transport_failure(stage: &'static str, error: &std::io::Error) -> EnrollmentFailure {
+    if is_timeout(error) {
+        EnrollmentFailure::SignerTimeout { stage }
+    } else {
+        EnrollmentFailure::SignerUnreachable
+    }
+}
+
+/// Connect to the signer, trying every resolved address, under both the
+/// per-attempt timeout and the whole-exchange `deadline`. Resolution failure
+/// is genuinely "no such signer", so it stays `SignerUnreachable`; running out
+/// of time is a timeout.
+///
+/// The deadline matters here and not only later: a host with an A and a AAAA
+/// record on a black-holed route costs two full per-attempt timeouts, and a
+/// wide round-robin record costs one each. Bounding only the reads would have
+/// left the connect phase proportional to how many addresses DNS returned,
+/// which is the hang this exists to remove. Each attempt is clamped to what is
+/// left, so the phase can never overrun the ceiling, and a slow-but-real
+/// connect cannot eat the whole budget before the exchange starts either.
+///
+/// `getaddrinfo` itself has no deadline in `std`, so the resolver's own is the
+/// only bound available for that step. That is a smaller exposure than an
+/// unbounded connect: a black-holed route hangs the connect indefinitely,
+/// whereas a resolver that never answers is already bounded by its own
+/// configuration.
+fn connect_to_signer(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<TcpStream, EnrollmentFailure> {
+    use std::net::ToSocketAddrs;
+
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    let timeout = enroll_timeout();
+    let mut timed_out = false;
+    for address in addresses {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // Sub-millisecond is treated as spent, not clamped to. A duration that
+        // rounds to zero in the platform `timeval` makes `connect_timeout`
+        // report `InvalidInput`, which is correctly not a timeout — so the
+        // phase would have ended as `SignerUnreachable` and told the operator
+        // the signer is not there, when what happened is that it ran out of
+        // time. Narrow window, wrong answer.
+        if remaining < Duration::from_millis(1) {
+            timed_out = true;
+            break;
+        }
+        match TcpStream::connect_timeout(&address, timeout.min(remaining)) {
+            Ok(stream) => return Ok(stream),
+            Err(error) if is_timeout(&error) => timed_out = true,
+            Err(_) => {}
+        }
+    }
+    Err(if timed_out {
+        EnrollmentFailure::SignerTimeout { stage: "connect" }
+    } else {
+        EnrollmentFailure::SignerUnreachable
+    })
+}
+
 /// POST `{password, csr}` to the signer and return the signed certificate PEM
 /// on success. A 401 is a [`EnrollmentFailure::BadToken`]; any transport
 /// failure is [`EnrollmentFailure::SignerUnreachable`]; a 2xx whose body is
@@ -353,18 +510,33 @@ pub fn request_signed_certificate(
     roots: &rustls::RootCertStore,
 ) -> Result<Vec<u8>, EnrollmentFailure> {
     let (host, port, path) = parse_url(url)?;
-    let mut tcp = TcpStream::connect((host.as_str(), port))
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    let deadline = exchange_deadline();
+    let mut tcp = connect_to_signer(&host, port, deadline)?;
     tcp.set_nodelay(true).ok();
+    // Armed before the TLS handshake, which `rustls::Stream` performs lazily
+    // on the first write, so the handshake is bounded too.
+    let timeout = enroll_timeout();
+    tcp.set_read_timeout(Some(timeout))
+        .and_then(|()| tcp.set_write_timeout(Some(timeout)))
+        .map_err(|error| EnrollmentFailure::TlsSetupFailed {
+            operation: "socket-deadlines",
+            detail: format!("{error}"),
+        })?;
 
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots.clone())
         .with_no_client_auth();
 
-    let server_name = rustls::pki_types::ServerName::try_from(host.clone())
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+    let server_name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| {
+        EnrollmentFailure::SignerUrlInvalid {
+            detail: "host-not-a-tls-server-name",
+        }
+    })?;
     let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+        .map_err(|error| EnrollmentFailure::TlsSetupFailed {
+            operation: "tls-client",
+            detail: format!("{error}"),
+        })?;
     let mut stream = rustls::Stream::new(&mut conn, &mut tcp); // needs tcp: &mut
 
     let request_body = format!(
@@ -376,12 +548,27 @@ pub fn request_signed_certificate(
         "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{request_body}",
         request_body.len()
     );
-    stream
+    // The TLS handshake happens here, on the first write, so a signer that
+    // accepts the connection and never completes the handshake fails as a
+    // `request` timeout rather than hanging.
+    //
+    // The body itself cannot drip: it is a few KiB against a socket send
+    // buffer of tens, so the kernel takes all of it in one go whether or not
+    // the peer ever reads. What can stretch is the handshake, whose flights
+    // each rearm the write timeout the same way a read is rearmed by every
+    // byte. Hence a check after rather than a manual write loop: there is no
+    // partial-write case to drive a loop with, and the check is what turns an
+    // overlong handshake into a typed timeout instead of a silently spent
+    // budget.
+    let write_result = stream
         .write_all(request.as_bytes())
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
-    stream
-        .flush()
-        .map_err(|_| EnrollmentFailure::SignerUnreachable)?;
+        .and_then(|()| stream.flush());
+    if let Err(error) = write_result {
+        return Err(transport_failure("request", &error));
+    }
+    if Instant::now() >= deadline {
+        return Err(EnrollmentFailure::SignerTimeout { stage: "request" });
+    }
 
     let mut response = Vec::new();
     // Read until the header/body separator is present. The body is read once we
@@ -395,11 +582,16 @@ pub fn request_signed_certificate(
         if response.len() > 1 << 16 {
             return Err(EnrollmentFailure::MalformedSignerResponse);
         }
+        if Instant::now() >= deadline {
+            return Err(EnrollmentFailure::SignerTimeout {
+                stage: "response-headers",
+            });
+        }
         let mut chunk = [0u8; 2048];
         let read = match stream.read(&mut chunk) {
             Ok(0) => break response.len(), // EOF before any separator
             Ok(read) => read,
-            Err(_) => return Err(EnrollmentFailure::SignerUnreachable),
+            Err(error) => return Err(transport_failure("response-headers", &error)),
         };
         response.extend_from_slice(&chunk[..read]);
     };
@@ -442,11 +634,16 @@ pub fn request_signed_certificate(
     }
     let mut response_body: Vec<u8> = response[body_start..].to_vec();
     while response_body.len() < content_length {
+        if Instant::now() >= deadline {
+            return Err(EnrollmentFailure::SignerTimeout {
+                stage: "response-body",
+            });
+        }
         let mut chunk = [0u8; 2048];
         let read = match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => read,
-            Err(_) => return Err(EnrollmentFailure::SignerUnreachable),
+            Err(error) => return Err(transport_failure("response-body", &error)),
         };
         response_body.extend_from_slice(&chunk[..read]);
     }
@@ -468,7 +665,9 @@ pub fn request_signed_certificate(
 fn parse_url(url: &str) -> Result<(String, u16, String), EnrollmentFailure> {
     let rest = url
         .strip_prefix("https://")
-        .ok_or(EnrollmentFailure::SignerUnreachable)?;
+        .ok_or(EnrollmentFailure::SignerUrlInvalid {
+            detail: "not-https",
+        })?;
     let (authority, path) = match rest.split_once('/') {
         Some((auth, path)) => (auth, format!("/{path}")),
         None => (rest, "/v1/enroll".to_owned()),
@@ -480,7 +679,9 @@ fn parse_url(url: &str) -> Result<(String, u16, String), EnrollmentFailure> {
         _ => (authority.to_owned(), 8443),
     };
     if host.is_empty() {
-        return Err(EnrollmentFailure::SignerUnreachable);
+        return Err(EnrollmentFailure::SignerUrlInvalid {
+            detail: "empty-host",
+        });
     }
     Ok((host, port, path))
 }
@@ -546,10 +747,113 @@ mod tests {
     }
 
     #[test]
-    fn local_crypto_failure_has_a_distinct_code_and_debug_detail() {
+    fn local_crypto_failure_has_a_distinct_code_and_detail() {
         let failure = local_crypto_failure("csr-sign", ring::error::Unspecified);
         assert_eq!(failure.code(), "local-crypto-failure");
-        assert_eq!(failure.debug_detail(), Some(("csr-sign", "Unspecified")));
+        assert_eq!(failure.detail(), Some(("csr-sign", "Unspecified")));
+    }
+
+    /// #94: the pre-network failures used to share `signer-unreachable` with
+    /// the network ones, so a local file or environment problem sent the
+    /// operator to look at the broker host. Each must be its own code, and
+    /// each must carry the fact that names the fix.
+    #[test]
+    fn every_local_failure_has_its_own_code_and_says_which_step_failed() {
+        let failures = [
+            EnrollmentFailure::TrustAnchorsUnresolved {
+                source: "ssl-cert-file",
+                detail: "ca-file-empty (/etc/ssl/nothing.pem)".to_owned(),
+            },
+            EnrollmentFailure::SignerUrlInvalid {
+                detail: "not-https",
+            },
+            EnrollmentFailure::TlsSetupFailed {
+                operation: "tls-client",
+                detail: "no provider".to_owned(),
+            },
+            EnrollmentFailure::IdentityStoreFailed {
+                operation: "store-bundle",
+                detail: "identity-required".to_owned(),
+            },
+            local_crypto_failure("csr-sign", ring::error::Unspecified),
+            EnrollmentFailure::SignerTimeout { stage: "connect" },
+        ];
+        let mut codes: Vec<&str> = failures.iter().map(EnrollmentFailure::code).collect();
+        let total = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(
+            codes.len(),
+            total,
+            "two local failures sharing a code is the #94 defect itself"
+        );
+        for failure in &failures {
+            assert_ne!(
+                failure.code(),
+                "signer-unreachable",
+                "a local failure must never claim the signer was unreachable: {failure:?}"
+            );
+            assert!(
+                failure.detail().is_some(),
+                "a code with no detail is the dead end #94 reported: {failure:?}"
+            );
+        }
+        // The network refusals stay as they are; they have nothing to add.
+        assert_eq!(EnrollmentFailure::SignerUnreachable.detail(), None);
+        assert_eq!(EnrollmentFailure::BadToken.detail(), None);
+    }
+
+    /// #106 review: the exchange ceiling has to bound the connect phase too.
+    /// Without the clamp each resolved address got a full per-attempt timeout
+    /// before the ceiling was consulted at all, so a host with an A and a AAAA
+    /// record on a black-holed route cost two of them, and a wide round-robin
+    /// record one each — the bound was proportional to what DNS returned.
+    ///
+    /// 192.0.2.1 is TEST-NET-1 (RFC 5737): reserved for documentation and
+    /// routed nowhere, so a connect to it stalls rather than being refused. A
+    /// network that does refuse it quickly makes this pass trivially rather
+    /// than flakily.
+    #[test]
+    fn the_connect_phase_cannot_outrun_the_exchange_deadline() {
+        // A deadline with nothing left must stop the phase, not open a fresh
+        // full-length attempt.
+        let started = Instant::now();
+        let failure = connect_to_signer("192.0.2.1", 8443, Instant::now())
+            .expect_err("a black-holed address cannot connect");
+        assert_eq!(
+            failure,
+            EnrollmentFailure::SignerTimeout { stage: "connect" }
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an exhausted deadline still spent {:?}",
+            started.elapsed()
+        );
+
+        // And a small remaining budget is honoured instead of being replaced
+        // by the full per-attempt timeout.
+        let started = Instant::now();
+        let _ = connect_to_signer("192.0.2.1", 8443, Instant::now() + Duration::from_secs(1));
+        assert!(
+            started.elapsed() < enroll_timeout(),
+            "a 1s budget spent {:?}; the attempt was not clamped to it",
+            started.elapsed()
+        );
+
+        // A nearly-spent budget must still say "ran out of time", never "not
+        // there". Clamping to a sub-millisecond duration risks the platform
+        // rounding it to zero, which `connect_timeout` reports as
+        // `InvalidInput` — correctly not a timeout, and so an answer that
+        // blames a signer which is present and merely slow.
+        assert_eq!(
+            connect_to_signer(
+                "192.0.2.1",
+                8443,
+                Instant::now() + Duration::from_micros(200)
+            )
+            .expect_err("a black-holed address cannot connect"),
+            EnrollmentFailure::SignerTimeout { stage: "connect" }
+        );
     }
 
     #[test]
