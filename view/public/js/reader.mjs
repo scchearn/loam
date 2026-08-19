@@ -182,9 +182,30 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
     doc.body.classList.remove('reader-open');
     article.replaceChildren();
     currentPath = null;
-    // Focus is restored only after the shell is interactive again.
-    invoker?.focus?.();
+    restoreFocus();
+  }
+
+  /**
+   * Hand the keyboard back to where it came from. Leaving Reader changes the
+   * route, and the view underneath re-renders on that change — which detaches
+   * the very node that opened Reader — so the control is found again by the
+   * hook it carries, and only then focused, one task after the route settles.
+   */
+  function restoreFocus() {
+    const target = invoker;
     invoker = null;
+    if (!target) return;
+    const hook = ['inspect', 'path'].map((name) => [name, target.dataset?.[name]]).find(([, value]) => value);
+    const settle = () => {
+      const live = target.isConnected
+        ? target
+        : hook && doc.querySelector(`[data-${hook[0]}="${CSS?.escape ? CSS.escape(hook[1]) : hook[1]}"]`);
+      (live ?? doc.querySelector('#workspace'))?.focus?.();
+    };
+    // A programmatic hash write delivers its hashchange as a task; this runs
+    // after it, so the re-rendered view is the one being focused into.
+    if (typeof win.setTimeout === 'function') win.setTimeout(settle, 0);
+    else settle();
   }
 
   async function loadDocument(path, fragment = '') {

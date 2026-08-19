@@ -82,6 +82,9 @@ function mount({ hash = '' } = {}) {
   return { dom, doc: dom.window.document, win: dom.window, reader, reads, refreshCount: () => refreshes };
 }
 
+/** Focus is restored one task after Back, so the re-rendered view is the target. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
 /** The Query palette and Inspector both announce an open through an event. */
 function announce(dom, detail, name = 'loam:open-reader') {
   dom.window.document.dispatchEvent(new dom.window.CustomEvent(name, { detail }));
@@ -247,6 +250,7 @@ describe('reader surface', () => {
 
     doc.querySelector('[data-reader-back]').click();
     assert.equal(shell.hasAttribute('inert'), false, 'Back must hand the shell back');
+    await settle();
     assert.equal(doc.activeElement, invoker, 'Back must restore focus to the control that opened Reader');
   });
 
@@ -265,6 +269,7 @@ describe('reader surface', () => {
     assert.equal(panel.classList.contains('is-open'), false, 'a full-screen Reader must not leave the Inspector floating above it');
 
     doc.querySelector('[data-reader-back]').click();
+    await settle();
     assert.equal(doc.activeElement, invoker, 'Back returns to the shell control, not to a control inside the closed panel');
   });
 
