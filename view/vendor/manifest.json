@@ -1,0 +1,44 @@
+{
+  "entries": [
+    {
+      "package": "marked",
+      "version": "18.0.6",
+      "upstreamUrl": "https://registry.npmjs.org/marked/-/marked-18.0.6.tgz",
+      "file": "view/vendor/marked/marked.esm.js",
+      "sha256": "35398f546525d5e79a8f2f8738635d3ecbd277618cba2ada874e9d27dc9e88f0",
+      "license": "view/vendor/marked/LICENSE"
+    },
+    {
+      "package": "dompurify",
+      "version": "3.4.12",
+      "upstreamUrl": "https://registry.npmjs.org/dompurify/-/dompurify-3.4.12.tgz",
+      "file": "view/vendor/dompurify/purify.es.mjs",
+      "sha256": "b51207de097d14ff9af93bb923d1a245d196a474cbbfdcfeda5e2166734715e1",
+      "license": "view/vendor/dompurify/LICENSE"
+    },
+    {
+      "package": "js-yaml",
+      "version": "5.2.1",
+      "upstreamUrl": "https://registry.npmjs.org/js-yaml/-/js-yaml-5.2.1.tgz",
+      "file": "view/vendor/js-yaml/js-yaml.esm.min.mjs",
+      "sha256": "5f13e3c58dcf9b3682f05bdc3d6927f356bd618da4cf4254674604fd17a8d84f",
+      "license": "view/vendor/js-yaml/LICENSE"
+    },
+    {
+      "package": "cytoscape",
+      "version": "3.34.0",
+      "upstreamUrl": "https://registry.npmjs.org/cytoscape/-/cytoscape-3.34.0.tgz",
+      "file": "view/vendor/cytoscape/cytoscape.esm.min.mjs",
+      "sha256": "6b366a8557116695ac8cfcccc998f36ffc8cef6135e12100db45fdb26f98f051",
+      "license": "view/vendor/cytoscape/LICENSE"
+    },
+    {
+      "package": "minisearch",
+      "version": "7.2.0",
+      "upstreamUrl": "https://registry.npmjs.org/minisearch/-/minisearch-7.2.0.tgz",
+      "file": "view/vendor/minisearch/index.js",
+      "sha256": "0393b3ba253b809d5e55707c7b0875ef9b518a296a006c6739b28876e154edb3",
+      "license": "view/vendor/minisearch/LICENSE"
+    }
+  ]
+}
