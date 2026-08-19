@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
 import {
@@ -75,8 +76,13 @@ test('hcom is a detection-only agent-messaging tool with no MCP lane', () => {
     assert.ok(recipe.label && recipe.command, `incomplete recipe: ${JSON.stringify(recipe)}`);
   }
   // Detection sites: the installer default, plus the documented override.
-  assert.deepEqual(hcom.tool.dirs('/home/u', {}), ['/home/u/.local/bin']);
-  assert.deepEqual(hcom.tool.dirs('/home/u', { HCOM_INSTALL_DIR: '/opt/h' }), ['/opt/h/bin', '/opt/h', '/home/u/.local/bin']);
+  // Joined, not string-built: the separator is the host's, on every platform.
+  const localBin = join('/home/u', '.local', 'bin');
+  assert.deepEqual(hcom.tool.dirs('/home/u', {}), [localBin]);
+  assert.deepEqual(
+    hcom.tool.dirs('/home/u', { HCOM_INSTALL_DIR: '/opt/h' }),
+    [join('/opt/h', 'bin'), '/opt/h', localBin],
+  );
 });
 
 test('isValidCatalogEntry rejects malformed entries', () => {
