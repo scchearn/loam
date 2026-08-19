@@ -1152,6 +1152,21 @@ code,
 
 .inspect-link:hover { color: var(--ink-primary); }
 
+/* WCAG 2.5.8: a standalone control needs a 24px target, and this type is set
+   small by design. A transparent overlay pays for the target without moving the
+   underline off the text or changing a single visible box. */
+.inspect-link { position: relative; }
+
+.inspect-link::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: 0;
+  left: 0;
+  height: 24px;
+  transform: translateY(-50%);
+}
+
 /* ---------- Empty state (an honest gap, never a blank panel) ---------- */
 
 .view-empty {
