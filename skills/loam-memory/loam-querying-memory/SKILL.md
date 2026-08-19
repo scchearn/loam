@@ -3,7 +3,7 @@ name: loam::querying-memory
 description: "Answer questions against existing memory (the wiki substrate). Use this whenever the user is asking what is happening in the project, directory, codebase, architecture, workflow, decisions, or current state and the wiki likely contains the answer, even if they do not explicitly mention the wiki. Also use it for summaries, comparisons, and reusable analyses grounded in current wiki pages. Routes authoritative goal-state questions to /loam::setting-goals. Not for surfacing unresolved gaps; use /loam::reviewing-memory for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.2.1"
+  version: "1.2.2"
   author: scchearn
   argument-hint: <question>
 ---
@@ -147,7 +147,7 @@ If modifying an existing page rather than creating a new analysis, adapt to that
 
 ### Refresh qmd after writes
 
-If you wrote to the wiki and qmd was ready, run `qmd update -c <collection> 2>/dev/null`. If refresh fails, report it but do not roll back wiki edits.
+If you wrote to the wiki and qmd was ready, run `qmd update -c <collection>` then `qmd embed -c <collection>`; report both outcomes separately. If either fails, report it but do not roll back wiki edits.
 
 ---
 

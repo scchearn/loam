@@ -3,7 +3,7 @@ name: loam::starting
 description: "Use when beginning or resuming a plan file, including mixed local and hcom-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
 allowed-tools: Read Write Edit Glob Grep Bash WebFetch
 metadata:
-  version: "2.5.0"
+  version: "2.6.1"
   author: scchearn
   argument-hint: plans/<slug>.md [T3 | T3,T5,T7 | T3-T7]
 ---
@@ -106,7 +106,7 @@ If no wiki exists, skip all wiki features and leave `Wiki updates: none` in hand
 
 If the plan contains `## Execution groups`, treat each wave as an ordering boundary. All tasks in an earlier wave must complete before later waves start. Without hcom, run tasks sequentially in listed order. With hcom available, tasks within the current wave may be dispatched concurrently when their dependencies are satisfied.
 
-Check whether `hcom` is available only when a current wave has more than one runnable task or when constraint labels require review/isolation. Keep this session as the hub.
+hcom availability comes from the `hcom:` line in the injected `## Workspace state` block (reuse contract in `loam::using`) — read it, do not probe for the binary. Consult it only when a current wave has more than one runnable task or when constraint labels require review/isolation. Keep this session as the hub.
 
 Constraint resolution:
 
@@ -351,13 +351,12 @@ Do not commit during the execution loop. Committing is handled separately. Your 
 
 ## Important rules
 
-- **Never skip verification.** Every task or delegated group must pass hub-run verification before being marked `[x]`.
-- **The hub owns verification.** `DONE:` and `APPROVED:` are handoff signals, not completion.
-- **Never work on a task whose dependencies are not `[x]`.** That includes `[>]` dependencies that still need re-running.
-- **Treat `[h]` as active external work.** Do not treat it like local `[~]`, and do not mark it `[x]` before hub verification.
-- **Respect the target set.** If a filter was given, do not execute tasks outside it.
+- **Never skip verification:** the hub must pass every task/group before `[x]`; `DONE:`/`APPROVED:` are handoff only.
+- **Dependencies:** work only when dependencies are `[x]`; `[>]` dependencies still need re-running.
+- **Delegation:** keep `[h]` active until hub verification; never treat it as local `[~]` or mark it `[x]` before verification.
+- **Target set:** if filtered, do not execute outside it.
 - **Never make destructive git operations** without explicit user instruction.
-- **If the plan is wrong, fix the plan.** Add or correct tasks, dependencies, or scope and log the change instead of silently working around it.
+- **If the plan is wrong:** fix tasks, dependencies, or scope and log the change; do not work around it.
 - **If memory (wiki substrate) exists, write back only durable, reusable findings.** Current repo state wins if memory is stale.
 - **YAML front matter is the only authoritative plan metadata.** Remove any legacy `updated_at` field or `## Plan summary` section when you edit the plan.
 - **Keep YAML front matter and `plans/INDEX.md` synchronized** on every plan edit. If task count changes, update `task_count` and the index `Tasks` column.

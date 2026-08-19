@@ -26,5 +26,6 @@ If any qmd command fails or returns stale results, treat qmd as degraded and ski
 
 If this skill wrote to memory (wiki substrate):
 
-1. Run `qmd update -c <collection> 2>/dev/null` to reindex changed files.
-2. If refresh fails, report it but do not roll back successful wiki edits.
+1. Run `qmd update -c <collection>` to reindex changed files; report its outcome.
+2. Run `qmd embed -c <collection>` after the update; report its outcome separately.
+3. If either command fails, report that failure but do not roll back successful wiki edits.

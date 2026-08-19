@@ -3,7 +3,7 @@ name: loam::syncing-code-graph
 description: "Reconcile the code graph in memory (wiki substrate) against the actual codebase. In --touched mode, re-summarizes only files a completed plan touched (cheap, post-plan gate). In --sweep mode, walks the whole repo and patches drift from out-of-band edits. Drift is accepted between gates; this skill is the only place the code graph is reconciled to the repo tree."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.7.0"
+  version: "1.7.1"
   author: scchearn
   argument-hint: <codebase root> [--touched <plan-path> | --sweep] [--ref <commit>]
 ---
@@ -177,7 +177,7 @@ Capture: nodes removed (count), nodes re-summarized (count), new files flagged f
 
 After either mode, apply `/loam::ingesting-codebase` Step 6: rebuild `code/_index.md` from every active ordinary code page, keep exactly one root `[[code/_index|Code graph]]` link, and remove direct root entries. Do this even when no nodes changed. Do not add individual code pages to root `index.md`.
 
-If qmd was ready and you wrote to the wiki, run `qmd update -c <collection> 2>/dev/null`. If refresh fails, report it but do not roll back wiki edits.
+If qmd was ready and you wrote to the wiki, run `qmd update -c <collection>` then `qmd embed -c <collection>`; report both outcomes separately. If either fails, report it but do not roll back wiki edits.
 
 ---
 

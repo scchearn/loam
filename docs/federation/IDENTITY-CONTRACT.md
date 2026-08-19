@@ -1,62 +1,94 @@
-# Identity contract (LOCKED — bigboss, 2026-08-09, email-based)
+# Client identity contract
 
-How a human principal is identified, and how the trustworthy display name is bound.
-Provisioning side (this deployment) issues the cert; the connector side (tula) reads
-identity from the CONNACK-authenticated cert. Same pattern as instance_id: the cert is
-authoritative, local config is only a consistency check.
+The client certificate is the identity presented to Mosquitto. Local Git
+configuration helps create or check that identity; it is not allowed to rewrite
+an already-issued certificate. The runtime reads the subject before opening the
+session, then the broker independently authenticates the same certificate; the
+certificate-derived values become session authority only after that acceptance.
 
-## The model
+## Identity model
 
-- **`principal_id` = git `user.email`.** It is the cert **CN**, the ACL principal
-  (broker `use_identity_as_username true` → username = CN = email), the dedup key, and
-  `data.from.principal_id`.
-- **display name = git `user.name`.** Carried so notifications read "from <name> did X"
-  instead of an email.
-- **Security: the display name is bound into the authenticated cert, never free-form
-  sender text.** Otherwise anyone could set their name to "Samuel Hearn" and spoof the
-  boss. It lives in the signed subject, so the broker-authenticated cert carries it.
+- `principal_id` is the Git `user.email` and the certificate subject CN.
+- The broker's `use_identity_as_username true` setting makes that CN the
+  authenticated MQTT username.
+- The display name is Git `user.name`, carried in the certificate's GN
+  (`givenName`) subject attribute. It is descriptive, not an authorization
+  field.
+- The current runtime uses the enrolled instance id as its local `agent_id`.
+- A second machine for the same person can share the same principal/CN while
+  using a different instance id and client certificate.
 
-## Cert subject (what `issue-client.sh <email> <instance> <name> [agent]` produces)
+The signed certificate binds the values that appear in messages. A caller cannot
+claim another principal or display name by putting text in an operation.
 
-```
+## Certificate subject
+
+[`pki/issue-client.sh`](../../deploy/mqtt-broker/pki/issue-client.sh) and the
+automatic enrollment CSR use this subject shape:
+
+```text
 subject = CN=<git_email>, emailAddress=<git_email>, GN=<git_user_name>
-subjectAltName = URI:urn:loam:instance:<instance_id>[, URI:urn:loam:agent:<agent_id>]
+subjectAltName = URI:urn:loam:instance:<instance_id>
 ```
 
-- **CN** — the email = `principal_id`. Broker username = CN.
-- **emailAddress** — the same email (conventional slot; redundant with CN by design).
-- **GN (givenName, OID 2.5.4.42)** — the display name. Chosen as a standard, openssl-
-  supported subject attribute that reliably round-trips in the signed subject. It is a
-  **carrier**, not a semantic given-name. **tula: if you'd prefer a different subject
-  attribute (e.g. a `displayName` OID), say so — it's a one-line `-subj` change; flagged
-  for your ack.**
-- SAN — instance/agent URNs (see INSTANCE-ID-CONTRACT.md).
+The optional manual `agent_id` argument may add a second
+`URI:urn:loam:agent:<agent_id>` SAN, but the current runtime does not need a
+separate agent id. The instance SAN remains the load-bearing machine identity;
+see [INSTANCE-ID-CONTRACT.md](INSTANCE-ID-CONTRACT.md).
 
-**GN-absent policy (agreed with tame):** a cert with no `GN` → `display_name` is empty,
-NOT a refusal — identity is the CN; the name is cosmetic + sanitized. `issue-client.sh`
-always sets GN (required arg), so this should not arise here, but the connector treats
-absent GN as empty display_name.
+- **CN** is the principal the broker authenticates.
+- **emailAddress** repeats the email in a conventional subject slot.
+- **GN** is the display name. A certificate without GN is valid and yields an
+  empty display name.
+- **SAN** carries the stable instance id.
 
-**Cert structure is standard X.509** — openssl-issued, DER subject in the standard
-issuer-then-subject order, CN/GN in the subject `Name`. tame reads the subject via a
-position-correct DER TLV walk (second `Name`, no x509 parser dep); this deployment keeps
-the structure standard, so that walk is stable.
+The signer copies the SAN from the machine's CSR. The machine generates the
+private key and never sends it to the signer.
 
-## Connector side (tula)
+## Connect-time checks
 
-- Read `principal_id` = cert **CN** (authenticated email). This settles C.10's principal
-  source: from the authenticated cert, not caller text, not the enrollment row alone
-  (the enrollment row's `principal_id` must equal the cert CN).
-- Add `display_name` to `data.from`, sourced from the **authenticated cert GN** — NEVER
-  from caller/transcript text. Render it through `sanitize_untrusted` (Slice D
-  injection-safety still applies to the name string).
-- **Connect-path consistency check:** read local git `user.email` + `user.name`; the
-  **email MUST equal the provisioned cert CN** (cert authoritative). A mismatch is a
-  typed refusal, never an override — same shape as the instance_id SAN check.
+Automatic enrollment requires a Git `user.email` because it must name the CSR.
+`user.name` is optional. After a certificate exists, the runtime:
 
-## Two-instance run (laptop + MacBook)
+1. reads the CN, GN, and instance SAN from the certificate it will present;
+2. checks the SAN instance id against the enrolled row;
+3. when a local Git email is configured, checks it against the certificate CN;
+4. uses the authenticated certificate subject to build the session identity.
 
-Both nodes are the SAME person ⇒ SAME email ⇒ SAME `principal_id` and SAME display name,
-differing ONLY by `instance_id`/`client-id`. This is exactly why the ACL scopes origin
-writes on `%c` (client-id = instance_id), not `%u` (= CN = shared email). The peer roster
-for the run lists the one email in `principals` and both bare instance ids in `origins`.
+A mismatch is refused. The runtime never changes Git configuration to make a
+mismatch disappear and never trusts a sender-supplied display name.
+
+## ACL relationship
+
+The broker uses `%u` for the certificate CN and `%c` for the MQTT client id.
+The CN authorizes the principal, while the bare instance id in `%c` prevents
+one of a person's machines from publishing under the other's origin. See
+[`acl`](../../deploy/mqtt-broker/acl) and
+[ROSTER-CONTRACT.md](ROSTER-CONTRACT.md).
+
+## Operator checks
+
+To inspect a manually issued certificate without exposing the private key:
+
+```sh
+openssl x509 -in /path/to/client.crt -noout -subject -ext subjectAltName
+```
+
+The CN should equal the Git email used for enrollment, and the SAN should carry
+the same instance id recorded by the enrollment. The certificate must chain to
+the organization CA configured as Mosquitto's `cafile`; the broker's public
+server certificate is a separate Let's Encrypt certificate.
+
+## Failure meanings
+
+| Failure | Meaning | Repair |
+| --- | --- | --- |
+| `git-identity-required` | Automatic enrollment has no usable Git email. | Set `git config user.email`; set `user.name` if a display name is wanted. |
+| `identity-mismatch` | The local Git email or certificate SAN disagrees with the enrollment. | Use the matching certificate/key and reconnect the intended workspace; do not edit the message identity. |
+| `certificate-malformed` / `key-format-unsupported` | The local PEM material cannot be loaded. | Restore a complete certificate and a supported private-key encoding. |
+| `key-cert-mismatch` | The certificate and private key are individually valid but do not belong together. | Replace the pair with the bundle from one enrollment. |
+| `connect_probe_failed` with `probe_authentication_failed` | The broker was reached but rejected the certificate identity. | Check the organization CA, certificate expiry/revocation, CN, and Mosquitto ACL. |
+
+The certificate proves who the session authenticated as. It does not prove that
+the session will remain online after `connect` returns; current liveness is a
+separate service and broker observation.
