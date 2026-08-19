@@ -3698,6 +3698,23 @@ impl ConnectError {
             ConnectError::RollbackIncomplete(_) => "rollback_incomplete",
         }
     }
+
+    /// What went wrong underneath the code, when there is anything to say. A
+    /// bare `connect_activation_failed` names the step that failed and nothing
+    /// else — not which manager command, not what the manager returned — which
+    /// made a first-run darwin failure an open-ended investigation instead of a
+    /// 30-second read (#128). The variants that carry a reason surface it; the
+    /// ones whose code is already the whole story stay silent.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            ConnectError::ActivationFailed(why) | ConnectError::RollbackIncomplete(why) => {
+                Some(why.as_str())
+            }
+            ConnectError::Probe(_)
+            | ConnectError::Registry(_)
+            | ConnectError::EnrollmentConflict => None,
+        }
+    }
 }
 
 fn capability_record(evidence: &CapabilityEvidence) -> crate::enrollment::CapabilityRecord {
@@ -5471,7 +5488,9 @@ mod connect_tests {
     use crate::enrollment::{
         PhysicalWorkspace, PlatformIdentity, ValidatedEnrollment, ValidatedRemote,
     };
-    use crate::service::{CommandRunner, ManagerCommand, ServiceContext, ServiceError};
+    use crate::service::{
+        CommandRunner, ManagerCommand, ManagerOutput, ServiceContext, ServiceError,
+    };
     use std::cell::RefCell;
 
     /// A recording service runner that can be made to fail when a command line
@@ -5520,7 +5539,7 @@ mod connect_tests {
     const DISABLE_MARK: &str = "disable";
 
     impl CommandRunner for FakeService {
-        fn run(&self, command: &ManagerCommand) -> Result<i32, ServiceError> {
+        fn run(&self, command: &ManagerCommand) -> Result<ManagerOutput, ServiceError> {
             let line = format!("{} {}", command.program, command.args.join(" "));
             self.recorded.borrow_mut().push(line.clone());
             if let Some(fail) = &self.fail_on {
@@ -5531,7 +5550,7 @@ mod connect_tests {
                     return Err(ServiceError::ManagerFailed { code: 1 });
                 }
             }
-            Ok(0)
+            Ok(ManagerOutput::ok())
         }
     }
 
@@ -5755,7 +5774,9 @@ mod lifecycle_tests {
     use crate::enrollment::{
         CapabilityRecord, PhysicalWorkspace, PlatformIdentity, ValidatedEnrollment, ValidatedRemote,
     };
-    use crate::service::{CommandRunner, ManagerCommand, ServiceContext, ServiceError};
+    use crate::service::{
+        CommandRunner, ManagerCommand, ManagerOutput, ServiceContext, ServiceError,
+    };
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
 
@@ -5784,16 +5805,13 @@ mod lifecycle_tests {
         }
     }
     impl CommandRunner for FakeService {
-        fn run(&self, command: &ManagerCommand) -> Result<i32, ServiceError> {
-            self.recorded.borrow_mut().push(format!(
-                "{} {}",
-                command.program,
-                command.args.join(" ")
-            ));
+        fn run(&self, command: &ManagerCommand) -> Result<ManagerOutput, ServiceError> {
+            let line = format!("{} {}", command.program, command.args.join(" "));
+            self.recorded.borrow_mut().push(line.clone());
             if self.fail_all {
                 return Err(ServiceError::ManagerFailed { code: 1 });
             }
-            Ok(0)
+            Ok(ManagerOutput::ok())
         }
     }
 

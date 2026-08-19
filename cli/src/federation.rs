@@ -900,26 +900,37 @@ fn orchestrate_cli(
         }
         Err(error) => {
             if json_output {
-                println!(
-                    "{}",
-                    Value::Object(vec![
-                        ("schema".into(), Value::Number("1".into())),
-                        ("status".into(), Value::String("error".into())),
-                        (
-                            "error".into(),
-                            Value::Object(vec![(
-                                "code".into(),
-                                Value::String(error.code().into())
-                            )]),
-                        ),
-                    ])
-                    .to_json()
-                );
+                println!("{}", connect_error_json(&error).to_json());
             } else {
-                eprintln!("federation connect: {}", error.code());
+                eprintln!("federation connect: {}", connect_error_line(&error));
             }
             connect_sysexit(&error)
         }
+    }
+}
+
+/// The `--json` failure envelope. The code is the stable contract; the detail is
+/// added only when the error carries one, so a consumer keying on `code` is
+/// unaffected while an operator reading the output finally gets the manager's
+/// own words (#128).
+fn connect_error_json(error: &crate::connector::ConnectError) -> Value {
+    let mut failure = vec![("code".into(), Value::String(error.code().into()))];
+    if let Some(detail) = error.detail() {
+        failure.push(("detail".into(), Value::String(detail.to_owned())));
+    }
+    Value::Object(vec![
+        ("schema".into(), Value::Number("1".into())),
+        ("status".into(), Value::String("error".into())),
+        ("error".into(), Value::Object(failure)),
+    ])
+}
+
+/// The same failure for a human. Without `--json` the detail was dropped too, so
+/// the terminal showed nothing but the opaque code.
+fn connect_error_line(error: &crate::connector::ConnectError) -> String {
+    match error.detail() {
+        Some(detail) => format!("{}: {detail}", error.code()),
+        None => error.code().to_owned(),
     }
 }
 
@@ -2837,5 +2848,52 @@ mod emit_tests {
     fn an_already_responded_outcome_is_a_typed_result_not_a_failure() {
         assert_eq!(EmitError::AlreadyResponded.sysexit(), 0);
         assert_eq!(EmitError::AlreadyResponded.code(), "already_responded");
+    }
+
+    // --- #128: an activation failure has to say what actually failed ---
+
+    #[test]
+    fn an_activation_failure_carries_the_managers_own_words_in_both_output_modes() {
+        use crate::connector::ConnectError;
+        // The shape the runtime now produces: the manager step that wedged, and
+        // what it was doing. Before this, `connect` printed the bare code and
+        // dropped every word of it — with or without --json.
+        let underlying = "service manager did not exit within 10s and was killed: \
+                          `launchctl kickstart gui/501/io.loam.connector`";
+        let error = ConnectError::ActivationFailed(underlying.to_owned());
+
+        let json = connect_error_json(&error).to_json();
+        assert!(
+            json.contains("connect_activation_failed"),
+            "the stable code must survive: {json}"
+        );
+        assert!(
+            json.contains("launchctl kickstart"),
+            "the underlying manager failure must reach --json output: {json}"
+        );
+
+        let line = connect_error_line(&error);
+        assert!(
+            line.starts_with("connect_activation_failed: "),
+            "the human line leads with the code: {line}"
+        );
+        assert!(
+            line.contains("launchctl kickstart"),
+            "the human line must carry the detail too — it was the mode with \
+             no detail at all: {line}"
+        );
+    }
+
+    #[test]
+    fn an_error_with_nothing_to_add_stays_a_bare_code() {
+        use crate::connector::ConnectError;
+        // A conflict's code IS the whole story; inventing a detail field for it
+        // would only add noise for consumers keying on `code`.
+        let error = ConnectError::EnrollmentConflict;
+        assert_eq!(connect_error_line(&error), "enrollment_conflict");
+        assert!(
+            !connect_error_json(&error).to_json().contains("detail"),
+            "no empty detail field is emitted"
+        );
     }
 }

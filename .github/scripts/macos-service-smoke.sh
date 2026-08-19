@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # Dormant-lifecycle service smoke (macOS/LaunchAgent).
 # Proves our rendered plist round-trips through real launchctl: install writes a
-# valid dormant plist, launchctl bootstraps and prints it, then bootout + our
-# uninstall remove it. RunAtLoad=false, so bootstrapping never starts it.
+# valid plist and loads nothing, our enable bootstraps it, and disable +
+# uninstall remove it.
+#
+# Dormancy here is a property of the lifecycle, not of RunAtLoad: the plist lives
+# under the global root rather than a launchd search path, so nothing reads it
+# until enable bootstraps it. The plist starts the job at load precisely so the
+# activation never calls `launchctl kickstart`, which waits out launchd's
+# ThrottleInterval when the started process exits within milliseconds — the 10s
+# wedge that made this leg red on every run (#124).
 set -euo pipefail
 BIN="${1:?path to loam binary required}"
 # Short root on purpose: the connector endpoint is a Unix socket and macOS
@@ -23,7 +30,13 @@ trap cleanup EXIT
 "$BIN" federation service install --global-root "$ROOT"
 test -f "$PLIST" || { echo "FAIL: plist not written"; exit 1; }
 plutil -lint "$PLIST" || { echo "FAIL: plist invalid"; exit 1; }
-grep -q "<key>RunAtLoad</key><false/>" "$PLIST" || { echo "FAIL: plist not dormant"; exit 1; }
+grep -q "<key>RunAtLoad</key><true/>" "$PLIST" || { echo "FAIL: plist does not start at load"; exit 1; }
+# The real dormancy check: install loaded nothing. A definition launchctl already
+# knows about here would mean install started the connector behind our back.
+if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+  echo "FAIL: install left a loaded job; the definition must stay dormant until enable"
+  exit 1
+fi
 test ! -f "$ROOT/loam.sqlite3" || { echo "FAIL: database created by install"; exit 1; }
 # Read-only status (the verb packaged setup delegates to for verification) must
 # not create a database or start anything; a dormant definition reports disabled.
@@ -74,6 +87,44 @@ if [ ! -S "$ROOT/run/connector.sock" ]; then
   launchctl print "$DOMAIN/$LABEL" 2>&1 | head -40 || true
   exit 1
 fi
+
+# --- the reload, observed (#131) ---
+# The unit tests can only assert the ORDER of the activation commands. Whether a
+# rewritten plist is actually re-read is a fact about real launchd, which
+# respawns from an in-memory job spec: an activation that only restarts the job
+# keeps executing the OLD definition, which is how a runtime update left the
+# plist, the ledger and verification all naming the new version while the
+# process ran the previous binary. A second enable against a live connector must
+# therefore replace the process, not reuse it.
+BEFORE_PID="$PID"
+"$BIN" federation service enable --global-root "$ROOT"
+RELOADED_PID=""
+for _ in $(seq 1 30); do
+  RELOADED_PID="$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*$/\1/p' | head -1)"
+  [ -n "$RELOADED_PID" ] && [ "$RELOADED_PID" != "$BEFORE_PID" ] && break
+  sleep 1
+done
+if [ -z "$RELOADED_PID" ]; then
+  echo "FAIL: no connector process after re-enabling a live connector"
+  launchctl print "$DOMAIN/$LABEL" 2>&1 | head -40 || true
+  exit 1
+fi
+if [ "$RELOADED_PID" = "$BEFORE_PID" ]; then
+  echo "FAIL: re-enable reused pid $BEFORE_PID — launchd kept its in-memory job spec"
+  echo "      a rewritten definition would not have been read; the activation is not a reload"
+  exit 1
+fi
+echo "reload observed: pid $BEFORE_PID replaced by $RELOADED_PID"
+# And the loaded job names the definition this activation bootstrapped, not some
+# earlier path launchd was still holding. Matched on the root-relative tail:
+# /tmp is a symlink to /private/tmp on macOS and launchd prints the resolved
+# path, so the absolute string never matches verbatim.
+launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -q "$(basename "$ROOT")/launchagents/$LABEL.plist" || {
+  echo "FAIL: the loaded job does not name the definition on disk ($PLIST)"
+  launchctl print "$DOMAIN/$LABEL" 2>&1 | head -40 || true
+  exit 1
+}
+PID="$RELOADED_PID"
 
 # Final disconnect equivalent: disable stops the agent and leaves nothing behind.
 "$BIN" federation service disable --global-root "$ROOT"
