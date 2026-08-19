@@ -679,7 +679,10 @@ fn auto_enroll(
     )
     .map_err(|failure| EnrollmentFailure::TrustAnchorsUnresolved {
         source: failure.source,
-        reason: failure.reason,
+        // The file, not only the fault: `ca-file-empty` does not say which
+        // `SSL_CERT_FILE` a shell had exported, and working that out is most
+        // of the debugging this refusal exists to save.
+        detail: failure.described(),
     })?;
     let certificate =
         crate::enrollment_auto::request_signed_certificate(&url, token, &csr_pem, &trust)?;

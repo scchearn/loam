@@ -206,18 +206,44 @@ const SSL_CERT_FILE: &str = "ssl-cert-file";
 /// One reason for every trust failure was the whole diagnosis an operator got,
 /// and "the CA did not resolve" does not say whether the path is wrong, the
 /// file is empty, or the contents are not certificates — three different fixes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustFailure {
     /// `ca-ref` or `ssl-cert-file` — the two rungs that read a file. The
     /// bundled rung is compiled in and cannot fail.
     pub source: &'static str,
     /// One of the `reason::CA_*` constants.
     pub reason: &'static str,
+    /// The file the rung named, when it named one. An operator debugging a
+    /// stale `SSL_CERT_FILE` should not have to reconstruct which file the
+    /// shell had exported — that reconstruction is most of the work.
+    pub path: Option<String>,
 }
 
 impl TrustFailure {
     fn new(source: &'static str, reason: &'static str) -> Self {
-        Self { source, reason }
+        Self {
+            source,
+            reason,
+            path: None,
+        }
+    }
+
+    fn at(source: &'static str, reason: &'static str, path: &str) -> Self {
+        Self {
+            source,
+            reason,
+            path: Some(path.to_owned()),
+        }
+    }
+
+    /// The reason together with the file it is about, for a diagnostic that
+    /// shows detail. `ca-file-empty` on its own does not say which file, and
+    /// finding that out is most of the debugging.
+    pub fn described(&self) -> String {
+        match &self.path {
+            Some(path) => format!("{} ({path})", self.reason),
+            None => self.reason.to_owned(),
+        }
     }
 
     /// The reason the *session-credential* surface reports.
@@ -226,8 +252,17 @@ impl TrustFailure {
     /// every trust failure since it existed, and the connector's reason strings
     /// are a tested IPC contract that does not move. So it keeps saying exactly
     /// that, deliberately and in one place. The specific [`TrustFailure::reason`]
-    /// is additive: it reaches the enrollment diagnostic, which is new, and
-    /// nothing else.
+    /// and [`TrustFailure::path`] are additive: they reach the enrollment
+    /// diagnostic, which is new, and nothing else.
+    ///
+    /// That means this surface names neither the fault nor the file, and that
+    /// is a constraint rather than an oversight: `SessionState::CredentialsUnresolved`
+    /// carries one `&'static str` and no detail channel, so saying more here
+    /// would mean either moving a pinned reason or widening that state — a
+    /// change this slice deliberately does not make. An operator who lands on
+    /// `ca-unresolved` gets the full diagnosis, path included, from
+    /// `federation connect`, which resolves the same anchors through the
+    /// enrollment path.
     pub fn credential_reason(&self) -> &'static str {
         reason::CA_UNRESOLVED
     }
@@ -239,12 +274,12 @@ fn read_trust_file(
     source: &'static str,
     path: &str,
 ) -> Result<rustls::RootCertStore, TrustFailure> {
-    let bytes =
-        std::fs::read(path).map_err(|_| TrustFailure::new(source, reason::CA_FILE_UNREADABLE))?;
+    let bytes = std::fs::read(path)
+        .map_err(|_| TrustFailure::at(source, reason::CA_FILE_UNREADABLE, path))?;
     if bytes.is_empty() {
-        return Err(TrustFailure::new(source, reason::CA_FILE_EMPTY));
+        return Err(TrustFailure::at(source, reason::CA_FILE_EMPTY, path));
     }
-    build_root_store(&bytes).map_err(|reason| TrustFailure::new(source, reason))
+    build_root_store(&bytes).map_err(|reason| TrustFailure::at(source, reason, path))
 }
 
 /// The no-`ca_ref` trust path: `SSL_CERT_FILE` first, then the bundled Mozilla
@@ -3173,22 +3208,18 @@ mod tests {
         // A named CA that resolves to nothing is a refusal, never a silent
         // downgrade to the bundle — that downgrade would turn a pinning
         // failure into a quietly wider trust decision.
+        let failure = resolve_trust_anchors(Some("/nonexistent/loam/ca.pem"), None).unwrap_err();
         assert_eq!(
-            resolve_trust_anchors(Some("/nonexistent/loam/ca.pem"), None).unwrap_err(),
-            TrustFailure {
-                source: "ca-ref",
-                reason: reason::CA_FILE_UNREADABLE
-            }
+            (failure.source, failure.reason),
+            ("ca-ref", reason::CA_FILE_UNREADABLE)
         );
 
         // A present-but-blank reference is malformed, not absent: reading it as
         // "no CA pinned" would turn a typo into a silently wider trust decision.
+        let failure = resolve_trust_anchors(Some("   "), None).unwrap_err();
         assert_eq!(
-            resolve_trust_anchors(Some("   "), None).unwrap_err(),
-            TrustFailure {
-                source: "ca-ref",
-                reason: reason::CA_REF_BLANK
-            }
+            (failure.source, failure.reason),
+            ("ca-ref", reason::CA_REF_BLANK)
         );
 
         // An empty trust file is not a trust store: it would build a root store
@@ -3196,24 +3227,20 @@ mod tests {
         // a resolved one.
         let empty = directory.join("empty.pem");
         std::fs::write(&empty, "").expect("empty trust file is writable");
+        let failure = resolve_trust_anchors(Some(&empty.to_string_lossy()), None).unwrap_err();
         assert_eq!(
-            resolve_trust_anchors(Some(&empty.to_string_lossy()), None).unwrap_err(),
-            TrustFailure {
-                source: "ca-ref",
-                reason: reason::CA_FILE_EMPTY
-            }
+            (failure.source, failure.reason),
+            ("ca-ref", reason::CA_FILE_EMPTY)
         );
 
         // Bytes that are not certificates: the path and the content are both
         // there, and neither is the problem the operator has.
         let junk = directory.join("junk.pem");
         std::fs::write(&junk, "not a certificate\n").expect("junk trust file is writable");
+        let failure = resolve_trust_anchors(Some(&junk.to_string_lossy()), None).unwrap_err();
         assert_eq!(
-            resolve_trust_anchors(Some(&junk.to_string_lossy()), None).unwrap_err(),
-            TrustFailure {
-                source: "ca-ref",
-                reason: reason::CA_NO_TRUSTED_CERTIFICATE
-            }
+            (failure.source, failure.reason),
+            ("ca-ref", reason::CA_NO_TRUSTED_CERTIFICATE)
         );
 
         // The same three faults on the SSL_CERT_FILE rung report that rung.
@@ -3227,12 +3254,17 @@ mod tests {
                 reason::CA_NO_TRUSTED_CERTIFICATE,
             ),
         ] {
+            let failure = resolve_trust_anchors(None, Some(path)).unwrap_err();
             assert_eq!(
-                resolve_trust_anchors(None, Some(path)).unwrap_err(),
-                TrustFailure {
-                    source: "ssl-cert-file",
-                    reason: expected
-                }
+                (failure.source, failure.reason),
+                ("ssl-cert-file", expected)
+            );
+            // The detail has to say which file, not only that a file failed.
+            assert_eq!(failure.path.as_deref(), Some(path));
+            assert!(
+                failure.described().contains(path),
+                "{}",
+                failure.described()
             );
         }
 
@@ -3240,14 +3272,12 @@ mod tests {
         // reporting the one reason it has always reported. The new ones are
         // additive, for the enrollment diagnostic, and do not move this.
         for failure in [
-            TrustFailure {
-                source: "ca-ref",
-                reason: reason::CA_REF_BLANK,
-            },
-            TrustFailure {
-                source: "ssl-cert-file",
-                reason: reason::CA_NO_TRUSTED_CERTIFICATE,
-            },
+            TrustFailure::new("ca-ref", reason::CA_REF_BLANK),
+            TrustFailure::at(
+                "ssl-cert-file",
+                reason::CA_NO_TRUSTED_CERTIFICATE,
+                "/tmp/x.pem",
+            ),
         ] {
             assert_eq!(failure.credential_reason(), reason::CA_UNRESOLVED);
         }

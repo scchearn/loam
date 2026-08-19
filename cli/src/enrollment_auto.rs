@@ -72,7 +72,9 @@ pub enum EnrollmentFailure {
     /// `SSL_CERT_FILE`. `source` names the rung that was in play.
     TrustAnchorsUnresolved {
         source: &'static str,
-        reason: &'static str,
+        /// The `reason::CA_*` constant, plus the file it is about when the
+        /// rung named one.
+        detail: String,
     },
     /// The signer URL is not one this client can dial — not HTTPS, no host, or
     /// a host TLS cannot name. A typo in `LOAM_FEDERATION_SIGNER` or in the
@@ -122,7 +124,7 @@ impl EnrollmentFailure {
             | EnrollmentFailure::IdentityStoreFailed { operation, detail } => {
                 Some((*operation, detail))
             }
-            EnrollmentFailure::TrustAnchorsUnresolved { source, reason } => Some((*source, reason)),
+            EnrollmentFailure::TrustAnchorsUnresolved { source, detail } => Some((*source, detail)),
             EnrollmentFailure::SignerUrlInvalid { detail } => Some(("signer-url", detail)),
             EnrollmentFailure::SignerTimeout { stage } => Some(("timeout-stage", stage)),
             EnrollmentFailure::BadToken
@@ -760,7 +762,7 @@ mod tests {
         let failures = [
             EnrollmentFailure::TrustAnchorsUnresolved {
                 source: "ssl-cert-file",
-                reason: "ca-unresolved",
+                detail: "ca-file-empty (/etc/ssl/nothing.pem)".to_owned(),
             },
             EnrollmentFailure::SignerUrlInvalid {
                 detail: "not-https",

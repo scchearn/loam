@@ -621,11 +621,14 @@ fn an_unusable_ssl_cert_file_names_the_trust_store_not_the_signer() {
             !stdout.contains("signer-unreachable"),
             "a local trust-store failure must not read as a network one: {stdout}"
         );
-        // The detail names the rung that answered and what was wrong with it,
-        // which together are the whole fix instruction.
+        // The detail names the rung that answered, what was wrong with it,
+        // and which file — together the whole fix instruction. Without the
+        // file the operator still has to work out which `SSL_CERT_FILE` a
+        // shell had exported, which is most of the debugging.
+        let named = path.to_str().unwrap();
         assert!(
-            stdout.contains("ssl-cert-file") && stdout.contains(expected),
-            "the detail must name the rung and `{expected}`: {stdout}"
+            stdout.contains("ssl-cert-file") && stdout.contains(expected) && stdout.contains(named),
+            "the detail must name the rung, `{expected}`, and `{named}`: {stdout}"
         );
     }
     let _ = std::fs::remove_dir_all(&root);
