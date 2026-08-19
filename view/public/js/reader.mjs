@@ -194,13 +194,17 @@ export function initReader({ root = document, getSnapshot = () => null, refreshS
   function restoreFocus() {
     const target = invoker;
     invoker = null;
-    if (!target) return;
-    const hook = ['inspect', 'path'].map((name) => [name, target.dataset?.[name]]).find(([, value]) => value);
+    const hook = ['inspect', 'path'].map((name) => [name, target?.dataset?.[name]]).find(([, value]) => value);
     const settle = () => {
-      const live = target.isConnected
+      const workspace = doc.querySelector('#workspace');
+      const live = target?.isConnected
         ? target
         : hook && doc.querySelector(`[data-${hook[0]}="${CSS?.escape ? CSS.escape(hook[1]) : hook[1]}"]`);
-      (live ?? doc.querySelector('#workspace'))?.focus?.();
+      (live ?? workspace)?.focus?.();
+      // A control the re-render replaced without leaving a hook, or one sitting
+      // inside a dialog that has since closed, refuses focus silently. The
+      // keyboard must never be stranded on <body> after leaving Reader.
+      if (!doc.activeElement || doc.activeElement === doc.body) workspace?.focus?.();
     };
     // A programmatic hash write delivers its hashchange as a task; this runs
     // after it, so the re-rendered view is the one being focused into.

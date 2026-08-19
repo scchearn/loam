@@ -254,6 +254,22 @@ describe('reader surface', () => {
     assert.equal(doc.activeElement, invoker, 'Back must restore focus to the control that opened Reader');
   });
 
+  it('falls back to the workspace region when the opener can no longer take focus', async () => {
+    const { dom, doc } = mount({ hash: '#/pulse' });
+    const invoker = doc.querySelector('[data-refresh]');
+    invoker.focus();
+
+    await announce(dom, { path: 'wiki/alpha.md' });
+    // The opener is gone by the time Back runs — a re-render dropped it, or it
+    // lived in a dialog that has since closed.
+    invoker.remove();
+
+    doc.querySelector('[data-reader-back]').click();
+    await settle();
+    assert.notEqual(doc.activeElement, doc.body, 'the keyboard must never be stranded on <body>');
+    assert.equal(doc.activeElement, doc.querySelector('#workspace'));
+  });
+
   it('closes the Inspector it was opened from and returns the keyboard to the shell', async () => {
     const { dom, doc } = mount({ hash: '#/atlas' });
     const { initInspector, openInspector } = await import('../public/js/inspector.mjs');
