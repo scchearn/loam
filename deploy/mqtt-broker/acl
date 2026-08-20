@@ -17,13 +17,26 @@ pattern read loam/v1/${ORG_ID}/+/state/+/#
 # ---- Reads: a client reads only its OWN inbox (principal by %u, instance by %c) ----
 pattern read loam/v1/${ORG_ID}/+/inbox/principal/%u/#
 pattern read loam/v1/${ORG_ID}/+/inbox/instance/%c/#
-# (agent-addressed inbox confidentiality, if used, is enforced by per-principal
-#  `user <principal>` blocks appended at provisioning — not a broad pattern.)
+# Agent-addressed inbox: dumb pipe, org is the trust boundary, so an org-wide
+# `+` on the agent segment is correct (matches the project `+` wildcard). Per-frame
+# principal/agent checks in the connector bound actual delivery, not the ACL.
+pattern read loam/v1/${ORG_ID}/+/inbox/agent/+/#
+
+# ---- Reads: project membership + org-wide member cards ----
+# Project membership: the retained roster payload the connector caches locally.
+pattern read loam/v1/${ORG_ID}/+/membership
+# Member cards are org-scoped (no project segment): every member's retained card,
+# from which each connector assembles its per-project roster and sees org-wide
+# project-sharing. One filter covers every project a machine is in.
+pattern read loam/v1/${ORG_ID}/members/+
 
 # ---- Writes: ONLY under the client's own origin (%c = its instance_id) ----
 pattern write loam/v1/${ORG_ID}/+/event/%c
 pattern write loam/v1/${ORG_ID}/+/state/%c/#
 pattern write loam/v1/${ORG_ID}/+/inbox/+/+/%c/#
+# Own member card, retained, org-scoped: %c = this instance_id, so an instance
+# can only publish its own card (member_topic: members/{instance_id}).
+pattern write loam/v1/${ORG_ID}/members/%c
 
 # Per-project tightening (optional hardening): provisioning MAY append
 # `user <principal_id>` blocks that restrict the `+` project wildcard above to the
