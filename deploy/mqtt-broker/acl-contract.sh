@@ -27,7 +27,8 @@
 # (c) the member-card write FAIL by design — a peer change adds those grants.
 # Do not weaken this test to match the current ACL.
 #
-# Requires: mosquitto, mosquitto_pub, mosquitto_sub, envsubst.
+# Requires: mosquitto, mosquitto_pub, mosquitto_sub, mosquitto_passwd, envsubst,
+#           python3, timeout.
 #
 # subcommands:
 #   selfcheck   render ./acl and run the full contract (throwaway broker)
@@ -51,7 +52,9 @@ fail() { echo "  FAIL: $*"; FAILED=1; }
 
 # --- broker lifecycle --------------------------------------------------------
 start_broker() {
-  DIR="$(mktemp -d)"
+  DIR="$(mktemp -d)"; BROKER=""
+  # arm cleanup BEFORE any early exit so a failed broker start never leaks $DIR.
+  trap stop_broker EXIT
   # Render the production ACL (only ${ORG_ID} is substituted; %u/%c are mosquitto's).
   ORG_ID="$ORG" envsubst '${ORG_ID}' < "$ACL_SRC" > "$DIR/acl"
   # TEST SCAFFOLDING (never shipped). The ACL header documents that provisioning
@@ -127,10 +130,11 @@ expect_write_denied() { # label user clientid topic
 }
 
 selfcheck() {
-  command -v mosquitto >/dev/null && command -v mosquitto_sub >/dev/null \
-    && command -v envsubst >/dev/null || { echo "acl-contract: needs mosquitto + envsubst"; exit 2; }
-  start_broker
-  trap stop_broker EXIT
+  local dep
+  for dep in mosquitto mosquitto_pub mosquitto_sub mosquitto_passwd envsubst python3 timeout; do
+    command -v "$dep" >/dev/null || { echo "acl-contract: needs $dep (requires: mosquitto mosquitto_pub mosquitto_sub mosquitto_passwd envsubst python3 timeout)"; exit 2; }
+  done
+  start_broker                        # arms the stop_broker EXIT trap itself
   local B="loam/v1/$ORG/$PROJ"        # org+project root
   local M="loam/v1/$ORG/members"      # org-scoped member-card root
 
