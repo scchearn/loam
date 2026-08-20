@@ -4,12 +4,13 @@ This directory contains the production Mosquitto broker, its TLS/PKI material,
 the enrollment signer, and the operational checks used by Loam federation. It
 is separate from the temporary broker fixtures under `cli/tests/`.
 
-> **HARD STOP — do not deploy or enable this production broker yet.** The
-> checked-in ACL is incompatible with the current connector. See the
-> [federation hard-stop warning](../../docs/federation/README.md#production-broker-hard-stop)
-> for the missing live-transport grants and the cross-project denial blocker.
+The checked-in ACL grants every live surface the connector needs, proven by
+[`acl-contract.sh`](acl-contract.sh); the broker is a dumb pipe scoped to one
+organization. See the [production broker status](../../docs/federation/README.md#production-broker-status)
+for the settled trust model and the one remaining operational caveat (the
+automated `provision` stage).
 
-When the blocker is cleared, read
+Read
 [`docs/federation/BROKER-SETUP.md`](../../docs/federation/BROKER-SETUP.md).
 This page is the concise reference for the files and trust model. The intended
 host procedure is [RUNBOOK.md](RUNBOOK.md); the evidence checklist is
