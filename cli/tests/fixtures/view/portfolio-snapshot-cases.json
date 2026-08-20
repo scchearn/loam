@@ -1,0 +1,88 @@
+{
+  "schema": "loam.view.portfolio-fixtures/v1",
+  "read_fields": [
+    "counts",
+    "status",
+    "title",
+    "updated_at",
+    "next_action"
+  ],
+  "body_fields_forbidden": true,
+  "cases": [
+    {
+      "id": "linux",
+      "platform": "linux",
+      "snapshots": [
+        {
+          "path_key": "/home/agent/repos/alpha",
+          "path_display": "/home/agent/repos/alpha",
+          "state": "enrolled",
+          "counts": { "goals": 2, "specs": 1, "plans": 1, "checkpoints": 0 },
+          "items": [
+            {
+              "status": "active",
+              "title": "Ship the view",
+              "updated_at": "2026-08-19T08:00:00Z",
+              "next_action": "continue the active plan"
+            }
+          ]
+        },
+        {
+          "path_key": "/home/agent/worktrees/alpha-view",
+          "path_display": "/home/agent/worktrees/alpha-view",
+          "state": "discovered",
+          "counts": { "goals": 0, "specs": 0, "plans": 1, "checkpoints": 1 },
+          "items": []
+        },
+        {
+          "path_key": "/home/agent/repos/missing",
+          "path_display": "/home/agent/repos/missing",
+          "state": "missing",
+          "counts": null,
+          "items": [],
+          "next_action": "restore path, or remove the enrollment"
+        }
+      ]
+    },
+    {
+      "id": "macos",
+      "platform": "macos",
+      "snapshots": [
+        {
+          "path_key": "/Users/agent/Repos/alpha",
+          "path_display": "/Users/agent/Repos/alpha",
+          "state": "enrolled",
+          "counts": { "goals": 2, "specs": 1, "plans": 1, "checkpoints": 0 },
+          "items": [
+            {
+              "status": "active",
+              "title": "Ship the view",
+              "updated_at": "2026-08-19T08:00:00Z",
+              "next_action": "continue the active plan"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "windows",
+      "platform": "windows",
+      "snapshots": [
+        {
+          "path_key": "C:/Users/agent/Repos/alpha",
+          "path_display": "C:\\Users\\agent\\Repos\\alpha",
+          "state": "enrolled",
+          "counts": { "goals": 2, "specs": 1, "plans": 1, "checkpoints": 0 },
+          "items": [
+            {
+              "status": "active",
+              "title": "Ship the view",
+              "updated_at": "2026-08-19T08:00:00Z",
+              "next_action": "continue the active plan"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
