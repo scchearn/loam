@@ -67,7 +67,7 @@ dryrun() {
   # production ACL (own tmp dirs — no host mutation, so it belongs in dryrun).
   # It needs a mosquitto toolchain; if any tool is missing we SKIP it EXPLICITLY
   # (never a silent pass) rather than red the off-host gate on a test-only dep.
-  local c acl_deps=1
+  local c acl_deps=1 acl_skipped=0
   for c in mosquitto mosquitto_pub mosquitto_sub mosquitto_passwd envsubst python3 timeout; do
     command -v "$c" >/dev/null 2>&1 || acl_deps=0
   done
@@ -75,8 +75,15 @@ dryrun() {
     "$HERE/acl-contract.sh" selfcheck >/dev/null 2>&1 || { echo "selfcheck: acl-contract"; ok=0; }
   else
     echo "SKIP: acl-contract selfcheck (missing mosquitto toolchain — install mosquitto + clients to run it)"
+    acl_skipped=1
   fi
-  [ "$ok" -eq 1 ] && { echo "DRYRUN GREEN"; return 0; } || { echo "DRYRUN RED"; return 1; }
+  # Tag the summary when a test-only dep forced a skip so CI can tell a fully
+  # green gate from one that couldn't run the ACL contract (still never RED).
+  if [ "$ok" -eq 1 ]; then
+    [ "$acl_skipped" -eq 1 ] && echo "DRYRUN GREEN (SKIPPED: acl-contract)" || echo "DRYRUN GREEN"
+    return 0
+  fi
+  echo "DRYRUN RED"; return 1
 }
 
 # ---------------------------------------------------------------------------
