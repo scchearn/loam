@@ -127,6 +127,47 @@ test('runtime installation verifies, smoke-tests, and atomically publishes stage
   if (process.platform !== 'win32') assert.notEqual((await stat(destination)).mode & 0o111, 0);
 });
 
+test('runtime smoke retries a transient spawn lock (Windows AV) then publishes', async () => {
+  const release = await releaseFixture();
+  const globalRoot = await rootFixture();
+  let smokeCalls = 0;
+  const result = await installRuntime({
+    configDir: globalRoot,
+    version: '0.9.1',
+    target,
+    releaseBaseUrl: release.url,
+    // First two spawns fail like an antivirus file-lock race (no exit code,
+    // EPERM), then the binary runs. The install must survive the transient race.
+    smokeRunner: async () => {
+      smokeCalls += 1;
+      if (smokeCalls <= 2) return { code: null, category: 'runtime_error', stdout: '', stderr: 'spawn EPERM' };
+      return { code: 0, stdout: '{"exists":false}', stderr: '' };
+    },
+  });
+  assert.equal(result.published, true);
+  assert.equal(smokeCalls, 3);
+});
+
+test('runtime smoke still fails when a spawn lock never clears', async () => {
+  const release = await releaseFixture();
+  const globalRoot = await rootFixture();
+  let smokeCalls = 0;
+  await assert.rejects(
+    () => installRuntime({
+      configDir: globalRoot,
+      version: '0.9.1',
+      target,
+      releaseBaseUrl: release.url,
+      smokeRunner: async () => {
+        smokeCalls += 1;
+        return { code: null, category: 'runtime_error', stdout: '', stderr: 'spawn EPERM' };
+      },
+    }),
+    /runtime smoke failed: spawn EPERM/,
+  );
+  assert.ok(smokeCalls > 1, 'a persistent lock should be retried before failing');
+});
+
 test('runtime downloads follow bounded HTTP redirects', async () => {
   const release = await releaseFixture();
   const server = createServer(async (request, response) => {
