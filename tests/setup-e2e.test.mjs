@@ -79,6 +79,21 @@ function outputCapture() {
 async function baseFixture() {
   const home = await mkdtemp(join(tmpdir(), 'loam-setup-home-'));
   pinConfigDir(home);
+  const env = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    LOCALAPPDATA: join(home, 'AppData', 'Local'),
+    APPDATA: join(home, 'AppData', 'Roaming'),
+  };
+  let userPath = '';
+  const pathRunner = async ({ action, entry }) => {
+    if (action === 'read') return { code: 0, stdout: userPath };
+    const delimiter = process.platform === 'win32' ? ';' : ':';
+    if (action === 'add') userPath = [userPath, entry].filter(Boolean).join(delimiter);
+    if (action === 'remove') userPath = userPath.split(delimiter).filter((part) => part !== entry).join(delimiter);
+    return { code: 0, stdout: '' };
+  };
   const workspace = await mkdtemp(join(tmpdir(), 'loam-setup-workspace-'));
   const release = await releaseFixture();
   const list = await fullList();
@@ -100,6 +115,8 @@ async function baseFixture() {
   return {
     home,
     workspace,
+    env,
+    pathRunner,
     release,
     releaseBaseUrl: release.url,
     runner,
@@ -717,20 +734,7 @@ test('failed later setup stages preserve the active integration and metadata', a
 
 async function readyHarnessFixture() {
   const fixture = await baseFixture();
-  const env = {
-    ...process.env,
-    HOME: fixture.home,
-    USERPROFILE: fixture.home,
-    LOCALAPPDATA: join(fixture.home, 'AppData', 'Local'),
-    APPDATA: join(fixture.home, 'AppData', 'Roaming'),
-  };
-  let userPath = '';
-  const pathRunner = async ({ action, entry }) => {
-    if (action === 'read') return { code: 0, stdout: userPath };
-    if (action === 'add') userPath = [userPath, entry].filter(Boolean).join(process.platform === 'win32' ? ';' : ':');
-    if (action === 'remove') userPath = userPath.split(process.platform === 'win32' ? ';' : ':').filter((part) => part !== entry).join(process.platform === 'win32' ? ';' : ':');
-    return { code: 0, stdout: '' };
-  };
+  const { env, pathRunner } = fixture;
   await mkdir(join(fixture.home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(fixture.home, '.claude'), { recursive: true });
   await mkdir(join(fixture.home, '.cursor'), { recursive: true });
@@ -772,7 +776,7 @@ async function readyHarnessFixture() {
     runner: fixture.runner,
     env,
   });
-  return { fixture: { ...fixture, env, pathRunner }, discovery };
+  return { fixture, discovery };
 }
 
 test('harness readiness ignores hook paths outside the setup-owned root', async () => {
