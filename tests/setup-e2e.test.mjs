@@ -17,6 +17,7 @@ import { verifyInstallation } from '../setup/verify.mjs';
 import { detectTarget, runtimePath } from '../setup/target.mjs';
 import { uninstall } from '../setup/uninstall.mjs';
 import { runDoctor } from '../setup/doctor.mjs';
+import { shimLocations } from '../setup/shim.mjs';
 import { federationDefinitionPath } from '../setup/federation.mjs';
 import { ledgerPath } from '../integration/ledger.mjs';
 
@@ -78,6 +79,21 @@ function outputCapture() {
 async function baseFixture() {
   const home = await mkdtemp(join(tmpdir(), 'loam-setup-home-'));
   pinConfigDir(home);
+  const env = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    LOCALAPPDATA: join(home, 'AppData', 'Local'),
+    APPDATA: join(home, 'AppData', 'Roaming'),
+  };
+  let userPath = '';
+  const pathRunner = async ({ action, entry }) => {
+    if (action === 'read') return { code: 0, stdout: userPath };
+    const delimiter = process.platform === 'win32' ? ';' : ':';
+    if (action === 'add') userPath = [userPath, entry].filter(Boolean).join(delimiter);
+    if (action === 'remove') userPath = userPath.split(delimiter).filter((part) => part !== entry).join(delimiter);
+    return { code: 0, stdout: '' };
+  };
   const workspace = await mkdtemp(join(tmpdir(), 'loam-setup-workspace-'));
   const release = await releaseFixture();
   const list = await fullList();
@@ -99,6 +115,8 @@ async function baseFixture() {
   return {
     home,
     workspace,
+    env,
+    pathRunner,
     release,
     releaseBaseUrl: release.url,
     runner,
@@ -716,6 +734,7 @@ test('failed later setup stages preserve the active integration and metadata', a
 
 async function readyHarnessFixture() {
   const fixture = await baseFixture();
+  const { env, pathRunner } = fixture;
   await mkdir(join(fixture.home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(fixture.home, '.claude'), { recursive: true });
   await mkdir(join(fixture.home, '.cursor'), { recursive: true });
@@ -733,12 +752,29 @@ async function readyHarnessFixture() {
     }
     return { code: 0, stdout: '', stderr: '' };
   };
-  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, runner, output: outputCapture().output });
+  const setupOutput = outputCapture();
+  const setupCode = await runSetup(parseArgs(['install', '--yes']), {
+    ...fixture,
+    packageRoot,
+    runner,
+    env,
+    pathRunner,
+    output: setupOutput.output,
+    errorOutput: setupOutput.output,
+  });
+  assert.equal(setupCode, 0, setupOutput.text());
+  const settings = JSON.parse(await readFile(join(fixture.home, '.claude', 'settings.json'), 'utf8'));
+  assert.ok(settings.hooks, 'a ready Claude install must preserve its hooks object');
+  if (process.platform === 'win32') {
+    const locations = shimLocations({ home: fixture.home, env, platform: 'win32' });
+    await readFile(locations.shimPath);
+  }
   const discovery = await discover({
     home: fixture.home,
     workspace: fixture.workspace,
     packageRoot,
     runner: fixture.runner,
+    env,
   });
   return { fixture, discovery };
 }
