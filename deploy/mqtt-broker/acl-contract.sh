@@ -175,9 +175,12 @@ selfcheck() {
   grep -q OWN_CARD <<<"$(conn_recv "$M/+")" \
     || fail "member-card read: own card not delivered on '$M/+'"                   # post-fix grant
 
-  echo "== (d) foreign-ORGANISATION read AND write are denied =="
+  echo "== (d) foreign-ORGANISATION read AND write are denied; own-origin write scoping =="
   expect_empty        "foreign read"  "loam/v1/$FOREIGN_ORG/+/event/+"
   expect_write_denied "foreign write" "$CONN_PRIN" "$CONN_INST" "loam/v1/$FOREIGN_ORG/$PROJ/event/$CONN_INST"
+  # same-ORG cross-origin: writes are bound to the writer's own %c, so the
+  # connector may not write into a peer's origin topic — proves origin isolation.
+  expect_write_denied "cross-origin write" "$CONN_PRIN" "$CONN_INST" "$B/event/$PEER_INST"
 
   if [ "$FAILED" -eq 0 ]; then echo "ACL CONTRACT PASS"; else echo "ACL CONTRACT FAIL"; return 1; fi
 }
