@@ -5,20 +5,22 @@ federation clients. It is intentionally separate from the newcomer walkthrough:
 `BROKER-SETUP.md` explains how to perform the work; this page says what must be
 observed afterward.
 
-## Current blockers
+## Trust model (settled)
 
-The following requirements are **currently unmet and blocked**. They are not
-acceptance-passing evidence for this deployment:
+The broker is a **dumb pipe**. Organization is the only trust boundary: an
+organization client certificate admits you to the org bus, and the ACL is
+scoped to the single org root with own-origin (`%c`) write scoping and
+own-inbox reads. Project is a routing/capability concept, not a broker-enforced
+boundary — you are in a project because you were invited with its id, not
+because the broker polices it. The org-scoped project `+` wildcard is therefore
+correct and stays.
 
-- **Connector live transport:** blocked. The checked-in `acl` lacks grants for
-  project-membership subscriptions, organization member-card subscription and
-  publication, and the agent inbox. `open_transport` aborts on denied
-  subscriptions, while the enrollment probe omits these paths; `connect` may
-  succeed while the connector loops offline.
-- **Cross-project denial:** blocked. The checked-in project wildcard grants
-  cannot enforce cross-project denial. There is no supported ACL workaround
-  yet; this needs an ACL/runtime correction outside documentation-only issue
-  #163.
+Cross-project confidentiality and delivery filtering live in the connector
+application layer, not the ACL; the broker holds no project-membership state.
+Member cards (`loam/v1/{org}/members/+`) make project sharing visible org-wide.
+There is **no cross-project denial at the broker, and that is by design** — a
+guessable project id is acceptable because project is not a confidentiality
+boundary against fellow org members.
 
 ## Required evidence
 
@@ -26,7 +28,7 @@ acceptance-passing evidence for this deployment:
 | --- | --- | --- |
 | 1 | TLS-only listener; anonymous and plaintext access are refused. | Rendered `mosquitto.conf`, `ss` output showing only the configured TLS port, and TLS/anonymous probes. |
 | 2 | Client certificate CN is the authenticated MQTT principal. | A valid organization-CA client certificate receives an accepted CONNACK; Mosquitto has `require_certificate true` and `use_identity_as_username true`. |
-| 3 | Organization/project ACLs and origin writes are isolated. | **BLOCKED — not acceptance-passing:** own-origin and cross-origin checks may be recorded, but the checked-in project wildcard grants cannot prove cross-project denial. No supported ACL workaround exists yet. |
+| 3 | Organization ACL and origin writes are isolated. | `acl-contract.sh selfcheck` stands up a throwaway Mosquitto against the rendered production ACL and proves a foreign-**organization** read and write are both denied, alongside own-origin (`%c`) write scoping and own-inbox reads. Project is not a broker confidentiality boundary (by design), so no cross-project denial is claimed. |
 | 4 | The organization CA issues valid client certificates and revocation works. | `pki/selfcheck.sh` passes; a revoked certificate is refused after the broker reloads `crl.pem`. |
 | 5 | The broker restarts without losing retained state. | A retained sentinel survives a planned service restart and the service is enabled. |
 | 6 | Backup and restore recover broker-owned data. | `backup-restore.sh selfcheck` passes and a before/after sentinel comparison is recorded. |
@@ -38,7 +40,7 @@ acceptance-passing evidence for this deployment:
 | 12 | Instance identity is consistent across certificate, enrollment, client id, and topic origin. | `provision-instance-id.sh selfcheck` passes; no identity-mismatch or source mismatch occurs in the connection probe. |
 | 13 | Two machines can use one project without sharing a client id. | Both sessions authenticate at once, exchange authorized frames, and keep distinct instance ids. |
 | 14 | Read-only inspection does not imply live liveness. | Human `loam federation status` output (and the JSON status field) records that the live broker session was not observed; `list` remains an inventory. Current liveness is evidenced separately through service/broker logs. |
-| 15 | The connector stays online with project-membership and agent-inbox subscriptions plus organization member-card subscription/publication. | **BLOCKED — not acceptance-passing:** the checked-in `acl` lacks these grants; `open_transport` aborts on denied subscriptions, and the enrollment probe does not cover them. |
+| 15 | The connector stays online with project-membership and agent-inbox subscriptions plus organization member-card subscription/publication. | `acl-contract.sh selfcheck` proves every connector live subscription delivers (project `membership`, agent inbox, and organization member-card `members/+`) and the retained self member-card publish (`members/%c`) succeeds against the rendered production ACL. |
 
 ## Off-host checks
 
@@ -52,8 +54,13 @@ These checks use throwaway directories and do not mutate a production host:
 ./resolve-credentials.sh selfcheck
 ./provision-peer-roster.sh selfcheck
 ./provision-instance-id.sh selfcheck
+./acl-contract.sh selfcheck
 python3 enroll/test_signer.py
 ```
+
+The ACL contract proves the rendered ACL's behaviour against a throwaway
+Mosquitto; it does not prove a live production deployment. See
+[what this checklist does not prove](#what-this-checklist-does-not-prove).
 
 The complete safe gate runs them together and checks the required files and
 configuration invariants:
@@ -68,10 +75,9 @@ The `acceptance-gate.sh provision` stage is currently unavailable/unsafe: it
 copies the tracked `${VARS}` templates without rendering them. Do **not** run
 `LOAM_LIVE_GO=1 ./acceptance-gate.sh provision`; setting the guard does not
 render the templates. The envsubst-rendered manual deployment sequence in
-[`BROKER-SETUP.md`](../../docs/federation/BROKER-SETUP.md), section 5, is also
-reference-only until the connector/ACL blockers and template-rendering defect
-are cleared; do not execute or enable the broker from it while those blockers
-remain.
+[`BROKER-SETUP.md`](../../docs/federation/BROKER-SETUP.md), section 5, is the
+supported render-and-install path; the automated `provision` stage stays
+unavailable until the template-rendering defect is fixed.
 
 On the target host, capture a baseline before any broker-owned write:
 

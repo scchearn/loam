@@ -6,12 +6,11 @@ make one change at a time, and never restart unrelated services. For a
 newcomer-friendly explanation of the same path, see
 [`docs/federation/BROKER-SETUP.md`](../../docs/federation/BROKER-SETUP.md).
 
-> **HARD STOP — do not execute this production deployment yet.** The checked-in
-> ACL is incompatible with the current connector, so `loam federation connect`
-> may succeed while the connector loops offline. See the
-> [federation hard-stop warning](../../docs/federation/README.md#production-broker-hard-stop)
-> and do not deploy or enable Mosquitto until the missing grants and
-> cross-project denial are corrected; no supported ACL workaround exists yet.
+The checked-in ACL grants every live surface the connector needs, proven by
+[`acl-contract.sh`](acl-contract.sh). One operational caveat remains: the
+automated `acceptance-gate.sh provision` stage copies unrendered templates, so
+render and install with the manual sequence in section 3. See the
+[production broker status](../../docs/federation/README.md#production-broker-status).
 
 ## 0. Prepare the host and parameters
 
@@ -82,9 +81,9 @@ Protect `$PKI_DIR/private/ca.key` as a root-only secret. The signer installer
 shares only the CA files and database paths it needs; it does not make the
 private directory generally readable.
 
-## 3. Render and install Mosquitto (after blocker clearance)
+## 3. Render and install Mosquitto
 
-After the hard stop is cleared, use the one canonical rendered replacement,
+Use the one canonical rendered replacement,
 backup, validation, daemon-reload, and restore sequence in
 [`BROKER-SETUP.md`](../../docs/federation/BROKER-SETUP.md#5-install-mosquitto-tls-and-the-acl),
 section 5. Do not maintain a second copy of the `envsubst`/`install` sequence
@@ -112,7 +111,7 @@ The installer creates `$ENROLL_DIR/password` mode `0600`. Share its contents
 through a secure channel, never in `params.env` or a command line. The client
 should use `--token-file`.
 
-## 5. First machine enrollment (after broker blocker clearance)
+## 5. First machine enrollment
 
 On the first client machine, configure a Git email and the organization:
 
@@ -234,9 +233,9 @@ safe off-host gate. The `acceptance-gate.sh provision` stage is currently
 unavailable/unsafe because it copies unresolved `${VARS}` templates. Do **not**
 run `LOAM_LIVE_GO=1 ./acceptance-gate.sh provision`. The envsubst-rendered
 manual deployment sequence in
-[`BROKER-SETUP.md`](../../docs/federation/BROKER-SETUP.md), section 5, is also
-reference-only until the connector/ACL blockers and template-rendering defect
-are cleared. After an approved deployment, run:
+[`BROKER-SETUP.md`](../../docs/federation/BROKER-SETUP.md), section 5, is the
+supported render-and-install path until that template-rendering defect is
+fixed. After an approved deployment, run:
 
 ```sh
 ./postflight-assert.sh "$BACKUP_DIR/preflight-baseline.snap"

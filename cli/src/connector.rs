@@ -2514,6 +2514,60 @@ fn own_member_card(
     }))
 }
 
+/// Incorporate one live member-card delivery into the session's admission
+/// roster. The in-memory update happens before the best-effort cache write, so
+/// a filesystem hiccup cannot leave a running connector deaf until restart.
+/// Valid cards are still cached and the durable project roster is refreshed for
+/// the next session when the configured roster root is available.
+fn incorporate_member_card(
+    root: Option<&std::path::Path>,
+    org_id: &str,
+    project_id: &str,
+    outcome: &ReceiveOutcome,
+    roster: &mut PeerRoster,
+) -> Result<(), &'static str> {
+    let ReceiveOutcome::MemberCard {
+        instance_id,
+        payload,
+    } = outcome
+    else {
+        return Ok(());
+    };
+    let text = std::str::from_utf8(payload).map_err(|_| reason::ROSTER_MALFORMED)?;
+    let card = crate::provisioning::parse_member_card_pub(text)?;
+    if card.instance_id != *instance_id {
+        return Err(reason::ROSTER_MALFORMED);
+    }
+
+    let belongs_to_project = card.projects.iter().any(|project| project == project_id);
+    if belongs_to_project {
+        if !roster.principals.contains(&card.principal_id) {
+            roster.principals.push(card.principal_id.clone());
+        }
+        if !roster.origins.contains(&card.instance_id) {
+            roster.origins.push(card.instance_id.clone());
+        }
+    }
+
+    // The card is useful to every project on this machine, not only this pump.
+    // The live authorization above deliberately does not depend on either write
+    // succeeding: these writes are durable follow-through, not the admission
+    // boundary for a validated broker delivery.
+    if let Some(root) = root {
+        if crate::provisioning::write_member_card(root, org_id, &card).is_ok() && belongs_to_project
+        {
+            if let Ok(assembled) =
+                crate::provisioning::assemble_project_roster(root, org_id, project_id)
+            {
+                let body = crate::provisioning::roster_body(&assembled);
+                let _ = crate::provisioning::write_roster(root, org_id, project_id, &body);
+                *roster = assembled;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The Git verdict for one received frame. Only an `io.loam.work.state` frame
 /// that the oracle proves published earns [`Publication::Verified`]; every other
 /// outcome, including every error, falls back to the sender-claim answer.
@@ -2849,62 +2903,40 @@ fn run_pump_loop(
         match transport.receive_outcome(PUMP_POLL, Utc::now(), &roster) {
             Ok(Some((topic, outcome))) => {
                 log_admission(&project_id, &topic, &outcome);
-                // A self-announced member card: persist the card to the cache
-                // and reassemble this project's roster from every retained card
-                // listing the project. The connector is the roster author, so
-                // the assembled file is the durable truth the next session
-                // (and `provisioning::resolve`) reads.
-                if let ReceiveOutcome::MemberCard { payload, .. } = &outcome {
-                    if let Ok(text) = std::str::from_utf8(payload) {
-                        if let Ok(root) = crate::provisioning::configured_roster_root() {
-                            match crate::provisioning::parse_member_card_pub(text) {
-                                Ok(card) => {
-                                    breadcrumb!(
-                                        "member card accepted org={org_id} instance={}",
-                                        card.instance_id
-                                    );
-                                    let _ = crate::provisioning::write_member_card(
-                                        &root, &org_id, &card,
-                                    );
-                                    if let Ok(assembled) =
-                                        crate::provisioning::assemble_project_roster(
-                                            &root,
-                                            &org_id,
-                                            &project_id,
-                                        )
-                                    {
-                                        let body = crate::provisioning::roster_body(&assembled);
-                                        let _ = crate::provisioning::write_roster(
-                                            &root,
-                                            &org_id,
-                                            &project_id,
-                                            &body,
-                                        );
-                                        breadcrumb!(
-                                            "roster assembled project={project_id} principals={} origins={}",
-                                            assembled.principals.len(),
-                                            assembled.origins.len()
-                                        );
-                                        roster = assembled;
-                                    }
-                                }
-                                // Every rejection up to the per-session limit,
-                                // not just the first: a parser bug refusing one
-                                // peer card and one refusing every peer card are
-                                // the same single line otherwise, and breadth is
-                                // the diagnostic. Past the limit they are counted
-                                // and reported once at session down, so a
-                                // systemic failure on a respawning daemon cannot
-                                // grow the log without bound. The reason is a
-                                // typed parse verdict, never card content.
-                                Err(reason) => {
-                                    rejected_cards += 1;
-                                    if rejected_cards <= CARD_REJECTION_LOG_LIMIT {
-                                        breadcrumb!(
-                                            "member card rejected org={org_id} reason={reason}; roster may be incomplete"
-                                        );
-                                    }
-                                }
+                // A self-announced member card is an admission update, not just
+                // a cache refresh: the current pump must authorize its origin
+                // before the next work-state frame arrives.
+                if matches!(outcome, ReceiveOutcome::MemberCard { .. }) {
+                    match incorporate_member_card(
+                        crate::provisioning::configured_roster_root()
+                            .ok()
+                            .as_deref(),
+                        &org_id,
+                        &project_id,
+                        &outcome,
+                        &mut roster,
+                    ) {
+                        Ok(()) => {
+                            let instance_id = match &outcome {
+                                ReceiveOutcome::MemberCard { instance_id, .. } => instance_id,
+                                _ => unreachable!("member-card branch checked above"),
+                            };
+                            breadcrumb!("member card accepted org={org_id} instance={instance_id}");
+                            breadcrumb!(
+                                "roster assembled project={project_id} principals={} origins={}",
+                                roster.principals.len(),
+                                roster.origins.len()
+                            );
+                        }
+                        // Every rejection up to the per-session limit, not just
+                        // the first: breadth is the useful diagnostic, while the
+                        // typed reason keeps card content out of the log.
+                        Err(reason) => {
+                            rejected_cards += 1;
+                            if rejected_cards <= CARD_REJECTION_LOG_LIMIT {
+                                breadcrumb!(
+                                    "member card rejected org={org_id} reason={reason}; roster may be incomplete"
+                                );
                             }
                         }
                     }
@@ -6964,6 +6996,176 @@ mod snapshot_tests {
         assert!(!filters
             .iter()
             .any(|filter| filter.ends_with("/event/instance-02")));
+    }
+
+    struct RosterRootEnvGuard {
+        previous: Option<String>,
+    }
+
+    impl RosterRootEnvGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var("LOAM_FEDERATION_ROSTER_DIR").ok();
+            std::env::set_var("LOAM_FEDERATION_ROSTER_DIR", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for RosterRootEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("LOAM_FEDERATION_ROSTER_DIR", value),
+                None => std::env::remove_var("LOAM_FEDERATION_ROSTER_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_member_card_received_after_startup_authorizes_a_new_origin_without_restart() {
+        let now = base_time();
+        let org = "org-3A1";
+        let project = "project-7M3";
+        let root = crate::enrollment::temp_global_root("live-roster-card");
+        let initial_card = crate::provisioning::MemberCard {
+            instance_id: RECIPIENT_INSTANCE.into(),
+            principal_id: SENDER_PRINCIPAL.into(),
+            display_name: None,
+            joined_at: now.to_rfc3339(),
+            projects: vec![project.into()],
+        };
+        crate::provisioning::write_member_card(&root, org, &initial_card)
+            .expect("the startup member card is writable");
+        let roster = crate::provisioning::assemble_project_roster(&root, org, project)
+            .expect("the startup roster assembles");
+        let new_origin = "instance-03";
+        let new_principal = "employee-207";
+        let new_card = crate::provisioning::MemberCard {
+            instance_id: new_origin.into(),
+            principal_id: new_principal.into(),
+            display_name: Some("New peer".into()),
+            joined_at: now.to_rfc3339(),
+            projects: vec![project.into()],
+        };
+        let card_topic = crate::provisioning::member_topic(org, new_origin);
+        let state_topic = format!("loam/v1/{org}/{project}/state/{new_origin}/task-7");
+        let frame_now = Utc::now();
+        let state_body = envelope_json(
+            "01K6Q6ESWMT48TPB",
+            "io.loam.work.state",
+            "urn:loam:schema:work-state:1",
+            &frame_now.to_rfc3339(),
+            &(frame_now + chrono::Duration::hours(1)).to_rfc3339(),
+            "New peer work",
+            project,
+            org,
+            Value::Array(vec![Value::Object(vec![
+                ("kind".into(), Value::String("project".into())),
+                ("id".into(), Value::String(project.into())),
+            ])]),
+            Value::Object(vec![
+                ("class".into(), Value::String("latest-state".into())),
+                ("key".into(), Value::String("task-7".into())),
+                ("revision".into(), Value::Number("1".into())),
+            ]),
+            Value::Object(vec![
+                ("state".into(), Value::String("active".into())),
+                ("acceptance".into(), Value::Object(vec![])),
+                ("verification".into(), Value::Array(vec![])),
+            ]),
+        )
+        .replace(SENDER_INSTANCE, new_origin)
+        .replace(SENDER_PRINCIPAL, new_principal);
+
+        // Use the OS null device as the configured root. The parent path ignored
+        // the card write error, reassembled an empty roster from this unusable
+        // root, and then refused the next frame. The fixed path admits in memory
+        // first.
+        #[cfg(unix)]
+        let broken_root = std::path::Path::new("/dev/null");
+        #[cfg(windows)]
+        let broken_root = std::path::Path::new("NUL");
+        let _env = crate::env_lock();
+        let _roster_root = RosterRootEnvGuard::set(broken_root);
+
+        let identity = SessionIdentity {
+            principal_id: SENDER_PRINCIPAL.into(),
+            agent_id: "agent-72".into(),
+            instance_id: RECIPIENT_INSTANCE.into(),
+            display_name: None,
+            allowed_claims: Vec::new(),
+        };
+        let config = TransportConfig::new(
+            "localhost",
+            1883,
+            "loam-connector-test",
+            8,
+            400_000,
+            ValidationConfig::default(),
+        )
+        .expect("transport config");
+        let session = MqttSession {
+            config,
+            username: None,
+            password: None,
+            ca_certificate: rustls::RootCertStore::empty(),
+            client_authentication: None,
+            claimed_identity: identity.clone(),
+        };
+        let mut transport =
+            MqttTransport::new(session, ValidationConfig::default(), now).expect("transport");
+        transport.identity = Some(identity.clone());
+        let mut card_publish = Publish::new(
+            card_topic,
+            QoS::AtLeastOnce,
+            crate::provisioning::member_card_to_json(&new_card).into_bytes(),
+            None,
+        );
+        card_publish.retain = true;
+        let state_publish =
+            Publish::new(state_topic, QoS::AtLeastOnce, state_body.into_bytes(), None);
+        transport.pending = vec![card_publish, state_publish];
+
+        let open = OpenSession {
+            transport,
+            identity,
+            roster,
+            oracle: None,
+            org_id: org.into(),
+            project_id: project.into(),
+        };
+        let snapshots = std::sync::Arc::new(std::sync::Mutex::new(
+            SnapshotStore::new(4).expect("snapshot store"),
+        ));
+        let observed = std::sync::Arc::clone(&snapshots);
+        let channels = ChannelRegistry::new();
+        let (_outbound, outbound_rx) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pump_stop = std::sync::Arc::clone(&stop);
+        let liveness = LivenessHandle::established(now);
+        let pump = std::thread::spawn(move || {
+            run_pump_loop(
+                open,
+                &snapshots,
+                &channels,
+                &outbound_rx,
+                &pump_stop,
+                &liveness,
+            )
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline
+            && observed.lock().expect("snapshot store").len(project) == 0
+        {
+            std::thread::yield_now();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let outcome = pump.join().expect("pump exits after stop");
+        assert!(matches!(outcome, EstablishOutcome::Ended));
+        assert_eq!(
+            observed.lock().expect("snapshot store").len(project),
+            1,
+            "a card received after startup must authorize its next work frame"
+        );
     }
 
     #[test]

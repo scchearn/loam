@@ -50,6 +50,23 @@ jobs:
       - name: Loam View producer/validator agreement
         run: node --test view/tests/loamstate-view-contract-test.mjs
 
+  path-shim-lifecycle:
+    name: path shim lifecycle (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: node --version
+      - run: npm ci
+      - name: Install fixture compiler
+        shell: bash
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - name: Exercise install, update, doctor, and uninstall
+        run: node .github/scripts/path-shim-lifecycle.mjs
+
   release-resolution:
     runs-on: ubuntu-22.04
     steps:

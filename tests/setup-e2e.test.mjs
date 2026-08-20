@@ -16,6 +16,8 @@ import { discover } from '../setup/discovery.mjs';
 import { verifyInstallation } from '../setup/verify.mjs';
 import { detectTarget, runtimePath } from '../setup/target.mjs';
 import { uninstall } from '../setup/uninstall.mjs';
+import { runDoctor } from '../setup/doctor.mjs';
+import { shimLocations } from '../setup/shim.mjs';
 import { federationDefinitionPath } from '../setup/federation.mjs';
 import { ledgerPath } from '../integration/ledger.mjs';
 
@@ -77,6 +79,21 @@ function outputCapture() {
 async function baseFixture() {
   const home = await mkdtemp(join(tmpdir(), 'loam-setup-home-'));
   pinConfigDir(home);
+  const env = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    LOCALAPPDATA: join(home, 'AppData', 'Local'),
+    APPDATA: join(home, 'AppData', 'Roaming'),
+  };
+  let userPath = '';
+  const pathRunner = async ({ action, entry }) => {
+    if (action === 'read') return { code: 0, stdout: userPath };
+    const delimiter = process.platform === 'win32' ? ';' : ':';
+    if (action === 'add') userPath = [userPath, entry].filter(Boolean).join(delimiter);
+    if (action === 'remove') userPath = userPath.split(delimiter).filter((part) => part !== entry).join(delimiter);
+    return { code: 0, stdout: '' };
+  };
   const workspace = await mkdtemp(join(tmpdir(), 'loam-setup-workspace-'));
   const release = await releaseFixture();
   const list = await fullList();
@@ -98,6 +115,8 @@ async function baseFixture() {
   return {
     home,
     workspace,
+    env,
+    pathRunner,
     release,
     releaseBaseUrl: release.url,
     runner,
@@ -231,6 +250,45 @@ test('update refreshes a ready installation without prompting', async () => {
   assert.match(capture.text(), /Loam Update/);
   const current = JSON.parse(await readFile(metadataPath, 'utf8'));
   assert.notEqual(current.integration_path, previous.integration_path);
+});
+
+test('the installed launcher stays byte-stable through update and doctor reports it healthy', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('Windows PATH registry verification runs in the native CI smoke');
+    return;
+  }
+  const fixture = await baseFixture();
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  const shimPath = join(fixture.home, '.local', 'bin', 'loam');
+  const before = await readFile(shimPath);
+  const updateCode = await runSetup(parseArgs(['update']), {
+    ...fixture,
+    packageRoot,
+    output: outputCapture().output,
+    errorOutput: outputCapture().output,
+  });
+  assert.equal(updateCode, 0);
+  assert.deepEqual(await readFile(shimPath), before);
+
+  const capture = outputCapture();
+  const doctorCode = await runDoctor({
+    home: fixture.home,
+    workspace: fixture.workspace,
+    packageRoot,
+    env: {
+      ...process.env,
+      HOME: fixture.home,
+      USERPROFILE: fixture.home,
+      PATH: `${join(fixture.home, '.local', 'bin')}:${process.env.PATH || ''}`,
+    },
+    runner: fixture.runner,
+    runtimeRunner: fixture.smokeRunner,
+    toolRunner: async () => ({ code: 1, stdout: '', stderr: 'tool absent' }),
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+  assert.equal(doctorCode, 0, capture.text());
+  assert.match(capture.text(), /PATH launcher: ok/);
 });
 
 test('setup reconciles an install from an older plugin version', async () => {
@@ -676,6 +734,7 @@ test('failed later setup stages preserve the active integration and metadata', a
 
 async function readyHarnessFixture() {
   const fixture = await baseFixture();
+  const { env, pathRunner } = fixture;
   await mkdir(join(fixture.home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(fixture.home, '.claude'), { recursive: true });
   await mkdir(join(fixture.home, '.cursor'), { recursive: true });
@@ -693,12 +752,29 @@ async function readyHarnessFixture() {
     }
     return { code: 0, stdout: '', stderr: '' };
   };
-  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, runner, output: outputCapture().output });
+  const setupOutput = outputCapture();
+  const setupCode = await runSetup(parseArgs(['install', '--yes']), {
+    ...fixture,
+    packageRoot,
+    runner,
+    env,
+    pathRunner,
+    output: setupOutput.output,
+    errorOutput: setupOutput.output,
+  });
+  assert.equal(setupCode, 0, setupOutput.text());
+  const settings = JSON.parse(await readFile(join(fixture.home, '.claude', 'settings.json'), 'utf8'));
+  assert.ok(settings.hooks, 'a ready Claude install must preserve its hooks object');
+  if (process.platform === 'win32') {
+    const locations = shimLocations({ home: fixture.home, env, platform: 'win32' });
+    await readFile(locations.shimPath);
+  }
   const discovery = await discover({
     home: fixture.home,
     workspace: fixture.workspace,
     packageRoot,
     runner: fixture.runner,
+    env,
   });
   return { fixture, discovery };
 }

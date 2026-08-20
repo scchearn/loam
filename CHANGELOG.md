@@ -6,6 +6,16 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Federation connector stays online.** The production broker's access rules
+  now grant the live-session subscriptions and retained member-card publication
+  the connector needs, so an enrolled machine no longer connects and then loops
+  offline. A real-broker contract test guards the rules, the deployment gate
+  runs it, and the broker acceptance checklist reflects the settled trust model:
+  the organization is the trust boundary, project membership is routing, and
+  member cards make project sharing visible across the organization. ([#173])
+
 ## [1.0.0]
 
 ### Added
@@ -75,3 +85,4 @@ Release entries are maintained as part of release work; see
 [#114]: https://github.com/scchearn/loam/pull/114
 [#146]: https://github.com/scchearn/loam/issues/146
 [#163]: https://github.com/scchearn/loam/issues/163
+[#173]: https://github.com/scchearn/loam/issues/173
