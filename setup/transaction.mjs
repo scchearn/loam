@@ -14,6 +14,7 @@ import { migrateEnrollment, migrateLegacyProject, migrateRuntimeLedger } from '.
 import { removeHarnesses } from './uninstall.mjs';
 import { verifyInstallation } from './verify.mjs';
 import { stageFederationService, federationDefinitionExists } from './federation.mjs';
+import { installShim } from './shim.mjs';
 
 // #97 fix 1 — a destructive rollback decision must name its reason. Turn the
 // per-check breakdown the verifier already computes into one operator-readable
@@ -28,6 +29,10 @@ function verifyFailureDetail(result, discovery) {
     // The runtime check now fails on the config-dir ledger/store: name the
     // category and, when present, the verb that converges it (install/update).
     failed.push(`runtime (${result.runtime.category || 'not ready'}${result.runtime.hint ? `, run ${result.runtime.hint}` : ''})`);
+  }
+  if (result?.shim && !result.shim.ready) {
+    const detail = result.shim.detail ? `: ${result.shim.detail}` : '';
+    failed.push(`launcher (${result.shim.category || 'not ready'}${detail})`);
   }
   for (const [id, harness] of Object.entries(result?.harnesses || {})) {
     if (!harness.ready) failed.push(`harness ${id} (${harness.category || 'not ready'})`);
@@ -104,9 +109,11 @@ export async function executeSetup(parsed, discovery, options = {}) {
   // refreshes an existing one instead of skipping the preservation the `refresh`
   // flag gated.
   let existingInstall = false;
+  let existingMetadata = null;
   try {
     const existing = JSON.parse(await readFile(join(discovery.globalRoot, 'install.json'), 'utf8'));
     existingInstall = true;
+    existingMetadata = existing;
     if (Array.isArray(existing.configured_harnesses)) previouslyConfigured = existing.configured_harnesses;
   } catch {}
   const preserveExisting = refresh || existingInstall;
@@ -209,6 +216,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
     let candidateIntegration;
     let harnessInstall;
     let federationRollback;
+    let shimInstall;
     let activated = false;
     let skillCount;
     let runtime;
@@ -235,15 +243,17 @@ export async function executeSetup(parsed, discovery, options = {}) {
       // never the skills tree. A `channel: pinned` ledger keeps its target on a
       // plain update without LOAM_RUNTIME_VERSION (locked-ref semantics), noted
       // volta-style; the env var moves the pin.
-      priorLedger = await readLedger({ home: discovery.home, platform: discovery.platform });
-      let resolved = resolveRuntimeTarget({ env: process.env });
-      if (priorLedger?.channel === 'pinned' && !process.env.LOAM_RUNTIME_VERSION) {
+      const setupEnv = discovery.env || process.env;
+      priorLedger = await readLedger({ home: discovery.home, platform: discovery.platform, env: setupEnv });
+      let resolved = resolveRuntimeTarget({ env: setupEnv });
+      if (priorLedger?.channel === 'pinned' && !setupEnv.LOAM_RUNTIME_VERSION) {
         resolved = { target: priorLedger.target, channel: 'pinned' };
         stepDetail(output, `runtime pinned at ${resolved.target}; set LOAM_RUNTIME_VERSION to move or release the pin`);
       }
       stepStart(output, `Preparing native runtime v${resolved.target} (${discovery.target})`);
       runtime = await installRuntime({
         home: discovery.home,
+        env: setupEnv,
         version: resolved.target,
         target: discovery.target,
         platform: discovery.platform,
@@ -345,6 +355,16 @@ export async function executeSetup(parsed, discovery, options = {}) {
       }
       if (marketplaceFailed) errorOutput.write('Marketplace plugin installation is incomplete.\n');
 
+      shimInstall = await installShim({
+        home: discovery.home,
+        globalRoot: discovery.globalRoot,
+        platform: discovery.platform,
+        env: discovery.env || process.env,
+        pathRunner: options.pathRunner,
+        update: refresh,
+        existing: existingMetadata?.shim,
+      });
+
       if (toRemove.length) {
         stepStart(output, 'Removing deselected harnesses');
         await removeHarnesses({
@@ -382,6 +402,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
         integration_path: integrationPath,
         skills_scope: 'global',
         skills_source: 'scchearn/loam',
+        shim: shimInstall.record,
         configured_harnesses: Object.entries(harnesses)
           .filter(([, harness]) => harness.state === 'ready')
           .map(([id]) => id),
@@ -467,6 +488,9 @@ export async function executeSetup(parsed, discovery, options = {}) {
       return marketplaceFailed ? 1 : 0;
     } finally {
       if (!activated) {
+        try {
+          await shimInstall?.rollback?.();
+        } catch {}
         // #97 — the rollback restores ONLY what this run staged, never a prior
         // ledger or store. A hard crash (finally never runs) instead leaves the
         // ledger ahead of install.json, which readiness reports as runtime_stale
@@ -477,7 +501,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
         // is unchanged (publishJson is atomic), so state stays safe/convergent —
         // a harmless disk leak, not skew. Reclaim it here only if it ever matters.
         if (ledgerStaged) {
-          const file = ledgerPath({ home: discovery.home, platform: discovery.platform });
+          const file = ledgerPath({ home: discovery.home, platform: discovery.platform, env: discovery.env || process.env });
           try {
             if (priorLedger) await writeFile(file, `${JSON.stringify(priorLedger, null, 2)}\n`, { mode: 0o600 });
             else if (file) await rm(file, { force: true });

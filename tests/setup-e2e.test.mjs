@@ -16,6 +16,7 @@ import { discover } from '../setup/discovery.mjs';
 import { verifyInstallation } from '../setup/verify.mjs';
 import { detectTarget, runtimePath } from '../setup/target.mjs';
 import { uninstall } from '../setup/uninstall.mjs';
+import { runDoctor } from '../setup/doctor.mjs';
 import { federationDefinitionPath } from '../setup/federation.mjs';
 import { ledgerPath } from '../integration/ledger.mjs';
 
@@ -231,6 +232,45 @@ test('update refreshes a ready installation without prompting', async () => {
   assert.match(capture.text(), /Loam Update/);
   const current = JSON.parse(await readFile(metadataPath, 'utf8'));
   assert.notEqual(current.integration_path, previous.integration_path);
+});
+
+test('the installed launcher stays byte-stable through update and doctor reports it healthy', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('Windows PATH registry verification runs in the native CI smoke');
+    return;
+  }
+  const fixture = await baseFixture();
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  const shimPath = join(fixture.home, '.local', 'bin', 'loam');
+  const before = await readFile(shimPath);
+  const updateCode = await runSetup(parseArgs(['update']), {
+    ...fixture,
+    packageRoot,
+    output: outputCapture().output,
+    errorOutput: outputCapture().output,
+  });
+  assert.equal(updateCode, 0);
+  assert.deepEqual(await readFile(shimPath), before);
+
+  const capture = outputCapture();
+  const doctorCode = await runDoctor({
+    home: fixture.home,
+    workspace: fixture.workspace,
+    packageRoot,
+    env: {
+      ...process.env,
+      HOME: fixture.home,
+      USERPROFILE: fixture.home,
+      PATH: `${join(fixture.home, '.local', 'bin')}:${process.env.PATH || ''}`,
+    },
+    runner: fixture.runner,
+    runtimeRunner: fixture.smokeRunner,
+    toolRunner: async () => ({ code: 1, stdout: '', stderr: 'tool absent' }),
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+  assert.equal(doctorCode, 0, capture.text());
+  assert.match(capture.text(), /PATH launcher: ok/);
 });
 
 test('setup reconciles an install from an older plugin version', async () => {

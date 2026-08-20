@@ -49,6 +49,7 @@ export async function discover({
   platform = process.platform,
   arch = process.arch,
   runner,
+  env = process.env,
 } = {}) {
   const resolvedHome = resolve(home);
   const resolvedWorkspace = resolve(workspace);
@@ -60,14 +61,14 @@ export async function discover({
   // destroys it).
   const { profileRoot, configRoot } = await import('./profile.mjs');
   const federationProfileRoot = profileRoot({
-    env: process.env,
+    env,
     home: resolvedHome,
     platform,
   });
   // The durable config-dir loam root. With the global root these are the roots
   // the legacy-project sweep must never treat as a removable project (#125):
   // run from $HOME, <workspace>/.agents/loam resolves ONTO the global install.
-  const loamConfigRoot = configRoot({ env: process.env, home: resolvedHome, platform });
+  const loamConfigRoot = configRoot({ env, home: resolvedHome, platform });
   const protectedRoots = [globalRoot, loamConfigRoot].filter(Boolean);
   // Whether federation was already enabled here (a file-based service definition
   // exists) BEFORE this run. Captured up front so the post-setup verify can fail
@@ -92,11 +93,12 @@ export async function discover({
     configRoot: loamConfigRoot,
     protectedRoots,
     federationEnabled,
-    target: target || detectTarget({ platform, arch }),
+    target: target || detectTarget({ platform, arch, override: env.LOAM_TARGET }),
     platform,
     arch,
     node: process.version,
-    npm: process.env.npm_execpath || 'npx',
+    npm: env.npm_execpath || 'npx',
+    env,
     harnesses: await detectHarnesses({ home: resolvedHome, pluginVersion: PACKAGE_VERSION }),
     legacy: { ...legacy, needed: hasEvidence, sourceRepository },
   };

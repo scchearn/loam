@@ -1,6 +1,7 @@
 import { discover } from './discovery.mjs';
 import { verifyInstallation } from './verify.mjs';
 import { CATALOG } from './integrations/catalog.mjs';
+import { verifyShim } from './shim.mjs';
 
 function detail(check) {
   return check?.detail || check?.message || check?.category || '';
@@ -24,6 +25,7 @@ export async function runDoctor(options = {}) {
       platform: options.platform,
       arch: options.arch,
       runner: options.runner,
+      env: options.env,
     });
     const result = await verifyInstallation({
       discovery,
@@ -44,6 +46,17 @@ export async function runDoctor(options = {}) {
     }
     report(output, 'Global skills', result.skills);
     report(output, 'Native runtime', result.runtime);
+    const shim = await verifyShim({
+      home: discovery.home,
+      globalRoot: discovery.globalRoot,
+      platform: discovery.platform,
+      env: options.env || discovery.env || process.env,
+      pathRunner: options.pathRunner,
+      integrationPath: result.install?.integration_path,
+      expectedRuntimePath: result.runtime?.runtimePath,
+      requireOnPath: true,
+    });
+    report(output, 'PATH launcher', shim);
     for (const [id, harness] of Object.entries(result.harnesses)) report(output, `${id} integration`, harness);
     report(output, 'Workspace migration', result.migration);
 
@@ -77,8 +90,9 @@ export async function runDoctor(options = {}) {
       }
     }
 
-    output.write(`Result: ${result.ready ? 'ready' : 'not ready'}\n`);
-    return result.ready ? 0 : 1;
+    const ready = result.ready && shim.ready;
+    output.write(`Result: ${ready ? 'ready' : 'not ready'}\n`);
+    return ready ? 0 : 1;
   } catch (error) {
     errorOutput.write(`Doctor failed: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;

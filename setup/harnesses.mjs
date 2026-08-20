@@ -200,6 +200,16 @@ export function nativeHookEntry(runtimePath, harness, event, { timeout } = {}) {
 
 const RUNTIME_EXECUTABLES = new Set(['loam', 'loam.exe']);
 
+function comparablePath(value) {
+  const resolved = resolve(value);
+  return process.platform === 'win32' ? resolved.replaceAll('\\', '/').toLowerCase() : resolved;
+}
+
+function pathInside(root, candidate) {
+  const relativePath = relative(comparablePath(root), comparablePath(candidate));
+  return Boolean(relativePath) && !relativePath.startsWith('..') && !isAbsolute(relativePath);
+}
+
 // The runtime path inside one of our native hook commands, in either form:
 // the current `"<runtime>" hook <harness> --event <event>` string, or the
 // pre-#135 args-array entry, which is still recognized so an update replaces
@@ -276,8 +286,7 @@ export function isOwnedNativeHook(item, globalRoot) {
   const runtimePath = nativeHookRuntimePath(item);
   if (!runtimePath) return false;
   const resolved = resolve(runtimePath);
-  const relativePath = relative(resolve(globalRoot), resolved);
-  if (Boolean(relativePath) && !relativePath.startsWith('..') && !isAbsolute(relativePath)) return true;
+  if (pathInside(globalRoot, resolved)) return true;
   // The staged runtime lives in the config-dir runtime store, not under the
   // global root, and that store is versioned:
   // `<config>/runtime/<version>/<target>/loam`. Recognizing ownership by the
@@ -302,8 +311,7 @@ export function isOwnedCommand(item, globalRoot, assetName) {
   if (typeof commandPath !== 'string') return false;
   const pluginRoot = resolve(globalRoot, 'plugins');
   const candidate = resolve(commandPath);
-  const relativePath = relative(pluginRoot, candidate);
-  return relativePath && !relativePath.startsWith('..') && !isAbsolute(relativePath) && basename(candidate) === assetName;
+  return pathInside(pluginRoot, candidate) && basename(candidate) === assetName;
 }
 
 function mergeClaudeHooks(existing, entry, globalRoot, assetName = 'claude-session-start.mjs') {
