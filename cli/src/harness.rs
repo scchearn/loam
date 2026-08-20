@@ -222,6 +222,7 @@ impl HookPaths {
             .unwrap_or_default();
         HookPaths {
             global_root: absolute_env("LOAM_HOME")
+                .or_else(|| crate::hooks::installed_global_root().ok())
                 .unwrap_or_else(|| home.join(".agents").join("loam")),
             skills_root: absolute_env("LOAM_SKILLS_ROOT")
                 .unwrap_or_else(|| home.join(".agents").join("skills")),
@@ -2527,6 +2528,144 @@ mod tests {
             matches!(fallback, Federation::Snapshot(_)),
             "per-turn without a session id falls back to the snapshot: {fallback:?}"
         );
+        server.join().expect("server thread");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registered_per_turn_boundaries_consume_each_mailbox_delta_without_snapshot_fallback() {
+        // Regression for #184: once a session is registered, every boundary must
+        // consume only the items admitted since the previous poll. A SnapshotGet
+        // here would re-emit the whole current state and accumulate in the
+        // append-only harness context.
+        let root = std::path::PathBuf::from("/tmp").join(format!(
+            "loam-per-turn-delta-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let run_dir = root.join("run");
+        let endpoint = ipc::unix::bind(&run_dir).expect("bind");
+        let summaries = ["turn-1", "turn-2", "turn-3"];
+        let server = std::thread::spawn(move || {
+            let config = IpcConfig::default();
+            let result = |items: Vec<Value>| {
+                ipc::ok_response(
+                    "hook",
+                    Value::Object(vec![
+                        ("schema".into(), Value::Number("1".into())),
+                        ("project_id".into(), Value::String("loam".into())),
+                        ("items".into(), Value::Array(items)),
+                    ]),
+                )
+            };
+            let item = |summary: &str| {
+                Value::Object(vec![
+                    ("type".into(), Value::String("io.loam.work.state".into())),
+                    ("summary".into(), Value::String(summary.into())),
+                ])
+            };
+
+            // The registration must reach the same endpoint all later polls use.
+            let mut registration = endpoint.accept_verified().expect("registration");
+            let request = ipc::read_frame(&mut registration, &config).expect("register request");
+            let parsed = crate::json::parse(std::str::from_utf8(&request).expect("register utf8"))
+                .expect("register json");
+            assert_eq!(
+                parsed.get("operation").and_then(Value::as_str),
+                Some("session.register-inject")
+            );
+            assert_eq!(
+                parsed
+                    .get("payload")
+                    .and_then(|payload| payload.get("session_id"))
+                    .and_then(Value::as_str),
+                Some("sess-delta")
+            );
+            ipc::write_frame(&mut registration, &result(Vec::new()), &config)
+                .expect("register response");
+
+            for summary in summaries {
+                let mut connection = endpoint.accept_verified().expect("poll");
+                let request = ipc::read_frame(&mut connection, &config).expect("poll request");
+                let parsed = crate::json::parse(std::str::from_utf8(&request).expect("poll utf8"))
+                    .expect("poll json");
+                assert_eq!(
+                    parsed.get("operation").and_then(Value::as_str),
+                    Some("session.poll-inject")
+                );
+                assert_eq!(
+                    parsed
+                        .get("payload")
+                        .and_then(|payload| payload.get("session_id"))
+                        .and_then(Value::as_str),
+                    Some("sess-delta")
+                );
+                ipc::write_frame(&mut connection, &result(vec![item(summary)]), &config)
+                    .expect("poll response");
+            }
+
+            // A later boundary with no newly admitted item stays empty; an old
+            // delta is never replayed from the full snapshot.
+            let mut connection = endpoint.accept_verified().expect("empty poll");
+            let request = ipc::read_frame(&mut connection, &config).expect("empty poll request");
+            let parsed =
+                crate::json::parse(std::str::from_utf8(&request).expect("empty poll utf8"))
+                    .expect("empty poll json");
+            assert_eq!(
+                parsed.get("operation").and_then(Value::as_str),
+                Some("session.poll-inject")
+            );
+            ipc::write_frame(&mut connection, &result(Vec::new()), &config)
+                .expect("empty poll response");
+        });
+
+        let paths = HookPaths {
+            global_root: root,
+            ..paths()
+        };
+        let config = HookConfig::default();
+        register_session(&paths, &config, Path::new("/w"), "sess-delta");
+
+        for expected in summaries {
+            let federation = query_federation(
+                &paths,
+                "/w",
+                &config,
+                HookEvent::UserPromptSubmit,
+                Some("sess-delta"),
+            );
+            let Federation::Snapshot(result) = federation else {
+                panic!("registered per-turn poll must return a delta: {federation:?}");
+            };
+            let items = result
+                .get("items")
+                .and_then(Value::as_array)
+                .expect("poll result items");
+            assert_eq!(items.len(), 1, "one newly admitted item per boundary");
+            assert_eq!(
+                items[0].get("summary").and_then(Value::as_str),
+                Some(expected),
+                "each delta is consumed in admission order"
+            );
+        }
+
+        let federation = query_federation(
+            &paths,
+            "/w",
+            &config,
+            HookEvent::UserPromptSubmit,
+            Some("sess-delta"),
+        );
+        let Federation::Snapshot(result) = federation else {
+            panic!("an empty registered poll must remain a successful delta: {federation:?}");
+        };
+        assert!(result
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.is_empty()));
+
         server.join().expect("server thread");
     }
 
