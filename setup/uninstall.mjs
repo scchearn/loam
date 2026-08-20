@@ -15,6 +15,7 @@ import { removeMarketplacePlugins } from './marketplace.mjs';
 import { removeFederationService } from './federation.mjs';
 import { readLedger } from './integrations/ledger.mjs';
 import { catalogEntry } from './integrations/catalog.mjs';
+import { removeShim, shimLocations } from './shim.mjs';
 
 const codexAgentMarker = '# Managed by @scchearn/loam setup.';
 
@@ -304,11 +305,15 @@ export async function uninstall({
   yes = false,
   confirm,
   purge = false,
+  platform = process.platform,
+  env = process.env,
+  pathRunner,
   input = process.stdin,
   output = process.stdout,
 } = {}) {
   const root = resolve(globalRoot || join(home, '.agents', 'loam'));
   const metadataPath = join(root, 'install.json');
+  const locations = shimLocations({ home, env, platform });
 
   let install = null;
   try {
@@ -330,7 +335,9 @@ export async function uninstall({
   const codexAgentProfile = await inspectCodexAgentProfile(home);
   const hasMarketplacePlugin = ['claude', 'codex'].some((id) =>
     detectedHarnesses[id]?.marketplaceInstalled || detectedHarnesses[id]?.marketplaceConfigured);
-  if (!install && !listedSkills.names.length && !hasMarketplacePlugin
+  const shimPresent = await exists(locations.shimPath)
+    || (platform === 'win32' && await exists(locations.scriptPath));
+  if (!install && !listedSkills.names.length && !hasMarketplacePlugin && !shimPresent
     && !codexAgentProfile.owned && codexAgentProfile.backup === undefined) {
     output.write('No Loam installation found at %s. Nothing to uninstall.\n'.replace('%s', root));
     return 0;
@@ -344,7 +351,7 @@ export async function uninstall({
   // `federation/` subtree: scoping there would force every future addition to
   // register itself with uninstall's purge list.
   const { configRoot } = await import('./profile.mjs');
-  const configDir = configRoot({ env: process.env, home, platform: process.platform });
+  const configDir = configRoot({ env, home, platform });
 
   await announce(output, 'Loam uninstall will:', [
     `- Remove ${listedSkills.names.length || 'any remaining'} globally installed Loam skills via the Skills CLI`,
@@ -353,6 +360,8 @@ export async function uninstall({
     '- Remove the Loam plugin file from OpenCode, which integrates by plugin rather than hooks',
     '- Remove installed Claude and Codex marketplace plugins through their native CLIs',
     `- Remove the global Loam root (install.json, runtime, integration, plugins, local operational history) at: ${root}`,
+    `- Remove the stable loam launcher at: ${locations.shimPath}`,
+    ...(platform === 'win32' ? ['- Remove the per-user PATH entry only when Loam added it'] : []),
     configDir
       ? `- PRESERVE the Loam config dir (federation identity, rosters, enrollment, registry, member cards, runtime store + ledger) at: ${configDir} so a reinstall resumes with the same identity and runtime`
       : '- PRESERVE the Loam config dir (none resolved)',
@@ -372,7 +381,7 @@ export async function uninstall({
     return 1;
   }
 
-  const results = { configs: [], codexAgentProfile: null, opencode: null, globalRoot: null, backups: [], skills: null, marketplace: null, federation: null };
+  const results = { configs: [], codexAgentProfile: null, opencode: null, globalRoot: null, backups: [], skills: null, marketplace: null, federation: null, shim: null };
 
   results.marketplace = await removeMarketplacePlugins({
     harnesses: detectedHarnesses,
@@ -431,7 +440,7 @@ export async function uninstall({
     const entry = catalogEntry(id);
     if (!entry) continue;
     results.integrations[id] = await entry.disable({
-      discovery: { globalRoot: root, home, platform: process.platform, harnesses: {} },
+      discovery: { globalRoot: root, home, platform, env, harnesses: {} },
       install,
       dryRun: false,
       purge,
@@ -451,6 +460,14 @@ export async function uninstall({
       runner: federationRunner,
     });
   }
+
+  results.shim = await removeShim({
+    home,
+    env,
+    platform,
+    pathRunner,
+    record: install?.shim,
+  });
 
   // The federation identity now lives in the config-dir profile (the whole
   // `federation/` subtree relocated there per the config-dir spec), NOT under

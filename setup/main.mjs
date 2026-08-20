@@ -18,6 +18,7 @@ export async function runSetup(parsed, options = {}) {
       platform: options.platform,
       arch: options.arch,
       runner: options.runner,
+      env: options.env,
     });
 
     if (parsed.command === 'update') {
@@ -28,6 +29,7 @@ export async function runSetup(parsed, options = {}) {
       const migratable = await hasMigratableRuntime({
         globalRoot: discovery.globalRoot,
         home: discovery.home,
+        env: discovery.env || process.env,
         platform: discovery.platform,
         arch: discovery.arch,
         target: discovery.target,

@@ -1184,7 +1184,18 @@ fn absolute_path(value: Option<String>, name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn absolute_env(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(name)?);
+    path.is_absolute().then_some(path)
+}
+
 pub(crate) fn installed_global_root() -> Result<PathBuf, String> {
+    // `LOAM_HOME` is the harness resolver's explicit root. Honor it first so
+    // connect, the native hook, and the plugin never split across roots.
+    if let Some(root) = absolute_env("LOAM_HOME") {
+        return Ok(root);
+    }
+
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let expected_name = if cfg!(windows) { "loam.exe" } else { "loam" };
     let target = executable.parent();
@@ -1212,7 +1223,31 @@ pub(crate) fn installed_global_root() -> Result<PathBuf, String> {
             return Ok(root);
         }
     }
+
+    // Schema-2 installs stage the runtime in the durable config-dir store, not
+    // under `<global-root>/bin`. When this process is that staged runtime, the
+    // harness root is the canonical home install root.
+    if crate::provisioning::configured_runtime_store_root()
+        .is_some_and(|store| path_is_inside(&executable, &store))
+    {
+        if let Some(home) = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+        {
+            let root = home.join(".agents").join("loam");
+            if root.join("install.json").is_file() {
+                return Ok(root);
+            }
+        }
+    }
+
     Err(inferred_root_error())
+}
+
+fn path_is_inside(path: &Path, root: &Path) -> bool {
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    path.starts_with(root)
 }
 
 fn inferred_root_error() -> String {

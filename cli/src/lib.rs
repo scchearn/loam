@@ -22,6 +22,10 @@ pub mod transport;
 
 pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     match args.next().as_deref() {
+        Some("--version") | Some("-V") => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            0
+        }
         Some("state") => state::run(args),
         Some("codegraph") => codegraph::run(args),
         Some("datecheck") => datecheck::run(args),
@@ -60,5 +64,10 @@ mod tests {
     #[test]
     fn library_dispatch_keeps_the_existing_invalid_command_contract() {
         assert_eq!(super::run(["not-a-command".to_owned()].into_iter()), 1);
+    }
+
+    #[test]
+    fn launcher_version_reports_the_compiled_runtime_version() {
+        assert_eq!(super::run(["--version".to_owned()].into_iter()), 0);
     }
 }

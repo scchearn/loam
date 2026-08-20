@@ -10,6 +10,7 @@ import { resolveRuntimePath } from '../integration/ledger.mjs';
 import { verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
 import { isOwnedCommand, nativeHookCommand, renderOpenCodePlugin } from './harnesses.mjs';
 import { federationDefinitionExists, verifyFederationService } from './federation.mjs';
+import { verifyShim } from './shim.mjs';
 
 async function fileExists(path) {
   try {
@@ -242,6 +243,7 @@ export async function verifyInstallation({
         platform: discovery.platform,
         arch: discovery.arch,
         home: discovery.home,
+        env: discovery.env || process.env,
         install,
       })
     : { ready: false, category: 'install_metadata_missing' };
@@ -253,6 +255,16 @@ export async function verifyInstallation({
       timeoutMs: runtimeTimeoutMs,
     });
   }
+  const shim = install
+    ? await verifyShim({
+        home: discovery.home,
+        globalRoot: discovery.globalRoot,
+        platform: discovery.platform,
+        env: discovery.env || process.env,
+        integrationPath: install.integration_path,
+        expectedRuntimePath: runtime.runtimePath,
+      })
+    : { ready: false, category: 'install_metadata_missing' };
   const harnesses = {};
   for (const [id, harness] of Object.entries(discovery.harnesses)) {
     harnesses[id] = await verifyHarness(id, harness, {
@@ -306,10 +318,11 @@ export async function verifyInstallation({
     };
   }
   return {
-    ready: Boolean(pluginVersionReady && skills.ready && runtime.ready && harnessReady && migration.ready && ingestExclusions.ready && federation.ready),
+    ready: Boolean(pluginVersionReady && skills.ready && runtime.ready && shim.ready && harnessReady && migration.ready && ingestExclusions.ready && federation.ready),
     install,
     skills,
     runtime,
+    shim,
     harnesses,
     ingestExclusions,
     harvestAgent,
