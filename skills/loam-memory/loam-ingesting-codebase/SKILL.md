@@ -38,7 +38,7 @@ If `exists` is false, stop and recommend:
 /loam::scaffolding-wiki <topic or wiki goal>
 ```
 
-If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. Use `wiki_root` from the resolved state as the wiki root. Do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh (`qmd update -c <collection>` then `qmd embed -c <collection>`). The skill works fully without qmd; it only accelerates post-ingest discovery.
+If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam install`; do not fabricate state or use a project-local fallback. Use `wiki_root` from the resolved state as the wiki root. Do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh (`qmd update -c <collection>` then `qmd embed -c <collection>`). The skill works fully without qmd; it only accelerates post-ingest discovery.
 
 A `code_ingest_pending` hint, when present, previews the work set; Step 2 remains authoritative when fast injected state omits that hint.
 
@@ -294,4 +294,4 @@ Codebase ingested from <codebase root>
 - Read the wiki schema before editing the index or log.
 - Prefer incremental linked updates over large rewrites.
 - Do not leave avoidable broken wikilinks after the ingest pass.
-- If the codegraph forwarder or the native runtime is missing or fails, stop and recommend `npx @scchearn/loam setup`; do not substitute a project-local fallback.
+- If the codegraph forwarder or the native runtime is missing or fails, stop and recommend `npx @scchearn/loam install`; do not substitute a project-local fallback.
