@@ -37,6 +37,11 @@ export async function main(argv = process.argv.slice(2), output = process.stdout
       const { uninstall } = await import('../setup/uninstall.mjs');
       return await uninstall({ ...parsed, output, errorOutput });
     }
+    if (parsed.command === 'view') {
+      const { launch } = await import('../view/launch.mjs');
+      await launch({ workspace: parsed.workspace, open: parsed.open, output, errorOutput });
+      return EXIT_CODES.OK;
+    }
   } catch (error) {
     errorOutput.write(`loam: ${error instanceof Error ? error.message : String(error)}\n`);
     return Number.isInteger(error?.exitCode) ? error.exitCode : EXIT_CODES.FAILURE;

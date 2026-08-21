@@ -271,6 +271,26 @@ Background memory maintenance is enabled by default. To opt out, set
 `LOAM_HARVEST_BACKGROUND=0` or set `background_harvest.enabled: false` in
 Loam's `config.json` under the platform configuration directory.
 
+## Loam View
+
+A local, read-only window onto one workspace: five areas over a single
+`loam state --view` snapshot — Pulse (what needs attention), Atlas (how things
+connect), Work Stream (why work exists and how far it got), Chronicle (how
+understanding changed), Stewardship (whether memory can be trusted).
+
+Ask your harness for it — "open loam view" — and the **Using** router
+background-spawns the launcher and hands you the URL. From a terminal:
+
+```bash
+npx @scchearn/loam view [workspace-root]
+```
+
+Requires Node.js >= 22. It is read-only, binds loopback only, and exports
+nothing; there is no flag to change any of that.
+
+See [Loam View](./docs/loam-view.md) for the full guide, including the
+background-spawn pattern for harness agents.
+
 ## Skill metrics
 
 Skills load into an agent's context window, so loam keeps each one small. A
@@ -295,7 +315,7 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::querying-memory | 530 | 105 | 175 | 1,596 |
 | loam::reviewing-memory | 510 | 113 | 137 | 1,787 |
 | loam::syncing-code-graph | 363 | 84 | 223 | 2,780 |
-| loam::using | 368 | 77 | 252 | 4,187 |
+| loam::using | 368 | 77 | 272 | 4,468 |
 | loam::amending-plan | 437 | 88 | 273 | 3,059 |
 | loam::checkpointing | 365 | 69 | 177 | 2,091 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,237 |

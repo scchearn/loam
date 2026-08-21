@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="loam">
+  <title>loam</title>
+  <!-- soil line -->
+  <path d="M24 102 h72" fill="none" stroke="#7B4B2B" stroke-width="7" stroke-linecap="round"/>
+  <!-- stem -->
+  <path d="M60 100 V48" fill="none" stroke="#4F8E1E" stroke-width="8" stroke-linecap="round"/>
+  <!-- left leaf -->
+  <path d="M60 66 C39 63 30 51 27 36 C48 36 57 48 60 66 Z" fill="#5E9D24"/>
+  <!-- right leaf -->
+  <path d="M60 57 C78 54 87 42 90 30 C72 30 63 39 60 57 Z" fill="#8BC43A"/>
+  <!-- seed -->
+  <circle cx="60" cy="39" r="9" fill="#E3A93C"/>
+</svg>

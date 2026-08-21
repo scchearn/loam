@@ -2629,6 +2629,10 @@ mod tests {
             "service.rs",
             "state.rs",
             "transport.rs",
+            // The View snapshot producer runs git exactly as `state.rs` does
+            // (workspace status plus the ≤100-commit Chronicle event source);
+            // it spawns nothing else and stays read-only.
+            "view.rs",
         ];
         let filesystem_files = [
             "check.rs",
@@ -2654,6 +2658,9 @@ mod tests {
             "service.rs",
             "sha256.rs",
             "state.rs",
+            // The View producer's read-only artifact inventory: front matter,
+            // hashes, and wikilink scans. It writes nothing.
+            "view.rs",
         ];
         // The owner-authenticated IPC endpoint uses a local Unix domain
         // socket (`UnixStream`/`UnixListener`) for same-host, same-user IPC — not

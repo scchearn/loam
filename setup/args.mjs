@@ -5,7 +5,7 @@ import { UsageError } from './errors.mjs';
 //   update   — version bump of an existing install, and only that.
 //   setup    — the configurator (federation + integrations + harness selection);
 //              never installs or updates core loam, never touches versions.
-const COMMANDS = new Set(['install', 'update', 'setup', 'doctor', 'uninstall']);
+const COMMANDS = new Set(['install', 'update', 'setup', 'doctor', 'uninstall', 'view']);
 
 // Flags each command accepts. Unknown command/flag combinations are a usage error
 // so automation fails loud instead of silently ignoring a misplaced flag.
@@ -37,6 +37,14 @@ export function parseArgs(argv) {
   const command = args[0];
   if (command === 'help') return { command: 'help' };
   if (command === 'version') return { command: 'version' };
+  if (command === 'view') {
+    const rest = args.slice(1).filter((value) => value !== '--no-open');
+    const open = !args.slice(1).includes('--no-open');
+    const flag = rest.find((value) => value.startsWith('--'));
+    if (flag) throw new UsageError(`unknown option: ${flag}`);
+    if (rest.length > 1) throw new UsageError('view accepts at most one workspace-root argument');
+    return { command: 'view', workspace: rest[0], open };
+  }
   if (!COMMANDS.has(command)) {
     throw new UsageError(`unknown command: ${command}`);
   }

@@ -20,6 +20,7 @@
     "adapters",
     "plugins",
     "skills",
+    "view",
     ".agents",
     ".opencode",
     ".claude-plugin",
@@ -38,5 +39,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1"
   }
 }

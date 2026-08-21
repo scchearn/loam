@@ -1,0 +1,44 @@
+{
+  "profile": "loam-view",
+  "schema_version": 1,
+  "generated_at": "2026-08-01T09:00:00+02:00",
+  "status": "not-configured",
+  "posture": "not-configured",
+  "workspace": {
+    "root": "/home/sam/work/sparse-project",
+    "name": "sparse-project",
+    "platform": "linux",
+    "git": {
+      "state": "clean",
+      "branch": "main",
+      "dirty": false,
+      "changed_count": 0
+    }
+  },
+  "capabilities": {
+    "wiki": { "state": "absent", "required": true, "reason": "no wiki/ directory found", "evidence": null },
+    "code_graph": { "state": "absent", "required": false, "reason": null, "evidence": null },
+    "goals": { "state": "absent", "required": false, "reason": null, "evidence": null },
+    "work": { "state": "absent", "required": false, "reason": null, "evidence": null },
+    "checkpoints": { "state": "absent", "required": false, "reason": null, "evidence": null },
+    "git": { "state": "ready", "required": false, "reason": null, "evidence": null },
+    "qmd": { "state": "absent", "required": false, "reason": null, "evidence": null },
+    "search_corpus": { "state": "absent", "required": true, "reason": "no wiki/ directory found", "evidence": null }
+  },
+  "artifacts": [],
+  "relationships": [],
+  "events": [],
+  "metrics": {},
+  "signals": [],
+  "hints": [
+    {
+      "kind": "no-memory",
+      "group": "wiki",
+      "severity": "action",
+      "message": "No wiki/ memory substrate found for this workspace.",
+      "command": "/loam::scaffolding-wiki",
+      "evidence": null
+    }
+  ],
+  "probes": []
+}
