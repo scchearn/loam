@@ -19,6 +19,11 @@ const removals = Object.freeze({
   codex: ['plugin', 'remove', 'loam@loam'],
 });
 
+const marketplaceRemovals = Object.freeze({
+  claude: ['plugin', 'marketplace', 'remove', 'loam'],
+  codex: ['plugin', 'marketplace', 'remove', 'loam'],
+});
+
 const updates = Object.freeze({
   claude: [
     ['plugin', 'update', 'loam@loam', '--scope', 'user'],
@@ -59,6 +64,20 @@ async function claudeRegistryState(root, readRegistry) {
 
 async function removeClaudeOrphanCache(root, removePath) {
   await removePath(join(root, 'plugins', 'cache', 'loam'), { recursive: true, force: true });
+}
+
+function goalAlreadyReached(run) {
+  if (run.ok) return true;
+  const detail = `${run.stderr || ''}\n${run.stdout || ''}`;
+  return /\b(?:not found|does not exist|no such (?:plugin|marketplace|source)|no (?:plugin|marketplace|source)|unknown (?:plugin|marketplace)|already (?:removed|gone|uninstalled|absent)|not (?:installed|configured|registered)|cannot find (?:plugin|marketplace|source))\b/i.test(detail);
+}
+
+function removalResult(run, action) {
+  return {
+    state: goalAlreadyReached(run) ? 'removed' : 'partial',
+    action: goalAlreadyReached(run) ? (run.ok ? action : 'already-absent') : 'failed',
+    ...(run.stderr || run.stdout ? { detail: run.stderr || run.stdout } : {}),
+  };
 }
 
 export async function installMarketplacePlugins({
@@ -109,7 +128,12 @@ export async function removeMarketplacePlugins({
   const result = {};
   for (const id of ['claude', 'codex']) {
     const harness = harnesses[id];
-    if (!harness?.marketplaceInstalled && !harness?.marketplaceConfigured) continue;
+    const hasPluginState = Boolean(harness?.marketplaceInstalled || harness?.marketplaceConfigured);
+    const hasMarketplaceRegistration = harness?.marketplaceRegistered === true;
+    if (!hasPluginState && !hasMarketplaceRegistration) continue;
+
+    let pluginRemoval;
+    let pluginRemovalInvoked = false;
 
     if (id === 'claude') {
       const registry = await claudeRegistryState(harness.root, readRegistry);
@@ -118,22 +142,50 @@ export async function removeMarketplacePlugins({
           // Only a registry with no loam entries can prove this cache is orphaned;
           // a project-scoped entry may still own the shared cache.
           if (!registry.hasAnyInstall) await removeClaudeOrphanCache(harness.root, removePath);
-          result[id] = { ...harness, state: 'removed' };
+          pluginRemoval = { state: 'removed', action: 'already-absent' };
         } catch (error) {
-          result[id] = {
-            ...harness,
-            state: 'partial',
-            detail: error instanceof Error ? error.message : String(error),
-          };
+          result[id] = { ...harness, state: 'partial', detail: error instanceof Error ? error.message : String(error) };
+          continue;
         }
+      } else if (hasPluginState) {
+        pluginRemovalInvoked = true;
+        const run = await runCommand({ command: id, args: removals[id], cwd, runner });
+        pluginRemoval = removalResult(run, 'removed');
+        if (pluginRemoval.state === 'partial') {
+          result[id] = { ...harness, state: 'partial', detail: pluginRemoval.detail || run.category };
+          continue;
+        }
+      }
+    } else if (hasPluginState) {
+      pluginRemovalInvoked = true;
+      const run = await runCommand({ command: id, args: removals[id], cwd, runner });
+      pluginRemoval = removalResult(run, 'removed');
+      if (pluginRemoval.state === 'partial') {
+        result[id] = { ...harness, state: 'partial', detail: pluginRemoval.detail || run.category };
         continue;
       }
     }
 
-    const run = await runCommand({ command: id, args: removals[id], cwd, runner });
-    result[id] = run.ok
-      ? { ...harness, state: 'removed' }
-      : { ...harness, state: 'partial', detail: run.stderr || run.category };
+    // Plugin removal can leave the source registration behind. Remove only the
+    // named Loam marketplace, and treat a missing registration as success.
+    if (hasMarketplaceRegistration || pluginRemovalInvoked) {
+      const run = await runCommand({ command: id, args: marketplaceRemovals[id], cwd, runner });
+      const marketplaceRemoval = removalResult(run, 'removed');
+      if (marketplaceRemoval.state === 'partial') {
+        result[id] = {
+          ...harness,
+          state: 'removed',
+          pluginRemoval,
+          marketplaceRemoval,
+          warnings: [{ kind: 'marketplace_registration', detail: marketplaceRemoval.detail || run.category || 'unknown failure' }],
+        };
+        continue;
+      }
+      result[id] = { ...harness, state: 'removed', pluginRemoval, marketplaceRemoval };
+      continue;
+    }
+
+    result[id] = { ...harness, state: 'removed', pluginRemoval };
   }
   return result;
 }

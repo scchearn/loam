@@ -455,8 +455,180 @@ test('uninstall delegates marketplace plugin removal to Claude and Codex', async
   assert.equal(code, 0);
   assert.deepEqual(calls, [
     { command: 'claude', args: ['plugin', 'uninstall', 'loam@loam', '--scope', 'user', '--yes'] },
+    { command: 'claude', args: ['plugin', 'marketplace', 'remove', 'loam'] },
     { command: 'codex', args: ['plugin', 'remove', 'loam@loam'] },
+    { command: 'codex', args: ['plugin', 'marketplace', 'remove', 'loam'] },
   ]);
+});
+
+test('uninstall removes only Loam Codex hook-state sections and preserves the rest byte-for-byte', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const configPath = join(home, '.codex', 'config.toml');
+  const before = [
+    'model = "keep-me"\n',
+    'trusted_commands = [\n',
+    '  "one",\n',
+    '  "two",\n',
+    ']\n',
+    '[plugins."loam@loam"]\n',
+    'enabled = true\n',
+    '\n',
+    '[hooks.state."loam@loam:hooks/hooks.json:session_start:0:0"]\n',
+    'command = "loam-session-start"\n',
+    'enabled = true\n',
+    '\n',
+    '[hooks.state."other@plugin:hooks/hooks.json:session_start:0:0"]\n',
+    'command = "keep-other"\n',
+    '\n',
+    '[projects."/workspace/loam"]\n',
+    'trust_level = "trusted"\n',
+    '\n',
+    '[hooks.state."loam@loam:hooks/hooks.json:stop:1:2"]\n',
+    'command = "loam-stop"\n',
+    '\n',
+    '[projects."/workspace/other"]\n',
+    'trust_level = "untrusted"\n',
+  ].join('');
+  const after = [
+    'model = "keep-me"\n',
+    'trusted_commands = [\n',
+    '  "one",\n',
+    '  "two",\n',
+    ']\n',
+    '[plugins."loam@loam"]\n',
+    'enabled = true\n',
+    '\n',
+    '[hooks.state."other@plugin:hooks/hooks.json:session_start:0:0"]\n',
+    'command = "keep-other"\n',
+    '\n',
+    '[projects."/workspace/loam"]\n',
+    'trust_level = "trusted"\n',
+    '\n',
+    '[projects."/workspace/other"]\n',
+    'trust_level = "untrusted"\n',
+  ].join('');
+  await writeFile(configPath, before);
+
+  const skills = skillsRunner();
+  const calls = [];
+  const runner = async (request) => {
+    if (request.command === 'codex') {
+      calls.push({ command: request.command, args: request.args });
+      return { code: 0, stdout: '', stderr: '' };
+    }
+    return skills(request);
+  };
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner, output: { write: () => {} } });
+
+  assert.equal(code, 0);
+  assert.equal(await readFile(configPath, 'utf8'), after);
+  assert.deepEqual(calls, [
+    { command: 'codex', args: ['plugin', 'remove', 'loam@loam'] },
+    { command: 'codex', args: ['plugin', 'marketplace', 'remove', 'loam'] },
+  ]);
+});
+
+test('uninstall leaves a Codex TOML file untouched when it has no Loam hook-state sections', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const configPath = join(home, '.codex', 'config.toml');
+  const before = [
+    'model = "keep-me"\n',
+    '\n',
+    '[projects."/workspace/loam"]\n',
+    'trust_level = "trusted"\n',
+    '\n',
+    '[projects."/workspace/other"]\n',
+    'trust_level = "untrusted"\n',
+  ].join('');
+  await writeFile(configPath, before);
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
+
+  assert.equal(code, 0);
+  assert.equal(await readFile(configPath, 'utf8'), before);
+});
+
+test('uninstall warns and leaves malformed Codex TOML unchanged', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const configPath = join(home, '.codex', 'config.toml');
+  const before = '[hooks.state."loam@loam:hooks/hooks.json:session_start:0:0"]\ncommand = [\n';
+  await writeFile(configPath, before);
+  let output = '';
+
+  const code = await uninstall({
+    home,
+    globalRoot,
+    yes: true,
+    runner: skillsRunner(),
+    output: { write: (chunk) => { output += chunk; } },
+  });
+
+  assert.equal(code, 0);
+  assert.equal(await readFile(configPath, 'utf8'), before);
+  assert.match(output, /Codex config cleanup warning/i);
+  assert.match(output, /malformed TOML/i);
+});
+
+test('uninstall preserves section-looking text inside a multiline TOML string', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const configPath = join(home, '.codex', 'config.toml');
+  const before = [
+    '[profile.instructions]\n',
+    'text = """\n',
+    '[hooks.state."loam@loam:inside-string"]\n',
+    'keep_me = true\n',
+    '"""\n',
+    '\n',
+    '[hooks.state."loam@loam:real-section"]\n',
+    'remove_me = true\n',
+    '\n',
+    '[projects."/workspace/loam"]\n',
+    'trust_level = "trusted"\n',
+  ].join('');
+  const after = [
+    '[profile.instructions]\n',
+    'text = """\n',
+    '[hooks.state."loam@loam:inside-string"]\n',
+    'keep_me = true\n',
+    '"""\n',
+    '\n',
+    '[projects."/workspace/loam"]\n',
+    'trust_level = "trusted"\n',
+  ].join('');
+  await writeFile(configPath, before);
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
+
+  assert.equal(code, 0);
+  assert.equal(await readFile(configPath, 'utf8'), after);
+});
+
+test('uninstall warns but continues when marketplace registration cleanup fails', async () => {
+  const { home, globalRoot } = await readyFixture();
+  await writeFile(join(home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
+  let output = '';
+  const skills = skillsRunner();
+  const runner = async (request) => {
+    if (request.command === 'codex' && request.args.includes('marketplace')) {
+      return { code: 1, stdout: '', stderr: 'marketplace permission denied' };
+    }
+    if (request.command === 'codex') return { code: 0, stdout: '', stderr: '' };
+    return skills(request);
+  };
+
+  const code = await uninstall({
+    home,
+    globalRoot,
+    yes: true,
+    runner,
+    output: { write: (chunk) => { output += chunk; } },
+  });
+
+  assert.equal(code, 0);
+  assert.equal(await exists(globalRoot), false);
+  assert.match(output, /marketplace registration cleanup warning/i);
+  assert.match(output, /marketplace permission denied/);
 });
 
 test('plugin-only uninstall succeeds without install metadata', async () => {
@@ -481,7 +653,10 @@ test('plugin-only uninstall succeeds without install metadata', async () => {
   const code = await uninstall({ home, globalRoot, yes: true, runner, output: { write: () => {} } });
 
   assert.equal(code, 0);
-  assert.deepEqual(calls, [['plugin', 'uninstall', 'loam@loam', '--scope', 'user', '--yes']]);
+  assert.deepEqual(calls, [
+    ['plugin', 'uninstall', 'loam@loam', '--scope', 'user', '--yes'],
+    ['plugin', 'marketplace', 'remove', 'loam'],
+  ]);
 });
 
 test('plugin-only uninstall removes an orphaned Claude cache without invoking its CLI', async () => {
