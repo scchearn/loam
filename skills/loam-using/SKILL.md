@@ -19,17 +19,21 @@ This is the router for the loam skill namespace. It tells you which loam skill t
 
 ## Global installation boundary
 
-Loam is installed once under the user's global `<home>/.agents/loam/` root.
-Skills are global and authoritative; the current workspace owns only its
-memory, goals, specs, plans, and checkpoint data. Do not install, update, or
-execute a project-local Loam runtime or skill copy.
+Skills are installed once globally under `<home>/.agents/skills/` and are
+authoritative; the current workspace owns only its memory, goals, specs,
+plans, and checkpoint data. The native runtime binary lives in the config-dir
+runtime store — `<config-root>/runtime/<version>/<target>/loam[.exe]`,
+selected by `<config-root>/runtime/ledger.json` — never on `PATH` and never
+inside a project. Do not install, update, or execute a project-local Loam
+runtime or skill copy.
 
 The injected `Native runtime command:` line is the only runtime command for
 skills. Use its quoted absolute native executable prefix directly; on Windows
 the value includes the PowerShell call operator and `.exe` path. The shared
-Node integration entry is reserved for status and harness startup. Setup owns
-downloads, updates, migration, and configuration. Startup and the integration
-are read-only, network-free, and must not poll for updates.
+Node integration entry is reserved for status; adapters own hook spawning.
+`npx @scchearn/loam install` owns first install, repair, downloads, updates,
+and migration; `setup` only configures an existing install. Startup and the
+integration are read-only, network-free, and must not poll for updates.
 
 ## The memory model
 
@@ -161,11 +165,32 @@ For native operations, invoke the same native command directly:
 <native-runtime-command> <native-loam-args>
 ```
 
+### Native command surface
+
+Skill-relevant subcommands (all run through `<native-runtime-command>`):
+
+- `state [--fast] <workspace-root>` — workspace state JSON: `wiki_root`,
+  qmd readiness, checkpoints, drift, signals. `--fast` skips expensive
+  aggregation; prefer the injected block before re-running it.
+- `lint [--only markdown|memory|work] <workspace-root>` — three-domain lint;
+  default runs all three, `--only` runs exactly one.
+- `datecheck <check|fix> <wiki-root> [--offset +HH:MM]` — timestamp lint and
+  repair; canonical offsets are `±HH:MM`.
+- `codegraph index <wiki-root> [--codebase-root <dir>]`, `walk
+  <codebase-root>`, `diff <codebase-root> [<wiki-root>]` — build, list, and
+  drift-check the code graph.
+- `checkpoint state [--window <minutes>] [<workspace-root>]` — digest of
+  recently touched files; `checkpoint verify <note.md>` validates a checkpoint
+  note and always exits 0.
+
+`hooks`, `hook`, `federation`, and `check versions` are adapter, setup, and
+release surfaces — not skill-callable state sources.
+
 If the integration reports `Loam is unavailable` or does not provide real
-state, you may run `npx @scchearn/loam setup` to install or repair Loam.
-Setup is agent-initiated — if the recovery command is in your context, use
-it. If setup succeeds, continue the task. If setup fails, retry once. If it
-fails again, report the failure output to the user and stop — do not loop.
+state, you may run `npx @scchearn/loam install` to install or repair Loam.
+Install is agent-initiated — if the recovery command is in your context, use
+it. If install succeeds, continue the task. If install fails, retry once. If
+it fails again, report the failure output to the user and stop — do not loop.
 Never fabricate workspace state or hints and never fall back to a
 project-local launcher.
 

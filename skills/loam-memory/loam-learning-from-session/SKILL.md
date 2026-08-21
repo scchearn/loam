@@ -200,7 +200,7 @@ If `exists` is false, stop and recommend:
 /loam::scaffolding-wiki <topic or wiki goal>
 ```
 
-If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. Use `wiki_root` as the resolved wiki root. Treat `has_overview: true` or a `legacy_structure_pending` hint as a legacy root-hub file. Use `qmd_ready` + `collection` for qmd state.
+If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam install`; do not fabricate state or use a project-local fallback. Use `wiki_root` as the resolved wiki root. Treat `has_overview: true` or a `legacy_structure_pending` hint as a legacy root-hub file. Use `qmd_ready` + `collection` for qmd state.
 
 If qmd is ready, follow the **qmd and code-graph discovery** protocol in `loam::using` (the router) for finding existing destination notes — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (search terms for what the session resolved, archive exclusion) if you want it. If qmd is not ready, use Grep/Glob to find existing pages.
 

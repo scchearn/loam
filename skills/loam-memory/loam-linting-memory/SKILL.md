@@ -52,7 +52,7 @@ If `exists` is false, check whether `goals/` exists (`ls goals/*.md 2>/dev/null`
 
 If the target was a single `goals/<slug>.md` path, skip all wiki-only steps and run only the goal-health pass for that file.
 
-If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. Use `wiki_root` as the resolved wiki root (resolved from on-disk contract files, not qmd metadata). If `has_overview` is true, note it as a legacy root-hub file to fold into `index.md`. Then resolve the lint scope: if the user named a wiki root, subdirectory, topic, or entity, use that. If no scope given, lint the whole wiki.
+If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam install`; do not fabricate state or use a project-local fallback. Use `wiki_root` as the resolved wiki root (resolved from on-disk contract files, not qmd metadata). If `has_overview` is true, note it as a legacy root-hub file to fold into `index.md`. Then resolve the lint scope: if the user named a wiki root, subdirectory, topic, or entity, use that. If no scope given, lint the whole wiki.
 
 This skill satisfies the `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, and `legacy_structure_pending` hints (see the hint contract in `loam::using`); treat them as advisory scope, not extra mandatory work. Fast state omits date drift, which the lint pass checks directly later.
 
@@ -89,7 +89,7 @@ arguments or an unreadable input. `--only markdown|memory|work` narrows the
 scan. The command is read-only and never fixes anything.
 
 If it exits 75 or 78 the native runtime is not ready — stop and report
-`npx @scchearn/loam setup`. Do not claim a clean result from a fallback check.
+`npx @scchearn/loam install`. Do not claim a clean result from a fallback check.
 The linter reports; **you** classify findings and apply safe fixes directly,
 recording each in `log.md`. Memory writes are agent-owned — the log entry is
 the audit trail, not a human gate. Never report a mechanical, reversible fix

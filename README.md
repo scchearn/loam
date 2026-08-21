@@ -292,10 +292,10 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::learning-from-session | 487 | 101 | 365 | 4,212 |
 | loam::linting-memory | 471 | 102 | 312 | 4,980 |
 | loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
-| loam::querying-memory | 530 | 105 | 175 | 1,596 |
+| loam::querying-memory | 530 | 105 | 175 | 1,593 |
 | loam::reviewing-memory | 510 | 113 | 137 | 1,787 |
 | loam::syncing-code-graph | 363 | 84 | 223 | 2,780 |
-| loam::using | 368 | 77 | 252 | 4,187 |
+| loam::using | 368 | 77 | 277 | 4,526 |
 | loam::amending-plan | 437 | 88 | 273 | 3,059 |
 | loam::checkpointing | 365 | 69 | 177 | 2,091 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,237 |
