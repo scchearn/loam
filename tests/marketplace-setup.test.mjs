@@ -252,3 +252,30 @@ test('marketplace removal skips Claude CLI when the registry and cache are absen
   assert.equal(called, false);
   assert.equal(result.claude.state, 'removed');
 });
+
+test('marketplace removal preserves a project-scoped Claude cache', async () => {
+  const root = await claudeRoot();
+  const cache = join(root, 'plugins', 'cache', 'loam', 'loam', '0.9.2');
+  await mkdir(cache, { recursive: true });
+  await writeFile(join(cache, 'project-plugin.txt'), 'project-owned plugin cache');
+  await mkdir(join(root, 'plugins'), { recursive: true });
+  await writeFile(join(root, 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'project', installPath: '/cache/loam' }] },
+  }));
+  let called = false;
+
+  const result = await removeMarketplacePlugins({
+    harnesses: {
+      claude: { ...harnesses.claude, root, marketplaceInstalled: true },
+    },
+    runner: async () => {
+      called = true;
+      return { code: 1, stdout: '', stderr: 'Claude CLI must not run for project-only state' };
+    },
+  });
+
+  assert.equal(called, false);
+  assert.equal(await exists(cache), true);
+  assert.equal(result.claude.state, 'removed');
+});
