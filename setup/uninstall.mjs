@@ -10,7 +10,7 @@ import { inspectIntent } from '../integration/ingest.mjs';
 import { loadSkillInventory } from './inventory.mjs';
 import { listSkills, skillEntryAliases, skillEntrySource } from './skills.mjs';
 import { runSkills } from './process.mjs';
-import { announce, confirmUninstall, finish } from './wizard.mjs';
+import { announce, confirmUninstall, finish, harnessLabel } from './wizard.mjs';
 import { removeMarketplacePlugins } from './marketplace.mjs';
 import { removeFederationService } from './federation.mjs';
 import { readLedger } from './integrations/ledger.mjs';
@@ -389,6 +389,11 @@ export async function uninstall({
     runner,
   });
   if (Object.values(results.marketplace).some((entry) => entry.state === 'partial')) {
+    for (const [id, entry] of Object.entries(results.marketplace)) {
+      if (entry.state === 'partial') {
+        output.write(`${harnessLabel(id)} marketplace removal failed: ${entry.detail || 'unknown failure'}\n`);
+      }
+    }
     output.write('Marketplace plugin removal failed; Loam core was preserved.\n');
     return 1;
   }

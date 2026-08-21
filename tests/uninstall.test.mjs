@@ -484,6 +484,59 @@ test('plugin-only uninstall succeeds without install metadata', async () => {
   assert.deepEqual(calls, [['plugin', 'uninstall', 'loam@loam', '--scope', 'user', '--yes']]);
 });
 
+test('plugin-only uninstall removes an orphaned Claude cache without invoking its CLI', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-uninstall-orphan-'));
+  const globalRoot = join(home, '.agents', 'loam');
+  const cache = join(home, '.claude', 'plugins', 'cache', 'loam');
+  await mkdir(cache, { recursive: true });
+  await writeFile(join(cache, 'orphan.txt'), 'orphaned plugin cache');
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
+  const calls = [];
+  const runner = async (request) => {
+    if (request.command === 'claude') {
+      calls.push(request.args);
+      return { code: 1, stdout: '', stderr: 'Claude CLI must not run for an orphan cache' };
+    }
+    return skillsRunner({ installed: false })(request);
+  };
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner, output: { write: () => {} } });
+
+  assert.equal(code, 0);
+  assert.deepEqual(calls, []);
+  assert.equal(await exists(cache), false, 'orphaned Claude cache removed');
+});
+
+test('uninstall reports genuine marketplace CLI failure detail and preserves the core', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.2');
+  await mkdir(cache, { recursive: true });
+  await writeFile(join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'loam@loam': true } }));
+  await writeFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'user', installPath: cache, version: '0.9.2' }] },
+  }));
+  const detail = 'Claude uninstall permission denied';
+  const skills = skillsRunner();
+  const runner = async (request) => request.command === 'claude'
+    ? { code: 1, stdout: '', stderr: detail }
+    : skills(request);
+  let output = '';
+
+  const code = await uninstall({
+    home,
+    globalRoot,
+    yes: true,
+    runner,
+    output: { write: (chunk) => { output += chunk; } },
+  });
+
+  assert.equal(code, 1);
+  assert.match(output, /Marketplace plugin removal failed; Loam core was preserved/);
+  assert.match(output, new RegExp(detail));
+  assert.equal(await exists(globalRoot), true, 'core remains after marketplace failure');
+});
+
 test('uninstall deletes a fresh harness config created by setup, not leaving an empty husk', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-uninstall-fresh-'));
   const globalRoot = join(home, '.agents', 'loam');
