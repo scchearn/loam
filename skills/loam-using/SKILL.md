@@ -183,8 +183,29 @@ Skill-relevant subcommands (all run through `<native-runtime-command>`):
   recently touched files; `checkpoint verify <note.md>` validates a checkpoint
   note and always exits 0.
 
-`hooks`, `hook`, `federation`, and `check versions` are adapter, setup, and
-release surfaces — not skill-callable state sources.
+`hooks`, `hook`, and `check versions` are adapter, setup, and release
+surfaces — not skill-callable state sources.
+
+### Federation
+
+The injected `## Federation` line is authoritative: `unenrolled`, `degraded
+(reason)`, or `live · project · items`. Degraded means collaboration state is
+unavailable this turn — the local context above it stays complete and current.
+Do not probe the broker, and never fabricate federation state; teammate items
+arrive as wake tips and are informational unless they request you.
+
+To join a project on this machine (agent-initiated, user-approved):
+`<native-runtime-command> federation connect <workspace>
+mqtts://<broker-host>:<port> --project <org/project> --token-file <path>`.
+The enrollment token comes from the broker operator — prefer `--token-file`;
+never place tokens in shell history or committed files. Git `user.email` must
+be set first. Read-only inventory: `federation list` and `federation status`
+(add `--json` for machine-readable output). Refusals map to fixes:
+`bad-token` → obtain a fresh token from the operator;
+`git-identity-required` → set `git config --global user.email`;
+`signer-unreachable` / `signer-timeout` → broker-side network problem,
+report to the operator. `federation emit` and `inject` are connector/adapter
+surfaces, not skill operations.
 
 If the integration reports `Loam is unavailable` or does not provide real
 state, you may run `npx @scchearn/loam install` to install or repair Loam.
