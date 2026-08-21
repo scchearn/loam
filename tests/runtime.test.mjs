@@ -59,8 +59,6 @@ test('resolveRuntimeTarget derives the target and channel from the package const
   assert.equal(resolved, RUNTIME_VERSION);
   // Provenance channel matches plugin-release.yml dist-tag routing.
   assert.equal(channel, RUNTIME_VERSION.includes('-') ? 'next' : 'latest');
-  // Explicit both-branch coverage of the suffix rule via the resolver output.
-  assert.equal(resolveRuntimeTarget({ env: {} }).channel, 'next'); // constant is 0.11.0-next.x
 });
 
 test('LOAM_RUNTIME_VERSION pins the target and marks the channel pinned', () => {

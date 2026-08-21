@@ -203,7 +203,8 @@ test('clean --yes setup completes and publishes verified install metadata', asyn
   assert.equal(metadata.skills_scope, 'global');
   const ledger = await readLedgerFor(fixture.home);
   assert.equal(ledger.schema_version, 1);
-  assert.equal(ledger.channel, 'next');
+  // Channel follows the package constant's lane: prerelease → next, final → latest.
+  assert.equal(ledger.channel, RUNTIME_VERSION.includes('-') ? 'next' : 'latest');
   assert.equal(ledger.target, RUNTIME_VERSION);
   assert.equal(ledger.sha256, createHash('sha256').update(fixture.release.bytes).digest('hex'));
   assert.equal(await readFile(ledger.store_path, 'utf8'), fixture.release.bytes);
