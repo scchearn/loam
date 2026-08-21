@@ -133,13 +133,20 @@ async function configureFederation(action, { discovery, install, parsed, options
   return { ok: true };
 }
 
-async function configureIntegration(id, mode, { discovery, install, parsed, options }) {
+function retryCommand(id, mode) {
+  return mode === 'enable'
+    ? `npx @scchearn/loam setup --integration ${id}`
+    : `npx @scchearn/loam setup --disable-integration ${id}`;
+}
+
+export async function configureIntegration(id, mode, { discovery, install, parsed, options }) {
   const output = options.output || process.stdout;
   const errorOutput = options.errorOutput || process.stderr;
   const entry = catalogEntry(id);
   if (!entry) {
     const known = CATALOG.map((e) => e.id).join(', ') || 'none available in this release';
     errorOutput.write(`Unknown integration: ${id} (available: ${known})\n`);
+    if (mode === 'enable') errorOutput.write(`Retry with: ${retryCommand(id, mode)}\n`);
     return { ok: false };
   }
   const ctx = {
@@ -152,6 +159,7 @@ async function configureIntegration(id, mode, { discovery, install, parsed, opti
     // Tool install/health spawns go through toolRunner (injected in tests, real
     // spawn in production); the cache-removal prompt uses confirm/input.
     toolRunner: options.toolRunner,
+    env: options.env || discovery.env,
     confirm: options.integrationConfirm,
     input: options.input,
     output,
@@ -159,12 +167,21 @@ async function configureIntegration(id, mode, { discovery, install, parsed, opti
   if (mode === 'enable' && entry.egress) {
     stepDetail(output, `${entry.label} sends queries to a third-party service (egress) — enabling is your consent.`);
   }
-  const result = mode === 'enable' ? await entry.enable(ctx) : await entry.disable(ctx);
+  let result;
+  try {
+    result = mode === 'enable' ? await entry.enable(ctx) : await entry.disable(ctx);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    errorOutput.write(`Integration ${id} ${mode} failed: ${detail}\n`);
+    if (mode === 'enable') errorOutput.write(`Retry with: ${retryCommand(id, mode)}\n`);
+    return { ok: false };
+  }
   if (!result?.ready) {
     const leftovers = result?.leftovers?.length
       ? ` — leftovers: ${result.leftovers.map((l) => l.harness ? `${l.kind}:${l.harness}` : (l.path || l.kind)).join(', ')}`
       : '';
     errorOutput.write(`Integration ${id} ${mode} failed: ${result?.detail || result?.category || 'unknown'}${leftovers}\n`);
+    if (mode === 'enable') errorOutput.write(`Retry with: ${retryCommand(id, mode)}\n`);
     return { ok: false };
   }
   stepDone(output, `Integration ${id} ${mode === 'enable' ? 'enabled' : 'disabled'}`);
