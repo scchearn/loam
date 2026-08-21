@@ -166,7 +166,9 @@ test('marketplace removal delegates to each owning harness', async () => {
 
   assert.deepEqual(calls, [
     { command: 'claude', args: ['plugin', 'uninstall', 'loam@loam', '--scope', 'user', '--yes'] },
+    { command: 'claude', args: ['plugin', 'marketplace', 'remove', 'loam'] },
     { command: 'codex', args: ['plugin', 'remove', 'loam@loam'] },
+    { command: 'codex', args: ['plugin', 'marketplace', 'remove', 'loam'] },
   ]);
   assert.equal(result.claude.state, 'removed');
   assert.equal(result.codex.state, 'removed');
@@ -185,7 +187,38 @@ test('marketplace removal delegates configured plugins even when cache bytes are
     },
   });
 
-  assert.deepEqual(calls, ['claude', 'codex']);
+  assert.deepEqual(calls, ['claude', 'claude', 'codex', 'codex']);
+});
+
+test('marketplace registration removal treats an already absent marketplace as removed', async () => {
+  const calls = [];
+  const result = await removeMarketplacePlugins({
+    harnesses: {
+      codex: { ...harnesses.codex, marketplaceRegistered: true },
+    },
+    runner: async (request) => {
+      calls.push({ command: request.command, args: request.args });
+      return request.args.includes('marketplace')
+        ? { code: 1, stdout: '', stderr: 'marketplace loam not found' }
+        : { code: 0, stdout: '', stderr: '' };
+    },
+  });
+
+  assert.deepEqual(calls, [
+    { command: 'codex', args: ['plugin', 'marketplace', 'remove', 'loam'] },
+  ]);
+  assert.equal(result.codex.state, 'removed');
+  assert.equal(result.codex.marketplaceRemoval?.state, 'removed');
+
+  const second = await removeMarketplacePlugins({
+    harnesses: { codex: { ...harnesses.codex, marketplaceRegistered: true } },
+    runner: async (request) => {
+      calls.push({ command: request.command, args: request.args });
+      return { code: 1, stdout: '', stderr: 'marketplace loam not found' };
+    },
+  });
+  assert.equal(second.codex.state, 'removed');
+  assert.equal(calls.length, 2, 'the second pass still reaches the same goal without a partial result');
 });
 
 test('marketplace removal invokes Claude CLI for a user-scoped registry entry', async () => {
@@ -209,6 +242,7 @@ test('marketplace removal invokes Claude CLI for a user-scoped registry entry', 
 
   assert.deepEqual(calls, [
     { command: 'claude', args: ['plugin', 'uninstall', 'loam@loam', '--scope', 'user', '--yes'] },
+    { command: 'claude', args: ['plugin', 'marketplace', 'remove', 'loam'] },
   ]);
   assert.equal(result.claude.state, 'removed');
 });

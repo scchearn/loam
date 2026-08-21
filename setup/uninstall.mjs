@@ -94,6 +94,192 @@ function cleanCursorConfig(config, globalRoot) {
   };
 }
 
+function lineWithoutEnding(line) {
+  return line.endsWith('\r\n') ? line.slice(0, -2)
+    : line.endsWith('\n') || line.endsWith('\r') ? line.slice(0, -1) : line;
+}
+
+function tomlLineWithoutComment(line) {
+  let quote = null;
+  let triple = false;
+  let escaped = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const next = line.slice(index, index + 3);
+    if (triple) {
+      if (next === triple) {
+        triple = false;
+        index += 2;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') quote = null;
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") quote = null;
+      continue;
+    }
+    if (next === '"""' || next === "'''") {
+      triple = next;
+      index += 2;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '#') return line.slice(0, index);
+  }
+  return line;
+}
+
+function tomlHeader(line) {
+  const text = tomlLineWithoutComment(lineWithoutEnding(line)).trim();
+  if (!text.startsWith('[')) return null;
+  const array = text.startsWith('[[');
+  const close = array ? ']]' : ']';
+  if (!text.endsWith(close)) return false;
+  const inner = text.slice(array ? 2 : 1, -close.length).trim();
+  if (!inner) return false;
+  let quote = null;
+  let escaped = false;
+  for (const char of inner) {
+    if (quote === '"') {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') quote = null;
+    } else if (quote === "'") {
+      if (char === "'") quote = null;
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === '[' || char === ']') {
+      return false;
+    }
+  }
+  return quote === null ? { text, array } : false;
+}
+
+function isLoamCodexHookState(line) {
+  const header = tomlHeader(line);
+  return Boolean(header && !header.array
+    && /^\[hooks\.state\."loam@loam:[^"]*"\]$/.test(header.text));
+}
+
+function isValidToml(contents) {
+  const lines = contents.split(/(?<=\n)/);
+  const stack = [];
+  let triple = null;
+
+  for (const rawLine of lines) {
+    const line = lineWithoutEnding(rawLine);
+    const header = tomlHeader(rawLine);
+    const trimmed = tomlLineWithoutComment(line).trim();
+    const continuationAtStart = Boolean(triple || stack.length);
+    if (header === false && !continuationAtStart) return false;
+    if (header && !continuationAtStart) {
+      continue;
+    }
+    if (!trimmed && !triple) continue;
+
+    let assignment = false;
+    let valueMeaningful = false;
+    let meaningful = false;
+    let quote = null;
+    let escaped = false;
+    let continuation = continuationAtStart;
+    for (let index = 0; index < line.length; index += 1) {
+      const char = line[index];
+      const next = line.slice(index, index + 3);
+      if (triple) {
+        if (next === triple) {
+          triple = null;
+          index += 2;
+        }
+        continue;
+      }
+      if (quote === '"') {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === '"') quote = null;
+        continue;
+      }
+      if (quote === "'") {
+        if (char === "'") quote = null;
+        continue;
+      }
+      if (next === '"""' || next === "'''") {
+        triple = next;
+        continuation = true;
+        meaningful = true;
+        if (assignment) valueMeaningful = true;
+        index += 2;
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        quote = char;
+        meaningful = true;
+        if (assignment) valueMeaningful = true;
+        continue;
+      }
+      if (char === '#') break;
+      if (!/\s/.test(char)) meaningful = true;
+      if (char === '=' && !stack.length) assignment = true;
+      else if (assignment && !/\s/.test(char)) valueMeaningful = true;
+      if (char === '[' || char === '{') stack.push(char);
+      else if (char === ']' || char === '}') {
+        const expected = char === ']' ? '[' : '{';
+        if (stack.pop() !== expected) return false;
+      }
+    }
+    if (quote || escaped) return false;
+    if (meaningful && !assignment && !continuation && !triple && !stack.length) return false;
+    if (assignment && !valueMeaningful && !triple && !stack.length) return false;
+  }
+  return !triple && stack.length === 0;
+}
+
+function stripCodexLoamHookState(contents) {
+  if (!isValidToml(contents)) return { action: 'skipped', reason: 'malformed TOML' };
+  const lines = contents.split(/(?<=\n)/);
+  const kept = [];
+  let removing = false;
+  let removed = false;
+  for (const line of lines) {
+    if (tomlHeader(line)) {
+      removing = isLoamCodexHookState(line);
+      if (removing) removed = true;
+    }
+    if (!removing) kept.push(line);
+  }
+  return removed
+    ? { action: 'cleaned', contents: kept.join('') }
+    : { action: 'untouched', contents };
+}
+
+async function cleanCodexMarketplaceConfig(path) {
+  let contents;
+  try {
+    contents = await readFile(path, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { path, action: 'absent' };
+    return { path, action: 'skipped', reason: `read failed: ${error?.message || String(error)}` };
+  }
+
+  const cleaned = stripCodexLoamHookState(contents);
+  if (cleaned.action !== 'cleaned') return { path, ...cleaned };
+  try {
+    const mode = (await stat(path)).mode & 0o777;
+    await writeAtomicFile(path, cleaned.contents, { mode });
+    return { path, action: 'cleaned' };
+  } catch (error) {
+    return { path, action: 'skipped', reason: `write failed: ${error?.message || String(error)}` };
+  }
+}
+
 async function hasBackup(dir) {
   for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
     if (entry.isFile() && entry.name.includes('.backup-')) return true;
@@ -272,6 +458,9 @@ export async function removeHarnesses({
     const detected = await detectHarnesses({ home });
     const scoped = Object.fromEntries(marketIds.map((id) => [id, detected[id]]));
     result.marketplace = await removeMarketplacePlugins({ harnesses: scoped, cwd, runner });
+    if (idSet.has('codex') && !Object.values(result.marketplace).some((entry) => entry.state === 'partial')) {
+      result.codexMarketplaceConfig = await cleanCodexMarketplaceConfig(join(home, '.codex', 'config.toml'));
+    }
   }
 
   for (const id of ids) {
@@ -334,7 +523,9 @@ export async function uninstall({
   const detectedHarnesses = await detectHarnesses({ home });
   const codexAgentProfile = await inspectCodexAgentProfile(home);
   const hasMarketplacePlugin = ['claude', 'codex'].some((id) =>
-    detectedHarnesses[id]?.marketplaceInstalled || detectedHarnesses[id]?.marketplaceConfigured);
+    detectedHarnesses[id]?.marketplaceInstalled
+      || detectedHarnesses[id]?.marketplaceConfigured
+      || detectedHarnesses[id]?.marketplaceRegistered);
   const shimPresent = await exists(locations.shimPath)
     || (platform === 'win32' && await exists(locations.scriptPath));
   if (!install && !listedSkills.names.length && !hasMarketplacePlugin && !shimPresent
@@ -358,7 +549,7 @@ export async function uninstall({
     '- Remove Loam-owned hook entries from the Claude, Codex, and Cursor configs',
     '- Remove the Loam-owned Codex ingestion profile, restoring any pre-existing profile preserved by setup',
     '- Remove the Loam plugin file from OpenCode, which integrates by plugin rather than hooks',
-    '- Remove installed Claude and Codex marketplace plugins through their native CLIs',
+    '- Remove installed Claude and Codex marketplace plugins and the Loam marketplace registration through their native CLIs',
     `- Remove the global Loam root (install.json, runtime, integration, plugins, local operational history) at: ${root}`,
     `- Remove the stable loam launcher at: ${locations.shimPath}`,
     ...(platform === 'win32' ? ['- Remove the per-user PATH entry only when Loam added it'] : []),
@@ -396,6 +587,23 @@ export async function uninstall({
     }
     output.write('Marketplace plugin removal failed; Loam core was preserved.\n');
     return 1;
+  }
+  for (const [id, entry] of Object.entries(results.marketplace)) {
+    for (const warning of entry.warnings || []) {
+      output.write(`${harnessLabel(id)} marketplace registration cleanup warning: ${warning.detail}\n`);
+    }
+  }
+
+  const shouldCleanCodexMarketplaceConfig = install?.configured_harnesses?.includes('codex')
+    || detectedHarnesses.codex?.marketplaceInstalled
+    || detectedHarnesses.codex?.marketplaceConfigured
+    || detectedHarnesses.codex?.marketplaceRegistered;
+  if (shouldCleanCodexMarketplaceConfig) {
+    const codexMarketplaceConfig = await cleanCodexMarketplaceConfig(join(home, '.codex', 'config.toml'));
+    results.codexMarketplaceConfig = codexMarketplaceConfig;
+    if (codexMarketplaceConfig.action === 'skipped') {
+      output.write(`Codex config cleanup warning: ${codexMarketplaceConfig.reason}\n`);
+    }
   }
 
   results.skills = await removeGlobalSkills({
