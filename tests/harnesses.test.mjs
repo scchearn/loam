@@ -662,6 +662,24 @@ test('disabled marketplace plugins remain discoverable for uninstall', async () 
   assert.equal(detected.claude.marketplaceOwned, false);
 });
 
+test('orphaned Loam marketplace registrations remain discoverable for uninstall', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-registration-'));
+  await mkdir(join(home, '.claude', 'plugins'), { recursive: true });
+  await mkdir(join(home, '.codex'), { recursive: true });
+  await writeFile(join(home, '.claude', 'plugins', 'known_marketplaces.json'), JSON.stringify({
+    loam: { source: { source: 'github', repo: 'scchearn/loam' } },
+  }));
+  await writeFile(join(home, '.codex', 'config.toml'), [
+    '[marketplaces.loam]\n',
+    'source = "github.com/scchearn/loam.git"\n',
+  ].join(''));
+
+  const detected = await detectHarnesses({ home });
+
+  assert.equal(detected.claude.marketplaceRegistered, true);
+  assert.equal(detected.codex.marketplaceRegistered, true);
+});
+
 test('project-scoped Claude plugins do not satisfy a user-scoped install', async () => {
   const home = await mkdtemp(join(tmpdir(), 'loam-marketplace-project-scope-'));
   const cache = join(home, '.claude', 'plugins', 'cache', 'loam', 'loam', '0.9.4');

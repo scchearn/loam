@@ -104,6 +104,19 @@ async function codexMarketplaceInstall(root, name, pluginVersion) {
   return { installed: true, ready, pluginRoot: readyIndex >= 0 ? join(pluginRoot, candidates[readyIndex].name) : null };
 }
 
+async function claudeMarketplaceRegistered(root) {
+  try {
+    const config = JSON.parse(await readFile(join(root, 'plugins', 'known_marketplaces.json'), 'utf8'));
+    return Boolean(config && typeof config === 'object' && !Array.isArray(config) && Object.hasOwn(config, 'loam'));
+  } catch {
+    return false;
+  }
+}
+
+function codexMarketplaceRegistered(config) {
+  return config.split(/\r?\n/).some((line) => /^\s*\[marketplaces\.loam\]\s*(?:#.*)?$/.test(line));
+}
+
 export async function detectHarnesses({ home = homedir(), pluginVersion } = {}) {
   const roots = {
     opencode: join(home, '.config', 'opencode'),
@@ -119,10 +132,12 @@ export async function detectHarnesses({ home = homedir(), pluginVersion } = {}) 
     let marketplaceInstalled = false;
     let marketplaceReady = false;
     let marketplaceRoot = null;
+    let marketplaceRegistered = false;
     if (state === 'detected' && id === 'claude') {
       const install = await claudeMarketplaceInstall(root, 'loam@loam', pluginVersion);
       marketplaceInstalled = install.installed;
       marketplaceRoot = install.pluginRoot;
+      marketplaceRegistered = await claudeMarketplaceRegistered(root);
       try {
         const settings = JSON.parse(await readFile(join(root, 'settings.json'), 'utf8'));
         marketplaceConfigured = Object.hasOwn(settings.enabledPlugins || {}, 'loam@loam');
@@ -137,6 +152,7 @@ export async function detectHarnesses({ home = homedir(), pluginVersion } = {}) 
       marketplaceRoot = install.pluginRoot;
       try {
         const config = await readFile(join(root, 'config.toml'), 'utf8');
+        marketplaceRegistered = codexMarketplaceRegistered(config);
         let loamPlugin = '';
         // ponytail: parse the table form Codex writes; unsupported TOML forms fail closed to setup ownership.
         for (const line of config.split(/\r?\n/)) {
@@ -157,7 +173,7 @@ export async function detectHarnesses({ home = homedir(), pluginVersion } = {}) 
         marketplaceOwned = false;
       }
     }
-    result[id] = { id, root, state, marketplaceOwned, marketplaceConfigured, marketplaceInstalled, marketplaceReady, marketplaceRoot };
+    result[id] = { id, root, state, marketplaceOwned, marketplaceConfigured, marketplaceInstalled, marketplaceReady, marketplaceRoot, marketplaceRegistered };
   }
   return result;
 }

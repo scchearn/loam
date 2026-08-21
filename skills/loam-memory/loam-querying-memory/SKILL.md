@@ -30,7 +30,7 @@ If the injected state cannot be reused, refresh native state through the injecte
 <native-runtime-command> state --fast "$(pwd)"
 ```
 
-If the question needs the code graph, run the required native check through `<native-runtime-command> ...` before trusting it because the startup state is fast. If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. If `exists` is false, stop and recommend `/loam::scaffolding-wiki <topic>`. Use `wiki_root` as the resolved wiki root and `qmd_ready` + `collection` for qmd state.
+If the question needs the code graph, run the required native check through `<native-runtime-command> ...` before trusting the injected snapshot alone. If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam install`; do not fabricate state or use a project-local fallback. If `exists` is false, stop and recommend `/loam::scaffolding-wiki <topic>`. Use `wiki_root` as the resolved wiki root and `qmd_ready` + `collection` for qmd state.
 
 Classify the question internally (do not expose unless it helps the answer): **lookup** (answer from one or a few pages), **comparison** (differences/tradeoffs across pages), **synthesis** (higher-level explanation combining multiple parts), **gap check** (whether memory can answer something yet). Derive 3-8 search terms.
 

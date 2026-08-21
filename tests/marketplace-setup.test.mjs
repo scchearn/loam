@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { installMarketplacePlugins, removeMarketplacePlugins } from '../setup/marketplace.mjs';
@@ -10,6 +13,19 @@ const harnesses = {
   codex: { id: 'codex', state: 'detected', marketplaceOwned: false },
   cursor: { id: 'cursor', state: 'detected' },
 };
+
+async function exists(path) {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function claudeRoot() {
+  return mkdtemp(join(tmpdir(), 'loam-marketplace-remove-'));
+}
 
 test('--yes selects every detected harness', async () => {
   assert.deepEqual(await selectHarnesses({ yes: true, harnesses }), {
@@ -150,7 +166,9 @@ test('marketplace removal delegates to each owning harness', async () => {
 
   assert.deepEqual(calls, [
     { command: 'claude', args: ['plugin', 'uninstall', 'loam@loam', '--scope', 'user', '--yes'] },
+    { command: 'claude', args: ['plugin', 'marketplace', 'remove', 'loam'] },
     { command: 'codex', args: ['plugin', 'remove', 'loam@loam'] },
+    { command: 'codex', args: ['plugin', 'marketplace', 'remove', 'loam'] },
   ]);
   assert.equal(result.claude.state, 'removed');
   assert.equal(result.codex.state, 'removed');
@@ -169,5 +187,129 @@ test('marketplace removal delegates configured plugins even when cache bytes are
     },
   });
 
-  assert.deepEqual(calls, ['claude', 'codex']);
+  assert.deepEqual(calls, ['claude', 'claude', 'codex', 'codex']);
+});
+
+test('marketplace registration removal treats an already absent marketplace as removed', async () => {
+  const calls = [];
+  const result = await removeMarketplacePlugins({
+    harnesses: {
+      codex: { ...harnesses.codex, marketplaceRegistered: true },
+    },
+    runner: async (request) => {
+      calls.push({ command: request.command, args: request.args });
+      return request.args.includes('marketplace')
+        ? { code: 1, stdout: '', stderr: 'marketplace loam not found' }
+        : { code: 0, stdout: '', stderr: '' };
+    },
+  });
+
+  assert.deepEqual(calls, [
+    { command: 'codex', args: ['plugin', 'marketplace', 'remove', 'loam'] },
+  ]);
+  assert.equal(result.codex.state, 'removed');
+  assert.equal(result.codex.marketplaceRemoval?.state, 'removed');
+
+  const second = await removeMarketplacePlugins({
+    harnesses: { codex: { ...harnesses.codex, marketplaceRegistered: true } },
+    runner: async (request) => {
+      calls.push({ command: request.command, args: request.args });
+      return { code: 1, stdout: '', stderr: 'marketplace loam not found' };
+    },
+  });
+  assert.equal(second.codex.state, 'removed');
+  assert.equal(calls.length, 2, 'the second pass still reaches the same goal without a partial result');
+});
+
+test('marketplace removal invokes Claude CLI for a user-scoped registry entry', async () => {
+  const root = await claudeRoot();
+  await mkdir(join(root, 'plugins'), { recursive: true });
+  await writeFile(join(root, 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'user', installPath: '/cache/loam' }] },
+  }));
+  const calls = [];
+
+  const result = await removeMarketplacePlugins({
+    harnesses: {
+      claude: { ...harnesses.claude, root, marketplaceInstalled: true },
+    },
+    runner: async (request) => {
+      calls.push({ command: request.command, args: request.args });
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  });
+
+  assert.deepEqual(calls, [
+    { command: 'claude', args: ['plugin', 'uninstall', 'loam@loam', '--scope', 'user', '--yes'] },
+    { command: 'claude', args: ['plugin', 'marketplace', 'remove', 'loam'] },
+  ]);
+  assert.equal(result.claude.state, 'removed');
+});
+
+test('marketplace removal skips Claude CLI and cleans an orphan cache without a registry', async () => {
+  const root = await claudeRoot();
+  const cache = join(root, 'plugins', 'cache', 'loam');
+  await mkdir(cache, { recursive: true });
+  await writeFile(join(cache, 'orphan.txt'), 'orphaned plugin cache');
+  let called = false;
+
+  const result = await removeMarketplacePlugins({
+    harnesses: {
+      claude: { ...harnesses.claude, root, marketplaceInstalled: true },
+    },
+    runner: async () => {
+      called = true;
+      return { code: 1, stdout: '', stderr: 'Claude CLI must not run for an orphan cache' };
+    },
+  });
+
+  assert.equal(called, false);
+  assert.equal(result.claude.state, 'removed');
+  assert.equal(await exists(cache), false);
+});
+
+test('marketplace removal skips Claude CLI when the registry and cache are absent', async () => {
+  const root = await claudeRoot();
+  let called = false;
+
+  const result = await removeMarketplacePlugins({
+    harnesses: {
+      claude: { ...harnesses.claude, root, marketplaceInstalled: true },
+    },
+    runner: async () => {
+      called = true;
+      return { code: 1, stdout: '', stderr: 'Claude CLI must not run without a registry entry' };
+    },
+  });
+
+  assert.equal(called, false);
+  assert.equal(result.claude.state, 'removed');
+});
+
+test('marketplace removal preserves a project-scoped Claude cache', async () => {
+  const root = await claudeRoot();
+  const cache = join(root, 'plugins', 'cache', 'loam', 'loam', '0.9.2');
+  await mkdir(cache, { recursive: true });
+  await writeFile(join(cache, 'project-plugin.txt'), 'project-owned plugin cache');
+  await mkdir(join(root, 'plugins'), { recursive: true });
+  await writeFile(join(root, 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'loam@loam': [{ scope: 'project', installPath: '/cache/loam' }] },
+  }));
+  let called = false;
+
+  const result = await removeMarketplacePlugins({
+    harnesses: {
+      claude: { ...harnesses.claude, root, marketplaceInstalled: true },
+    },
+    runner: async () => {
+      called = true;
+      return { code: 1, stdout: '', stderr: 'Claude CLI must not run for project-only state' };
+    },
+  });
+
+  assert.equal(called, false);
+  assert.equal(await exists(cache), true);
+  assert.equal(result.claude.state, 'removed');
 });
