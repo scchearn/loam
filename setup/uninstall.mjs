@@ -169,6 +169,44 @@ function isLoamCodexHookState(line) {
     && /^\[hooks\.state\."loam@loam:[^"]*"\]$/.test(header.text));
 }
 
+function updateTomlTripleState(line, initial = null) {
+  let triple = initial;
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const next = line.slice(index, index + 3);
+    if (triple) {
+      if (next === triple) {
+        triple = null;
+        index += 2;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') quote = null;
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") quote = null;
+      continue;
+    }
+    if (next === '"""' || next === "'''") {
+      triple = next;
+      index += 2;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '#') break;
+  }
+  return triple;
+}
+
 function isValidToml(contents) {
   const lines = contents.split(/(?<=\n)/);
   const stack = [];
@@ -248,12 +286,19 @@ function stripCodexLoamHookState(contents) {
   const kept = [];
   let removing = false;
   let removed = false;
+  let triple = null;
   for (const line of lines) {
+    if (triple) {
+      if (!removing) kept.push(line);
+      triple = updateTomlTripleState(line, triple);
+      continue;
+    }
     if (tomlHeader(line)) {
       removing = isLoamCodexHookState(line);
       if (removing) removed = true;
     }
     if (!removing) kept.push(line);
+    triple = updateTomlTripleState(line);
   }
   return removed
     ? { action: 'cleaned', contents: kept.join('') }

@@ -570,6 +570,40 @@ test('uninstall warns and leaves malformed Codex TOML unchanged', async () => {
   assert.match(output, /malformed TOML/i);
 });
 
+test('uninstall preserves section-looking text inside a multiline TOML string', async () => {
+  const { home, globalRoot } = await readyFixture();
+  const configPath = join(home, '.codex', 'config.toml');
+  const before = [
+    '[profile.instructions]\n',
+    'text = """\n',
+    '[hooks.state."loam@loam:inside-string"]\n',
+    'keep_me = true\n',
+    '"""\n',
+    '\n',
+    '[hooks.state."loam@loam:real-section"]\n',
+    'remove_me = true\n',
+    '\n',
+    '[projects."/workspace/loam"]\n',
+    'trust_level = "trusted"\n',
+  ].join('');
+  const after = [
+    '[profile.instructions]\n',
+    'text = """\n',
+    '[hooks.state."loam@loam:inside-string"]\n',
+    'keep_me = true\n',
+    '"""\n',
+    '\n',
+    '[projects."/workspace/loam"]\n',
+    'trust_level = "trusted"\n',
+  ].join('');
+  await writeFile(configPath, before);
+
+  const code = await uninstall({ home, globalRoot, yes: true, runner: skillsRunner(), output: { write: () => {} } });
+
+  assert.equal(code, 0);
+  assert.equal(await readFile(configPath, 'utf8'), after);
+});
+
 test('uninstall warns but continues when marketplace registration cleanup fails', async () => {
   const { home, globalRoot } = await readyFixture();
   await writeFile(join(home, '.codex', 'config.toml'), '[plugins."loam@loam"]\nenabled = true\n');
