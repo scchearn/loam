@@ -470,6 +470,13 @@ a:focus-visible,
   overflow-x: auto;
   padding-bottom: var(--space-2);
   scrollbar-width: thin;
+  /* Mouse users can grab and drag the strip (see drag-scroll.mjs). */
+  cursor: grab;
+}
+
+.card-row.is-dragging {
+  cursor: grabbing;
+  user-select: none;
 }
 
 .card-grid {
