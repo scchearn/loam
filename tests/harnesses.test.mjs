@@ -176,6 +176,47 @@ test('OpenCode background events queue work and normalize the all-session status
   ]);
 });
 
+test('OpenCode auto-continues truncated responses without harvesting, then resets per user turn', async () => {
+  const prompts = [];
+  let messagesCalls = 0;
+  let gateCalls = 0;
+  const plugin = await createOpenCodeAdapter({
+    client: {
+      session: {
+        messages: async () => {
+          messagesCalls += 1;
+          return { data: [{ info: { role: 'assistant', finish: 'length', tokens: { output: 1 } } }] };
+        },
+        promptAsync: async (input) => { prompts.push(input); },
+      },
+    },
+    getContext: async () => '',
+    wakeServer: async () => ({ close: async () => {} }),
+    ingestion: {
+      gate: async () => { gateCalls += 1; return { action: 'skip' }; },
+      resolveGlobalRoot: () => '/global',
+      resolveSkillsRoot: () => '/skills',
+      runWorker: async () => undefined,
+    },
+  })({ directory: '/workspace' });
+
+  await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-auto' } });
+  await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-auto' } });
+  await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-auto' } });
+  assert.equal(prompts.length, 3, 'truncated responses continue up to the per-turn maximum');
+  assert.equal(gateCalls, 0, 'a synthetic continue does not also enter harvesting');
+  assert.equal(messagesCalls, 3);
+  assert.match(prompts[0].body.parts[0].text, /^\[auto-continue\]/);
+
+  // The first transform is SessionStart; the next one is the real user-turn
+  // boundary that resets the continuation budget.
+  const output = { messages: [{ info: { role: 'user', sessionID: 'parent-auto' }, parts: [{ type: 'text', text: 'next' }] }] };
+  await plugin['experimental.chat.messages.transform']({}, output);
+  await plugin['experimental.chat.messages.transform']({}, output);
+  await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-auto' } });
+  assert.equal(prompts.length, 4, 'the next user turn gets a fresh continuation budget');
+});
+
 test('OpenCode toast visibility uses the pinned SDK shape for launch and terminal outcomes', async () => {
   const root = await mkdtemp(join(tmpdir(), 'loam-opencode-toast-'));
   const calls = [];

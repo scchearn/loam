@@ -210,6 +210,7 @@ function createOpenCodeAdapter({
 } = {}) {
   const childSessions = new Set();
   const completedChildSessions = new Set();
+  const autoContinueCounts = new Map(); // sessionId -> continues this user turn
   const completedOrder = [];
   const COMPLETED_CHILD_MAX = 64;
   // Live wake state (live-push T4), kept per adapter instance so tests that
@@ -368,7 +369,9 @@ function createOpenCodeAdapter({
             await logStage('error', 'wake listener failed', { error: String(error) });
           }
         })();
-      } else if (loamWake.server?.reregister) {
+      } else {
+        autoContinueCounts.delete(loamWake.sessionId);
+        if (loamWake.server?.reregister) {
         // Per-hook idempotent re-registration (connector-self-healing): every
         // per-turn boundary re-asserts this session's wake_ref, so a connector
         // that restarted since SessionStart re-attaches the mailbox for an active
@@ -377,6 +380,7 @@ function createOpenCodeAdapter({
         // must never be hostage to a contentful render.
         void loamWake.server.reregister().catch(() => {});
         await logStageOnce('hook:reregister', 'info', 'wake re-register', {});
+        }
       }
       const event = isFirst ? 'SessionStart' : 'UserPromptSubmit';
       // SessionStart renders the full history snapshot (no session id, no drain).
@@ -406,6 +410,42 @@ function createOpenCodeAdapter({
       if (event?.type !== 'session.idle') return;
       const childId = event.sessionID || event.session_id || event.properties?.sessionID || event.properties?.session_id;
       if (childId && (childSessions.has(childId) || completedChildSessions.has(childId))) return;
+      // --- auto-continue on truncated / near-cap assistant response ---
+      const AUTO_CONTINUE_SOFT_LIMIT = Infinity; // truncation-only: near-cap heuristic off. Set to e.g. 115_000 (~88% of ~131k cap) to also continue clean finishes glued to the cap.
+      const AUTO_CONTINUE_MAX = 3;              // per user turn
+      const AUTO_CONTINUE_TEXT =
+        '[auto-continue] Your previous response was interrupted by the output limit. ' +
+        'Continue EXACTLY where you left off — do not repeat anything already said or done.';
+
+      if (childId && sdk?.session?.messages && sdk?.session?.promptAsync &&
+          (autoContinueCounts.get(childId) ?? 0) < AUTO_CONTINUE_MAX) {
+        const acWorkspace = directory || event.directory || process.cwd();
+        try {
+          const res = await sdk.session.messages({ path: { id: childId }, query: { directory: acWorkspace } });
+          const list = responseData(res) || [];
+          let last = null;
+          for (let i = list.length - 1; i >= 0; i--) {
+            const m = list[i]?.info ?? list[i];
+            if (m?.role === 'assistant') { last = m; break; }
+          }
+          if (last) {
+            const truncated = last.error?.name === 'MessageOutputLengthError' || last.finish === 'length';
+            const nearCap = (last.tokens?.output ?? 0) >= AUTO_CONTINUE_SOFT_LIMIT;
+            if (truncated || nearCap) {
+              autoContinueCounts.set(childId, (autoContinueCounts.get(childId) ?? 0) + 1);
+              await logStage('info', 'auto-continue', {
+                session: childId, n: autoContinueCounts.get(childId), truncated, output: last.tokens?.output ?? null,
+              });
+              await sdk.session.promptAsync({
+                path: { id: childId },
+                query: { directory: acWorkspace },
+                body: { parts: [{ type: 'text', text: AUTO_CONTINUE_TEXT }] },
+              });
+              return; // synthetic continue-turn re-idles on its own; don't also harvest now
+            }
+          }
+        } catch { /* best-effort: never disturb the session */ }
+      }
       const workspace = directory || event.directory || process.cwd();
       const env = process.env;
       let hookRun = null;
