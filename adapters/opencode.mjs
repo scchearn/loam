@@ -411,7 +411,7 @@ function createOpenCodeAdapter({
       const childId = event.sessionID || event.session_id || event.properties?.sessionID || event.properties?.session_id;
       if (childId && (childSessions.has(childId) || completedChildSessions.has(childId))) return;
       // --- auto-continue on truncated / near-cap assistant response ---
-      const AUTO_CONTINUE_SOFT_LIMIT = 115_000; // ~88% of ~131k cap; Infinity disables the near-cap heuristic
+      const AUTO_CONTINUE_SOFT_LIMIT = Infinity; // truncation-only: near-cap heuristic off. Set to e.g. 115_000 (~88% of ~131k cap) to also continue clean finishes glued to the cap.
       const AUTO_CONTINUE_MAX = 3;              // per user turn
       const AUTO_CONTINUE_TEXT =
         '[auto-continue] Your previous response was interrupted by the output limit. ' +
