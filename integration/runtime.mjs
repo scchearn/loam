@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { lstat, readFile, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 
 import { readInstallMetadata, readSkillContent, validateInstallMetadata } from './metadata.mjs';
 import { assertInside, assertPhysicalInside, detectTarget, resolveSkillsRoot } from './paths.mjs';
@@ -12,6 +13,11 @@ import { configRoot } from './config-store.mjs';
 
 export const MAX_DETAIL = 4096;
 const MAX_RUNTIME_BYTES = 64 * 1024 * 1024;
+// Default stdout ceiling for a runtime call. Small commands (state, hooks) stay
+// well under this; `loam state --view` overrides it, since a large workspace's
+// snapshot legitimately exceeds 1 MiB and must not be truncated.
+const DEFAULT_MAX_STDOUT_BYTES = 1_048_576;
+export const MAX_VIEW_STDOUT_BYTES = 64 * 1024 * 1024;
 const SHA256 = /^[a-f0-9]{64}$/i;
 
 export function safeDetail(value, limit = MAX_DETAIL) {
@@ -44,6 +50,7 @@ function withTimeout(task, timeoutMs) {
           code: result?.code ?? 1,
           signal: result?.signal ?? null,
           stdout: String(result?.stdout ?? ''),
+          stdoutTruncated: Boolean(result?.stdoutTruncated),
           stderr: safeDetail(result?.stderr),
           ...(result?.category ? { category: result.category } : {}),
         });
@@ -63,7 +70,7 @@ function withTimeout(task, timeoutMs) {
   });
 }
 
-function spawnRuntime({ runtimePath, args, cwd, timeoutMs, input }) {
+function spawnRuntime({ runtimePath, args, cwd, timeoutMs, input, maxStdoutBytes = DEFAULT_MAX_STDOUT_BYTES }) {
   return new Promise((resolvePromise) => {
     const child = spawn(runtimePath, args, {
       cwd,
@@ -75,18 +82,46 @@ function spawnRuntime({ runtimePath, args, cwd, timeoutMs, input }) {
     });
     let stdout = '';
     let stderr = '';
+    let stdoutTruncated = false;
     let settled = false;
+    // Decode across chunk boundaries: raw stdout arrives in arbitrary byte
+    // slices, so a multi-byte UTF-8 character can straddle two chunks. A per-
+    // chunk `chunk.toString()` would split it into replacement chars and
+    // corrupt otherwise-valid JSON; StringDecoder holds the partial bytes until
+    // the character completes.
+    const outDecoder = new StringDecoder('utf8');
+    const errDecoder = new StringDecoder('utf8');
     const finish = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      // Flush any bytes the decoder is still holding; on a clean close this is
+      // empty, on truncation/kill it is a (possibly partial) tail.
+      if (!stdoutTruncated) appendStdout(outDecoder.end());
+      stderr += errDecoder.end();
       resolvePromise({
         code: result.code,
         signal: result.signal,
         stdout,
+        stdoutTruncated,
         stderr: safeDetail(stderr),
         ...(result.category ? { category: result.category } : {}),
       });
+    };
+    // Bound accumulation, but record when we drop characters so the caller can
+    // fail loudly instead of parsing a silently-truncated document. (The old
+    // `if (len < LIMIT) stdout += chunk` overshot by one chunk AND hid the
+    // loss — that truncation is what broke `loam state --view` on large
+    // workspaces.)
+    const appendStdout = (text) => {
+      if (stdoutTruncated || text.length === 0) return;
+      const room = maxStdoutBytes - stdout.length;
+      if (text.length > room) {
+        stdout += text.slice(0, Math.max(0, room));
+        stdoutTruncated = true;
+      } else {
+        stdout += text;
+      }
     };
     const timer = setTimeout(() => {
       child.kill();
@@ -94,10 +129,11 @@ function spawnRuntime({ runtimePath, args, cwd, timeoutMs, input }) {
     }, timeoutMs);
 
     child.stdout?.on('data', (chunk) => {
-      if (stdout.length < 1_048_576) stdout += chunk.toString();
+      if (stdoutTruncated) return;
+      appendStdout(outDecoder.write(chunk));
     });
     child.stderr?.on('data', (chunk) => {
-      if (stderr.length < 1_048_576) stderr += chunk.toString();
+      if (stderr.length < 1_048_576) stderr += errDecoder.write(chunk);
     });
     child.once('error', (error) => {
       stderr += error.message;
@@ -113,11 +149,11 @@ function spawnRuntime({ runtimePath, args, cwd, timeoutMs, input }) {
   });
 }
 
-export function invokeRuntime({ runtimePath: executable, args = [], cwd, timeoutMs = 5000, input, runner } = {}) {
+export function invokeRuntime({ runtimePath: executable, args = [], cwd, timeoutMs = 5000, input, runner, maxStdoutBytes = DEFAULT_MAX_STDOUT_BYTES } = {}) {
   return withTimeout(
     () => (runner
-      ? runner({ runtimePath: executable, args, cwd, timeoutMs, input })
-      : spawnRuntime({ runtimePath: executable, args, cwd, timeoutMs, input })),
+      ? runner({ runtimePath: executable, args, cwd, timeoutMs, input, maxStdoutBytes })
+      : spawnRuntime({ runtimePath: executable, args, cwd, timeoutMs, input, maxStdoutBytes })),
     timeoutMs,
   );
 }
