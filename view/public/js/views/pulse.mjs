@@ -289,34 +289,7 @@ function glyphFor(key) {
   return CATEGORY_GLYPH.find(([pattern]) => pattern.test(key))?.[1] ?? 'i-shield';
 }
 
-/**
- * Evidence is an object, an array of them, or null, and the producer also emits
- * bare path strings (artifact-parse does); only paths interest Pulse.
- */
-function evidencePaths(evidence) {
-  const items = Array.isArray(evidence) ? evidence : [evidence];
-  return items
-    .map((item) => (typeof item === 'string' ? item : item?.path))
-    .filter((path) => typeof path === 'string' && path);
-}
-
-/**
- * An inventoried artifact path is an Inspector entry point; anything else (a
- * source file, a path the snapshot does not carry) stays plain text rather than
- * offering a door that opens onto nothing.
- */
-function evidenceNode(doc, path, inventory) {
-  const artifact = inventory.get(path);
-  if (!artifact) return el(doc, 'code', 'code-chip', path);
-
-  const button = el(doc, 'button', 'file-link', path);
-  button.type = 'button';
-  button.dataset.path = path;
-  button.addEventListener('click', () => openInspector(artifact));
-  return button;
-}
-
-function advisorCard(doc, { id, category, severity, badgeClass, badgeLabel, message, command, evidence }, inventory) {
+function advisorCard(doc, { id, category, severity, badgeClass, badgeLabel, message, command }) {
   const article = el(doc, 'article', 'issue-card');
   if (severity === 'critical') article.classList.add('critical');
   if (severity === 'watch') article.classList.add('warn');
@@ -337,22 +310,15 @@ function advisorCard(doc, { id, category, severity, badgeClass, badgeLabel, mess
   if (copy) actions.append(copy);
 
   head.append(cat, actions);
+  // Pulse is the glance surface: the signal's headline carries the count
+  // ("82 artifact(s)..."); the per-file evidence list lives in Stewardship, so
+  // it is deliberately omitted here to keep the card compact.
   article.append(head, el(doc, 'h3', 'issue-title', message));
-
-  const paths = evidencePaths(evidence);
-  if (paths.length) {
-    const desc = el(doc, 'p', 'issue-desc');
-    for (const [index, path] of paths.entries()) {
-      if (index) desc.append(doc.createTextNode(' · '));
-      desc.append(evidenceNode(doc, path, inventory));
-    }
-    article.append(desc);
-  }
 
   return article;
 }
 
-function renderAdvisor(doc, snapshot, inventory) {
+function renderAdvisor(doc, snapshot) {
   const signals = snapshot.signals ?? [];
   const hints = snapshot.hints ?? [];
   const total = signals.length + hints.length;
@@ -383,8 +349,7 @@ function renderAdvisor(doc, snapshot, inventory) {
       badgeLabel: humanize(signal.state),
       message: signal.message,
       command: signal.command,
-      evidence: signal.evidence,
-    }, inventory));
+    }));
   }
 
   for (const hint of hints) {
@@ -396,8 +361,7 @@ function renderAdvisor(doc, snapshot, inventory) {
       badgeLabel: humanize(hint.severity),
       message: hint.message,
       command: hint.command,
-      evidence: hint.evidence,
-    }, inventory));
+    }));
   }
 
   if (!total) {
@@ -480,11 +444,10 @@ export function renderPulse(doc, snapshot, target) {
     return;
   }
 
-  const inventory = new Map((snapshot.artifacts ?? []).map((artifact) => [artifact.path, artifact]));
   target.replaceChildren(
     renderOverview(doc, snapshot),
     renderMetrics(doc, snapshot),
-    renderAdvisor(doc, snapshot, inventory),
+    renderAdvisor(doc, snapshot),
     renderFocus(doc, snapshot),
   );
 }
