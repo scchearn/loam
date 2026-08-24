@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +20,8 @@ import { runDoctor } from '../setup/doctor.mjs';
 import { shimLocations } from '../setup/shim.mjs';
 import { federationDefinitionPath } from '../setup/federation.mjs';
 import { ledgerPath } from '../integration/ledger.mjs';
+import { CATALOG } from '../setup/integrations/catalog.mjs';
+import { managedBinPath } from '../setup/integrations/tools.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 // #137: an installed marketplace plugin carries the shipped hooks.json (with the
@@ -74,6 +76,35 @@ async function fullList() {
 function outputCapture() {
   const chunks = [];
   return { output: { write: (chunk) => chunks.push(String(chunk)) }, text: () => chunks.join('') };
+}
+
+function qmdToolRunner(globalRoot, { installCode = 0 } = {}) {
+  const calls = [];
+  return {
+    calls,
+    runner: async ({ args = [] }) => {
+      calls.push(args);
+      if (args.includes('install')) {
+        if (installCode === 0) {
+          const bin = managedBinPath(globalRoot, 'qmd', 'qmd', process.platform);
+          await mkdir(join(bin, '..'), { recursive: true });
+          await writeFile(bin, process.platform === 'win32' ? 'qmd' : '#!/bin/sh\necho qmd\n');
+          await chmod(bin, 0o755);
+        }
+        return { code: installCode, stdout: '', stderr: installCode === 0 ? '' : 'npm ERR! 404 Not Found' };
+      }
+      if (args.includes('--version')) return { code: 0, stdout: 'qmd 1.2.3\n', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  };
+}
+
+function assertOptionalIntegrationHints(text) {
+  assert.match(text, /Optional integrations — enable anytime:/u);
+  for (const entry of CATALOG) {
+    assert.match(text, new RegExp(`npx @scchearn/loam setup --integration ${entry.id}`));
+    assert.match(text, new RegExp(entry.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
 }
 
 async function baseFixture() {
@@ -182,16 +213,24 @@ test('harvest_packaging: upgrade stages harvest modules idempotently and final v
 test('clean --yes setup completes and publishes verified install metadata', async () => {
   const fixture = await baseFixture();
   const capture = outputCapture();
+  let prompted = false;
   const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
+    integrationSelect: async () => {
+      prompted = true;
+      return ['qmd'];
+    },
     output: capture.output,
     errorOutput: capture.output,
   });
 
   assert.equal(code, 0, capture.text());
+  assert.equal(prompted, false);
   assert.match(capture.text(), /Loam is ready/);
+  assertOptionalIntegrationHints(capture.text());
   const globalRoot = join(fixture.home, '.agents', 'loam');
+  await assert.rejects(() => readFile(join(globalRoot, 'integrations.json')), { code: 'ENOENT' });
   const metadata = JSON.parse(await readFile(join(globalRoot, 'install.json'), 'utf8'));
   // Schema 2: install.json carries no runtime_* fields — the config-dir ledger
   // is the runtime authority.
@@ -208,6 +247,83 @@ test('clean --yes setup completes and publishes verified install metadata', asyn
   assert.equal(ledger.target, RUNTIME_VERSION);
   assert.equal(ledger.sha256, createHash('sha256').update(fixture.release.bytes).digest('hex'));
   assert.equal(await readFile(ledger.store_path, 'utf8'), fixture.release.bytes);
+});
+
+test('clean interactive install prints optional integration hints', async () => {
+  const fixture = await baseFixture();
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['install']), {
+    ...fixture,
+    packageRoot,
+    confirm: async () => true,
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+
+  assert.equal(code, 0, capture.text());
+  assertOptionalIntegrationHints(capture.text());
+});
+
+test('interactive install can select qmd and registers its managed MCP before completion', async () => {
+  const fixture = await baseFixture();
+  await mkdir(join(fixture.home, '.config', 'opencode'), { recursive: true });
+  const capture = outputCapture();
+  const globalRoot = join(fixture.home, '.agents', 'loam');
+  const tool = qmdToolRunner(globalRoot);
+  const code = await runSetup(parseArgs(['install']), {
+    ...fixture,
+    env: { ...fixture.env, PATH: '' },
+    packageRoot,
+    confirm: async () => true,
+    marketplaceSelect: async () => ['opencode'],
+    integrationSelect: async ({ options }) => {
+      assert.deepEqual(options.map(({ value }) => value), CATALOG.map((entry) => entry.id));
+      return ['qmd'];
+    },
+    toolRunner: tool.runner,
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+
+  assert.equal(code, 0, capture.text());
+  assert.ok(tool.calls.some((args) => args.includes('install') && args.includes('@tobilu/qmd')));
+  assert.ok(tool.calls.some((args) => args.includes('--version')));
+  const install = JSON.parse(await readFile(join(globalRoot, 'install.json'), 'utf8'));
+  assert.deepEqual(install.configured_harnesses, ['opencode']);
+  const bin = managedBinPath(globalRoot, 'qmd', 'qmd', process.platform);
+  await assert.doesNotReject(() => stat(bin));
+  const opencode = JSON.parse(await readFile(join(fixture.home, '.config', 'opencode', 'opencode.json'), 'utf8'));
+  assert.deepEqual(opencode.mcp.qmd, { type: 'local', command: [bin, 'mcp'], enabled: true });
+  assert.match(capture.text(), /Integrations enabled: qmd/);
+  assert.match(capture.text(), /setup --integration grep/);
+  assert.match(capture.text(), /setup --integration hcom/);
+  assert.doesNotMatch(capture.text(), /setup --integration qmd/);
+});
+
+test('failed interactive integration leaves the committed core install and reports an exact retry command', async () => {
+  const fixture = await baseFixture();
+  await mkdir(join(fixture.home, '.config', 'opencode'), { recursive: true });
+  const capture = outputCapture();
+  const globalRoot = join(fixture.home, '.agents', 'loam');
+  const tool = qmdToolRunner(globalRoot, { installCode: 1 });
+  const code = await runSetup(parseArgs(['install']), {
+    ...fixture,
+    env: { ...fixture.env, PATH: '' },
+    packageRoot,
+    confirm: async () => true,
+    marketplaceSelect: async () => ['opencode'],
+    integrationSelect: async () => ['qmd'],
+    toolRunner: tool.runner,
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+
+  assert.equal(code, 1, capture.text());
+  await assert.doesNotReject(() => readFile(join(globalRoot, 'install.json')));
+  await assert.rejects(() => stat(managedBinPath(globalRoot, 'qmd', 'qmd', process.platform)), { code: 'ENOENT' });
+  assert.match(capture.text(), /Integration qmd enable failed/);
+  assert.match(capture.text(), /npx @scchearn\/loam setup --integration qmd/);
+  assert.match(capture.text(), /Loam core is ready/);
 });
 
 test('complete ready rerun is local-only and does not call Skills CLI or download', async () => {
@@ -249,6 +365,8 @@ test('update refreshes a ready installation without prompting', async () => {
   assert.equal(code, 0, capture.text());
   assert.equal(skillAdds, 1);
   assert.match(capture.text(), /Loam Update/);
+  assert.doesNotMatch(capture.text(), /Optional integrations — enable anytime:/u);
+  await assert.rejects(() => readFile(join(fixture.home, '.agents', 'loam', 'integrations.json')), { code: 'ENOENT' });
   const current = JSON.parse(await readFile(metadataPath, 'utf8'));
   assert.notEqual(current.integration_path, previous.integration_path);
 });

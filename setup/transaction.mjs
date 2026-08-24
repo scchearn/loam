@@ -4,7 +4,20 @@ import { randomUUID } from 'node:crypto';
 
 import { cleanupStaging, createStagingDirectory, writeAtomicFile, publishJson } from './atomic.mjs';
 import { resolveRuntimeTarget } from './constants.mjs';
-import { confirmSetup, finish, harnessLabel, renderDiscovery, selectHarnesses, stepDetail, stepDone, stepSkip, stepStart, summaryNote } from './wizard.mjs';
+import {
+  confirmSetup,
+  finish,
+  harnessLabel,
+  optionalIntegrationSummary,
+  renderDiscovery,
+  selectHarnesses,
+  selectIntegrations,
+  stepDetail,
+  stepDone,
+  stepSkip,
+  stepStart,
+  summaryNote,
+} from './wizard.mjs';
 import { ensureGlobalSkills, verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
 import { installRuntime } from './runtime.mjs';
 import { ledgerPath, readLedger } from '../integration/ledger.mjs';
@@ -15,6 +28,9 @@ import { removeHarnesses } from './uninstall.mjs';
 import { verifyInstallation } from './verify.mjs';
 import { stageFederationService, federationDefinitionExists } from './federation.mjs';
 import { installShim } from './shim.mjs';
+import { configureIntegration } from './configure.mjs';
+import { CATALOG } from './integrations/catalog.mjs';
+import { readLedger as readIntegrationLedger } from './integrations/ledger.mjs';
 
 // #97 fix 1 — a destructive rollback decision must name its reason. Turn the
 // per-check breakdown the verifier already computes into one operator-readable
@@ -86,11 +102,21 @@ async function stageIntegration({ packageRoot, globalRoot, pluginVersion }) {
   return { root: candidateRoot, path: join(candidateRoot, 'loam.mjs') };
 }
 
+async function enableSelectedIntegrations(ids, { discovery, install, parsed, options }) {
+  const enabled = [];
+  for (const id of ids) {
+    const result = await configureIntegration(id, 'enable', { discovery, install, parsed, options });
+    if (result.ok) enabled.push(id);
+  }
+  return { enabled, failed: enabled.length !== ids.length };
+}
+
 export async function executeSetup(parsed, discovery, options = {}) {
   const output = options.output || process.stdout;
   const errorOutput = options.errorOutput || process.stderr;
   const refresh = parsed.command === 'update';
   const yes = parsed.yes || refresh;
+  const integrationCatalog = options.integrationCatalog ?? CATALOG;
   const tilde = (p) => (typeof p === 'string' && p.startsWith(discovery.home) ? `~${p.slice(discovery.home.length)}` : p);
   await renderDiscovery(discovery, output, { action: refresh ? 'Update' : 'Install', dryRun: parsed.dryRun });
   if (parsed.dryRun) {
@@ -131,6 +157,24 @@ export async function executeSetup(parsed, discovery, options = {}) {
     finish(output, 'Setup cancelled');
     return 130;
   }
+  const explicitIntegrations = parsed.command === 'install' && Array.isArray(parsed.integrations)
+    ? [...new Set(parsed.integrations)]
+    : [];
+  const selectedIntegrations = explicitIntegrations.length
+    ? explicitIntegrations
+    : await selectIntegrations({
+        yes,
+        catalog: integrationCatalog,
+        select: options.integrationSelect,
+        input: options.input,
+        output,
+      });
+  if (selectedIntegrations === null) {
+    finish(output, 'Setup cancelled');
+    return 130;
+  }
+  const previousIntegrationLedger = await readIntegrationLedger(discovery.globalRoot);
+  const previouslyEnabledIntegrations = Object.keys(previousIntegrationLedger.integrations || {});
   const selectedSet = new Set(selection.selected);
   const toRemove = selection.toRemove;
   const selectedMarketplaceHarnesses = selection.selected.filter((id) => id === 'claude' || id === 'codex');
@@ -206,8 +250,18 @@ export async function executeSetup(parsed, discovery, options = {}) {
       legacy: migratedLegacy,
     });
     if (alreadyReady.ready && !refresh && toRemove.length === 0) {
-      finish(output, '🌱 Loam is ready', 'already ready; no replacement or network operation required');
-      return 0;
+      const integrations = await enableSelectedIntegrations(selectedIntegrations, {
+        discovery,
+        install: alreadyReady.install,
+        parsed,
+        options,
+      });
+      const integrationSummary = !refresh
+        ? optionalIntegrationSummary(integrationCatalog, integrations.enabled, previouslyEnabledIntegrations)
+        : '';
+      if (integrationSummary) summaryNote(output, 'Installed', integrationSummary);
+      finish(output, integrations.failed ? '🌱 Loam core is ready' : '🌱 Loam is ready', 'already ready; no replacement or network operation required');
+      return integrations.failed ? 1 : 0;
     }
 
     stepStart(output, 'Checking environment');
@@ -466,6 +520,16 @@ export async function executeSetup(parsed, discovery, options = {}) {
       await publishJson({ filePath: metadataPath, value: install });
       activated = true;
 
+      // Optional integrations are enabled only after the core install is
+      // committed. Their registrar owns each integration's rollback, while a
+      // failure leaves the verified core install available for retry.
+      const integrations = await enableSelectedIntegrations(selectedIntegrations, {
+        discovery,
+        install,
+        parsed,
+        options,
+      });
+
       // Old-store removal — the LAST commit, best-effort and non-fatal. Both
       // commits (ledger, install.json) are in; now retire only a PRIOR store
       // entry at a different version. A delete that fails (e.g. Windows EBUSY on
@@ -476,16 +540,22 @@ export async function executeSetup(parsed, discovery, options = {}) {
       }
 
       const configuredLabels = install.configured_harnesses.map((id) => harnessLabel(id));
-      summaryNote(output, 'Installed', [
+      const summary = [
         `Plugin     v${discovery.packageVersion}`,
         `Runtime    v${resolved.target}  (${discovery.target})`,
         `Skills     ${skillCount ?? '?'} · ${tilde(discovery.skillsRoot)}`,
         `Harnesses  ${configuredLabels.length ? configuredLabels.join(', ') : 'none'}`,
         '',
         'Next: open a coding session and say "set up a wiki" or "plan this work".',
-      ].join('\n'));
-      finish(output, marketplaceFailed ? '🌱 Loam core is ready' : '🌱 Loam is ready');
-      return marketplaceFailed ? 1 : 0;
+      ];
+      const integrationSummary = !refresh
+        ? optionalIntegrationSummary(integrationCatalog, integrations.enabled, previouslyEnabledIntegrations)
+        : '';
+      if (integrationSummary) summary.push('', integrationSummary);
+      summaryNote(output, 'Installed', summary.join('\n'));
+      const failed = marketplaceFailed || integrations.failed;
+      finish(output, failed ? '🌱 Loam core is ready' : '🌱 Loam is ready');
+      return failed ? 1 : 0;
     } finally {
       if (!activated) {
         try {
