@@ -54,6 +54,28 @@ Typical example:
 
 Keep these thin unless the workspace clearly expects something else.
 
+## Protected — the Loam memory map
+
+The fenced region inside root `AGENTS.md` is Loam-owned and generated:
+
+```markdown
+<!-- loam:memory-map · generated from wiki/index.md · do not edit by hand -->
+...
+<!-- /loam:memory-map -->
+```
+
+Normalization preserves it byte-for-byte. Do not reflow, resort, reword,
+summarize, relocate, or trim it — a normalized region reads as drift to
+`loam lint --only guidance`, and the next regeneration discards the edit
+regardless. It is regenerated only by `/loam::auditing-guidance` or
+`loam lint --only guidance --fix`.
+
+The `## Memory` heading and the prose *above* the opening marker are ordinary
+human-authored guidance and are triaged like any other section.
+
+If the region is absent or its slugs look stale, do not fix it here — note it
+and route to `/loam::auditing-guidance`.
+
 ## Out of scope
 
 Leave a guidance file out of the current pass when:
@@ -66,5 +88,6 @@ Leave a guidance file out of the current pass when:
 
 - Do not delete unique operational guidance unless the durable replacement clearly exists and is referenced.
 - Do not turn guidance files into shadow wiki pages.
+- Do not edit inside the `loam:memory-map` markers; it is generated, not authored.
 - Prefer concise pointers into memory (wiki substrate) over duplicated deep-reference prose.
 - Preserve commands, hard rules, and safety constraints.

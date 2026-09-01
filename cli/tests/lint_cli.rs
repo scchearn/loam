@@ -86,7 +86,7 @@ fn default_run_covers_every_domain() {
     seen.dedup();
     assert_eq!(
         seen,
-        vec!["markdown", "memory", "work"],
+        vec!["guidance", "markdown", "memory", "work"],
         "every domain should report: {stdout}"
     );
 }
@@ -97,7 +97,7 @@ fn only_selects_exactly_one_domain() {
     let root = workspace.to_str().unwrap().to_owned();
 
     let mut results = Vec::new();
-    for domain in ["markdown", "memory", "work"] {
+    for domain in ["guidance", "markdown", "memory", "work"] {
         let output = loam(&["lint", "--only", domain, &root, "--now", NOW]);
         let stdout = String::from_utf8(output.stdout).expect("findings should be UTF-8");
         results.push((domain, output.status.code(), stdout));
@@ -217,6 +217,12 @@ fn clean_workspace_exits_zero_and_reports_nothing() {
     write(
         &workspace.join("wiki/alpha-note.md"),
         "# Alpha Note\n\nBody.\n",
+    );
+    // The wiki holds no page-type directories, so the current map is the bare
+    // marker pair.
+    write(
+        &workspace.join("AGENTS.md"),
+        "# Guide\n\n## Memory\n\nProse.\n\n<!-- loam:memory-map · generated from wiki/index.md · do not edit by hand -->\n<!-- /loam:memory-map -->\n",
     );
 
     let output = loam(&["lint", workspace.to_str().unwrap(), "--now", NOW]);

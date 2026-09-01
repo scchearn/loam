@@ -88,6 +88,23 @@
 
 **0 points**: Vague or theoretical
 
+### 7. Memory map (pass/fail, wiki-bearing workspaces only)
+
+Not scored out of a weight — it is a gate that applies only when the workspace
+has a `wiki/`. Workspaces without one skip this criterion entirely.
+
+| Check | Pass |
+|-------|------|
+| Present | `AGENTS.md` carries both `loam:memory-map` markers under a `## Memory` heading |
+| Current | Every slug between the markers matches the durable pages under `wiki/`, with nothing added or missing |
+| Prose intact | The human-authored prose above the opening marker still reads correctly and was not clobbered by regeneration |
+| Bounded | No category exceeds the 30-slug inline threshold without the ` … (+M more, see index.md)` truncation |
+| Shim intact | `CLAUDE.md`, if present, is exactly `@AGENTS.md` — no memory-map content was written into it |
+
+A failing Present or Current check is the same signal the runtime reports as
+`guidance-map-missing` / `guidance-map-stale`; fix it via the ensure/regenerate
+step rather than by hand-editing inside the markers.
+
 ## Assessment Process
 
 1. Read the guidance file completely
@@ -143,3 +160,6 @@ The currency score (section 5) feeds directly into prune proposals. When currenc
 - "TODO" items never completed
 - Duplicate info across multiple guidance files
 - A repo-root `DESIGN.md` exists but AGENTS.md does not mention it (agents miss the canonical design system)
+- A `wiki/` exists but AGENTS.md carries no `loam:memory-map` region (the memory is invisible at session start)
+- Slugs between the markers no longer match `wiki/` (the map points at pages that moved or vanished)
+- Hand-written content sits between the markers (it will be destroyed on the next regeneration — move it above the opening marker)

@@ -6,6 +6,20 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+### Added
+
+- **The memory announces itself in `AGENTS.md`.** A workspace with a wiki now
+  carries a small Loam-owned memory map inside its guidance file, listing the
+  durable page slugs by type so an agent learns the memory exists at session
+  start instead of having to go looking. It is plain markdown that every
+  harness already reads — no import syntax, no session-start injection — and it
+  stays bounded as the wiki grows. `loam lint` gains a `guidance` domain that
+  reports the map missing or out of date and a drifted `CLAUDE.md` shim, and
+  `loam lint --fix` regenerates the map in place without touching anything
+  outside its markers. Scaffolding seeds the block, the guidance audit can
+  refresh it with or without the native runtime, and normalization leaves it
+  alone.
+
 ### Fixed
 
 - **Federation connector stays online.** The production broker's access rules

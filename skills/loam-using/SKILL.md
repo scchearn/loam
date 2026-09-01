@@ -172,8 +172,10 @@ Skill-relevant subcommands (all run through `<native-runtime-command>`):
 - `state [--fast] <workspace-root>` — workspace state JSON: `wiki_root`,
   qmd readiness, checkpoints, drift, signals. `--fast` skips expensive
   aggregation; prefer the injected block before re-running it.
-- `lint [--only markdown|memory|work] <workspace-root>` — three-domain lint;
-  default runs all three, `--only` runs exactly one.
+- `lint [--only guidance|markdown|memory|work] [--fix] <workspace-root>` —
+  four-domain lint; default runs all four, `--only` runs exactly one. `--fix`
+  regenerates the `AGENTS.md` `loam:memory-map` region and writes nothing
+  outside its markers.
 - `datecheck <check|fix> <wiki-root> [--offset +HH:MM]` — timestamp lint and
   repair; canonical offsets are `±HH:MM`.
 - `codegraph index <wiki-root> [--codebase-root <dir>]`, `walk

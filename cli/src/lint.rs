@@ -1,16 +1,19 @@
 use std::path::Path;
 
+use crate::guidance;
 use crate::markdown;
 use crate::memory;
 
-const DOMAINS: [&str; 3] = ["markdown", "memory", "work"];
+const DOMAINS: [&str; 4] = ["guidance", "markdown", "memory", "work"];
 
 pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     let mut workspace = None;
     let mut only = None;
     let mut now = None;
+    let mut fix = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--fix" => fix = true,
             "--only" => match args.next() {
                 Some(value) if DOMAINS.contains(&value.as_str()) && only.is_none() => {
                     only = Some(value)
@@ -63,6 +66,15 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     let selected = |domain: &str| only.as_deref().map(|value| value == domain).unwrap_or(true);
     let mut findings = Vec::new();
 
+    if fix && selected("guidance") {
+        if let Err(error) = guidance::fix(workspace) {
+            eprintln!("loam lint: {error}");
+            return 1;
+        }
+    }
+    if selected("guidance") {
+        guidance::findings(workspace, &mut findings);
+    }
     if selected("markdown") {
         match markdown::lint_workspace(workspace) {
             Ok(diagnostics) => findings.extend(diagnostics.into_iter().map(Finding::from_markdown)),
@@ -92,7 +104,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
 
 fn usage() {
     eprintln!(
-        "Usage: loam lint [--only markdown|memory|work] <workspace-root> [--now 'YYYY-MM-DD HH:MM ±HH:MM']\n\n  --only runs exactly one domain; the default runs all three.\n  --now overrides the clock for date-relative rules; it exists for\n  deterministic tests and replay, not for routine use."
+        "Usage: loam lint [--only guidance|markdown|memory|work] [--fix] <workspace-root> [--now 'YYYY-MM-DD HH:MM ±HH:MM']\n\n  --only runs exactly one domain; the default runs all four.\n  --fix regenerates the `loam:memory-map` region in AGENTS.md; it is the\n  only writing option and touches nothing outside the fenced markers.\n  --now overrides the clock for date-relative rules; it exists for\n  deterministic tests and replay, not for routine use."
     );
 }
 
@@ -209,6 +221,7 @@ impl Finding {
     /// belongs to, so no call site has to repeat it.
     fn domain(&self) -> &'static str {
         match &self.rule[..3] {
+            "GDN" => "guidance",
             "MEM" => "memory",
             "WRK" => "work",
             _ => "markdown",

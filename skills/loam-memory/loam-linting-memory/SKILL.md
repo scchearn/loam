@@ -85,8 +85,9 @@ reading pages, so manual review is spent on judgement rather than link chasing:
 
 Each line is one JSON finding with `rule`, `file`, `line`, `description`,
 `target`, and `candidates`. Exit 0 is clean, 2 means findings, 1 means bad
-arguments or an unreadable input. `--only markdown|memory|work` narrows the
-scan. The command is read-only and never fixes anything.
+arguments or an unreadable input. `--only guidance|markdown|memory|work` narrows
+the scan. The command is read-only except for `--fix`, which regenerates only
+the `AGENTS.md` memory-map region (see K below).
 
 If it exits 75 or 78 the native runtime is not ready — stop and report
 `npx @scchearn/loam install`. Do not claim a clean result from a fallback check.
@@ -128,7 +129,9 @@ Keep structural checks Glob/Grep-led and follow the qmd search protocol in
 
 **I. Stranded code pages in `entities/`** — Check whether `entities/` contains pages with `source_path:` front matter. These are code-graph pages that belong in `code/`, not `entities/`. Prose entity pages never carry `source_path:`. See Step 2 for the migration procedure.
 
-**J. Legacy code identity fields** — Check code-graph pages under `code/` and legacy `entities/` pages with `source_path:` front matter for missing `source_size:`, `content_hash:`, `content_id:`, `source_state:`, or `generator_version:`. Native rule `MEM008` retains the `legacy-hash-fields` alias for compatibility and reports these omissions as informational. Do not require `blob_oid:` or `source_commit:` because non-Git and provisional files legitimately lack Git provenance. Do not backfill during lint; run `/loam::ingesting-codebase <codebase root>` until the incremental migration is complete. Updating Loam itself never mutates a project's wiki.
+**J. Legacy code identity fields** — Check `code/` pages and legacy `entities/` pages carrying `source_path:` for missing `source_size:`, `content_hash:`, `content_id:`, `source_state:`, or `generator_version:` (`MEM008` / `legacy-hash-fields`, informational). `blob_oid:` and `source_commit:` stay optional — non-Git and provisional files legitimately lack Git provenance. Do not backfill during lint; migrate incrementally with `/loam::ingesting-codebase <codebase root>`.
+
+**K. Guidance memory map** — Three warn-level `guidance` diagnostics against root `AGENTS.md`, silent without a wiki: `guidance-map-missing`, `guidance-map-stale`, `guidance-claude-shim`. See [references/lint-checklist.md](references/lint-checklist.md) "Guidance memory map" for the checks and the fix route.
 
 Distinguish: **fix now** (safe from existing wiki evidence) vs **annotate now** (mark but don't resolve) vs **follow-up** (needs future evidence/research/user direction).
 
@@ -203,10 +206,11 @@ Allowed direct fixes:
 7. adding contradiction or stale-claim notes when wiki already contains the evidence
 8. improving headings or descriptions for index navigability
 9. normalizing internal links to canonical `[[kebab-case-note-name]]` form
-10. moving only a misplaced nested `<wiki root>/.obsidian/` directory to the parent directory root when the destination has no `.obsidian/` directory
-11. reconciling stale `<wiki root>/.wiki-metadata.json` paths to the actual resolved wiki root
-12. renaming legacy checkpoint files from `checkpoint-YYYY-MM-DD-HHMM-<slug>.md` to `checkpoint-YYYY-MM-DD-HHMM.md` and updating their checkpoint wikilinks when the mapping is collision-free and local
+10. moving a misplaced nested `.obsidian/` to the parent root when that destination has none
+11. reconciling stale `.wiki-metadata.json` paths to the actual resolved wiki root
+12. renaming legacy slugged checkpoint files and their wikilinks when the mapping is collision-free and local
 13. moving stranded code pages from `entities/` to `code/`, rebuilding the hub, and logging the migration
+14. regenerating the `AGENTS.md` memory-map region with `<native-runtime-command> lint --only guidance --fix "$WORKSPACE_ROOT"` — never by hand-editing inside the markers
 
 Do not: ingest new raw sources, invent facts, silently merge/rename notes, silently delete disagreement/uncertainty, leave redundant `overview.md`, overwrite or merge an existing parent `.obsidian/`, move or rename `<wiki root>` or any wiki content directory, perform broad rewrites, or modify raw-source files.
 
@@ -259,7 +263,7 @@ After wiki writes, run `qmd update -c <collection>` then `qmd embed -c <collecti
 
 The goal pass runs when `goals/` exists (`ls goals/*.md 2>/dev/null`), even if native state reports no wiki. It is structurally separate from wiki linting, report-only, and does not alter files or append a wiki lint log entry solely for goal checks.
 
-Read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/lint-checklist.md` and apply the **Goal health** section. It checks: missing required front matter or sections, invalid lifecycle status, stale drafts (30 days), overdue or stale active goals (`next_review_at`, otherwise `reviewed_at` or fallback `updated_at` at 90 days), broken linked spec/plan paths, inconsistent `goals/INDEX.md` rows, achieved without a passing review, and `reviewed_at` inconsistent with the newest review entry (compare date portion only).
+Read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/lint-checklist.md` and apply its **Goal health** section, which carries the full check list (front matter and sections, lifecycle status, draft and active staleness, linked-path resolution, `goals/INDEX.md` consistency, review evidence).
 
 Paused, achieved, and abandoned goals are exempt from staleness checks. Report goal findings in a separate section. Do not alter goal files. Route corrections through `/loam::setting-goals`.
 
@@ -308,7 +312,7 @@ If the pass found no significant issues, say so explicitly and still note any re
 - Treat `<wiki root>/.obsidian/` as misplaced Obsidian config when `<wiki root>` is a subdirectory. Move only `.obsidian/` to the parent directory root when that destination has no `.obsidian/` directory.
 - Reconcile stale `.wiki-metadata.json` to the actual resolved wiki root. Lint updates metadata to match the on-disk wiki; it never moves the on-disk wiki to match metadata.
 - Own checkpoint filename migration. New checkpoints should be named `checkpoint-YYYY-MM-DD-HHMM.md`; lint may rename legacy slugged checkpoint files and update checkpoint wikilinks when the mapping is collision-free and local.
-- Own code-page migration. Lint may move `entities/*.md` pages with `source_path:` front matter to `code/` and rebuild the generated hub. Wikilinks need no change (Obsidian resolves by filename). On collision with an existing `code/<slug>.md`, do not overwrite; report unresolved. Append a `## [YYYY-MM-DD] migrate | code entities → code/` log entry (structural change exception to the no-per-pass-entry rule).
+- Own code-page migration. Lint may move `entities/*.md` pages carrying `source_path:` to `code/` and rebuild the generated hub; wikilinks resolve by filename and need no change. On collision with an existing `code/<slug>.md`, report unresolved rather than overwrite. Append a `## [YYYY-MM-DD] migrate | code entities → code/` log entry (a structural exception to the no-per-pass-entry rule).
 - Never move or rename `<wiki root>` or any wiki content directory as part of `.obsidian/` placement or qmd metadata repair.
 - Rotate `<wiki root>/log.md` when it exceeds 500 lines; lint does not append per-pass entries to `log.md`.
 - Check date format drift with `<native-runtime-command> datecheck check`; canonical formats are in `loam-using/references/date-formats.md`. Apply only unambiguous local normalizations and report ambiguous drift.
