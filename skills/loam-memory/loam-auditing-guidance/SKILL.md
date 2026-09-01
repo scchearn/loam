@@ -68,9 +68,10 @@ check `.stitch/DESIGN.md`). If one exists, verify `AGENTS.md` references it
 
 ### Phase 1d: Memory map ensure/regenerate
 
-Only when the workspace has a `wiki/` (a `wiki/` directory holding `SCHEMA.md`,
-`index.md`, or `log.md`). Workspaces without one skip this phase — the block is
-not applicable and its absence is not a defect.
+Only when the workspace has a memory root: a `wiki/` directory holding
+`SCHEMA.md`, `index.md`, or `log.md` — or those files at the workspace root
+itself, which the runtime also accepts. Workspaces without one skip this phase;
+the block is not applicable and its absence is not a defect.
 
 Loam owns a fenced region inside root `AGENTS.md` that lists the durable memory
 page slugs, so an agent reading the guidance file learns the memory exists
@@ -86,25 +87,27 @@ the single source of truth for both, here and in `loam::scaffolding-wiki`.
 <native-runtime-command> lint --only guidance --fix "$WORKSPACE_ROOT"   # insert or regenerate
 ```
 
-`--fix` inserts the `## Memory` section when the markers are absent and
-regenerates the region in place when it is stale. It preserves every byte
-outside the markers and never touches `CLAUDE.md`. Re-run the report form
-afterwards; it should be silent.
+`--fix` inserts the `## Memory` section when the markers are absent — creating
+`AGENTS.md` if the workspace has none — and regenerates the region in place when
+it is stale. It preserves every byte outside the markers and never touches
+`CLAUDE.md`. Re-run the report form afterwards; it should be silent.
 
 **Without the native runtime** (graceful fallback — no runtime dependency, and
 nothing invented): build the region yourself from the page tree and edit it in.
 
 ```bash
 ls wiki/topics wiki/entities wiki/concepts wiki/analyses 2>/dev/null
-ls wiki/code/*.md 2>/dev/null | grep -v '_index.md' | wc -l
+find wiki/code -name '*.md' ! -name '_index.md' 2>/dev/null | wc -l
 ```
 
 Then apply the generation rules from the template verbatim: group in the fixed
 order, drop `_index`, sort kebab-lexical, omit empty groups, truncate any group
 over 30 slugs, append the code-graph pointer only when code pages exist. Edit
-only the bytes between the two markers; if the markers are absent, append the
-whole `## Memory` section (prose included) to `AGENTS.md`. Never write the block
-into `CLAUDE.md`.
+only the bytes between the two markers — and when an unbalanced marker is
+present, pair the closing marker with the *last* opening marker before it, never
+an orphan further up. If the markers are absent, append the whole `## Memory`
+section (prose included) to `AGENTS.md`, creating the file if it does not exist.
+Never write the block into `CLAUDE.md`.
 
 Report the outcome in the Phase 3 quality report as present / inserted /
 regenerated, and note which path (runtime or fallback) produced it.

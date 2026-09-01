@@ -254,6 +254,13 @@ The two marker strings are a fixed contract shared with `loam lint --only
 guidance`, `loam::scaffolding-wiki`, and `loam::normalizing-memory`. Reproduce
 them byte-for-byte — a changed marker makes the region invisible to the runtime.
 
+That includes the `wiki/index.md` path inside the opening marker: it is part of
+the fixed string, not a computed one. A workspace whose memory root is not
+`wiki/` — the runtime also accepts `SCHEMA.md` / `index.md` / `log.md` sitting
+at the workspace root — still gets this exact marker text, while the rendered
+group paths and the code-graph pointer follow the real root. Do not "correct"
+the marker to match.
+
 ````markdown
 ## Memory
 
@@ -283,7 +290,8 @@ independently produce the same bytes:
 | Empty groups | Omitted entirely — never rendered as `Topics (0):` |
 | Line shape | `Topics (N): slug · slug · slug` (middle dot `·`, spaced) |
 | Truncation | Over 30 slugs: list the first 30, then ` … (+M more, see index.md)` where M is the remainder |
-| Code pointer | `Code graph: N pages → wiki/code/_index.md`, where N counts `wiki/code/*.md` excluding `_index.md`; omitted when there are no code pages |
+| Code pointer | `Code graph: N pages → wiki/code/_index.md`, where N counts every `.md` under `wiki/code/` (recursively) except `_index.md`; omitted when there are no code pages |
+| Not mapped | Pages outside the four page-type directories — a flat-layout wiki with `wiki/<slug>.md`, or any other subdirectory — are not listed and do not make the region stale. A flat wiki therefore renders an empty region; move pages into `topics/`, `entities/`, `concepts/`, or `analyses/` to have them mapped |
 | Empty wiki | The two markers with nothing between them — still valid, still current |
 
 Descriptions never appear here. The three disclosure altitudes are: this block

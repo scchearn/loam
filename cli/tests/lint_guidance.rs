@@ -292,3 +292,104 @@ fn guidance_only_selects_the_guidance_domain() {
     assert_eq!(stdout, "");
     assert_eq!(code, 0);
 }
+
+/// The reviewer's blocker repro: an unbalanced opening marker must never let a
+/// later `--fix` swallow the prose below it.
+#[test]
+fn guidance_fix_preserves_prose_below_an_orphan_opening_marker() {
+    let workspace = workspace_with_wiki("orphan-open");
+    let original = format!(
+        "# Guide\n\n{MAP_OPEN}\nTopics (1): alpha\n\n## Commands\n\nRun it.\n\n## Style\n\nTabs.\n"
+    );
+    write(&workspace.join("AGENTS.md"), &original);
+
+    lint(&workspace, &["--fix"]);
+    let once = fs::read_to_string(workspace.join("AGENTS.md")).expect("guide should be readable");
+    lint(&workspace, &["--fix"]);
+    let twice = fs::read_to_string(workspace.join("AGENTS.md")).expect("guide should be readable");
+
+    assert_eq!(once, twice, "second --fix must be a no-op");
+    assert!(
+        once.starts_with(&original),
+        "prose above was rewritten: {once}"
+    );
+    assert!(once.contains("## Commands\n\nRun it."), "{once}");
+    assert!(once.contains("## Style\n\nTabs."), "{once}");
+    assert_eq!(once.matches(MAP_CLOSE).count(), 1);
+}
+
+/// A page pushed out of view by truncation was not removed; the finding must
+/// not name it.
+#[test]
+fn guidance_stale_never_blames_a_page_that_still_exists() {
+    let workspace = workspace_with_wiki("truncated-blame");
+    fs::remove_file(workspace.join("wiki/topics/alpha.md")).expect("page should be removed");
+    fs::remove_file(workspace.join("wiki/topics/beta.md")).expect("page should be removed");
+    fs::remove_file(workspace.join("wiki/entities/gamma.md")).expect("page should be removed");
+    for index in 1..=31 {
+        write(
+            &workspace.join(format!("wiki/topics/topic-{index:02}.md")),
+            "# Topic\n",
+        );
+    }
+    write(&workspace.join("AGENTS.md"), "# Guide\n");
+    lint(&workspace, &["--fix"]);
+
+    write(&workspace.join("wiki/topics/aaa.md"), "# Aaa\n");
+    let (code, stdout) = lint(&workspace, &[]);
+
+    assert_eq!(rules(&stdout), vec!["GDN002".to_owned()]);
+    assert_eq!(code, 2);
+    assert!(!stdout.contains("topic-30"), "blamed a live page: {stdout}");
+    assert!(!stdout.contains("\"removed\""), "{stdout}");
+    assert!(stdout.contains("\"topics\":\"31 → 32\""), "{stdout}");
+}
+
+/// A page added past the truncation threshold is invisible to the slug diff;
+/// the finding must still say something actionable.
+#[test]
+fn guidance_stale_is_actionable_past_the_truncation_threshold() {
+    let workspace = workspace_with_wiki("truncated-tail");
+    fs::remove_file(workspace.join("wiki/entities/gamma.md")).expect("page should be removed");
+    fs::remove_file(workspace.join("wiki/topics/alpha.md")).expect("page should be removed");
+    fs::remove_file(workspace.join("wiki/topics/beta.md")).expect("page should be removed");
+    for index in 1..=31 {
+        write(
+            &workspace.join(format!("wiki/topics/topic-{index:02}.md")),
+            "# Topic\n",
+        );
+    }
+    write(&workspace.join("AGENTS.md"), "# Guide\n");
+    lint(&workspace, &["--fix"]);
+
+    write(&workspace.join("wiki/topics/zzz.md"), "# Zzz\n");
+    let (_, stdout) = lint(&workspace, &[]);
+
+    assert_eq!(rules(&stdout), vec!["GDN002".to_owned()]);
+    assert!(
+        !stdout.contains("\"evidence\":{}"),
+        "empty evidence: {stdout}"
+    );
+    assert!(stdout.contains("\"topics\":\"31 → 32\""), "{stdout}");
+}
+
+#[test]
+fn guidance_fix_creates_a_missing_guidance_file() {
+    let workspace = workspace_with_wiki("fix-create");
+
+    let (code, stdout) = lint(&workspace, &[]);
+    assert_eq!(rules(&stdout), vec!["GDN001".to_owned()]);
+    assert!(stdout.contains("`AGENTS.md` does not exist"), "{stdout}");
+    assert_eq!(code, 2);
+
+    let (code, stdout) = lint(&workspace, &["--fix"]);
+    assert_eq!(stdout, "");
+    assert_eq!(code, 0);
+    assert_eq!(
+        fs::read_to_string(workspace.join("AGENTS.md")).expect("guide should be readable"),
+        format!(
+            "## Memory\n\nThis project keeps a **Loam memory** — agent-owned markdown in `wiki/`. Consult it\nbefore non-trivial work and keep it current. Start at `wiki/index.md`.\n\n{}\n",
+            fresh_region()
+        )
+    );
+}

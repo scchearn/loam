@@ -5,7 +5,7 @@
 //! guidance file — including the `## Memory` prose above the opening marker — is
 //! human-authored and is never rewritten.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -25,6 +25,8 @@ pub const MEMORY_PROSE: &str = "This project keeps a **Loam memory** — agent-o
 
 /// Slugs listed inline per page type before the region truncates.
 const INLINE_THRESHOLD: usize = 30;
+/// Tail of the truncation suffix. Doubles as the "this group is truncated" mark.
+const TRUNCATION_HINT: &str = "more, see index.md";
 /// Page-type directories, in the order they are rendered.
 const GROUPS: [(&str, &str); 4] = [
     ("topics", "Topics"),
@@ -39,21 +41,24 @@ pub fn findings(workspace: &Path, out: &mut Vec<Finding>) {
         return;
     };
 
-    let agents = fs::read_to_string(workspace.join("AGENTS.md")).unwrap_or_default();
+    let path = workspace.join("AGENTS.md");
+    let agents = fs::read_to_string(&path).unwrap_or_default();
     match find_region(&agents) {
         None => out.push(Finding::file(
             "GDN001",
             "guidance-map-missing",
             Severity::Warning,
             "AGENTS.md",
-            "`AGENTS.md` has no `loam:memory-map` region",
+            if path.is_file() {
+                "`AGENTS.md` has no `loam:memory-map` region"
+            } else {
+                "`AGENTS.md` does not exist"
+            },
         )),
         Some((start, end)) => {
             let current = &agents[start..end];
             let generated = region(workspace, &wiki_root);
             if normalize(current) != normalize(&generated) {
-                let present = region_slugs(current);
-                let expected = region_slugs(&generated);
                 let mut finding = Finding::file(
                     "GDN002",
                     "guidance-map-stale",
@@ -61,13 +66,8 @@ pub fn findings(workspace: &Path, out: &mut Vec<Finding>) {
                     "AGENTS.md",
                     "`loam:memory-map` region no longer matches the wiki",
                 );
-                let added = join(expected.difference(&present));
-                let removed = join(present.difference(&expected));
-                if !added.is_empty() {
-                    finding = finding.with_evidence("added", &added);
-                }
-                if !removed.is_empty() {
-                    finding = finding.with_evidence("removed", &removed);
+                for (key, value) in stale_evidence(current, &generated, &wiki_root) {
+                    finding = finding.with_evidence(&key, &value);
                 }
                 out.push(finding);
             }
@@ -87,23 +87,59 @@ pub fn findings(workspace: &Path, out: &mut Vec<Finding>) {
     }
 }
 
-/// Inserts or regenerates the region in the workspace `AGENTS.md`. Returns
-/// whether the file changed. A workspace with no wiki, or no `AGENTS.md` to
-/// append to, is a no-op — seeding a fresh guidance file is the skill's job.
+/// What drifted, in terms the reader can act on.
+///
+/// Slug names are only trustworthy while neither region is truncated: past the
+/// threshold a page slides in and out of view without being added or removed,
+/// so naming the visible delta would accuse the wrong page. Under truncation
+/// the per-group counts are the honest evidence, and a slug diff is the last
+/// resort for the case where the counts happen to match (a rename).
+fn stale_evidence(current: &str, generated: &str, wiki_root: &Path) -> Vec<(String, String)> {
+    if is_truncated(current) || is_truncated(generated) {
+        let counts = count_deltas(current, generated);
+        if !counts.is_empty() {
+            return counts;
+        }
+    }
+
+    let present = region_slugs(current);
+    let expected = region_slugs(generated);
+    let on_disk = mapped_slugs(wiki_root);
+    let added = join(expected.difference(&present));
+    // A slug that still resolves to a durable page was never removed; it was
+    // only pushed out of view.
+    let removed = join(
+        present
+            .difference(&expected)
+            .filter(|slug| !on_disk.contains(*slug)),
+    );
+
+    [("added", added), ("removed", removed)]
+        .into_iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect()
+}
+
+/// Inserts or regenerates the region in the workspace `AGENTS.md`, creating the
+/// file when it does not exist. Returns whether the file changed. A workspace
+/// with no wiki is a no-op.
 pub fn fix(workspace: &Path) -> Result<bool, String> {
     let Some(wiki_root) = state::resolve_wiki_root(workspace) else {
         return Ok(false);
     };
     let path = workspace.join("AGENTS.md");
-    let Ok(existing) = fs::read_to_string(&path) else {
-        return Ok(false);
-    };
+    let existing = fs::read_to_string(&path).unwrap_or_default();
 
     let crlf = existing.contains("\r\n");
     let newline = if crlf { "\r\n" } else { "\n" };
     let generated = with_newlines(&region(workspace, &wiki_root), newline);
 
     let updated = match find_region(&existing) {
+        // Byte comparison, not the whitespace-normalized one `findings` uses: a
+        // cosmetically reflowed region is not reported stale, but `--fix` still
+        // restores it to canonical form. Loam owns these bytes, so rewriting
+        // them is free.
         Some((start, end)) => {
             if existing[start..end] == generated {
                 return Ok(false);
@@ -112,12 +148,15 @@ pub fn fix(workspace: &Path) -> Result<bool, String> {
         }
         None => {
             let mut text = existing.clone();
-            if !text.is_empty() && !text.ends_with('\n') {
+            if !text.is_empty() {
+                if !text.ends_with('\n') {
+                    text.push_str(newline);
+                }
                 text.push_str(newline);
             }
             let prose = with_newlines(MEMORY_PROSE, newline);
             text.push_str(&format!(
-                "{newline}{MEMORY_HEADING}{newline}{newline}{prose}{newline}{newline}{generated}{newline}"
+                "{MEMORY_HEADING}{newline}{newline}{prose}{newline}{newline}{generated}{newline}"
             ));
             text
         }
@@ -157,9 +196,14 @@ pub fn region(workspace: &Path, wiki_root: &Path) -> String {
 }
 
 /// Byte offsets of the region in `text`, markers included.
+///
+/// Anchored on the closing marker, then the *last* opening marker before it. An
+/// orphan opening marker — a hand-edit, a truncated file, a bad merge — must
+/// never widen the span across human prose, because everything inside it is
+/// replaced on the next regeneration.
 pub fn find_region(text: &str) -> Option<(usize, usize)> {
-    let start = text.find(MAP_OPEN)?;
-    let close = text[start..].find(MAP_CLOSE)? + start;
+    let close = text.find(MAP_CLOSE)?;
+    let start = text[..close].rfind(MAP_OPEN)?;
     Some((start, close + MAP_CLOSE.len()))
 }
 
@@ -178,18 +222,72 @@ fn group_slugs(pages: &[String], directory: &str) -> Vec<String> {
     slugs
 }
 
+/// Every slug the map covers, truncation ignored. Pages outside the four
+/// page-type directories are not mapped and never appear here.
+fn mapped_slugs(wiki_root: &Path) -> BTreeSet<String> {
+    let pages = memory::durable_pages(wiki_root);
+    GROUPS
+        .iter()
+        .flat_map(|(directory, _)| group_slugs(&pages, directory))
+        .collect()
+}
+
 fn render_group(label: &str, slugs: &[String]) -> String {
     let total = slugs.len();
     let shown = total.min(INLINE_THRESHOLD);
     let listed = slugs[..shown].join(" · ");
     if total > shown {
         format!(
-            "{label} ({total}): {listed} … (+{} more, see index.md)",
+            "{label} ({total}): {listed} … (+{} {TRUNCATION_HINT})",
             total - shown
         )
     } else {
         format!("{label} ({total}): {listed}")
     }
+}
+
+fn is_truncated(region: &str) -> bool {
+    region.contains(TRUNCATION_HINT)
+}
+
+/// Rendered per-group totals, keyed by the lowercased group label.
+fn group_counts(region: &str) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for line in region.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Code graph: ") {
+            if let Some(total) = rest.split_whitespace().next().and_then(|v| v.parse().ok()) {
+                counts.insert("code graph".to_owned(), total);
+            }
+            continue;
+        }
+        let Some((head, _)) = line.split_once(": ") else {
+            continue;
+        };
+        let Some((label, total)) = head.split_once(" (") else {
+            continue;
+        };
+        if let Some(total) = total.strip_suffix(')').and_then(|v| v.parse().ok()) {
+            counts.insert(label.to_ascii_lowercase(), total);
+        }
+    }
+    counts
+}
+
+fn count_deltas(current: &str, generated: &str) -> Vec<(String, String)> {
+    let before = group_counts(current);
+    let after = group_counts(generated);
+    before
+        .keys()
+        .chain(after.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|key| {
+            let from = before.get(key).copied().unwrap_or(0);
+            let to = after.get(key).copied().unwrap_or(0);
+            (from != to).then(|| (key.clone(), format!("{from} → {to}")))
+        })
+        .collect()
 }
 
 /// Slugs a rendered region lists, ignoring counts and truncation markers.
@@ -373,6 +471,47 @@ mod tests {
             slugs.into_iter().collect::<Vec<_>>(),
             vec!["alpha".to_owned(), "beta".to_owned()]
         );
+    }
+
+    #[test]
+    fn guidance_find_region_never_widens_past_an_orphan_opening_marker() {
+        // A truncated file or bad merge can leave an unbalanced opening marker.
+        // The span must start at the marker that actually pairs with the close,
+        // never at the orphan, or the next regeneration eats the prose between.
+        let text = format!(
+            "{MAP_OPEN}\nTopics (1): orphan\n\n## Commands\n\nRun it.\n\n\
+             {MAP_OPEN}\nTopics (1): real\n{MAP_CLOSE}\n"
+        );
+        let (start, end) = find_region(&text).expect("region should be found");
+        assert_eq!(
+            &text[start..end],
+            format!("{MAP_OPEN}\nTopics (1): real\n{MAP_CLOSE}")
+        );
+        assert!(text[..start].contains("## Commands"));
+    }
+
+    #[test]
+    fn guidance_find_region_ignores_an_opening_marker_with_no_close() {
+        let text = format!("{MAP_OPEN}\nTopics (1): orphan\n\n## Commands\n");
+        assert_eq!(find_region(&text), None);
+    }
+
+    #[test]
+    fn guidance_count_deltas_name_the_groups_that_moved() {
+        let before = format!("{MAP_OPEN}\nTopics (31): a … (+1 {TRUNCATION_HINT})\n{MAP_CLOSE}");
+        let after = format!("{MAP_OPEN}\nTopics (32): a … (+2 {TRUNCATION_HINT})\n{MAP_CLOSE}");
+        assert_eq!(
+            count_deltas(&before, &after),
+            vec![("topics".to_owned(), "31 → 32".to_owned())]
+        );
+    }
+
+    #[test]
+    fn guidance_truncation_is_detected_from_the_rendered_suffix() {
+        assert!(is_truncated(&format!(
+            "Topics (31): a … (+1 {TRUNCATION_HINT})"
+        )));
+        assert!(!is_truncated("Topics (2): alpha · beta"));
     }
 
     #[test]
