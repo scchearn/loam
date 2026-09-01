@@ -393,3 +393,27 @@ fn guidance_fix_creates_a_missing_guidance_file() {
         )
     );
 }
+
+/// Mirror of the orphan-open blocker: a stray closing marker must not make
+/// every `--fix` append another section.
+#[test]
+fn guidance_fix_is_idempotent_below_an_orphan_closing_marker() {
+    let workspace = workspace_with_wiki("orphan-close");
+    let original = format!("# Guide\n\n{MAP_CLOSE}\n\n## Commands\n\nHuman prose.\n");
+    write(&workspace.join("AGENTS.md"), &original);
+
+    lint(&workspace, &["--fix"]);
+    let once = fs::read_to_string(workspace.join("AGENTS.md")).expect("guide should be readable");
+    lint(&workspace, &["--fix"]);
+    lint(&workspace, &["--fix"]);
+    let thrice = fs::read_to_string(workspace.join("AGENTS.md")).expect("guide should be readable");
+
+    assert_eq!(once, thrice, "repeated --fix must not append again");
+    assert!(once.starts_with(&original), "prose was rewritten: {once}");
+    assert_eq!(once.matches("## Memory").count(), 1, "{once}");
+    assert_eq!(once.matches(MAP_OPEN).count(), 1, "{once}");
+
+    let (code, stdout) = lint(&workspace, &[]);
+    assert_eq!(stdout, "", "the finding never cleared");
+    assert_eq!(code, 0);
+}

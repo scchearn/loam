@@ -197,14 +197,23 @@ pub fn region(workspace: &Path, wiki_root: &Path) -> String {
 
 /// Byte offsets of the region in `text`, markers included.
 ///
-/// Anchored on the closing marker, then the *last* opening marker before it. An
-/// orphan opening marker — a hand-edit, a truncated file, a bad merge — must
-/// never widen the span across human prose, because everything inside it is
-/// replaced on the next regeneration.
+/// The first closing marker that *has* an opening marker before it, paired with
+/// the last such opening marker. Both halves matter, and an unbalanced marker of
+/// either kind — a hand-edit, a truncated file, a bad merge — is skipped rather
+/// than trusted: an orphan opening marker must never widen the span across human
+/// prose, since everything inside it is replaced on the next regeneration, and
+/// an orphan closing marker must never hide a real region below it, since that
+/// would make every `--fix` append yet another section.
 pub fn find_region(text: &str) -> Option<(usize, usize)> {
-    let close = text.find(MAP_CLOSE)?;
-    let start = text[..close].rfind(MAP_OPEN)?;
-    Some((start, close + MAP_CLOSE.len()))
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(MAP_CLOSE) {
+        let close = from + offset;
+        if let Some(start) = text[..close].rfind(MAP_OPEN) {
+            return Some((start, close + MAP_CLOSE.len()));
+        }
+        from = close + MAP_CLOSE.len();
+    }
+    None
 }
 
 /// Sorted slugs for one page-type directory. `_index.md` is the reserved hub
@@ -488,6 +497,28 @@ mod tests {
             format!("{MAP_OPEN}\nTopics (1): real\n{MAP_CLOSE}")
         );
         assert!(text[..start].contains("## Commands"));
+    }
+
+    #[test]
+    fn guidance_find_region_skips_a_closing_marker_with_no_open() {
+        // Mirror of the orphan-open case, cut from the other end. A stray close
+        // must not hide the real region below it, or every `--fix` appends
+        // another section and the finding never clears.
+        let text = format!(
+            "# Guide\n\n{MAP_CLOSE}\n\n## Commands\n\nRun it.\n\n\
+             {MAP_OPEN}\nTopics (1): real\n{MAP_CLOSE}\n"
+        );
+        let (start, end) = find_region(&text).expect("region should be found");
+        assert_eq!(
+            &text[start..end],
+            format!("{MAP_OPEN}\nTopics (1): real\n{MAP_CLOSE}")
+        );
+    }
+
+    #[test]
+    fn guidance_find_region_ignores_a_closing_marker_with_no_region_at_all() {
+        let text = format!("# Guide\n\n{MAP_CLOSE}\n\n## Commands\n");
+        assert_eq!(find_region(&text), None);
     }
 
     #[test]
