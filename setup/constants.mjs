@@ -13,7 +13,7 @@ export const SKILLS_CLI_VERSION = '1.5.20';
 // `cli/Cargo.toml [package]` (T9), and `cli/src/check.rs` gates the two into
 // agreement. It is NOT read from the skills tree — a stale skills `CLI_VERSION`
 // can never again freeze the runtime. See plans/runtime-channel-ledger.md.
-export const RUNTIME_VERSION = '1.0.0';
+export const RUNTIME_VERSION = '1.0.1';
 
 // Core semver with optional semver-2.0.0 prerelease; build metadata (`+...`)
 // stays rejected (npm refuses it and `+` in tag-derived URLs is unsafe).
