@@ -6,6 +6,8 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+## [1.0.2] — runtime 1.0.1
+
 ### Added
 
 - **Specs for judged work now name their oracle.** When a request's quality bar
@@ -115,6 +117,7 @@ Release entries are maintained as part of release work; see
 [RELEASING.md](./docs/RELEASING.md).
 
 [Unreleased]: https://github.com/scchearn/loam/compare/v1.0.0...HEAD
+[1.0.2]: https://github.com/scchearn/loam/releases/tag/v1.0.2
 [1.0.1]: https://github.com/scchearn/loam/releases/tag/v1.0.1
 [1.0.0]: https://github.com/scchearn/loam/releases/tag/v1.0.0
 [#114]: https://github.com/scchearn/loam/pull/114
