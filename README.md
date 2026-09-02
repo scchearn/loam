@@ -303,7 +303,7 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::resuming | 376 | 77 | 142 | 1,847 |
 | loam::setting-goals | 473 | 101 | 184 | 1,883 |
 | loam::starting | 166 | 34 | 356 | 4,985 |
-| loam::writing-spec | 332 | 66 | 253 | 3,002 |
+| loam::writing-spec | 332 | 66 | 261 | 3,323 |
 <!-- END skill-metrics -->
 
 ## Documentation

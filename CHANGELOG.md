@@ -8,6 +8,17 @@ All notable changes to loam are documented here. This file follows
 
 ### Added
 
+- **Specs for judged work now name their oracle.** When a request's quality bar
+  is judged rather than test-proven (visual/UI/design, generated content, prose,
+  media), `loam::writing-spec` elicits four oracle questions — the reference
+  that defines "good", the evidence contract an agent must produce before
+  claiming done, the stop condition (including blind comparison where
+  available), and the retry budget — and records them in two new spec sections,
+  `## Quality anchor` and `## Verification oracle`. The completeness gate
+  enforces both, and the evidence contract must appear in Scope so planning
+  schedules the verification harness as early work instead of an afterthought.
+  Hard-oracle work (done provable by tests or commands) is unaffected.
+  (`loam-writing-spec` 3.3.0)
 - **The memory announces itself in `AGENTS.md`.** A workspace with a wiki now
   carries a small Loam-owned memory map inside its guidance file, listing the
   durable page slugs by type so an agent learns the memory exists at session
