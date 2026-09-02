@@ -3,7 +3,7 @@ name: loam::writing-spec
 description: "Research workspace context, APIs, implementation options, or external evidence before planning. The terminal artifact is always a spec at specs/<slug>.md; a plans/research/<slug>.md memo is optional supporting evidence when substantial investigation was needed. Accepts an optional goal path for provenance; see loam::setting-goals."
 allowed-tools: Read Glob Grep Bash WebFetch Write Edit
 metadata:
-  version: "3.2.0"
+  version: "3.3.0"
   author: scchearn
   argument-hint: <topic, question, or goal path>
 ---
@@ -34,6 +34,7 @@ Decide whether Step 2 elicitation is required. Trigger clarification when **any*
 - The work affects user-visible behavior, APIs/CLI contracts, data persistence, auth/security/privacy, migrations, integrations, billing, notifications, deployment/ops, or non-trivial UI flows.
 - Expected behavior includes edge cases not stated by the user.
 - The user asked for "research," "spec," "design," "feature," "workflow," or "architecture" rather than a tiny known edit.
+- The work's quality is judged rather than test-proven: visual/UI/design, generated content, prose, or media, or the request uses judged-quality language such as "AAA", "polished", "photographic", or "high-end". This fires the oracle elicitation in Step 2.
 - You would otherwise need to invent a product decision, permission rule, error response, data retention choice, rollout strategy, or verification standard.
 
 Skip clarification when **all** of: the task is trivial/localized, repo conventions make the behavior obvious, missing details are non-blocking, and the spec can be draft with explicit gaps.
@@ -50,6 +51,8 @@ Ask focused clarification questions only when answers materially affect scope, b
 - If three or more trigger conditions apply, ask up to 5–7 focused questions.
 - Ask fewer when repo evidence already answers the question.
 - Stop asking once remaining unknowns are resolved, assumed safely, or marked blocking/non-blocking.
+
+When a judged-oracle trigger from Step 1 fires, also ask the four oracle questions from `references/oracle-questions.md`: quality anchor, oracle type with its evidence contract, convergence/stop condition, and retry budget. These four do not count against the question budget above; record their answers as ordinary Q/A/Status triples. For judged work, assume the evidence contract or verification harness is itself in scope and record that as an `assumed` clarification unless the user says otherwise. When the oracle is hard — done is provable by tests, commands, or mechanical checks — skip the oracle bank; the existing Verification handling is sufficient.
 
 Use workspace evidence, wiki, and docs to answer what you can without bothering the user. Record all clarifications in the spec `## Clarifications` section with Q/A/Status triples:
 
@@ -154,6 +157,8 @@ After the draft spec content exists, run an internal completeness check against 
 | Integrations | External systems, API docs, rate limits, webhooks are specified or marked n/a. |
 | Operations / rollout | Deployment order, feature flags, observability, rollback are specified or marked n/a. |
 | Verification | Tests, commands, or manual checks are named or explicitly TBD. |
+| Quality anchor | The external reference for "good" (reference implementation, gold outputs, screenshot set, style reference) is named, or explicitly n/a. |
+| Convergence / retry economics | Stop condition, pass threshold, and retry/round budget for judged loops are stated, or explicitly n/a. |
 | Planning inputs | Key files/modules, validation commands, and rejected alternatives are sufficient or gap-marked. |
 | Open questions | Blocking questions are resolved; non-blocking questions are marked. |
 
@@ -193,6 +198,8 @@ Also include, using `none` when empty:
 
 - `## Scope`
 - `## Constraints`
+- `## Quality anchor`
+- `## Verification oracle`
 - `## Rejected alternatives`
 - `## Key files / modules`
 - `## Completeness checklist`
@@ -258,5 +265,6 @@ If the spec is draft and all completeness areas are `pass` or `n/a`, say "ready 
 - Prefer workspace evidence and official documentation over generic advice.
 - If research shows an existing plan is wrong, say so and recommend updating the spec before `/loam::amending-plan`.
 - Elicitation questions must materially affect scope, behavior, risk, or verification. Do not pad questionnaires.
+- For judged-oracle specs, `## Quality anchor` and `## Verification oracle` must not be `none`, and the evidence contract (harness outputs, artifact types, judge inputs) must appear in Scope so loam::planning schedules it as early work.
 - For behavior-changing specs, Acceptance criteria must be derived from Scenarios. Do not author them independently.
 - Run the completeness gate after drafting the spec body, before finalizing. Do not skip it.
