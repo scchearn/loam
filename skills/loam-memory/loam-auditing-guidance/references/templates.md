@@ -269,9 +269,9 @@ before non-trivial work and keep it current. Start at `wiki/index.md`.
 
 <!-- loam:memory-map · generated from wiki/index.md · do not edit by hand -->
 Topics (24): authentication · connector-hardening · pricing-strategy … (+21 more, see index.md)
-Entities (3): ovhcloud · second-spectrum · skillcorner
-Concepts (1): kitman-labs-oauth-scopes
-Analyses (2): chelsea-vendor-integration-learnings · gtm-assessment
+Entities (3): acme-corp · globex · initech
+Concepts (1): oauth-token-scopes
+Analyses (2): vendor-integration-review · market-assessment
 Code graph: 429 pages → wiki/code/_index.md
 <!-- /loam:memory-map -->
 ````

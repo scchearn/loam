@@ -380,10 +380,10 @@ mod tests {
         let workspace = wiki(
             "order",
             &pages(&[
-                "analyses/gtm-assessment.md",
+                "analyses/market-assessment.md",
                 "concepts/oauth-scopes.md",
-                "entities/ovhcloud.md",
-                "entities/skillcorner.md",
+                "entities/acme-corp.md",
+                "entities/globex.md",
                 "topics/authentication.md",
             ]),
         );
@@ -392,9 +392,9 @@ mod tests {
             format!(
                 "{MAP_OPEN}\n\
                  Topics (1): authentication\n\
-                 Entities (2): ovhcloud · skillcorner\n\
+                 Entities (2): acme-corp · globex\n\
                  Concepts (1): oauth-scopes\n\
-                 Analyses (1): gtm-assessment\n\
+                 Analyses (1): market-assessment\n\
                  {MAP_CLOSE}"
             )
         );
