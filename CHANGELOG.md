@@ -6,6 +6,31 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+### Added
+
+- **Specs for judged work now name their oracle.** When a request's quality bar
+  is judged rather than test-proven (visual/UI/design, generated content, prose,
+  media), `loam::writing-spec` elicits four oracle questions — the reference
+  that defines "good", the evidence contract an agent must produce before
+  claiming done, the stop condition (including blind comparison where
+  available), and the retry budget — and records them in two new spec sections,
+  `## Quality anchor` and `## Verification oracle`. The completeness gate
+  enforces both, and the evidence contract must appear in Scope so planning
+  schedules the verification harness as early work instead of an afterthought.
+  Hard-oracle work (done provable by tests or commands) is unaffected.
+  (`loam-writing-spec` 3.3.0)
+- **The memory announces itself in `AGENTS.md`.** A workspace with a wiki now
+  carries a small Loam-owned memory map inside its guidance file, listing the
+  durable page slugs by type so an agent learns the memory exists at session
+  start instead of having to go looking. It is plain markdown that every
+  harness already reads — no import syntax, no session-start injection — and it
+  stays bounded as the wiki grows. `loam lint` gains a `guidance` domain that
+  reports the map missing or out of date and a drifted `CLAUDE.md` shim, and
+  `loam lint --fix` regenerates the map in place without touching anything
+  outside its markers. Scaffolding seeds the block, the guidance audit can
+  refresh it with or without the native runtime, and normalization leaves it
+  alone.
+
 ### Fixed
 
 - **Federation connector stays online.** The production broker's access rules
@@ -15,6 +40,15 @@ All notable changes to loam are documented here. This file follows
   runs it, and the broker acceptance checklist reflects the settled trust model:
   the organization is the trust boundary, project membership is routing, and
   member cards make project sharing visible across the organization. ([#173])
+
+## [1.0.1]
+
+### Added
+
+- **Optional integrations are offered during install.** The setup wizard now
+  surfaces the opt-in integrations (research and coordination tools) while
+  installing, so a new install can enable them interactively instead of having
+  to edit configuration afterward. ([#197])
 
 ## [1.0.0]
 
@@ -81,8 +115,10 @@ Release entries are maintained as part of release work; see
 [RELEASING.md](./docs/RELEASING.md).
 
 [Unreleased]: https://github.com/scchearn/loam/compare/v1.0.0...HEAD
+[1.0.1]: https://github.com/scchearn/loam/releases/tag/v1.0.1
 [1.0.0]: https://github.com/scchearn/loam/releases/tag/v1.0.0
 [#114]: https://github.com/scchearn/loam/pull/114
+[#197]: https://github.com/scchearn/loam/pull/197
 [#146]: https://github.com/scchearn/loam/issues/146
 [#163]: https://github.com/scchearn/loam/issues/163
 [#173]: https://github.com/scchearn/loam/issues/173

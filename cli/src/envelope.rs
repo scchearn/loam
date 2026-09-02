@@ -2643,6 +2643,10 @@ mod tests {
             // The federation CLI reads the identity bundle and the registry for
             // the one-command connect surface and the lifecycle verbs.
             "federation.rs",
+            // Reads the wiki page tree and the guidance files, and writes back
+            // exactly one thing: the fenced `loam:memory-map` region inside the
+            // workspace `AGENTS.md`. `CLAUDE.md` is read-only here.
+            "guidance.rs",
             // The harness read path reads the installed skill body,
             // `install.json`, and the workspace state that the retired Node
             // integration used to assemble. Reads only — it opens no file for

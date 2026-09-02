@@ -70,6 +70,17 @@ Use this checklist to health-check a markdown wiki without turning the pass into
 
 Goal lint findings are report-only. Do not alter goal files. Route corrections through `/loam::setting-goals`.
 
+## Guidance memory map
+
+Applies only when the workspace has a `wiki/`; otherwise skip the section.
+
+- Does root `AGENTS.md` carry both `loam:memory-map` markers (`guidance-map-missing`)?
+- Do the slugs between the markers match the durable pages under `wiki/` (`guidance-map-stale`, reported with `added` and `removed` evidence)?
+- Is `CLAUDE.md`, if present, exactly `@AGENTS.md` (`guidance-claude-shim`)?
+- Has anything hand-written been left between the markers? It is destroyed on the next regeneration — move it above the opening marker.
+
+Fix the first two with `<native-runtime-command> lint --only guidance --fix "$WORKSPACE_ROOT"`, or regenerate via `/loam::auditing-guidance` when the runtime is unavailable. The shim finding is report-only here: collapsing a drifted `CLAUDE.md` belongs to `/loam::auditing-guidance`, and nothing is ever written to that file.
+
 ## Avoid during lint
 
 - new source ingestion
