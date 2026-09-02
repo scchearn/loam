@@ -3,7 +3,7 @@
 // here rather than committed as thousands of files.
 //
 // Fixture size: 2000 source files across 20 directories, 2000 wiki code pages,
-// 50 checkpoints. Sports-bridge and uwf sub-0.5s runs stay manual benchmarks.
+// 50 checkpoints. Real-workspace sub-0.5s runs stay manual benchmarks.
 use std::fs;
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};

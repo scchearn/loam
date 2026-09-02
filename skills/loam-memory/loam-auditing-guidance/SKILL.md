@@ -3,7 +3,7 @@ name: loam::auditing-guidance
 description: "Audit, prune, and improve agent guidance markdown files in repositories. Use when the user asks to check, audit, update, improve, or fix AGENTS.md, CLAUDE.md, or related guidance files. Adds missing commands and gotchas, removes stale entries, deduplicates, and keeps the file small and relevant. Scan for guidance files, evaluate quality against templates, output a quality report, then make targeted updates."
 allowed-tools: Read Glob Grep Bash Edit
 metadata:
-  version: "0.4.0"
+  version: "0.5.0"
   author: scchearn
 ---
 
@@ -65,6 +65,57 @@ check `.stitch/DESIGN.md`). If one exists, verify `AGENTS.md` references it
   user decide what to add.
 - **If no DESIGN.md exists:** no action — the check is conditional on the
   file being present.
+
+### Phase 1d: Memory map ensure/regenerate
+
+Only when the workspace has a memory root: a `wiki/` directory holding
+`SCHEMA.md`, `index.md`, or `log.md` — or those files at the workspace root
+itself, which the runtime also accepts. Workspaces without one skip this phase;
+the block is not applicable and its absence is not a defect.
+
+Loam owns a fenced region inside root `AGENTS.md` that lists the durable memory
+page slugs, so an agent reading the guidance file learns the memory exists
+without paying for `index.md` every session. See
+[references/templates.md](references/templates.md) "Template: Memory (Loam memory
+map)" for the exact marker strings and the generation rules — that template is
+the single source of truth for both, here and in `loam::scaffolding-wiki`.
+
+**With the native runtime** (preferred — it is the same generator):
+
+```bash
+<native-runtime-command> lint --only guidance "$WORKSPACE_ROOT"         # report
+<native-runtime-command> lint --only guidance --fix "$WORKSPACE_ROOT"   # insert or regenerate
+```
+
+`--fix` inserts the `## Memory` section when the markers are absent — creating
+`AGENTS.md` if the workspace has none — and regenerates the region in place when
+it is stale. It preserves every byte outside the markers and never touches
+`CLAUDE.md`. Re-run the report form afterwards; it should be silent.
+
+**Without the native runtime** (graceful fallback — no runtime dependency, and
+nothing invented): build the region yourself from the page tree and edit it in.
+
+```bash
+ls wiki/topics wiki/entities wiki/concepts wiki/analyses 2>/dev/null
+find wiki/code -name '*.md' ! -name '_index.md' 2>/dev/null | wc -l
+```
+
+Then apply the generation rules from the template verbatim: group in the fixed
+order, drop `_index`, sort kebab-lexical, omit empty groups, truncate any group
+over 30 slugs, append the code-graph pointer only when code pages exist. Edit
+only the bytes between the two markers — and when an unbalanced marker is
+present, pair the closing marker with the *last* opening marker before it, never
+an orphan further up. If the markers are absent, append the whole `## Memory`
+section (prose included) to `AGENTS.md`, creating the file if it does not exist.
+Never write the block into `CLAUDE.md`.
+
+Report the outcome in the Phase 3 quality report as present / inserted /
+regenerated, and note which path (runtime or fallback) produced it.
+
+**Size guard.** The block counts toward the root `AGENTS.md` 150-line budget
+(Phase 4b, check 5). Truncation keeps it near ten lines; if the file is over 150
+lines, trim elsewhere — never by hand-editing inside the markers, which the next
+regeneration overwrites.
 
 ### Phase 2: Quality Assessment
 
@@ -187,7 +238,7 @@ The audit is two-directional: add what's missing, remove what's stale. After pro
 
 4. **Propose consolidation.** When sections grew organically and overlap, propose a merged version. Show the before/after.
 
-5. **Size guard.** If a root `AGENTS.md` is over 150 lines (or a package-level one over 50), flag it. Suggest what to trim or move to the wiki / `references/` docs.
+5. **Size guard.** If a root `AGENTS.md` is over 150 lines (or a package-level one over 50), flag it. Suggest what to trim or move to the wiki / `references/` docs. Count the whole file, memory-map region included; trim prose and stale sections rather than the generated region, which is already bounded by its truncation rule and is restored on the next regeneration anyway.
 
 6. **Collapse drifted CLAUDE.md.** If Phase 1b found CLAUDE.md with content beyond `@AGENTS.md`, and the extra content has been moved (to AGENTS.md, `.claude/rules/`, or `.claude.local.md`), propose collapsing CLAUDE.md back to `@AGENTS.md` only.
 
@@ -231,6 +282,7 @@ See [references/templates.md](references/templates.md) for guidance file templat
 6. **Undocumented gotchas**: Non-obvious patterns not captured → Phase 4 addition
 7. **Duplicated info**: Same content in two places → Phase 4b deduplicate
 8. **Overgrown file**: AGENTS.md over 150 lines → Phase 4b size guard
+9. **Missing or stale memory map**: a `wiki/` exists but AGENTS.md has no `loam:memory-map` region, or its slugs no longer match `wiki/` → Phase 1d ensure/regenerate
 
 ## User Tips to Share
 

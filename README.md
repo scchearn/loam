@@ -284,18 +284,18 @@ the skill runs. The table below shows how much space each skill uses against the
 | Skill | Desc chars (max 1,024) | Desc tokens (~100) | Body lines (max 500) | Body tokens (< 5,000) |
 |-------|---:|---:|---:|---:|
 | loam::initializing-vault | 206 | 51 | 9 | 73 |
-| loam::scaffolding-wiki | 445 | 90 | 198 | 2,196 |
+| loam::scaffolding-wiki | 445 | 90 | 207 | 2,400 |
 | loam::adding-to-memory | 592 | 116 | 217 | 2,311 |
 | loam::amending-memory | 505 | 114 | 180 | 1,961 |
-| loam::auditing-guidance | 410 | 85 | 252 | 2,528 |
+| loam::auditing-guidance | 410 | 85 | 304 | 3,256 |
 | loam::ingesting-codebase | 329 | 76 | 288 | 3,660 |
 | loam::learning-from-session | 487 | 101 | 365 | 4,212 |
-| loam::linting-memory | 471 | 102 | 312 | 4,980 |
+| loam::linting-memory | 471 | 102 | 316 | 4,989 |
 | loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
 | loam::querying-memory | 530 | 105 | 175 | 1,593 |
 | loam::reviewing-memory | 510 | 113 | 137 | 1,787 |
 | loam::syncing-code-graph | 363 | 84 | 223 | 2,780 |
-| loam::using | 368 | 77 | 298 | 4,800 |
+| loam::using | 368 | 77 | 300 | 4,837 |
 | loam::amending-plan | 437 | 88 | 273 | 3,059 |
 | loam::checkpointing | 365 | 69 | 177 | 2,091 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,237 |

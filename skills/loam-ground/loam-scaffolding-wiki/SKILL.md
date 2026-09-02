@@ -126,6 +126,14 @@ Acceptable starters: topic map page if clear subdomains exist, short analyses pa
 
 Do not fabricate content that should come from later `/loam::adding-to-memory` runs.
 
+### E. Guidance-file seed
+
+Seed a `## Memory` section into the workspace's root `AGENTS.md` so the next agent session learns the memory exists. At scaffold time the wiki has no durable pages, so the fenced region is the bare marker pair — that is complete and current, not stale.
+
+Copy the section, the marker strings, and the generation rules verbatim from `loam-auditing-guidance/references/templates.md` → "Template: Memory (Loam memory map)"; that is the single source of truth. Append the section if `AGENTS.md` exists, create it with that section alone if it does not, and leave any existing content untouched. Never write the block into `CLAUDE.md` — it stays the `@AGENTS.md` shim.
+
+Refresh later with `/loam::auditing-guidance` or `loam lint --only guidance --fix`.
+
 ---
 
 ## Step 3 — Offer optional setup
@@ -170,6 +178,7 @@ Wiki scaffold ready at <wiki root>
 - Obsidian vault root: <path or "not configured">
 - Schema: <path>
 - Root guidance link: <path or "none">
+- Memory block seeded in root `AGENTS.md`: yes | no (<reason>)
 
 ### Retrieval setup
 

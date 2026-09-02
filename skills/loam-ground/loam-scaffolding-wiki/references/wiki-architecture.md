@@ -82,6 +82,38 @@ A separate root `overview.md` is legacy drift. If one exists, fold its still-use
 - carries no `source_path:` front matter and is not a code node
 - provides two-hop reachability from root `index.md` to every derived code page
 
+### Root `AGENTS.md` — `## Memory` block
+
+Scaffolding a wiki also seeds a `## Memory` section into the workspace's root
+`AGENTS.md`, so the very next agent session learns the memory exists without
+being told. Loam owns only the fenced `loam:memory-map` region inside it; the
+heading and the prose above the opening marker are seeded once and stay
+human-editable.
+
+The marker strings and the generation rules have exactly one source of truth:
+`loam-auditing-guidance/references/templates.md` → "Template: Memory (Loam
+memory map)". Copy them from there; never restate or reword them here.
+
+At scaffold time the wiki holds no durable pages yet, so the region is the bare
+marker pair with nothing between it:
+
+````markdown
+## Memory
+
+This project keeps a **Loam memory** — agent-owned markdown in `wiki/`. Consult it
+before non-trivial work and keep it current. Start at `wiki/index.md`.
+
+<!-- loam:memory-map · generated from wiki/index.md · do not edit by hand -->
+<!-- /loam:memory-map -->
+````
+
+That is a complete, current region — `loam lint --only guidance` reads it as
+present and fresh, not stale. It fills in as pages land, refreshed by
+`/loam::auditing-guidance` or `loam lint --only guidance --fix`.
+
+If root `AGENTS.md` does not exist, create it with this section alone. Never
+write the block into `CLAUDE.md`; that file stays the `@AGENTS.md` shim.
+
 ### `log.md`
 
 - chronological, append-only history
@@ -131,6 +163,7 @@ During build:
 - define memory structure
 - define the schema
 - initialize `index.md` with a concise `## Overview` section and `log.md`
+- seed the root `AGENTS.md` `## Memory` block with an empty-but-valid memory-map region
 - establish the canonical link and filename rules
 - create only the starter pages required for orientation
 - do not create source-derived notes from raw files
