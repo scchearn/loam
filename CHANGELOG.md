@@ -41,6 +41,15 @@ All notable changes to loam are documented here. This file follows
   the organization is the trust boundary, project membership is routing, and
   member cards make project sharing visible across the organization. ([#173])
 
+## [1.0.1]
+
+### Added
+
+- **Optional integrations are offered during install.** The setup wizard now
+  surfaces the opt-in integrations (research and coordination tools) while
+  installing, so a new install can enable them interactively instead of having
+  to edit configuration afterward. ([#197])
+
 ## [1.0.0]
 
 ### Added
@@ -106,8 +115,10 @@ Release entries are maintained as part of release work; see
 [RELEASING.md](./docs/RELEASING.md).
 
 [Unreleased]: https://github.com/scchearn/loam/compare/v1.0.0...HEAD
+[1.0.1]: https://github.com/scchearn/loam/releases/tag/v1.0.1
 [1.0.0]: https://github.com/scchearn/loam/releases/tag/v1.0.0
 [#114]: https://github.com/scchearn/loam/pull/114
+[#197]: https://github.com/scchearn/loam/pull/197
 [#146]: https://github.com/scchearn/loam/issues/146
 [#163]: https://github.com/scchearn/loam/issues/163
 [#173]: https://github.com/scchearn/loam/issues/173
