@@ -126,9 +126,11 @@ git tag cli-v<runtime-version>
 git push origin cli-v<runtime-version>
 ```
 
-The `v*` tag starts the plugin publish workflow. The `cli-v*` tag starts the
-five-target runtime build, creates the GitHub release, attaches the raw
-binaries and manifest, and runs the published-resolution check. A coordinated
+The `v*` tag starts the plugin publish workflow, which publishes to npm and
+creates the repository's GitHub release; the plugin release owns the
+"Latest" slot. The `cli-v*` tag starts the five-target runtime build, creates
+the runtime's GitHub release (never marked latest), attaches the raw binaries
+and manifest, and runs the published-resolution check. A coordinated
 release may create the two tags in either order only when the plugin does not
 point at an unpublished runtime; otherwise use the runtime-first order above.
 

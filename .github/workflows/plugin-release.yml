@@ -12,7 +12,7 @@ jobs:
   publish:
     runs-on: ubuntu-22.04
     permissions:
-      contents: read
+      contents: write # GitHub release for the plugin tag
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,3 +42,22 @@ jobs:
         env:
           NPM_DIST_TAG: ${{ contains(github.ref_name, '-') && 'next' || 'latest' }}
         run: npm publish --access public --provenance --tag "$NPM_DIST_TAG"
+
+      # The plugin is the product users install, so its tag owns the
+      # repository's "Latest" release; runtime releases are published with
+      # --latest=false and never claim it.
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          channel=(--latest)
+          [[ "$version" == *-* ]] && channel=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Loam $version" \
+            --generate-notes \
+            "${channel[@]}"
