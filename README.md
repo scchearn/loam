@@ -285,24 +285,24 @@ the skill runs. The table below shows how much space each skill uses against the
 |-------|---:|---:|---:|---:|
 | loam::initializing-vault | 206 | 51 | 9 | 73 |
 | loam::scaffolding-wiki | 445 | 90 | 207 | 2,400 |
-| loam::adding-to-memory | 592 | 116 | 217 | 2,311 |
-| loam::amending-memory | 505 | 114 | 180 | 1,961 |
+| loam::adding-to-memory | 592 | 116 | 217 | 2,312 |
+| loam::amending-memory | 505 | 114 | 180 | 1,958 |
 | loam::auditing-guidance | 410 | 85 | 304 | 3,256 |
 | loam::ingesting-codebase | 329 | 76 | 288 | 3,660 |
-| loam::learning-from-session | 487 | 101 | 365 | 4,212 |
-| loam::linting-memory | 471 | 102 | 316 | 4,989 |
+| loam::learning-from-session | 487 | 101 | 365 | 4,213 |
+| loam::linting-memory | 471 | 102 | 316 | 5,000 |
 | loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
-| loam::querying-memory | 530 | 105 | 175 | 1,593 |
-| loam::reviewing-memory | 510 | 113 | 137 | 1,787 |
+| loam::querying-memory | 530 | 105 | 206 | 2,025 |
+| loam::reviewing-memory | 510 | 113 | 137 | 1,799 |
 | loam::syncing-code-graph | 363 | 84 | 223 | 2,780 |
-| loam::using | 368 | 77 | 300 | 4,837 |
+| loam::using | 368 | 77 | 71 | 1,609 |
 | loam::amending-plan | 437 | 88 | 273 | 3,059 |
-| loam::checkpointing | 365 | 69 | 177 | 2,091 |
+| loam::checkpointing | 365 | 69 | 177 | 2,094 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,237 |
-| loam::planning | 327 | 62 | 323 | 4,314 |
-| loam::resuming | 376 | 77 | 142 | 1,847 |
+| loam::planning | 327 | 62 | 323 | 4,321 |
+| loam::resuming | 376 | 77 | 142 | 1,850 |
 | loam::setting-goals | 473 | 101 | 184 | 1,883 |
-| loam::starting | 166 | 34 | 356 | 4,985 |
+| loam::starting | 166 | 34 | 356 | 4,989 |
 | loam::writing-spec | 332 | 66 | 261 | 3,323 |
 <!-- END skill-metrics -->
 
