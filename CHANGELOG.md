@@ -6,6 +6,14 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+## [1.0.2]
+
+> **Existing workspaces: run the guidance lint once.** The `AGENTS.md` memory
+> map below is seeded by scaffolding for new workspaces only. A workspace that
+> already has a wiki gets it by running
+> `loam lint --only guidance --fix <workspace>` (or `/loam::linting-memory`)
+> once after updating. Until then `loam lint` reports the map as missing.
+
 ### Added
 
 - **Specs for judged work now name their oracle.** When a request's quality bar
@@ -18,7 +26,7 @@ All notable changes to loam are documented here. This file follows
   enforces both, and the evidence contract must appear in Scope so planning
   schedules the verification harness as early work instead of an afterthought.
   Hard-oracle work (done provable by tests or commands) is unaffected.
-  (`loam-writing-spec` 3.3.0)
+  (`loam-writing-spec` 3.3.0) ([#207])
 - **The memory announces itself in `AGENTS.md`.** A workspace with a wiki now
   carries a small Loam-owned memory map inside its guidance file, listing the
   durable page slugs by type so an agent learns the memory exists at session
@@ -29,7 +37,7 @@ All notable changes to loam are documented here. This file follows
   `loam lint --fix` regenerates the map in place without touching anything
   outside its markers. Scaffolding seeds the block, the guidance audit can
   refresh it with or without the native runtime, and normalization leaves it
-  alone.
+  alone. ([#206])
 
 ### Fixed
 
@@ -114,7 +122,8 @@ All notable changes to loam are documented here. This file follows
 Release entries are maintained as part of release work; see
 [RELEASING.md](./docs/RELEASING.md).
 
-[Unreleased]: https://github.com/scchearn/loam/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/scchearn/loam/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/scchearn/loam/releases/tag/v1.0.2
 [1.0.1]: https://github.com/scchearn/loam/releases/tag/v1.0.1
 [1.0.0]: https://github.com/scchearn/loam/releases/tag/v1.0.0
 [#114]: https://github.com/scchearn/loam/pull/114
@@ -122,3 +131,5 @@ Release entries are maintained as part of release work; see
 [#146]: https://github.com/scchearn/loam/issues/146
 [#163]: https://github.com/scchearn/loam/issues/163
 [#173]: https://github.com/scchearn/loam/issues/173
+[#206]: https://github.com/scchearn/loam/pull/206
+[#207]: https://github.com/scchearn/loam/pull/207
