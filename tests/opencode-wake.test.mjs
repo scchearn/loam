@@ -537,7 +537,9 @@ test('the baseline spawns the runtime once per session and is byte-identical acr
   assert.equal(first.system[0], second.system[0], 'the baseline is byte-identical across calls (prompt caching)');
 });
 
-test('chat.message passes the input session id to the render and prepends the persisted part', async () => {
+test('chat.message mints a valid persisted part that sorts before its sibling', async () => {
+  // OpenCode 1.18.27 validates user parts before save: id, sessionID, messageID
+  // are required, and the injected part must sort first in the message.
   const contextCalls = [];
   const plugin = await createOpenCodeAdapter({
     client: { session: { promptAsync: async () => ({}) } },
@@ -545,13 +547,34 @@ test('chat.message passes the input session id to the render and prepends the pe
     wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', port: 0, registered: true, close: async () => {} }),
   })({ directory: '/workspace' });
 
-  const out = { parts: [{ type: 'text', text: 'user prompt' }] };
+  const sibling = { id: 'prt_00112233445566778899', sessionID: 'msg-sess', messageID: 'msg_abc', type: 'text', text: 'user prompt' };
+  const out = { message: { id: 'msg_abc' }, parts: [sibling] };
   await plugin['chat.message']({ sessionID: 'msg-sess' }, out);
   const call = contextCalls.find((c) => c.event === 'UserPromptSubmit');
   assert.equal(call.sessionId, 'msg-sess', 'the drain keys off the input session id, not loamWake.sessionId');
   assert.equal(out.parts.length, 2, 'the render is prepended as a persisted part');
-  assert.ok(out.parts[0].text.includes('## Federation'), 'the injected part leads');
-  assert.equal(out.parts[0].id, undefined, 'no borrowed part id — OpenCode mints one on store');
+  const injected = out.parts[0];
+  assert.ok(injected.text.includes('## Federation'), 'the injected part leads');
+  assert.ok(typeof injected.id === 'string' && injected.id.startsWith('prt_'), 'it carries a part id (required before save)');
+  assert.equal(injected.sessionID, 'msg-sess', 'it carries a sessionID');
+  assert.equal(injected.messageID, 'msg_abc', 'it carries a messageID');
+  assert.ok(injected.id < sibling.id, 'the minted id sorts before the sibling, so the block leads the message');
+  assert.equal(injected.id, 'prt_00112233445500000000000000', 'same 12-hex time prefix, all-zero tail');
+});
+
+test('chat.message with no sibling part injects nothing (no invalid part)', async () => {
+  // Without a sibling part there is no safe id to mint from; emitting a bare part
+  // would fail OpenCode's pre-save schema, so the hook skips (the system prompt
+  // still carries the baseline).
+  const plugin = await createOpenCodeAdapter({
+    client: { session: { promptAsync: async () => ({}) } },
+    getContext: async () => '<LOAM_IMPORTANT>\n## Federation\nrefresh\n</LOAM_IMPORTANT>',
+    wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', port: 0, registered: true, close: async () => {} }),
+  })({ directory: '/workspace' });
+
+  const out = { parts: [{ type: 'text', text: 'user prompt' }] };
+  await plugin['chat.message']({ sessionID: 'no-ref-sess' }, out);
+  assert.equal(out.parts.length, 1, 'no sibling id, no injected part');
 });
 
 test('chat.message with an empty render leaves the parts untouched', async () => {
@@ -561,7 +584,7 @@ test('chat.message with an empty render leaves the parts untouched', async () =>
     wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', port: 0, registered: true, close: async () => {} }),
   })({ directory: '/workspace' });
 
-  const out = { parts: [{ type: 'text', text: 'user prompt' }] };
+  const out = { parts: [{ id: 'prt_00112233445566778899', sessionID: 'empty-sess', messageID: 'm', type: 'text', text: 'user prompt' }] };
   await plugin['chat.message']({ sessionID: 'empty-sess' }, out);
   assert.equal(out.parts.length, 1, 'an empty render adds no part');
 });

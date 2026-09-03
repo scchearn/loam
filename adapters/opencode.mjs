@@ -419,7 +419,22 @@ function createOpenCodeAdapter({
       // never written into a persisted message every turn.
       const context = await renderContext('UserPromptSubmit', workspace, sessionId);
       if (!context || context === UNAVAILABLE) return;
-      output.parts.unshift({ type: 'text', text: context });
+      // OpenCode 1.18.27 validates user parts before save: each part requires
+      // id, sessionID, and messageID, and a bare { type, text } fails with a
+      // SchemaError ("Missing key at [id],[sessionID],[messageID]"). Mint an id
+      // from a sibling part — the same 12-hex time prefix with an all-zero tail,
+      // so the injected part sorts first in the message — and borrow the
+      // sibling's sessionID/messageID. No sibling part, no safe id: skip rather
+      // than emit an invalid part (the system prompt still carries the baseline).
+      const ref = output.parts.find((part) => typeof part?.id === 'string' && part.id.startsWith('prt_'));
+      if (!ref) return;
+      output.parts.unshift({
+        id: `${ref.id.slice(0, 16)}00000000000000`,
+        sessionID: ref.sessionID || sessionId,
+        messageID: ref.messageID || output.message?.id,
+        type: 'text',
+        text: context,
+      });
     },
     'experimental.session.compacting': async (input, output) => {
       // Belt-and-braces: compaction summarises the transcript, so re-supply the

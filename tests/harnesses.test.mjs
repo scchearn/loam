@@ -82,8 +82,8 @@ test('OpenCode carries the full block in the system prompt and the federation re
   const system = [];
   await plugin['experimental.chat.system.transform']({ sessionID: 'sess-1' }, { system });
   await plugin['experimental.chat.system.transform']({ sessionID: 'sess-1' }, { system });
-  const turn1 = { parts: [{ type: 'text', text: 'superpowers context' }] };
-  const turn2 = { parts: [{ type: 'text', text: 'next prompt' }] };
+  const turn1 = { message: { id: 'msg_1' }, parts: [{ id: 'prt_00112233445566778899', sessionID: 'sess-1', messageID: 'msg_1', type: 'text', text: 'superpowers context' }] };
+  const turn2 = { message: { id: 'msg_2' }, parts: [{ id: 'prt_00112233445566778899', sessionID: 'sess-1', messageID: 'msg_2', type: 'text', text: 'next prompt' }] };
   await plugin['chat.message']({ sessionID: 'sess-1' }, turn1);
   await plugin['chat.message']({ sessionID: 'sess-1' }, turn2);
 
