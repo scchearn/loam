@@ -54,7 +54,9 @@ jobs:
           # carries a hyphen in its `cli-v` prefix, so testing the ref name
           # marked every stable runtime as a prerelease and left the repo's
           # "Latest" release pinned to an old one.
-          prerelease=()
+          # The plugin tag owns the repository's "Latest" release; a runtime
+          # release never claims it.
+          prerelease=(--latest=false)
           [[ "$version" == *-* ]] && prerelease=(--prerelease)
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
