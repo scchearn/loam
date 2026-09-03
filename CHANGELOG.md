@@ -6,6 +6,10 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+## [1.0.4]
+
+Plugin 1.0.4 and runtime 1.0.3 ship together.
+
 ### Fixed
 
 - **The injected router now fits the harness hook cap.** `loam::using` is
