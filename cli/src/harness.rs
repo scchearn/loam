@@ -397,11 +397,32 @@ fn query_federation(
         HookEvent::UserPromptSubmit | HookEvent::PreToolUse | HookEvent::PostToolUse
     ) {
         if let Some(session_id) = session_id {
-            let poll = request_body(workspace, Operation::SessionPollInject, Some(session_id));
-            if let Ok(body) = call_connector(&paths.run_dir(), poll.as_bytes(), &ipc_config) {
-                if let Federation::Snapshot(_) = interpret_response(&body) {
-                    return interpret_response(&body);
+            let drain = || {
+                let poll = request_body(workspace, Operation::SessionPollInject, Some(session_id));
+                call_connector(&paths.run_dir(), poll.as_bytes(), &ipc_config)
+                    .ok()
+                    .map(|body| interpret_response(&body))
+            };
+            match drain() {
+                Some(snapshot @ Federation::Snapshot(_)) => return snapshot,
+                Some(Federation::Degraded(_)) => {
+                    // #204 §4: a refused drain is the unregistered-session case
+                    // (the connector bounced mid-session). `register_session`
+                    // runs only at SessionStart, so without this every later
+                    // per-turn falls back to the full snapshot and re-renders the
+                    // whole backlog each turn. Re-register and retry the drain
+                    // once; the snapshot fallback then renders at most once per
+                    // restart. Fire-and-forget register, same shape as SessionStart.
+                    let register =
+                        request_body(workspace, Operation::SessionRegisterInject, Some(session_id));
+                    let _ = call_connector(&paths.run_dir(), register.as_bytes(), &ipc_config);
+                    if let Some(snapshot @ Federation::Snapshot(_)) = drain() {
+                        return snapshot;
+                    }
                 }
+                // Unenrolled, or no response (connector down): fall through to the
+                // snapshot fallback below — no point re-registering.
+                _ => {}
             }
         }
     }
@@ -2665,6 +2686,123 @@ mod tests {
             .and_then(Value::as_array)
             .is_some_and(|items| items.is_empty()));
 
+        server.join().expect("server thread");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_per_turn_drain_re_registers_and_retries_once() {
+        // #204 §4: after a connector restart the session is unregistered, so the
+        // drain is refused. Rather than fall back to the full snapshot every turn
+        // (re-rendering the whole backlog), the per-turn arm re-registers and
+        // retries the drain once, recovering the delta path for the rest of the
+        // session.
+        let root = std::path::PathBuf::from("/tmp").join(format!(
+            "loam-per-turn-restart-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let run_dir = root.join("run");
+        let endpoint = ipc::unix::bind(&run_dir).expect("bind");
+        let server = std::thread::spawn(move || {
+            let config = IpcConfig::default();
+            // Connection 1: the drain is refused (unregistered session).
+            let mut refused = endpoint.accept_verified().expect("accept refused poll");
+            let request = ipc::read_frame(&mut refused, &config).expect("refused request");
+            let parsed =
+                crate::json::parse(std::str::from_utf8(&request).expect("utf8")).expect("json");
+            assert_eq!(
+                parsed.get("operation").and_then(Value::as_str),
+                Some("session.poll-inject")
+            );
+            ipc::write_frame(
+                &mut refused,
+                &ipc::error_response("hook", &IpcError::Busy, &config),
+                &config,
+            )
+            .expect("respond refused");
+            // Connection 2: the per-turn arm re-registers the session.
+            let mut register = endpoint.accept_verified().expect("accept register");
+            let request = ipc::read_frame(&mut register, &config).expect("register request");
+            let parsed =
+                crate::json::parse(std::str::from_utf8(&request).expect("utf8")).expect("json");
+            assert_eq!(
+                parsed.get("operation").and_then(Value::as_str),
+                Some("session.register-inject")
+            );
+            assert_eq!(
+                parsed
+                    .get("payload")
+                    .and_then(|payload| payload.get("session_id"))
+                    .and_then(Value::as_str),
+                Some("sess-restart")
+            );
+            ipc::write_frame(
+                &mut register,
+                &ipc::ok_response(
+                    "hook",
+                    crate::json::parse(r#"{"schema":1,"project_id":"loam","items":[]}"#).unwrap(),
+                ),
+                &config,
+            )
+            .expect("respond register");
+            // Connection 3: the retried drain now succeeds with the delta.
+            let mut retry = endpoint.accept_verified().expect("accept retry poll");
+            let request = ipc::read_frame(&mut retry, &config).expect("retry request");
+            let parsed =
+                crate::json::parse(std::str::from_utf8(&request).expect("utf8")).expect("json");
+            assert_eq!(
+                parsed.get("operation").and_then(Value::as_str),
+                Some("session.poll-inject")
+            );
+            ipc::write_frame(
+                &mut retry,
+                &ipc::ok_response(
+                    "hook",
+                    Value::Object(vec![
+                        ("schema".into(), Value::Number("1".into())),
+                        ("project_id".into(), Value::String("loam".into())),
+                        (
+                            "items".into(),
+                            Value::Array(vec![Value::Object(vec![
+                                ("type".into(), Value::String("io.loam.work.state".into())),
+                                ("summary".into(), Value::String("recovered".into())),
+                            ])]),
+                        ),
+                    ]),
+                ),
+                &config,
+            )
+            .expect("respond retry");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+
+        let paths = HookPaths {
+            global_root: root,
+            ..paths()
+        };
+        let federation = query_federation(
+            &paths,
+            "/w",
+            &HookConfig::default(),
+            HookEvent::UserPromptSubmit,
+            Some("sess-restart"),
+        );
+        let Federation::Snapshot(result) = federation else {
+            panic!("a re-registered retry must recover the delta: {federation:?}");
+        };
+        let items = result
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("retry items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].get("summary").and_then(Value::as_str),
+            Some("recovered"),
+            "the retried drain carries the delta, not the full snapshot"
+        );
         server.join().expect("server thread");
     }
 
