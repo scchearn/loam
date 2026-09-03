@@ -1,9 +1,9 @@
 ---
 name: loam::querying-memory
 description: "Answer questions against existing memory (the wiki substrate). Use this whenever the user is asking what is happening in the project, directory, codebase, architecture, workflow, decisions, or current state and the wiki likely contains the answer, even if they do not explicitly mention the wiki. Also use it for summaries, comparisons, and reusable analyses grounded in current wiki pages. Routes authoritative goal-state questions to /loam::setting-goals. Not for surfacing unresolved gaps; use /loam::reviewing-memory for that."
-allowed-tools: Read Glob Grep Write Edit Bash
+allowed-tools: Read Glob Grep Write Edit Bash mcp__hcom-mcp__transcript
 metadata:
-  version: "1.2.2"
+  version: "1.3.0"
   author: scchearn
   argument-hint: <question>
 ---
@@ -57,6 +57,36 @@ Read the actual wiki files for top candidates. Follow `[[wikilinks]]`, `Related 
 
 If qmd results and the wiki disagree, trust the wiki files. Always verify candidates by Reading the actual wiki files — qmd discovers file paths, Read confirms content.
 
+### Transcript search (secondary source)
+
+Transcripts are a legitimate secondary source, ranked below the wiki: the wiki
+is curated and durable, transcripts are raw and noisy. Consult them when the
+question concerns recent or in-flight work, what an agent did or said, or when
+wiki evidence is thin and a session might corroborate or date it. Do not lead
+with them. When a transcript and a wiki page disagree, report both and say
+which is more recent; a newer transcript often means the wiki is stale, so
+route the disagreement to /loam::amending-memory rather than picking a side.
+
+Availability check, in order; stop at the first that works, skip the whole
+subsection silently if none do:
+
+1. The injected `Workspace state` block says `hcom: ready`. Prefer the `mcp__hcom-mcp__transcript` tool when it is present; otherwise use the `hcom` CLI via Bash.
+2. If the block is absent, the `mcp__hcom-mcp__transcript` tool being present is sufficient.
+
+If neither is available, do not mention hcom, do not install anything, and
+answer from the wiki alone.
+
+Search: MCP `transcript` with `mode: search`, `pattern`, `exclude_self: true`,
+`limit: 10`; or `hcom transcript search "<pattern>" --exclude-self --limit 10 --json`.
+Then read the matching exchange with `mode: read` (or `hcom transcript <name> N`)
+before citing it. Snippets are truncated; never cite from a snippet alone.
+
+Discard results whose `text` is `binary file matches` — those agents store
+transcripts in a database the search cannot read.
+
+Cite transcript evidence as `<agent name>, exchange N`. Do not cite or write
+back the transcript file path.
+
 ---
 
 ## Step 2 — Answer with citations
@@ -70,6 +100,7 @@ Rules:
 3. Distinguish between:
    - what memory clearly supports
    - what memory only suggests indirectly
+   - what only a session transcript supports (not yet in memory)
    - what memory does not yet establish
 4. If the question cannot be answered well from the current wiki, say that explicitly and identify the missing source, page, or ingest work that would help.
 
@@ -178,7 +209,7 @@ If nothing was written back, say `none` under `Filed back into wiki`.
 - Cite supporting wiki page paths in the answer.
 - Always verify qmd candidates by Reading the actual wiki files. qmd discovers file paths — Read confirms content.
 - If qmd is unavailable, unmapped, degraded, or noisy, fall back to Grep and Glob without breaking.
-- Do not fetch external sources in this skill.
+- Do not fetch web or external sources in this skill. Agent transcripts via hcom are a permitted secondary source, ranked below the wiki for curation, not for recency; surface disagreements instead of resolving them here.
 - Do not modify raw-source files.
 - Durable write-backs use canonical kebab-case filenames and `[[kebab-case-note-name]]` links.
 - Route authoritative goal-state and readiness questions to `/loam::setting-goals`. The wiki may reference goals, but the goal document is authoritative for lifecycle, validation, and review history.

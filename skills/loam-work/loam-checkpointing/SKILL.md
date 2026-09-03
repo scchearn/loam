@@ -44,7 +44,7 @@ If an argument is given, treat it as guidance for what the user expects to do fi
 
 Treat `<wiki root>/checkpoints/` as the checkpoint lane for this skill.
 
-Writing a checkpoint here satisfies the `checkpoint_stale` hint that native state emits when the worktree is dirty and the last checkpoint is missing or 30+ min old (see the hint contract in `loam::using`).
+Writing a checkpoint here satisfies the `checkpoint_stale` hint that native state emits when the worktree is dirty and the last checkpoint is missing or 30+ min old (see the hint contract in `loam-using/references/runtime.md`).
 
 ---
 

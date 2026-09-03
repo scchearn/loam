@@ -54,7 +54,7 @@ If the target was a single `goals/<slug>.md` path, skip all wiki-only steps and 
 
 If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam install`; do not fabricate state or use a project-local fallback. Use `wiki_root` as the resolved wiki root (resolved from on-disk contract files, not qmd metadata). If `has_overview` is true, note it as a legacy root-hub file to fold into `index.md`. Then resolve the lint scope: if the user named a wiki root, subdirectory, topic, or entity, use that. If no scope given, lint the whole wiki.
 
-This skill satisfies the `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, and `legacy_structure_pending` hints (see the hint contract in `loam::using`); treat them as advisory scope, not extra mandatory work. Fast state omits date drift, which the lint pass checks directly later.
+This skill satisfies the `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, and `legacy_structure_pending` hints (see the hint contract in `loam-using/references/runtime.md`); treat them as advisory scope, not extra mandatory work. Fast state omits date drift, which the lint pass checks directly later.
 
 ### Read the wiki contract
 
@@ -135,7 +135,7 @@ Keep structural checks Glob/Grep-led and follow the qmd search protocol in
 
 Distinguish: **fix now** (safe from existing wiki evidence) vs **annotate now** (mark but don't resolve) vs **follow-up** (needs future evidence/research/user direction).
 
-**Expand with qmd (content, if ready)**: Follow the qmd search protocol in `loam::using` to find related-note neighborhoods for orphan pages, missing cross-links, stale claims, and contradictions (structural steps A, B, E above stay Glob/Grep-led).
+**Expand with qmd (content, if ready)**: Follow the qmd search protocol in `loam-using/references/discovery.md` to find related-note neighborhoods for orphan pages, missing cross-links, stale claims, and contradictions (structural steps A, B, E above stay Glob/Grep-led).
 
 ---
 
@@ -319,7 +319,7 @@ If the pass found no significant issues, say so explicitly and still note any re
 - Check that qmd excludes `.archive/**`; flag missing archive exclusion as a health issue.
 - Flag pages older than 90 days that cite volatile surfaces for re-validation; do not auto-archive them.
 - Keep the note graph traversable, not just the index accurate.
-- qmd is secondary. Structural checks (inventory, orphans, wikilinks, .obsidian placement, checkpoint filenames) remain Glob- and Grep-led. Use qmd (the protocol in `loam::using`) only for content discovery: stale claims, contradictions, and related-note neighborhoods.
+- qmd is secondary. Structural checks (inventory, orphans, wikilinks, .obsidian placement, checkpoint filenames) remain Glob- and Grep-led. Use qmd (the protocol in `loam-using/references/discovery.md`) only for content discovery: stale claims, contradictions, and related-note neighborhoods.
 - After wiki edits, refresh qmd if the collection is ready. If refresh fails, report it but do not roll back.
 - If qmd is unavailable, unmapped, or degraded, continue without it. The skill must not fail.
 - Goal lint is report-only. It runs when `goals/` exists, even without a wiki. It does not alter goal files or append a wiki lint log entry. Route corrections through `/loam::setting-goals`.

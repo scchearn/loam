@@ -57,7 +57,7 @@ Use `Glob` and `Grep` to map the pages in scope before reading deeply.
 3. If qmd is still not ready: qmd not available, use Grep/Glob only.
 4. Runtime guard: if any qmd command fails or returns stale results, treat as degraded — fall back to Grep/Glob.
 
-qmd is **secondary only** in this skill: use it only for *content* discovery — expanding from a discovered issue into nearby related notes, surfacing neighborhoods of related open signals. If ready, follow the qmd search protocol in `loam::using` (structural steps A–E above stay Grep/Glob-led — qmd does not replace the primary scan).
+qmd is **secondary only** in this skill: use it only for *content* discovery — expanding from a discovered issue into nearby related notes, surfacing neighborhoods of related open signals. If ready, follow the qmd search protocol in `loam-using/references/discovery.md` (structural steps A–E above stay Grep/Glob-led — qmd does not replace the primary scan).
 
 ### Scan for open signals
 
@@ -73,7 +73,7 @@ qmd is **secondary only** in this skill: use it only for *content* discovery —
 
 ### Expand from issues with qmd (content, if ready)
 
-If qmd is ready, follow the qmd search protocol in `loam::using` to expand from a discovered issue into nearby notes:
+If qmd is ready, follow the qmd search protocol in `loam-using/references/discovery.md` to expand from a discovered issue into nearby notes:
 
 1. Run `qmd search "<topic or entity from the signal>" --files -n 3 -c <collection>` for each significant signal. Strip the `qmd://<collection>/` prefix to get relative wiki paths.
 2. Read candidate files to confirm they are related.
@@ -142,5 +142,5 @@ If the review found no significant open items, say so explicitly and note any re
 - Keep the report concise but complete. The first thing the user sees should be the summary counts.
 - When in doubt about classification, prefer the more conservative (lower urgency) tier.
 - Do not classify incomplete goals (`goals/*.md` with `status: draft` or open questions) as memory gaps. Goals are workflow artifacts, not memory. Goal health is handled by `/loam::linting-memory` and `/loam::setting-goals`.
-- qmd is secondary. Structural scan (steps A–E) stays Grep/Glob-led. Use qmd (the protocol in `loam::using`) only for content discovery: expanding from discovered issues into related-note neighborhoods.
+- qmd is secondary. Structural scan (steps A–E) stays Grep/Glob-led. Use qmd (the protocol in `loam-using/references/discovery.md`) only for content discovery: expanding from discovered issues into related-note neighborhoods.
 - If qmd is unavailable, unmapped, or degraded, continue without it. The skill must not fail.

@@ -947,8 +947,16 @@ fn plugin_version(global_root: &Path) -> String {
 }
 
 fn skill_body(skills_root: &Path) -> String {
-    match std::fs::read_to_string(skills_root.join("loam-using").join("SKILL.md")) {
-        Ok(content) => strip_frontmatter(&content),
+    let skill_dir = skills_root.join("loam-using");
+    match std::fs::read_to_string(skill_dir.join("SKILL.md")) {
+        // The body is injected into a system prompt, where the skill directory
+        // is unknown: rewrite relative `references/` pointers to absolute paths
+        // so progressive disclosure still resolves. The file on disk keeps the
+        // spec-relative form for ordinary skill loaders.
+        Ok(content) => strip_frontmatter(&content).replace(
+            "`references/",
+            &format!("`{}/references/", skill_dir.display()),
+        ),
         Err(_) => String::new(),
     }
 }
@@ -1188,13 +1196,16 @@ fn compose_body_reporting(
         None => String::new(),
     };
 
+    // Facts first, guidance last: the runtime line and state blocks are the
+    // parts no reference file can recover, so a harness that caps hook output
+    // truncates the skill body rather than them.
     let sections = [
         heading,
-        skill_body(&paths.skills_root),
         command,
         workspace_state_section(&workspace),
         federation_section(&federation, config),
         collaboration_section(&federation, paths, &workspace),
+        skill_body(&paths.skills_root),
     ];
     let content = sections
         .iter()
