@@ -474,7 +474,9 @@ fn call_connector(run_dir: &Path, request: &[u8], config: &IpcConfig) -> Result<
 /// and the budget. Harness-agnostic by construction — it returns one bounded
 /// text body, and only the envelope mapper knows which key each harness wants.
 /// This is the per-turn and SessionStart surface: a status line plus the terse
-/// items (the same renderer the wake path emits, differing only in framing).
+/// items (the same renderer the wake path emits, differing only in framing). In
+/// practice the status line renders at SessionStart only — the per-turn surface
+/// renders this section just when the drain returned items (#204).
 fn federation_section(federation: &Federation, config: &HookConfig) -> String {
     let mut lines = vec!["## Federation".to_owned(), String::new()];
     match federation {
@@ -1136,13 +1138,13 @@ fn compose_body_reporting(
         HookEvent::UserPromptSubmit | HookEvent::PreToolUse | HookEvent::PostToolUse
     ) {
         // Per-turn refresh: federation only, wrapped in the same framing so the
-        // harness treats it as the same kind of context it already has. On the
-        // tool boundaries the empty path is the harness's valid empty envelope
-        // (the hook always exits 0), so a tool call with nothing new costs one
-        // short local IPC round trip and no broker contact.
-        if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
-            && federation_has_no_items(&federation)
-        {
+        // harness treats it as the same kind of context it already has. On every
+        // per-turn boundary the empty path is the harness's valid empty envelope
+        // (the hook always exits 0), so a turn with nothing new costs one short
+        // local IPC round trip and no broker contact. Status lines (unenrolled /
+        // degraded / live) are the SessionStart open frame's job — a per-turn
+        // fire with no drained items renders nothing (#204).
+        if federation_has_no_items(&federation) {
             return String::new();
         }
         return format!(
@@ -1214,7 +1216,7 @@ fn drain_and_discard(paths: &HookPaths, config: &HookConfig, workspace: &Path, s
     let _ = call_connector(&paths.run_dir(), request.as_bytes(), &ipc_config);
 }
 
-/// Whether a resolved federation state carries nothing to render. The tool
+/// Whether a resolved federation state carries nothing to render. The per-turn
 /// boundaries use this to emit the harness's valid empty envelope instead of a
 /// full federation section when the mailbox reported no items.
 fn federation_has_no_items(federation: &Federation) -> bool {
@@ -1815,64 +1817,39 @@ mod tests {
 
     #[test]
     fn the_per_turn_boundary_renders_federation_only_and_session_start_renders_the_full_block() {
-        // T3: `UserPromptSubmit` re-injects only the federation section — the
-        // baseline is already in the session, and re-sending the whole block
-        // every turn would burn context for no new information. Session start
-        // keeps the full block.
-        let paths = paths();
-        let frame = Value::Object(Vec::new());
-        let config = HookConfig::default();
-        let federation = Some(Federation::Degraded("connector_unreachable"));
-
-        let refresh = compose_body(
-            &paths,
-            &config,
-            &frame,
-            HookEvent::UserPromptSubmit,
-            federation.clone(),
-        );
-        assert!(refresh.starts_with("<LOAM_IMPORTANT>"));
-        assert!(refresh.ends_with("</LOAM_IMPORTANT>"));
-        assert!(refresh.contains("## Federation"), "{refresh}");
-        assert!(
-            refresh.contains("federation: degraded (connector_unreachable)"),
-            "{refresh}"
-        );
-        // The baseline is not re-sent on a per-turn refresh.
-        assert!(!refresh.contains("You have loam"), "{refresh}");
-        assert!(!refresh.contains("## Workspace state"), "{refresh}");
-        assert!(!refresh.contains("Native runtime command"), "{refresh}");
-
-        let start = compose_body(&paths, &config, &frame, HookEvent::SessionStart, federation);
-        assert!(start.contains("You have loam"), "{start}");
-        assert!(start.contains("## Workspace state"), "{start}");
-        assert!(start.contains("## Federation"), "{start}");
-    }
-
-    #[test]
-    fn tool_boundaries_render_federation_only_and_empty_pool_emits_the_empty_envelope() {
-        // T3: PreToolUse/PostToolUse behave like UserPromptSubmit — federation
-        // only — except that an empty pool yields the harness's valid empty
-        // envelope (empty body) instead of a full federation section, so a tool
-        // call with nothing new costs one short local IPC round trip.
+        // #204: a per-turn fire with nothing new to deliver injects nothing. The
+        // status line (unenrolled / degraded / live) is the SessionStart open
+        // frame's job; mid-session only item deltas render. SessionStart keeps
+        // the full block, status line included.
         let paths = paths();
         let frame = Value::Object(Vec::new());
         let config = HookConfig::default();
 
-        // Empty snapshot: the tool boundary emits nothing at all.
-        let empty = Federation::Snapshot(Value::Object(vec![
+        let empty_snapshot = Federation::Snapshot(Value::Object(vec![
             ("project_id".into(), Value::String("loam".into())),
             ("items".into(), Value::Array(Vec::new())),
         ]));
-        for event in [HookEvent::PreToolUse, HookEvent::PostToolUse] {
-            let body = compose_body(&paths, &config, &frame, event, Some(empty.clone()));
+
+        // Nothing-new per-turn boundaries all render the empty envelope.
+        for federation in [
+            Federation::Degraded("connector_unreachable"),
+            Federation::Unenrolled,
+            empty_snapshot,
+        ] {
+            let body = compose_body(
+                &paths,
+                &config,
+                &frame,
+                HookEvent::UserPromptSubmit,
+                Some(federation.clone()),
+            );
             assert_eq!(
                 body, "",
-                "{event:?} with an empty pool must emit the empty envelope"
+                "a per-turn boundary with nothing new must inject nothing: {federation:?}"
             );
         }
 
-        // Pending items: the federation-only refresh renders, like UserPromptSubmit.
+        // A drained item renders the federation section only — no baseline.
         let items = vec![crate::json::parse(
             r#"{"source":"s","type":"io.loam.message","summary":"Fresh.","from":{"principal_id":"employee-1"}}"#,
         )
@@ -1881,68 +1858,90 @@ mod tests {
             ("project_id".into(), Value::String("loam".into())),
             ("items".into(), Value::Array(items)),
         ]));
-        for event in [HookEvent::PreToolUse, HookEvent::PostToolUse] {
+        let refresh = compose_body(
+            &paths,
+            &config,
+            &frame,
+            HookEvent::UserPromptSubmit,
+            Some(pending),
+        );
+        assert!(refresh.starts_with("<LOAM_IMPORTANT>"));
+        assert!(refresh.ends_with("</LOAM_IMPORTANT>"));
+        assert!(refresh.contains("## Federation"), "{refresh}");
+        assert!(refresh.contains("Fresh."), "{refresh}");
+        // The baseline is not re-sent on a per-turn refresh.
+        assert!(!refresh.contains("You have loam"), "{refresh}");
+        assert!(!refresh.contains("## Workspace state"), "{refresh}");
+        assert!(!refresh.contains("Native runtime command"), "{refresh}");
+
+        // SessionStart keeps the full block including the status line.
+        let start = compose_body(
+            &paths,
+            &config,
+            &frame,
+            HookEvent::SessionStart,
+            Some(Federation::Degraded("connector_unreachable")),
+        );
+        assert!(start.contains("You have loam"), "{start}");
+        assert!(start.contains("## Workspace state"), "{start}");
+        assert!(start.contains("## Federation"), "{start}");
+        assert!(
+            start.contains("federation: degraded (connector_unreachable)"),
+            "{start}"
+        );
+    }
+
+    #[test]
+    fn tool_boundaries_render_federation_only_and_empty_pool_emits_the_empty_envelope() {
+        // #204: all three per-turn boundaries (UserPromptSubmit, PreToolUse,
+        // PostToolUse) behave alike — federation only, and an empty pool /
+        // degraded / unenrolled state yields the harness's valid empty envelope
+        // instead of a status line, so a turn with nothing new costs one short
+        // local IPC round trip.
+        let paths = paths();
+        let frame = Value::Object(Vec::new());
+        let config = HookConfig::default();
+        const PER_TURN: [HookEvent; 3] = [
+            HookEvent::UserPromptSubmit,
+            HookEvent::PreToolUse,
+            HookEvent::PostToolUse,
+        ];
+
+        // Nothing-new states all emit the empty envelope on every per-turn event.
+        let empty = Federation::Snapshot(Value::Object(vec![
+            ("project_id".into(), Value::String("loam".into())),
+            ("items".into(), Value::Array(Vec::new())),
+        ]));
+        for federation in [
+            empty.clone(),
+            Federation::Degraded("connector_unreachable"),
+            Federation::Unenrolled,
+        ] {
+            for event in PER_TURN {
+                let body = compose_body(&paths, &config, &frame, event, Some(federation.clone()));
+                assert_eq!(
+                    body, "",
+                    "{event:?} with {federation:?} must emit the empty envelope"
+                );
+            }
+        }
+
+        // Pending items: the federation-only refresh renders on every per-turn event.
+        let items = vec![crate::json::parse(
+            r#"{"source":"s","type":"io.loam.message","summary":"Fresh.","from":{"principal_id":"employee-1"}}"#,
+        )
+        .unwrap()];
+        let pending = Federation::Snapshot(Value::Object(vec![
+            ("project_id".into(), Value::String("loam".into())),
+            ("items".into(), Value::Array(items)),
+        ]));
+        for event in PER_TURN {
             let body = compose_body(&paths, &config, &frame, event, Some(pending.clone()));
             assert!(body.starts_with("<LOAM_IMPORTANT>"), "{event:?}");
             assert!(body.contains("## Federation"), "{event:?}: {body}");
             assert!(body.contains("Fresh."), "{event:?}: {body}");
             assert!(!body.contains("You have loam"), "{event:?}: {body}");
         }
-
-        // Degraded and unenrolled also emit the empty envelope on tool boundaries.
-        for federation in [
-            Federation::Degraded("connector_unreachable"),
-            Federation::Unenrolled,
-        ] {
-            let body = compose_body(
-                &paths,
-                &config,
-                &frame,
-                HookEvent::PreToolUse,
-                Some(federation),
-            );
-            assert_eq!(body, "", "degraded/unenrolled tool boundary must be empty");
-        }
-
-        // UserPromptSubmit is the dashboard, not a tool boundary: it always
-        // renders the federation section, and for an enrolled workspace it renders
-        // AT LEAST the status line even when the drain came back empty or
-        // unregistered. A fully-empty per-turn would be indistinguishable from
-        // loam being absent, so it never happens for an enrolled workspace.
-        let body = compose_body(
-            &paths,
-            &config,
-            &frame,
-            HookEvent::UserPromptSubmit,
-            Some(empty),
-        );
-        assert!(
-            !body.is_empty(),
-            "an enrolled per-turn is never fully empty"
-        );
-        assert!(body.contains("## Federation"), "{body}");
-        assert!(
-            body.contains("federation: live · project: loam · items: 0"),
-            "an empty drain still renders the status line:\n{body}"
-        );
-
-        // The unregistered/degraded drain also renders a non-empty section — the
-        // degraded line stands in for the status line, never nothing.
-        let degraded = compose_body(
-            &paths,
-            &config,
-            &frame,
-            HookEvent::UserPromptSubmit,
-            Some(Federation::Degraded("connector_unreachable")),
-        );
-        assert!(
-            !degraded.is_empty(),
-            "a degraded per-turn is never fully empty"
-        );
-        assert!(
-            degraded.contains("federation: degraded (connector_unreachable)"),
-            "a degraded drain still names its state:\n{degraded}"
-        );
     }
 
     #[test]
