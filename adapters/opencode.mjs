@@ -327,36 +327,48 @@ function createOpenCodeAdapter({
   const hookGlobalRoot = hookRuns.resolveGlobalRoot || resolveGlobalRoot;
   return async ({ directory, client: invocationClient } = {}) => {
     sdk = client || invocationClient;
-    // T4: the first transform fire is the session start (full block); every
-    // later fire is a per-turn refresh (federation only). The native hook
-    // renders the right shape for the event, so the adapter only tracks which
-    // boundary it is on.
-    let sessionStarted = false;
+    // #209: the OpenCode transform hook is per-model-call and never persisted, so
+    // context injected through it lived for one LLM call and vanished. Each kind
+    // of content now rides the hook whose lifetime matches it:
+    //   - SessionStart render  -> experimental.chat.system.transform (per call,
+    //                             stable prefix) cached per session id.
+    //   - UserPromptSubmit render (federation + drained mailbox) -> chat.message
+    //                             (once per user turn, mutation persisted).
+    //   - post-compaction     -> experimental.session.compacting.
+    // Per-session baseline cache. Replaces the instance-wide sessionStarted flag;
+    // in a one-server-many-sessions process every session gets its own baseline.
+    const sessions = new Map();
+    const sessionState = (id) => {
+      let s = sessions.get(id);
+      if (!s) { s = { baseline: null }; sessions.set(id, s); }
+      return s;
+    };
+    // The wake listener is a single localhost TCP server per adapter instance,
+    // injecting into loamWake.sessionId; it can serve only one session, so it is
+    // opened once per instance (last-writer-wins across sessions, as today).
+    // Keying the wake channel per session is out of scope here (#209 Step 4).
+    let wakeListenerOpened = false;
     return {
-    'experimental.chat.messages.transform': async (_input, output) => {
-      if (!output?.messages?.length) return;
-      const firstUser = output.messages.find((message) => message.info?.role === 'user');
-      if (!firstUser?.parts?.length) return;
+    'experimental.chat.system.transform': async (input, output) => {
+      const sessionId = typeof input?.sessionID === 'string' ? input.sessionID : null;
+      if (!sessionId || !Array.isArray(output?.system)) return;
       const workspace = directory || process.cwd();
-      const isFirst = !sessionStarted;
-      await logStageOnce('hook:transform', 'info', 'hook transform first fire', { boundary: isFirst ? 'SessionStart' : 'UserPromptSubmit' });
-      if (isFirst) {
-        // First fire of this adapter instance is the SessionStart boundary.
-        // OpenCode does not emit session.created for the main session, so the
-        // notify listener opens here: once per plugin instance, registered
-        // against the session id carried on the first user message. This runs
-        // UNCONDITIONALLY, before the context gate below — registration must not
-        // be hostage to a contentful render, or a session whose very first
-        // render is empty (a failed hook spawn, an unregistered drain, a quiet
-        // federation) would never register and never wake, permanently.
-        sessionStarted = true;
-        const childId = firstUser.info?.sessionID || firstUser.info?.session_id;
-        loamWake.sessionId = typeof childId === 'string' ? childId : null;
+      const state = sessionState(sessionId);
+
+      if (!wakeListenerOpened) {
+        // SessionStart boundary. OpenCode emits no session.created for the main
+        // session, so the notify listener opens on the first system-transform
+        // fire, registered against this session id. UNCONDITIONAL and before the
+        // render gate — registration must not be hostage to a contentful render,
+        // or a session whose first render is empty (failed spawn, quiet
+        // federation) would never register and never wake.
+        wakeListenerOpened = true;
+        loamWake.sessionId = sessionId;
         void (async () => {
           try {
             loamWake.server = await wakeServer({
               workspace,
-              sessionId: loamWake.sessionId || 'unknown',
+              sessionId,
               globalRoot: resolveLoamRoot(),
               onWake: () => injectWake(workspace),
               log: (message, extra) => logStage('info', message, extra),
@@ -368,39 +380,89 @@ function createOpenCodeAdapter({
             await logStage('error', 'wake listener failed', { error: String(error) });
           }
         })();
-      } else if (loamWake.server?.reregister) {
-        // Per-hook idempotent re-registration (connector-self-healing): every
-        // per-turn boundary re-asserts this session's wake_ref, so a connector
-        // that restarted since SessionStart re-attaches the mailbox for an active
-        // session even though the persisted-wake reload only covers idle ones.
-        // Best-effort and unconditional, like the SessionStart registration — it
-        // must never be hostage to a contentful render.
+      }
+
+      // First render for this session: the full SessionStart block. No session
+      // id, no drain — the runtime's SessionStart arm registers and
+      // drain-and-discards itself, so the per-turn path starts from a clean
+      // mailbox. Cached and reused byte-for-byte on every later call so the
+      // runtime binary spawns once per session and provider prompt caching pays
+      // for the ~22 KB block once.
+      if (state.baseline === null) {
+        const rendered = await renderContext('SessionStart', workspace, null);
+        state.baseline = rendered || '';
+        await logStageOnce('hook:system-transform', 'info', 'hook system transform first fire', { boundary: 'SessionStart' });
+      }
+      // Push, do not unshift: OpenCode's own environment and agent prompt lead,
+      // loam's block trails, keeping OpenCode's prefix stable.
+      if (state.baseline) output.system.push(state.baseline);
+    },
+    'chat.message': async (input, output) => {
+      const sessionId = typeof input?.sessionID === 'string' ? input.sessionID : null;
+      if (!sessionId || !Array.isArray(output?.parts)) return;
+      const workspace = directory || process.cwd();
+
+      if (loamWake.server?.reregister) {
+        // Per-turn idempotent re-registration (connector-self-healing): a
+        // connector restart drops the live channel; an active session re-attaches
+        // its mailbox at the next turn. Best-effort, unconditional.
         void loamWake.server.reregister().catch(() => {});
         await logStageOnce('hook:reregister', 'info', 'wake re-register', {});
       }
-      const event = isFirst ? 'SessionStart' : 'UserPromptSubmit';
-      // SessionStart renders the full history snapshot (no session id, no drain).
-      // Per-turn drains this session's mailbox like the wake path, so an item
-      // enters context exactly once across all surfaces (the one-seen-set
-      // amendment) instead of the board being re-rendered every turn — the
-      // session id it registered with is what keys that drain. Without it (an
-      // unregistered session) the runtime falls back to the full snapshot, the
-      // safety net the fallback was meant to be.
-      const context = await renderContext(event, workspace, isFirst ? null : loamWake.sessionId);
-      // The context gate governs only what gets injected. An empty render skips
-      // the prepend but never the registration above.
-      if (!context) return;
-      const reference = firstUser.parts[0];
-      firstUser.parts.unshift({ ...reference, type: 'text', text: context });
+
+      // Per-turn: drain THIS session's mailbox (the input session id, not the
+      // instance-wide loamWake.sessionId, is what makes the drain per-session)
+      // and render the federation delta. The text is written into the user
+      // message before it is stored, so a drained item stays in the transcript
+      // for the rest of the session — the one-seen-set contract finally holds on
+      // OpenCode. UNAVAILABLE is surfaced once via the system prompt (baseline),
+      // never written into a persisted message every turn.
+      const context = await renderContext('UserPromptSubmit', workspace, sessionId);
+      if (!context || context === UNAVAILABLE) return;
+      // OpenCode 1.18.27 validates user parts before save: each part requires
+      // id, sessionID, and messageID, and a bare { type, text } fails with a
+      // SchemaError ("Missing key at [id],[sessionID],[messageID]"). Mint an id
+      // from a sibling part — the same 12-hex time prefix with an all-zero tail,
+      // so the injected part sorts first in the message — and borrow the
+      // sibling's sessionID/messageID. No sibling part, no safe id: skip rather
+      // than emit an invalid part (the system prompt still carries the baseline).
+      const ref = output.parts.find((part) => typeof part?.id === 'string' && part.id.startsWith('prt_'));
+      if (!ref) return;
+      // synthetic:true keeps the part out of the TUI (OpenCode filters
+      // `type==='text' && !synthetic` for display and skips synthetic-only
+      // messages for title generation) while still sending it to the model.
+      output.parts.unshift({
+        id: `${ref.id.slice(0, 16)}00000000000000`,
+        sessionID: ref.sessionID || sessionId,
+        messageID: ref.messageID || output.message?.id,
+        type: 'text',
+        text: context,
+        synthetic: true,
+      });
+    },
+    'experimental.session.compacting': async (input, output) => {
+      // Belt-and-braces: compaction summarises the transcript, so re-supply the
+      // cached baseline into the retained context. With the system-transform hook
+      // pushing it every call this is redundant today; it matters if a future
+      // change stops pushing the baseline on every call.
+      const sessionId = typeof input?.sessionID === 'string' ? input.sessionID : null;
+      if (!sessionId || !Array.isArray(output?.context)) return;
+      const state = sessions.get(sessionId);
+      if (state?.baseline) output.context.push(state.baseline);
     },
     event: async ({ event } = {}) => {
       await logStageOnce('hook:event', 'info', 'hook event first fire', { type: event?.type });
-      if ((event?.type === 'session.deleted' || event?.type === 'session.ended') && loamWake.server) {
-        const teardown = loamWake.server;
-        loamWake.server = null;
-        loamWake.sessionId = null;
-        await logStage('info', 'wake listener closed', { type: event?.type });
-        void teardown.close().catch(() => {});
+      if (event?.type === 'session.deleted' || event?.type === 'session.ended') {
+        const endedId = event.sessionID || event.session_id || event.properties?.sessionID || event.properties?.session_id;
+        if (typeof endedId === 'string') sessions.delete(endedId);
+        if (loamWake.server) {
+          const teardown = loamWake.server;
+          loamWake.server = null;
+          loamWake.sessionId = null;
+          wakeListenerOpened = false;
+          await logStage('info', 'wake listener closed', { type: event?.type });
+          void teardown.close().catch(() => {});
+        }
         return;
       }
       if (event?.type !== 'session.idle') return;
@@ -637,7 +699,7 @@ async function appLog(client, level, message, extra) {
 // export, so no loader path can mistake it for a plugin). An `export-surface`
 // contract test pins both contracts. See the local Federation debugging notes.
 //
-// Factory-local state (childSessions, loamWake, sessionStarted, sdk) all lives
+// Factory-local state (childSessions, loamWake, per-session baseline map, sdk) all lives
 // inside createOpenCodeAdapter and its returned closure, so an instance-disposal
 // re-run of this factory (opencode reruns it on client.config.update) rebuilds
 // that state fresh — there is no module-level per-session state to go stale.

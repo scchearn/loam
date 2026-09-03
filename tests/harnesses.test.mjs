@@ -59,7 +59,10 @@ test('opencode config plugin entries pointing at a repo-local loam.js are rewrit
   );
 });
 
-test('OpenCode re-injects on every turn: full block first, federation refresh after', async () => {
+test('OpenCode carries the full block in the system prompt and the federation refresh per turn', async () => {
+  // #209: the SessionStart block rides the system prompt (rebuilt per model call,
+  // cached per session); the per-turn federation refresh rides the persisted
+  // user message.
   const calls = [];
   const wakeStarts = [];
   const plugin = await createOpenCodeAdapter({
@@ -74,32 +77,30 @@ test('OpenCode re-injects on every turn: full block first, federation refresh af
       return { wakeRef: 'notify-tcp://127.0.0.1:0', registered: false, close: async () => {} };
     },
   })({ directory: '/workspace' });
-  const output = {
-    messages: [{ info: { role: 'user', sessionID: 'sess-1' }, parts: [{ type: 'text', text: 'superpowers context' }] }],
-  };
 
-  await plugin['experimental.chat.messages.transform']({}, output);
-  await plugin['experimental.chat.messages.transform']({}, output);
-  await plugin['experimental.chat.messages.transform']({}, output);
-  // T4: the first fire is the session start (full block); every later fire is a
-  // per-turn refresh. The OWN_MARKER self-dedup is gone — the native hook
-  // renders the right shape per event.
+  // Two model calls (system-transform) and two user turns (chat.message).
+  const system = [];
+  await plugin['experimental.chat.system.transform']({ sessionID: 'sess-1' }, { system });
+  await plugin['experimental.chat.system.transform']({ sessionID: 'sess-1' }, { system });
+  const turn1 = { message: { id: 'msg_1' }, parts: [{ id: 'prt_00112233445566778899', sessionID: 'sess-1', messageID: 'msg_1', type: 'text', text: 'superpowers context' }] };
+  const turn2 = { message: { id: 'msg_2' }, parts: [{ id: 'prt_00112233445566778899', sessionID: 'sess-1', messageID: 'msg_2', type: 'text', text: 'next prompt' }] };
+  await plugin['chat.message']({ sessionID: 'sess-1' }, turn1);
+  await plugin['chat.message']({ sessionID: 'sess-1' }, turn2);
+
+  // SessionStart renders once (cached); the two turns each render UserPromptSubmit.
   assert.deepEqual(calls, [
     { workspace: '/workspace', event: 'SessionStart' },
     { workspace: '/workspace', event: 'UserPromptSubmit' },
     { workspace: '/workspace', event: 'UserPromptSubmit' },
   ]);
-  // The notify listener opens once, on the first fire, against the session id
-  // carried on the first user message (OpenCode emits no session.created for
-  // the main session).
+  // The notify listener opens once, on the first system-transform fire.
   assert.deepEqual(wakeStarts, [{ workspace: '/workspace', sessionId: 'sess-1' }]);
-  const parts = output.messages[0].parts.filter((part) => part.type === 'text');
-  assert.equal(parts.length, 4, 'one full block + two refreshes');
-  // unshift puts the newest injection first: the two refreshes, then the full
-  // block, then the original user text.
-  assert.ok(parts[0].text.includes('## Federation'), 'newest part is a refresh');
-  assert.ok(parts[1].text.includes('## Federation'), 'second part is a refresh');
-  assert.ok(parts[2].text.includes('You have loam'), 'the full block is still present');
+  // The full block is appended to the system prompt on every model call, byte-stable.
+  assert.equal(system.length, 2, 'the baseline is pushed on every model call');
+  assert.ok(system[0].includes('You have loam') && system[0] === system[1], 'byte-stable full block');
+  // Each user turn carries the federation refresh as a persisted, prepended part.
+  assert.ok(turn1.parts[0].text.includes('## Federation'), 'turn 1 gets the refresh');
+  assert.ok(turn2.parts[0].text.includes('## Federation'), 'turn 2 gets the refresh');
 });
 
 test('OpenCode background events queue work and normalize the all-session status map', async () => {
