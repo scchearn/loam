@@ -6,6 +6,14 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+### Added
+
+- **Session start says when the memory map is missing.** A workspace whose
+  `AGENTS.md` has no `loam:memory-map` region, or whose map has drifted from
+  the wiki, now gets a `guidance_map_missing` / `guidance_map_stale` signal in
+  the injected workspace state pointing at `/loam::linting-memory`, instead of
+  only surfacing when someone runs the guidance lint by hand.
+
 ## [1.0.2]
 
 > **Existing workspaces: run the guidance lint once.** The `AGENTS.md` memory
