@@ -271,26 +271,6 @@ Background memory maintenance is enabled by default. To opt out, set
 `LOAM_HARVEST_BACKGROUND=0` or set `background_harvest.enabled: false` in
 Loam's `config.json` under the platform configuration directory.
 
-## Loam View
-
-A local, read-only window onto one workspace: five areas over a single
-`loam state --view` snapshot — Pulse (what needs attention), Atlas (how things
-connect), Work Stream (why work exists and how far it got), Chronicle (how
-understanding changed), Stewardship (whether memory can be trusted).
-
-Ask your harness for it — "open loam view" — and the **Using** router
-background-spawns the launcher and hands you the URL. From a terminal:
-
-```bash
-npx @scchearn/loam view [workspace-root]
-```
-
-Requires Node.js >= 22. It is read-only, binds loopback only, and exports
-nothing; there is no flag to change any of that.
-
-See [Loam View](./docs/loam-view.md) for the full guide, including the
-background-spawn pattern for harness agents.
-
 ## Skill metrics
 
 Skills load into an agent's context window, so loam keeps each one small. A
@@ -305,24 +285,24 @@ the skill runs. The table below shows how much space each skill uses against the
 |-------|---:|---:|---:|---:|
 | loam::initializing-vault | 206 | 51 | 9 | 73 |
 | loam::scaffolding-wiki | 445 | 90 | 207 | 2,400 |
-| loam::adding-to-memory | 592 | 116 | 217 | 2,311 |
-| loam::amending-memory | 505 | 114 | 180 | 1,961 |
+| loam::adding-to-memory | 592 | 116 | 217 | 2,312 |
+| loam::amending-memory | 505 | 114 | 180 | 1,958 |
 | loam::auditing-guidance | 410 | 85 | 304 | 3,256 |
 | loam::ingesting-codebase | 329 | 76 | 288 | 3,660 |
-| loam::learning-from-session | 487 | 101 | 365 | 4,212 |
-| loam::linting-memory | 471 | 102 | 316 | 4,989 |
+| loam::learning-from-session | 487 | 101 | 365 | 4,213 |
+| loam::linting-memory | 471 | 102 | 316 | 5,000 |
 | loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
-| loam::querying-memory | 530 | 105 | 175 | 1,593 |
-| loam::reviewing-memory | 510 | 113 | 137 | 1,787 |
+| loam::querying-memory | 530 | 105 | 206 | 2,025 |
+| loam::reviewing-memory | 510 | 113 | 137 | 1,799 |
 | loam::syncing-code-graph | 363 | 84 | 223 | 2,780 |
-| loam::using | 368 | 77 | 320 | 5,118 |
+| loam::using | 368 | 77 | 76 | 1,813 |
 | loam::amending-plan | 437 | 88 | 273 | 3,059 |
-| loam::checkpointing | 365 | 69 | 177 | 2,091 |
+| loam::checkpointing | 365 | 69 | 177 | 2,094 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,237 |
-| loam::planning | 327 | 62 | 323 | 4,314 |
-| loam::resuming | 376 | 77 | 142 | 1,847 |
+| loam::planning | 327 | 62 | 323 | 4,321 |
+| loam::resuming | 376 | 77 | 142 | 1,850 |
 | loam::setting-goals | 473 | 101 | 184 | 1,883 |
-| loam::starting | 166 | 34 | 356 | 4,985 |
+| loam::starting | 166 | 34 | 356 | 4,989 |
 | loam::writing-spec | 332 | 66 | 261 | 3,323 |
 <!-- END skill-metrics -->
 

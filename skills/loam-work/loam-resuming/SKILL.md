@@ -30,7 +30,7 @@ If no hint is provided, derive the likely resume target from the current session
 
    If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam install`; do not fabricate state or use a project-local fallback. Treat an empty `wiki_root` as "no wiki," not as an error. If no state is available, do not use Glob to discover the wiki root.
 
-   A `resume_available` or `resume_stale` hint in the integration state is the advisory signal for this skill (see the hint contract in `loam::using`); `resume_stale` means the latest checkpoint is over 24h old, so verify live state extra carefully.
+   A `resume_available` or `resume_stale` hint in the integration state is the advisory signal for this skill (see the hint contract in `loam-using/references/runtime.md`); `resume_stale` means the latest checkpoint is over 24h old, so verify live state extra carefully.
 
 2. **List checkpoints with `ls`, not Glob** (same gitignore caveat applies to checkpoint files). From the resolved `<wiki_root>`:
 

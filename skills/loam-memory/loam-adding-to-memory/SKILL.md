@@ -60,7 +60,7 @@ If `exists` is true, use `wiki_root` as the resolved wiki root and `qmd_ready` +
 
 If multiple wiki roots are present and the target is ambiguous, ask the smallest possible follow-up question.
 
-If qmd is ready (`qmd_ready: true`), use the `collection` name and follow the **qmd and code-graph discovery** protocol in `loam::using` (the router) to find existing related notes — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (deriving search terms, archive exclusion) if you want it. If qmd is not ready, use Grep/Glob to find existing notes.
+If qmd is ready (`qmd_ready: true`), use the `collection` name and follow the discovery protocol in `loam-using/references/discovery.md` to find existing related notes — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (deriving search terms, archive exclusion) if you want it. If qmd is not ready, use Grep/Glob to find existing notes.
 
 If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam install`; do not fabricate state or use a project-local fallback. If qmd is not ready, use Grep/Glob for existing notes.
 
@@ -81,7 +81,7 @@ Read before editing:
 5. `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/ingest-checklist.md`
 6. if chat-context mode: `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/chat-context-ingest.md`
 
-**If qmd is ready**, follow the qmd search protocol in `loam::using` (search terms: 2-4 terms derived from the source content or topic) to find existing related notes before editing.
+**If qmd is ready**, follow the qmd search protocol in `loam-using/references/discovery.md` (search terms: 2-4 terms derived from the source content or topic) to find existing related notes before editing.
 
 **If qmd is not ready**, use Grep and Glob to find existing notes that mention the same entities, topics, or concepts.
 
@@ -207,7 +207,7 @@ If the source was already represented and you refreshed it, say so explicitly.
 - Chat-context mode: synthesize from the current conversation context only.
 - Prefer one source per run.
 - Read the wiki schema before editing.
-- If qmd is ready, use the qmd search protocol in `loam::using` to find existing related notes; otherwise fall back to Grep/Glob.
+- If qmd is ready, use the qmd search protocol in `loam-using/references/discovery.md` to find existing related notes; otherwise fall back to Grep/Glob.
 - Never edit a wiki page based only on qmd output. Always read the actual wiki files first.
 - Durable category notes use canonical kebab-case filenames.
 - Internal note links use `[[kebab-case-note-name]]`.

@@ -57,6 +57,17 @@ fn state_hints(plan: &str) -> String {
 }
 
 #[test]
+fn a_wiki_without_an_agents_md_memory_map_surfaces_a_guidance_hint() {
+    // state_hints writes a wiki but no AGENTS.md, so the guidance lint's
+    // GDN001 must reach the session-start signals as a maintenance hint.
+    let stdout = state_hints(&plan_with("- [ ] pending."));
+    assert!(
+        stdout.contains(r#""kind":"guidance_map_missing","group":"maintenance","severity":"info","message":"AGENTS.md has no loam memory map; regenerate it so agents learn the wiki exists.","command":"/loam::linting-memory","evidence":{"finding":"`AGENTS.md` does not exist"}"#),
+        "expected guidance_map_missing hint, got {stdout}"
+    );
+}
+
+#[test]
 fn plan_with_complete_tasks_and_open_criteria_is_reconcilable() {
     // [>] and the unrecognized [~] count as open; [-] counts as resolved.
     let stdout = state_hints(&plan_with(

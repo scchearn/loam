@@ -59,7 +59,7 @@ fn installation(label: &str) -> (PathBuf, PathBuf) {
     std::fs::create_dir_all(&using).unwrap();
     std::fs::write(
         using.join("SKILL.md"),
-        "---\nname: loam-using\n---\n# Using loam\n\nSKILL-BODY-MARKER\n",
+        "---\nname: loam-using\n---\n# Using loam\n\nSKILL-BODY-MARKER read `references/discovery.md`\n",
     )
     .unwrap();
     (global_root, skills_root)
@@ -211,6 +211,20 @@ fn every_harness_returns_its_native_envelope_for_every_frame_shape() {
             assert!(body.ends_with("</LOAM_IMPORTANT>"), "{id}/{name}: {body}");
             assert!(body.contains("You have loam (v9.9.9)."), "{id}/{name}");
             assert!(body.contains("SKILL-BODY-MARKER"), "{id}/{name}: {body}");
+            // Reference pointers are absolute in the injected copy: a system
+            // prompt has no skill directory to resolve `references/` against.
+            assert!(
+                body.contains(&format!(
+                    "`{}/references/discovery.md`",
+                    skills_root.join("loam-using").display()
+                )),
+                "{id}/{name}: {body}"
+            );
+            // Facts before guidance: the state block precedes the skill body.
+            assert!(
+                body.find("## Workspace state") < body.find("SKILL-BODY-MARKER"),
+                "{id}/{name}: {body}"
+            );
             assert!(
                 !body.contains("name: loam-using"),
                 "{id}/{name}: frontmatter"

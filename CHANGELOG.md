@@ -6,6 +6,82 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+## [1.0.4]
+
+Plugin 1.0.4 and runtime 1.0.3 ship together.
+
+### Fixed
+
+- **The injected router now fits the harness hook cap.** `loam::using` is
+  injected whole at session start; it had grown to ~5,000 tokens, and with
+  the runtime line and state blocks the injection reached 21 KB. Claude Code
+  caps hook context near 10 KB, so the model saw a 2 KB preview and the
+  workspace state at the tail (wiki root, qmd, `hcom:`) never arrived. The
+  router now carries only what a session needs before any skill is invoked
+  (1,609 tokens); every other sentence moved verbatim into
+  `references/memory-lifecycle.md`, `references/discovery.md`, and
+  `references/runtime.md`, each named at its trigger point. The native
+  session-start assembly emits the runtime command and state blocks before
+  the skill body, and rewrites the body's `references/` pointers to absolute
+  paths so progressive disclosure resolves from a system prompt. Skills that
+  cited protocol sections in the router now name the reference file. ([#213])
+
+### Added
+
+- **hcom transcripts as a secondary memory source.** `querying-memory` may
+  search agent transcripts through the hcom MCP tool or CLI when the injected
+  `hcom:` line says `ready`, ranked below the wiki for curation but not for
+  recency; on disagreement it reports both and routes to `amending-memory`.
+  The router gains a discovery order (wiki via qmd, then transcripts, then raw
+  source) and a memory-first red flag. Skips silently when hcom is not
+  installed. ([#213])
+
+## [1.0.3]
+
+Plugin 1.0.3 and runtime 1.0.2 ship together.
+
+> **Existing workspaces: run the guidance lint once** if you skipped it on
+> 1.0.2. Session start now tells you when the map is missing (see below).
+
+### Fixed
+
+- **OpenCode agents keep their loam context past the first turn.** The
+  OpenCode adapter injected everything through a transform hook that OpenCode
+  applies per model call and never stores, so the router block and workspace
+  state existed for exactly one call and every later turn saw only the
+  federation line; items drained from the federation mailbox were shown once
+  and then lost; and a second session in the same OpenCode server never got a
+  session start at all. Each kind of context now rides the hook whose lifetime
+  matches it: the session-start block lives in the system prompt (cached per
+  session, so provider prompt caching pays for it once), the per-turn
+  federation delta is written into the stored user message as a hidden part,
+  and the block is re-supplied after compaction. Claude Code, Codex, and
+  Cursor were never affected. ([#209], [#210])
+- **Quiet turns inject nothing.** The per-prompt federation refresh used to
+  re-inject the status line on every prompt even when nothing had changed,
+  including the permanent `unenrolled` line in workspaces that never joined a
+  project. A turn with no new items now injects an empty envelope on every
+  harness; the status line renders at session start only. A session whose
+  mailbox registration was lost to a connector restart re-registers and
+  retries once instead of re-rendering the whole backlog each turn. ([#204],
+  [#210])
+
+### Added
+
+- **Session start says when the memory map is missing.** A workspace whose
+  `AGENTS.md` has no `loam:memory-map` region, or whose map has drifted from
+  the wiki, now gets a `guidance_map_missing` / `guidance_map_stale` signal in
+  the injected workspace state pointing at `/loam::linting-memory`, instead of
+  only surfacing when someone runs the guidance lint by hand. ([#211])
+
+## [1.0.2]
+
+> **Existing workspaces: run the guidance lint once.** The `AGENTS.md` memory
+> map below is seeded by scaffolding for new workspaces only. A workspace that
+> already has a wiki gets it by running
+> `loam lint --only guidance --fix <workspace>` (or `/loam::linting-memory`)
+> once after updating. Until then `loam lint` reports the map as missing.
+
 ### Added
 
 - **Specs for judged work now name their oracle.** When a request's quality bar
@@ -18,7 +94,7 @@ All notable changes to loam are documented here. This file follows
   enforces both, and the evidence contract must appear in Scope so planning
   schedules the verification harness as early work instead of an afterthought.
   Hard-oracle work (done provable by tests or commands) is unaffected.
-  (`loam-writing-spec` 3.3.0)
+  (`loam-writing-spec` 3.3.0) ([#207])
 - **The memory announces itself in `AGENTS.md`.** A workspace with a wiki now
   carries a small Loam-owned memory map inside its guidance file, listing the
   durable page slugs by type so an agent learns the memory exists at session
@@ -29,7 +105,7 @@ All notable changes to loam are documented here. This file follows
   `loam lint --fix` regenerates the map in place without touching anything
   outside its markers. Scaffolding seeds the block, the guidance audit can
   refresh it with or without the native runtime, and normalization leaves it
-  alone.
+  alone. ([#206])
 
 ### Fixed
 
@@ -114,7 +190,9 @@ All notable changes to loam are documented here. This file follows
 Release entries are maintained as part of release work; see
 [RELEASING.md](./docs/RELEASING.md).
 
-[Unreleased]: https://github.com/scchearn/loam/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/scchearn/loam/compare/v1.0.3...HEAD
+[1.0.3]: https://github.com/scchearn/loam/releases/tag/v1.0.3
+[1.0.2]: https://github.com/scchearn/loam/releases/tag/v1.0.2
 [1.0.1]: https://github.com/scchearn/loam/releases/tag/v1.0.1
 [1.0.0]: https://github.com/scchearn/loam/releases/tag/v1.0.0
 [#114]: https://github.com/scchearn/loam/pull/114
@@ -122,3 +200,10 @@ Release entries are maintained as part of release work; see
 [#146]: https://github.com/scchearn/loam/issues/146
 [#163]: https://github.com/scchearn/loam/issues/163
 [#173]: https://github.com/scchearn/loam/issues/173
+[#206]: https://github.com/scchearn/loam/pull/206
+[#207]: https://github.com/scchearn/loam/pull/207
+[#204]: https://github.com/scchearn/loam/issues/204
+[#209]: https://github.com/scchearn/loam/issues/209
+[#210]: https://github.com/scchearn/loam/pull/210
+[#211]: https://github.com/scchearn/loam/pull/211
+[#213]: https://github.com/scchearn/loam/pull/213

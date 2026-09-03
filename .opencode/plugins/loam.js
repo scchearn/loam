@@ -10,13 +10,12 @@ async function loadAdapter() {
 
 function recoveryPlugin() {
   return {
-    'experimental.chat.messages.transform': async (_input, output) => {
-      if (!output?.messages?.length) return;
-      const firstUser = output.messages.find((message) => message.info?.role === 'user');
-      if (!firstUser?.parts?.length) return;
-      if (firstUser.parts.some((part) => part.type === 'text' && part.text.includes('You have loam'))) return;
-      const reference = firstUser.parts[0];
-      firstUser.parts.unshift({ ...reference, type: 'text', text: RECOVERY_CONTEXT });
+    // #209: ride the system prompt, which OpenCode rebuilds per model call, so
+    // the notice survives past the first call. The system array is rebuilt each
+    // time, so no dedupe check is needed.
+    'experimental.chat.system.transform': async (_input, output) => {
+      if (!Array.isArray(output?.system)) return;
+      output.system.push(RECOVERY_CONTEXT);
     },
   };
 }

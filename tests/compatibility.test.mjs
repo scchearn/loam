@@ -55,9 +55,9 @@ test('missing adapter in an existing clone returns setup recovery instead of a l
   try {
     const loaded = await import(`${pathToFileURL(cloneLoader).href}?fixture=${Date.now()}`);
     const plugin = await loaded.LoamPlugin({ directory: clone });
-    const output = { messages: [{ info: { role: 'user' }, parts: [{ type: 'text', text: 'hello' }] }] };
-    await plugin['experimental.chat.messages.transform']({}, output);
-    assert.match(output.messages[0].parts[0].text, /npx @scchearn\/loam install/);
+    const output = { system: [] };
+    await plugin['experimental.chat.system.transform']({ sessionID: 's' }, output);
+    assert.match(output.system[0], /npx @scchearn\/loam install/);
   } finally {
     await rm(clone, { recursive: true, force: true });
   }
@@ -81,7 +81,7 @@ test('packed tarball contains a loadable adapter through the preserved main entr
     const packedLoader = join(packedRoot, '.opencode', 'plugins', 'loam.js');
     const loaded = await import(`${pathToFileURL(packedLoader).href}?fixture=${Date.now()}`);
     const plugin = await loaded.LoamPlugin({ directory: packedRoot });
-    assert.equal(typeof plugin['experimental.chat.messages.transform'], 'function');
+    assert.equal(typeof plugin['experimental.chat.system.transform'], 'function');
   } finally {
     await rm(destination, { recursive: true, force: true });
   }

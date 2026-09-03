@@ -592,6 +592,34 @@ fn add_hints(context: HintContext<'_>, hints: &mut Vec<String>) {
         );
     }
 
+    // The memory map in AGENTS.md is how an agent learns the wiki exists at
+    // session start, so its absence or drift is surfaced here as well as by
+    // `lint --only guidance`. One file read; cheap enough for --fast.
+    let mut guidance_findings = Vec::new();
+    crate::guidance::findings(workspace, &mut guidance_findings);
+    for finding in &guidance_findings {
+        let (kind, message) = match finding.rule {
+            "GDN001" => (
+                "guidance_map_missing",
+                "AGENTS.md has no loam memory map; regenerate it so agents learn the wiki exists.",
+            ),
+            "GDN002" => (
+                "guidance_map_stale",
+                "AGENTS.md memory map no longer matches the wiki; regenerate it.",
+            ),
+            _ => continue,
+        };
+        add_hint(
+            hints,
+            kind,
+            "maintenance",
+            "info",
+            message,
+            Some("/loam::linting-memory"),
+            format!("{{\"finding\":\"{}\"}}", json_escape(&finding.description)),
+        );
+    }
+
     if !metadata.status.is_empty() && metadata.status != "ready" {
         add_hint(
             hints,

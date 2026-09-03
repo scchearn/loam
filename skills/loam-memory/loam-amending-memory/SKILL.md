@@ -44,14 +44,14 @@ If no wiki exists, stop. There is nothing to amend.
 3. If qmd is still not ready: use Grep/Glob to find affected pages.
 4. Runtime guard: if any qmd command fails or returns stale results, treat as degraded — fall back to Grep/Glob.
 
-If qmd is ready, follow the **qmd and code-graph discovery** protocol in `loam::using` (the router) for broadening affected-page discovery — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (search terms for "what changed and why", archive exclusion) if you want it.
+If qmd is ready, follow the discovery protocol in `loam-using/references/discovery.md` for broadening affected-page discovery — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (search terms for "what changed and why", archive exclusion) if you want it.
 
 ### Identify affected pages
 
 1. Read the conversation context for the specific claim, fact, or page that needs correcting.
 2. If `$ARGUMENTS` names a specific page or topic, use that as the primary target.
 3. If `$ARGUMENTS` is descriptive, search `index.md` and use `Grep` to find pages that contain the stale or wrong content.
-4. **If qmd is ready**, follow the qmd search protocol in `loam::using` (search terms: what changed and why — derive 2-4 terms from the evidence) to find all notes likely influenced by the stale or wrong claim.
+4. **If qmd is ready**, follow the qmd search protocol in `loam-using/references/discovery.md` (search terms: what changed and why — derive 2-4 terms from the evidence) to find all notes likely influenced by the stale or wrong claim.
 5. Read each candidate page to confirm it actually contains the issue before changing it.
 6. If qmd results are noisy or irrelevant, ignore them and rely on Grep and Glob.
 
