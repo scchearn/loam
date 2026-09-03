@@ -428,12 +428,16 @@ function createOpenCodeAdapter({
       // than emit an invalid part (the system prompt still carries the baseline).
       const ref = output.parts.find((part) => typeof part?.id === 'string' && part.id.startsWith('prt_'));
       if (!ref) return;
+      // synthetic:true keeps the part out of the TUI (OpenCode filters
+      // `type==='text' && !synthetic` for display and skips synthetic-only
+      // messages for title generation) while still sending it to the model.
       output.parts.unshift({
         id: `${ref.id.slice(0, 16)}00000000000000`,
         sessionID: ref.sessionID || sessionId,
         messageID: ref.messageID || output.message?.id,
         type: 'text',
         text: context,
+        synthetic: true,
       });
     },
     'experimental.session.compacting': async (input, output) => {

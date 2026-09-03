@@ -560,6 +560,7 @@ test('chat.message mints a valid persisted part that sorts before its sibling', 
   assert.equal(injected.messageID, 'msg_abc', 'it carries a messageID');
   assert.ok(injected.id < sibling.id, 'the minted id sorts before the sibling, so the block leads the message');
   assert.equal(injected.id, 'prt_00112233445500000000000000', 'same 12-hex time prefix, all-zero tail');
+  assert.equal(injected.synthetic, true, 'synthetic keeps the part out of the TUI while still reaching the model');
 });
 
 test('chat.message with no sibling part injects nothing (no invalid part)', async () => {
