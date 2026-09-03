@@ -6,6 +6,32 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **The injected router now fits the harness hook cap.** `loam::using` is
+  injected whole at session start; it had grown to ~5,000 tokens, and with
+  the runtime line and state blocks the injection reached 21 KB. Claude Code
+  caps hook context near 10 KB, so the model saw a 2 KB preview and the
+  workspace state at the tail (wiki root, qmd, `hcom:`) never arrived. The
+  router now carries only what a session needs before any skill is invoked
+  (1,609 tokens); every other sentence moved verbatim into
+  `references/memory-lifecycle.md`, `references/discovery.md`, and
+  `references/runtime.md`, each named at its trigger point. The native
+  session-start assembly emits the runtime command and state blocks before
+  the skill body, and rewrites the body's `references/` pointers to absolute
+  paths so progressive disclosure resolves from a system prompt. Skills that
+  cited protocol sections in the router now name the reference file. ([#213])
+
+### Added
+
+- **hcom transcripts as a secondary memory source.** `querying-memory` may
+  search agent transcripts through the hcom MCP tool or CLI when the injected
+  `hcom:` line says `ready`, ranked below the wiki for curation but not for
+  recency; on disagreement it reports both and routes to `amending-memory`.
+  The router gains a discovery order (wiki via qmd, then transcripts, then raw
+  source) and a memory-first red flag. Skips silently when hcom is not
+  installed. ([#213])
+
 ## [1.0.3]
 
 Plugin 1.0.3 and runtime 1.0.2 ship together.
@@ -176,3 +202,4 @@ Release entries are maintained as part of release work; see
 [#209]: https://github.com/scchearn/loam/issues/209
 [#210]: https://github.com/scchearn/loam/pull/210
 [#211]: https://github.com/scchearn/loam/pull/211
+[#213]: https://github.com/scchearn/loam/pull/213
