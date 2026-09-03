@@ -15,7 +15,7 @@ This is the router for the loam skill namespace: which skill to invoke for a giv
 1. **Invoke the matching skill before any loam action.** This document only routes; the skill body has the rules. Err on the side of invoking, even if you read it earlier this session.
 2. **Memory first.** "Memory" is the umbrella; "wiki" names only the markdown substrate. Consult memory before raw source or recall (see Discovery order).
 3. **Agent-owned memory writes.** Write, correct, route, and archive memory without pre-approval. A human flagging a page as wrong triggers the same correction flow as an agent-found contradiction.
-4. **Domain-router precedence.** In a workspace with `wiki/`, `goals/`, `specs/`, or `plans/`, this router wins over generic skill routers for memory, goals, specs, plans, checkpoints, and debates.
+4. **Domain-router precedence.** In a workspace with loam artifacts (`wiki/`, `goals/`, `specs/`, `plans/`), this router wins over generic skill routers for memory, goals, specs, plans, checkpoints, and debates.
 5. **Global install only.** Skills live under `<home>/.agents/skills/`; the runtime is the injected `Native runtime command:` and nothing else. Never install, probe for, or run a project-local loam, and never `which loam`/`which hcom` — the injected state lines are the availability answer.
 
 ## Memory model
@@ -53,7 +53,7 @@ A wiki page must be reusable, about the project/domain, and costly to reconstruc
 - Wrong claim → `amending-memory`; whole-graph check → `linting-memory`.
 - Want an answer → `querying-memory`; want open gaps → `reviewing-memory`.
 - Have a source → `adding-to-memory`; session produced insight → `learning-from-session`.
-- Verifiable ambition → `setting-goals`; research question → `writing-spec` (a goal may yield several specs; a spec may record goal provenance). Explicit debate intent → `configuring-agents`.
+- Verifiable ambition → `setting-goals`; research question → `writing-spec` (a goal may yield several specs; a spec may record goal provenance). Explicit debate or consensus intent wins → `configuring-agents`.
 - Still unsure whether it's guidance, wiki, checkpoint, or goal? Ask before guessing.
 
 ## Red flags — "I'll just…" means you're skipping a skill
