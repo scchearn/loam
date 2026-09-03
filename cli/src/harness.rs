@@ -413,8 +413,11 @@ fn query_federation(
                     // whole backlog each turn. Re-register and retry the drain
                     // once; the snapshot fallback then renders at most once per
                     // restart. Fire-and-forget register, same shape as SessionStart.
-                    let register =
-                        request_body(workspace, Operation::SessionRegisterInject, Some(session_id));
+                    let register = request_body(
+                        workspace,
+                        Operation::SessionRegisterInject,
+                        Some(session_id),
+                    );
                     let _ = call_connector(&paths.run_dir(), register.as_bytes(), &ipc_config);
                     if let Some(snapshot @ Federation::Snapshot(_)) = drain() {
                         return snapshot;
