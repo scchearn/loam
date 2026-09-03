@@ -6,13 +6,43 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+## [1.0.3]
+
+Plugin 1.0.3 and runtime 1.0.2 ship together.
+
+> **Existing workspaces: run the guidance lint once** if you skipped it on
+> 1.0.2. Session start now tells you when the map is missing (see below).
+
+### Fixed
+
+- **OpenCode agents keep their loam context past the first turn.** The
+  OpenCode adapter injected everything through a transform hook that OpenCode
+  applies per model call and never stores, so the router block and workspace
+  state existed for exactly one call and every later turn saw only the
+  federation line; items drained from the federation mailbox were shown once
+  and then lost; and a second session in the same OpenCode server never got a
+  session start at all. Each kind of context now rides the hook whose lifetime
+  matches it: the session-start block lives in the system prompt (cached per
+  session, so provider prompt caching pays for it once), the per-turn
+  federation delta is written into the stored user message as a hidden part,
+  and the block is re-supplied after compaction. Claude Code, Codex, and
+  Cursor were never affected. ([#209], [#210])
+- **Quiet turns inject nothing.** The per-prompt federation refresh used to
+  re-inject the status line on every prompt even when nothing had changed,
+  including the permanent `unenrolled` line in workspaces that never joined a
+  project. A turn with no new items now injects an empty envelope on every
+  harness; the status line renders at session start only. A session whose
+  mailbox registration was lost to a connector restart re-registers and
+  retries once instead of re-rendering the whole backlog each turn. ([#204],
+  [#210])
+
 ### Added
 
 - **Session start says when the memory map is missing.** A workspace whose
   `AGENTS.md` has no `loam:memory-map` region, or whose map has drifted from
   the wiki, now gets a `guidance_map_missing` / `guidance_map_stale` signal in
   the injected workspace state pointing at `/loam::linting-memory`, instead of
-  only surfacing when someone runs the guidance lint by hand.
+  only surfacing when someone runs the guidance lint by hand. ([#211])
 
 ## [1.0.2]
 
@@ -130,7 +160,8 @@ All notable changes to loam are documented here. This file follows
 Release entries are maintained as part of release work; see
 [RELEASING.md](./docs/RELEASING.md).
 
-[Unreleased]: https://github.com/scchearn/loam/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/scchearn/loam/compare/v1.0.3...HEAD
+[1.0.3]: https://github.com/scchearn/loam/releases/tag/v1.0.3
 [1.0.2]: https://github.com/scchearn/loam/releases/tag/v1.0.2
 [1.0.1]: https://github.com/scchearn/loam/releases/tag/v1.0.1
 [1.0.0]: https://github.com/scchearn/loam/releases/tag/v1.0.0
@@ -141,3 +172,7 @@ Release entries are maintained as part of release work; see
 [#173]: https://github.com/scchearn/loam/issues/173
 [#206]: https://github.com/scchearn/loam/pull/206
 [#207]: https://github.com/scchearn/loam/pull/207
+[#204]: https://github.com/scchearn/loam/issues/204
+[#209]: https://github.com/scchearn/loam/issues/209
+[#210]: https://github.com/scchearn/loam/pull/210
+[#211]: https://github.com/scchearn/loam/pull/211
