@@ -202,7 +202,7 @@ If `exists` is false, stop and recommend:
 
 If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam install`; do not fabricate state or use a project-local fallback. Use `wiki_root` as the resolved wiki root. Treat `has_overview: true` or a `legacy_structure_pending` hint as a legacy root-hub file. Use `qmd_ready` + `collection` for qmd state.
 
-If qmd is ready, follow the **qmd and code-graph discovery** protocol in `loam::using` (the router) for finding existing destination notes — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (search terms for what the session resolved, archive exclusion) if you want it. If qmd is not ready, use Grep/Glob to find existing pages.
+If qmd is ready, follow the discovery protocol in `loam-using/references/discovery.md` for finding existing destination notes — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (search terms for what the session resolved, archive exclusion) if you want it. If qmd is not ready, use Grep/Glob to find existing pages.
 
 #### Read the wiki contract & discover destinations
 
@@ -216,7 +216,7 @@ Read before editing:
 
 Resolve the scope: if `$ARGUMENTS` names a topic, use that as primary focus. Otherwise derive from the session. Use `index.md` and `Grep` to find directly related pages. Do not propose edits to a page you have not read.
 
-**If qmd is ready**, follow the qmd search protocol in `loam::using` (search terms: 2-4 terms derived from what each learning resolved) to find the best existing destination note for each candidate learning.
+**If qmd is ready**, follow the qmd search protocol in `loam-using/references/discovery.md` (search terms: 2-4 terms derived from what each learning resolved) to find the best existing destination note for each candidate learning.
 
 **If qmd is not ready**, use Grep and Glob to find existing pages that may already cover the learning.
 
@@ -355,7 +355,7 @@ If the review found nothing durable enough to add, say so explicitly and do not 
 - Route through the five-way matrix before writing.
 - The classification is a feature. Do not collapse the destinations into one.
 - Wiki path: direct page updates only. Never create a conversation-source note in this skill.
-- Wiki path: prefer existing pages over new pages. Use the qmd search protocol in `loam::using` to find existing destination notes when ready; fall back to Grep/Glob when not ready.
+- Wiki path: prefer existing pages over new pages. Use the qmd search protocol in `loam-using/references/discovery.md` to find existing destination notes when ready; fall back to Grep/Glob when not ready.
 - Wiki path: never edit a wiki page based only on qmd output. Always read the actual wiki files first.
 - Wiki path: keep additions concise, durable, and attributable to the session.
 - Wiki path: corrections and supersessions use archive + correct + log; do not silently replace stale claims.
