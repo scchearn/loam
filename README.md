@@ -43,8 +43,10 @@ tools or machines.
   is made there yet.
 - **Direct coordinator integration** through the `loam-coordinator` command. The
   command invokes a ready implementation of the transport-neutral coordinator
-  interface without an hcom compatibility layer. Set `LOAM_COORDINATOR_MODULE`
-  to an absolute path or `file://` URL for the module exporting `coordinator`.
+  interface without a compatibility layer. Set `LOAM_COORDINATOR_URL` and
+  `LOAM_COORDINATOR_TOKEN` for the long-lived loopback service, or set
+  `LOAM_COORDINATOR_MODULE` to an absolute path or `file://` URL for an embedded
+  module.
 - **Independent plugin and runtime releases**, so a skills or integration
   change does not require a native-binary release. See
   [RELEASING.md](./docs/RELEASING.md).
@@ -119,8 +121,10 @@ loam-coordinator send --json '{"sender":"<actor-id>","recipients":["<recipient-i
 loam-coordinator spawn --json '{"runtime":"opencode","workspace":"<absolute-path>","taskId":"T1","body":"..."}'
 ```
 
-The command fails closed when `LOAM_COORDINATOR_MODULE` is not set or when the
-loaded module does not expose every method in the `Coordinator` interface.
+The command fails closed when neither coordinator source is set, when a remote
+URL is not loopback HTTP, or when a loaded module does not expose every method
+in the `Coordinator` interface. The loopback service keeps identity and worker
+state alive between commands.
 
 ## Federation
 

@@ -14,7 +14,7 @@ export class CoordinatorUnavailableError extends Error {
 function moduleSpecifier(modulePath) {
   if (!modulePath) {
     throw new CoordinatorUnavailableError(
-      'coordinator is not configured; set LOAM_COORDINATOR_MODULE to a module exporting a ready Coordinator',
+      'coordinator is not configured; set LOAM_COORDINATOR_URL and LOAM_COORDINATOR_TOKEN, or LOAM_COORDINATOR_MODULE',
     );
   }
   if (modulePath.startsWith('file://')) return modulePath;
@@ -38,7 +38,46 @@ function readCoordinator(namespace, modulePath) {
   return value;
 }
 
-export async function loadCoordinator({ modulePath = process.env.LOAM_COORDINATOR_MODULE } = {}) {
+function createHttpCoordinator(baseUrl, token) {
+  const parsed = new URL(baseUrl);
+  if (parsed.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)) {
+    throw new CoordinatorUnavailableError('coordinator URL must use loopback HTTP');
+  }
+  if (!token) throw new CoordinatorUnavailableError('LOAM_COORDINATOR_TOKEN is required with LOAM_COORDINATOR_URL');
+  const root = baseUrl.replace(/\/$/, '');
+  const request = async (operation, input) => {
+    const response = await fetch(`${root}/v1/${operation}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+      signal: AbortSignal.timeout(30_000),
+    });
+    let body;
+    try {
+      body = await response.json();
+    } catch {
+      throw new CoordinatorUnavailableError(`coordinator returned invalid JSON for ${operation}`);
+    }
+    if (!response.ok) throw new CoordinatorUnavailableError(body?.error ?? `coordinator returned HTTP ${response.status}`);
+    return body;
+  };
+  return {
+    registerIdentity: (input) => request('registerIdentity', input),
+    send: (input) => request('send', input),
+    subscribe: async () => { throw new CoordinatorUnavailableError('subscribe is managed by the coordinator server'); },
+    spawn: (input) => request('spawn', input),
+    status: (input) => request('status', input),
+    cancel: (input) => request('cancel', input),
+    resume: (input) => request('resume', input),
+  };
+}
+
+export async function loadCoordinator({
+  modulePath = process.env.LOAM_COORDINATOR_MODULE,
+  baseUrl = process.env.LOAM_COORDINATOR_URL,
+  token = process.env.LOAM_COORDINATOR_TOKEN,
+} = {}) {
+  if (!modulePath && baseUrl) return createHttpCoordinator(baseUrl, token);
   const specifier = moduleSpecifier(modulePath);
   try {
     return readCoordinator(await import(specifier), modulePath);
