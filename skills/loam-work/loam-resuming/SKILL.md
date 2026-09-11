@@ -109,7 +109,7 @@ Verify only what the checkpoint would cause you to act on, such as:
 - does `Intended return` still fit the live workspace state, when one was recorded
 - do referenced files still exist
 - does the cited plan/spec/note still match the checkpoint summary
-- do named tools, services, or threads still appear current. Check the injected `hcom:` line before running any `hcom` command — on `not installed`, treat every hcom pointer in the checkpoint as stale context and say so rather than probing. Treat empty `hcom events --thread <name>` results as "thread idle/expired — re-open or re-delegate," not as an error. The thread may have been pruned or never persisted; do not fail the resume.
+- do named tools, services, or threads still appear current. Check `LOAM_COORDINATOR_MODULE` before using coordinator operations. If it is absent, treat coordinator pointers in the checkpoint as stale context and say so rather than probing. Treat an empty coordinator status or message result as "thread idle/expired, re-open or re-delegate," not as an error. The thread may have been pruned or never persisted; do not fail the resume.
 - is the claimed blocker or next step still plausible from live workspace state
 - if the checkpoint or plan references a goal path and the file is missing or unreadable, report the path and stop. Otherwise read live status; do not resume a `paused`, `achieved`, or `abandoned` goal unless explicitly authorized
 

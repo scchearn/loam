@@ -1,7 +1,7 @@
 ---
 name: loam::configuring-agents
 description: "Use when agents must debate, conference, deliberate, or reach consensus on a goal — competing positions argue and converge on one deliverable, adversarial review with synthesis, multi-stakeholder deliberation, structured disagreement with a forcing-field deliverable. Triggers: 'have agents debate X', 'reach consensus on Y', 'argue distinct positions and converge'. Not for saved team configs, agents/<slug> artifacts, implementation, or open-ended research."
-compatibility: "Requires hcom for live agent coordination. The prepared plan can be returned without hcom when approval is denied or hcom is unavailable."
+compatibility: "Requires the direct coordinator for live agent coordination. The prepared plan can be returned without it when approval is denied or the coordinator is unavailable."
 metadata:
   version: "2.1.0"
   author: scchearn
@@ -13,12 +13,12 @@ metadata:
 
 ## Overview
 
-Run a structured debate, conference, or deliberation between agents so they reach consensus on a goal. The skill produces a prepared debate plan — hub prompt, distinct role briefs, convergence prompt, round count, stopping rule, forcing-field deliverable, and the exact first hcom action — and presents it for human approval. No agent contact happens before approval. If approval is denied or absent, the prepared plan is the deliverable and the skill stops.
+Run a structured debate, conference, or deliberation between agents so they reach consensus on a goal. The skill produces a prepared debate plan — hub prompt, distinct role briefs, convergence prompt, round count, stopping rule, forcing-field deliverable, and the exact first coordinator action — and presents it for human approval. No agent contact happens before approval. If approval is denied or absent, the prepared plan is the deliverable and the skill stops.
 
 Core principle: produce a runnable consensus protocol, not just advice. This skill exists to prevent five baseline failures:
 
 - stopping at the parameter interview when safe defaults would compose a complete prepared plan
-- firing any hcom send, spawn, thread seed, or launch before explicit per-debate human approval
+- firing any coordinator send, spawn, or launch before explicit per-debate human approval
 - drifting into project implementation instead of staying in debate/consensus scope
 - emitting launch guidance with invalid OpenCode spawn flags or ambiguous bare model names
 - treating a one-off debate as a reusable saved team config — that contract is retired
@@ -37,7 +37,7 @@ Do not use this skill for:
 
 - producing `agents/<slug>.toml` or `agents/<slug>.md` artifacts — that contract is retired
 - loading, reusing, or running saved team configs — that behavior is retired
-- installing or troubleshooting hcom itself
+- installing or troubleshooting the coordinator itself
 - open-ended research without a convergence goal
 - building the target project — the skill runs a debate about the goal, it does not implement the goal
 
@@ -47,22 +47,21 @@ If the user asks for saved team artifacts or a saved-config loader, state that t
 
 Three rules with no exceptions. Violating any produces work that looks right but bypasses the gate.
 
-1. **Proposal-first on agent coordination.** The skill produces the complete prepared debate plan — hub prompt, role briefs for each position, convergence prompt, round count, stopping rule, forcing-field deliverable, and the exact first hcom action that would fire — and presents it to the user. No hcom send, no agent spawn, no thread seed, no launch command runs until the user explicitly approves. If approval is denied or absent, the skill returns the prepared plan and stops. The prepared plan is a valid deliverable in that case; it is not a failure state.
+1. **Proposal-first on agent coordination.** The skill produces the complete prepared debate plan — hub prompt, role briefs for each position, convergence prompt, round count, stopping rule, forcing-field deliverable, and the exact first coordinator action that would fire — and presents it to the user. No coordinator send, no agent spawn, and no launch command runs until the user explicitly approves. If approval is denied or absent, the skill returns the prepared plan and stops. The prepared plan is a valid deliverable in that case; it is not a failure state.
 
 2. **The gate is per-debate, not per-session.** Approval covers this debate only. A new debate needs new approval. Approval is not transferable to a later run, a different tension axis, or a different agent roster.
 
 3. **"No" means stop, not renegotiate.** If the user denies approval, the skill returns the prepared plan and stops. It does not loop back to re-open parameters. Renegotiation is a fresh invocation with new `$ARGUMENTS`, not a continuation of this one. The gate is a confirmation step, not a clarification loop.
 
-## Check hcom availability
+## Check coordinator availability
 
-Before entering the hcom-specific workflow, read the `hcom:` line in the
-injected `## Workspace state` block (reuse contract in `loam::using`). Do not
-probe for the binary; the briefing already answered. Only when that block is
-absent or belongs to another workspace, refresh native state through the
-injected native runtime command.
+Before entering the live coordinator workflow, read `LOAM_COORDINATOR_MODULE`
+from the injected session environment. Do not probe for another transport. Only
+when the session context is absent or belongs to another workspace, refresh
+native state through the injected native runtime command.
 
-- **If hcom is available (`hcom: ready`):** continue with the workflow below (sections 1–7 + common mistakes). This is the primary mode.
-- **If hcom is not available (`hcom: not installed`):** see [When hcom is unavailable](#when-hcom-is-unavailable) at the bottom. The interview, gate, and mechanics are identical; only the dispatch mechanism differs.
+- **If the coordinator is configured:** continue with the workflow below (sections 1–7 + common mistakes). This is the primary mode.
+- **If the coordinator is not configured:** see [When the coordinator is unavailable](#when-the-coordinator-is-unavailable) at the bottom. The interview, gate, and mechanics are identical; only the dispatch mechanism differs.
 
 ## Input
 
@@ -76,7 +75,7 @@ The consensus request is: $ARGUMENTS
 | 2 distinct positions + bias reduction | position-vs-position-with-synthesizer |
 | 3+ distinct positions or multi-stakeholder | multi-position-roundtable |
 | independent-answer aggregation with judgment | ensemble-with-judge |
-| User does not specify runtime | `hcom opencode --headless` |
+| User does not specify runtime | coordinator `spawn` with `runtime: "opencode"` |
 | User does not specify models | resolve exact OpenCode IDs with `opencode models`; narrow with `opencode models <provider>` when needed |
 | Same family appears under multiple providers | surface top exact IDs and choose one assumption |
 | User does not specify round count | 2 rounds |
@@ -119,8 +118,8 @@ Read references only when needed:
 - `references/model-selection.md` for cost/capability tradeoffs across positions
 - `references/roles-and-reviewers.md` for role-brief design and mandate-disagreement rules
 - `references/output-contract.md` immediately before composing the prepared plan
-- `references/hcom-primitives.md` for messaging, transcript, events, and launch primitives
-- `references/hcom-gotchas.md` before finalizing any launch or send guidance
+- `references/coordinator-primitives.md` for messaging, lifecycle, and launch primitives
+- `references/coordinator-gotchas.md` before finalizing any launch or send guidance
 
 ### 3. Compose the prepared debate plan
 
@@ -135,7 +134,7 @@ Produce, in one block:
 - the forcing-field deliverable spec
 - scope facts the debate must respect
 - assumptions, if defaults were chosen
-- the **exact first hcom action** that would fire if approved — a verbatim `hcom send` or spawn command, not a placeholder
+- the **exact first coordinator action** that would fire if approved — a verbatim `loam-coordinator send` or `spawn` command, not a placeholder
 
 The prepared plan is the proposal. It must be complete enough that approval is a yes/no decision, not a clarification round.
 
@@ -156,13 +155,13 @@ The gate is per-debate, not per-session. Approval is not transferable.
 
 After approval, execute the prepared plan:
 
-1. **Brief the agents** — send each role brief to its assigned agent on the workflow thread. Use `--intent request` for assignments.
+1. **Brief the agents** — use coordinator `send` with each role brief and the workflow `threadId`. Use `request` for assignments.
 2. **Collect openings** — each agent argues its opening position on-thread.
 3. **Run rounds** — default 2 rounds. Each round: agents respond to the other positions, then the hub advances or closes.
 4. **Apply the stopping rule** — when the stop condition fires, rounds end. Do not add a round without a stated reason.
 5. **Converge** — issue the convergence prompt. The hub (or the synthesizer role, if the topology includes one) produces the forcing-field deliverable.
 
-Report the convergence deliverable on-thread per loam reporting norms. Use `--intent inform` for the final outcome.
+Report the convergence deliverable on-thread per loam reporting norms. Use `inform` for the final outcome.
 
 ### 6. Output rules
 
@@ -173,9 +172,9 @@ If assumptions were chosen, include them under `## Assumptions` in the prepared 
 When the prepared plan includes a launch sequence:
 
 - initialize the workflow thread once and reuse it across the debate
-- do not pass `--thread` to `hcom opencode` spawn commands
-- use tags as stable addresses for group routing, in the real `@<tag>-` form such as `@pro-` or `@con-`
-- for OpenCode launch examples, prefer `HCOM_OPENCODE_ARGS="--model <provider/model>"` and `--headless` unless the user asked for a visible terminal
+- keep workflow `threadId` in coordinator message fields; spawn does not need a thread field
+- route by immutable coordinator actor IDs, not mutable display names
+- for OpenCode launch examples, use coordinator `spawn` with `runtime: "opencode"`, an exact `model`, and headless execution unless the user asked for a visible terminal
 - do not use bare model family names; record full provider-qualified IDs such as `openai/gpt-5.5`
 - use `--intent request` for initial assignments and handoffs that require action
 - use `--intent inform` for status updates, reports, and the final convergence deliverable
@@ -190,9 +189,9 @@ Return the answer in this order:
 
 1. short summary of the chosen debate topology and why it fits the tension axis
 2. short assumptions list if defaults were chosen
-3. the prepared debate plan (hub prompt, role briefs, convergence prompt, round count, stopping rule, forcing-field deliverable, exact first hcom action)
+3. the prepared debate plan (hub prompt, role briefs, convergence prompt, round count, stopping rule, forcing-field deliverable, exact first coordinator action)
 4. the approval gate prompt
-5. if approved: the convergence result, reported on-thread
+5. if approved: the convergence result, reported through the coordinator
 6. short risks or follow-up notes
 
 If approval was denied or absent, stop at step 3. The prepared plan is the deliverable.
@@ -204,21 +203,21 @@ If approval was denied or absent, stop at step 3. The prepared plan is the deliv
 | "I'll fire the first send and confirm as we go" | No. All sends wait on the gate. Confirmation is not retroactive. |
 | "The user said 'set up a debate,' that implies run it" | No. "Set up" is preparation. Running is a separate explicit approval. |
 | "I got approval for debate A, so debate B is pre-approved" | No. The gate is per-debate. |
-| "I'll seed the thread now and wait for approval before the first round" | No. Thread seeding is an hcom send. It waits with everything else. |
+| "I'll seed the thread now and wait for approval before the first round" | No. Thread seeding is a coordinator send. It waits with everything else. |
 | "The prepared plan is just a draft, I don't need to show the first send" | Show the exact first send. The user is approving a concrete action, not a vibe. |
 | "Clones are fine if the prompt is good" | No. Distinct models or distinct prompts. Disagreement is mandated. |
 | "No explicit stop rule, we'll know when we're done" | No. State the stop rule in the prepared plan. |
-| "I can put `--thread` on every `hcom` command, including agent spawn" | Use `--thread` on workflow messaging and wait commands, not on `hcom opencode` spawn lines. |
-| "I can invent my own intent label like `review`" | Only use the actual hcom intent values: `request`, `inform`, or `ack`. |
+| "I can put a thread on every coordinator operation, including spawn" | Use `threadId` on workflow messages; keep lifecycle correlation in structured spawn and status fields. |
+| "I can invent my own intent label like `review`" | Only use the coordinator intent values: `request`, `inform`, or `ack`. |
 | "I can write just `gpt-5.5` and the runtime will know what I mean" | Resolve and record the exact provider-qualified OpenCode model ID. |
 | "I can present provider-qualified IDs as confirmed even when I did not run discovery" | If `opencode models` was not actually run, label the IDs as assumptions or likely candidates. |
 | "If multiple providers expose the same family, I should silently pick one" | Surface the top exact IDs, then choose one explicit assumption in the prepared plan. |
 | "The user asked for saved team configs, so I should generate them" | No. The saved-config contract is retired. Compose the debate inline. |
 | "I'll emit both a prepared plan and a fresh agents/<slug>.toml just in case" | No. Do not emit `agents/<slug>` artifacts. That contract is retired. |
 
-## When hcom is unavailable
+## When the coordinator is unavailable
 
-When hcom is not installed, the skill still produces the prepared debate plan via the same interview and gate. The only difference is dispatch: compose the hub prompt, role briefs, and convergence prompt inline and dispatch via your harness's subagent mechanism (Task tool, subagent dispatch, manual handoff). The interview, gate, and mechanics are identical. No saved-config fallback exists; the saved-config contract is retired.
+When the coordinator is not configured, the skill still produces the prepared debate plan via the same interview and gate. The only difference is dispatch: compose the hub prompt, role briefs, and convergence prompt inline and dispatch via your harness's subagent mechanism (Task tool, subagent dispatch, manual handoff). The interview, gate, and mechanics are identical. No saved-config fallback exists; the saved-config contract is retired.
 
 Output a markdown prepared plan containing:
 
