@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -51,9 +52,33 @@ test('coordinator loader accepts a ready module and validates the complete inter
 
 test('coordinator loader fails closed when no module is configured', async () => {
   await assert.rejects(
-    () => loadCoordinator({ modulePath: undefined }),
+    () => loadCoordinator({ modulePath: '', baseUrl: '' }),
     (error) => error instanceof CoordinatorUnavailableError && /LOAM_COORDINATOR_MODULE/.test(error.message),
   );
+});
+
+test('coordinator loader uses the authenticated loopback service directly', async () => {
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    requests.push({ url: request.url, auth: request.headers.authorization, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify({ state: 'idle' }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    const coordinator = await loadCoordinator({ modulePath: '', baseUrl: `http://127.0.0.1:${port}`, token: 'test-token' });
+    assert.deepEqual(await coordinator.status({ actorId: 'actor-1' }), { state: 'idle' });
+    assert.deepEqual(requests, [{
+      url: '/v1/status',
+      auth: 'Bearer test-token',
+      body: { actorId: 'actor-1' },
+    }]);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test('coordinator CLI parses one JSON payload and emits the direct result', async () => {
