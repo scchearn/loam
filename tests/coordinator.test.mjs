@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { createServer } from 'node:http';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 
 import {
   CoordinatorUnavailableError,
@@ -15,6 +17,8 @@ import {
 } from '../integration/coordinator.mjs';
 
 const METHODS = ['registerIdentity', 'send', 'subscribe', 'spawn', 'status', 'cancel', 'resume'];
+const execFileAsync = promisify(execFile);
+const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 
 function fakeCoordinator(calls = []) {
   return Object.fromEntries(METHODS.map((method) => [method, async (input) => {
@@ -95,4 +99,20 @@ test('coordinator CLI parses one JSON payload and emits the direct result', asyn
   });
   assert.deepEqual(result, { method: 'send', input: { body: 'hello' } });
   assert.equal(chunks.join(''), '{"method":"send","input":{"body":"hello"}}\n');
+});
+
+test('coordinator CLI completes a direct Loam operation with hcom absent from PATH', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'loam-coordinator-cli-'));
+  const modulePath = join(dir, 'coordinator.mjs');
+  const binPath = join(packageRoot, 'bin', 'coordinator.mjs');
+  try {
+    await writeFile(modulePath, `export const coordinator = {\n${METHODS.map((method) => `  ${method}: async (input) => ({ method: "${method}", input }),`).join('\n')}\n};\n`);
+    const result = await execFileAsync(process.execPath, [binPath, 'send', '--json', '{"body":"no-hcom-proof"}'], {
+      cwd: dir,
+      env: { ...process.env, PATH: '', LOAM_COORDINATOR_MODULE: modulePath },
+    });
+    assert.deepEqual(JSON.parse(result.stdout), { method: 'send', input: { body: 'no-hcom-proof' } });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
