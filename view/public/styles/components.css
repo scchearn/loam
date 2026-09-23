@@ -463,10 +463,20 @@ a:focus-visible,
   display: grid;
   grid-auto-flow: column;
   grid-auto-columns: minmax(var(--card-row-min-col), 1fr);
+  /* Each card keeps its natural height; one long card must not stretch its
+     neighbours into tall empty columns. */
+  align-items: start;
   gap: var(--space-4);
   overflow-x: auto;
   padding-bottom: var(--space-2);
   scrollbar-width: thin;
+  /* Mouse users can grab and drag the strip (see drag-scroll.mjs). */
+  cursor: grab;
+}
+
+.card-row.is-dragging {
+  cursor: grabbing;
+  user-select: none;
 }
 
 .card-grid {
@@ -674,6 +684,13 @@ a:focus-visible,
   margin: auto 0 0;
   color: var(--ink-secondary);
   font: 400 0.82rem/1.45 var(--font-sans);
+  /* A signal can cite dozens of paths (82 malformed artifacts, etc.). Bound the
+     evidence block and scroll it inside the card rather than letting one card
+     grow to thousands of pixels and dominate the whole view. */
+  max-height: 15rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
 }
 
 /* ---------- Pulse overview box (DESIGN.md §4 tile container, §5 dot-grid panel) ---------- */

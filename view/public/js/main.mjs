@@ -9,6 +9,7 @@ import { initChronicle } from './views/chronicle.mjs';
 import { initWorkStream } from './views/workstream.mjs';
 import { initAtlas } from './views/atlas.mjs';
 import { initStewardship } from './views/stewardship.mjs';
+import { initDragScroll } from './drag-scroll.mjs';
 
 // The Inspector is a top-level overlay, not part of a view, so it wires itself
 // to the static markup once and the area views just call openInspector().
@@ -20,5 +21,9 @@ initWorkStream({});
 initChronicle({});
 initAtlas();
 initStewardship({ root: document });
+
+// Mouse drag-to-pan for horizontal card strips; delegated, so it covers strips
+// from any later render.
+initDragScroll({ root: document });
 
 boot();
