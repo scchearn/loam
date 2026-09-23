@@ -12,6 +12,16 @@ import { detectTarget } from '../setup/target.mjs';
 import { installRuntime } from '../setup/runtime.mjs';
 import { RUNTIME_VERSION, resolveRuntimeTarget } from '../setup/constants.mjs';
 import { ledgerPath, readLedger, runtimeStorePath, writeLedger } from '../integration/ledger.mjs';
+import { invokeRuntime, MAX_VIEW_STDOUT_BYTES } from '../integration/runtime.mjs';
+
+// Drive invokeRuntime against `node -e <src>` so stdout content is fully
+// controlled; runtimePath is any executable, args are its argv.
+const node = (src, opts = {}) => invokeRuntime({
+  runtimePath: process.execPath,
+  args: ['-e', src],
+  timeoutMs: 10_000,
+  ...opts,
+});
 
 const target = detectTarget();
 
@@ -437,4 +447,42 @@ test('a binary whose self-reported version differs from the target fails at smok
     /binary reports version 0\.8\.0, expected 0\.9\.1/,
   );
   assert.equal(await readLedger({ root: globalRoot }), null);
+});
+
+test('stdout under the ceiling comes back whole and untruncated', async () => {
+  const result = await node('process.stdout.write("x".repeat(500000))', { maxStdoutBytes: 1_048_576 });
+  assert.equal(result.code, 0);
+  assert.equal(result.stdoutTruncated, false);
+  assert.equal(result.stdout.length, 500000);
+});
+
+test('stdout past the ceiling is flagged truncated, not silently dropped', async () => {
+  // The `loam state --view` regression: a 1.2 MB document exceeds the 1 MiB
+  // default and must surface stdoutTruncated so the caller fails loudly.
+  const result = await node('process.stdout.write("x".repeat(1200000))', { maxStdoutBytes: 1_048_576 });
+  assert.equal(result.code, 0);
+  assert.equal(result.stdoutTruncated, true);
+  assert.equal(result.stdout.length, 1_048_576);
+});
+
+test('a large view ceiling carries a multi-megabyte snapshot intact', async () => {
+  const size = 3_000_000;
+  const result = await node(`process.stdout.write("x".repeat(${size}))`, { maxStdoutBytes: MAX_VIEW_STDOUT_BYTES });
+  assert.equal(result.stdoutTruncated, false);
+  assert.equal(result.stdout.length, size);
+});
+
+test('multi-byte UTF-8 split across stdout chunks decodes without corruption', async () => {
+  // Emit 400k three-byte characters (~1.2 MB) so many land astride the ~64 KB
+  // pipe-chunk boundaries. A per-chunk toString() would split them into U+FFFD;
+  // StringDecoder must reassemble them exactly.
+  const count = 400_000;
+  const result = await node(
+    `process.stdout.write("\\u20AC".repeat(${count}))`,
+    { maxStdoutBytes: MAX_VIEW_STDOUT_BYTES },
+  );
+  assert.equal(result.stdoutTruncated, false);
+  assert.equal(result.stdout.length, count);
+  assert.ok(!result.stdout.includes('�'), 'no replacement characters');
+  assert.equal(result.stdout, '€'.repeat(count));
 });

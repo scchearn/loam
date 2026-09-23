@@ -5,7 +5,7 @@ import { access, constants } from 'node:fs/promises';
 import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { checkReadiness, invokeRuntime, safeDetail } from '../integration/runtime.mjs';
+import { checkReadiness, invokeRuntime, safeDetail, MAX_VIEW_STDOUT_BYTES } from '../integration/runtime.mjs';
 import { resolveGlobalRoot, resolveSkillsRoot } from '../integration/paths.mjs';
 import { createServer } from './server/server.mjs';
 import { validateSnapshot } from './server/validate-snapshot.mjs';
@@ -68,6 +68,9 @@ async function captureSnapshot({ runtimePath, workspaceRoot, timeoutMs = PRODUCE
     cwd: workspaceRoot,
     timeoutMs,
     runner,
+    // The view snapshot legitimately runs to many MB on large workspaces; give
+    // it a generous ceiling so it is never silently truncated into invalid JSON.
+    maxStdoutBytes: MAX_VIEW_STDOUT_BYTES,
   });
   if (result.category === 'timeout') {
     throw Object.assign(new Error(`loam state --view timed out after ${timeoutMs}ms`), { status: 504 });
@@ -75,6 +78,14 @@ async function captureSnapshot({ runtimePath, workspaceRoot, timeoutMs = PRODUCE
   if (result.code !== 0) {
     throw Object.assign(
       new Error(safeDetail(result.stderr || result.stdout || `loam state --view exited with code ${result.code}`)),
+      { status: 500 },
+    );
+  }
+  if (result.stdoutTruncated) {
+    throw Object.assign(
+      new Error(
+        `loam state --view output exceeded ${MAX_VIEW_STDOUT_BYTES} bytes and was truncated; the workspace snapshot is too large to render.`,
+      ),
       { status: 500 },
     );
   }
