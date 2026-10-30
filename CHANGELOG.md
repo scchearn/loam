@@ -6,6 +6,25 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+## [1.0.5]
+
+Plugin 1.0.5 and runtime 1.0.4 ship together.
+
+### Added
+
+- **A machine-wide list of every loam: `loam workspaces`.** Each SessionStart
+  in a hooked harness (Claude Code, Codex, Cursor, OpenCode) records the
+  workspace in the config dir (`<configRoot>/workspaces/`, one small JSON
+  file per loam, keyed by its wiki). Registration runs after the session
+  context is printed, under a 250 ms deadline, and never changes startup
+  output. `loam workspaces list --checkpoints` shows every loam with its
+  status and newest checkpoints in one command (`--json`, `--limit N`).
+  `import` backfills from the hook ledger, `add` records a path by hand, and
+  `prune` is a dry run unless given `--yes`; it removes only entries whose
+  workspace or wiki is gone, and treats an unmounted drive as unreachable,
+  not missing. Nothing is ever written inside a workspace, and federation
+  never reads the store. `LOAM_WORKSPACES=off` disables registration. ([#217])
+
 ## [1.0.4]
 
 Plugin 1.0.4 and runtime 1.0.3 ship together.
@@ -200,6 +219,7 @@ Release entries are maintained as part of release work; see
 [#146]: https://github.com/scchearn/loam/issues/146
 [#163]: https://github.com/scchearn/loam/issues/163
 [#173]: https://github.com/scchearn/loam/issues/173
+[#217]: https://github.com/scchearn/loam/pull/217
 [#206]: https://github.com/scchearn/loam/pull/206
 [#207]: https://github.com/scchearn/loam/pull/207
 [#204]: https://github.com/scchearn/loam/issues/204

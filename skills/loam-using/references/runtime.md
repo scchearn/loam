@@ -79,6 +79,13 @@ Skill-relevant subcommands (all run through `<native-runtime-command>`):
   recently touched files; `checkpoint verify <note.md>` validates a checkpoint
   note and always exits 0.
 
+- `workspaces list [--checkpoints] [--limit <N>] [--json]` — every loam on
+  this machine (recorded at each SessionStart) with its status and newest
+  checkpoints; use it for a cross-workspace view. `workspaces add <path>`
+  records one by hand; `workspaces prune` is a dry run unless given `--yes`,
+  and only the user decides to prune. The output lists local client paths:
+  never paste it into public text. Available from runtime 1.0.4.
+
 `hooks`, `hook`, and `check versions` are adapter, setup, and release
 surfaces — not skill-callable state sources.
 
