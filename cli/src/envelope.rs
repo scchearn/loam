@@ -2650,6 +2650,9 @@ mod tests {
             "harness.rs",
             "hooks.rs",
             "ipc/unix.rs",
+            // Machine-local workspaces store under the config dir; never reads
+            // federation state.
+            "workspaces.rs",
             "markdown.rs",
             "memory.rs",
             // Reads only, and only two things: the per-project peer roster that
@@ -2751,6 +2754,31 @@ mod tests {
             assert!(
                 !production.contains("impl ExtensionView"),
                 "ExtensionView acquired behavior in {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn federation_never_reads_workspaces_store() {
+        // The machine-local workspaces store must stay invisible to federation code.
+        // Production text is cut at the test module, so these needles do not self-trip.
+        const FEDERATION_FILES: [&str; 8] = [
+            "federation.rs",
+            "envelope.rs",
+            "connector.rs",
+            "enrollment.rs",
+            "enrollment_auto.rs",
+            "transport.rs",
+            "service.rs",
+            "ipc.rs",
+        ];
+        for (path, production) in crate_production_sources() {
+            if !(FEDERATION_FILES.contains(&path.as_str()) || path.starts_with("ipc/")) {
+                continue;
+            }
+            assert!(
+                !production.contains("crate::workspaces") && !production.contains("workspaces::"),
+                "federation module {path} references the workspaces store"
             );
         }
     }

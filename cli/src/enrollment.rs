@@ -638,7 +638,7 @@ impl PhysicalWorkspace {
 /// device name or a component ending in a dot or space keep the prefix: there
 /// it is load-bearing, and dropping it would name a different file or none.
 #[cfg(windows)]
-fn dos_compatible(path: PathBuf) -> PathBuf {
+pub(crate) fn dos_compatible(path: PathBuf) -> PathBuf {
     use std::path::{Component, Prefix};
     const DOS_PATH_MAX: usize = 260;
     const RESERVED: [&str; 22] = [
@@ -687,7 +687,7 @@ fn dos_compatible(path: PathBuf) -> PathBuf {
 /// Nothing to reduce anywhere else: a canonical path is already the path every
 /// tool takes.
 #[cfg(not(windows))]
-fn dos_compatible(path: PathBuf) -> PathBuf {
+pub(crate) fn dos_compatible(path: PathBuf) -> PathBuf {
     path
 }
 

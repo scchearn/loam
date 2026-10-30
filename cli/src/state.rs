@@ -334,11 +334,11 @@ fn json_string_value(content: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_owned())
 }
 
-struct Checkpoint {
-    path: String,
-    title: Option<String>,
-    captured_at: Option<String>,
-    scope: Option<String>,
+pub(crate) struct Checkpoint {
+    pub(crate) path: String,
+    pub(crate) title: Option<String>,
+    pub(crate) captured_at: Option<String>,
+    pub(crate) scope: Option<String>,
 }
 
 fn read_checkpoints(wiki_root: &Path) -> Vec<Checkpoint> {
@@ -363,6 +363,12 @@ fn read_checkpoints(wiki_root: &Path) -> Vec<Checkpoint> {
 
 fn parse_checkpoint(path: PathBuf) -> Checkpoint {
     let content = fs::read_to_string(&path).unwrap_or_default();
+    parse_checkpoint_content(&path, &content)
+}
+
+/// `parse_checkpoint` over text the caller already read, so the caller can
+/// observe I/O errors that `parse_checkpoint` swallows.
+pub(crate) fn parse_checkpoint_content(path: &Path, content: &str) -> Checkpoint {
     let mut h1_title = None;
     let mut h3_title = None;
     let mut first_header_seen = false;
