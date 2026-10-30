@@ -363,6 +363,12 @@ pub(crate) fn read_checkpoints(wiki_root: &Path) -> Vec<Checkpoint> {
 
 pub(crate) fn parse_checkpoint(path: PathBuf) -> Checkpoint {
     let content = fs::read_to_string(&path).unwrap_or_default();
+    parse_checkpoint_content(&path, &content)
+}
+
+/// `parse_checkpoint` over text the caller already read, so the caller can
+/// observe I/O errors that `parse_checkpoint` swallows.
+pub(crate) fn parse_checkpoint_content(path: &Path, content: &str) -> Checkpoint {
     let mut h1_title = None;
     let mut h3_title = None;
     let mut first_header_seen = false;

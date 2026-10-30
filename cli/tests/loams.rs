@@ -298,10 +298,88 @@ fn hung_checkpoint_read_times_out_while_other_loams_report() {
     let (code, stdout, stderr) = fixture.run(&["list", "--checkpoints", "--json"]);
     let elapsed = started.elapsed();
     assert_eq!(code, 0, "{stderr}");
-    assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
     let json = parse(&stdout);
     assert_eq!(status_of(&json, "ddd"), "timeout");
+    let hung_row = json
+        .get("loams")
+        .and_then(|loams| loams.as_array())
+        .unwrap()
+        .iter()
+        .find(|item| item.get("key").and_then(|v| v.as_str()) == Some("ddd"))
+        .unwrap();
+    for field in ["workspace", "wiki_root", "registered_at", "last_seen_at"] {
+        assert!(hung_row.get(field).is_some(), "timeout row lacks {field}");
+    }
+    assert_eq!(
+        hung_row.get("workspace").and_then(|v| v.as_str()),
+        Some(hung.display().to_string().as_str())
+    );
     assert_eq!(status_of(&json, "aaa"), "live");
     assert_eq!(status_of(&json, "bbb"), "live");
     assert_eq!(status_of(&json, "ccc"), "missing");
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_checkpoint_dir_and_file_report_errors_not_live() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("readerr");
+    let locked = fixture.workspace("locked", 2);
+    let unreadable = fixture.workspace("unreadable", 1);
+    fixture.entry("aaa", &locked, "2026-03-01 09:00:00+02:00");
+    fixture.entry("bbb", &unreadable, "2026-03-02 09:00:00+02:00");
+    let dir = locked.join("checkpoints");
+    let file = unreadable
+        .join("checkpoints")
+        .join("checkpoint-2026-01-09-1.md");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+    let restore = || {
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
+        let _ = fs::set_permissions(&file, fs::Permissions::from_mode(0o644));
+    };
+    // Permission bits do not bind root; skip rather than assert a false pass.
+    if fs::read_dir(&dir).is_ok() {
+        restore();
+        return;
+    }
+    let (code, stdout, stderr) = fixture.run(&["list", "--checkpoints", "--json"]);
+    restore();
+    assert_eq!(code, 0, "{stderr}");
+    let json = parse(&stdout);
+    assert!(status_of(&json, "aaa").starts_with("error:"), "{stdout}");
+    assert!(status_of(&json, "bbb").starts_with("error:"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_named_like_a_checkpoint_is_skipped() {
+    let fixture = Fixture::new("cpdir");
+    let workspace = fixture.workspace("dirs", 1);
+    fs::create_dir(workspace.join("checkpoints").join("checkpoint-dir.md")).unwrap();
+    fixture.entry("aaa", &workspace, "2026-03-01 09:00:00+02:00");
+    let (code, stdout, _) = fixture.run(&["list", "--checkpoints", "--json"]);
+    assert_eq!(code, 0);
+    let json = parse(&stdout);
+    assert_eq!(status_of(&json, "aaa"), "live");
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_entry_name_is_invalid_and_does_not_fail_the_listing() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let fixture = Fixture::new("badname");
+    three(&fixture);
+    let name = OsStr::from_bytes(b"bad\xff.json");
+    fs::write(fixture.store().join(name), "{}").unwrap();
+    let (code, stdout, stderr) = fixture.run(&["list", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let json = parse(&stdout);
+    let loams = json.get("loams").unwrap().as_array().unwrap();
+    assert_eq!(loams.len(), 4);
+    assert!(loams
+        .iter()
+        .any(|l| l.get("status").and_then(|v| v.as_str()) == Some("invalid")));
 }

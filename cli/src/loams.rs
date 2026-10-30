@@ -453,16 +453,42 @@ struct Report {
     checkpoints: Vec<Checkpoint>,
 }
 
+/// Worker messages. `Parsed` goes out as soon as the entry parses so a
+/// worker that later hangs still leaves its workspace for the timeout row.
+enum Message {
+    Parsed(String, Entry),
+    Done(Report),
+}
+
 /// A row after collection; `status: None` means the worker never answered.
 struct Row {
     key: String,
     status: Option<Status>,
+    /// Overrides the status text: `error: <detail>` for failures that are not
+    /// an `io::ErrorKind` (a thread that could not be spawned, an unreadable
+    /// directory item).
+    error: Option<String>,
     entry: Option<Entry>,
     checkpoints: Vec<Checkpoint>,
 }
 
-fn status_text(status: Option<&Status>) -> String {
-    match status {
+impl Row {
+    fn bare(key: String, status: Option<Status>) -> Row {
+        Row {
+            key,
+            status,
+            error: None,
+            entry: None,
+            checkpoints: Vec::new(),
+        }
+    }
+}
+
+fn status_text(row: &Row) -> String {
+    if let Some(detail) = &row.error {
+        return format!("error: {detail}");
+    }
+    match row.status.as_ref() {
         Some(Status::Live) => "live".to_owned(),
         Some(Status::Missing) => "missing".to_owned(),
         Some(Status::Unreachable) => "unreachable".to_owned(),
@@ -473,7 +499,9 @@ fn status_text(status: Option<&Status>) -> String {
 }
 
 /// `captured_at` as written by checkpoints: `YYYY-MM-DD HH:MM ±HH:MM` is the
-/// norm; seconds, RFC 3339 and offset-less stamps (read as UTC) are tolerated.
+/// norm. Seconds, RFC 3339 and the compact `±HHMM` offset are tolerated.
+/// A stamp with no offset is not guessed at (it would silently be read as the
+/// wrong instant); it counts as unparseable.
 fn parse_captured(text: &str) -> Option<DateTime<FixedOffset>> {
     let text = text.trim();
     for format in [
@@ -481,25 +509,16 @@ fn parse_captured(text: &str) -> Option<DateTime<FixedOffset>> {
         "%Y-%m-%d %H:%M:%S %:z",
         "%Y-%m-%d %H:%M:%S%:z",
         "%Y-%m-%d %H:%M%:z",
+        "%Y-%m-%d %H:%M %z",
+        "%Y-%m-%d %H:%M:%S %z",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M%z",
     ] {
         if let Ok(parsed) = DateTime::parse_from_str(text, format) {
             return Some(parsed);
         }
     }
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(text) {
-        return Some(parsed);
-    }
-    let utc = FixedOffset::east_opt(0)?;
-    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
-        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(text, format) {
-            return naive.and_local_timezone(utc).single();
-        }
-    }
-    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
-        .ok()?
-        .and_hms_opt(0, 0, 0)?
-        .and_local_timezone(utc)
-        .single()
+    DateTime::parse_from_rfc3339(text).ok()
 }
 
 fn checkpoint_time(checkpoint: &Checkpoint) -> Option<DateTime<FixedOffset>> {
@@ -516,36 +535,53 @@ fn sort_checkpoints(checkpoints: &mut [Checkpoint]) {
     });
 }
 
-/// Checkpoint files by name only. Unlike `state::read_checkpoints` this does
-/// not stat the file type, so an entry that cannot be read still reaches
-/// `parse_checkpoint` and is caught by the deadline.
-fn checkpoint_files(wiki_root: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(wiki_root.join("checkpoints")) else {
-        return Vec::new();
+/// Read every checkpoint file, reporting the first I/O error. Unlike
+/// `state::read_checkpoints` this does not stat each file's type (`is_file`
+/// would skip a FIFO, hiding exactly the stalled read the deadline exists
+/// for); it only skips directories that happen to be named like checkpoints.
+fn read_checkpoints(wiki_root: &Path) -> Result<Vec<Checkpoint>, ErrorKind> {
+    let entries = match fs::read_dir(wiki_root.join("checkpoints")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.kind()),
     };
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("checkpoint-") && name.ends_with(".md"))
-        })
-        .collect()
+    let mut checkpoints = Vec::new();
+    for item in entries {
+        let item = item.map_err(|error| error.kind())?;
+        let path = item.path();
+        let named = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("checkpoint-") && name.ends_with(".md"));
+        if !named || item.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let content = fs::read_to_string(&path).map_err(|error| error.kind())?;
+        checkpoints.push(crate::state::parse_checkpoint_content(&path, &content));
+    }
+    Ok(checkpoints)
 }
 
-fn inspect(path: &Path, key: String, with_checkpoints: bool) -> Report {
-    let status = classify(path, &Stat::default());
-    let entry = fs::read_to_string(path)
+fn inspect(
+    path: &Path,
+    key: String,
+    with_checkpoints: bool,
+    sender: &mpsc::Sender<Message>,
+) -> Report {
+    let entry = read_entry(path)
         .ok()
         .and_then(|text| Entry::parse(&text).ok());
+    if let Some(entry) = &entry {
+        let _ = sender.send(Message::Parsed(key.clone(), entry.clone()));
+    }
+    let mut status = classify(path, &Stat::default());
     let mut checkpoints = Vec::new();
     if with_checkpoints && status == Status::Live {
         if let Some(entry) = &entry {
-            checkpoints = checkpoint_files(Path::new(&entry.wiki_root))
-                .into_iter()
-                .map(crate::state::parse_checkpoint)
-                .collect();
+            match read_checkpoints(Path::new(&entry.wiki_root)) {
+                Ok(found) => checkpoints = found,
+                Err(kind) => status = Status::Error(kind),
+            }
         }
     }
     Report {
@@ -556,59 +592,113 @@ fn inspect(path: &Path, key: String, with_checkpoints: bool) -> Report {
     }
 }
 
-fn entry_files(dir: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
+/// One store file to inspect.
+struct Listed {
+    key: String,
+    path: PathBuf,
+    /// The file name is not UTF-8: reported `invalid`, never skipped.
+    bad_name: bool,
+}
+
+/// The store listing: entry files plus rows for directory items that could
+/// not be listed at all. One bad item never fails the whole listing.
+struct Listing {
+    files: Vec<Listed>,
+    failed: Vec<Row>,
+}
+
+fn entry_files(dir: &Path) -> std::io::Result<Listing> {
     let mut files = Vec::new();
+    let mut failed = Vec::new();
     for item in fs::read_dir(dir)? {
-        let path = item?.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        let item = match item {
+            Ok(item) => item,
+            Err(error) => {
+                let mut row = Row::bare("?".to_owned(), None);
+                row.error = Some(error.kind().to_string());
+                failed.push(row);
+                continue;
+            }
+        };
+        let path = item.path();
+        let Some(raw) = path.file_name() else {
             continue;
+        };
+        let (name, bad_name) = match raw.to_str() {
+            Some(name) => (name.to_owned(), false),
+            None => (raw.to_string_lossy().into_owned(), true),
         };
         if name.contains(".tmp-") {
             continue;
         }
         if let Some(key) = name.strip_suffix(".json") {
-            files.push((key.to_owned(), path.clone()));
+            files.push(Listed {
+                key: key.to_owned(),
+                path: path.clone(),
+                bad_name,
+            });
         }
     }
-    files.sort();
-    Ok(files)
+    files.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(Listing { files, failed })
 }
 
 /// Spawn one detached worker per entry and collect under a single deadline.
 /// Workers are never joined: a hung read must not hang the command.
-fn collect_rows(files: Vec<(String, PathBuf)>, with_checkpoints: bool) -> Vec<Row> {
+fn collect_rows(listing: Listing, with_checkpoints: bool) -> Vec<Row> {
     let (sender, receiver) = mpsc::channel();
-    let total = files.len();
-    let keys: Vec<String> = files.iter().map(|(key, _)| key.clone()).collect();
+    let mut rows = listing.failed;
+    let mut pending: Vec<String> = Vec::new();
     let deadline = Instant::now() + FANOUT_DEADLINE;
-    for (key, path) in files {
-        let sender = sender.clone();
-        std::thread::spawn(move || {
-            let _ = sender.send(inspect(&path, key, with_checkpoints));
+    for listed in listing.files {
+        if listed.bad_name {
+            rows.push(Row::bare(listed.key, Some(Status::Invalid)));
+            continue;
+        }
+        let worker_sender = sender.clone();
+        let Listed { key, path, .. } = listed;
+        let worker_key = key.clone();
+        let spawned = std::thread::Builder::new().spawn(move || {
+            let report = inspect(&path, worker_key, with_checkpoints, &worker_sender);
+            let _ = worker_sender.send(Message::Done(report));
         });
+        match spawned {
+            Ok(_) => pending.push(key),
+            Err(_) => {
+                let mut row = Row::bare(key, None);
+                row.error = Some("spawn".to_owned());
+                rows.push(row);
+            }
+        }
     }
     drop(sender);
-    let mut rows = Vec::new();
-    while rows.len() < total {
+    let mut parsed: Vec<(String, Entry)> = Vec::new();
+    let mut done = 0;
+    while done < pending.len() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match receiver.recv_timeout(remaining) {
-            Ok(report) => rows.push(Row {
-                key: report.key,
-                status: report.status,
-                entry: report.entry,
-                checkpoints: report.checkpoints,
-            }),
+            Ok(Message::Parsed(key, entry)) => parsed.push((key, entry)),
+            Ok(Message::Done(report)) => {
+                done += 1;
+                rows.push(Row {
+                    key: report.key,
+                    status: report.status,
+                    error: None,
+                    entry: report.entry,
+                    checkpoints: report.checkpoints,
+                });
+            }
             Err(_) => break,
         }
     }
-    for key in keys {
+    for key in pending {
         if !rows.iter().any(|row| row.key == key) {
-            rows.push(Row {
-                key,
-                status: None,
-                entry: None,
-                checkpoints: Vec::new(),
-            });
+            let mut row = Row::bare(key.clone(), None);
+            row.entry = parsed
+                .iter()
+                .find(|(parsed_key, _)| *parsed_key == key)
+                .map(|(_, entry)| entry.clone());
+            rows.push(row);
         }
     }
     rows
@@ -638,7 +728,10 @@ fn list(args: impl Iterator<Item = String>) -> i32 {
     };
     let files = match entry_files(&dir) {
         Ok(files) => files,
-        Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(error) if error.kind() == ErrorKind::NotFound => Listing {
+            files: Vec::new(),
+            failed: Vec::new(),
+        },
         Err(error) => {
             eprintln!("loam loams: cannot read {}: {error}", dir.display());
             return 1;
@@ -679,7 +772,7 @@ fn render_json(rows: &[Row], with_checkpoints: bool) -> String {
         .map(|row| {
             let mut fields = vec![
                 ("key".to_owned(), text(&row.key)),
-                ("status".to_owned(), text(&status_text(row.status.as_ref()))),
+                ("status".to_owned(), text(&status_text(row))),
             ];
             if let Some(entry) = &row.entry {
                 fields.push(("workspace".to_owned(), text(&entry.workspace)));
@@ -718,7 +811,7 @@ fn render_json(rows: &[Row], with_checkpoints: bool) -> String {
 fn render_table(rows: &[Row], with_checkpoints: bool) -> String {
     let mut out = String::new();
     for row in rows {
-        let status = status_text(row.status.as_ref());
+        let status = status_text(row);
         match &row.entry {
             Some(entry) => out.push_str(&format!(
                 "{status:<12} {}  (last seen {})\n",
@@ -1322,5 +1415,43 @@ mod tests {
         assert_eq!(classify(&path, &Stat::default()), Status::Invalid);
         fs::write(&path, "{\"schema\":1,\"workspace\":\"/x\"}").unwrap();
         assert_eq!(classify(&path, &Stat::default()), Status::Invalid);
+    }
+
+    fn cp(path: &str, captured: Option<&str>) -> Checkpoint {
+        Checkpoint {
+            path: path.to_owned(),
+            title: None,
+            captured_at: captured.map(str::to_owned),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn parse_captured_accepts_offsets_and_rejects_offsetless_and_garbage() {
+        let colon = parse_captured("2026-02-01 10:00 +02:00").unwrap();
+        let compact = parse_captured("2026-02-01 10:00 +0200").unwrap();
+        assert_eq!(colon, compact);
+        assert_eq!(colon.offset().local_minus_utc(), 7200);
+        assert!(parse_captured("2026-02-01 10:00").is_none());
+        assert!(parse_captured("2026-02-01 10:00:00").is_none());
+        assert!(parse_captured("2026-02-01").is_none());
+        assert!(parse_captured("garbage").is_none());
+    }
+
+    #[test]
+    fn sort_checkpoints_puts_unparseable_after_parsed_by_filename_descending() {
+        let mut items = vec![
+            cp("a-offsetless", Some("2026-03-01 10:00")),
+            cp("b-old", Some("2026-01-01 10:00 +02:00")),
+            cp("c-garbage", Some("garbage")),
+            cp("d-new", Some("2026-02-01 10:00 +0200")),
+            cp("e-none", None),
+        ];
+        sort_checkpoints(&mut items);
+        let order: Vec<_> = items.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(
+            order,
+            ["d-new", "b-old", "e-none", "c-garbage", "a-offsetless"]
+        );
     }
 }
