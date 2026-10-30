@@ -152,7 +152,7 @@ pub(crate) fn gate(workspace: &Path, temp_root: &Path) -> Result<Gated, Skip> {
 pub(crate) fn key(canonical: &Path) -> String {
     let text = canonical.to_string_lossy();
     #[cfg(windows)]
-    let text = std::borrow::Cow::Owned(text.to_ascii_lowercase());
+    let text: std::borrow::Cow<str> = std::borrow::Cow::Owned(text.to_ascii_lowercase());
     let mut hasher = Sha256::default();
     hasher.update(text.as_bytes());
     hasher.finish()
