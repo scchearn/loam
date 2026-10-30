@@ -3,7 +3,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 struct Fixture {
     root: PathBuf,
@@ -370,7 +372,8 @@ fn directory_named_like_a_checkpoint_is_skipped() {
     assert_eq!(status_of(&json, "aaa"), "live");
 }
 
-#[cfg(unix)]
+// APFS (macOS) refuses non-UTF-8 file names, so these run where they can exist.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn non_utf8_entry_name_is_invalid_and_does_not_fail_the_listing() {
     use std::ffi::OsStr;
@@ -741,13 +744,15 @@ fn a_non_utf8_workspace_row_is_skipped_not_fatal() {
     assert!(stdout.contains("1 recorded"), "{stdout}");
 }
 
-#[cfg(unix)]
+// APFS (macOS) refuses non-UTF-8 file names, so these run where they can exist.
+#[cfg(all(unix, not(target_os = "macos")))]
 fn bad_name() -> std::ffi::OsString {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::OsStr::from_bytes(b"bad\xff.json").to_owned()
 }
 
-#[cfg(unix)]
+// APFS (macOS) refuses non-UTF-8 file names, so these run where they can exist.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn prune_removes_a_symlink_but_never_what_it_points_at_inside_the_store() {
     let fixture = Fixture::new("prunelink");
@@ -761,7 +766,8 @@ fn prune_removes_a_symlink_but_never_what_it_points_at_inside_the_store() {
     assert!(fixture.store().join("live.json").is_file());
 }
 
-#[cfg(unix)]
+// APFS (macOS) refuses non-UTF-8 file names, so these run where they can exist.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn prune_removes_a_symlink_but_never_what_it_points_at_outside_the_store() {
     let fixture = Fixture::new("prunelinkout");
