@@ -1871,6 +1871,30 @@ fn writable_store(root: &Path) -> Result<Connection, String> {
     Ok(connection)
 }
 
+/// Distinct `workspace` values recorded in the hook ledger at `database`,
+/// opened read-only. `Ok(None)` when no ledger file exists. Never writes.
+pub(crate) fn ledger_workspaces(database: &Path) -> Result<Option<Vec<String>>, String> {
+    if !database.is_file() {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    connection
+        .busy_timeout(BUSY_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare("SELECT DISTINCT workspace FROM hook_run WHERE workspace IS NOT NULL ORDER BY workspace")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let mut workspaces = Vec::new();
+    for row in rows {
+        workspaces.push(row.map_err(|error| error.to_string())?);
+    }
+    Ok(Some(workspaces))
+}
+
 fn list(args: ListArgs) -> Result<(), String> {
     let database = args.root.join(DATABASE_NAME);
     if !database.is_file() {

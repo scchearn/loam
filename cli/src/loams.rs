@@ -1,9 +1,6 @@
 //! Machine-local loams store: one small JSON entry per loam workspace under
 //! `<configRoot>/loams/`. Nothing here ever writes under a workspace, and
 //! nothing here reads federation state.
-// `add`, `import` and `prune` (T4) will use the remaining helpers.
-#![allow(dead_code)]
-
 use crate::json::{self, Value};
 use crate::sha256::Sha256;
 use chrono::{DateTime, FixedOffset};
@@ -411,10 +408,9 @@ fn usage() {
 pub(crate) fn run(mut args: impl Iterator<Item = String>) -> i32 {
     match args.next().as_deref() {
         Some("list") => list(args),
-        Some("add" | "import" | "prune") => {
-            eprintln!("loam loams: this subcommand is not yet implemented");
-            1
-        }
+        Some("add") => add(args),
+        Some("import") => import(args),
+        Some("prune") => prune(args),
         _ => {
             usage();
             1
@@ -484,18 +480,23 @@ impl Row {
     }
 }
 
+fn status_label(status: &Status) -> String {
+    match status {
+        Status::Live => "live".to_owned(),
+        Status::Missing => "missing".to_owned(),
+        Status::Unreachable => "unreachable".to_owned(),
+        Status::Error(kind) => format!("error: {kind}"),
+        Status::Invalid => "invalid".to_owned(),
+    }
+}
+
 fn status_text(row: &Row) -> String {
     if let Some(detail) = &row.error {
         return format!("error: {detail}");
     }
-    match row.status.as_ref() {
-        Some(Status::Live) => "live".to_owned(),
-        Some(Status::Missing) => "missing".to_owned(),
-        Some(Status::Unreachable) => "unreachable".to_owned(),
-        Some(Status::Error(kind)) => format!("error: {kind}"),
-        Some(Status::Invalid) => "invalid".to_owned(),
-        None => "timeout".to_owned(),
-    }
+    row.status
+        .as_ref()
+        .map_or_else(|| "timeout".to_owned(), status_label)
 }
 
 /// `captured_at` as written by checkpoints: `YYYY-MM-DD HH:MM ±HH:MM` is the
@@ -702,6 +703,208 @@ fn collect_rows(listing: Listing, with_checkpoints: bool) -> Vec<Row> {
         }
     }
     rows
+}
+
+fn skip_text(skip: &Skip) -> &'static str {
+    match skip {
+        Skip::Disabled => "disabled",
+        Skip::Temp => "temp",
+        Skip::NotLoam => "not_loam",
+        Skip::ConfigRootUnresolved => "config_root_unresolved",
+        Skip::ConfigRootRelative => "config_root_relative",
+        Skip::StoreInsideWorkspace => "store_inside_workspace",
+    }
+}
+
+/// `register` with the real clock and temp root.
+fn register_now(workspace: &Path) -> Result<Outcome, String> {
+    register(
+        workspace,
+        chrono::Local::now().fixed_offset(),
+        &std::env::temp_dir(),
+    )
+}
+
+fn add(mut args: impl Iterator<Item = String>) -> i32 {
+    let (Some(path), None) = (args.next(), args.next()) else {
+        usage();
+        return 1;
+    };
+    match register_now(Path::new(&path)) {
+        Ok(Outcome::Created) => println!("created: {path}"),
+        Ok(Outcome::Rewritten) => println!("rewritten: {path}"),
+        Ok(Outcome::Unchanged) => println!("unchanged: {path}"),
+        Ok(Outcome::Skipped(skip)) => {
+            eprintln!("loam loams: skipped: {}", skip_text(&skip));
+            return 1;
+        }
+        Err(reason) => {
+            eprintln!("loam loams: {reason}");
+            return 1;
+        }
+    }
+    0
+}
+
+fn import(mut args: impl Iterator<Item = String>) -> i32 {
+    let mut ledger = None;
+    while let Some(arg) = args.next() {
+        match (arg.as_str(), args.next()) {
+            ("--ledger", Some(path)) => ledger = Some(PathBuf::from(path)),
+            _ => {
+                usage();
+                return 1;
+            }
+        }
+    }
+    let ledger = ledger.unwrap_or_else(|| {
+        crate::harness::HookPaths::from_env()
+            .global_root
+            .join("loam.sqlite3")
+    });
+    let workspaces = match crate::hooks::ledger_workspaces(&ledger) {
+        Ok(Some(workspaces)) => workspaces,
+        Ok(None) => {
+            println!("no hook ledger");
+            return 0;
+        }
+        Err(reason) => {
+            eprintln!("loam loams: cannot read {}: {reason}", ledger.display());
+            return 1;
+        }
+    };
+    let (mut recorded, mut unchanged, mut skipped) = (0, 0, 0);
+    for workspace in &workspaces {
+        match register_now(Path::new(workspace)) {
+            Ok(Outcome::Created | Outcome::Rewritten) => {
+                recorded += 1;
+                println!("recorded: {workspace}");
+            }
+            Ok(Outcome::Unchanged) => {
+                unchanged += 1;
+                println!("unchanged: {workspace}");
+            }
+            Ok(Outcome::Skipped(skip)) => {
+                skipped += 1;
+                println!("skipped: {}: {workspace}", skip_text(&skip));
+            }
+            Err(reason) => {
+                skipped += 1;
+                println!("skipped: {reason}: {workspace}");
+            }
+        }
+    }
+    println!("{recorded} recorded, {unchanged} unchanged, {skipped} skipped");
+    0
+}
+
+/// A temp file this old is an abandoned write, not one in flight.
+const STALE_TEMP: Duration = Duration::from_secs(3600);
+
+/// Delete `target` only if it canonically sits directly inside `store`.
+fn remove_inside(store: &Path, target: &Path) -> Result<(), String> {
+    let canonical = fs::canonicalize(target).map_err(|error| error.to_string())?;
+    if canonical.parent() != Some(store) {
+        return Err("refused: outside the store".to_owned());
+    }
+    fs::remove_file(&canonical).map_err(|error| error.to_string())
+}
+
+fn prune(args: impl Iterator<Item = String>) -> i32 {
+    let mut yes = false;
+    for arg in args {
+        if arg == "--yes" {
+            yes = true;
+        } else {
+            usage();
+            return 1;
+        }
+    }
+    let dir = match store_dir() {
+        Ok(dir) => dir,
+        Err(reason) => {
+            eprintln!("loam loams: {reason}");
+            return 1;
+        }
+    };
+    let listing = match entry_files(&dir) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == ErrorKind::NotFound => return 0,
+        Err(error) => {
+            eprintln!("loam loams: cannot read {}: {error}", dir.display());
+            return 1;
+        }
+    };
+    let mut remove: Vec<(PathBuf, &'static str)> = Vec::new();
+    let mut keep: Vec<(String, String)> = Vec::new();
+    for listed in listing.files {
+        let status = if listed.bad_name {
+            Status::Invalid
+        } else {
+            classify(&listed.path, &Stat::default())
+        };
+        match status {
+            Status::Missing => remove.push((listed.path, "missing")),
+            Status::Invalid => remove.push((listed.path, "invalid")),
+            other => keep.push((listed.key, status_label(&other))),
+        }
+    }
+    for row in listing.failed {
+        keep.push((row.key.clone(), status_text(&row)));
+    }
+    if let Ok(items) = fs::read_dir(&dir) {
+        for item in items.filter_map(Result::ok) {
+            let path = item.path();
+            let stale = path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(".tmp-"))
+                && item
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > STALE_TEMP);
+            if stale {
+                remove.push((path, "stale temp"));
+            }
+        }
+    }
+    remove.sort();
+    let name_of = |path: &Path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    if !yes {
+        println!("would remove ({}):", remove.len());
+        for (path, why) in &remove {
+            println!("  {}  [{why}]", name_of(path));
+        }
+        println!("keep ({}):", keep.len());
+        for (key, status) in &keep {
+            println!("  {key}.json  [{status}]");
+        }
+        println!("dry run: pass --yes to delete");
+        return 0;
+    }
+    let store = match fs::canonicalize(&dir) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("loam loams: cannot read {}: {error}", dir.display());
+            return 1;
+        }
+    };
+    let mut failed = false;
+    for (path, why) in &remove {
+        match remove_inside(&store, path) {
+            Ok(()) => println!("removed: {}  [{why}]", name_of(path)),
+            Err(reason) => {
+                failed = true;
+                eprintln!("loam loams: could not remove {}: {reason}", name_of(path));
+            }
+        }
+    }
+    i32::from(failed)
 }
 
 fn newest(row: &Row) -> Option<DateTime<FixedOffset>> {

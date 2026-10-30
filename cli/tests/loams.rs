@@ -22,6 +22,10 @@ impl Fixture {
         self.root.join("config")
     }
 
+    fn home(&self) -> PathBuf {
+        self.root.join("home")
+    }
+
     fn store(&self) -> PathBuf {
         self.config().join("loams")
     }
@@ -64,6 +68,7 @@ impl Fixture {
             .arg("loams")
             .args(args)
             .env("LOAM_CONFIG_DIR", self.config())
+            .env("LOAM_HOME", self.home())
             .output()
             .expect("loam should run");
         (
@@ -382,4 +387,231 @@ fn non_utf8_entry_name_is_invalid_and_does_not_fail_the_listing() {
     assert!(loams
         .iter()
         .any(|l| l.get("status").and_then(|v| v.as_str()) == Some("invalid")));
+}
+
+// ---------------------------------------------------------------------------
+// add / import / prune
+// ---------------------------------------------------------------------------
+
+/// Every file under `roots` with its bytes, for before/after comparison.
+fn snapshot(roots: &[&Path]) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        for item in fs::read_dir(dir).unwrap() {
+            let path = item.unwrap().path();
+            if path.is_dir() {
+                out.push((path.clone(), Vec::new()));
+                walk(&path, out);
+            } else {
+                out.push((path.clone(), fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for root in roots {
+        walk(root, &mut out);
+    }
+    out.sort();
+    out
+}
+
+fn store_names(fixture: &Fixture) -> Vec<String> {
+    let mut names: Vec<String> = match fs::read_dir(fixture.store()) {
+        Ok(items) => items
+            .map(|item| item.unwrap().file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    names
+}
+
+#[test]
+fn add_records_a_loam_then_reports_unchanged() {
+    let fixture = Fixture::new("add");
+    let workspace = fixture.workspace("one", 1);
+    let before = snapshot(&[&workspace]);
+
+    let (code, stdout, stderr) = fixture.run(&["add", workspace.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("created"), "{stdout}");
+    assert_eq!(store_names(&fixture).len(), 1);
+
+    let (code, stdout, _) = fixture.run(&["add", workspace.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("unchanged"), "{stdout}");
+    assert_eq!(snapshot(&[&workspace]), before);
+}
+
+#[test]
+fn add_on_a_non_loam_exits_one_naming_the_skip() {
+    let fixture = Fixture::new("addno");
+    let plain = fixture.root.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let before = snapshot(&[&plain]);
+    let (code, _, stderr) = fixture.run(&["add", plain.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("not_loam"), "{stderr}");
+    assert!(!fixture.store().exists());
+    assert_eq!(snapshot(&[&plain]), before);
+
+    let (code, _, stderr) = fixture.run(&["add"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Usage"), "{stderr}");
+}
+
+/// Build a real hook ledger by driving `loam hooks begin` per workspace.
+fn ledger_with(fixture: &Fixture, workspaces: &[&Path]) -> PathBuf {
+    let home = fixture.home();
+    for workspace in workspaces {
+        let output = Command::new(env!("CARGO_BIN_EXE_loam"))
+            .args(["hooks", "begin", home.to_str().unwrap()])
+            .args(["--harness", "claude", "--hook", "session-start"])
+            .args(["--workspace", workspace.to_str().unwrap()])
+            .args(["--plugin-version", "1.0.0"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    home.join("loam.sqlite3")
+}
+
+#[test]
+fn import_records_only_loams_and_is_idempotent() {
+    let fixture = Fixture::new("import");
+    let loam_ws = fixture.workspace("real", 2);
+    let plain = fixture.root.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let gone = fixture.root.join("gone");
+    let temp_ws = std::env::temp_dir().join(format!(
+        "loam-loams-import-{}",
+        fixture.root.file_name().unwrap().to_string_lossy()
+    ));
+    fs::create_dir_all(&temp_ws).unwrap();
+    fs::write(temp_ws.join("index.md"), "# index\n").unwrap();
+    let ledger = ledger_with(&fixture, &[&loam_ws, &plain, &gone, &temp_ws]);
+    let ledger_before = fs::read(&ledger).unwrap();
+    let trees_before = snapshot(&[&loam_ws, &plain]);
+
+    let (code, stdout, stderr) = fixture.run(&["import", "--ledger", ledger.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("recorded: "), "{stdout}");
+    assert!(stdout.contains("skipped: temp"), "{stdout}");
+    assert!(
+        stdout.contains("1 recorded, 0 unchanged, 3 skipped"),
+        "{stdout}"
+    );
+    assert_eq!(store_names(&fixture).len(), 1, "{stdout}");
+    let entry = fs::read_to_string(fixture.store().join(&store_names(&fixture)[0])).unwrap();
+    assert!(entry.contains(&loam_ws.display().to_string()), "{entry}");
+
+    let (code, stdout, _) = fixture.run(&["import", "--ledger", ledger.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let _ = fs::remove_dir_all(&temp_ws);
+    assert!(!stdout.contains("recorded: "), "{stdout}");
+    assert!(stdout.contains("unchanged: "), "{stdout}");
+    assert!(
+        stdout.contains("0 recorded, 1 unchanged, 3 skipped"),
+        "{stdout}"
+    );
+    assert_eq!(store_names(&fixture).len(), 1);
+
+    assert_eq!(fs::read(&ledger).unwrap(), ledger_before);
+    assert_eq!(snapshot(&[&loam_ws, &plain]), trees_before);
+}
+
+#[test]
+fn import_defaults_to_the_global_root_ledger_and_tolerates_none() {
+    let fixture = Fixture::new("importdef");
+    let (code, stdout, _) = fixture.run(&["import"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("no hook ledger"), "{stdout}");
+    assert!(!fixture.store().exists());
+
+    let workspace = fixture.workspace("real", 0);
+    ledger_with(&fixture, &[&workspace]);
+    let (code, stdout, stderr) = fixture.run(&["import"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("recorded"), "{stdout}");
+    assert_eq!(store_names(&fixture).len(), 1);
+}
+
+/// Live, missing and invalid entries plus a stale and a fresh temp file.
+fn prune_fixture(fixture: &Fixture) -> (PathBuf, PathBuf) {
+    let live = fixture.workspace("live", 1);
+    fixture.entry("live", &live, "2026-03-01 09:00:00+02:00");
+    fixture.entry(
+        "gone",
+        &fixture.root.join("gone"),
+        "2026-03-02 09:00:00+02:00",
+    );
+    fs::write(fixture.store().join("broken.json"), "{not json").unwrap();
+    let stale = fixture.store().join("live.json.tmp-1-old");
+    let fresh = fixture.store().join("live.json.tmp-2-new");
+    fs::write(&stale, "{").unwrap();
+    fs::write(&fresh, "{").unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+    fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    (stale, fresh)
+}
+
+#[test]
+fn prune_without_yes_lists_and_deletes_nothing() {
+    let fixture = Fixture::new("prunedry");
+    let (_, _) = prune_fixture(&fixture);
+    let live = fixture.root.join("live");
+    let store_before = snapshot(&[&fixture.store()]);
+    let tree_before = snapshot(&[&live]);
+
+    let (code, stdout, stderr) = fixture.run(&["prune"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("would remove"), "{stdout}");
+    assert!(stdout.contains("gone.json"), "{stdout}");
+    assert!(stdout.contains("broken.json"), "{stdout}");
+    assert!(stdout.contains("keep"), "{stdout}");
+    assert_eq!(snapshot(&[&fixture.store()]), store_before);
+    assert_eq!(snapshot(&[&live]), tree_before);
+}
+
+#[test]
+fn prune_yes_removes_missing_invalid_and_stale_temp_only() {
+    let fixture = Fixture::new("pruneyes");
+    let (stale, fresh) = prune_fixture(&fixture);
+    let live = fixture.root.join("live");
+    // An unreachable entry (workspace on another volume) must survive.
+    let other = fixture.root.join("gone-elsewhere");
+    fixture.entry("elsewhere", &other, "2026-03-03 09:00:00+02:00");
+    let path = fixture.store().join("elsewhere.json");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace(&volume_of(&fixture.root), "other-volume");
+    fs::write(&path, text).unwrap();
+    let tree_before = snapshot(&[&live]);
+
+    let (code, stdout, stderr) = fixture.run(&["prune", "--yes"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("removed"), "{stdout}");
+    assert_eq!(
+        store_names(&fixture),
+        ["elsewhere.json", "live.json", "live.json.tmp-2-new"]
+    );
+    assert!(fresh.exists() && !stale.exists());
+    assert_eq!(snapshot(&[&live]), tree_before);
+}
+
+#[test]
+fn prune_on_an_absent_store_is_a_quiet_success() {
+    let fixture = Fixture::new("pruneabsent");
+    let (code, _, _) = fixture.run(&["prune", "--yes"]);
+    assert_eq!(code, 0);
+    assert!(!fixture.store().exists());
 }
