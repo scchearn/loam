@@ -1482,6 +1482,11 @@ const REGISTRY_DEADLINE: Duration = Duration::from_millis(250);
 /// out worker thread is abandoned: process exit ends it, though a thread stuck
 /// in uninterruptible I/O can delay exit, which is accepted.
 fn register_workspace(workspace: &Path) -> Option<String> {
+    // Cheap pre-check so a disabled store costs no thread; `loams::gate`
+    // re-checks inside the worker for the other callers.
+    if std::env::var("LOAM_REGISTRY").as_deref() == Ok("off") {
+        return None;
+    }
     let (sender, receiver) = std::sync::mpsc::channel();
     let target = workspace.to_path_buf();
     std::thread::spawn(move || {
@@ -1495,7 +1500,11 @@ fn register_workspace(workspace: &Path) -> Option<String> {
     match receiver.recv_timeout(REGISTRY_DEADLINE) {
         Ok(Ok(_)) => None,
         Ok(Err(reason)) => Some(format!("registry: {reason}")),
-        Err(_) => Some("registry: timeout".to_string()),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some("registry: timeout".to_string()),
+        // The sender dropped without sending: the worker panicked.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Some("registry: panicked".to_string())
+        }
     }
 }
 
