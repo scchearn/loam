@@ -520,7 +520,9 @@ fn import_records_only_loams_and_is_idempotent() {
     );
     assert_eq!(store_names(&fixture).len(), 1, "{stdout}");
     let entry = fs::read_to_string(fixture.store().join(&store_names(&fixture)[0])).unwrap();
-    assert!(entry.contains(&loam_ws.display().to_string()), "{entry}");
+    // The entry is JSON, so Windows backslashes appear escaped.
+    let expected = loam_ws.display().to_string().replace('\\', "\\\\");
+    assert!(entry.contains(&expected), "{entry}");
 
     let (code, stdout, _) = fixture.run(&["import", "--ledger", ledger.to_str().unwrap()]);
     assert_eq!(code, 0);
@@ -799,8 +801,13 @@ fn prune_skips_directories_named_like_entries_without_ending_the_run() {
     fs::create_dir_all(fixture.store().join("dir.json")).unwrap();
     let tmp_dir = fixture.store().join("dir.json.tmp-1-old");
     fs::create_dir_all(&tmp_dir).unwrap();
-    let old = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
-    fs::File::open(&tmp_dir).unwrap().set_modified(old).unwrap();
+    // Windows cannot open a directory as a `File`, so only age it on Unix; the
+    // point is that directories never end the run, old or not.
+    #[cfg(unix)]
+    {
+        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+        fs::File::open(&tmp_dir).unwrap().set_modified(old).unwrap();
+    }
     let (code, stdout, stderr) = fixture.run(&["prune", "--yes"]);
     assert_eq!(code, 0, "{stdout}{stderr}");
     assert!(fixture.store().join("dir.json").is_dir());
