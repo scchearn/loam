@@ -341,7 +341,7 @@ pub(crate) struct Checkpoint {
     pub(crate) scope: Option<String>,
 }
 
-pub(crate) fn read_checkpoints(wiki_root: &Path) -> Vec<Checkpoint> {
+fn read_checkpoints(wiki_root: &Path) -> Vec<Checkpoint> {
     let directory = wiki_root.join("checkpoints");
     let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
@@ -361,7 +361,7 @@ pub(crate) fn read_checkpoints(wiki_root: &Path) -> Vec<Checkpoint> {
     paths.into_iter().map(parse_checkpoint).collect()
 }
 
-pub(crate) fn parse_checkpoint(path: PathBuf) -> Checkpoint {
+fn parse_checkpoint(path: PathBuf) -> Checkpoint {
     let content = fs::read_to_string(&path).unwrap_or_default();
     parse_checkpoint_content(&path, &content)
 }

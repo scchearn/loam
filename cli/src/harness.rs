@@ -1484,7 +1484,7 @@ const REGISTRY_DEADLINE: Duration = Duration::from_millis(250);
 fn register_workspace(workspace: &Path) -> Option<String> {
     // Cheap pre-check so a disabled store costs no thread; `loams::gate`
     // re-checks inside the worker for the other callers.
-    if std::env::var("LOAM_REGISTRY").as_deref() == Ok("off") {
+    if std::env::var("LOAM_REGISTRY").is_ok_and(|value| value.trim() == "off") {
         return None;
     }
     let (sender, receiver) = std::sync::mpsc::channel();

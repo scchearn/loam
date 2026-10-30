@@ -33,7 +33,8 @@ pub(crate) enum Skip {
 /// A workspace that passed the gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Gated {
-    pub canonical: PathBuf,
+    /// The wiki root's parent when it is named `wiki`, else the wiki root.
+    pub workspace: PathBuf,
     pub wiki_root: PathBuf,
 }
 
@@ -118,14 +119,23 @@ pub(crate) fn gate(workspace: &Path, temp_root: &Path) -> Result<Gated, Skip> {
     if canonical.starts_with(&temp) {
         return Err(Skip::Temp);
     }
-    let wiki_root = crate::state::resolve_wiki_root(&canonical).ok_or(Skip::NotLoam)?;
+    let wiki_root = crate::state::resolve_wiki_root(&canonical)
+        .map(crate::enrollment::dos_compatible)
+        .ok_or(Skip::NotLoam)?;
+    // A loam's identity is its wiki: `/x` and `/x/wiki` are the same loam.
+    let workspace = match wiki_root.parent() {
+        Some(parent) if wiki_root.file_name().is_some_and(|name| name == "wiki") => {
+            parent.to_path_buf()
+        }
+        _ => wiki_root.clone(),
+    };
     Ok(Gated {
-        canonical,
+        workspace,
         wiki_root,
     })
 }
 
-/// Lowercase hex sha256 of the canonical path. Folded to ASCII lowercase on
+/// Lowercase hex sha256 of the canonical wiki root. Folded to ASCII lowercase on
 /// Windows only, where paths compare case-insensitively.
 pub(crate) fn key(canonical: &Path) -> String {
     let text = canonical.to_string_lossy();
@@ -206,34 +216,44 @@ pub(crate) fn register(
     now: DateTime<FixedOffset>,
     temp_root: &Path,
 ) -> Result<Outcome, String> {
+    register_recorded(workspace, now, temp_root).map(|(outcome, _)| outcome)
+}
+
+/// `register`, also returning the normalized workspace it recorded (`None`
+/// when skipped).
+fn register_recorded(
+    workspace: &Path,
+    now: DateTime<FixedOffset>,
+    temp_root: &Path,
+) -> Result<(Outcome, Option<PathBuf>), String> {
     let gated = match gate(workspace, temp_root) {
         Ok(gated) => gated,
-        Err(skip) => return Ok(Outcome::Skipped(skip)),
+        Err(skip) => return Ok((Outcome::Skipped(skip), None)),
     };
+    let recorded = Some(gated.workspace.clone());
+    let skipped = |skip| Ok((Outcome::Skipped(skip), None));
     let dir = match store_dir() {
         Ok(dir) => dir,
-        Err("config_root_relative") => return Ok(Outcome::Skipped(Skip::ConfigRootRelative)),
-        Err(_) => return Ok(Outcome::Skipped(Skip::ConfigRootUnresolved)),
+        Err("config_root_relative") => return skipped(Skip::ConfigRootRelative),
+        Err(_) => return skipped(Skip::ConfigRootUnresolved),
     };
     // The store must never be created under the workspace, even via an
     // absolute config root that points inside it.
     let anchor = dir
         .ancestors()
         .find_map(|candidate| canonical_path(candidate).ok());
-    if anchor.is_some_and(|anchor| anchor.starts_with(&gated.canonical)) {
-        return Ok(Outcome::Skipped(Skip::StoreInsideWorkspace));
+    if anchor.is_some_and(|anchor| anchor.starts_with(&gated.workspace)) {
+        return skipped(Skip::StoreInsideWorkspace);
     }
-    let volume = volume(&gated.canonical).map_err(|error| format!("volume: {}", error.kind()))?;
+    let volume = volume(&gated.workspace).map_err(|error| format!("volume: {}", error.kind()))?;
     let mut entry = Entry {
-        workspace: gated.canonical.display().to_string(),
-        wiki_root: crate::enrollment::dos_compatible(gated.wiki_root.clone())
-            .display()
-            .to_string(),
+        workspace: gated.workspace.display().to_string(),
+        wiki_root: gated.wiki_root.display().to_string(),
         volume,
         registered_at: now.format(TIMESTAMP_FORMAT).to_string(),
         last_seen_at: now.format(TIMESTAMP_FORMAT).to_string(),
     };
-    let path = dir.join(format!("{}.json", key(&gated.canonical)));
+    let path = dir.join(format!("{}.json", key(&gated.wiki_root)));
     let outcome = match read_entry(&path) {
         Ok(text) => match Entry::parse(&text) {
             Ok(existing) => {
@@ -241,7 +261,7 @@ pub(crate) fn register(
                     && existing.wiki_root == entry.wiki_root
                     && existing.volume == entry.volume;
                 if same && existing.seen_on(&now) {
-                    return Ok(Outcome::Unchanged);
+                    return Ok((Outcome::Unchanged, recorded));
                 }
                 entry.registered_at = existing.registered_at;
                 Outcome::Rewritten
@@ -254,7 +274,7 @@ pub(crate) fn register(
     };
     write_atomic(&dir, &path, &entry.to_json())
         .map_err(|error| format!("write: {}", error.kind()))?;
-    Ok(outcome)
+    Ok((outcome, recorded))
 }
 
 /// A name unique across threads and processes without the process id: time,
@@ -310,7 +330,8 @@ fn rename_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// Windows refuses to replace a file another process holds open; retry
-/// briefly (5 attempts, 25 ms apart) inside the caller's deadline.
+/// briefly (5 attempts, sleeping 25 ms between them, so at most 100 ms of
+/// sleep) inside the caller's deadline.
 #[cfg(windows)]
 fn rename_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut attempt = 0;
@@ -717,8 +738,8 @@ fn skip_text(skip: &Skip) -> &'static str {
 }
 
 /// `register` with the real clock and temp root.
-fn register_now(workspace: &Path) -> Result<Outcome, String> {
-    register(
+fn register_now(workspace: &Path) -> Result<(Outcome, Option<PathBuf>), String> {
+    register_recorded(
         workspace,
         chrono::Local::now().fixed_offset(),
         &std::env::temp_dir(),
@@ -731,10 +752,16 @@ fn add(mut args: impl Iterator<Item = String>) -> i32 {
         return 1;
     };
     match register_now(Path::new(&path)) {
-        Ok(Outcome::Created) => println!("created: {path}"),
-        Ok(Outcome::Rewritten) => println!("rewritten: {path}"),
-        Ok(Outcome::Unchanged) => println!("unchanged: {path}"),
-        Ok(Outcome::Skipped(skip)) => {
+        Ok((outcome @ (Outcome::Created | Outcome::Rewritten | Outcome::Unchanged), recorded)) => {
+            let label = match outcome {
+                Outcome::Created => "created",
+                Outcome::Rewritten => "rewritten",
+                _ => "unchanged",
+            };
+            let shown = recorded.map_or(path, |workspace| workspace.display().to_string());
+            println!("{label}: {shown}");
+        }
+        Ok((Outcome::Skipped(skip), _)) => {
             eprintln!("loam loams: skipped: {}", skip_text(&skip));
             return 1;
         }
@@ -757,10 +784,14 @@ fn import(mut args: impl Iterator<Item = String>) -> i32 {
             }
         }
     }
+    if let Err(reason) = store_dir() {
+        eprintln!("loam loams: {reason}");
+        return 1;
+    }
     let ledger = ledger.unwrap_or_else(|| {
         crate::harness::HookPaths::from_env()
             .global_root
-            .join("loam.sqlite3")
+            .join(crate::hooks::DATABASE_NAME)
     });
     let workspaces = match crate::hooks::ledger_workspaces(&ledger) {
         Ok(Some(workspaces)) => workspaces,
@@ -773,41 +804,85 @@ fn import(mut args: impl Iterator<Item = String>) -> i32 {
             return 1;
         }
     };
-    let (mut recorded, mut unchanged, mut skipped) = (0, 0, 0);
+    let (mut recorded, mut unchanged, mut skipped, mut failed) = (0, 0, 0, 0);
     for workspace in &workspaces {
+        let Some(workspace) = workspace else {
+            skipped += 1;
+            println!("skipped: non-utf8 workspace");
+            continue;
+        };
         match register_now(Path::new(workspace)) {
-            Ok(Outcome::Created | Outcome::Rewritten) => {
+            Ok((Outcome::Created | Outcome::Rewritten, _)) => {
                 recorded += 1;
                 println!("recorded: {workspace}");
             }
-            Ok(Outcome::Unchanged) => {
+            Ok((Outcome::Unchanged, _)) => {
                 unchanged += 1;
                 println!("unchanged: {workspace}");
             }
-            Ok(Outcome::Skipped(skip)) => {
+            Ok((Outcome::Skipped(skip), _)) => {
                 skipped += 1;
                 println!("skipped: {}: {workspace}", skip_text(&skip));
             }
             Err(reason) => {
-                skipped += 1;
-                println!("skipped: {reason}: {workspace}");
+                failed += 1;
+                println!("failed: {reason}: {workspace}");
             }
         }
     }
-    println!("{recorded} recorded, {unchanged} unchanged, {skipped} skipped");
-    0
+    println!("{recorded} recorded, {unchanged} unchanged, {skipped} skipped, {failed} failed");
+    i32::from(failed > 0)
 }
 
 /// A temp file this old is an abandoned write, not one in flight.
 const STALE_TEMP: Duration = Duration::from_secs(3600);
 
-/// Delete `target` only if it canonically sits directly inside `store`.
+/// Delete `target` only if it sits directly inside `store` and is a regular
+/// file or a symlink. A symlink is removed itself, never what it points at.
 fn remove_inside(store: &Path, target: &Path) -> Result<(), String> {
-    let canonical = fs::canonicalize(target).map_err(|error| error.to_string())?;
-    if canonical.parent() != Some(store) {
+    let parent = target.parent().map(fs::canonicalize);
+    if !matches!(parent, Some(Ok(parent)) if parent == store) {
         return Err("refused: outside the store".to_owned());
     }
-    fs::remove_file(&canonical).map_err(|error| error.to_string())
+    let kind = fs::symlink_metadata(target)
+        .map_err(|error| error.to_string())?
+        .file_type();
+    if !(kind.is_file() || kind.is_symlink()) {
+        return Err("refused: not a file".to_owned());
+    }
+    fs::remove_file(target).map_err(|error| error.to_string())
+}
+
+/// An abandoned temp file: a file or symlink (never a directory) older than
+/// `STALE_TEMP`. Judged on the link itself, not its target.
+fn is_stale_temp(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| {
+        (meta.is_file() || meta.file_type().is_symlink())
+            && meta
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_TEMP)
+    })
+}
+
+/// Re-evaluate a prune candidate right before deleting it; anything whose
+/// status changed since it was listed is kept.
+fn still_prunable(path: &Path, why: &str) -> bool {
+    let name_is_utf8 = path.file_name().is_some_and(|name| name.to_str().is_some());
+    let status = || {
+        if name_is_utf8 {
+            classify(path, &Stat::default())
+        } else {
+            Status::Invalid
+        }
+    };
+    match why {
+        "missing" => status() == Status::Missing,
+        "invalid" => status() == Status::Invalid,
+        "stale temp" => is_stale_temp(path),
+        _ => false,
+    }
 }
 
 fn prune(args: impl Iterator<Item = String>) -> i32 {
@@ -837,39 +912,56 @@ fn prune(args: impl Iterator<Item = String>) -> i32 {
     };
     let mut remove: Vec<(PathBuf, &'static str)> = Vec::new();
     let mut keep: Vec<(String, String)> = Vec::new();
-    for listed in listing.files {
-        let status = if listed.bad_name {
-            Status::Invalid
-        } else {
-            classify(&listed.path, &Stat::default())
-        };
-        match status {
-            Status::Missing => remove.push((listed.path, "missing")),
-            Status::Invalid => remove.push((listed.path, "invalid")),
-            other => keep.push((listed.key, status_label(&other))),
-        }
+    // A name that is not UTF-8 is invalid by definition and never read.
+    let (bad, good): (Vec<Listed>, Vec<Listed>) = listing
+        .files
+        .into_iter()
+        .partition(|listed| listed.bad_name);
+    for listed in bad {
+        remove.push((listed.path, "invalid"));
     }
-    for row in listing.failed {
-        keep.push((row.key.clone(), status_text(&row)));
+    // Same fan-out and deadline as `list`; a worker that never answers is a
+    // timeout row and is kept.
+    let rows = collect_rows(
+        Listing {
+            files: good,
+            failed: listing.failed,
+        },
+        false,
+    );
+    for row in rows {
+        match (&row.status, &row.error) {
+            (Some(Status::Missing), None) => {
+                remove.push((dir.join(format!("{}.json", row.key)), "missing"));
+            }
+            (Some(Status::Invalid), None) => {
+                remove.push((dir.join(format!("{}.json", row.key)), "invalid"));
+            }
+            _ => keep.push((row.key.clone(), status_text(&row))),
+        }
     }
     if let Ok(items) = fs::read_dir(&dir) {
         for item in items.filter_map(Result::ok) {
             let path = item.path();
-            let stale = path
+            let is_temp = path
                 .file_name()
-                .is_some_and(|name| name.to_string_lossy().contains(".tmp-"))
-                && item
-                    .metadata()
-                    .and_then(|meta| meta.modified())
-                    .ok()
-                    .and_then(|modified| modified.elapsed().ok())
-                    .is_some_and(|age| age > STALE_TEMP);
-            if stale {
+                .is_some_and(|name| name.to_string_lossy().contains(".tmp-"));
+            if !is_temp {
+                continue;
+            }
+            if is_stale_temp(&path) {
                 remove.push((path, "stale temp"));
+            } else if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                keep.push((name, "error: not a file".to_owned()));
             }
         }
     }
     remove.sort();
+    keep.sort();
     let name_of = |path: &Path| {
         path.file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -896,6 +988,10 @@ fn prune(args: impl Iterator<Item = String>) -> i32 {
     };
     let mut failed = false;
     for (path, why) in &remove {
+        if !still_prunable(path, why) {
+            println!("kept: {}  [changed since listing]", name_of(path));
+            continue;
+        }
         match remove_inside(&store, path) {
             Ok(()) => println!("removed: {}  [{why}]", name_of(path)),
             Err(reason) => {
@@ -1156,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_wiki_root_rewrites_and_keeps_registered_at() {
+    fn a_new_wiki_root_is_a_new_identity() {
         let _lock = crate::env_lock();
         let scratch = Scratch::new();
         let _env = registered(&scratch);
@@ -1167,16 +1263,15 @@ mod tests {
             Ok(Outcome::Created)
         );
 
+        // The wiki moves to `<workspace>/wiki`: identity is the wiki, so this
+        // is a second loam sharing the workspace path.
         fs::create_dir_all(workspace.join("wiki")).unwrap();
         fs::write(workspace.join("wiki").join("index.md"), "# wiki\n").unwrap();
-        let same_day = at("2026-10-30 10:00:00+02:00");
         assert_eq!(
-            register(&workspace, same_day, Path::new(NO_TEMP)),
-            Ok(Outcome::Rewritten)
+            register(&workspace, now, Path::new(NO_TEMP)),
+            Ok(Outcome::Created)
         );
-        let entry = Entry::parse(&fs::read_to_string(&entry_files(&scratch)[0]).unwrap()).unwrap();
-        assert!(entry.wiki_root.ends_with("wiki"), "{}", entry.wiki_root);
-        assert_eq!(entry.registered_at, "2026-10-30 09:00:00+02:00");
+        assert_eq!(entry_files(&scratch).len(), 2);
     }
 
     #[test]
@@ -1639,6 +1734,96 @@ mod tests {
         assert!(parse_captured("2026-02-01 10:00:00").is_none());
         assert!(parse_captured("2026-02-01").is_none());
         assert!(parse_captured("garbage").is_none());
+    }
+
+    #[test]
+    fn a_workspace_and_its_wiki_dir_share_one_entry_with_the_parent_as_workspace() {
+        let _lock = crate::env_lock();
+        let scratch = Scratch::new();
+        let _env = registered(&scratch);
+        let workspace = scratch.0.join("x");
+        fs::create_dir_all(workspace.join("wiki")).unwrap();
+        fs::write(workspace.join("wiki").join("index.md"), "# wiki\n").unwrap();
+        let now = at("2026-10-30 09:00:00+02:00");
+        assert_eq!(
+            register(&workspace, now, Path::new(NO_TEMP)),
+            Ok(Outcome::Created)
+        );
+        assert_eq!(
+            register(&workspace.join("wiki"), now, Path::new(NO_TEMP)),
+            Ok(Outcome::Unchanged)
+        );
+        let files = entry_files(&scratch);
+        assert_eq!(files.len(), 1, "{files:?}");
+        let entry = Entry::parse(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+        assert_eq!(
+            entry.workspace,
+            fs::canonicalize(&workspace).unwrap().display().to_string()
+        );
+        assert!(entry.wiki_root.ends_with("wiki"), "{}", entry.wiki_root);
+    }
+
+    #[test]
+    fn a_wiki_at_the_root_records_that_root_as_the_workspace() {
+        let _lock = crate::env_lock();
+        let scratch = Scratch::new();
+        let _env = registered(&scratch);
+        let workspace = scratch.workspace("y");
+        register(
+            &workspace,
+            at("2026-10-30 09:00:00+02:00"),
+            Path::new(NO_TEMP),
+        )
+        .unwrap();
+        let entry = Entry::parse(&fs::read_to_string(&entry_files(&scratch)[0]).unwrap()).unwrap();
+        assert_eq!(
+            entry.workspace,
+            fs::canonicalize(&workspace).unwrap().display().to_string()
+        );
+    }
+
+    #[test]
+    fn a_store_inside_the_wiki_dir_is_skipped_for_the_normalized_workspace() {
+        let _lock = crate::env_lock();
+        let scratch = Scratch::new();
+        let workspace = scratch.0.join("x");
+        fs::create_dir_all(workspace.join("wiki")).unwrap();
+        fs::write(workspace.join("wiki").join("index.md"), "# wiki\n").unwrap();
+        let config = workspace.join(".cfg");
+        let _env = Env::set(&[
+            ("LOAM_CONFIG_DIR", Some(config.to_str().unwrap())),
+            ("LOAM_REGISTRY", None),
+        ]);
+        assert_eq!(
+            register(
+                &workspace.join("wiki"),
+                at("2026-10-30 09:00:00+02:00"),
+                Path::new(NO_TEMP)
+            ),
+            Ok(Outcome::Skipped(Skip::StoreInsideWorkspace))
+        );
+        assert!(!config.exists());
+    }
+
+    #[test]
+    fn prune_rechecks_a_candidate_right_before_deleting_it() {
+        let _lock = crate::env_lock();
+        let scratch = Scratch::new();
+        let _env = registered(&scratch);
+        let workspace = scratch.workspace("flip");
+        register(
+            &workspace,
+            at("2026-10-30 09:00:00+02:00"),
+            Path::new(NO_TEMP),
+        )
+        .unwrap();
+        let file = entry_files(&scratch).remove(0);
+        // Classified missing a moment ago; the marker is back now.
+        assert!(!still_prunable(&file, "missing"));
+        assert!(!still_prunable(&file, "invalid"));
+        fs::write(&file, "{not json").unwrap();
+        assert!(still_prunable(&file, "invalid"));
+        assert!(!still_prunable(&file, "stale temp"));
     }
 
     #[test]

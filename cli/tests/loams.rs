@@ -615,3 +615,205 @@ fn prune_on_an_absent_store_is_a_quiet_success() {
     assert_eq!(code, 0);
     assert!(!fixture.store().exists());
 }
+
+// ---------------------------------------------------------------------------
+// identity is the wiki; review findings
+// ---------------------------------------------------------------------------
+
+/// `<root>/<name>/wiki/index.md`, returning the workspace directory.
+fn wiki_workspace(fixture: &Fixture, name: &str) -> PathBuf {
+    let path = fixture.root.join(name);
+    fs::create_dir_all(path.join("wiki")).unwrap();
+    fs::write(path.join("wiki").join("index.md"), "# index\n").unwrap();
+    path
+}
+
+fn only_entry(fixture: &Fixture) -> loam::json::Value {
+    let names = store_names(fixture);
+    assert_eq!(names.len(), 1, "{names:?}");
+    loam::json::parse(&fs::read_to_string(fixture.store().join(&names[0])).unwrap()).unwrap()
+}
+
+#[test]
+fn add_of_a_workspace_and_its_wiki_dir_is_one_loam() {
+    let fixture = Fixture::new("idwiki");
+    let ws = wiki_workspace(&fixture, "x");
+    let (code, _, stderr) = fixture.run(&["add", ws.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, stdout, stderr) = fixture.run(&["add", ws.join("wiki").to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("unchanged"), "{stdout}");
+    let entry = only_entry(&fixture);
+    assert_eq!(
+        entry.get("workspace").and_then(|v| v.as_str()),
+        Some(ws.display().to_string().as_str())
+    );
+}
+
+#[test]
+fn a_wiki_at_the_root_records_itself_as_the_workspace() {
+    let fixture = Fixture::new("idroot");
+    let ws = fixture.workspace("y", 0);
+    let (code, _, stderr) = fixture.run(&["add", ws.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    let entry = only_entry(&fixture);
+    assert_eq!(
+        entry.get("workspace").and_then(|v| v.as_str()),
+        Some(ws.display().to_string().as_str())
+    );
+}
+
+#[test]
+fn import_of_a_ledger_with_both_forms_gives_one_entry() {
+    let fixture = Fixture::new("idimport");
+    let ws = wiki_workspace(&fixture, "x");
+    let ledger = ledger_with(&fixture, &[&ws, &ws.join("wiki")]);
+    let (code, stdout, stderr) = fixture.run(&["import", "--ledger", ledger.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("1 recorded, 1 unchanged"), "{stdout}");
+    assert_eq!(store_names(&fixture).len(), 1);
+}
+
+#[test]
+fn add_echoes_the_canonical_workspace() {
+    let fixture = Fixture::new("addecho");
+    let ws = fixture.workspace("one", 0);
+    let raw = fixture.root.join("one").join("..").join("one");
+    let (code, stdout, stderr) = fixture.run(&["add", raw.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout.trim(), format!("created: {}", ws.display()));
+}
+
+#[test]
+fn import_fails_up_front_when_the_store_cannot_be_resolved() {
+    let fixture = Fixture::new("importnostore");
+    let output = Command::new(env!("CARGO_BIN_EXE_loam"))
+        .args(["loams", "import", "--ledger", "/nonexistent/ledger.sqlite3"])
+        .env("LOAM_CONFIG_DIR", "relative/config")
+        .env("LOAM_HOME", fixture.home())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("config_root_relative"));
+}
+
+#[test]
+fn import_exits_one_and_counts_failed_when_a_register_errors() {
+    let fixture = Fixture::new("importfail");
+    let ws = fixture.workspace("real", 0);
+    let ledger = ledger_with(&fixture, &[&ws]);
+    fs::create_dir_all(fixture.config()).unwrap();
+    fs::write(fixture.store(), "a file where the store should be").unwrap();
+    let (code, stdout, _) = fixture.run(&["import", "--ledger", ledger.to_str().unwrap()]);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.contains("1 failed"), "{stdout}");
+    assert!(stdout.contains("0 skipped"), "{stdout}");
+}
+
+#[test]
+fn a_ledger_without_a_hook_run_table_means_no_hook_ledger() {
+    let fixture = Fixture::new("importnotable");
+    let path = fixture.root.join("empty.sqlite3");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute("CREATE TABLE other (x)", []).unwrap();
+    drop(connection);
+    let (code, stdout, stderr) = fixture.run(&["import", "--ledger", path.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("no hook ledger"), "{stdout}");
+}
+
+#[test]
+fn a_non_utf8_workspace_row_is_skipped_not_fatal() {
+    let fixture = Fixture::new("importbadrow");
+    let ws = fixture.workspace("real", 0);
+    let ledger = ledger_with(&fixture, &[&ws, &fixture.root.join("other")]);
+    let connection = rusqlite::Connection::open(&ledger).unwrap();
+    connection
+        .execute(
+            "UPDATE hook_run SET workspace = CAST(x'2fff' AS TEXT) WHERE workspace LIKE '%other'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let (code, stdout, stderr) = fixture.run(&["import", "--ledger", ledger.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("skipped: non-utf8"), "{stdout}");
+    assert!(stdout.contains("1 recorded"), "{stdout}");
+}
+
+#[cfg(unix)]
+fn bad_name() -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::OsStr::from_bytes(b"bad\xff.json").to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_removes_a_symlink_but_never_what_it_points_at_inside_the_store() {
+    let fixture = Fixture::new("prunelink");
+    let live = fixture.workspace("live", 0);
+    fixture.entry("live", &live, "2026-03-01 09:00:00+02:00");
+    let link = fixture.store().join(bad_name());
+    std::os::unix::fs::symlink(fixture.store().join("live.json"), &link).unwrap();
+    let (code, stdout, stderr) = fixture.run(&["prune", "--yes"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(link.symlink_metadata().is_err(), "link survived");
+    assert!(fixture.store().join("live.json").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_removes_a_symlink_but_never_what_it_points_at_outside_the_store() {
+    let fixture = Fixture::new("prunelinkout");
+    let outside = fixture.root.join("outside.json");
+    fs::write(&outside, "precious").unwrap();
+    fs::create_dir_all(fixture.store()).unwrap();
+    let link = fixture.store().join(bad_name());
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let (code, stdout, stderr) = fixture.run(&["prune", "--yes"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(link.symlink_metadata().is_err(), "link survived");
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "precious");
+}
+
+#[test]
+fn prune_skips_directories_named_like_entries_without_ending_the_run() {
+    let fixture = Fixture::new("prunedirs");
+    let (stale, _) = prune_fixture(&fixture);
+    fs::create_dir_all(fixture.store().join("dir.json")).unwrap();
+    let tmp_dir = fixture.store().join("dir.json.tmp-1-old");
+    fs::create_dir_all(&tmp_dir).unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+    fs::File::open(&tmp_dir).unwrap().set_modified(old).unwrap();
+    let (code, stdout, stderr) = fixture.run(&["prune", "--yes"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(fixture.store().join("dir.json").is_dir());
+    assert!(tmp_dir.is_dir());
+    assert!(!stale.exists());
+    assert!(!fixture.store().join("gone.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_keeps_an_entry_whose_read_hangs() {
+    let fixture = Fixture::new("prunehang");
+    let live = fixture.workspace("live", 0);
+    fixture.entry("live", &live, "2026-03-01 09:00:00+02:00");
+    fixture.entry(
+        "gone",
+        &fixture.root.join("gone"),
+        "2026-03-02 09:00:00+02:00",
+    );
+    let fifo = fixture.store().join("hung.json");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let started = Instant::now();
+    let (code, stdout, stderr) = fixture.run(&["prune", "--yes"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(fifo.symlink_metadata().is_ok(), "hung entry was deleted");
+    assert!(!fixture.store().join("gone.json").exists());
+}
