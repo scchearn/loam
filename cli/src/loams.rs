@@ -122,6 +122,18 @@ pub(crate) fn gate(workspace: &Path, temp_root: &Path) -> Result<Gated, Skip> {
     let wiki_root = crate::state::resolve_wiki_root(&canonical)
         .map(crate::enrollment::dos_compatible)
         .ok_or(Skip::NotLoam)?;
+    // A folder inside a wiki (e.g. the code-graph hub `wiki/code/index.md`) is
+    // part of that wiki, never a loam of its own.
+    if wiki_root.file_name().is_none_or(|name| name != "wiki")
+        && wiki_root.ancestors().skip(1).any(|ancestor| {
+            ancestor.file_name().is_some_and(|name| name == "wiki")
+                && crate::state::resolve_wiki_root(ancestor)
+                    .map(crate::enrollment::dos_compatible)
+                    .is_some_and(|root| root == ancestor)
+        })
+    {
+        return Err(Skip::NotLoam);
+    }
     // A loam's identity is its wiki: `/x` and `/x/wiki` are the same loam.
     let workspace = match wiki_root.parent() {
         Some(parent) if wiki_root.file_name().is_some_and(|name| name == "wiki") => {
@@ -1134,6 +1146,23 @@ fn render_table(rows: &[Row], with_checkpoints: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_inside_a_wiki_is_not_a_loam() {
+        let root = std::env::temp_dir().join(format!("loams-subwiki-{}", std::process::id()));
+        let code = root.join("x").join("wiki").join("code");
+        fs::create_dir_all(&code).unwrap();
+        fs::write(root.join("x").join("wiki").join("index.md"), "# w\n").unwrap();
+        fs::write(code.join("index.md"), "# c\n").unwrap();
+        let temp = Path::new("/nonexistent-temp");
+        assert!(matches!(gate(&code, temp), Err(Skip::NotLoam)));
+        let gated = gate(&root.join("x"), temp).expect("the parent wiki is a loam");
+        assert_eq!(
+            gated.wiki_root,
+            canonical_path(&root.join("x").join("wiki")).unwrap()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
