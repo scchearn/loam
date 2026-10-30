@@ -29,6 +29,8 @@ pub(crate) enum Skip {
     ConfigRootUnresolved,
     /// The config root is not absolute (hooks run with cwd = the workspace).
     ConfigRootRelative,
+    /// The store directory would live under the workspace.
+    StoreInsideWorkspace,
 }
 
 /// A workspace that passed the gate.
@@ -71,6 +73,26 @@ pub(crate) struct Stat {
     /// When set, replaces the measured volume of the nearest existing
     /// ancestor of a vanished workspace.
     pub ancestor_volume: Option<String>,
+    /// When set, replaces the measured volume of an existing workspace whose
+    /// wiki marker is gone (`None` measures it for real).
+    pub workspace_volume: Option<String>,
+}
+
+/// Entries larger than this are malformed.
+const MAX_ENTRY_BYTES: u64 = 64 * 1024;
+
+/// Read an entry file, refusing anything over `MAX_ENTRY_BYTES` or not UTF-8
+/// with `InvalidData`.
+fn read_entry(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_ENTRY_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_ENTRY_BYTES {
+        return Err(ErrorKind::InvalidData.into());
+    }
+    String::from_utf8(bytes).map_err(|_| ErrorKind::InvalidData.into())
 }
 
 /// `<configRoot>/loams`.
@@ -196,16 +218,26 @@ pub(crate) fn register(
         Err("config_root_relative") => return Ok(Outcome::Skipped(Skip::ConfigRootRelative)),
         Err(_) => return Ok(Outcome::Skipped(Skip::ConfigRootUnresolved)),
     };
+    // The store must never be created under the workspace, even via an
+    // absolute config root that points inside it.
+    let anchor = dir
+        .ancestors()
+        .find_map(|candidate| canonical_path(candidate).ok());
+    if anchor.is_some_and(|anchor| anchor.starts_with(&gated.canonical)) {
+        return Ok(Outcome::Skipped(Skip::StoreInsideWorkspace));
+    }
     let volume = volume(&gated.canonical).map_err(|error| format!("volume: {}", error.kind()))?;
     let mut entry = Entry {
         workspace: gated.canonical.display().to_string(),
-        wiki_root: gated.wiki_root.display().to_string(),
+        wiki_root: crate::enrollment::dos_compatible(gated.wiki_root.clone())
+            .display()
+            .to_string(),
         volume,
         registered_at: now.format(TIMESTAMP_FORMAT).to_string(),
         last_seen_at: now.format(TIMESTAMP_FORMAT).to_string(),
     };
     let path = dir.join(format!("{}.json", key(&gated.canonical)));
-    let outcome = match fs::read_to_string(&path) {
+    let outcome = match read_entry(&path) {
         Ok(text) => match Entry::parse(&text) {
             Ok(existing) => {
                 let same = existing.workspace == entry.workspace
@@ -220,6 +252,7 @@ pub(crate) fn register(
             Err(_) => Outcome::Rewritten,
         },
         Err(error) if error.kind() == ErrorKind::NotFound => Outcome::Created,
+        Err(error) if error.kind() == ErrorKind::InvalidData => Outcome::Rewritten,
         Err(error) => return Err(format!("read: {}", error.kind())),
     };
     write_atomic(&dir, &path, &entry.to_json())
@@ -280,16 +313,16 @@ fn rename_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// Windows refuses to replace a file another process holds open; retry
-/// briefly (3 attempts, 50 ms apart) inside the caller's deadline.
+/// briefly (5 attempts, 25 ms apart) inside the caller's deadline.
 #[cfg(windows)]
 fn rename_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut attempt = 0;
     loop {
         match fs::rename(from, to) {
             Ok(()) => return Ok(()),
-            Err(_) if attempt < 2 => {
+            Err(_) if attempt < 4 => {
                 attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(25));
             }
             Err(error) => return Err(error),
         }
@@ -298,8 +331,9 @@ fn rename_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// Classify one entry file against the live filesystem.
 pub(crate) fn classify(entry_path: &Path, stat: &Stat) -> Status {
-    let text = match fs::read_to_string(entry_path) {
+    let text = match read_entry(entry_path) {
         Ok(text) => text,
+        Err(error) if error.kind() == ErrorKind::InvalidData => return Status::Invalid,
         Err(error) => return Status::Error(error.kind()),
     };
     let Ok(entry) = Entry::parse(&text) else {
@@ -309,9 +343,28 @@ pub(crate) fn classify(entry_path: &Path, stat: &Stat) -> Status {
     match fs::metadata(workspace) {
         Ok(_) => {
             if crate::state::resolve_wiki_root(workspace).is_some() {
-                Status::Live
-            } else {
-                Status::Missing
+                return Status::Live;
+            }
+            // Only a marker that is absent everywhere counts as gone; an
+            // unreadable one is an error, not a deletion.
+            for dir in [workspace.join("wiki"), workspace.to_path_buf()] {
+                for name in ["SCHEMA.md", "index.md", "log.md"] {
+                    if let Err(error) = fs::metadata(dir.join(name)) {
+                        if error.kind() != ErrorKind::NotFound {
+                            return Status::Error(error.kind());
+                        }
+                    }
+                }
+            }
+            // A mount point left behind by an unmounted volume is empty.
+            let measured = match &stat.workspace_volume {
+                Some(volume) => Ok(volume.clone()),
+                None => volume(workspace),
+            };
+            match measured {
+                Ok(current) if current == entry.volume => Status::Missing,
+                Ok(_) => Status::Unreachable,
+                Err(error) => Status::Error(error.kind()),
             }
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -597,6 +650,50 @@ mod tests {
         }
         assert!(!scratch.config().exists());
         assert!(!workspace.join("loams").exists());
+        // The relative root must not be created relative to the cwd or the
+        // workspace either.
+        assert!(!std::env::current_dir().unwrap().join("relative").exists());
+        assert!(!workspace.join("relative").exists());
+    }
+
+    #[test]
+    fn a_store_inside_the_workspace_is_skipped_and_nothing_is_created() {
+        let _lock = crate::env_lock();
+        let scratch = Scratch::new();
+        let workspace = scratch.workspace("inside");
+        let config = workspace.join(".cfg");
+        let _env = Env::set(&[
+            ("LOAM_CONFIG_DIR", Some(config.to_str().unwrap())),
+            ("LOAM_REGISTRY", None),
+        ]);
+        let before = fs::read_dir(&workspace).unwrap().count();
+        assert_eq!(
+            register(
+                &workspace,
+                at("2026-10-30 09:00:00+02:00"),
+                Path::new(NO_TEMP)
+            ),
+            Ok(Outcome::Skipped(Skip::StoreInsideWorkspace))
+        );
+        assert!(!config.exists());
+        assert_eq!(fs::read_dir(&workspace).unwrap().count(), before);
+    }
+
+    #[test]
+    fn an_oversized_entry_is_rewritten_by_register() {
+        let _lock = crate::env_lock();
+        let scratch = Scratch::new();
+        let _env = registered(&scratch);
+        let workspace = scratch.workspace("big");
+        let now = at("2026-10-30 09:00:00+02:00");
+        register(&workspace, now, Path::new(NO_TEMP)).unwrap();
+        let file = entry_files(&scratch).remove(0);
+        fs::write(&file, vec![b' '; 70 * 1024]).unwrap();
+        assert_eq!(
+            register(&workspace, now, Path::new(NO_TEMP)),
+            Ok(Outcome::Rewritten)
+        );
+        assert!(Entry::parse(&fs::read_to_string(&file).unwrap()).is_ok());
     }
 
     #[test]
@@ -622,7 +719,13 @@ mod tests {
             })
             .collect();
         for handle in handles {
-            assert!(handle.join().unwrap().is_ok());
+            let result = handle.join().unwrap();
+            // Windows may refuse a rename onto a file another thread holds.
+            let tolerated = cfg!(windows)
+                && result
+                    .as_ref()
+                    .is_err_and(|message| message.starts_with("write:"));
+            assert!(result.is_ok() || tolerated, "{result:?}");
         }
         let files = entry_files(&scratch);
         assert_eq!(files.len(), 1, "{files:?}");
@@ -797,6 +900,7 @@ mod tests {
         fs::remove_dir_all(&workspace).unwrap();
         let other = Stat {
             ancestor_volume: Some("dev:no-such-device".to_owned()),
+            ..Stat::default()
         };
         assert_eq!(classify(&path, &other), Status::Unreachable);
 
@@ -806,6 +910,47 @@ mod tests {
         entry.volume = "dev:no-such-device".to_owned();
         let path = write_entry(&scratch, &entry);
         assert_eq!(classify(&path, &Stat::default()), Status::Unreachable);
+    }
+
+    #[test]
+    fn classify_unreachable_when_the_workspace_exists_on_another_volume_without_a_marker() {
+        let scratch = Scratch::new();
+        let workspace = scratch.workspace("mount-point");
+        let path = write_entry(&scratch, &entry_for(&workspace));
+        fs::remove_file(workspace.join("index.md")).unwrap();
+        let other = Stat {
+            workspace_volume: Some("dev:no-such-device".to_owned()),
+            ..Stat::default()
+        };
+        assert_eq!(classify(&path, &other), Status::Unreachable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_error_when_the_marker_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let workspace = scratch.workspace("locked");
+        let path = write_entry(&scratch, &entry_for(&workspace));
+        fs::remove_file(workspace.join("index.md")).unwrap();
+        let wiki = workspace.join("wiki");
+        fs::create_dir_all(&wiki).unwrap();
+        fs::write(wiki.join("index.md"), "# wiki\n").unwrap();
+        fs::set_permissions(&wiki, fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = fs::metadata(wiki.join("index.md")).is_err();
+        let status = classify(&path, &Stat::default());
+        fs::set_permissions(&wiki, fs::Permissions::from_mode(0o755)).unwrap();
+        if blocked {
+            assert_eq!(status, Status::Error(ErrorKind::PermissionDenied));
+        }
+    }
+
+    #[test]
+    fn classify_invalid_when_the_entry_is_over_the_size_cap() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("huge.json");
+        fs::write(&path, vec![b' '; 70 * 1024]).unwrap();
+        assert_eq!(classify(&path, &Stat::default()), Status::Invalid);
     }
 
     #[test]
