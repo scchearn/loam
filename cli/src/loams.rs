@@ -1,7 +1,7 @@
 //! Machine-local loams store: one small JSON entry per loam workspace under
 //! `<configRoot>/loams/`. Nothing here ever writes under a workspace, and
 //! nothing here reads federation state.
-// Wired into `harness::run` (registration, T2) and the `loams` command (T3).
+// `add`, `import` and `prune` (T4) will use the remaining helpers.
 #![allow(dead_code)]
 
 use crate::json::{self, Value};
@@ -335,6 +335,355 @@ pub(crate) fn classify(entry_path: &Path, stat: &Stat) -> Status {
         }
         Err(error) => Status::Error(error.kind()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// `loam loams`
+// ---------------------------------------------------------------------------
+
+use crate::state::Checkpoint;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// One overall deadline for every per-entry worker.
+const FANOUT_DEADLINE: Duration = Duration::from_secs(2);
+const DEFAULT_LIMIT: usize = 3;
+
+fn usage() {
+    eprintln!(
+        "Usage:\n  loam loams list [--checkpoints] [--limit <N>] [--json]\n  loam loams add <path>\n  loam loams import [--ledger <path>]\n  loam loams prune [--yes]"
+    );
+}
+
+pub(crate) fn run(mut args: impl Iterator<Item = String>) -> i32 {
+    match args.next().as_deref() {
+        Some("list") => list(args),
+        Some("add" | "import" | "prune") => {
+            eprintln!("loam loams: this subcommand is not yet implemented");
+            1
+        }
+        _ => {
+            usage();
+            1
+        }
+    }
+}
+
+struct ListOptions {
+    checkpoints: bool,
+    limit: usize,
+    json: bool,
+}
+
+fn parse_list_args(mut args: impl Iterator<Item = String>) -> Option<ListOptions> {
+    let mut options = ListOptions {
+        checkpoints: false,
+        limit: DEFAULT_LIMIT,
+        json: false,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--checkpoints" => options.checkpoints = true,
+            "--json" => options.json = true,
+            "--limit" => options.limit = args.next()?.parse().ok()?,
+            _ => return None,
+        }
+    }
+    Some(options)
+}
+
+/// What one worker found for one entry file.
+struct Report {
+    key: String,
+    status: Option<Status>,
+    entry: Option<Entry>,
+    checkpoints: Vec<Checkpoint>,
+}
+
+/// A row after collection; `status: None` means the worker never answered.
+struct Row {
+    key: String,
+    status: Option<Status>,
+    entry: Option<Entry>,
+    checkpoints: Vec<Checkpoint>,
+}
+
+fn status_text(status: Option<&Status>) -> String {
+    match status {
+        Some(Status::Live) => "live".to_owned(),
+        Some(Status::Missing) => "missing".to_owned(),
+        Some(Status::Unreachable) => "unreachable".to_owned(),
+        Some(Status::Error(kind)) => format!("error: {kind}"),
+        Some(Status::Invalid) => "invalid".to_owned(),
+        None => "timeout".to_owned(),
+    }
+}
+
+/// `captured_at` as written by checkpoints: `YYYY-MM-DD HH:MM ±HH:MM` is the
+/// norm; seconds, RFC 3339 and offset-less stamps (read as UTC) are tolerated.
+fn parse_captured(text: &str) -> Option<DateTime<FixedOffset>> {
+    let text = text.trim();
+    for format in [
+        "%Y-%m-%d %H:%M %:z",
+        "%Y-%m-%d %H:%M:%S %:z",
+        "%Y-%m-%d %H:%M:%S%:z",
+        "%Y-%m-%d %H:%M%:z",
+    ] {
+        if let Ok(parsed) = DateTime::parse_from_str(text, format) {
+            return Some(parsed);
+        }
+    }
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(text) {
+        return Some(parsed);
+    }
+    let utc = FixedOffset::east_opt(0)?;
+    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(text, format) {
+            return naive.and_local_timezone(utc).single();
+        }
+    }
+    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .ok()?
+        .and_hms_opt(0, 0, 0)?
+        .and_local_timezone(utc)
+        .single()
+}
+
+fn checkpoint_time(checkpoint: &Checkpoint) -> Option<DateTime<FixedOffset>> {
+    checkpoint.captured_at.as_deref().and_then(parse_captured)
+}
+
+/// Newest first by parsed `captured_at`; unparseable stamps sort after parsed
+/// ones, and ties fall back to the file name, descending.
+fn sort_checkpoints(checkpoints: &mut [Checkpoint]) {
+    checkpoints.sort_by(|left, right| {
+        checkpoint_time(right)
+            .cmp(&checkpoint_time(left))
+            .then_with(|| right.path.cmp(&left.path))
+    });
+}
+
+/// Checkpoint files by name only. Unlike `state::read_checkpoints` this does
+/// not stat the file type, so an entry that cannot be read still reaches
+/// `parse_checkpoint` and is caught by the deadline.
+fn checkpoint_files(wiki_root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(wiki_root.join("checkpoints")) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("checkpoint-") && name.ends_with(".md"))
+        })
+        .collect()
+}
+
+fn inspect(path: &Path, key: String, with_checkpoints: bool) -> Report {
+    let status = classify(path, &Stat::default());
+    let entry = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| Entry::parse(&text).ok());
+    let mut checkpoints = Vec::new();
+    if with_checkpoints && status == Status::Live {
+        if let Some(entry) = &entry {
+            checkpoints = checkpoint_files(Path::new(&entry.wiki_root))
+                .into_iter()
+                .map(crate::state::parse_checkpoint)
+                .collect();
+        }
+    }
+    Report {
+        key,
+        status: Some(status),
+        entry,
+        checkpoints,
+    }
+}
+
+fn entry_files(dir: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
+    let mut files = Vec::new();
+    for item in fs::read_dir(dir)? {
+        let path = item?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.contains(".tmp-") {
+            continue;
+        }
+        if let Some(key) = name.strip_suffix(".json") {
+            files.push((key.to_owned(), path.clone()));
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Spawn one detached worker per entry and collect under a single deadline.
+/// Workers are never joined: a hung read must not hang the command.
+fn collect_rows(files: Vec<(String, PathBuf)>, with_checkpoints: bool) -> Vec<Row> {
+    let (sender, receiver) = mpsc::channel();
+    let total = files.len();
+    let keys: Vec<String> = files.iter().map(|(key, _)| key.clone()).collect();
+    let deadline = Instant::now() + FANOUT_DEADLINE;
+    for (key, path) in files {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(inspect(&path, key, with_checkpoints));
+        });
+    }
+    drop(sender);
+    let mut rows = Vec::new();
+    while rows.len() < total {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(report) => rows.push(Row {
+                key: report.key,
+                status: report.status,
+                entry: report.entry,
+                checkpoints: report.checkpoints,
+            }),
+            Err(_) => break,
+        }
+    }
+    for key in keys {
+        if !rows.iter().any(|row| row.key == key) {
+            rows.push(Row {
+                key,
+                status: None,
+                entry: None,
+                checkpoints: Vec::new(),
+            });
+        }
+    }
+    rows
+}
+
+fn newest(row: &Row) -> Option<DateTime<FixedOffset>> {
+    row.checkpoints.first().and_then(checkpoint_time)
+}
+
+fn last_seen(row: &Row) -> Option<DateTime<FixedOffset>> {
+    row.entry
+        .as_ref()
+        .and_then(|entry| DateTime::parse_from_str(&entry.last_seen_at, TIMESTAMP_FORMAT).ok())
+}
+
+fn list(args: impl Iterator<Item = String>) -> i32 {
+    let Some(options) = parse_list_args(args) else {
+        usage();
+        return 1;
+    };
+    let dir = match store_dir() {
+        Ok(dir) => dir,
+        Err(reason) => {
+            eprintln!("loam loams: {reason}");
+            return 1;
+        }
+    };
+    let files = match entry_files(&dir) {
+        Ok(files) => files,
+        Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            eprintln!("loam loams: cannot read {}: {error}", dir.display());
+            return 1;
+        }
+    };
+    let mut rows = collect_rows(files, options.checkpoints);
+    for row in &mut rows {
+        sort_checkpoints(&mut row.checkpoints);
+        if options.limit > 0 {
+            row.checkpoints.truncate(options.limit);
+        }
+    }
+    rows.sort_by(|left, right| {
+        newest(right)
+            .cmp(&newest(left))
+            .then_with(|| last_seen(right).cmp(&last_seen(left)))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    if options.json {
+        println!("{}", render_json(&rows, options.checkpoints));
+    } else {
+        print!("{}", render_table(&rows, options.checkpoints));
+    }
+    0
+}
+
+fn text(value: &str) -> Value {
+    Value::String(value.to_owned())
+}
+
+fn optional(value: Option<&str>) -> Value {
+    value.map_or(Value::Null, text)
+}
+
+fn render_json(rows: &[Row], with_checkpoints: bool) -> String {
+    let loams = rows
+        .iter()
+        .map(|row| {
+            let mut fields = vec![
+                ("key".to_owned(), text(&row.key)),
+                ("status".to_owned(), text(&status_text(row.status.as_ref()))),
+            ];
+            if let Some(entry) = &row.entry {
+                fields.push(("workspace".to_owned(), text(&entry.workspace)));
+                fields.push(("wiki_root".to_owned(), text(&entry.wiki_root)));
+                fields.push(("registered_at".to_owned(), text(&entry.registered_at)));
+                fields.push(("last_seen_at".to_owned(), text(&entry.last_seen_at)));
+                if with_checkpoints {
+                    let items = row
+                        .checkpoints
+                        .iter()
+                        .map(|checkpoint| {
+                            Value::Object(vec![
+                                ("path".to_owned(), text(&checkpoint.path)),
+                                ("title".to_owned(), optional(checkpoint.title.as_deref())),
+                                (
+                                    "captured_at".to_owned(),
+                                    optional(checkpoint.captured_at.as_deref()),
+                                ),
+                                ("scope".to_owned(), optional(checkpoint.scope.as_deref())),
+                            ])
+                        })
+                        .collect();
+                    fields.push(("checkpoints".to_owned(), Value::Array(items)));
+                }
+            }
+            Value::Object(fields)
+        })
+        .collect();
+    Value::Object(vec![
+        ("schema".to_owned(), Value::Number(SCHEMA.to_owned())),
+        ("loams".to_owned(), Value::Array(loams)),
+    ])
+    .to_json()
+}
+
+fn render_table(rows: &[Row], with_checkpoints: bool) -> String {
+    let mut out = String::new();
+    for row in rows {
+        let status = status_text(row.status.as_ref());
+        match &row.entry {
+            Some(entry) => out.push_str(&format!(
+                "{status:<12} {}  (last seen {})\n",
+                entry.workspace, entry.last_seen_at
+            )),
+            None => out.push_str(&format!("{status:<12} {}\n", row.key)),
+        }
+        if with_checkpoints {
+            for checkpoint in &row.checkpoints {
+                out.push_str(&format!(
+                    "    {}  {}\n",
+                    checkpoint.captured_at.as_deref().unwrap_or("-"),
+                    checkpoint.title.as_deref().unwrap_or("(untitled)")
+                ));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
