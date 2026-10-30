@@ -2759,6 +2759,31 @@ mod tests {
     }
 
     #[test]
+    fn federation_never_reads_loams_store() {
+        // The machine-local loams store must stay invisible to federation code.
+        // Production text is cut at the test module, so these needles do not self-trip.
+        const FEDERATION_FILES: [&str; 8] = [
+            "federation.rs",
+            "envelope.rs",
+            "connector.rs",
+            "enrollment.rs",
+            "enrollment_auto.rs",
+            "transport.rs",
+            "service.rs",
+            "ipc.rs",
+        ];
+        for (path, production) in crate_production_sources() {
+            if !(FEDERATION_FILES.contains(&path.as_str()) || path.starts_with("ipc/")) {
+                continue;
+            }
+            assert!(
+                !production.contains("crate::loams") && !production.contains("loams::"),
+                "federation module {path} references the loams store"
+            );
+        }
+    }
+
+    #[test]
     fn render_quotes_and_sanitizes_the_injection_corpus() {
         let cases = json::parse(include_str!("../tests/fixtures/mqtt/injection-corpus.json"))
             .expect("injection corpus should parse");
