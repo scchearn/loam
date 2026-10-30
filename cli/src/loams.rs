@@ -1,7 +1,7 @@
 //! Machine-local loams store: one small JSON entry per loam workspace under
 //! `<configRoot>/loams/`. Nothing here ever writes under a workspace, and
 //! nothing here reads federation state.
-// Wired into `harness::run` (registration, T2) and the `loams` command (T3).
+// Registration is wired into `harness::run`; the `loams` command (T3) uses the rest.
 #![allow(dead_code)]
 
 use crate::json::{self, Value};

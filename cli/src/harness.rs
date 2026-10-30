@@ -1455,6 +1455,11 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     // Record after stdout: the harness already has its envelope, so a slow or
     // locked ledger cannot delay the response. Fail-open inside record_native.
     let workspace = workspace_from_frame(&frame, &paths.cwd);
+    let registry_detail = if event == HookEvent::SessionStart {
+        register_workspace(&workspace)
+    } else {
+        None
+    };
     record_native(
         &paths,
         harness,
@@ -1462,10 +1467,36 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         frame.get("session_id").and_then(Value::as_str),
         &workspace,
         outcome,
-        None,
+        registry_detail.as_deref(),
         started_at_ms,
     );
     0
+}
+
+/// Registration deadline: the adapters settle on process close, so a slow
+/// store must not hold the hook open.
+const REGISTRY_DEADLINE: Duration = Duration::from_millis(250);
+
+/// Register `workspace` in the machine loams store under a hard deadline and
+/// return the ledger `detail` (`None` for success and for every skip). A timed
+/// out worker thread is abandoned: process exit ends it, though a thread stuck
+/// in uninterruptible I/O can delay exit, which is accepted.
+fn register_workspace(workspace: &Path) -> Option<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let target = workspace.to_path_buf();
+    std::thread::spawn(move || {
+        let result = crate::loams::register(
+            &target,
+            chrono::Local::now().fixed_offset(),
+            &std::env::temp_dir(),
+        );
+        let _ = sender.send(result);
+    });
+    match receiver.recv_timeout(REGISTRY_DEADLINE) {
+        Ok(Ok(_)) => None,
+        Ok(Err(reason)) => Some(format!("registry: {reason}")),
+        Err(_) => Some("registry: timeout".to_string()),
+    }
 }
 
 /// Append this native hook invocation to the shared `hook_run` ledger (#136).
