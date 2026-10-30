@@ -2650,6 +2650,9 @@ mod tests {
             "harness.rs",
             "hooks.rs",
             "ipc/unix.rs",
+            // Machine-local loams store under the config dir; never reads
+            // federation state.
+            "loams.rs",
             "markdown.rs",
             "memory.rs",
             // Reads only, and only two things: the per-project peer roster that

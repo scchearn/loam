@@ -13,6 +13,7 @@ pub(crate) mod hooks;
 pub mod ipc;
 pub mod json;
 mod lint;
+mod loams;
 mod markdown;
 mod memory;
 pub mod provisioning;
