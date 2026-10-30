@@ -334,14 +334,14 @@ fn json_string_value(content: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_owned())
 }
 
-struct Checkpoint {
-    path: String,
-    title: Option<String>,
-    captured_at: Option<String>,
-    scope: Option<String>,
+pub(crate) struct Checkpoint {
+    pub(crate) path: String,
+    pub(crate) title: Option<String>,
+    pub(crate) captured_at: Option<String>,
+    pub(crate) scope: Option<String>,
 }
 
-fn read_checkpoints(wiki_root: &Path) -> Vec<Checkpoint> {
+pub(crate) fn read_checkpoints(wiki_root: &Path) -> Vec<Checkpoint> {
     let directory = wiki_root.join("checkpoints");
     let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
@@ -361,7 +361,7 @@ fn read_checkpoints(wiki_root: &Path) -> Vec<Checkpoint> {
     paths.into_iter().map(parse_checkpoint).collect()
 }
 
-fn parse_checkpoint(path: PathBuf) -> Checkpoint {
+pub(crate) fn parse_checkpoint(path: PathBuf) -> Checkpoint {
     let content = fs::read_to_string(&path).unwrap_or_default();
     let mut h1_title = None;
     let mut h3_title = None;
