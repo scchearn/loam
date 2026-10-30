@@ -110,7 +110,7 @@ fn run_hook_full(
         .env("LOAM_SKILLS_ROOT", skills_root)
         // Hermetic by default: a hook run must never register the repo checkout
         // into the real machine store. Callers override via `extra_env`.
-        .env("LOAM_REGISTRY", "off");
+        .env("LOAM_WORKSPACES", "off");
     if let Some(config_dir) = config_dir {
         command.env("LOAM_CONFIG_DIR", config_dir);
     }
@@ -600,12 +600,12 @@ fn the_briefing_reports_hcom_readiness_both_ways() {
     assert!(body.contains("hcom: not installed"), "{body}");
 }
 
-// ---- machine loams registry: SessionStart registration (T2) ----
+// ---- machine workspaces store: SessionStart registration (T2) ----
 
-/// A wiki workspace outside `temp_dir()` (the registry skips temp paths).
-fn registry_workspace(label: &str, marker: &str) -> PathBuf {
+/// A wiki workspace outside `temp_dir()` (the store skips temp paths).
+fn store_workspace(label: &str, marker: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "loams-{label}-{}",
+        "workspaces-{label}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -617,16 +617,16 @@ fn registry_workspace(label: &str, marker: &str) -> PathBuf {
     dir
 }
 
-/// Run a hook with `LOAM_REGISTRY` as given (`None` = unset, the production
+/// Run a hook with `LOAM_WORKSPACES` as given (`None` = unset, the production
 /// default) and the config/home roots pinned.
-fn run_registry_hook(
+fn run_store_hook(
     harness: &str,
     event: &str,
     workspace: &Path,
     global_root: &Path,
     skills_root: &Path,
     config_dir: &Path,
-    registry: Option<&str>,
+    store: Option<&str>,
 ) -> Run {
     let mut command = Command::new(binary());
     command
@@ -635,13 +635,13 @@ fn run_registry_hook(
         .env("LOAM_HOME", global_root)
         .env("LOAM_SKILLS_ROOT", skills_root)
         .env("LOAM_CONFIG_DIR", config_dir)
-        .env_remove("LOAM_REGISTRY")
+        .env_remove("LOAM_WORKSPACES")
         .current_dir(workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(value) = registry {
-        command.env("LOAM_REGISTRY", value);
+    if let Some(value) = store {
+        command.env("LOAM_WORKSPACES", value);
     }
     let mut child = command.spawn().expect("hook spawns");
     let frame = format!(r#"{{"cwd":"{}"}}"#, json_path(workspace));
@@ -660,7 +660,7 @@ fn run_registry_hook(
 }
 
 fn store_entries(config_dir: &Path) -> usize {
-    match std::fs::read_dir(config_dir.join("loams")) {
+    match std::fs::read_dir(config_dir.join("workspaces")) {
         Ok(entries) => entries
             .filter_map(Result::ok)
             .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
@@ -670,12 +670,12 @@ fn store_entries(config_dir: &Path) -> usize {
 }
 
 #[test]
-fn loams_session_start_records_the_workspace_for_every_harness() {
+fn workspaces_session_start_records_the_workspace_for_every_harness() {
     for harness in ["claude", "codex", "cursor", "opencode"] {
-        let (global_root, skills_root) = installation(&format!("loams-{harness}"));
-        let config = isolated_config(&format!("loams-{harness}"));
-        let workspace = registry_workspace(harness, "wiki/index.md");
-        let on = run_registry_hook(
+        let (global_root, skills_root) = installation(&format!("workspaces-{harness}"));
+        let config = isolated_config(&format!("workspaces-{harness}"));
+        let workspace = store_workspace(harness, "wiki/index.md");
+        let on = run_store_hook(
             harness,
             "SessionStart",
             &workspace,
@@ -686,8 +686,8 @@ fn loams_session_start_records_the_workspace_for_every_harness() {
         );
         assert_eq!(on.status, 0, "{harness}: {}", on.stderr);
         assert_eq!(store_entries(&config), 1, "{harness} recorded once");
-        let off_config = isolated_config(&format!("loams-{harness}-off"));
-        let off = run_registry_hook(
+        let off_config = isolated_config(&format!("workspaces-{harness}-off"));
+        let off = run_store_hook(
             harness,
             "SessionStart",
             &workspace,
@@ -707,12 +707,12 @@ fn loams_session_start_records_the_workspace_for_every_harness() {
 }
 
 #[test]
-fn loams_non_loam_and_goals_only_workspaces_do_not_record() {
+fn workspaces_non_loam_and_goals_only_workspaces_do_not_record() {
     for (label, marker) in [("plain", "README.md"), ("goals", "goals/g.md")] {
-        let (global_root, skills_root) = installation(&format!("loams-{label}"));
-        let config = isolated_config(&format!("loams-{label}"));
-        let workspace = registry_workspace(label, marker);
-        let run = run_registry_hook(
+        let (global_root, skills_root) = installation(&format!("workspaces-{label}"));
+        let config = isolated_config(&format!("workspaces-{label}"));
+        let workspace = store_workspace(label, marker);
+        let run = run_store_hook(
             "claude",
             "SessionStart",
             &workspace,
@@ -727,11 +727,11 @@ fn loams_non_loam_and_goals_only_workspaces_do_not_record() {
 }
 
 #[test]
-fn loams_other_events_do_not_record() {
-    let (global_root, skills_root) = installation("loams-prompt");
-    let config = isolated_config("loams-prompt");
-    let workspace = registry_workspace("prompt", "wiki/index.md");
-    let run = run_registry_hook(
+fn workspaces_other_events_do_not_record() {
+    let (global_root, skills_root) = installation("workspaces-prompt");
+    let config = isolated_config("workspaces-prompt");
+    let workspace = store_workspace("prompt", "wiki/index.md");
+    let run = run_store_hook(
         "claude",
         "UserPromptSubmit",
         &workspace,
@@ -745,13 +745,13 @@ fn loams_other_events_do_not_record() {
 }
 
 #[test]
-fn loams_unwritable_config_root_keeps_stdout_and_marks_the_ledger() {
-    let (global_root, skills_root) = installation("loams-unwritable");
-    let workspace = registry_workspace("unwritable", "wiki/index.md");
+fn workspaces_unwritable_config_root_keeps_stdout_and_marks_the_ledger() {
+    let (global_root, skills_root) = installation("workspaces-unwritable");
+    let workspace = store_workspace("unwritable", "wiki/index.md");
     // A regular file where the config directory should be.
-    let blocked = temp_root("loams-blocked").join("config-is-a-file");
+    let blocked = temp_root("workspaces-blocked").join("config-is-a-file");
     std::fs::write(&blocked, "x").unwrap();
-    let on = run_registry_hook(
+    let on = run_store_hook(
         "claude",
         "SessionStart",
         &workspace,
@@ -760,7 +760,7 @@ fn loams_unwritable_config_root_keeps_stdout_and_marks_the_ledger() {
         &blocked,
         None,
     );
-    let off = run_registry_hook(
+    let off = run_store_hook(
         "claude",
         "SessionStart",
         &workspace,
@@ -773,7 +773,7 @@ fn loams_unwritable_config_root_keeps_stdout_and_marks_the_ledger() {
     assert_eq!(on.stdout, off.stdout, "stdout is invariant");
     let listing = hooks_list(&global_root, &[]);
     assert!(
-        listing.contains("\"detail\":\"registry:"),
-        "ledger detail names the registry failure: {listing}"
+        listing.contains("\"detail\":\"workspaces:"),
+        "ledger detail names the workspaces store failure: {listing}"
     );
 }

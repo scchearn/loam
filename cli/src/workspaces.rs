@@ -1,5 +1,5 @@
-//! Machine-local loams store: one small JSON entry per loam workspace under
-//! `<configRoot>/loams/`. Nothing here ever writes under a workspace, and
+//! Machine-local workspaces store: one small JSON entry per loam workspace under
+//! `<configRoot>/workspaces/`. Nothing here ever writes under a workspace, and
 //! nothing here reads federation state.
 use crate::json::{self, Value};
 use crate::sha256::Sha256;
@@ -16,7 +16,7 @@ const SCHEMA: &str = "1";
 /// Why a workspace was not registered. Skips are not failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Skip {
-    /// `LOAM_REGISTRY=off`.
+    /// `LOAM_WORKSPACES=off`.
     Disabled,
     /// The workspace sits under the system temp dir.
     Temp,
@@ -93,13 +93,13 @@ fn read_entry(path: &Path) -> std::io::Result<String> {
     String::from_utf8(bytes).map_err(|_| ErrorKind::InvalidData.into())
 }
 
-/// `<configRoot>/loams`.
+/// `<configRoot>/workspaces`.
 pub(crate) fn store_dir() -> Result<PathBuf, &'static str> {
     let root = crate::provisioning::configured_config_root().ok_or("config_root_unresolved")?;
     if !root.is_absolute() {
         return Err("config_root_relative");
     }
-    Ok(root.join("loams"))
+    Ok(root.join("workspaces"))
 }
 
 /// Canonicalize, reduced to the path every tool accepts.
@@ -109,7 +109,7 @@ fn canonical_path(path: &Path) -> std::io::Result<PathBuf> {
 
 /// The SessionStart gate: not disabled, outside the temp root, a loam.
 pub(crate) fn gate(workspace: &Path, temp_root: &Path) -> Result<Gated, Skip> {
-    if std::env::var("LOAM_REGISTRY").is_ok_and(|value| value.trim() == "off") {
+    if std::env::var("LOAM_WORKSPACES").is_ok_and(|value| value.trim() == "off") {
         return Err(Skip::Disabled);
     }
     // A workspace that cannot be canonicalized cannot be a loam either.
@@ -421,7 +421,7 @@ pub(crate) fn classify(entry_path: &Path, stat: &Stat) -> Status {
 }
 
 // ---------------------------------------------------------------------------
-// `loam loams`
+// `loam workspaces`
 // ---------------------------------------------------------------------------
 
 use crate::state::Checkpoint;
@@ -434,7 +434,7 @@ const DEFAULT_LIMIT: usize = 3;
 
 fn usage() {
     eprintln!(
-        "Usage:\n  loam loams list [--checkpoints] [--limit <N>] [--json]\n  loam loams add <path>\n  loam loams import [--ledger <path>]\n  loam loams prune [--yes]"
+        "Usage:\n  loam workspaces list [--checkpoints] [--limit <N>] [--json]\n  loam workspaces add <path>\n  loam workspaces import [--ledger <path>]\n  loam workspaces prune [--yes]"
     );
 }
 
@@ -774,11 +774,11 @@ fn add(mut args: impl Iterator<Item = String>) -> i32 {
             println!("{label}: {shown}");
         }
         Ok((Outcome::Skipped(skip), _)) => {
-            eprintln!("loam loams: skipped: {}", skip_text(&skip));
+            eprintln!("loam workspaces: skipped: {}", skip_text(&skip));
             return 1;
         }
         Err(reason) => {
-            eprintln!("loam loams: {reason}");
+            eprintln!("loam workspaces: {reason}");
             return 1;
         }
     }
@@ -797,7 +797,7 @@ fn import(mut args: impl Iterator<Item = String>) -> i32 {
         }
     }
     if let Err(reason) = store_dir() {
-        eprintln!("loam loams: {reason}");
+        eprintln!("loam workspaces: {reason}");
         return 1;
     }
     let ledger = ledger.unwrap_or_else(|| {
@@ -812,7 +812,10 @@ fn import(mut args: impl Iterator<Item = String>) -> i32 {
             return 0;
         }
         Err(reason) => {
-            eprintln!("loam loams: cannot read {}: {reason}", ledger.display());
+            eprintln!(
+                "loam workspaces: cannot read {}: {reason}",
+                ledger.display()
+            );
             return 1;
         }
     };
@@ -910,7 +913,7 @@ fn prune(args: impl Iterator<Item = String>) -> i32 {
     let dir = match store_dir() {
         Ok(dir) => dir,
         Err(reason) => {
-            eprintln!("loam loams: {reason}");
+            eprintln!("loam workspaces: {reason}");
             return 1;
         }
     };
@@ -918,7 +921,7 @@ fn prune(args: impl Iterator<Item = String>) -> i32 {
         Ok(listing) => listing,
         Err(error) if error.kind() == ErrorKind::NotFound => return 0,
         Err(error) => {
-            eprintln!("loam loams: cannot read {}: {error}", dir.display());
+            eprintln!("loam workspaces: cannot read {}: {error}", dir.display());
             return 1;
         }
     };
@@ -994,7 +997,7 @@ fn prune(args: impl Iterator<Item = String>) -> i32 {
     let store = match fs::canonicalize(&dir) {
         Ok(store) => store,
         Err(error) => {
-            eprintln!("loam loams: cannot read {}: {error}", dir.display());
+            eprintln!("loam workspaces: cannot read {}: {error}", dir.display());
             return 1;
         }
     };
@@ -1008,7 +1011,10 @@ fn prune(args: impl Iterator<Item = String>) -> i32 {
             Ok(()) => println!("removed: {}  [{why}]", name_of(path)),
             Err(reason) => {
                 failed = true;
-                eprintln!("loam loams: could not remove {}: {reason}", name_of(path));
+                eprintln!(
+                    "loam workspaces: could not remove {}: {reason}",
+                    name_of(path)
+                );
             }
         }
     }
@@ -1033,7 +1039,7 @@ fn list(args: impl Iterator<Item = String>) -> i32 {
     let dir = match store_dir() {
         Ok(dir) => dir,
         Err(reason) => {
-            eprintln!("loam loams: {reason}");
+            eprintln!("loam workspaces: {reason}");
             return 1;
         }
     };
@@ -1044,7 +1050,7 @@ fn list(args: impl Iterator<Item = String>) -> i32 {
             failed: Vec::new(),
         },
         Err(error) => {
-            eprintln!("loam loams: cannot read {}: {error}", dir.display());
+            eprintln!("loam workspaces: cannot read {}: {error}", dir.display());
             return 1;
         }
     };
@@ -1078,7 +1084,7 @@ fn optional(value: Option<&str>) -> Value {
 }
 
 fn render_json(rows: &[Row], with_checkpoints: bool) -> String {
-    let loams = rows
+    let workspaces = rows
         .iter()
         .map(|row| {
             let mut fields = vec![
@@ -1114,7 +1120,7 @@ fn render_json(rows: &[Row], with_checkpoints: bool) -> String {
         .collect();
     Value::Object(vec![
         ("schema".to_owned(), Value::Number(SCHEMA.to_owned())),
-        ("loams".to_owned(), Value::Array(loams)),
+        ("workspaces".to_owned(), Value::Array(workspaces)),
     ])
     .to_json()
 }
@@ -1149,7 +1155,7 @@ mod tests {
 
     #[test]
     fn a_folder_inside_a_wiki_is_not_a_loam() {
-        let root = std::env::temp_dir().join(format!("loams-subwiki-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("workspaces-subwiki-{}", std::process::id()));
         let code = root.join("x").join("wiki").join("code");
         fs::create_dir_all(&code).unwrap();
         fs::write(root.join("x").join("wiki").join("index.md"), "# w\n").unwrap();
@@ -1176,7 +1182,7 @@ mod tests {
             let dir = fs::canonicalize(std::env::temp_dir())
                 .unwrap()
                 .join(format!(
-                    "loam-loams-test-{nanos}-{}",
+                    "loam-workspaces-test-{nanos}-{}",
                     N.fetch_add(1, Ordering::SeqCst)
                 ));
             fs::create_dir_all(&dir).unwrap();
@@ -1233,12 +1239,12 @@ mod tests {
     fn registered(scratch: &Scratch) -> Env {
         Env::set(&[
             ("LOAM_CONFIG_DIR", Some(scratch.config().to_str().unwrap())),
-            ("LOAM_REGISTRY", None),
+            ("LOAM_WORKSPACES", None),
         ])
     }
 
     fn entry_files(scratch: &Scratch) -> Vec<PathBuf> {
-        let mut files: Vec<PathBuf> = fs::read_dir(scratch.config().join("loams"))
+        let mut files: Vec<PathBuf> = fs::read_dir(scratch.config().join("workspaces"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect();
@@ -1322,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn non_loams_are_skipped_and_nothing_is_written() {
+    fn non_workspaces_are_skipped_and_nothing_is_written() {
         let _lock = crate::env_lock();
         let scratch = Scratch::new();
         let _env = registered(&scratch);
@@ -1352,7 +1358,7 @@ mod tests {
                 workspace.display()
             );
         }
-        assert!(!scratch.config().join("loams").exists());
+        assert!(!scratch.config().join("workspaces").exists());
     }
 
     #[test]
@@ -1372,11 +1378,11 @@ mod tests {
         let narrow_root = scratch.0.join("tmp");
         fs::create_dir_all(&narrow_root).unwrap();
         assert!(gate(&sibling, &narrow_root).is_ok());
-        assert!(!scratch.config().join("loams").exists());
+        assert!(!scratch.config().join("workspaces").exists());
     }
 
     #[test]
-    fn registry_off_relative_and_unresolved_config_roots_skip_silently() {
+    fn disabled_relative_and_unresolved_config_roots_skip_silently() {
         let _lock = crate::env_lock();
         let scratch = Scratch::new();
         let workspace = scratch.workspace("gated");
@@ -1385,7 +1391,7 @@ mod tests {
         {
             let _env = Env::set(&[
                 ("LOAM_CONFIG_DIR", Some(scratch.config().to_str().unwrap())),
-                ("LOAM_REGISTRY", Some("off")),
+                ("LOAM_WORKSPACES", Some("off")),
             ]);
             assert_eq!(
                 register(&workspace, now, Path::new(NO_TEMP)),
@@ -1395,7 +1401,7 @@ mod tests {
         {
             let _env = Env::set(&[
                 ("LOAM_CONFIG_DIR", Some("relative/config")),
-                ("LOAM_REGISTRY", None),
+                ("LOAM_WORKSPACES", None),
             ]);
             assert_eq!(store_dir(), Err("config_root_relative"));
             assert_eq!(
@@ -1409,7 +1415,7 @@ mod tests {
                 ("XDG_CONFIG_HOME", None),
                 ("APPDATA", None),
                 ("HOME", None),
-                ("LOAM_REGISTRY", None),
+                ("LOAM_WORKSPACES", None),
             ]);
             assert_eq!(store_dir(), Err("config_root_unresolved"));
             assert_eq!(
@@ -1418,7 +1424,7 @@ mod tests {
             );
         }
         assert!(!scratch.config().exists());
-        assert!(!workspace.join("loams").exists());
+        assert!(!workspace.join("workspaces").exists());
         // The relative root must not be created relative to the cwd or the
         // workspace either.
         assert!(!std::env::current_dir().unwrap().join("relative").exists());
@@ -1433,7 +1439,7 @@ mod tests {
         let config = workspace.join(".cfg");
         let _env = Env::set(&[
             ("LOAM_CONFIG_DIR", Some(config.to_str().unwrap())),
-            ("LOAM_REGISTRY", None),
+            ("LOAM_WORKSPACES", None),
         ]);
         let before = fs::read_dir(&workspace).unwrap().count();
         assert_eq!(
@@ -1466,11 +1472,11 @@ mod tests {
     }
 
     #[test]
-    fn store_dir_is_the_config_root_plus_loams() {
+    fn store_dir_is_the_config_root_plus_workspaces() {
         let _lock = crate::env_lock();
         let scratch = Scratch::new();
         let _env = registered(&scratch);
-        assert_eq!(store_dir(), Ok(scratch.config().join("loams")));
+        assert_eq!(store_dir(), Ok(scratch.config().join("workspaces")));
     }
 
     #[test]
@@ -1516,7 +1522,7 @@ mod tests {
             Path::new(NO_TEMP),
         )
         .unwrap();
-        let dir_mode = fs::metadata(scratch.config().join("loams"))
+        let dir_mode = fs::metadata(scratch.config().join("workspaces"))
             .unwrap()
             .permissions()
             .mode();
@@ -1821,7 +1827,7 @@ mod tests {
         let config = workspace.join(".cfg");
         let _env = Env::set(&[
             ("LOAM_CONFIG_DIR", Some(config.to_str().unwrap())),
-            ("LOAM_REGISTRY", None),
+            ("LOAM_WORKSPACES", None),
         ]);
         assert_eq!(
             register(

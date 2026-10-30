@@ -2650,9 +2650,9 @@ mod tests {
             "harness.rs",
             "hooks.rs",
             "ipc/unix.rs",
-            // Machine-local loams store under the config dir; never reads
+            // Machine-local workspaces store under the config dir; never reads
             // federation state.
-            "loams.rs",
+            "workspaces.rs",
             "markdown.rs",
             "memory.rs",
             // Reads only, and only two things: the per-project peer roster that
@@ -2759,8 +2759,8 @@ mod tests {
     }
 
     #[test]
-    fn federation_never_reads_loams_store() {
-        // The machine-local loams store must stay invisible to federation code.
+    fn federation_never_reads_workspaces_store() {
+        // The machine-local workspaces store must stay invisible to federation code.
         // Production text is cut at the test module, so these needles do not self-trip.
         const FEDERATION_FILES: [&str; 8] = [
             "federation.rs",
@@ -2777,8 +2777,8 @@ mod tests {
                 continue;
             }
             assert!(
-                !production.contains("crate::loams") && !production.contains("loams::"),
-                "federation module {path} references the loams store"
+                !production.contains("crate::workspaces") && !production.contains("workspaces::"),
+                "federation module {path} references the workspaces store"
             );
         }
     }

@@ -1,4 +1,4 @@
-//! `loam loams list` — fan-out view over the machine-local loams store.
+//! `loam workspaces list` — fan-out view over the machine-local workspaces store.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ fn plain(path: PathBuf) -> PathBuf {
 
 impl Fixture {
     fn new(label: &str) -> Fixture {
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("loams-{label}"));
+        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("workspaces-{label}"));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let root = plain(fs::canonicalize(root).unwrap());
@@ -39,7 +39,7 @@ impl Fixture {
     }
 
     fn store(&self) -> PathBuf {
-        self.config().join("loams")
+        self.config().join("workspaces")
     }
 
     /// A workspace with a wiki marker and `count` checkpoints, captured on
@@ -77,7 +77,7 @@ impl Fixture {
     fn run(&self, args: &[&str]) -> (i32, String, String) {
         let binary = env!("CARGO_BIN_EXE_loam");
         let output = Command::new(binary)
-            .arg("loams")
+            .arg("workspaces")
             .args(args)
             .env("LOAM_CONFIG_DIR", self.config())
             .env("LOAM_HOME", self.home())
@@ -119,8 +119,8 @@ fn three(fixture: &Fixture) {
 }
 
 fn status_of(json: &loam::json::Value, key: &str) -> String {
-    json.get("loams")
-        .and_then(|loams| loams.as_array())
+    json.get("workspaces")
+        .and_then(|workspaces| workspaces.as_array())
         .unwrap()
         .iter()
         .find(|item| item.get("key").and_then(|v| v.as_str()) == Some(key))
@@ -146,15 +146,15 @@ fn list_json_reports_statuses_and_the_three_newest_checkpoints() {
     assert_eq!(status_of(&json, "bbb"), "live");
     assert_eq!(status_of(&json, "ccc"), "missing");
 
-    let loams = json.get("loams").unwrap().as_array().unwrap();
+    let workspaces = json.get("workspaces").unwrap().as_array().unwrap();
     // Newest checkpoint first: busy, then the rest by last_seen_at (desc).
-    let keys: Vec<_> = loams
+    let keys: Vec<_> = workspaces
         .iter()
         .map(|l| l.get("key").unwrap().as_str().unwrap())
         .collect();
     assert_eq!(keys, ["aaa", "ccc", "bbb"]);
 
-    let busy = &loams[0];
+    let busy = &workspaces[0];
     for field in ["workspace", "wiki_root", "registered_at", "last_seen_at"] {
         assert!(busy.get(field).is_some(), "{field}");
     }
@@ -176,7 +176,7 @@ fn list_json_reports_statuses_and_the_three_newest_checkpoints() {
     assert_eq!(first.get("scope").unwrap().as_str(), Some("scope-5"));
     assert!(first.get("path").is_some());
     assert_eq!(
-        loams[2]
+        workspaces[2]
             .get("checkpoints")
             .unwrap()
             .as_array()
@@ -193,7 +193,7 @@ fn list_without_checkpoints_flag_omits_the_field() {
     let (code, stdout, _) = fixture.run(&["list", "--json"]);
     assert_eq!(code, 0);
     let json = parse(&stdout);
-    for item in json.get("loams").unwrap().as_array().unwrap() {
+    for item in json.get("workspaces").unwrap().as_array().unwrap() {
         assert!(item.get("checkpoints").is_none());
     }
 }
@@ -220,7 +220,7 @@ fn limit_zero_shows_all_checkpoints() {
     three(&fixture);
     let (_, stdout, _) = fixture.run(&["list", "--checkpoints", "--limit", "0", "--json"]);
     let json = parse(&stdout);
-    let busy = &json.get("loams").unwrap().as_array().unwrap()[0];
+    let busy = &json.get("workspaces").unwrap().as_array().unwrap()[0];
     assert_eq!(
         busy.get("checkpoints").unwrap().as_array().unwrap().len(),
         5
@@ -240,9 +240,9 @@ fn malformed_entry_is_invalid_with_key_and_status_only() {
     assert_eq!(code, 0);
     let json = parse(&stdout);
     assert_eq!(status_of(&json, "zzz"), "invalid");
-    let loams = json.get("loams").unwrap().as_array().unwrap();
-    assert_eq!(loams.len(), 4);
-    let invalid = loams
+    let workspaces = json.get("workspaces").unwrap().as_array().unwrap();
+    assert_eq!(workspaces.len(), 4);
+    let invalid = workspaces
         .iter()
         .find(|l| l.get("key").unwrap().as_str() == Some("zzz"))
         .unwrap();
@@ -256,7 +256,7 @@ fn absent_store_is_empty_and_exits_zero() {
     let (code, stdout, _) = fixture.run(&["list", "--json"]);
     assert_eq!(code, 0);
     assert!(parse(&stdout)
-        .get("loams")
+        .get("workspaces")
         .unwrap()
         .as_array()
         .unwrap()
@@ -283,7 +283,7 @@ fn store_path_that_is_a_file_exits_one_with_path_and_error() {
 fn relative_config_root_exits_one_with_reason() {
     let fixture = Fixture::new("relcfg");
     let output = Command::new(env!("CARGO_BIN_EXE_loam"))
-        .args(["loams", "list"])
+        .args(["workspaces", "list"])
         .env("LOAM_CONFIG_DIR", "relative/dir")
         .current_dir(&fixture.root)
         .output()
@@ -302,7 +302,7 @@ fn bad_arguments_print_usage() {
 
 #[cfg(unix)]
 #[test]
-fn hung_checkpoint_read_times_out_while_other_loams_report() {
+fn hung_checkpoint_read_times_out_while_other_workspaces_report() {
     let fixture = Fixture::new("fifo");
     three(&fixture);
     let hung = fixture.workspace("hung", 1);
@@ -319,8 +319,8 @@ fn hung_checkpoint_read_times_out_while_other_loams_report() {
     let json = parse(&stdout);
     assert_eq!(status_of(&json, "ddd"), "timeout");
     let hung_row = json
-        .get("loams")
-        .and_then(|loams| loams.as_array())
+        .get("workspaces")
+        .and_then(|workspaces| workspaces.as_array())
         .unwrap()
         .iter()
         .find(|item| item.get("key").and_then(|v| v.as_str()) == Some("ddd"))
@@ -395,9 +395,9 @@ fn non_utf8_entry_name_is_invalid_and_does_not_fail_the_listing() {
     let (code, stdout, stderr) = fixture.run(&["list", "--json"]);
     assert_eq!(code, 0, "{stderr}");
     let json = parse(&stdout);
-    let loams = json.get("loams").unwrap().as_array().unwrap();
-    assert_eq!(loams.len(), 4);
-    assert!(loams
+    let workspaces = json.get("workspaces").unwrap().as_array().unwrap();
+    assert_eq!(workspaces.len(), 4);
+    assert!(workspaces
         .iter()
         .any(|l| l.get("status").and_then(|v| v.as_str()) == Some("invalid")));
 }
@@ -494,14 +494,14 @@ fn ledger_with(fixture: &Fixture, workspaces: &[&Path]) -> PathBuf {
 }
 
 #[test]
-fn import_records_only_loams_and_is_idempotent() {
+fn import_records_only_workspaces_and_is_idempotent() {
     let fixture = Fixture::new("import");
     let loam_ws = fixture.workspace("real", 2);
     let plain = fixture.root.join("plain");
     fs::create_dir_all(&plain).unwrap();
     let gone = fixture.root.join("gone");
     let temp_ws = std::env::temp_dir().join(format!(
-        "loam-loams-import-{}",
+        "loam-workspaces-import-{}",
         fixture.root.file_name().unwrap().to_string_lossy()
     ));
     fs::create_dir_all(&temp_ws).unwrap();
@@ -703,7 +703,12 @@ fn add_echoes_the_canonical_workspace() {
 fn import_fails_up_front_when_the_store_cannot_be_resolved() {
     let fixture = Fixture::new("importnostore");
     let output = Command::new(env!("CARGO_BIN_EXE_loam"))
-        .args(["loams", "import", "--ledger", "/nonexistent/ledger.sqlite3"])
+        .args([
+            "workspaces",
+            "import",
+            "--ledger",
+            "/nonexistent/ledger.sqlite3",
+        ])
         .env("LOAM_CONFIG_DIR", "relative/config")
         .env("LOAM_HOME", fixture.home())
         .output()
