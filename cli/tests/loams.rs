@@ -11,12 +11,22 @@ struct Fixture {
     root: PathBuf,
 }
 
+/// `fs::canonicalize` returns verbatim `\\?\C:\...` paths on Windows; the store
+/// records the plain `C:\...` form, so fixtures use it too.
+fn plain(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
 impl Fixture {
     fn new(label: &str) -> Fixture {
         let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("loams-{label}"));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let root = fs::canonicalize(root).unwrap();
+        let root = plain(fs::canonicalize(root).unwrap());
         Fixture { root }
     }
 

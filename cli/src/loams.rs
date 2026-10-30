@@ -1787,7 +1787,7 @@ mod tests {
         let entry = Entry::parse(&fs::read_to_string(&files[0]).unwrap()).unwrap();
         assert_eq!(
             entry.workspace,
-            fs::canonicalize(&workspace).unwrap().display().to_string()
+            canonical_path(&workspace).unwrap().display().to_string()
         );
         assert!(entry.wiki_root.ends_with("wiki"), "{}", entry.wiki_root);
     }
@@ -1807,7 +1807,7 @@ mod tests {
         let entry = Entry::parse(&fs::read_to_string(&entry_files(&scratch)[0]).unwrap()).unwrap();
         assert_eq!(
             entry.workspace,
-            fs::canonicalize(&workspace).unwrap().display().to_string()
+            canonical_path(&workspace).unwrap().display().to_string()
         );
     }
 
