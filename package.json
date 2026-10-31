@@ -11,7 +11,8 @@
   "bugs": "https://github.com/scchearn/loam/issues",
   "main": ".opencode/plugins/loam.js",
   "bin": {
-    "loam": "bin/loam.mjs"
+    "loam": "bin/loam.mjs",
+    "loam-coordinator": "bin/coordinator.mjs"
   },
   "files": [
     "bin",

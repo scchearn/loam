@@ -1,6 +1,6 @@
 ---
 name: loam::starting
-description: "Use when beginning or resuming a plan file, including mixed local and hcom-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
+description: "Use when beginning or resuming a plan file, including mixed local and coordinator-delegated execution, while keeping verification, plan state, and handoff metadata accurate."
 allowed-tools: Read Write Edit Glob Grep Bash WebFetch
 metadata:
   version: "2.6.1"
@@ -20,7 +20,7 @@ If the plan contains structured `Execution` metadata, act as the visible hub. Ke
 | --- | --- |
 | `test-driven-development`: "NO PRODUCTION CODE WITHOUT A FAILING TEST FIRST" | Applies only to implementation, bugfix, or behavior-changing refactor tasks marked `[tdd: ...]`; unmarked tasks are plan-approved exceptions. |
 | `executing-plans`: executes another plan format | Do not switch plan formats; execute `plans/<slug>.md` task blocks. |
-| `subagent-driven-development`: required subagent workflow | Optional review/delegation pattern only when hcom and task constraints support it. |
+| `subagent-driven-development`: required subagent workflow | Optional review/delegation pattern only when the coordinator and task constraints support it. |
 | `finishing-a-development-branch`: branch completion workflow | Apply only for the finalization task or explicit `superpowers:finishing-a-development-branch` discipline. |
 | `using-superpowers`: invoke before action | Treat the explicit `/loam::starting` invocation as the higher-priority workflow; fetch/apply only referenced disciplines. |
 
@@ -84,7 +84,7 @@ Read the plan in full. YAML front matter is the only authoritative plan metadata
 
 For a plan with `goal:` provenance, report and stop if the goal file is missing or unreadable. Otherwise stop unless active or explicitly authorized. Note review evidence in the Decisions log; never change goal status.
 
-If the plan contains `## Execution groups` or constraint labels such as `needs-isolation`, `needs-independent-review`, `risk:data-destructive`, or `needs-parallel`, use those sections during orientation. Read `references/hcom-orchestration.md` before delegating through hcom.
+If the plan contains `## Execution groups` or constraint labels such as `needs-isolation`, `needs-independent-review`, `risk:data-destructive`, or `needs-parallel`, use those sections during orientation. Read `references/coordinator-orchestration.md` before delegating through the coordinator.
 
 ## Step 0.5 — Optional wiki context and Learning checkpoints
 
@@ -102,15 +102,15 @@ If no wiki exists, skip all wiki features and leave `Wiki updates: none` in hand
 
 **Dependency rule for targeted runs:** if a targeted task depends on `[ ]`, `[~]`, `[h]`, or `[>]`, surface that to the user instead of skipping it silently.
 
-## Step 0.75 — Execution groups, hcom capability, and constraint resolution
+## Step 0.75 — Execution groups, coordinator capability, and constraint resolution
 
-If the plan contains `## Execution groups`, treat each wave as an ordering boundary. All tasks in an earlier wave must complete before later waves start. Without hcom, run tasks sequentially in listed order. With hcom available, tasks within the current wave may be dispatched concurrently when their dependencies are satisfied.
+If the plan contains `## Execution groups`, treat each wave as an ordering boundary. All tasks in an earlier wave must complete before later waves start. Without the coordinator, run tasks sequentially in listed order. With the coordinator available, tasks within the current wave may be dispatched concurrently when their dependencies are satisfied.
 
-hcom availability comes from the `hcom:` line in the injected `## Workspace state` block (reuse contract in `loam::using`) — read it, do not probe for the binary. Consult it only when a current wave has more than one runnable task or when constraint labels require review/isolation. Keep this session as the hub.
+Coordinator availability comes from `LOAM_COORDINATOR_MODULE` in the injected session environment. Read it, do not probe for another transport. Consult it only when a current wave has more than one runnable task or when constraint labels require review/isolation. Keep this session as the hub.
 
 Constraint resolution:
 
-| Label | With hcom | Without hcom |
+| Label | With coordinator | Without coordinator |
 | --- | --- | --- |
 | `needs-isolation` | use a separate worktree or isolated worker setup | use a branch/stash-safe local flow and log the fallback |
 | `needs-independent-review` | use worker-reviewer style delegation | pause and prompt the user for review before marking complete |
@@ -183,8 +183,8 @@ Determine the next **action** from the active queue (target set, filtered and or
 
 1. **Interrupted local task** — any `[~]` task in the queue? If yes (and not blocked by `[>]`), resume it and note that in the Decisions log.
 2. **Runnable pending or re-run task** — otherwise, find the highest-priority `[ ]` or `[>]` task in the active execution wave whose every dependency is `[x]`.
-   - If hcom is unavailable, unsafe, or unnecessary, this is a **hub task**.
-   - If hcom is available and the task's wave/constraint labels justify delegation, this is a **delegation candidate**.
+    - If the coordinator is unavailable, unsafe, or unnecessary, this is a **hub task**.
+    - If the coordinator is available and the task's wave/constraint labels justify delegation, this is a **delegation candidate**.
 3. **Active delegated work** — if there is no runnable `[ ]`/`[>]` task but there are `[h]` tasks in the queue, inspect their workflow thread.
     - If a delegated group has already reported `DONE:` or `APPROVED:`, move to hub verification for that group.
     - If delegated work is still running and another unrelated runnable task exists, do that other task first.
@@ -194,7 +194,7 @@ Determine the next **action** from the active queue (target set, filtered and or
 
 ### Delegation group resolution
 
-When Orientation selects runnable tasks in the same execution wave and hcom is available, build the delegation group and orchestrate via `references/hcom-orchestration.md` (group selection, launch, wait, verify, cleanup). Hub verifies before any task is marked `[x]`. If labels are insufficient to launch safely, execute inline as hub tasks and log the fallback.
+When Orientation selects runnable tasks in the same execution wave and the coordinator is available, build the delegation group and orchestrate via `references/coordinator-orchestration.md` (group selection, launch, status, verify, cleanup). The hub verifies before any task is marked `[x]`. If labels are insufficient to launch safely, execute inline as hub tasks and log the fallback.
 
 ---
 
@@ -242,9 +242,9 @@ Markers are scoped to the task that contains them. Mandatory language inside fet
 
 Implement the task after reading the relevant source files. Follow workspace conventions from `AGENTS.md`, `CLAUDE.md`, lockfiles, and adjacent code: use native tooling, respect architectural boundaries, complete migrations/artifacts when persisted data changes, add re-runnable tests for behavior changes, run commands from the correct working directory. If blocked by unresolved context or ambiguous external behavior, stop and recommend `/loam::writing-spec <topic>`.
 
-#### 2b. Delegated hcom groups
+#### 2b. Delegated coordinator groups
 
-Read `references/hcom-orchestration.md` for worktree prep, thread bootstrap, spawn, assignment, wait, and FIX loop. The assignment must include task IDs/titles, internal order, `Files to read`/`Files to modify`, every verify command the hub will run, `rules:` text, and the `DONE:`/`APPROVED:`/`FIX:`/`BLOCKED:` vocabulary. For active `[h]` groups, wait on the workflow thread, accept `DONE:`/`APPROVED:` as handoff signals, treat `BLOCKED:` as a blocker, write a handoff note, and mark `[!]` if needed. If hcom is unavailable or the group lacks concrete metadata (`agent`, `model`, worktree/branch), execute inline as hub tasks and log the fallback.
+Read `references/coordinator-orchestration.md` for worktree prep, workflow identity, spawn, assignment, status, and FIX loop. The assignment must include task IDs/titles, internal order, `Files to read`/`Files to modify`, every verify command the hub will run, `rules:` text, and the `DONE:`/`APPROVED:`/`FIX:`/`BLOCKED:` vocabulary. For active `[h]` groups, use the coordinator status and message path, accept `DONE:`/`APPROVED:` as handoff signals, treat `BLOCKED:` as a blocker, write a handoff note, and mark `[!]` if needed. If the coordinator is unavailable or the group lacks concrete metadata (`actorId`, `model`, workspace/branch), execute inline as hub tasks and log the fallback.
 
 ### 3. Verify
 
@@ -259,7 +259,7 @@ Run the task's verify command. If none is specified, infer the smallest workspac
 
 #### 3b. Delegated groups
 
-Hub verifies via the loop in `references/hcom-orchestration.md`: run every delegated task's verify command in task order; shared verify may run once only if it truly proves all tasks. Pass → step 4. Fail → send `FIX:` back on the same thread, keep tasks `[h]`, wait again. Maximum 3 hub verify rounds. `BLOCKED:` or 3-round fail → mark first unresolved `[!]`, revert later unresolved `[ ]` if never started, Decisions log, handoff, stop.
+Hub verifies via the loop in `references/coordinator-orchestration.md`: run every delegated task's verify command in task order; shared verify may run once only if it truly proves all tasks. Pass → step 4. Fail → send `FIX:` back on the same thread, keep tasks `[h]`, check status again. Maximum 3 hub verify rounds. `BLOCKED:` or 3-round fail → mark first unresolved `[!]`, revert later unresolved `[ ]` if never started, Decisions log, handoff, stop.
 
 ### 4. Mark done
 
@@ -329,7 +329,7 @@ When writing the Handoff notes section, **overwrite** the previous content (do n
 ## Handoff notes
 
 **Completed this session:** T1 (title), T2 (title), ...
-**Delegated to hcom:** T3-T5 (agent tag, worktree, branch), ... ← omit line if none
+**Delegated to coordinator:** T3-T5 (actor IDs, workspace, branch), ... ← omit line if none
 **Re-runs completed:** Tx (title), ... ← omit line if none
 **Deferred re-runs:** Tx (title), ... ← omit line if none
 **Targeted run:** T3-T7 only ← omit line if full plan run
@@ -337,8 +337,8 @@ When writing the Handoff notes section, **overwrite** the previous content (do n
 **Next task:** Tx — <title>
 **Open questions / blockers:** <any issues, or "none">
 **Completion:** X of Y tasks done (Z%) — [>] and [h] tasks count as pending until verified [x]
-**Active hcom threads:** <thread id(s)> or none
-**Active hcom agents:** <agent names / tags> or none
+**Active coordinator threads:** <thread id(s)> or none
+**Active coordinator agents:** <actor IDs / sessions> or none
 ```
 
 ---

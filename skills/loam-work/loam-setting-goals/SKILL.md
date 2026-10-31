@@ -102,7 +102,7 @@ An explicit review runs the validation procedure and records the outcome. Review
 ### Independent-review procedure
 
 When the contract names an independent-review procedure (for visual or subjective goals):
-1. Delegate through the host harness's native subagent/Task mechanism so a reviewer distinct from the worker receives the goal contract and observable result; when the injected `## Workspace state` block reports `hcom: ready`, load `using-hcom` and delegate there instead — read that line rather than probing, and fall back to the native mechanism when it reports `not installed`.
+1. Delegate through the host harness's native subagent/Task mechanism so a reviewer distinct from the worker receives the goal contract and observable result; when `LOAM_COORDINATOR_MODULE` is configured, use the direct coordinator instead. Read the session environment rather than probing, and fall back to the native mechanism when it is absent.
 2. The reviewer returns a rubric-based finding.
 3. Record only the concise result and useful evidence reference. Do not copy the reviewer's full output.
 4. If no distinct agent is available, record the review as blocked; the worker must not substitute self-assessment.
