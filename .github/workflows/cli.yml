@@ -46,7 +46,7 @@ jobs:
           - os: ubuntu-22.04
             artifact: loam-ubuntu
             binary: target/release/loam
-          - os: macos-14
+          - os: macos-15
             artifact: loam-macos
             binary: target/release/loam
           - os: windows-2022
@@ -80,7 +80,7 @@ jobs:
           - os: ubuntu-22.04
             binary: target/release/loam
             run: bash .github/scripts/linux-service-smoke.sh target/release/loam
-          - os: macos-14
+          - os: macos-15
             binary: target/release/loam
             run: bash .github/scripts/macos-service-smoke.sh target/release/loam
           - os: windows-2022
@@ -124,7 +124,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14]
+        os: [ubuntu-22.04, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
