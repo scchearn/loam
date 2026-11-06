@@ -6,6 +6,22 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+## [1.0.6]
+
+Plugin 1.0.6 ships alone; the runtime stays at 1.0.4.
+
+### Fixed
+
+- **Windows install no longer dead-ends on an old runtime ledger.** `install`
+  aborted with "ledger store_path is outside the config dir" when an existing
+  `runtime/ledger.json` pointed at a case-variant spelling of the config dir,
+  or at a config root that has since moved. Path containment now ignores case
+  on Windows, and the install/update transaction ignores an invalid prior
+  ledger with a notice and writes a fresh one; its path is never reused or
+  deleted. The same-store checks now ignore case too, so a reinstall at the
+  same version can no longer remove the live runtime directory. Readiness and
+  hooks still reject an invalid ledger. ([#220], [#221])
+
 ## [1.0.5]
 
 Plugin 1.0.5 and runtime 1.0.4 ship together.
@@ -209,7 +225,8 @@ Plugin 1.0.3 and runtime 1.0.2 ship together.
 Release entries are maintained as part of release work; see
 [RELEASING.md](./docs/RELEASING.md).
 
-[Unreleased]: https://github.com/scchearn/loam/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/scchearn/loam/compare/v1.0.6...HEAD
+[1.0.6]: https://github.com/scchearn/loam/releases/tag/v1.0.6
 [1.0.3]: https://github.com/scchearn/loam/releases/tag/v1.0.3
 [1.0.2]: https://github.com/scchearn/loam/releases/tag/v1.0.2
 [1.0.1]: https://github.com/scchearn/loam/releases/tag/v1.0.1
@@ -227,3 +244,5 @@ Release entries are maintained as part of release work; see
 [#210]: https://github.com/scchearn/loam/pull/210
 [#211]: https://github.com/scchearn/loam/pull/211
 [#213]: https://github.com/scchearn/loam/pull/213
+[#220]: https://github.com/scchearn/loam/issues/220
+[#221]: https://github.com/scchearn/loam/pull/221
