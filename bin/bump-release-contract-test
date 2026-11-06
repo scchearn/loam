@@ -113,6 +113,36 @@ count_in "$fixture/package.json" "\"version\": \"$PLUGIN_VERSION\"" 1 "package.j
 count_in "$fixture/package-lock.json" "\"version\": \"$PLUGIN_VERSION\"" 2 "package-lock untouched by runtime bump"
 count_in "$fixture/.cursor-plugin/plugin.json" "\"version\": \"$PLUGIN_VERSION\"" 1 "cursor untouched by runtime bump"
 
+# --- 2b. a lockfile dependency sharing the plugin version is left alone -----
+# Real case: node_modules/sisteransi sat at 1.0.5 when the plugin was 1.0.5.
+# Only the root and packages[""] fields may move.
+fixture="$tmp/lock-collision"
+make_fixture "$fixture"
+printf '{\n  "name": "@scchearn/loam",\n  "version": "%s",\n  "lockfileVersion": 3,\n  "requires": true,\n  "packages": {\n    "": {\n      "name": "@scchearn/loam",\n      "version": "%s",\n      "license": "MIT"\n    },\n    "node_modules/sisteransi": {\n      "version": "%s",\n      "license": "MIT"\n    }\n  }\n}\n' \
+  "$PLUGIN_VERSION" "$PLUGIN_VERSION" "$PLUGIN_VERSION" > "$fixture/package-lock.json"
+git -C "$fixture" commit -qam "lock collision"
+if out="$(run_bump "$fixture" --plugin 0.9.1)"; then
+  grep -Fq 'version agreement: plugin PASS (0.9.1)' <<< "$out" || fail "lock-collision bump did not verify: $out"
+else
+  fail "lock-collision bump exited non-zero: $out"
+fi
+count_in "$fixture/package-lock.json" '"version": "0.9.1"' 2 "lock-collision: root and packages[\"\"] bumped"
+count_in "$fixture/package-lock.json" "\"version\": \"$PLUGIN_VERSION\"" 1 "lock-collision: dependency version untouched"
+grep -Fq '"version": "0.9.1",' "$fixture/package-lock.json" || fail "lock-collision: trailing comma lost"
+
+# A lockfile whose package fields disagree with the bump source is refused
+# without mutating anything.
+fixture="$tmp/lock-missing"
+make_fixture "$fixture"
+printf '{\n  "name": "@scchearn/loam",\n  "version": "%s",\n  "lockfileVersion": 3,\n  "packages": {\n    "node_modules/sisteransi": {\n      "version": "%s"\n    }\n  }\n}\n' \
+  "$PLUGIN_VERSION" "$PLUGIN_VERSION" > "$fixture/package-lock.json"
+git -C "$fixture" commit -qam "lock without packages[\"\"]"
+before="$(fingerprint "$fixture")"
+if run_bump "$fixture" --plugin 0.9.1 > /dev/null 2>&1; then
+  fail "lockfile without packages[\"\"] version was accepted"
+fi
+[[ "$before" == "$(fingerprint "$fixture")" ]] || fail "refused lockfile bump mutated the tree"
+
 # --- 3. a missing or wrong lane selector is refused --------------------------
 for args in "0.9.1" "--both 0.9.1" "--plugin" "--runtime" "--plugin 0.9.1 extra"; do
   fixture="$tmp/args"
