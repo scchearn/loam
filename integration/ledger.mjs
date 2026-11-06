@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { isAbsolute, join, resolve, sep } from 'node:path';
+import nodePath, { isAbsolute, join, resolve } from 'node:path';
 
 // These live in the integration tree, not setup/: the published integration is
 // staged standalone, so it must not import ../setup/* (that tree is not copied
@@ -49,6 +49,22 @@ export function runtimeStorePath({ version, target, platform = process.platform,
   return join(store, version, target, executable);
 }
 
+// Containment and identity are decided with `path.relative`, not a string
+// prefix: on win32 it compares case-insensitively (the filesystem does, and a
+// config dir can be spelled `C:\Users\Alice` or `c:\users\alice` across
+// runs) and reports another drive or UNC share as an absolute result. The
+// path flavour is a parameter so tests can exercise win32 rules on any host.
+// The root itself is not "inside" itself: store paths are always below it.
+export function isInsideRoot(root, target, p = nodePath) {
+  const rel = p.relative(p.resolve(root), p.resolve(target));
+  return Boolean(rel) && !rel.startsWith('..') && !p.isAbsolute(rel);
+}
+
+// True when two paths name the same location (case-insensitive on win32).
+export function samePath(a, b, p = nodePath) {
+  return p.relative(p.resolve(a), p.resolve(b)) === '';
+}
+
 // Validate and normalize a ledger object. Throws on any malformed field. When a
 // config root resolves, `store_path` must be an absolute path inside it.
 export function validateLedger(value, options = {}) {
@@ -70,7 +86,7 @@ export function validateLedger(value, options = {}) {
     throw new Error('ledger store_path must be an absolute path');
   }
   const root = resolveConfigRoot(options);
-  if (root && !(resolve(store_path) + sep).startsWith(resolve(root) + sep)) {
+  if (root && !isInsideRoot(root, store_path)) {
     throw new Error('ledger store_path is outside the config dir');
   }
   return { schema_version, channel, target, sha256: sha256.toLowerCase(), store_path };
@@ -94,18 +110,39 @@ export async function resolveRuntimePath({ globalRoot, ...options } = {}) {
   return null;
 }
 
-// Read + validate the ledger; `null` when it does not exist (or no config dir).
-export async function readLedger(options = {}) {
+// Raw ledger text; `null` when it does not exist (or no config dir). I/O errors
+// other than ENOENT propagate.
+async function readLedgerText(options) {
   const path = ledgerPath(options);
   if (!path) return null;
-  let raw;
   try {
-    raw = await readFile(path, 'utf8');
+    return await readFile(path, 'utf8');
   } catch (error) {
     if (error?.code === 'ENOENT') return null;
     throw error;
   }
-  return validateLedger(JSON.parse(raw), options);
+}
+
+// Read + validate the ledger; `null` when it does not exist (or no config dir).
+export async function readLedger(options = {}) {
+  const raw = await readLedgerText(options);
+  return raw === null ? null : validateLedger(JSON.parse(raw), options);
+}
+
+// Install/update-only read. A present-but-invalid ledger (unparseable, or
+// failing validation — e.g. an out-of-root `store_path`) is reported as
+// `invalid` with the reason and `ledger: null`, so the transaction that is about
+// to rewrite the ledger can replace it. The unvalidated content is never
+// returned: `ledger` is the validated object or `null`. Readiness and hook
+// paths keep using the strict `readLedger`.
+export async function readLedgerLenient(options = {}) {
+  const raw = await readLedgerText(options);
+  if (raw === null) return { ledger: null, invalid: null };
+  try {
+    return { ledger: validateLedger(JSON.parse(raw), options), invalid: null };
+  } catch (error) {
+    return { ledger: null, invalid: error.message };
+  }
 }
 
 // Atomically write the ledger (0600 via publishJson; the runtime/ dir is 0700).

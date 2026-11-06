@@ -898,6 +898,43 @@ async function readyHarnessFixture() {
   return { fixture, discovery };
 }
 
+// #220: a ledger whose store_path lies outside the config dir (a Windows case
+// variant, or a hand-edited file) used to make install/update throw. It is now
+// replaced by a fresh ledger, and the stale store_path is never acted on.
+test('install and update replace an out-of-root ledger without touching its store_path', async () => {
+  const { fixture } = await readyHarnessFixture();
+  const configDir = join(fixture.home, '.config', 'loam');
+  const outside = await mkdtemp(join(tmpdir(), 'loam-setup-outside-'));
+  const sentinel = join(outside, 'sentinel');
+  await writeFile(sentinel, 'keep');
+  const invalidLedger = async () => {
+    const ledger = await readLedgerFor(fixture.home);
+    const storePath = join(outside, '9.9.9', target, ledger.store_path.endsWith('.exe') ? 'loam.exe' : 'loam');
+    await writeFile(ledgerPath({ root: configDir }), `${JSON.stringify({ ...ledger, store_path: storePath })}\n`);
+  };
+
+  await invalidLedger();
+  const install = outputCapture();
+  const installCode = await runSetup(parseArgs(['install', '--yes']), {
+    ...fixture, packageRoot, output: install.output, errorOutput: install.output,
+  });
+  assert.equal(installCode, 0, install.text());
+  assert.match(install.text(), /ignoring invalid runtime ledger/);
+  const repaired = await readLedgerFor(fixture.home);
+  assert.ok(repaired.store_path.startsWith(configDir), repaired.store_path);
+  assert.equal(await readFile(sentinel, 'utf8'), 'keep');
+
+  await invalidLedger();
+  const update = outputCapture();
+  const updateCode = await runSetup(parseArgs(['update', '--yes']), {
+    ...fixture, packageRoot, output: update.output, errorOutput: update.output,
+  });
+  assert.equal(updateCode, 0, update.text());
+  assert.doesNotMatch(update.text(), /No Loam installation found/);
+  assert.ok((await readLedgerFor(fixture.home)).store_path.startsWith(configDir));
+  assert.equal(await readFile(sentinel, 'utf8'), 'keep');
+});
+
 test('harness readiness ignores hook paths outside the setup-owned root', async () => {
   const { fixture, discovery } = await readyHarnessFixture();
   const settingsPath = join(fixture.home, '.claude', 'settings.json');
