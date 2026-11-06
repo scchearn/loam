@@ -139,7 +139,20 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
   // The injected hook command runs the config-dir store binary; compare against
   // the ledger's store_path (schema-1 install.json runtime_path as migration
   // fallback), never a dropped schema-2 field.
-  const runtimePath = (await resolveRuntimePath({ globalRoot, home, platform })) ?? install.runtime_path;
+  // An invalid ledger makes this strict resolver throw; report the harness as
+  // not ready (so install/update proceeds to replace the ledger) rather than
+  // letting it escape verification.
+  let runtimePath;
+  try {
+    runtimePath = (await resolveRuntimePath({ globalRoot, home, platform })) ?? install.runtime_path;
+  } catch (error) {
+    return {
+      ...harness,
+      ready: false,
+      category: 'runtime_ledger_invalid',
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
   try {
     if (id === 'claude' || id === 'codex') {
       if (!harness.marketplaceReady || !harness.marketplaceRoot) return { ...harness, ready: false, category: 'plugin_incomplete' };

@@ -4,14 +4,14 @@ import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import path, { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
 import { detectTarget } from '../setup/target.mjs';
 import { installRuntime } from '../setup/runtime.mjs';
 import { RUNTIME_VERSION, resolveRuntimeTarget } from '../setup/constants.mjs';
-import { ledgerPath, readLedger, runtimeStorePath, writeLedger } from '../integration/ledger.mjs';
+import { isInsideRoot, ledgerPath, readLedger, runtimeStorePath, samePath, writeLedger } from '../integration/ledger.mjs';
 
 const target = detectTarget();
 
@@ -52,6 +52,35 @@ test('runtime ledger rejects every malformed field', async () => {
   await assert.rejects(() => writeLedger({ ...good, sha256: 'xyz' }, { env }), /sha256 is invalid/);
   await assert.rejects(() => writeLedger({ ...good, store_path: 'relative/loam' }, { env }), /absolute path/);
   await assert.rejects(() => writeLedger({ ...good, store_path: '/etc/loam' }, { env }), /outside the config dir/);
+});
+
+// The containment and same-path helpers take the path flavour as a parameter, so
+// the win32 rules are exercised on any runner: they are pure string functions.
+test('isInsideRoot accepts win32 case variants and rejects escapes', () => {
+  const { win32 } = path;
+  const root = 'c:\\users\\alice\\appdata\\roaming\\loam\\';
+  assert.equal(isInsideRoot(root, 'C:\\Users\\Alice\\AppData\\Roaming\\loam\\runtime\\x\\loam.exe', win32), true);
+  assert.equal(isInsideRoot('\\\\srv\\share\\loam', '\\\\SRV\\Share\\loam\\runtime\\x', win32), true);
+  assert.equal(isInsideRoot('C:\\a\\loam', 'D:\\a\\loam\\runtime\\x', win32), false);
+  assert.equal(isInsideRoot('\\\\srv\\share\\loam', '\\\\srv\\other\\loam\\runtime\\x', win32), false);
+  assert.equal(isInsideRoot('C:\\a\\loam', 'C:\\a\\loamx\\y', win32), false);
+  assert.equal(isInsideRoot('C:\\a\\loam', 'C:\\a\\loam', win32), false);
+  assert.equal(isInsideRoot('C:\\a\\loam', 'C:\\a\\loam\\..\\elsewhere\\x', win32), false);
+});
+
+test('isInsideRoot stays case-sensitive on posix', () => {
+  const { posix } = path;
+  assert.equal(isInsideRoot('/home/alice/loam', '/home/alice/loam/runtime/x', posix), true);
+  assert.equal(isInsideRoot('/home/alice/loam', '/home/Alice/loam/runtime/x', posix), false);
+  assert.equal(isInsideRoot('/home/alice/loam', '/home/alice/loamx/y', posix), false);
+  assert.equal(isInsideRoot('/home/alice/loam', '/home/alice/loam/../x', posix), false);
+});
+
+test('samePath ignores case on win32 only', () => {
+  assert.equal(samePath('C:\\Users\\Alice\\loam.exe', 'c:\\users\\alice\\LOAM.exe', path.win32), true);
+  assert.equal(samePath('C:\\Users\\Alice\\loam.exe', 'C:\\Users\\Bob\\loam.exe', path.win32), false);
+  assert.equal(samePath('/home/Alice/loam', '/home/alice/loam', path.posix), false);
+  assert.equal(samePath('/home/alice/loam', '/home/alice/./loam', path.posix), true);
 });
 
 test('resolveRuntimeTarget derives the target and channel from the package constant', () => {

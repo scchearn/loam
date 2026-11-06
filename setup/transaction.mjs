@@ -20,7 +20,7 @@ import {
 } from './wizard.mjs';
 import { ensureGlobalSkills, verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
 import { installRuntime } from './runtime.mjs';
-import { ledgerPath, readLedger } from '../integration/ledger.mjs';
+import { ledgerPath, readLedgerLenient, samePath } from '../integration/ledger.mjs';
 import { detectHarnesses, installHarnesses } from './harnesses.mjs';
 import { installMarketplacePlugins } from './marketplace.mjs';
 import { migrateEnrollment, migrateLegacyProject, migrateRuntimeLedger } from './migration.mjs';
@@ -298,7 +298,12 @@ export async function executeSetup(parsed, discovery, options = {}) {
       // plain update without LOAM_RUNTIME_VERSION (locked-ref semantics), noted
       // volta-style; the env var moves the pin.
       const setupEnv = discovery.env || process.env;
-      priorLedger = await readLedger({ home: discovery.home, platform: discovery.platform, env: setupEnv });
+      // An invalid prior ledger is replaced, not trusted: priorLedger stays null,
+      // so its unvalidated store_path is never reused or deleted, and
+      // installRuntime writes a fresh ledger.
+      const prior = await readLedgerLenient({ home: discovery.home, platform: discovery.platform, env: setupEnv });
+      priorLedger = prior.ledger;
+      if (prior.invalid) stepDetail(output, `ignoring invalid runtime ledger (${prior.invalid}); reinstalling`);
       let resolved = resolveRuntimeTarget({ env: setupEnv });
       if (priorLedger?.channel === 'pinned' && !setupEnv.LOAM_RUNTIME_VERSION) {
         resolved = { target: priorLedger.target, channel: 'pinned' };
@@ -326,7 +331,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
       }
       // A new store/ledger was staged only when the target differs from the prior
       // ledger's store; a same-version reuse restages nothing to roll back.
-      ledgerStaged = !priorLedger || priorLedger.store_path !== runtime.storePath;
+      ledgerStaged = !priorLedger || !samePath(priorLedger.store_path, runtime.storePath);
       const shortSha = typeof runtime.sha256 === 'string' ? runtime.sha256.slice(0, 12) : '';
       if (runtime.reused) {
         stepDetail(output, `reused verified binary${shortSha ? ` (sha256 ${shortSha}…)` : ''}`);
@@ -535,7 +540,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
       // entry at a different version. A delete that fails (e.g. Windows EBUSY on
       // a running connector binary) leaves a named orphan, never a failed
       // update; the config dir and the current store are never touched.
-      if (priorLedger?.store_path && runtime?.storePath && priorLedger.store_path !== runtime.storePath) {
+      if (priorLedger?.store_path && runtime?.storePath && !samePath(priorLedger.store_path, runtime.storePath)) {
         await rm(dirname(dirname(priorLedger.store_path)), { recursive: true, force: true }).catch(() => {});
       }
 
@@ -576,7 +581,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
             if (priorLedger) await writeFile(file, `${JSON.stringify(priorLedger, null, 2)}\n`, { mode: 0o600 });
             else if (file) await rm(file, { force: true });
           } catch {}
-          if (runtime?.storePath && (!priorLedger || priorLedger.store_path !== runtime.storePath)) {
+          if (runtime?.storePath && (!priorLedger || !samePath(priorLedger.store_path, runtime.storePath))) {
             // Remove ONLY this run's <version>/<target> dir. Then drop the
             // <version> parent only when it is now empty — a sibling <target>
             // staged by a prior same-machine LOAM_TARGET run is not ours to
