@@ -105,6 +105,10 @@ export async function gate({ harness, payload = {}, globalRoot, env = process.en
   // Mark the recursion refusal distinctly from a config-disabled skip so the
   // hook-finish producer can emit claude_recursion_guard only for the former.
   if (recursion(payload, env)) return { action: 'skip', reason: 'disabled', recursion: true };
+  // A session that another agent launched (hcom sets HCOM_LAUNCHED_BY) runs a brief that owns
+  // its turn. Background ingest there would end the turn early (the Codex native continuation)
+  // or write the same wiki concurrently, so it stays out unless LOAM_INGEST_BACKGROUND=1.
+  if (env.HCOM_LAUNCHED_BY && env.LOAM_INGEST_BACKGROUND !== '1') return { action: 'skip', reason: 'disabled', delegated: true };
   const workspace = await canonicalWorkspace(payloadWorkspace(payload));
   const root = runRoot(globalRoot, workspace);
   await ensureRoot(root);

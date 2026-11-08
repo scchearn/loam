@@ -43,7 +43,9 @@ must not use it to resolve workspace state.
 Background code ingestion is enabled by default and boundary-triggered only.
 Set `LOAM_INGEST_BACKGROUND=0` to opt out unconditionally, or set
 `background_ingest.enabled` to `false` in global config;
-`LOAM_INGEST_BACKGROUND=1` overrides a disabled config. Claude Stop, Codex
+`LOAM_INGEST_BACKGROUND=1` overrides a disabled config. A session another
+agent launched through hcom (`HCOM_LAUNCHED_BY` set) skips background ingest
+unless `LOAM_INGEST_BACKGROUND=1`, so a delegated brief keeps its turn. Claude Stop, Codex
 Stop, and OpenCode `session.idle` may start a same-harness worker; Cursor has no
 idle worker. The worker acquires a workspace lease before probing, requires
 full state and `code_ingest_pending.evidence.pending_count > 0`, resolves the
