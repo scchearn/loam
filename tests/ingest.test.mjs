@@ -134,6 +134,13 @@ test('boundary gate honors config and environment precedence and blocks worker r
   assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_WORKER: '1' } }), { action: 'skip', reason: 'disabled', recursion: true });
   assert.deepEqual(await gate({ ...options, payload: { cwd: workspace, agent_type: 'loam:ingestor' }, env: {} }), { action: 'skip', reason: 'disabled', recursion: true });
   assert.equal((await gate({ ...options, payload: { cwd: workspace, agent_type: 'other-agent' }, env: {} })).action, 'spawn_worker');
+
+  // A session another agent launched (hcom sets HCOM_LAUNCHED_BY) is a delegated lane: its
+  // brief owns the turn, so background ingest stays out unless explicitly forced on.
+  assert.deepEqual(await gate({ ...options, env: { HCOM_LAUNCHED_BY: 'lead' } }), { action: 'skip', reason: 'disabled', delegated: true });
+  assert.deepEqual(await gate({ ...options, harness: 'codex', env: { HCOM_LAUNCHED_BY: 'lead' } }), { action: 'skip', reason: 'disabled', delegated: true });
+  assert.equal((await gate({ ...options, env: { HCOM_LAUNCHED_BY: '' } })).action, 'spawn_worker');
+  assert.equal((await gate({ ...options, env: { HCOM_LAUNCHED_BY: 'lead', LOAM_INGEST_BACKGROUND: '1' } })).action, 'spawn_worker');
 });
 
 test('boundary debounce trusts only coherent successful or nothing-to-do outcomes', async () => {
