@@ -216,7 +216,7 @@ export async function commitMemoryWrites({ snapshot, kind, summary, env = {}, gi
     const added = await git(['--literal-pathspecs', 'add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul'], { cwd: toplevel, env, input });
     if (added.code !== 0) return skipped(failureReason(added));
     const committed = await git(
-      ['--literal-pathspecs', 'commit', '--only', '-q', '-m', message, '--pathspec-from-file=-', '--pathspec-file-nul'],
+      ['--literal-pathspecs', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', 'commit', '--only', '-q', '-m', message, '--pathspec-from-file=-', '--pathspec-file-nul'],
       { cwd: toplevel, env, input },
     );
     if (committed.code !== 0) {
