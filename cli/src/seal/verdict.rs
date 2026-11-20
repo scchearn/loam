@@ -128,6 +128,7 @@ pub mod code {
     pub const REVIEW_BY_PASSED: &str = "seal.freshness.review_by_passed";
     pub const REVIEW_BY_CAPPED: &str = "seal.freshness.review_by_capped";
     pub const RECHECK_DUE: &str = "seal.freshness.recheck_due";
+    pub const TIME_VERIFIED_FUTURE: &str = "seal.freshness.time_verified_future";
     pub const FRESH: &str = "seal.freshness.current";
     pub const LEVEL_ABOVE_ATTAINABLE: &str = "seal.level.requested_above_attainable";
     pub const CAPPED_DERIVED: &str = "seal.level.capped_derived";
@@ -146,7 +147,7 @@ pub mod code {
             | PRINCIPAL_MISMATCH | SIGNER_REVOKED => "SEL003",
             BINDING_MISMATCH | SPAN_MISSING => "SEL004",
             EVIDENCE_DRIFTED | EVIDENCE_UNRESOLVABLE => "SEL005",
-            REVIEW_BY_PASSED | REVIEW_BY_CAPPED | RECHECK_DUE => "SEL006",
+            REVIEW_BY_PASSED | REVIEW_BY_CAPPED | RECHECK_DUE | TIME_VERIFIED_FUTURE => "SEL006",
             CITED_NOT_CITABLE | RETRACTED => "SEL007",
             LEVEL_ABOVE_ATTAINABLE
             | CAPPED_DERIVED
@@ -278,13 +279,14 @@ pub fn evaluate(input: &Inputs<'_>) -> Outcome {
                 Expiry::ReviewByPassed => code::REVIEW_BY_PASSED,
                 Expiry::ReviewByCapped => code::REVIEW_BY_CAPPED,
                 Expiry::RecheckDue(_) => code::RECHECK_DUE,
+                Expiry::TimeVerifiedInFuture => code::TIME_VERIFIED_FUTURE,
             },
         );
     }
     if fresh.review_by_capped && !fresh.expired.contains(&Expiry::ReviewByCapped) {
         codes.informational.push(code::REVIEW_BY_CAPPED);
     }
-    if fresh.expired.is_empty() && (input.review_by.is_some() || !rechecks.is_empty()) {
+    if fresh.expired.is_empty() {
         codes.success.push(code::FRESH);
     }
 

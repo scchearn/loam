@@ -70,6 +70,8 @@ impl EvidenceState {
         self.code == Code::Current && (!self.is_derived() || self.cited.is_some())
     }
 
+    /// A citable cited seal (`seal:`) counts as a primary basis: derived seals
+    /// cap at the cited level rather than being refused.
     fn counts_toward_evidence(&self) -> bool {
         match self.weight {
             Weight::Zero => false,
@@ -283,6 +285,8 @@ pub enum Expiry {
     ReviewByCapped,
     /// An `every:<dur>` recheck is due.
     RecheckDue(String),
+    /// `time_verified` is later than `now` (beyond clock skew).
+    TimeVerifiedInFuture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,23 +304,41 @@ pub struct FreshnessInputs<'a> {
     pub max_review_days: u32,
 }
 
-/// A `review_by` expires after the instant passes; it never outlives
-/// `time_verified + max_review`. A recheck is due once
-/// `time_verified + interval` is reached. A seal without `review_by` has no
-/// review expiry (the spec caps a declared date, it does not require one).
+/// Clock skew tolerated before a `time_verified` counts as forward-dated.
+const FUTURE_SKEW_MINUTES: i64 = 5;
+
+/// The freshness window is anchored on `time_verified`, which a writer
+/// declares, so the reader's policy bounds it from both sides:
+///
+/// - a `time_verified` more than a few minutes after `now` is stale
+///   ([`Expiry::TimeVerifiedInFuture`]); a forward-dated record cannot buy
+///   itself a long window;
+/// - a `review_by` never outlives `time_verified + max_review`; an absent
+///   `review_by` is treated as expiring at that cap (flagged capped), so
+///   omitting the field does not escape the reader's `max_review`;
+/// - a recheck is due once `time_verified + interval` is reached (`>=`),
+///   while `review_by` and the cap lapse only once strictly passed (`>`).
+///
+/// Date arithmetic is checked: an unrepresentable cap is treated as
+/// unbounded and an unrepresentable recheck deadline as not yet due, so
+/// untrusted input cannot panic the verifier.
 pub fn freshness(input: &FreshnessInputs<'_>) -> Freshness {
     let mut expired = Vec::new();
-    let mut review_by_capped = false;
-    if let Some(review_by) = input.review_by {
-        let cap = input.time_verified + Duration::days(i64::from(input.max_review_days));
-        let (deadline, capped) = if review_by > cap {
-            (cap, true)
-        } else {
-            (review_by, false)
-        };
-        review_by_capped = capped;
+    if input.time_verified > input.now + Duration::minutes(FUTURE_SKEW_MINUTES) {
+        expired.push(Expiry::TimeVerifiedInFuture);
+    }
+    let cap = input
+        .time_verified
+        .checked_add_signed(Duration::days(i64::from(input.max_review_days)));
+    let (deadline, review_by_capped) = match (input.review_by, cap) {
+        (Some(review_by), Some(cap)) if review_by > cap => (Some(cap), true),
+        (Some(review_by), _) => (Some(review_by), false),
+        (None, Some(cap)) => (Some(cap), true),
+        (None, None) => (None, false),
+    };
+    if let Some(deadline) = deadline {
         if input.now > deadline {
-            expired.push(if capped {
+            expired.push(if review_by_capped {
                 Expiry::ReviewByCapped
             } else {
                 Expiry::ReviewByPassed
@@ -324,12 +346,14 @@ pub fn freshness(input: &FreshnessInputs<'_>) -> Freshness {
         }
     }
     for recheck in input.rechecks {
-        if let Some(interval) = recheck.interval() {
-            if input.now >= input.time_verified + interval {
-                let label = recheck.as_string();
-                if !expired.contains(&Expiry::RecheckDue(label.clone())) {
-                    expired.push(Expiry::RecheckDue(label));
-                }
+        let due = recheck
+            .interval()
+            .and_then(|interval| input.time_verified.checked_add_signed(interval))
+            .is_some_and(|at| input.now >= at);
+        if due {
+            let label = recheck.as_string();
+            if !expired.contains(&Expiry::RecheckDue(label.clone())) {
+                expired.push(Expiry::RecheckDue(label));
             }
         }
     }

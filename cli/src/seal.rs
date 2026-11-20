@@ -108,7 +108,7 @@ mod tests {
 
     use super::evidence::{Code, Kind, Recheck};
     use super::policy::{self, Level, SignatureStanding};
-    use super::verdict::fixture::{at, cited, note, primary, verified, Case, AGENT, STAMP as T0};
+    use super::verdict::fixture::{at, cited, note, primary, verified, Case};
     use super::verdict::{code, Verdict};
     use crate::json::Value;
 
@@ -337,14 +337,82 @@ mod tests {
         assert_eq!(c.run().verdict, Verdict::Stale);
     }
 
-    /// Nothing about the verdict depends on the wall clock: the same inputs
-    /// with the same injected `now` always agree.
+    /// Equivalent instants in different offsets give the same outcome.
     #[test]
-    fn stale_is_deterministic_in_now() {
+    fn stale_is_offset_independent() {
         let mut c = Case::citable();
         c.review_by = Some(at("2026-12-01 00:00 +02:00"));
-        let _ = (T0, AGENT);
-        assert_eq!(c.run(), c.run());
+        c.now = at("2026-12-01 00:01 +02:00");
+        let a = c.run();
+        c.now = at("2026-11-30 22:01 +00:00");
+        c.review_by = Some(at("2026-11-30 22:00 +00:00"));
+        assert_eq!(a, c.run());
+        assert_eq!(a.verdict, Verdict::Stale);
+    }
+
+    /// A seal with no `review_by` expires at the reader's `max_review` cap.
+    #[test]
+    fn stale_missing_review_by_expires_at_cap() {
+        let mut c = Case::citable();
+        c.now = at("2027-05-19 14:29 +02:00");
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Citable);
+        assert!(got.codes.informational.contains(&code::REVIEW_BY_CAPPED));
+        c.now = at("2027-05-19 14:31 +02:00");
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Stale);
+        assert!(got.codes.failure.contains(&code::REVIEW_BY_CAPPED));
+    }
+
+    /// A forward-dated `time_verified` cannot buy a long window.
+    #[test]
+    fn stale_time_verified_in_future() {
+        let mut c = Case::citable();
+        c.time_verified = at("2099-01-01 00:00 +00:00");
+        c.review_by = Some(at("2099-02-01 00:00 +00:00"));
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Stale);
+        assert!(got.codes.failure.contains(&code::TIME_VERIFIED_FUTURE));
+        assert_eq!(code::lint_code(code::TIME_VERIFIED_FUTURE), Some("SEL006"));
+        // Within clock skew is fine.
+        let mut c = Case::citable();
+        c.time_verified = at("2026-11-20 14:34 +02:00");
+        c.now = at("2026-11-20 14:30 +02:00");
+        assert_eq!(c.run().verdict, Verdict::Citable);
+    }
+
+    /// Untrusted dates and durations never panic the verifier.
+    #[test]
+    fn stale_overflow_does_not_panic() {
+        let mut c = Case::citable();
+        c.policy.max_review = "4294967295d".into();
+        c.review_by = Some(at("2099-01-01 00:00 +00:00"));
+        let _ = c.run();
+
+        let mut c = Case::citable();
+        c.time_verified = at("+262000-01-01 00:00 +00:00");
+        c.review_by = Some(at("2099-01-01 00:00 +00:00"));
+        let mut item = primary(Kind::Blob);
+        item.recheck = Recheck::Every("9999w".into());
+        c.evidence = vec![item];
+        assert_eq!(c.run().verdict, Verdict::Stale);
+    }
+
+    /// Exact boundaries: `review_by` lapses strictly after the instant, a
+    /// recheck is due at the instant.
+    #[test]
+    fn stale_boundaries() {
+        let mut c = Case::citable();
+        c.review_by = Some(at("2026-12-01 00:00 +02:00"));
+        c.now = at("2026-12-01 00:00 +02:00");
+        assert_eq!(c.run().verdict, Verdict::Citable);
+
+        let mut c = Case::citable();
+        let mut item = primary(Kind::Blob);
+        item.recheck = Recheck::Every("30d".into());
+        c.evidence = vec![item];
+        c.now = at("2026-12-20 14:30 +02:00");
+        assert_eq!(c.run().verdict, Verdict::Stale);
     }
 
     /// S20: a capture under the cap is stored with origin and retrieved_at,

@@ -257,6 +257,9 @@ impl Default for Policy {
     }
 }
 
+/// Upper bound for `max_review`, about a century.
+const MAX_REVIEW_DAYS: u32 = 36_500;
+
 impl Policy {
     /// `max_review` in days (`180d` form).
     pub fn max_review_days(&self) -> u32 {
@@ -362,10 +365,19 @@ pub fn parse_policy(text: &str) -> Result<Policy, TrustError> {
         let text = v
             .as_str()
             .filter(|s| {
-                s.strip_suffix('d')
-                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                s.strip_suffix('d').is_some_and(|d| {
+                    !d.is_empty()
+                        && d.bytes().all(|b| b.is_ascii_digit())
+                        && d.parse::<u32>().is_ok_and(|n| n <= MAX_REVIEW_DAYS)
+                })
             })
-            .ok_or_else(|| err(POLICY_FILE, 0, "max_review must look like `180d`"))?;
+            .ok_or_else(|| {
+                err(
+                    POLICY_FILE,
+                    0,
+                    "max_review must look like `180d` (at most 36500 days)",
+                )
+            })?;
         policy.max_review = text.to_owned();
     }
     if let Some(levels) = doc.get("levels") {
@@ -923,6 +935,8 @@ mod tests {
         assert_eq!(custom.audited_principals, default.audited_principals);
         assert!(parse_policy(r#"{"_type":"other/v1"}"#).is_err());
         assert!(parse_policy(r#"{"max_review":"soon"}"#).is_err());
+        assert!(parse_policy(r#"{"max_review":"4294967295d"}"#).is_err());
+        assert!(parse_policy(r#"{"max_review":"36500d"}"#).is_ok());
         assert!(parse_policy(r#"{"levels":{"canonical":{"min_signers":0}}}"#).is_err());
         assert!(parse_policy("[]").is_err());
     }
