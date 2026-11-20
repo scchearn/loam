@@ -179,7 +179,7 @@ For each hint, emit one Markdown list item in this form:
 Rules:
 
 - **`plan_reconcilable`** — aggregate workflow hint for completed plans with open acceptance criteria; route listed plans to `/loam::amending-plan`.
-- **`seals_attention`** — aggregate maintenance hint raised only when non-citable seals exist; command `lint --only seals`, run as `<native-runtime-command> lint --only seals`. Satisfied by `/loam::linting-memory`; definitions in `references/seals.md`.
+- **`seals_attention`** — aggregate maintenance hint raised only when non-citable seals exist; command `loam lint --only seals`, where the leading `loam` means the injected native runtime command (never a PATH binary): run `<native-runtime-command> lint --only seals`. Satisfied by `/loam::linting-memory`; definitions in `references/seals.md`.
 - **Suppress satisfied hints.** Skip any hint whose `kind` your skill body names as one it satisfies. A skill may satisfy more than one (e.g. `linting-memory` satisfies `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, `legacy_structure_pending`, and `seals_attention`); suppress all of them.
 - **Only surface hints with a non-null `command`.** Hints without a command (e.g. `retrieval_not_ready`) are informational; mention them only if the user asks for state.
 - **Do not auto-run the suggested skill.** Hints are advisory; the user decides whether to act. End your turn or hand back to the user after surfacing.

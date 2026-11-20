@@ -114,19 +114,31 @@ from this session.
 ## Floor procedure (no runtime)
 
 When the native runtime is unavailable, a reader can still check a seal by
-hand. This reaches the same result as `<native-runtime-command> seal verify`.
+hand. It approximates `<native-runtime-command> seal verify`; only a pass of every step below, including step 4, is a `citable`-quality check.
 
 1. Span digest.
    - Linux or macOS: `sh <Skill root>/scripts/seal-canon.sh --digest <page> <anchor>`
    - Windows, on one line: `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <Skill root>/scripts/seal-canon.ps1 -Digest <page> <anchor>`
 2. Signature.
-   - Linux or macOS: `ssh-keygen -Y verify -f <configRoot>/seal/allowed_signers -I <principal> -n loam-seal -s <id>.json.sig < <id>.json`
-   - Windows: `cmd /c "ssh-keygen -Y verify -f <configRoot>\seal\allowed_signers -I <principal> -n loam-seal -s <id>.json.sig < <id>.json"`; PowerShell 5.1 has no `<` redirection and re-encodes piped bytes.
+   - Linux or macOS: `ssh-keygen -Y verify -f <configRoot>/seal/allowed_signers -I <principal> -n loam-seal -O verify-time=<time_verified> -s <id>.json.sig < <id>.json`
+   - Windows: `cmd /c "ssh-keygen -Y verify -f <configRoot>\seal\allowed_signers -I <principal> -n loam-seal -O verify-time=<time_verified> -s <id>.json.sig < <id>.json"`; PowerShell 5.1 has no `<` redirection and re-encodes piped bytes.
 3. Evidence: `git hash-object <path>`, and `sha256sum <path>` (Linux), `shasum -a 256 <path>` (macOS) or `certutil -hashfile <path> SHA256` (Windows).
 
+`<time_verified>` is the record's `time_verified` converted to
+`YYYYMMDDHHMMSS` in UTC (apply the stamp's offset). It matters because rotated
+keys keep a closed validity window in `allowed_signers`.
+
+4. Standing. Confirm that no `status` record in `wiki/.seals/records/` names
+   this id in `updates` with retract, supersede or demote; that `review_by`
+   (or `time_verified` plus the policy max_review) has not passed; and that
+   `verifier.principal` equals the `-I` principal.
+
 Compare the step 1 digest with the record's `subject[0].digest.sha256`, and
-each evidence digest with its recorded value. A match on all three is a
-`citable`-quality check only if the signer is in your `allowed_signers`.
+each evidence digest with its recorded value. A match on steps 1 to 3 with
+the signer in your `allowed_signers` and a clean step 4 is `citable`-quality.
+If step 4 fails or you skipped it, treat the seal as provisional. Level grants
+from policy are not checked by hand.
+
 To trust another person's seals, run
 `<native-runtime-command> seal trust add <principal> <pubkey>`; it shows the
 key fingerprint to confirm first.
