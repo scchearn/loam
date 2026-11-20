@@ -305,7 +305,7 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::reviewing-memory | 510 | 113 | 137 | 1,799 |
 | loam::sealing-memory | 518 | 125 | 87 | 1,521 |
 | loam::syncing-code-graph | 363 | 84 | 223 | 2,780 |
-| loam::using | 368 | 77 | 71 | 1,615 |
+| loam::using | 368 | 77 | 75 | 1,750 |
 | loam::amending-plan | 437 | 88 | 273 | 3,059 |
 | loam::checkpointing | 365 | 69 | 177 | 2,094 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,237 |

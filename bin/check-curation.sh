@@ -246,6 +246,13 @@ else
   grep -Fq "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <Skill root>/scripts/seal-canon.ps1" "$seals_ref" \
     || fail "seals reference must pin the PowerShell floor form"
 fi
+router="skills/loam-using/SKILL.md"
+grep -Fq 'Cite sealed text only when `seal verify`/state reports `citable`; everything else is provisional.' "$router" \
+  || fail "router must carry the cite-only-citable non-negotiable"
+grep -Fq 'Never hand-edit seal markers or `wiki/.seals/`; editing sealed text is allowed and breaks the seal' "$router" \
+  || fail "router must carry the no-hand-edit-seals non-negotiable"
+grep -Fq 'make a verified claim citable → `sealing-memory`' "$router" \
+  || fail "router must route citable claims to sealing-memory"
 grep -Fq 'seals_attention' skills/loam-using/references/runtime.md \
   || fail "runtime reference must register the seals_attention hint"
 
