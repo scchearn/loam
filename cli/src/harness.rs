@@ -961,8 +961,8 @@ fn skill_body(skills_root: &Path) -> String {
     }
 }
 
-/// The `## Workspace state` block, reproducing `context.mjs::formatWorkspaceState`
-/// against the same `loam state` aggregate the Node path shelled out for.
+/// The `## Workspace state` block, rendered from the same `loam state --fast`
+/// aggregate the `state` command prints.
 fn workspace_state_section(workspace: &Path) -> String {
     let aggregate = crate::state::aggregate(workspace, true);
     let state = crate::json::parse(&aggregate).unwrap_or(Value::Object(Vec::new()));
@@ -1034,6 +1034,10 @@ fn workspace_state_section(workspace: &Path) -> String {
         lines.push(format!("Code graph drift: {drift}"));
     }
 
+    if let Some(line) = seals_line(state.get("seals")) {
+        lines.push(line);
+    }
+
     if let Some(hints) = state.get("hints").and_then(Value::as_array) {
         if !hints.is_empty() {
             lines.push(String::new());
@@ -1045,6 +1049,30 @@ fn workspace_state_section(workspace: &Path) -> String {
     }
 
     format!("## Workspace state\n\n{}", lines.join("\n"))
+}
+
+/// `Seals: 14 citable · 2 drifted`, non-zero buckets in a fixed order. None
+/// when there are no seals. `diag` is never rendered.
+fn seals_line(seals: Option<&Value>) -> Option<String> {
+    let seals = seals.filter(|v| !v.is_null())?;
+    let parts: Vec<String> = [
+        "citable",
+        "drifted",
+        "stale",
+        "unverifiable",
+        "untrusted",
+        "forged",
+        "retracted",
+        "disputed",
+        "unchecked",
+    ]
+    .iter()
+    .filter_map(|key| {
+        let count = number(seals, key);
+        (count > 0).then(|| format!("{count} {key}"))
+    })
+    .collect();
+    (!parts.is_empty()).then(|| format!("Seals: {}", parts.join(" · ")))
 }
 
 fn hint_line(hint: &Value) -> String {
@@ -1583,6 +1611,82 @@ mod tests {
             runtime: Some(PathBuf::from("/opt/loam/bin/loam")),
             cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
         }
+    }
+
+    struct ConfigEnv(Option<std::ffi::OsString>);
+    impl ConfigEnv {
+        fn pin(dir: &Path) -> ConfigEnv {
+            let prior = std::env::var_os("LOAM_CONFIG_DIR");
+            std::env::set_var("LOAM_CONFIG_DIR", dir);
+            ConfigEnv(prior)
+        }
+    }
+    impl Drop for ConfigEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("LOAM_CONFIG_DIR", v),
+                None => std::env::remove_var("LOAM_CONFIG_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_state_section_renders_the_14_2_1_seals_line_and_one_hint() {
+        use crate::seal_cache::fixture::Fx;
+        let _guard = crate::env_lock();
+        let fx = Fx::new("harness-seals");
+        let _config = ConfigEnv::pin(&fx.root.join("config"));
+        for i in 0..16 {
+            fx.seal(
+                &format!("page{i}"),
+                &format!("s-claim-{i}"),
+                "Original.",
+                &["file:run.log"],
+                None,
+            );
+        }
+        fx.seal_stale("old", "s-old-claim", "Old.", &["file:run.log"]);
+        fx.write_page("page0", "s-claim-0", "Edited after sealing.");
+        fx.write_page("page1", "s-claim-1", "Edited after sealing.");
+        fx.age();
+        let _ = crate::state::aggregate(&fx.root, false);
+        let section = workspace_state_section(&fx.root);
+        assert!(
+            section
+                .lines()
+                .any(|l| l == "Seals: 14 citable · 2 drifted · 1 stale"),
+            "{section}"
+        );
+        assert_eq!(section.matches("seals_attention").count(), 1, "{section}");
+        assert!(!section.contains("hashed_bytes"));
+    }
+
+    #[test]
+    fn workspace_state_section_all_citable_has_a_line_and_no_hint() {
+        use crate::seal_cache::fixture::Fx;
+        let _guard = crate::env_lock();
+        let fx = Fx::new("harness-seals-ok");
+        let _config = ConfigEnv::pin(&fx.root.join("config"));
+        fx.seal("alpha", "s-first-claim", "Fine.", &["file:run.log"], None);
+        fx.age();
+        let _ = crate::state::aggregate(&fx.root, false);
+        let section = workspace_state_section(&fx.root);
+        assert!(
+            section.lines().any(|l| l == "Seals: 1 citable"),
+            "{section}"
+        );
+        assert!(!section.contains("seals_attention"), "{section}");
+    }
+
+    #[test]
+    fn workspace_state_section_without_seals_has_neither() {
+        use crate::seal_cache::fixture::Fx;
+        let _guard = crate::env_lock();
+        let fx = Fx::new("harness-seals-none");
+        let _config = ConfigEnv::pin(&fx.root.join("config"));
+        let section = workspace_state_section(&fx.root);
+        assert!(!section.contains("Seals:"), "{section}");
+        assert!(!section.contains("seals_attention"), "{section}");
     }
 
     #[test]
