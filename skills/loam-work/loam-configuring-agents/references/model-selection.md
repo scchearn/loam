@@ -34,7 +34,7 @@ If you could not run discovery, present the shortlist as likely candidates and m
 
 Prefer:
 
-- `hcom opencode --headless`
+- coordinator `spawn` with `runtime: "opencode"` and headless execution
 
 Use when:
 

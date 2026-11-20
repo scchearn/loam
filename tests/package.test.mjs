@@ -84,6 +84,11 @@ test('packed install is offline, direct-native, and preserves the legacy entry',
     assert.doesNotMatch(integration, /command === 'hook'/);
     await assert.rejects(() => readFile(join(fixture.root, 'integration', 'context.mjs')));
 
+    const coordinatorCommand = await readFile(join(fixture.root, 'bin', 'coordinator.mjs'), 'utf8');
+    assert.match(coordinatorCommand, /runCoordinator/);
+    const coordinatorIntegration = await readFile(join(fixture.root, 'integration', 'coordinator.mjs'), 'utf8');
+    assert.match(coordinatorIntegration, /LOAM_COORDINATOR_MODULE/);
+
     const legacy = await import(pathToFileURL(join(fixture.root, '.opencode', 'plugins', 'loam.js')).href);
     assert.equal(typeof legacy.LoamPlugin, 'function');
   } finally {
