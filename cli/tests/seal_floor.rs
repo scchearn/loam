@@ -297,6 +297,9 @@ fn failures_exit_2_with_nothing_on_stdout() {
         for digest in [false, true] {
             let cases = [
                 (fixture("lf.md"), "s-nope"),
+                // The runtime matches ids exactly; a case-insensitive map would not.
+                (fixture("lf.md"), "S-Floor-Span"),
+                (fixture("lf.md"), "^#s-floor-span"),
                 (dir.0.join("missing.md"), ANCHOR),
                 (bad.clone(), ANCHOR),
                 (outside.clone(), ANCHOR),
@@ -359,6 +362,124 @@ fn runtime_refuses_the_same_malformed_spans() {
         for floor in floors() {
             let output = floor.run(false, &file, ANCHOR);
             assert_eq!(output.status.code(), Some(2), "{} {name}", floor.label);
+        }
+    }
+}
+
+fn runtime_hash(file: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_loam"))
+        .args(["seal", "hash", file.to_str().unwrap(), ANCHOR])
+        .env("LOAM_WORKSPACES", "off")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn floor_never_certifies_a_span_the_runtime_would_not() {
+    // Each page is one the floor's line scanner could misread. Whatever the
+    // runtime says, the floor must either print the runtime's digest or
+    // refuse with exit 2; it may never print a different digest, and it
+    // must refuse whenever the runtime does.
+    let open = "<!-- loam:seal s-floor-span -->";
+    let close = "<!-- /loam:seal -->";
+    let cases: Vec<(&str, String)> = vec![
+        // A decoy copy in a list-item fence, the real span a list continuation.
+        (
+            "list-fence-decoy",
+            format!(
+                "- ```\n  {open}\n  original\n  {close}\n  ```\n\n- item\n\n    {open}\n    tampered\n    {close}\n"
+            ),
+        ),
+        (
+            "list-continuation",
+            format!("- item\n\n    {open}\n    real\n    {close}\n"),
+        ),
+        (
+            "list-fence-hides-real",
+            format!("- item\n  ```\n  {open}\n  fake\n  {close}\n  ```\n"),
+        ),
+        (
+            "quote-fence",
+            format!("> ```\n{open}\nx\n{close}\n"),
+        ),
+        (
+            "question-inside",
+            format!("{open}\nx\n- [ ] Q: who? ^q-who-signs\n{close}\n"),
+        ),
+        (
+            "heading-then-indented",
+            format!("# H\n    {open}\n    x\n    {close}\n"),
+        ),
+        (
+            "fence-then-indented",
+            format!("```\ncode\n```\n    {open}\n    x\n    {close}\n"),
+        ),
+        (
+            "comment-then-indented",
+            format!("<!-- note -->\n    {open}\n    x\n    {close}\n"),
+        ),
+        ("form-feed-closer", format!("{open}\nx\n{close}\x0c\n")),
+        ("nbsp-closer", format!("{open}\nx\n{close}\u{a0}\n")),
+        ("nul-in-span", format!("{open}\na\0b\n{close}\n")),
+        (
+            "front-matter-blank-line",
+            format!("---\n\n{open}\nx\n{close}\n---\n"),
+        ),
+        (
+            "front-matter",
+            format!("---\ntitle: t\n---\n\n{open}\nx\n{close}\n"),
+        ),
+        ("plain", format!("intro\n\n{open}\nx\n{close}\n")),
+    ];
+    let dir = TempDir::new("never-certifies");
+    for (name, body) in &cases {
+        let file = dir.0.join(format!("{name}.md"));
+        std::fs::write(&file, body).unwrap();
+        let runtime = runtime_hash(&file);
+        let runtime_ok = runtime.status.code() == Some(0);
+        for floor in floors() {
+            let output = floor.run(true, &file, ANCHOR);
+            match output.status.code() {
+                Some(0) => {
+                    assert!(
+                        runtime_ok,
+                        "{} certified {name} but the runtime refuses",
+                        floor.label
+                    );
+                    assert_eq!(
+                        String::from_utf8_lossy(&output.stdout).trim(),
+                        String::from_utf8_lossy(&runtime.stdout).trim(),
+                        "{} digest differs from the runtime for {name}",
+                        floor.label
+                    );
+                }
+                Some(2) => assert!(
+                    output.stdout.is_empty(),
+                    "{} {name}: {output:?}",
+                    floor.label
+                ),
+                other => panic!("{} {name}: unexpected status {other:?}", floor.label),
+            }
+            if !runtime_ok {
+                assert_eq!(
+                    output.status.code(),
+                    Some(2),
+                    "{} must refuse {name}, which the runtime refuses",
+                    floor.label
+                );
+            }
+        }
+    }
+    // Ordinary pages still verify.
+    for name in ["plain", "front-matter"] {
+        let file = dir.0.join(format!("{name}.md"));
+        for floor in floors() {
+            assert_eq!(
+                floor.run(true, &file, ANCHOR).status.code(),
+                Some(0),
+                "{} {name}",
+                floor.label
+            );
         }
     }
 }

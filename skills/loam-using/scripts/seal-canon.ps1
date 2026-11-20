@@ -15,7 +15,15 @@ tabs are stripped per line; leading and trailing blank lines are dropped;
 exactly one final LF; an all-blank span is the empty byte string. No NFC, no
 reflow, no re-escaping. It mirrors seal-canon.sh and the runtime scanner:
 whole-line HTML comment markers outside fenced code, indented code and front
-matter; a malformed, nested, unclosed or duplicated span is not found.
+matter; a malformed, nested, unclosed or duplicated span, or one holding a
+question record, is not found.
+
+It is not a CommonMark parser, so it refuses (exit 2) rather than guesses: a
+fence opener inside a list item or block quote, or code indented inside a list,
+is ambiguous, and when the target id is mentioned in a file holding one the
+span is refused. So is any marker or question line carrying whitespace beyond
+space and tab (the runtime trims Unicode white space). The floor may refuse a
+span the runtime accepts; it must never print a digest the runtime would not.
 
 Exit: 0 ok; 2 usage, missing file, missing or malformed anchor, invalid UTF-8.
 Targets Windows PowerShell 5.1.
@@ -37,7 +45,8 @@ if ([string]::IsNullOrEmpty($File) -or [string]::IsNullOrEmpty($Anchor)) {
     [Console]::Error.WriteLine('usage: seal-canon.ps1 [-Digest] <file> <anchor>')
     exit 2
 }
-$Anchor = $Anchor.TrimStart('#', '^')
+# The runtime trims every leading '#', then every leading '^'.
+$Anchor = $Anchor.TrimStart('#').TrimStart('^')
 if ($Anchor.Length -eq 0) { Fail 'empty anchor' }
 
 try {
@@ -101,48 +110,102 @@ function Test-ValidId([string]$prefix, [string]$id) {
     return $true
 }
 
+# Strip block-quote and list-item prefixes; sets $script:pre when any went.
+function Remove-Prefix([string]$s) {
+    $script:pre = $false
+    for ($g = 0; $g -lt 32; $g++) {
+        $b = $s.TrimStart($ws)
+        if ($b.StartsWith('>', [StringComparison]::Ordinal)) { $s = $b.Substring(1); $script:pre = $true; continue }
+        $m = [regex]::Match($b, '^([-+*]|[0-9]+[.)])([ \t]|$)')
+        if ($m.Success) { $s = $b.Substring($m.Length); $script:pre = $true; continue }
+        break
+    }
+    return $s
+}
+
+# A question record the runtime nests-checks: "- [x] Q: ... ^q-<slug>".
+function Test-QuestionAnchor([string]$s) {
+    $tt = $s.TrimStart($ws)
+    if (-not ($tt.StartsWith('- [', [StringComparison]::Ordinal) -or $tt.StartsWith('* [', [StringComparison]::Ordinal))) { return $false }
+    $rest = $tt.Substring(3)
+    if ($rest.Length -eq 0) { return $false }
+    $l = if ([char]::IsHighSurrogate($rest[0])) { 2 } else { 1 }
+    if ($rest.Length -lt $l) { return $false }
+    if (-not $rest.Substring($l).StartsWith('] Q: ', [StringComparison]::Ordinal)) { return $false }
+    $tok = @($tt.TrimEnd($ws) -split '[ \t]+')[-1]
+    if (-not $tok.StartsWith('^', [StringComparison]::Ordinal)) { return $false }
+    return (Test-ValidId 'q-' $tok.Substring(1))
+}
+
+$uws = '[\u000B\u000C\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+
 $fmEnd = -1
-if ($n -gt 0 -and $lines[0] -match '^---[ \t]*$') {
+if ($n -gt 1 -and $lines[0] -match '^---[ \t]*$' -and $lines[1].Trim($ws).Length -gt 0) {
     for ($i = 1; $i -lt $n; $i++) {
         if ($lines[$i] -match '^(---|\.\.\.)[ \t]*$') { $fmEnd = $i; break }
     }
 }
 
 $stack = New-Object System.Collections.ArrayList
-$seen = @{}
-$dup = @{}
-$found = @{}
+# Ordinal: the runtime matches ids exactly, and a plain @{} ignores case.
+$seen = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
+$dup = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
+$found = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
 $fence = $false
 $fch = [char]'`'
 $flen = 0
 $icode = $false
 $pb = $true
+$cont = $false
+$amb = $false
+$mention = $false
+$badws = $false
+$pre = $false
 
 for ($i = $fmEnd + 1; $i -lt $n; $i++) {
     $line = $lines[$i]
+    if ($line.Contains('loam:seal') -and $line.Contains($Anchor)) { $mention = $true }
+    if (($line.Contains('loam:') -or $line.Contains('] Q: ')) -and $line -match $uws) { $badws = $true }
     $blank = ($line.Trim($ws).Length -eq 0)
     $ind = Get-Width $line
     $body = $line.TrimStart($ws)
     if ($fence) {
         $r = Get-Run $body $fch
-        if ($ind -le 3 -and $r -ge $flen -and $body.Substring($r).Trim($ws).Length -eq 0) { $fence = $false }
         $pb = $false
+        if ($ind -le 3 -and $r -ge $flen -and $body.Substring($r).Trim($ws).Length -eq 0) { $fence = $false; $pb = $true }
         continue
     }
     if ($blank) { $pb = $true; continue }
-    if ($ind -ge 4 -and ($pb -or $icode)) { $icode = $true; $pb = $false; continue }
+    if ($ind -ge 4 -and ($pb -or $icode)) { $icode = $true; $pb = $false; if ($cont) { $amb = $true }; continue }
     $icode = $false
     $pb = $false
-    $first = $body[0]
-    if ($ind -le 3 -and ($first -eq '`' -or $first -eq '~')) {
-        $r = Get-Run $body $first
-        if ($r -ge 3 -and -not ($first -eq '`' -and $body.Substring($r).Contains('`'))) {
-            $fence = $true; $fch = $first; $flen = $r
-            continue
-        }
+    $s2 = Remove-Prefix $line
+    $b2 = $s2.TrimStart($ws)
+    $fl = $false
+    if ($b2.Length -gt 0 -and ($b2[0] -eq '`' -or $b2[0] -eq '~')) {
+        $c2 = $b2[0]
+        $r2 = Get-Run $b2 $c2
+        if ($r2 -ge 3 -and -not ($c2 -eq '`' -and $b2.Substring($r2).Contains('`'))) { $fl = $true }
     }
+    if ($fl -and ($pre -or ($ind -ge 1 -and $cont))) { $amb = $true }
+    if ($pre) { $cont = $true }
+    if ($ind -le 3 -and -not $pre -and $fl) {
+        $fence = $true; $fch = $c2; $flen = $r2
+        continue
+    }
+    $t2 = $body -replace '[ \t]', ''
+    $isHeading = ($body -match '^#+([ \t]|$)') -and ((Get-Run $body '#') -le 6)
+    $isBreak = ($t2.Length -ge 3 -and $t2 -match '^(-+|\*+|_+)$') -or ($t2 -match '^(=+|-+)$')
+    if ($ind -le 3 -and ($isHeading -or $isBreak)) { $pb = $true; continue }
 
     $t = $line.Trim($ws)
+    if ($t.StartsWith('<!--', [StringComparison]::Ordinal) -and $t.EndsWith('-->', [StringComparison]::Ordinal)) { $pb = $true }
+    if ($stack.Count -gt 0 -and (Test-QuestionAnchor $line)) {
+        for ($s = $stack.Count - 1; $s -ge 0; $s--) {
+            if ($stack[$s].Kind -eq 'seal') { $stack[$s].Ex = $true; break }
+        }
+        continue
+    }
     if ($t.Length -lt 7 -or -not $t.StartsWith('<!--', [StringComparison]::Ordinal) -or -not $t.EndsWith('-->', [StringComparison]::Ordinal)) { continue }
     $inner = $t.Substring(4, $t.Length - 7).Trim($ws)
     if ($inner.Length -eq 0) { continue }
@@ -189,6 +252,8 @@ for ($i = $fmEnd + 1; $i -lt $n; $i++) {
     }
 }
 
+if ($badws) { Fail "unsupported whitespace in a marker line of $File; use the loam runtime" }
+if ($amb -and $mention) { Fail "ambiguous list or block-quote structure around ^$Anchor in $File; use the loam runtime" }
 if (-not $found.ContainsKey($Anchor) -or $dup.ContainsKey($Anchor)) {
     Fail "no well-formed seal span ^$Anchor in $File"
 }
