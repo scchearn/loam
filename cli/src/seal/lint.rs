@@ -307,6 +307,7 @@ mod tests {
             time_verified: None,
             likely_location: None,
             superseded_by: None,
+            unchecked: false,
         }
     }
 

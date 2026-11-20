@@ -18,6 +18,7 @@ pub mod markers;
 mod memory;
 pub mod provisioning;
 pub mod seal;
+pub mod seal_cache;
 mod service;
 pub mod sha256;
 mod state;

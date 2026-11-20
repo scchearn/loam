@@ -27,6 +27,23 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_REFUSED: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
 
+#[cfg(test)]
+thread_local! {
+    static SPAWNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test probe: counts the processes this thread's verification started
+/// (`ssh-keygen`, `git`), so the cache-only fast path can prove it starts none.
+#[cfg(test)]
+pub(crate) fn note_spawn() {
+    SPAWNS.with(|n| n.set(n.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_count() -> u64 {
+    SPAWNS.with(std::cell::Cell::get)
+}
+
 pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     match args.next().as_deref() {
         Some("hash") => hash(args),
@@ -156,7 +173,7 @@ fn verify_wiki(
         .ok_or_else(|| fail(format!("no wiki/ directory at or above {}", cwd.display())))?;
     let env = verify::Env::load(&wiki, trust::seal_dir().ok(), options.now).map_err(&fail)?;
     let selector = options.selector.clone().resolve(&wiki, &cwd);
-    let reports = verify::verify_all(&env).map_err(fail)?;
+    let reports = verify::verify_and_cache(&env).map_err(fail)?;
     Ok((reports, selector))
 }
 

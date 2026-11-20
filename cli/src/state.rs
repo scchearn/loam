@@ -61,6 +61,7 @@ pub(crate) fn aggregate(workspace: &Path, fast: bool) -> String {
     let checkpoints = read_checkpoints(&wiki_root);
     let git_status = git_status(workspace);
     let drift_count = (!fast).then(|| datecheck::drift_count(&wiki_root));
+    let seals = crate::seal_cache::seal_counts(&wiki_root, fast);
     let mut hints = Vec::new();
 
     add_hints(
@@ -101,7 +102,7 @@ pub(crate) fn aggregate(workspace: &Path, fast: bool) -> String {
         .unwrap_or_default();
 
     format!(
-        "{{\"version\":\"{}\",\"wiki_root\":\"{}\",\"exists\":true,\"has_schema\":{},\"has_index\":{},\"has_log\":{},\"has_overview\":{},\"qmd_ready\":{},\"hcom_ready\":{},\"collection\":\"{}\",\"metadata_status\":\"{}\",\"metadata_path\":\"{}\",\"latest_checkpoint\":{},\"recent_checkpoints\":{},\"checkpoint_count\":{},\"git_status\":{},\"drift_count\":{},\"hints\":{}}}",
+        "{{\"version\":\"{}\",\"wiki_root\":\"{}\",\"exists\":true,\"has_schema\":{},\"has_index\":{},\"has_log\":{},\"has_overview\":{},\"qmd_ready\":{},\"hcom_ready\":{},\"collection\":\"{}\",\"metadata_status\":\"{}\",\"metadata_path\":\"{}\",\"latest_checkpoint\":{},\"recent_checkpoints\":{},\"checkpoint_count\":{},\"git_status\":{},\"drift_count\":{},\"seals\":{},\"hints\":{}}}",
         runtime_version(),
         json_escape(&wiki_root.display().to_string()),
         has_schema,
@@ -118,6 +119,7 @@ pub(crate) fn aggregate(workspace: &Path, fast: bool) -> String {
         checkpoints.len(),
         git_json,
         drift_json,
+        seals.to_json(),
         hints_json,
     )
 }
@@ -132,7 +134,7 @@ pub(crate) fn runtime_version() -> &'static str {
 
 fn minimal_state(hcom_ready: bool) -> String {
     format!(
-        "{{\"version\":\"{}\",\"wiki_root\":\"\",\"exists\":false,\"qmd_ready\":false,\"hcom_ready\":{},\"latest_checkpoint\":null,\"recent_checkpoints\":[],\"checkpoint_count\":0,\"git_status\":null,\"drift_count\":null,\"hints\":[{{\"kind\":\"memory_missing\",\"group\":\"maintenance\",\"severity\":\"info\",\"message\":\"No memory substrate found; scaffold a wiki to begin.\",\"command\":\"/loam::scaffolding-wiki <goal>\",\"evidence\":{{}}}}]}}",
+        "{{\"version\":\"{}\",\"wiki_root\":\"\",\"exists\":false,\"qmd_ready\":false,\"hcom_ready\":{},\"latest_checkpoint\":null,\"recent_checkpoints\":[],\"checkpoint_count\":0,\"git_status\":null,\"drift_count\":null,\"seals\":null,\"hints\":[{{\"kind\":\"memory_missing\",\"group\":\"maintenance\",\"severity\":\"info\",\"message\":\"No memory substrate found; scaffold a wiki to begin.\",\"command\":\"/loam::scaffolding-wiki <goal>\",\"evidence\":{{}}}}]}}",
         runtime_version(),
         hcom_ready
     )
@@ -968,5 +970,128 @@ mod tests {
         let (date, _) = lint_age("## [2026-07-11] lint-check | wiki marksman links\n")
             .expect("annotated lint-check should be recognized");
         assert_eq!(date, "2026-07-11");
+    }
+
+    // --------------------------------------------------------------- seals
+
+    use crate::json;
+    use crate::seal_cache::fixture::Fx;
+
+    /// Restores an environment variable on drop.
+    struct EnvVar(&'static str, Option<std::ffi::OsString>);
+    impl EnvVar {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> EnvVar {
+            let prior = std::env::var_os(name);
+            std::env::set_var(name, value);
+            EnvVar(name, prior)
+        }
+    }
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    fn seals_of(state: &str) -> json::Value {
+        json::parse(state)
+            .expect("state is valid JSON")
+            .get("seals")
+            .cloned()
+            .expect("state carries seals")
+    }
+
+    fn number(value: &json::Value, key: &str) -> u64 {
+        match value.get(key) {
+            Some(json::Value::Number(n)) => n.parse().unwrap(),
+            other => panic!("{key}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seals_counts_match_a_citable_drifted_stale_fixture() {
+        let _guard = crate::env_lock();
+        let fx = Fx::new("state");
+        let _config = EnvVar::set("LOAM_CONFIG_DIR", fx.root.join("config"));
+        fx.seal("alpha", "s-first-claim", "Fine.", &["file:run.log"], None);
+        fx.seal(
+            "beta",
+            "s-second-claim",
+            "Original.",
+            &["file:run.log"],
+            None,
+        );
+        fx.seal_stale("gamma", "s-third-claim", "Old.", &["file:run.log"]);
+        fx.write_page("beta", "s-second-claim", "Edited after sealing.");
+        fx.age();
+
+        let full = seals_of(&aggregate(&fx.root, false));
+        for (key, want) in [
+            ("citable", 1),
+            ("drifted", 1),
+            ("stale", 1),
+            ("unverifiable", 0),
+            ("untrusted", 0),
+            ("forged", 0),
+            ("retracted", 0),
+            ("disputed", 0),
+            ("unchecked", 0),
+        ] {
+            assert_eq!(number(&full, key), want, "{key} in {full:?}");
+        }
+
+        // The full run warmed the cache, so the fast path agrees exactly.
+        let fast = seals_of(&aggregate(&fx.root, true));
+        for key in ["citable", "drifted", "stale", "unchecked"] {
+            assert_eq!(number(&fast, key), number(&full, key), "{key}");
+        }
+        let diag = fast.get("diag").expect("diag");
+        assert_eq!(number(diag, "hashed_bytes"), 0);
+        assert_eq!(number(diag, "over_budget"), 0);
+        assert_eq!(number(diag, "no_cache"), 0);
+    }
+
+    #[test]
+    fn seals_counts_a_cold_fast_state_never_invents_a_verdict() {
+        let _guard = crate::env_lock();
+        let fx = Fx::new("state-cold");
+        let _config = EnvVar::set("LOAM_CONFIG_DIR", fx.root.join("config"));
+        fx.seal("alpha", "s-first-claim", "Fine.", &["file:run.log"], None);
+        fx.age();
+        let fast = seals_of(&aggregate(&fx.root, true));
+        assert_eq!(number(&fast, "citable"), 0);
+        assert_eq!(number(&fast, "unchecked"), 1);
+    }
+
+    #[test]
+    fn seals_counts_are_zero_without_a_seals_directory() {
+        let _guard = crate::env_lock();
+        let fx = Fx::new("state-none");
+        let _config = EnvVar::set("LOAM_CONFIG_DIR", fx.root.join("config"));
+        for fast in [true, false] {
+            let seals = seals_of(&aggregate(&fx.root, fast));
+            for key in [
+                "citable",
+                "drifted",
+                "stale",
+                "unverifiable",
+                "untrusted",
+                "forged",
+                "retracted",
+                "disputed",
+                "unchecked",
+            ] {
+                assert_eq!(number(&seals, key), 0, "{key}");
+            }
+        }
+        assert!(!fx.cache_dir.exists());
+    }
+
+    #[test]
+    fn seals_counts_minimal_state_carries_null() {
+        let parsed = json::parse(&minimal_state(false)).unwrap();
+        assert!(parsed.get("seals").is_some_and(json::Value::is_null));
     }
 }

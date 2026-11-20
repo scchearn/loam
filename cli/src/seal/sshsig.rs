@@ -334,6 +334,8 @@ fn diagnostic(output: &Output) -> String {
 }
 
 fn run(bin: &Path, args: &[&std::ffi::OsStr], stdin: Option<&[u8]>) -> Result<Output, SshsigError> {
+    #[cfg(test)]
+    crate::seal::note_spawn();
     let mut child = Command::new(bin)
         .args(args)
         // A passphrase-protected key must fail fast, not block on a prompt.

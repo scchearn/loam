@@ -2677,6 +2677,8 @@ mod tests {
             "seal/trust.rs",
             "seal/lint.rs",
             "seal/verify.rs",
+            // Derived seal cache under the config dir; never reads or writes the wiki.
+            "seal_cache.rs",
             "service.rs",
             "sha256.rs",
             "state.rs",

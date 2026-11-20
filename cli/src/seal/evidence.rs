@@ -468,6 +468,8 @@ struct GitRun {
 }
 
 fn git_command(repo: &Path, args: &[&str]) -> Command {
+    #[cfg(test)]
+    crate::seal::note_spawn();
     let mut command = Command::new("git");
     command
         .args(args)
@@ -634,7 +636,7 @@ fn local(ctx: &Ctx, raw: &str) -> PathBuf {
     }
 }
 
-fn weight_of(item: &Item, ctx: &Ctx) -> Weight {
+pub fn weight_of(item: &Item, ctx: &Ctx) -> Weight {
     match item.kind {
         Kind::Note => Weight::Zero,
         Kind::Seal => Weight::Derived,
@@ -646,7 +648,7 @@ fn weight_of(item: &Item, ctx: &Ctx) -> Weight {
     }
 }
 
-fn local_input(item: &Item, ctx: &Ctx) -> Option<PathBuf> {
+pub fn local_input(item: &Item, ctx: &Ctx) -> Option<PathBuf> {
     match item.kind {
         Kind::Blob | Kind::File => recorded_path(&item.reference)
             .ok()
@@ -904,7 +906,7 @@ pub fn check(item: &Item, ctx: &Ctx) -> Check {
     }
 }
 
-fn check_code(item: &Item, ctx: &Ctx) -> (Code, String) {
+pub fn check_code(item: &Item, ctx: &Ctx) -> (Code, String) {
     let current = || (Code::Current, String::new());
     let unresolvable = |why: &str| (Code::Unresolvable, why.to_owned());
     match item.kind {

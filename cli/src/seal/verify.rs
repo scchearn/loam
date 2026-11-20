@@ -18,8 +18,9 @@ use crate::seal::sshsig::{self, Capability, SshsigError};
 use crate::seal::status;
 use crate::seal::trust::{self, Trust};
 use crate::seal::verdict::{self, code, Binding, Inputs, Lifecycle, Outcome, Verdict};
+use crate::seal_cache::{self, Ctl, PageEntry};
 use chrono::{DateTime, FixedOffset};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,6 +45,9 @@ pub struct Env {
     pub trust_dir: Option<PathBuf>,
     pub keygen: PathBuf,
     pub now: DateTime<FixedOffset>,
+    /// Where the derived seal cache lives (`<configRoot>/cache/seals`);
+    /// `None` disables it.
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Env {
@@ -64,6 +68,7 @@ impl Env {
         let repo_root = evidence::repo_root(wiki)
             .or_else(|| wiki.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| wiki.to_path_buf());
+        let cache_dir = cache_dir_beside(trust_dir.as_deref());
         Ok(Env {
             wiki: wiki.to_path_buf(),
             repo_root,
@@ -71,8 +76,71 @@ impl Env {
             trust_dir,
             keygen: sshsig::keygen_binary(),
             now,
+            cache_dir,
         })
     }
+
+    /// The environment for the cache-only fast path: nothing here spawns a
+    /// process. `keygen` is a placeholder the fast path never runs, and the
+    /// repository root is found by walking up to a `.git`, not by asking git.
+    pub fn load_fast(
+        wiki: &Path,
+        trust_dir: Option<PathBuf>,
+        cache_dir: Option<PathBuf>,
+        now: DateTime<FixedOffset>,
+    ) -> Result<Env, String> {
+        let trust = match &trust_dir {
+            Some(dir) => trust::load(dir).map_err(|e| e.to_string())?,
+            None => Trust {
+                signers: Vec::new(),
+                revoked: Vec::new(),
+                policy: trust::Policy::default(),
+            },
+        };
+        let repo_root = wiki
+            .ancestors()
+            .find(|dir| dir.join(".git").exists())
+            .or_else(|| wiki.parent())
+            .unwrap_or(wiki)
+            .to_path_buf();
+        Ok(Env {
+            wiki: wiki.to_path_buf(),
+            repo_root,
+            trust,
+            trust_dir,
+            keygen: PathBuf::new(),
+            now,
+            cache_dir,
+        })
+    }
+}
+
+/// `<configRoot>/cache/seals` for a trust directory of `<configRoot>/seal`.
+fn cache_dir_beside(trust_dir: Option<&Path>) -> Option<PathBuf> {
+    trust_dir
+        .and_then(Path::parent)
+        .map(|root| root.join("cache").join("seals"))
+}
+
+/// Work the fast path declined to do, for `state`'s `diag`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Diag {
+    /// Page bytes hashed this run.
+    pub hashed_bytes: u64,
+    /// Changed pages left unhashed because the budget was spent.
+    pub over_budget: u64,
+    /// Signature or evidence lookups with no usable cache entry.
+    pub no_cache: u64,
+}
+
+/// Whether verification reads and writes the derived cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Off,
+    /// Recompute everything, then refill the cache.
+    Full,
+    /// Answer from the cache only; unanswerable seals are `unchecked`.
+    Fast,
 }
 
 /// One seal's result.
@@ -101,6 +169,9 @@ pub struct Report {
     /// that drifted; a re-seal is the remedy for drift, so such a record is
     /// history rather than a defect.
     pub superseded_by: Option<String>,
+    /// Set only by the fast path: an input (signature, evidence or page
+    /// digest) was not in the derived cache, so no verdict was reached.
+    pub unchecked: bool,
 }
 
 impl Report {
@@ -318,19 +389,50 @@ pub(super) fn markdown_files(wiki: &Path) -> Result<Vec<(String, PathBuf)>, Stri
     Ok(files)
 }
 
-fn collect_spans(files: &[(String, PathBuf)], overlay: Option<&Overlay>) -> Vec<Span> {
+/// Every seal span in `files`, plus the pages the fast path left unhashed
+/// (budget spent), whose spans are therefore unknown.
+fn collect_spans(
+    files: &[(String, PathBuf)],
+    overlay: Option<&Overlay>,
+    ctl: Option<&Ctl>,
+) -> (Vec<Span>, Vec<String>) {
     let mut spans = Vec::new();
+    let mut unhashed = Vec::new();
     for (name, path) in files {
         let replaced = overlay
             .and_then(|o| o.page.as_ref())
             .filter(|(page, _)| page == name)
             .map(|(_, bytes)| bytes.clone());
+        // Stamp before reading: a write that lands after the stamp changes
+        // the next stamp, never hides behind this one.
+        let stamp = ctl.and_then(|_| seal_cache::file_fingerprint(path));
+        if let (Some(ctl), Some((fingerprint, _))) = (ctl, &stamp) {
+            if ctl.fast {
+                if let Some(entry) = ctl.cached_page(name, fingerprint) {
+                    for (anchor, digest) in &entry.spans {
+                        spans.push(Span {
+                            name: name.clone(),
+                            anchor: anchor.clone(),
+                            digest: digest.clone(),
+                        });
+                    }
+                    ctl.put_page(name, entry);
+                    continue;
+                }
+                let size = fs::metadata(path).map_or(0, |m| m.len());
+                if !ctl.spend(size) {
+                    unhashed.push(name.clone());
+                    continue;
+                }
+            }
+        }
         let Some(bytes) = replaced.or_else(|| fs::read(path).ok()) else {
             continue;
         };
         let Ok(source) = std::str::from_utf8(&bytes) else {
             continue;
         };
+        let first = spans.len();
         for marker in markers::scan(source)
             .markers
             .iter()
@@ -342,8 +444,24 @@ fn collect_spans(files: &[(String, PathBuf)], overlay: Option<&Overlay>) -> Vec<
                 digest: canon::digest(&bytes[marker.content.clone()]).ok(),
             });
         }
+        if let (Some(ctl), Some((fingerprint, newest))) = (ctl, stamp) {
+            ctl.put_page(
+                name,
+                PageEntry {
+                    stamp: seal_cache::Stamp {
+                        fingerprint,
+                        newest,
+                        checked_at: seal_cache::now_ns(),
+                    },
+                    spans: spans[first..]
+                        .iter()
+                        .map(|s| (s.anchor.clone(), s.digest.clone()))
+                        .collect(),
+                },
+            );
+        }
     }
-    spans
+    (spans, unhashed)
 }
 
 /// In-memory state verified in place of what is on disk, so `attest` can
@@ -362,21 +480,65 @@ pub struct Overlay {
     pub captures: Vec<String>,
 }
 
-/// Verifies every seal record in the wiki, sorted by id.
+impl Overlay {
+    fn is_empty(&self) -> bool {
+        self.page.is_none()
+            && self.record.is_none()
+            && self.signature.is_none()
+            && self.captures.is_empty()
+    }
+}
+
+/// Verifies every seal record in the wiki, sorted by id. Reads no cache and
+/// writes none.
 pub fn verify_all(env: &Env) -> Result<Vec<Report>, String> {
-    verify_with(env, None)
+    verify_with(env, None, Mode::Off).map(|(reports, _)| reports)
+}
+
+/// [`verify_all`], then refills the derived cache under `env.cache_dir` with
+/// the signature, evidence and page results it computed.
+pub fn verify_and_cache(env: &Env) -> Result<Vec<Report>, String> {
+    verify_with(env, None, Mode::Full).map(|(reports, _)| reports)
+}
+
+/// Verifies from the derived cache alone: no `ssh-keygen`, no `git`, at most
+/// [`seal_cache::HASH_BUDGET`] bytes of pages hashed. A seal whose inputs are
+/// not all cached comes back with `unchecked` set.
+pub fn verify_fast(env: &Env) -> Result<(Vec<Report>, Diag), String> {
+    verify_with(env, None, Mode::Fast)
 }
 
 /// Verifies the single seal `id` as it would stand once `overlay` is applied.
 pub fn verify_overlay(env: &Env, overlay: &Overlay, id: &str) -> Result<Report, String> {
-    verify_with(env, Some(overlay))?
+    // An empty overlay is a plain verification of what is on disk (the check
+    // after a write), so it refills the cache; a real one is hypothetical
+    // and must never be cached.
+    let mode = if overlay.is_empty() {
+        Mode::Full
+    } else {
+        Mode::Off
+    };
+    verify_with(env, Some(overlay), mode)?
+        .0
         .into_iter()
         .find(|report| report.id == id)
         .ok_or_else(|| format!("seal {id} did not verify as a seal record"))
 }
 
-fn verify_with(env: &Env, overlay: Option<&Overlay>) -> Result<Vec<Report>, String> {
-    let verifier = build_verifier(env, overlay)?;
+fn verify_with(
+    env: &Env,
+    overlay: Option<&Overlay>,
+    mode: Mode,
+) -> Result<(Vec<Report>, Diag), String> {
+    let ctl = (mode != Mode::Off).then(|| {
+        Ctl::open(
+            env.cache_dir.as_deref(),
+            &env.wiki,
+            env.trust_dir.as_deref(),
+            mode == Mode::Fast,
+        )
+    });
+    let verifier = build_verifier(env, overlay, ctl.as_ref())?;
     let mut reports = Vec::new();
     for loaded in &verifier.records {
         let is_seal = match &loaded.view {
@@ -390,7 +552,12 @@ fn verify_with(env: &Env, overlay: Option<&Overlay>) -> Result<Vec<Report>, Stri
         }
     }
     mark_superseded(&verifier, &mut reports);
-    Ok(reports)
+    drop(verifier);
+    let diag = ctl.as_ref().map(Ctl::diag).unwrap_or_default();
+    if let Some(ctl) = ctl {
+        ctl.finish();
+    }
+    Ok((reports, diag))
 }
 
 /// Flags each drifted record that a sound child re-seal replaces. The child
@@ -407,6 +574,7 @@ fn mark_superseded(verifier: &Verifier<'_>, reports: &mut [Report]) {
         !failure.contains(&code::MALFORMED)
             && !failure.contains(&code::SIGNATURE_INVALID)
             && !drifts(report)
+            && !report.unchecked
             && !matches!(
                 report.outcome.verdict,
                 Verdict::Forged | Verdict::Untrusted | Verdict::Retracted
@@ -439,6 +607,7 @@ fn mark_superseded(verifier: &Verifier<'_>, reports: &mut [Report]) {
         let mut visited: BTreeSet<&str> = BTreeSet::new();
         visited.insert(report.id.as_str());
         let mut found: Option<String> = None;
+        let mut blocked = false;
         for (first, first_parent, subject) in &children {
             if first_parent != &report.id || report.subject.as_ref() != Some(subject) {
                 continue;
@@ -450,6 +619,7 @@ fn mark_superseded(verifier: &Verifier<'_>, reports: &mut [Report]) {
                     continue;
                 }
                 let Some(other) = by_id(node) else { continue };
+                blocked |= other.unchecked;
                 if sound(other) {
                     if other
                         .base_level
@@ -471,13 +641,20 @@ fn mark_superseded(verifier: &Verifier<'_>, reports: &mut [Report]) {
                 break;
             }
         }
+        // A re-seal the fast path could not settle might supersede this
+        // record, so this one cannot be called drifted either.
+        report.unchecked |= found.is_none() && blocked;
         report.superseded_by = found;
     }
 }
 
-fn build_verifier<'a>(env: &'a Env, overlay: Option<&'a Overlay>) -> Result<Verifier<'a>, String> {
+fn build_verifier<'a>(
+    env: &'a Env,
+    overlay: Option<&'a Overlay>,
+    ctl: Option<&'a Ctl>,
+) -> Result<Verifier<'a>, String> {
     let files = markdown_files(&env.wiki)?;
-    let spans = collect_spans(&files, overlay);
+    let (spans, unhashed) = collect_spans(&files, overlay, ctl);
     let mut records = record::load_all(&env.wiki)?;
     if let Some((id, bytes)) = overlay.and_then(|o| o.record.as_ref()) {
         records.retain(|loaded| &loaded.id != id);
@@ -495,6 +672,9 @@ fn build_verifier<'a>(env: &'a Env, overlay: Option<&'a Overlay>) -> Result<Veri
         records,
         overlay,
         cache: RefCell::new(HashMap::new()),
+        ctl,
+        unhashed,
+        miss: Cell::new(false),
     })
 }
 
@@ -510,7 +690,7 @@ pub struct AppliedUpdate {
 
 /// Every verified `link-retarget` update for the seal `id`.
 pub fn updates_for(env: &Env, id: &str) -> Result<Vec<AppliedUpdate>, String> {
-    let verifier = build_verifier(env, None)?;
+    let verifier = build_verifier(env, None, None)?;
     let Some(loaded) = verifier.records.iter().find(|l| l.id == id) else {
         return Ok(Vec::new());
     };
@@ -532,11 +712,20 @@ struct Verifier<'a> {
     records: Vec<Loaded>,
     overlay: Option<&'a Overlay>,
     cache: RefCell<HashMap<String, Report>>,
+    /// The derived cache for this run, when one is in use.
+    ctl: Option<&'a Ctl>,
+    /// Pages the fast path did not hash; their spans are unknown.
+    unhashed: Vec<String>,
+    /// Set when an input this seal needs was not in the cache.
+    miss: Cell<bool>,
 }
 
 impl Verifier<'_> {
     fn report(&self, id: &str, stack: &mut Vec<String>) -> Option<Report> {
         if let Some(found) = self.cache.borrow().get(id) {
+            if found.unchecked {
+                self.miss.set(true);
+            }
             return Some(found.clone());
         }
         if stack.iter().any(|seen| seen == id) || stack.len() >= MAX_CITE_DEPTH {
@@ -572,10 +761,21 @@ impl Verifier<'_> {
             time_verified: view.map(|v| v.time_verified.clone()),
             likely_location: None,
             superseded_by: None,
+            unchecked: false,
         }
     }
 
+    /// Runs [`Self::compute_inner`] and records whether any input it (or a
+    /// seal it cites) needed was missing from the cache.
     fn compute(&self, loaded: &Loaded, stack: &mut Vec<String>) -> Report {
+        let outer = self.miss.replace(false);
+        let mut report = self.compute_inner(loaded, stack);
+        report.unchecked = self.miss.get();
+        self.miss.set(outer || report.unchecked);
+        report
+    }
+
+    fn compute_inner(&self, loaded: &Loaded, stack: &mut Vec<String>) -> Report {
         let Ok(view) = &loaded.view else {
             return self.malformed(loaded, None);
         };
@@ -629,7 +829,15 @@ impl Verifier<'_> {
             Some(_) => Binding::Mismatch,
         };
         let moved = picked.is_some_and(|s| !same_page(&s.name, &page));
-        let likely_location = (binding == Binding::SpanMissing)
+        // A page the fast path left unhashed may hold this span (or the moved
+        // copy), so a binding settled without it is not settled.
+        if self.ctl.is_some()
+            && (self.unhashed.iter().any(|name| same_page(name, &page))
+                || (binding == Binding::SpanMissing && !self.unhashed.is_empty()))
+        {
+            self.miss.set(true);
+        }
+        let likely_location = (binding == Binding::SpanMissing && self.ctl.is_none_or(|c| !c.fast))
             .then(|| self.locate(view))
             .flatten();
 
@@ -646,7 +854,13 @@ impl Verifier<'_> {
         let states: Vec<EvidenceState> = items
             .iter()
             .map(|item| {
-                let mut check = evidence::check(item, &ctx);
+                let (code, weight) = self.evidence_check(item, &ctx);
+                let mut check = evidence::Check {
+                    code,
+                    weight,
+                    detail: String::new(),
+                    local_path: None,
+                };
                 let pending = item.kind == evidence::Kind::Capture
                     && item.sha256.as_ref().is_some_and(|digest| {
                         self.overlay
@@ -720,6 +934,7 @@ impl Verifier<'_> {
             time_verified: Some(view.time_verified.clone()),
             likely_location,
             superseded_by: None,
+            unchecked: false,
         }
     }
 
@@ -874,10 +1089,104 @@ impl Verifier<'_> {
         let Some(signature) = signature else {
             return (SignatureStanding::Forged(ForgeReason::BadSignature), None);
         };
+        // Keyed by everything the result depends on: the record, its
+        // signature file and the trust files. A change to any is a miss.
+        let key = self.ctl.map(|ctl| {
+            format!(
+                "{}:{}:{}",
+                crate::sha256::hex(&loaded.bytes),
+                crate::sha256::hex(signature.as_bytes()),
+                ctl.trust_digest
+            )
+        });
+        if let (Some(ctl), Some(key)) = (self.ctl, &key) {
+            if ctl.fast {
+                return match ctl.cached_signature(key) {
+                    Some(standing) => Self::with_signer(standing),
+                    None => {
+                        ctl.note_miss();
+                        self.miss.set(true);
+                        (SignatureStanding::VerifierUnavailable, None)
+                    }
+                };
+            }
+        }
         if sshsig::capability_of(&self.env.keygen) != Capability::Available {
             return (SignatureStanding::VerifierUnavailable, None);
         }
         let standing = self.check_signature(&signature, view, &loaded.bytes);
+        if let (Some(ctl), Some(key)) = (self.ctl, &key) {
+            ctl.put_signature(key, &standing);
+        }
+        Self::with_signer(standing)
+    }
+
+    /// One evidence item's result code and weight. With a cache, a file,
+    /// blob, capture or commit result is reused only while its inputs'
+    /// `{mtime, size}` (or the repository's refs) are unchanged; the fast path
+    /// never recomputes, and reports a seal `unchecked` when it must.
+    fn evidence_check(
+        &self,
+        item: &evidence::Item,
+        ctx: &Ctx,
+    ) -> (evidence::Code, evidence::Weight) {
+        use evidence::{Code, Kind};
+        let weight = evidence::weight_of(item, ctx);
+        let Some(ctl) = self.ctl else {
+            return (evidence::check(item, ctx).code, weight);
+        };
+        // Resolved from files the verifier already reads, never by a process.
+        if matches!(item.kind, Kind::Note | Kind::Seal) {
+            return (evidence::check_code(item, ctx).0, weight);
+        }
+        let key = match item.kind {
+            Kind::Commit => format!(
+                "commit:{}@{}",
+                item.reference,
+                item.git_ref.as_deref().unwrap_or("")
+            ),
+            _ => format!(
+                "{}:{}:{}",
+                item.kind.as_str(),
+                item.reference,
+                item.git_blob
+                    .as_deref()
+                    .or(item.sha256.as_deref())
+                    .unwrap_or("")
+            ),
+        };
+        let stamp = if item.kind == Kind::Commit {
+            seal_cache::refs_fingerprint(&ctx.repo_root)
+        } else {
+            match evidence::local_input(item, ctx) {
+                // An invalid recorded path resolves (to unresolvable) without
+                // touching the file system or git.
+                None => return (evidence::check_code(item, ctx).0, weight),
+                Some(path) if !path.is_file() => {
+                    return (evidence::check_code(item, ctx).0, weight)
+                }
+                Some(path) => seal_cache::file_fingerprint(&path),
+            }
+        };
+        if ctl.fast {
+            if let Some((fingerprint, _)) = &stamp {
+                if let Some(code) = ctl.cached_evidence(&key, fingerprint) {
+                    return (code, weight);
+                }
+            }
+            ctl.note_miss();
+            self.miss.set(true);
+            return (Code::Unresolvable, weight);
+        }
+        // Stamped before the check, so a change during it is never hidden.
+        let code = evidence::check(item, ctx).code;
+        if let Some((fingerprint, newest)) = stamp {
+            ctl.put_evidence(&key, fingerprint, newest, code);
+        }
+        (code, weight)
+    }
+
+    fn with_signer(standing: SignatureStanding) -> (SignatureStanding, Option<String>) {
         let signer = match &standing {
             SignatureStanding::Verified {
                 matched_principal, ..
@@ -1090,6 +1399,7 @@ mod tests {
             time_verified: None,
             likely_location: None,
             superseded_by: Some("child1".to_owned()),
+            unchecked: false,
         };
         let value = report.to_value();
         let info = value.get("codes").and_then(|c| c.get("informational"));
