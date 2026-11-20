@@ -9,3 +9,5 @@ cli/tests/fixtures/seal/invalid-utf8.md -text
 cli/tests/fixtures/seal-canon/** text eol=lf
 cli/tests/fixtures/seal-canon/crlf.md -text
 cli/tests/fixtures/seal-canon/cr.md -text
+skills/loam-using/scripts/*.sh text eol=lf
+skills/loam-using/scripts/*.ps1 text eol=lf

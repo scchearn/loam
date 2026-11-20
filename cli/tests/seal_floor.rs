@@ -11,13 +11,15 @@ const ANCHOR: &str = "s-floor-span";
 const FIXTURES: &[&str] = &[
     "lf.md",
     "crlf.md",
-    "cr.md",
     "trailing-ws.md",
     "boundary-blank.md",
     "non-ascii.md",
     "fenced-lookalike.md",
     "reflowed.md",
 ];
+
+/// Lone-CR page: the runtime accepts it; the floor deliberately refuses.
+const REFUSED_FIXTURE: &str = "cr.md";
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -170,6 +172,17 @@ fn raw_and_digest_modes_equal_the_runtime_for_every_fixture() {
 }
 
 #[test]
+fn lone_cr_pages_are_refused_by_the_floor() {
+    for floor in floors() {
+        for digest in [false, true] {
+            let output = floor.run(digest, &fixture(REFUSED_FIXTURE), ANCHOR);
+            assert_eq!(output.status.code(), Some(2), "{} {output:?}", floor.label);
+            assert!(output.stdout.is_empty(), "{} {output:?}", floor.label);
+        }
+    }
+}
+
+#[test]
 fn raw_output_is_the_exact_canonical_bytes() {
     let expected: &[u8] =
         b"TLS tries the bundled rung first.\n\nThen it falls back to the system store.\n";
@@ -177,7 +190,6 @@ fn raw_output_is_the_exact_canonical_bytes() {
         for name in [
             "lf.md",
             "crlf.md",
-            "cr.md",
             "trailing-ws.md",
             "boundary-blank.md",
             "fenced-lookalike.md",
@@ -211,7 +223,6 @@ fn encoding_noise_is_absorbed_but_reflow_and_content_are_not() {
         let base = digest("lf.md");
         for same in [
             "crlf.md",
-            "cr.md",
             "trailing-ws.md",
             "boundary-blank.md",
             "fenced-lookalike.md",
@@ -424,6 +435,13 @@ fn floor_never_certifies_a_span_the_runtime_would_not() {
             "comment-then-indented",
             format!("<!-- note -->\n    {open}\n    x\n    {close}\n"),
         ),
+        (
+            "lone-cr-x1",
+            format!("- item\r\r    {open}\r    x\r    {close}\r"),
+        ),
+        ("lone-cr-trailing", format!("{open}\nx\n{close}\n\r")),
+        ("lone-cr-in-body", format!("{open}\na\rb\n{close}\n")),
+        ("lone-cr-eof-no-lf", format!("{open}\nx\n{close}\r")),
         ("form-feed-closer", format!("{open}\nx\n{close}\x0c\n")),
         ("nbsp-closer", format!("{open}\nx\n{close}\u{a0}\n")),
         ("nul-in-span", format!("{open}\na\0b\n{close}\n")),
@@ -567,23 +585,70 @@ fn floor_never_certifies_generated_pages() {
             .wrapping_add(1_442_695_040_888_963_407);
         (state >> 33) as usize
     };
-    let pages: Vec<(String, String)> = (0..600)
+    let terminators = ["\n", "\n", "\n", "\r\n", "\r"];
+    let random_pages: Vec<(String, String)> = (0..600)
         .map(|index| {
             let count = 4 + next() % 12;
             let mut body = String::new();
             for _ in 0..count {
                 body.push_str(&snippets[next() % snippets.len()]);
-                body.push('\n');
+                body.push_str(terminators[next() % terminators.len()]);
             }
             (format!("gen-{index}"), body)
         })
         .collect();
+    // Plain intro / opener / random content / closer pages mostly reach the
+    // accept path, so digest parity (not just refusal) is exercised.
+    let content = [
+        "plain words",
+        "caf\u{e9} \u{301}",
+        "nbsp\u{a0}inside",
+        "tab\tinside",
+        "trailing  ",
+        "trailing\t",
+        "",
+        "   ",
+        "\u{4e16}\u{754c}",
+        "emoji \u{1f600}",
+        "a  b",
+    ];
+    let accept_terms = ["\n", "\r\n", "\n", "\r\n"];
+    let mut accept_pages: Vec<(String, String)> = Vec::new();
+    for index in 0..300 {
+        let mut body = String::from("intro");
+        body.push_str(accept_terms[next() % accept_terms.len()]);
+        body.push_str(accept_terms[next() % accept_terms.len()]);
+        body.push_str(open);
+        body.push_str(accept_terms[next() % accept_terms.len()]);
+        for _ in 0..(1 + next() % 5) {
+            body.push_str(content[next() % content.len()]);
+            // Occasionally a lone CR, which the floor must refuse.
+            let term = if next() % 25 == 0 {
+                "\r"
+            } else {
+                accept_terms[next() % accept_terms.len()]
+            };
+            body.push_str(term);
+        }
+        body.push_str(close);
+        body.push_str(accept_terms[next() % accept_terms.len()]);
+        accept_pages.push((format!("acc-{index}"), body));
+    }
+    // Interleave so the ps1 floor's first 60 pages cover both families.
+    let mut accept_iter = accept_pages.into_iter();
+    let mut pages: Vec<(String, String)> = Vec::new();
+    for (index, page) in random_pages.into_iter().enumerate() {
+        pages.push(page);
+        if index % 2 == 0 {
+            pages.extend(accept_iter.next());
+        }
+    }
     let cases: Vec<(&str, String)> = pages
         .iter()
         .map(|(name, body)| (name.as_str(), body.clone()))
         .collect();
     let dir = TempDir::new("never-certifies-gen");
-    check_never_certifies(&dir, &cases, 600, 60);
+    check_never_certifies(&dir, &cases, usize::MAX, 60);
 }
 
 /// Each ps1 case is a PowerShell cold start, so a ps1 floor only sees the

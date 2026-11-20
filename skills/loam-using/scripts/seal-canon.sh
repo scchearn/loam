@@ -8,7 +8,7 @@
 # of the seal span `<anchor>` (a leading `^` or `#` is accepted), or with
 # --digest only the lowercase sha256 hex of those bytes.
 #
-# loam.canon/v1: strict UTF-8; CRLF and lone CR become LF; trailing spaces and
+# loam.canon/v1: strict UTF-8; CRLF becomes LF (a file with a lone CR is refused); trailing spaces and
 # tabs are stripped per line; leading and trailing blank lines are dropped;
 # exactly one final LF; an all-blank span is the empty byte string. No NFC,
 # no reflow, no re-escaping.
@@ -26,7 +26,7 @@
 # mentioned in a file holding one the span is refused. So is any marker or
 # question line carrying whitespace beyond space and tab (form feed, NBSP, U+2000..): the runtime
 # trims Unicode white space, this script does not. NUL bytes are refused
-# on purpose as invalid text. The floor may refuse a span the runtime
+# on purpose as invalid text. So is any lone CR (a CR not followed by LF). The floor may refuse a span the runtime
 # accepts; it must never print a digest the runtime would not.
 #
 # Exit: 0 ok, 2 usage, missing file, missing/ambiguous anchor, invalid UTF-8.
@@ -74,6 +74,13 @@ total=$(wc -c <"$file") || exit 2
 clean=$(LC_ALL=C tr -d '\000' <"$file" | wc -c) || exit 2
 if [ "$((total + 0))" -ne "$((clean + 0))" ]; then
     echo "seal-canon: $file contains NUL bytes; use the loam runtime" >&2
+    exit 2
+fi
+
+# A lone CR at end of file is invisible to awk records; check the last byte.
+lastbyte=$(tail -c 1 "$file" | od -An -tx1 | tr -d ' \n')
+if [ "$lastbyte" = "0d" ]; then
+    echo "seal-canon: $file contains a lone CR; use the loam runtime" >&2
     exit 2
 fi
 
@@ -163,13 +170,13 @@ BEGIN {
 {
     rec = $0
     if (rec !~ utf8) { bad = 1; exit }
-    # CRLF, lone CR and LF all end a line.
+    # CRLF and LF end a line; any other CR is a lone CR, which is refused.
     sub(/\r$/, "", rec)
-    k = split(rec, parts, "\r")
-    if (k == 0) parts[k = 1] = ""
-    for (j = 1; j <= k; j++) lines[++n] = parts[j]
+    if (index(rec, "\r")) { bad = 2; exit }
+    lines[++n] = rec
 }
 END {
+    if (bad == 2) exit 8
     if (bad) exit 3
     id = ENVIRON["SEAL_ID"]
     # A leading BOM is content-neutral: it never sits inside a span.
@@ -317,6 +324,7 @@ report() {
         4) echo "seal-canon: no well-formed seal span ^$anchor in $file" >&2 ;;
         5) echo "seal-canon: unsupported whitespace in a marker line of $file; use the loam runtime" >&2 ;;
         6) echo "seal-canon: ambiguous markdown structure around ^$anchor in $file; use the loam runtime" >&2 ;;
+        8) echo "seal-canon: $file contains a lone CR; use the loam runtime" >&2 ;;
         7) echo "seal-canon: ^$anchor opens on more than one line of $file; use the loam runtime" >&2 ;;
         *) echo "seal-canon: awk failed on $file (status $1)" >&2 ;;
     esac

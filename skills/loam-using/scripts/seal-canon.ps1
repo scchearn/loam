@@ -10,7 +10,7 @@ seal span <anchor> (a leading ^ or # is accepted) to stdout, raw, with no BOM
 and no newline translation. With -Digest it writes only the lowercase sha256
 hex of those bytes, computed in-process.
 
-loam.canon/v1: strict UTF-8; CRLF and lone CR become LF; trailing spaces and
+loam.canon/v1: strict UTF-8; CRLF becomes LF (a file with a lone CR is refused); trailing spaces and
 tabs are stripped per line; leading and trailing blank lines are dropped;
 exactly one final LF; an all-blank span is the empty byte string. No NFC, no
 reflow, no re-escaping. It mirrors seal-canon.sh and the runtime scanner:
@@ -63,7 +63,7 @@ try {
     Fail "$File is not valid UTF-8"
 }
 
-# CRLF, lone CR and LF all end a line.
+# CRLF and LF end a line. A lone CR is refused: the floor does not model it.
 $lines = New-Object 'System.Collections.Generic.List[string]'
 $sb = New-Object System.Text.StringBuilder
 $len = $text.Length
@@ -72,7 +72,7 @@ for ($k = 0; $k -lt $len; $k++) {
     if ($c -eq "`n") {
         $lines.Add($sb.ToString()); [void]$sb.Clear()
     } elseif ($c -eq "`r") {
-        if ($k + 1 -lt $len -and $text[$k + 1] -eq "`n") { $k++ }
+        if ($k + 1 -lt $len -and $text[$k + 1] -eq "`n") { $k++ } else { Fail "$File contains a lone CR; use the loam runtime" }
         $lines.Add($sb.ToString()); [void]$sb.Clear()
     } else {
         [void]$sb.Append($c)
