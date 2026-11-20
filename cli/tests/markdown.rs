@@ -369,3 +369,105 @@ fn markdown_lint_skips_symlinked_roots() {
     );
     assert!(output.stdout.is_empty());
 }
+
+const MARKER_TARGET: &str = "# Target\n\n\
+<!-- loam:class c-payroll-notes local-only -->\n\
+Class body.\n\n\
+<!-- loam:seal s-tls-rung-order -->\n\
+Seal body.\n\
+<!-- /loam:seal -->\n\
+<!-- /loam:class -->\n\n\
+- [ ] Q: Who signs off hosting? ^q-hosting-signoff\n";
+
+#[test]
+fn markdown_lint_resolves_marker_block_ids() {
+    let workspace = temporary_workspace();
+    write_file(&workspace, "wiki/target.md", MARKER_TARGET);
+    write_file(
+        &workspace,
+        "wiki/index.md",
+        "# Index\n\n\
+[[target#^s-tls-rung-order]]\n\n\
+[[target#^c-payroll-notes]]\n\n\
+[[target#^q-hosting-signoff]]\n\n\
+[[target.md#^s-tls-rung-order|alias]]\n\n\
+[rel](target.md#^q-hosting-signoff)\n\n\
+[enc](target.md#%5Es-tls-rung-order)\n\n\
+[[#^q-local-question]]\n\n\
+[same](#^q-local-question)\n\n\
+- [ ] Q: Local question? ^q-local-question\n",
+    );
+
+    let output = run_lint(&workspace);
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    assert_eq!(output.status.code(), Some(0), "output: {stdout}");
+    assert!(stdout.is_empty(), "output: {stdout}");
+}
+
+#[test]
+fn markdown_lint_reports_missing_block_id_as_lmd003_and_md051() {
+    let workspace = temporary_workspace();
+    write_file(&workspace, "wiki/target.md", MARKER_TARGET);
+    write_file(
+        &workspace,
+        "wiki/index.md",
+        "# Index\n\n\
+[[target#^s-missing-seal]]\n\n\
+[rel](target.md#^q-missing-question)\n\n\
+[[#^c-local-missing]]\n\n\
+[same](#^q-local-missing)\n",
+    );
+
+    let output = run_lint(&workspace);
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+    let stdout = String::from_utf8(output.stdout).expect("lint output should be UTF-8");
+
+    assert_eq!(output.status.code(), Some(2), "output: {stdout}");
+    assert!(
+        stdout.contains("Block id \\\"^s-missing-seal\\\" does not exist in \\\"target\\\""),
+        "output: {stdout}"
+    );
+    assert!(
+        stdout.contains("Block id \\\"^c-local-missing\\\""),
+        "output: {stdout}"
+    );
+    let count = |rule: &str| {
+        stdout
+            .lines()
+            .filter(|line| line.contains(&format!("\"rule\":\"{rule}\"")))
+            .count()
+    };
+    // Wikilinks to a missing block id and the cross-document link are LMD003;
+    // the same-file Markdown link is MD051. No LMD004 for block ids.
+    assert_eq!(count("LMD003"), 3, "output: {stdout}");
+    assert_eq!(count("MD051"), 1, "output: {stdout}");
+    assert_eq!(count("LMD004"), 0, "output: {stdout}");
+}
+
+#[test]
+fn markdown_lint_ignores_fenced_block_ids() {
+    let workspace = temporary_workspace();
+    write_file(
+        &workspace,
+        "wiki/target.md",
+        "# Target\n\n```\n<!-- loam:seal s-fenced-seal -->\nbody\n<!-- /loam:seal -->\n- [ ] Q: Fenced? ^q-fenced-one\n```\n",
+    );
+    write_file(
+        &workspace,
+        "wiki/index.md",
+        "# Index\n\n[[target#^s-fenced-seal]]\n\n[rel](target.md#^q-fenced-one)\n",
+    );
+
+    let output = run_lint(&workspace);
+    fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
+    let stdout = String::from_utf8(output.stdout).expect("lint output should be UTF-8");
+
+    assert_eq!(output.status.code(), Some(2), "output: {stdout}");
+    assert_eq!(
+        stdout.matches("\"rule\":\"LMD003\"").count(),
+        2,
+        "output: {stdout}"
+    );
+}

@@ -1,3 +1,4 @@
+use crate::markers;
 use pulldown_cmark::{BrokenLink, Event, LinkType, Options, Parser, Tag, TagEnd};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -30,6 +31,7 @@ struct ParsedDocument {
     definitions: Vec<Definition>,
     wikilinks: Vec<Wikilink>,
     fragments: HashSet<String>,
+    markers: markers::Scan,
 }
 
 struct Heading {
@@ -465,6 +467,10 @@ fn parse_document(source: &str) -> ParsedDocument {
     for anchor in html_anchors {
         fragments.insert(anchor);
     }
+    let markers = markers::scan(source);
+    for id in markers.anchors.keys() {
+        fragments.insert(format!("#^{id}"));
+    }
 
     ParsedDocument {
         headings,
@@ -472,6 +478,7 @@ fn parse_document(source: &str) -> ParsedDocument {
         definitions,
         wikilinks,
         fragments,
+        markers,
     }
 }
 
@@ -753,6 +760,19 @@ fn lint_wikilink(
         return;
     };
     let heading = heading.trim();
+    if let Some(id) = heading.strip_prefix('^') {
+        if !target_document.parsed.markers.anchors.contains_key(id) {
+            diagnostics.push(diagnostic(
+                document,
+                wikilink.range.clone(),
+                RULE_LMD003,
+                format!("Block id \"^{id}\" does not exist in \"{target}\""),
+                Some(format!("{target}#{heading}")),
+                Vec::new(),
+            ));
+        }
+        return;
+    }
     let heading_matches = target_document
         .parsed
         .headings
