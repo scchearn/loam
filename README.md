@@ -251,7 +251,7 @@ not the whole Loam config directory.
 
 ## Workflow skills
 
-21 skills, grouped by what they're for:
+22 skills, grouped by what they're for:
 
 You can ask for an outcome in ordinary language; the Using skill routes the
 request to the matching workflow:
@@ -261,8 +261,9 @@ request to the matching workflow:
 - **Goals and decisions:** define a measurable goal or run a structured debate
   before choosing an approach.
 - **Project memory:** add a source, ask what the memory says, correct stale
-  knowledge, normalize or lint a notes corpus, review open questions, and
-  capture useful session learnings.
+  knowledge, normalize or lint a notes corpus, review open questions,
+  capture useful session learnings, and seal a verified claim so it can be
+  cited.
 - **Code understanding:** ingest a codebase into the memory graph and reconcile
   that graph after planned changes.
 - **Setup:** scaffold a wiki or initialize an Obsidian vault.
@@ -293,23 +294,24 @@ the skill runs. The table below shows how much space each skill uses against the
 |-------|---:|---:|---:|---:|
 | loam::initializing-vault | 206 | 51 | 9 | 73 |
 | loam::scaffolding-wiki | 445 | 90 | 207 | 2,400 |
-| loam::adding-to-memory | 592 | 116 | 217 | 2,312 |
-| loam::amending-memory | 505 | 114 | 180 | 1,958 |
+| loam::adding-to-memory | 592 | 116 | 218 | 2,362 |
+| loam::amending-memory | 505 | 114 | 182 | 2,122 |
 | loam::auditing-guidance | 410 | 85 | 304 | 3,256 |
 | loam::ingesting-codebase | 329 | 76 | 288 | 3,660 |
-| loam::learning-from-session | 487 | 101 | 365 | 4,213 |
-| loam::linting-memory | 471 | 102 | 316 | 5,000 |
-| loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
-| loam::querying-memory | 530 | 105 | 206 | 2,025 |
+| loam::learning-from-session | 487 | 101 | 366 | 4,249 |
+| loam::linting-memory | 471 | 102 | 303 | 4,961 |
+| loam::normalizing-memory | 457 | 101 | 262 | 2,712 |
+| loam::querying-memory | 530 | 105 | 208 | 2,078 |
 | loam::reviewing-memory | 510 | 113 | 137 | 1,799 |
+| loam::sealing-memory | 518 | 125 | 87 | 1,521 |
 | loam::syncing-code-graph | 363 | 84 | 223 | 2,780 |
-| loam::using | 368 | 77 | 71 | 1,615 |
+| loam::using | 368 | 77 | 75 | 1,750 |
 | loam::amending-plan | 437 | 88 | 273 | 3,059 |
 | loam::checkpointing | 365 | 69 | 177 | 2,094 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,237 |
-| loam::planning | 327 | 62 | 323 | 4,321 |
-| loam::resuming | 376 | 77 | 142 | 1,850 |
-| loam::setting-goals | 473 | 101 | 184 | 1,883 |
+| loam::planning | 327 | 62 | 325 | 4,347 |
+| loam::resuming | 376 | 77 | 144 | 1,903 |
+| loam::setting-goals | 473 | 101 | 186 | 1,921 |
 | loam::starting | 166 | 34 | 356 | 4,989 |
 | loam::writing-spec | 332 | 66 | 261 | 3,323 |
 <!-- END skill-metrics -->

@@ -3,7 +3,7 @@ name: loam::resuming
 description: "Use when resuming work after a pause, reboot, or context switch and the workspace uses `wiki/checkpoints/` resumable notes. Read the latest relevant checkpoint chain, orient to the most likely in-flight scope, verify current files and tools before acting, and report the safest next step. Treats a goal path as concrete context; checks live goal status over stale checkpoints."
 allowed-tools: Read Glob Grep Bash
 metadata:
-  version: "1.4.0"
+  version: "1.5.0"
   author: scchearn
   argument-hint: "[optional hint or focus]"
 ---
@@ -114,6 +114,8 @@ Verify only what the checkpoint would cause you to act on, such as:
 - if the checkpoint or plan references a goal path and the file is missing or unreadable, report the path and stop. Otherwise read live status; do not resume a `paused`, `achieved`, or `abandoned` goal unless explicitly authorized
 
 If the live state conflicts with the checkpoint, say so directly and prefer the live state.
+
+If the checkpoint relies on sealed text, cite it with the `cite_as`, verdict and effective level from `<native-runtime-command> seal verify … --json` (`loam-using/references/seals.md`); never say "sealed" without a verify result.
 
 ---
 

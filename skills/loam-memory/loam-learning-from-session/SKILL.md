@@ -3,7 +3,7 @@ name: loam::learning-from-session
 description: "Review the current session for durable learnings, then route each one through the five-way matrix: wiki page, guidance file, checkpoint, task annotation/plan, or discard. Use when the session uncovered decisions, architecture facts, commands, conventions, gotchas, or open questions that future sessions should inherit. Not for source ingestion or correcting stale wiki claims; use /loam::adding-to-memory or /loam::amending-memory. Routes goal-specific progress to /loam::setting-goals."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.5.2"
+  version: "1.6.0"
   author: scchearn
   argument-hint: [topic or session summary]
 ---
@@ -238,6 +238,7 @@ Rules:
 4. Keep additions concise and durable. Do not dump session transcripts.
 5. If a learning contradicts an existing memory claim, archive the superseded durable page, write the correction, log it, and continue.
 6. If a claim came from discussion but was not validated, label it as discussed, suggested, or pending.
+7. Offer to seal decision-grade facts via `/loam::sealing-memory` (`loam-using/references/seals.md`); never add seal markers without attesting.
 
 ### 3B — Guidance-file path
 

@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate) and goal artifacts. Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, consolidate a legacy root `overview.md` into `index.md`, or health-check goal artifacts. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.11.1"
+  version: "1.12.0"
   author: scchearn
   argument-hint: [wiki root, goal path, or focus area]
 ---
@@ -54,7 +54,7 @@ If the target was a single `goals/<slug>.md` path, skip all wiki-only steps and 
 
 If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam install`; do not fabricate state or use a project-local fallback. Use `wiki_root` as the resolved wiki root (resolved from on-disk contract files, not qmd metadata). If `has_overview` is true, note it as a legacy root-hub file to fold into `index.md`. Then resolve the lint scope: if the user named a wiki root, subdirectory, topic, or entity, use that. If no scope given, lint the whole wiki.
 
-This skill satisfies the `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, and `legacy_structure_pending` hints (see the hint contract in `loam-using/references/runtime.md`); treat them as advisory scope, not extra mandatory work. Fast state omits date drift, which the lint pass checks directly later.
+This skill satisfies the `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, `legacy_structure_pending`, and `seals_attention` hints (see the hint contract in `loam-using/references/runtime.md`); treat them as advisory scope, not extra mandatory work. Fast state omits date drift, which the lint pass checks directly later.
 
 ### Read the wiki contract
 
@@ -85,9 +85,11 @@ reading pages, so manual review is spent on judgement rather than link chasing:
 
 Each line is one JSON finding with `rule`, `file`, `line`, `description`,
 `target`, and `candidates`. Exit 0 is clean, 2 means findings, 1 means bad
-arguments or an unreadable input. `--only guidance|markdown|memory|work` narrows
+arguments or an unreadable input. `--only guidance|markdown|memory|seals|work` narrows
 the scan. The command is read-only except for `--fix`, which regenerates only
 the `AGENTS.md` memory-map region (see K below).
+
+Seals: run `<native-runtime-command> lint --only seals "$WORKSPACE_ROOT"` (satisfies `seals_attention`; see `loam-using/references/seals.md`). Report findings only: never re-hash or edit a seal record.
 
 If it exits 75 or 78 the native runtime is not ready — stop and report
 `npx @scchearn/loam install`. Do not claim a clean result from a fallback check.
@@ -175,7 +177,7 @@ When `<wiki root>/checkpoints/` contains legacy slugged checkpoint filenames:
 
 1. identify files matching `checkpoint-YYYY-MM-DD-HHMM-<slug>.md`
 2. rename to `checkpoint-YYYY-MM-DD-HHMM.md`, using the smallest suffix only when a collision exists
-3. update checkpoint wikilinks that reference renamed notes
+3. update checkpoint wikilinks that reference renamed notes, except inside `<!-- loam:seal ... -->` spans: leave those bytes untouched and report the stale link (see `loam-using/references/seals.md`)
 4. apply the migration directly — it is mechanical and git-reversible, so it needs no approval; the `log.md` entry below is what makes it non-silent
 5. record the checkpoint filename migration in `<wiki root>/log.md`
 
@@ -208,7 +210,7 @@ Allowed direct fixes:
 9. normalizing internal links to canonical `[[kebab-case-note-name]]` form
 10. moving a misplaced nested `.obsidian/` to the parent root when that destination has none
 11. reconciling stale `.wiki-metadata.json` paths to the actual resolved wiki root
-12. renaming legacy slugged checkpoint files and their wikilinks when the mapping is collision-free and local
+12. renaming legacy slugged checkpoint files and their wikilinks when the mapping is collision-free and local (never inside sealed spans)
 13. moving stranded code pages from `entities/` to `code/`, rebuilding the hub, and logging the migration
 14. regenerating the `AGENTS.md` memory-map region with `<native-runtime-command> lint --only guidance --fix "$WORKSPACE_ROOT"` — never by hand-editing inside the markers
 
@@ -236,22 +238,7 @@ This is the stable evidence the native state probe reads for the `memory_lint_st
 
 ### Check date format drift
 
-Run `datecheck` to scan all markdown files for date-format drift:
-
-```bash
-<native-runtime-command> datecheck check "$WIKI_ROOT"
-```
-
-The script reports drift as JSON: front matter point-in-time fields missing timezone offsets, legacy TZ labels (`SAST`, `GMT+N`, `UTC`), and decisions-log entries using non-em-dash separators.
-
-Canonical formats are defined in `loam-using/references/date-formats.md`.
-
-If drift is found:
-1. Run `<native-runtime-command> datecheck fix "$WIKI_ROOT"`. `--offset` is optional and defaults to the machine's local offset, so no human input is needed.
-2. Re-run `datecheck check "$WIKI_ROOT"` to confirm zero drift.
-3. Record it in `<wiki root>/log.md` and report under "Fixed now".
-
-`check` never writes. `fix` is idempotent and loses no information — run it directly, never report date drift as needing approval.
+Run `<native-runtime-command> datecheck check "$WIKI_ROOT"`; if it reports drift, run `<native-runtime-command> datecheck fix "$WIKI_ROOT"` directly (never ask approval), re-check, and log it. Read `references/date-drift.md` for drift kinds, the fix steps and log wording.
 
 ### Refresh qmd after writes
 

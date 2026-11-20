@@ -3,7 +3,7 @@ name: loam::planning
 description: "Use when an approved workspace spec needs an execution-ready implementation plan with ordered, verifiable steps. Specs are mandatory: this skill consumes design decisions, verifies that the spec still matches the codebase, and writes the repo-native plans/ artifacts. Inherits optional goal provenance; see loam::setting-goals."
 allowed-tools: Read Glob Grep Bash Write Edit Skill
 metadata:
-  version: "2.5.0"
+  version: "2.6.0"
   author: scchearn
   argument-hint: <spec path or spec topic>
 ---
@@ -183,6 +183,8 @@ Use this order:
 7. `Files`
 8. `Verify`
 9. `Passes when`
+
+`Evidence: seal:<id>` is a valid acceptance-criterion evidence form (`loam-using/references/seals.md`).
 
 `Passes when` describes the expected passing state in plain language. It is the primary signal a smaller model uses to decide the task is complete.
 

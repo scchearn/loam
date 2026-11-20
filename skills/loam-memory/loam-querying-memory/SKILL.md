@@ -3,7 +3,7 @@ name: loam::querying-memory
 description: "Answer questions against existing memory (the wiki substrate). Use this whenever the user is asking what is happening in the project, directory, codebase, architecture, workflow, decisions, or current state and the wiki likely contains the answer, even if they do not explicitly mention the wiki. Also use it for summaries, comparisons, and reusable analyses grounded in current wiki pages. Routes authoritative goal-state questions to /loam::setting-goals. Not for surfacing unresolved gaps; use /loam::reviewing-memory for that."
 allowed-tools: Read Glob Grep Write Edit Bash mcp__hcom-mcp__transcript
 metadata:
-  version: "1.3.0"
+  version: "1.4.0"
   author: scchearn
   argument-hint: <question>
 ---
@@ -103,6 +103,8 @@ Rules:
    - what only a session transcript supports (not yet in memory)
    - what memory does not yet establish
 4. If the question cannot be answered well from the current wiki, say that explicitly and identify the missing source, page, or ingest work that would help.
+
+Sealed text: cite it with the `cite_as`, verdict and effective level from `<native-runtime-command> seal verify … --json` (see `loam-using/references/seals.md`). Never say "sealed" without a verify result from this session.
 
 Keep the answer concise but complete. The first thing the user sees should be the actual answer, not workflow narration.
 
