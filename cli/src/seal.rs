@@ -5,9 +5,11 @@
 
 pub mod canon;
 pub mod evidence;
+pub mod policy;
 pub mod record;
 pub mod sshsig;
 pub mod trust;
+pub mod verdict;
 
 use crate::markers::{self, Kind};
 use std::fs;
@@ -102,6 +104,247 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
+    }
+
+    use super::evidence::{Code, Kind, Recheck};
+    use super::policy::{self, Level, SignatureStanding};
+    use super::verdict::fixture::{at, cited, note, primary, verified, Case, AGENT, STAMP as T0};
+    use super::verdict::{code, Verdict};
+    use crate::json::Value;
+
+    fn codes(outcome: &super::verdict::Outcome) -> Vec<&'static str> {
+        let c = &outcome.codes;
+        c.success
+            .iter()
+            .chain(&c.informational)
+            .chain(&c.failure)
+            .copied()
+            .collect()
+    }
+
+    /// S6 (a): note-only and unsealed-page evidence never rises above
+    /// unsealed.
+    #[test]
+    fn level_ceiling_note_only_is_unverifiable() {
+        let mut c = Case::citable();
+        c.requested = Level::Evidence;
+        c.evidence = vec![note()];
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Unverifiable);
+        assert_eq!(got.effective_level, None);
+
+        // A wiki page is zero-weight too (the resolver assigns the weight).
+        let mut page = primary(Kind::File);
+        page.weight = super::evidence::Weight::Zero;
+        c.evidence = vec![page, note()];
+        assert_eq!(c.run().effective_level, None);
+    }
+
+    /// S6 (b): canonical requested by a principal granted only audited.
+    #[test]
+    fn level_ceiling_overclaim_reports_sel008() {
+        let mut c = Case::citable();
+        c.requested = Level::Canonical;
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Citable);
+        assert_eq!(got.effective_level, Some(Level::Audited));
+        assert_eq!(got.requested_level, Level::Canonical);
+        assert!(got
+            .codes
+            .informational
+            .contains(&code::LEVEL_ABOVE_ATTAINABLE));
+        assert_eq!(
+            code::lint_code(code::LEVEL_ABOVE_ATTAINABLE),
+            Some("SEL008")
+        );
+    }
+
+    /// Ceilings per D2: no signature gives evidence; an unlisted signer gives
+    /// evidence; canonical needs the canonical list and `min_signers`.
+    #[test]
+    fn level_ceiling_by_signer() {
+        let mut c = Case::citable();
+        c.requested = Level::Canonical;
+
+        c.signature = SignatureStanding::Unsigned;
+        assert_eq!(c.run().effective_level, Some(Level::Evidence));
+
+        c.signature = verified("alice@example.com", "ssh-ed25519");
+        assert_eq!(c.run().effective_level, Some(Level::Evidence));
+
+        c.policy.audited_principals.push("alice@example.com".into());
+        assert_eq!(c.run().effective_level, Some(Level::Audited));
+
+        c.policy.canonical_principals = vec!["alice@example.com".into()];
+        let got = c.run();
+        assert_eq!(got.effective_level, Some(Level::Canonical));
+        assert!(got.codes.informational.contains(&code::UNATTENDED_KEY));
+
+        // A hardware-backed key carries no unattended note.
+        c.signature = verified("alice@example.com", "sk-ssh-ed25519@openssh.com");
+        let got = c.run();
+        assert_eq!(got.effective_level, Some(Level::Canonical));
+        assert!(!got.codes.informational.contains(&code::UNATTENDED_KEY));
+
+        // min_signers needs a second distinct canonical signer.
+        c.policy.canonical_min_signers = 2;
+        assert_eq!(c.run().effective_level, Some(Level::Audited));
+        c.cosigners = vec!["alice@example.com".into()];
+        assert_eq!(
+            c.run().effective_level,
+            Some(Level::Audited),
+            "same signer twice"
+        );
+        c.cosigners = vec!["bob@example.com".into()];
+        assert_eq!(
+            c.run().effective_level,
+            Some(Level::Audited),
+            "bob not listed"
+        );
+        c.policy.canonical_principals.push("bob@example.com".into());
+        assert_eq!(c.run().effective_level, Some(Level::Canonical));
+    }
+
+    /// Audited needs every item to resolve; evidence needs only one primary.
+    #[test]
+    fn level_ceiling_all_items_must_resolve_for_audited() {
+        let mut c = Case::citable();
+        let mut orphan = primary(Kind::Commit);
+        orphan.code = Code::Orphaned;
+        c.evidence = vec![primary(Kind::Blob), orphan];
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Citable);
+        assert_eq!(got.effective_level, Some(Level::Evidence));
+        assert!(got
+            .codes
+            .informational
+            .contains(&code::LEVEL_ABOVE_ATTAINABLE));
+    }
+
+    /// S6 (c): a derived seal takes the minimum level of what it cites.
+    #[test]
+    fn level_ceiling_derived_takes_minimum() {
+        let mut c = Case::citable();
+        c.requested = Level::Audited;
+        c.evidence = vec![cited(Some(Level::Evidence))];
+        let got = c.run();
+        assert_eq!(got.effective_level, Some(Level::Evidence));
+        assert!(got.codes.informational.contains(&code::CAPPED_DERIVED));
+
+        c.evidence = vec![cited(Some(Level::Canonical)), cited(Some(Level::Audited))];
+        assert_eq!(c.run().effective_level, Some(Level::Audited));
+
+        c.evidence = vec![primary(Kind::Blob), cited(Some(Level::Evidence))];
+        assert_eq!(c.run().effective_level, Some(Level::Evidence));
+    }
+
+    /// Pure `redaction_cap`: an audited signer with `redacted:["token"]`
+    /// ends at evidence.
+    #[test]
+    fn level_ceiling_redaction_cap() {
+        let redacted = vec![Value::String("token".into())];
+        assert_eq!(policy::redaction_cap(&redacted), Some(Level::Evidence));
+        assert_eq!(policy::redaction_cap(&[]), None);
+
+        let mut c = Case::citable();
+        c.redacted = redacted;
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Citable);
+        assert_eq!(got.effective_level, Some(Level::Evidence));
+        assert!(got.codes.informational.contains(&code::CAPPED_REDACTION));
+    }
+
+    /// With the verifier unavailable the verdict is not refused but the
+    /// level is no higher than evidence, with the informational code.
+    #[test]
+    fn level_ceiling_verifier_unavailable() {
+        let mut c = Case::citable();
+        c.signature = SignatureStanding::VerifierUnavailable;
+        c.requested = Level::Canonical;
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Citable);
+        assert_eq!(got.effective_level, Some(Level::Evidence));
+        assert!(codes(&got).contains(&code::VERIFIER_UNAVAILABLE));
+        assert!(got.codes.failure.is_empty());
+    }
+
+    /// S8: evidence drift is stale with SEL005.
+    #[test]
+    fn stale_evidence_drift() {
+        let mut c = Case::citable();
+        let mut drifted = primary(Kind::Blob);
+        drifted.code = Code::Drifted;
+        c.evidence = vec![drifted];
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Stale);
+        assert!(got.codes.failure.contains(&code::EVIDENCE_DRIFTED));
+        assert_eq!(code::lint_code(code::EVIDENCE_DRIFTED), Some("SEL005"));
+
+        let mut gone = primary(Kind::Blob);
+        gone.code = Code::Unresolvable;
+        c.evidence = vec![gone];
+        assert_eq!(c.run().verdict, Verdict::Stale);
+    }
+
+    /// S8: a passed `review_by` is stale with SEL006; a future one is not.
+    #[test]
+    fn stale_review_by() {
+        let mut c = Case::citable();
+        c.review_by = Some(at("2026-12-01 00:00 +02:00"));
+        c.now = at("2026-11-30 23:59 +02:00");
+        assert_eq!(c.run().verdict, Verdict::Citable);
+        c.now = at("2026-12-01 00:01 +02:00");
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Stale);
+        assert!(got.codes.failure.contains(&code::REVIEW_BY_PASSED));
+        assert_eq!(code::lint_code(code::REVIEW_BY_PASSED), Some("SEL006"));
+    }
+
+    /// S8: a due `every:<dur>` recheck is stale; before it is due, citable.
+    #[test]
+    fn stale_recheck_due() {
+        let mut c = Case::citable();
+        let mut item = primary(Kind::Blob);
+        item.recheck = Recheck::Every("30d".into());
+        c.evidence = vec![item];
+        c.now = at("2026-12-19 14:30 +02:00");
+        assert_eq!(c.run().verdict, Verdict::Citable);
+        c.now = at("2026-12-20 14:30 +02:00");
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Stale);
+        assert!(got.codes.failure.contains(&code::RECHECK_DUE));
+    }
+
+    /// S8: `review_by` of 2099 is treated as expiring at the 180-day cap.
+    #[test]
+    fn stale_review_by_2099_expires_at_cap() {
+        let mut c = Case::citable();
+        c.review_by = Some(at("2099-01-01 00:00 +00:00"));
+        // time_verified 2026-11-20 14:30 +02:00 plus 180 days.
+        c.now = at("2027-05-19 14:29 +02:00");
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Citable);
+        assert!(got.codes.informational.contains(&code::REVIEW_BY_CAPPED));
+
+        c.now = at("2027-05-19 14:31 +02:00");
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Stale);
+        assert!(got.codes.failure.contains(&code::REVIEW_BY_CAPPED));
+
+        // The cap follows the reader's policy, not a constant.
+        c.policy.max_review = "30d".into();
+        c.now = at("2026-12-21 00:00 +02:00");
+        assert_eq!(c.run().verdict, Verdict::Stale);
+    }
+
+    /// Nothing about the verdict depends on the wall clock: the same inputs
+    /// with the same injected `now` always agree.
+    #[test]
+    fn stale_is_deterministic_in_now() {
+        let mut c = Case::citable();
+        c.review_by = Some(at("2026-12-01 00:00 +02:00"));
+        let _ = (T0, AGENT);
+        assert_eq!(c.run(), c.run());
     }
 
     /// S20: a capture under the cap is stored with origin and retrieved_at,
