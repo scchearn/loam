@@ -6,6 +6,10 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Background code ingestion skips sessions another agent launched through hcom (`HCOM_LAUNCHED_BY` set) unless `LOAM_INGEST_BACKGROUND=1`. A Codex worker lane no longer gets a Stop continuation telling it to spawn `loam_ingestor` and finish immediately, which ended delegated turns early and broke briefs that forbid subagents.
+
 ## [1.0.6]
 
 Plugin 1.0.6 ships alone; the runtime stays at 1.0.4.
