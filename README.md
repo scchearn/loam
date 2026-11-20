@@ -261,8 +261,9 @@ request to the matching workflow:
 - **Goals and decisions:** define a measurable goal or run a structured debate
   before choosing an approach.
 - **Project memory:** add a source, ask what the memory says, correct stale
-  knowledge, normalize or lint a notes corpus, review open questions, and
-  capture useful session learnings.
+  knowledge, normalize or lint a notes corpus, review open questions,
+  capture useful session learnings, and seal a verified claim so it can be
+  cited.
 - **Code understanding:** ingest a codebase into the memory graph and reconcile
   that graph after planned changes.
 - **Setup:** scaffold a wiki or initialize an Obsidian vault.
@@ -302,7 +303,7 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
 | loam::querying-memory | 530 | 105 | 206 | 2,025 |
 | loam::reviewing-memory | 510 | 113 | 137 | 1,799 |
-| loam::sealing-memory | 518 | 125 | 87 | 1,482 |
+| loam::sealing-memory | 518 | 125 | 87 | 1,521 |
 | loam::syncing-code-graph | 363 | 84 | 223 | 2,780 |
 | loam::using | 368 | 77 | 71 | 1,615 |
 | loam::amending-plan | 437 | 88 | 273 | 3,059 |

@@ -18,9 +18,9 @@ What to seal: $ARGUMENTS
 
 ## Step 1 - Check the runtime and key
 
-1. Run `<native-runtime-command> seal status`. It must run and report a seal key.
-2. If the runtime is unavailable, or `seal status` says the seal key is missing, stop and tell the user to run `npx @scchearn/loam setup` (plain setup provisions the key). Do not fabricate a seal, hand-write records under `wiki/.seals/`, or generate keys yourself.
-3. Locate the wiki. If no wiki exists, stop; there is nothing to seal.
+1. Locate the wiki first. If no wiki exists, stop; there is nothing to seal.
+2. Probe that the runtime runs, for example `<native-runtime-command> seal trust show`.
+3. The signing key is checked when `attest` runs. If the runtime is unavailable, or `attest` refuses with the setup hint (missing signing key) or an `ssh-keygen` capability error, stop and tell the user to run `npx @scchearn/loam setup` (plain setup provisions the key). Do not fabricate a seal, hand-write records under `wiki/.seals/`, or generate keys yourself.
 
 ## Step 2 - Decide whether the claim deserves a seal
 
@@ -69,7 +69,7 @@ Add `--review-by <stamp>` (`YYYY-MM-DD HH:MM +HH:MM`) when the fact has a known 
    <native-runtime-command> seal attest <page>#^<anchor> --level <level> --claim "<one-sentence claim>" --evidence <kind:ref> [--evidence <kind:ref> ...] [--review-by <stamp>]
    ```
 
-   Re-sealing after a deliberate edit adds `--parent <old-id>`; evidence unchanged since the parent carries its check results forward.
+   Re-sealing after a deliberate edit adds `--parent <old-id>`. `--parent` re-resolves every evidence item, and only capture provenance carries forward. Every item must still resolve now.
 2. Run `<native-runtime-command> seal verify <page>#^<anchor>` and read the verdict and `effective_level`. Expect `citable`. If not, report what the codes say; do not claim the seal holds.
 3. Append to `log.md` (use the page's existing date and timestamp conventions; see `loam-using/references/date-formats.md`):
 
