@@ -402,8 +402,11 @@ fn markdown_lint_resolves_marker_block_ids() {
     fs::remove_dir_all(&workspace).expect("temporary workspace should be removed");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
+    // The class span in the target draws the single reserved-class info
+    // finding, which never fails a run; no link finding appears.
     assert_eq!(output.status.code(), Some(0), "output: {stdout}");
-    assert!(stdout.is_empty(), "output: {stdout}");
+    assert_eq!(stdout.lines().count(), 1, "output: {stdout}");
+    assert!(stdout.contains("\"rule\":\"MRK010\""), "output: {stdout}");
 }
 
 #[test]

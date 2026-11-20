@@ -4,7 +4,7 @@ use crate::guidance;
 use crate::markdown;
 use crate::memory;
 
-const DOMAINS: [&str; 4] = ["guidance", "markdown", "memory", "work"];
+const DOMAINS: [&str; 5] = ["guidance", "markdown", "memory", "seals", "work"];
 
 pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     let mut workspace = None;
@@ -75,9 +75,14 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     if selected("guidance") {
         guidance::findings(workspace, &mut findings);
     }
-    if selected("markdown") {
+    if selected("markdown") || selected("seals") {
         match markdown::lint_workspace(workspace) {
-            Ok(diagnostics) => findings.extend(diagnostics.into_iter().map(Finding::from_markdown)),
+            Ok(diagnostics) => findings.extend(
+                diagnostics
+                    .into_iter()
+                    .map(Finding::from_markdown)
+                    .filter(|finding| selected(finding.domain())),
+            ),
             Err(error) => {
                 eprintln!("loam lint: {error}");
                 return 1;
@@ -95,16 +100,20 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     for finding in &findings {
         println!("{}", finding.to_json());
     }
-    if findings.is_empty() {
-        0
-    } else {
+    // Info findings are advisory: only a warning or error fails the run.
+    if findings
+        .iter()
+        .any(|finding| !matches!(finding.severity, Severity::Info))
+    {
         2
+    } else {
+        0
     }
 }
 
 fn usage() {
     eprintln!(
-        "Usage: loam lint [--only guidance|markdown|memory|work] [--fix] <workspace-root> [--now 'YYYY-MM-DD HH:MM ±HH:MM']\n\n  --only runs exactly one domain; the default runs all four.\n  --fix regenerates the `loam:memory-map` region in AGENTS.md; it is the\n  only writing option and touches nothing outside the fenced markers.\n  --now overrides the clock for date-relative rules; it exists for\n  deterministic tests and replay, not for routine use."
+        "Usage: loam lint [--only guidance|markdown|memory|seals|work] [--fix] <workspace-root> [--now 'YYYY-MM-DD HH:MM ±HH:MM']\n\n  --only runs exactly one domain; the default runs all five.\n  --fix regenerates the `loam:memory-map` region in AGENTS.md; it is the\n  only writing option and touches nothing outside the fenced markers.\n  --now overrides the clock for date-relative rules; it exists for\n  deterministic tests and replay, not for routine use."
     );
 }
 
@@ -192,7 +201,7 @@ impl Finding {
         Self {
             rule: diagnostic.rule,
             rule_name: diagnostic.rule_name,
-            severity: Severity::Error,
+            severity: diagnostic.severity,
             file: diagnostic.file,
             line: diagnostic.line,
             column: diagnostic.column,
@@ -223,6 +232,8 @@ impl Finding {
         match &self.rule[..3] {
             "GDN" => "guidance",
             "MEM" => "memory",
+            "SEL" => "seals",
+            "MRK" => "markdown",
             "WRK" => "work",
             _ => "markdown",
         }
