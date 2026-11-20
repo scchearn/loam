@@ -123,7 +123,9 @@ every step below, including steps 0 and 4, is a `citable`-quality check.
    from the record and require it to match the page and anchor you were
    given; use the record's values in step 1. A mismatch is tampering: do not
    rely on the seal and report it.
-1. Span digest.
+1. Span digest. The scripts are deliberately conservative: exit 2 means they
+   cannot model the page (a lone CR, a NUL byte, ambiguous structure), so use
+   the runtime; it never means the seal is bad.
    - Linux or macOS: `sh <Skill root>/scripts/seal-canon.sh --digest <page> <anchor>`
    - Windows, on one line: `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <Skill root>/scripts/seal-canon.ps1 -Digest <page> <anchor>`
 2. Signature (skip this step when the record has no `.sig`: a clean steps 0,
