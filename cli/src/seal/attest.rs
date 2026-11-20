@@ -519,9 +519,11 @@ pub fn attest(ctx: &Context, request: &Request) -> Result<Attested, AttestError>
                 .iter()
                 .find(|report| &report.id == id)
                 .ok_or_else(|| usage(format!("--parent {id} is not a seal record in this wiki")))?;
-            if report.anchor.as_deref() != Some(request.anchor.as_str()) {
+            if report.anchor.as_deref() != Some(request.anchor.as_str())
+                || report.page.as_deref() != Some(page.as_str())
+            {
                 return Err(usage(format!(
-                    "--parent {id} seals a different anchor; a parent must seal ^{}",
+                    "--parent {id} does not seal this span; a parent must seal {page}#^{}",
                     request.anchor
                 )));
             }

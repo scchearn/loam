@@ -1818,5 +1818,27 @@ mod tests {
         ));
         assert_eq!(fs::read(&page).unwrap(), page_before);
         assert_eq!(world.reports(NOW).len(), count);
+
+        // The same anchor on another page is a different span: refused too.
+        let beta = world.page_with("beta", UNMARKED);
+        let mut on_beta = request(&["capture:run.log"]);
+        on_beta.page = "beta".to_owned();
+        ctx.now = super::policy::parse_stamp("2026-11-21 14:00 +02:00").unwrap();
+        let beta_id = attest::attest(&ctx, &on_beta).unwrap().id;
+        let alpha_before = fs::read(&page).unwrap();
+        let beta_before = fs::read(&beta).unwrap();
+        let count = world.reports(NOW).len();
+        let mut cross_page = request(&["capture:run.log"]);
+        cross_page.parent = Some(beta_id);
+        ctx.now = super::policy::parse_stamp("2026-11-21 14:30 +02:00").unwrap();
+        match attest::attest(&ctx, &cross_page).unwrap_err() {
+            AttestError::Usage(message) => {
+                assert!(message.contains("alpha#^s-trust-order"), "{message}");
+            }
+            other => panic!("expected usage, got {other:?}"),
+        }
+        assert_eq!(fs::read(&page).unwrap(), alpha_before);
+        assert_eq!(fs::read(&beta).unwrap(), beta_before);
+        assert_eq!(world.reports(NOW).len(), count);
     }
 }
