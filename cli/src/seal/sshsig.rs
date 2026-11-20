@@ -202,6 +202,32 @@ pub fn verify(
     })
 }
 
+/// Whether `signature` is cryptographically valid over `data` in
+/// [`NAMESPACE`], regardless of who signed it or whether that key is trusted
+/// (`ssh-keygen -Y check-novalidate`). Lets a reader tell a forged signature
+/// from a genuine one by a key it does not trust.
+pub fn check_novalidate(bin: &Path, signature: &str, data: &[u8]) -> Result<(), SshsigError> {
+    let scratch = Scratch::new("novalidate").map_err(SshsigError::Local)?;
+    let sig_path = scratch.write("sig", signature.as_bytes())?;
+    let output = run(
+        bin,
+        &[
+            "-Y".as_ref(),
+            "check-novalidate".as_ref(),
+            "-n".as_ref(),
+            NAMESPACE.as_ref(),
+            "-s".as_ref(),
+            sig_path.as_os_str(),
+        ],
+        Some(data),
+    )?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(SshsigError::Rejected(diagnostic(&output)))
+    }
+}
+
 /// Principals in `allowed_signers` whose key made `signature`.
 pub fn find_principals(
     bin: &Path,
