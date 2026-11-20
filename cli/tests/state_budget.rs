@@ -36,9 +36,12 @@ struct Signer {
 /// keygen, the fixture stays unsigned and says so. The real binary is used for
 /// setup only; the timed runs get the recording stub.
 #[cfg(unix)]
-fn test_signer(trust_dir: &Path) -> Option<Signer> {
+fn test_signer(trust_dir: &Path, force_unsigned: bool) -> Option<Signer> {
     use loam::seal::{sshsig, trust};
 
+    if force_unsigned {
+        return None;
+    }
     let keygen = std::path::PathBuf::from("ssh-keygen");
     if sshsig::capability_of(&keygen) != sshsig::Capability::Available {
         return None;
@@ -52,7 +55,7 @@ fn test_signer(trust_dir: &Path) -> Option<Signer> {
 }
 
 #[cfg(not(unix))]
-fn test_signer(_trust_dir: &Path) -> Option<Signer> {
+fn test_signer(_trust_dir: &Path, _force_unsigned: bool) -> Option<Signer> {
     None
 }
 
@@ -176,16 +179,16 @@ fn git_blob_id(root: &Path) -> String {
         .to_owned()
 }
 
-/// Backdates every file under `dir` so no cache stamp is racy.
-fn age(dir: &Path) {
+/// Backdates `path`, or every file under it when it is a directory, so no
+/// cache stamp is racy.
+fn age(path: &Path) {
     let when = SystemTime::now() - std::time::Duration::from_secs(3600);
-    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            age(&path);
-        } else if let Ok(file) = fs::OpenOptions::new().write(true).open(&path) {
-            let _ = file.set_modified(when);
+    if path.is_dir() {
+        for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+            age(&entry.path());
         }
+    } else if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(when);
     }
 }
 
@@ -227,8 +230,25 @@ fn counter(object: &loam::json::Value, key: &str) -> u64 {
     }
 }
 
+/// The timed runs are wall-clock budgets, so the two variants never overlap.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn fast_state_stays_within_the_five_second_hook_budget() {
+    let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    budget_run(false);
+}
+
+/// The machine with no usable `ssh-keygen` (ubuntu-22.04 ships OpenSSH 8.9):
+/// every record is unsigned whatever is on PATH, and the pre-warmed evidence
+/// entries must still settle the seals.
+#[test]
+fn fast_state_budget_holds_without_a_capable_ssh_keygen() {
+    let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    budget_run(true);
+}
+
+fn budget_run(force_unsigned: bool) {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
@@ -313,7 +333,7 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
     // fixture root, and a cache pre-warmed for signatures and evidence only.
     let config = root.join("config");
     fs::create_dir_all(config.join("seal")).expect("trust dir");
-    let signer = test_signer(&config.join("seal"));
+    let signer = test_signer(&config.join("seal"), force_unsigned);
     let signed = if signer.is_some() { SIGNED } else { 0 };
     if signer.is_none() {
         eprintln!(
@@ -339,6 +359,21 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
     age(&root.join("wiki/decisions"));
     age(&root.join("wiki/.seals"));
     age(&root.join("src/evidence.txt"));
+    // A stamp younger than the racy window is never trusted, so every seal
+    // would come back unchecked on a fast machine (CI saw no_cache == 500).
+    for path in [
+        root.join("src/evidence.txt"),
+        root.join("wiki/decisions/d-0.md"),
+    ] {
+        let age = SystemTime::now()
+            .duration_since(
+                fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .expect("mtime"),
+            )
+            .expect("mtime in the past");
+        assert!(age.as_secs() >= 600, "{} was not backdated", path.display());
+    }
     prewarm_cache(&root, &config, signed);
 
     // `git` and `ssh-keygen` stand-ins that record every call. The `git` stub
