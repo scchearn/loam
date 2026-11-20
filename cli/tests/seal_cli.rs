@@ -416,6 +416,11 @@ mod attest {
                 .env("LOAM_WORKSPACES", "off")
                 .env("LOAM_CONFIG_DIR", self.0.join("config"))
                 .env("LOAM_HARNESS", "cli-test")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
                 .env_remove("LOAM_FEDERATION_ORG")
                 .output()
                 .expect("loam should run")

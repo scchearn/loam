@@ -177,6 +177,12 @@ fn ends_with_block_id(text: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+/// Blank once blockquote markers are stripped (`>` alone is a blank quoted line).
+fn is_blank(text: &str) -> bool {
+    text.trim_matches(|c: char| c == '>' || c.is_whitespace())
+        .is_empty()
+}
+
 /// A line made only of `=` or `-` (setext underline or rule) ends a block.
 fn is_setext_underline(text: &str) -> bool {
     let t = text.trim();
@@ -275,7 +281,7 @@ pub fn insert_markers(source: &str, anchor: &str) -> Result<Option<String>, Stri
         while first > 0 {
             let previous = &lines[first - 1];
             let text = &source[previous.start..previous.end];
-            if text.trim().is_empty()
+            if is_blank(text)
                 || is_heading(text)
                 || is_marker_comment(text)
                 || is_thematic_break(text)
@@ -293,6 +299,26 @@ pub fn insert_markers(source: &str, anchor: &str) -> Result<Option<String>, Stri
                 ));
             }
             first -= 1;
+        }
+    }
+
+    // The token must end its block: the next line has to be a boundary, not a
+    // continuation (a mid-paragraph token or a setext underline).
+    if let Some(next) = lines.get(last + 1) {
+        let text = &source[next.start..next.end];
+        let boundary = is_blank(text)
+            || is_heading(last_content)
+            || is_thematic_break(last_content)
+            || (!is_setext_underline(text)
+                && (is_heading(text)
+                    || is_thematic_break(text)
+                    || is_marker_comment(text)
+                    || is_list_item(text)
+                    || in_code(next)));
+        if !boundary {
+            return Err(format!(
+                "block id ^{anchor} is not at the end of its block (the next line continues it); move the token to the block's last line or place the markers by hand"
+            ));
         }
     }
 
@@ -948,6 +974,41 @@ mod tests {
         let source = "Title\n=====\nbody text ^s-one-two\n";
         let out = insert_markers(source, "s-one-two").unwrap().unwrap();
         assert!(out.starts_with("Title\n=====\n<!-- loam:seal"), "{out}");
+    }
+
+    #[test]
+    fn refuses_a_token_that_does_not_end_its_block() {
+        for source in [
+            "line one ^s-one-two\nline two continues\n",
+            "Title ^s-one-two\n=====\n",
+            "Title ^s-one-two\n-----\n",
+            "> q1 ^s-one-two\n> q2\n",
+        ] {
+            let err = insert_markers(source, "s-one-two").unwrap_err();
+            assert!(
+                err.contains("not at the end of its block"),
+                "{source}: {err}"
+            );
+        }
+        for source in [
+            "para ^s-one-two\n# Next\n",
+            "para ^s-one-two\n- item\n",
+            "para ^s-one-two\n```\ncode\n```\n",
+            "## Head ^s-one-two\nbody\n",
+        ] {
+            assert!(insert_markers(source, "s-one-two").is_ok(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_blank_line_bounds_a_block() {
+        let out = insert_markers("> q1\n>\n> q2 ^s-one-two\n", "s-one-two")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            out,
+            "> q1\n>\n<!-- loam:seal s-one-two -->\n> q2\n<!-- /loam:seal -->\n"
+        );
     }
 
     #[test]
