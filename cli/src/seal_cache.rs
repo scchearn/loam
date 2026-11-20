@@ -1348,6 +1348,63 @@ mod tests {
     }
 
     #[test]
+    fn full_then_fast_through_env_load_is_citable_with_nothing_unchecked() {
+        let fx = Fx::new("load-roundtrip");
+        let Some((_, head)) = repo_at(&fx) else {
+            return;
+        };
+        fx.seal(
+            "alpha",
+            "s-first-claim",
+            "Body.",
+            &["file:run.log", "blob:run.log", &format!("commit:{head}")],
+            None,
+        );
+        fx.age();
+        // No repo_root override anywhere: both passes build their own Env.
+        let full = fx.counts(false);
+        assert_eq!((full.citable, full.unchecked), (1, 0), "{full:?}");
+        let before = spawn_count();
+        let fast = fx.counts(true);
+        assert_eq!(spawn_count(), before);
+        assert_eq!((fast.citable, fast.unchecked), (1, 0), "{fast:?}");
+    }
+
+    #[test]
+    fn env_load_and_load_fast_agree_on_the_repo_root() {
+        let fx = Fx::new("load-root-eq");
+        if repo_at(&fx).is_none() {
+            return;
+        }
+        let now = crate::seal::policy::parse_stamp(NOW).unwrap();
+        let load = |wiki: &Path| {
+            let slow = verify::Env::load(wiki, Some(fx.trust_dir.clone()), now).unwrap();
+            let fast = verify::Env::load_fast(
+                wiki,
+                Some(fx.trust_dir.clone()),
+                Some(fx.cache_dir.clone()),
+                now,
+            )
+            .unwrap();
+            (slow.repo_root, fast.repo_root)
+        };
+        let (slow, fast) = load(&fx.wiki);
+        assert_eq!(slow, fast);
+
+        // Reached through a symlink, git reports the resolved top level while
+        // a walk-up keeps the link: both must still collapse to one spelling.
+        #[cfg(unix)]
+        {
+            let link = fx.root.with_extension("link");
+            let _ = fs::remove_file(&link);
+            std::os::unix::fs::symlink(&fx.root, &link).unwrap();
+            let (slow, fast) = load(&link.join("wiki"));
+            let _ = fs::remove_file(&link);
+            assert_eq!(slow, fast);
+        }
+    }
+
+    #[test]
     fn commit_evidence_fingerprint_follows_the_repository_refs() {
         let Some(repo) = fixture::git_repo("refs") else {
             return;

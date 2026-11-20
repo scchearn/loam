@@ -61,9 +61,11 @@ impl Env {
         now: DateTime<FixedOffset>,
     ) -> Result<Env, String> {
         let (trust, trust_digest) = load_trust(trust_dir.as_deref())?;
-        let repo_root = evidence::repo_root(wiki)
-            .or_else(|| wiki.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| wiki.to_path_buf());
+        let repo_root = normalized_root(
+            evidence::repo_root(wiki)
+                .or_else(|| wiki.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| wiki.to_path_buf()),
+        );
         let cache_dir = cache_dir_beside(trust_dir.as_deref());
         Ok(Env {
             wiki: wiki.to_path_buf(),
@@ -87,12 +89,13 @@ impl Env {
         now: DateTime<FixedOffset>,
     ) -> Result<Env, String> {
         let (trust, trust_digest) = load_trust(trust_dir.as_deref())?;
-        let repo_root = wiki
-            .ancestors()
-            .find(|dir| dir.join(".git").exists())
-            .or_else(|| wiki.parent())
-            .unwrap_or(wiki)
-            .to_path_buf();
+        let repo_root = normalized_root(
+            wiki.ancestors()
+                .find(|dir| dir.join(".git").exists())
+                .or_else(|| wiki.parent())
+                .unwrap_or(wiki)
+                .to_path_buf(),
+        );
         Ok(Env {
             wiki: wiki.to_path_buf(),
             repo_root,
@@ -103,6 +106,18 @@ impl Env {
             now,
             cache_dir,
         })
+    }
+}
+
+/// One spelling of the repository root for both constructors: the evidence
+/// cache keys embed it, so `git --show-toplevel` (`C:/x` on Windows) and a
+/// walk-up (`\\?\C:\x` once canonicalized) must agree or every
+/// file/blob/commit seal is `unchecked` after a full run. Falls back to the
+/// raw path when it cannot be canonicalized.
+fn normalized_root(path: PathBuf) -> PathBuf {
+    match std::fs::canonicalize(&path) {
+        Ok(canonical) => crate::enrollment::dos_compatible(canonical),
+        Err(_) => path,
     }
 }
 
