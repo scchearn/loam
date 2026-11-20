@@ -251,7 +251,7 @@ not the whole Loam config directory.
 
 ## Workflow skills
 
-21 skills, grouped by what they're for:
+22 skills, grouped by what they're for:
 
 You can ask for an outcome in ordinary language; the Using skill routes the
 request to the matching workflow:
@@ -302,6 +302,7 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
 | loam::querying-memory | 530 | 105 | 206 | 2,025 |
 | loam::reviewing-memory | 510 | 113 | 137 | 1,799 |
+| loam::sealing-memory | 518 | 125 | 87 | 1,482 |
 | loam::syncing-code-graph | 363 | 84 | 223 | 2,780 |
 | loam::using | 368 | 77 | 71 | 1,615 |
 | loam::amending-plan | 437 | 88 | 273 | 3,059 |

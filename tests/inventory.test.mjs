@@ -9,8 +9,8 @@ import { loadSkillInventory } from '../setup/inventory.mjs';
 test('inventory derives all shipped skill names from plugin metadata and frontmatter', async () => {
   const inventory = await loadSkillInventory();
 
-  assert.equal(inventory.skills.length, 21);
-  assert.equal(new Set(inventory.skills.map((skill) => skill.frontmatterName)).size, 21);
+  assert.equal(inventory.skills.length, 22);
+  assert.equal(new Set(inventory.skills.map((skill) => skill.frontmatterName)).size, 22);
   assert.ok(inventory.skills.some((skill) => skill.frontmatterName === 'loam::using'));
   assert.ok(inventory.skills.every((skill) => skill.aliases.includes(skill.frontmatterName)));
   assert.ok(inventory.skills.every((skill) => skill.aliases.includes(skill.directoryName)));

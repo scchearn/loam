@@ -64,6 +64,7 @@ runtime_docs=(
   "skills/loam-memory/loam-querying-memory/SKILL.md"
   "skills/loam-memory/loam-learning-from-session/SKILL.md"
   "skills/loam-memory/loam-linting-memory/SKILL.md"
+  "skills/loam-memory/loam-sealing-memory/SKILL.md"
   "skills/loam-memory/loam-ingesting-codebase/SKILL.md"
   "skills/loam-memory/loam-syncing-code-graph/SKILL.md"
   "skills/loam-work/loam-resuming/SKILL.md"
