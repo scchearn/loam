@@ -417,3 +417,73 @@ fn guidance_fix_is_idempotent_below_an_orphan_closing_marker() {
     assert_eq!(stdout, "", "the finding never cleared");
     assert_eq!(code, 0);
 }
+
+fn sealed_stale_guide(eol: &str) -> String {
+    // The region is stale (it lists only alpha) and sits inside a seal span.
+    let lines = [
+        "# Guide",
+        "",
+        "<!-- loam:seal s-map-copy -->",
+        MAP_OPEN,
+        "Topics (1): alpha",
+        MAP_CLOSE,
+        "<!-- /loam:seal -->",
+        "",
+    ];
+    lines.join(eol)
+}
+
+fn wiki_snapshot(workspace: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut stack = vec![workspace.join("wiki")];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("wiki directory should be readable") {
+            let path = entry.expect("entry should be readable").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let bytes = fs::read(&path).expect("wiki file should be readable");
+                files.push((path, bytes));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn assert_sealed_fix_reports_sel008(eol: &str, label: &str) {
+    let workspace = workspace_with_wiki(label);
+    let guide = sealed_stale_guide(eol);
+    fs::write(workspace.join("AGENTS.md"), guide.as_bytes()).expect("guide should be written");
+    let wiki_before = wiki_snapshot(&workspace);
+
+    let (code, stdout) = lint(&workspace, &["--fix"]);
+
+    assert_eq!(
+        fs::read(workspace.join("AGENTS.md")).expect("guide should be readable"),
+        guide.as_bytes(),
+        "sealed bytes must not change"
+    );
+    assert_eq!(wiki_snapshot(&workspace), wiki_before);
+    let sel008: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains("\"rule\":\"SEL008\""))
+        .collect();
+    assert_eq!(sel008.len(), 1, "{stdout}");
+    assert!(sel008[0].contains("\"domain\":\"seals\""), "{}", sel008[0]);
+    assert!(sel008[0].contains("\"severity\":\"info\""), "{}", sel008[0]);
+    assert!(sel008[0].contains("s-map-copy"), "{}", sel008[0]);
+    // The stale region was left alone, so GDN002 is still reported.
+    assert!(rules(&stdout).contains(&"GDN002".to_owned()), "{stdout}");
+    assert_eq!(code, 2, "{stdout}");
+}
+
+#[test]
+fn guidance_fix_reports_sel008_for_a_sealed_region_and_leaves_it_untouched() {
+    assert_sealed_fix_reports_sel008("\n", "fix-sealed");
+}
+
+#[test]
+fn guidance_fix_reports_sel008_for_a_sealed_region_in_a_crlf_file() {
+    assert_sealed_fix_reports_sel008("\r\n", "fix-sealed-crlf");
+}

@@ -30,7 +30,7 @@ fn loam(args: &[&str]) -> std::process::Output {
         .expect("loam should run")
 }
 
-/// One defect per domain: a duplicate heading and broken wikilink (markdown),
+/// One defect per domain: a seal opener with tokens (seals), a duplicate heading and broken wikilink (markdown),
 /// a legacy `overview.md` (memory), and a goal missing from the index (work).
 fn defective_workspace(label: &str) -> PathBuf {
     let workspace = temporary_workspace(label);
@@ -41,6 +41,10 @@ fn defective_workspace(label: &str) -> PathBuf {
     write(
         &workspace.join("wiki/overview.md"),
         "# Overview\n\nLegacy.\n",
+    );
+    write(
+        &workspace.join("wiki/sealed.md"),
+        "# Sealed\n\n<!-- loam:seal s-aa-bb level=canonical -->\nbody\n<!-- /loam:seal -->\n",
     );
     write(
         &workspace.join("goals/sample-goal.md"),
@@ -86,7 +90,7 @@ fn default_run_covers_every_domain() {
     seen.dedup();
     assert_eq!(
         seen,
-        vec!["guidance", "markdown", "memory", "work"],
+        vec!["guidance", "markdown", "memory", "seals", "work"],
         "every domain should report: {stdout}"
     );
 }
@@ -97,7 +101,7 @@ fn only_selects_exactly_one_domain() {
     let root = workspace.to_str().unwrap().to_owned();
 
     let mut results = Vec::new();
-    for domain in ["guidance", "markdown", "memory", "work"] {
+    for domain in ["guidance", "markdown", "memory", "seals", "work"] {
         let output = loam(&["lint", "--only", domain, &root, "--now", NOW]);
         let stdout = String::from_utf8(output.stdout).expect("findings should be UTF-8");
         results.push((domain, output.status.code(), stdout));

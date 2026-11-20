@@ -2,9 +2,10 @@ use std::path::Path;
 
 use crate::guidance;
 use crate::markdown;
+use crate::markers;
 use crate::memory;
 
-const DOMAINS: [&str; 4] = ["guidance", "markdown", "memory", "work"];
+const DOMAINS: [&str; 5] = ["guidance", "markdown", "memory", "seals", "work"];
 
 pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     let mut workspace = None;
@@ -66,18 +67,38 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     let selected = |domain: &str| only.as_deref().map(|value| value == domain).unwrap_or(true);
     let mut findings = Vec::new();
 
+    // SEL008 from the fixer follows the fixer's domain selection (guidance),
+    // not the seals domain, so the skip stays visible under `--only guidance`.
     if fix && selected("guidance") {
-        if let Err(error) = guidance::fix(workspace) {
-            eprintln!("loam lint: {error}");
-            return 1;
+        match guidance::fix(workspace) {
+            Ok(guidance::FixOutcome::SealSkipped(anchor)) => findings.push(
+                Finding::file(
+                    markers::SEL008_CODE,
+                    markers::SEL008_NAME,
+                    Severity::Info,
+                    "AGENTS.md",
+                    markers::SEL008_DESCRIPTION,
+                )
+                .with_evidence("anchor", &anchor),
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("loam lint: {error}");
+                return 1;
+            }
         }
     }
     if selected("guidance") {
         guidance::findings(workspace, &mut findings);
     }
-    if selected("markdown") {
+    if selected("markdown") || selected("seals") {
         match markdown::lint_workspace(workspace) {
-            Ok(diagnostics) => findings.extend(diagnostics.into_iter().map(Finding::from_markdown)),
+            Ok(diagnostics) => findings.extend(
+                diagnostics
+                    .into_iter()
+                    .map(Finding::from_markdown)
+                    .filter(|finding| selected(finding.domain())),
+            ),
             Err(error) => {
                 eprintln!("loam lint: {error}");
                 return 1;
@@ -95,16 +116,20 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     for finding in &findings {
         println!("{}", finding.to_json());
     }
-    if findings.is_empty() {
-        0
-    } else {
+    // Info findings are advisory: only a warning or error fails the run.
+    if findings
+        .iter()
+        .any(|finding| !matches!(finding.severity, Severity::Info))
+    {
         2
+    } else {
+        0
     }
 }
 
 fn usage() {
     eprintln!(
-        "Usage: loam lint [--only guidance|markdown|memory|work] [--fix] <workspace-root> [--now 'YYYY-MM-DD HH:MM ±HH:MM']\n\n  --only runs exactly one domain; the default runs all four.\n  --fix regenerates the `loam:memory-map` region in AGENTS.md; it is the\n  only writing option and touches nothing outside the fenced markers.\n  --now overrides the clock for date-relative rules; it exists for\n  deterministic tests and replay, not for routine use."
+        "Usage: loam lint [--only guidance|markdown|memory|seals|work] [--fix] <workspace-root> [--now 'YYYY-MM-DD HH:MM ±HH:MM']\n\n  --only runs exactly one domain; the default runs all five.\n  --fix regenerates the `loam:memory-map` region in AGENTS.md; it is the\n  only writing option and touches nothing outside the fenced markers.\n  --now overrides the clock for date-relative rules; it exists for\n  deterministic tests and replay, not for routine use."
     );
 }
 
@@ -192,7 +217,7 @@ impl Finding {
         Self {
             rule: diagnostic.rule,
             rule_name: diagnostic.rule_name,
-            severity: Severity::Error,
+            severity: diagnostic.severity,
             file: diagnostic.file,
             line: diagnostic.line,
             column: diagnostic.column,
@@ -223,6 +248,8 @@ impl Finding {
         match &self.rule[..3] {
             "GDN" => "guidance",
             "MEM" => "memory",
+            "SEL" => "seals",
+            "MRK" => "markdown",
             "WRK" => "work",
             _ => "markdown",
         }
@@ -323,5 +350,73 @@ mod tests {
             Finding::cmp(&left, &finding(&["wiki/a.md"])),
             std::cmp::Ordering::Equal
         );
+    }
+
+    fn temp_workspace(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "loam-lintfix-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("wiki/topics")).unwrap();
+        std::fs::write(dir.join("wiki/index.md"), "# Index\n\n## Overview\n").unwrap();
+        std::fs::write(dir.join("wiki/topics/auth.md"), "# Auth\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn fix_skips_sealed() {
+        let dir = temp_workspace("sealed");
+        let agents = format!(
+            "<!-- loam:seal s-map-copy -->\n{}\nTopics (1): stale\n{}\n<!-- /loam:seal -->\n",
+            guidance::MAP_OPEN,
+            guidance::MAP_CLOSE
+        );
+        std::fs::write(dir.join("AGENTS.md"), &agents).unwrap();
+        let wiki_before = std::fs::read(dir.join("wiki/topics/auth.md")).unwrap();
+
+        let outcome = guidance::fix(&dir).unwrap();
+        assert_eq!(
+            outcome,
+            guidance::FixOutcome::SealSkipped("s-map-copy".to_owned())
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("AGENTS.md")).unwrap(),
+            agents
+        );
+        assert_eq!(
+            std::fs::read(dir.join("wiki/topics/auth.md")).unwrap(),
+            wiki_before
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fix_rewrites_an_unsealed_region_and_never_writes_under_wiki() {
+        let dir = temp_workspace("unsealed");
+        let agents = format!(
+            "<!-- loam:seal s-other-note -->\nkept\n<!-- /loam:seal -->\n\n{}\nTopics (1): stale\n{}\n",
+            guidance::MAP_OPEN,
+            guidance::MAP_CLOSE
+        );
+        std::fs::write(dir.join("AGENTS.md"), &agents).unwrap();
+        let snapshot = |root: &std::path::Path| {
+            let mut out = Vec::new();
+            for entry in ["index.md", "topics/auth.md"] {
+                out.push(std::fs::read(root.join("wiki").join(entry)).unwrap());
+            }
+            out
+        };
+        let wiki_before = snapshot(&dir);
+
+        assert_eq!(guidance::fix(&dir).unwrap(), guidance::FixOutcome::Written);
+        let after = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(after.starts_with("<!-- loam:seal s-other-note -->\nkept\n<!-- /loam:seal -->\n"));
+        assert!(after.contains("Topics (1): auth"));
+        assert_eq!(snapshot(&dir), wiki_before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
