@@ -88,8 +88,8 @@ Verdict is computed on every read, never typed:
 | `stale` | `review_by` or a recheck interval has passed | Do not cite as sealed; re-verify evidence, then re-seal |
 | `unverifiable` | Evidence or tooling cannot be checked here | Treat as provisional; say what could not be checked |
 | `untrusted` (tampered: malformed record or id mismatch, SEL003) | The record is not well formed, or its id is not the first 20 hex characters of its SHA-256 | Never rely on it; report it, do not repair it |
-| `untrusted` (key) | Signing key is revoked, or a valid signature from a key not in the reader's `allowed_signers` | Provisional; trust is the reader's decision |
-| `forged` | Bad signature, wrong namespace, or `verifier.principal` differs from the signer | Never rely on it; report it, do not repair it |
+| `untrusted` (key) | Signing key is revoked (SEL003), or a valid signature from a key not in the reader's `allowed_signers` | Provisional; trust is the reader's decision |
+| `forged` (SEL003) | Bad signature, wrong namespace, or `verifier.principal` differs from the signer | Never rely on it; report it, do not repair it |
 | `retracted` | A status record withdrew it | Never cite as sealed |
 
 Lifecycle is separate: `active`, `disputed` (flag only), `superseded`,
@@ -126,7 +126,9 @@ every step below, including steps 0 and 4, is a `citable`-quality check.
 1. Span digest.
    - Linux or macOS: `sh <Skill root>/scripts/seal-canon.sh --digest <page> <anchor>`
    - Windows, on one line: `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <Skill root>/scripts/seal-canon.ps1 -Digest <page> <anchor>`
-2. Signature. One command form on every OS, run in a POSIX shell (on Windows,
+2. Signature (skip this step when the record has no `.sig`: a clean steps 0,
+   1, 3 and 4 is then citable-quality at `evidence` only). `<principal>` is the
+   record's `verifier.principal`. One command form on every OS, run in a POSIX shell (on Windows,
    Git Bash, which ships `bash` and a capable `ssh-keygen`; never cmd or
    PowerShell, whose quoting and `<` redirection break it):
    ```sh
@@ -167,8 +169,8 @@ it lists is `untrusted`.
    unauthorised status records; treat any such record as a reason to run
    `seal verify` when the runtime returns); that freshness holds
    (the earlier of `review_by` and `time_verified` plus the policy max_review
-   has not passed; no evidence recheck is due); and that `verifier.principal`
-   equals the `-I` principal.
+   has not passed; no evidence recheck is due); and that step 2
+   succeeded for that principal.
 
 Compare the step 1 digest with the record's `subject[0].digest.sha256`, and
 each evidence digest with its recorded value. A match on steps 1 to 3 with
