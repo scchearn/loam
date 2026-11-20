@@ -114,26 +114,40 @@ from this session.
 ## Floor procedure (no runtime)
 
 When the native runtime is unavailable, a reader can still check a seal by
-hand. It approximates `<native-runtime-command> seal verify`; only a pass of every step below, including step 4, is a `citable`-quality check.
+hand. It approximates `<native-runtime-command> seal verify`; only a pass of
+every step below, including step 4, is a `citable`-quality check.
 
 1. Span digest.
    - Linux or macOS: `sh <Skill root>/scripts/seal-canon.sh --digest <page> <anchor>`
    - Windows, on one line: `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <Skill root>/scripts/seal-canon.ps1 -Digest <page> <anchor>`
-2. Signature.
-   - Linux or macOS: `ssh-keygen -Y verify -f <configRoot>/seal/allowed_signers -I <principal> -n loam-seal -O verify-time=<time_verified> [-r <configRoot>/seal/revoked] -s <id>.json.sig < <id>.json`
-   - Windows: `cmd /c ""C:\Program Files\Git\usr\bin\ssh-keygen.exe" -Y verify -f <configRoot>\seal\allowed_signers -I <principal> -n loam-seal -O verify-time=<time_verified> [-r <configRoot>\seal\revoked] -s <id>.json.sig < <id>.json"`; PowerShell 5.1 has no `<` redirection and re-encodes piped bytes. Use `LOAM_SSH_KEYGEN` instead of the Git for Windows path when it is set. The in-box Windows OpenSSH 8.x cannot do `verify-time`, so do not call the bare `ssh-keygen`.
-3. Evidence: `git hash-object <path>`, and `sha256sum <path>` (Linux), `shasum -a 256 <path>` (macOS) or `certutil -hashfile <path> SHA256` (Windows).
+2. Signature. One command form on every OS, run in a POSIX shell (on Windows,
+   Git Bash, which ships `bash` and a capable `ssh-keygen`; never cmd or
+   PowerShell, whose quoting and `<` redirection break it):
+   ```sh
+   "${LOAM_SSH_KEYGEN:-ssh-keygen}" -Y verify -f <configRoot>/seal/allowed_signers \
+     -I <principal> -n loam-seal -O verify-time=<time_verified> \
+     [-r <configRoot>/seal/revoked] -s <id>.json.sig < <id>.json
+   ```
+   This needs OpenSSH 9.1 or newer for `verify-time` (check `ssh -V`; Ubuntu
+   22.04 ships 8.9, in-box Windows OpenSSH is 8.x). `LOAM_SSH_KEYGEN`, when
+   set, names the binary to use on any OS. With no capable binary the result
+   is `unverifiable`, not a failed signature.
+3. Evidence: `git hash-object <path>`, and `sha256sum <path>` (Linux),
+   `shasum -a 256 <path>` (macOS) or `certutil -hashfile <path> SHA256`
+   (Windows).
 
 `<time_verified>` is the record's `time_verified` converted to UTC and written
-`YYYYMMDDHHMMZ`, with the trailing `Z` (without it ssh-keygen reads local time),
-the same as the runtime. Example: `2026-11-20 14:05 +02:00` becomes `202611201205Z`. It matters because rotated
-keys keep a closed validity window in `allowed_signers`. Pass `-r` only when
-the `revoked` file exists; a signer it lists is `untrusted`.
+`YYYYMMDDHHMMZ`, with the trailing `Z` (without it ssh-keygen reads local
+time), the same as the runtime. Example: `2026-11-20 14:05 +02:00` becomes
+`202611201205Z`. It matters because rotated keys keep a closed validity window
+in `allowed_signers`. Pass `-r` only when the `revoked` file exists; a signer
+it lists is `untrusted`.
 
 4. Standing. Confirm that no `status` record in `wiki/.seals/records/` names
-   this id in `updates` with retract, supersede or demote; that `review_by`
-   (or `time_verified` plus the policy max_review) has not passed; and that
-   `verifier.principal` equals the `-I` principal.
+   this id in `updates` with retract, supersede or demote; that freshness holds
+   (the earlier of `review_by` and `time_verified` plus the policy max_review
+   has not passed; no evidence recheck is due); and that `verifier.principal`
+   equals the `-I` principal.
 
 Compare the step 1 digest with the record's `subject[0].digest.sha256`, and
 each evidence digest with its recorded value. A match on steps 1 to 3 with
