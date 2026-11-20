@@ -2,7 +2,8 @@
 //!
 //! Input is the raw bytes strictly between a seal span's marker lines. The
 //! algorithm, which the floor scripts (`seal-canon.sh` / `seal-canon.ps1`)
-//! mirror exactly:
+//! mirror, except that the floors refuse (exit 2, use the runtime) any file
+//! holding a lone CR, where the runtime accepts it per step 2:
 //!
 //! 1. The bytes must be valid UTF-8; anything else is an error. A leading
 //!    BOM is ordinary content and is not stripped.

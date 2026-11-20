@@ -754,6 +754,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     let rest: Vec<String> = args.collect();
     match (verb.as_deref(), rest.as_slice()) {
         (Some("init"), []) => cmd_init(),
+        // `init` always prints JSON; setup passes `--json` explicitly.
+        (Some("init"), [flag]) if flag == "--json" => cmd_init(),
         (Some("add"), [principal, pubkey]) => cmd_add(principal, pubkey),
         (Some("show"), []) => cmd_show(),
         _ => usage(),
@@ -762,7 +764,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
 
 fn usage() -> i32 {
     eprintln!(
-        "Usage:\n  loam seal trust init\n  loam seal trust add <principal> <pubkey|pubkey-file>\n  loam seal trust show"
+        "Usage:\n  loam seal trust init [--json]\n  loam seal trust add <principal> <pubkey|pubkey-file>\n  loam seal trust show"
     );
     EXIT_USAGE
 }
@@ -1320,6 +1322,14 @@ mod tests {
         );
         assert_eq!(run(["init".to_owned()].into_iter()), EXIT_OK);
         assert_eq!(fs::read(dir.join(ALLOWED_FILE)).unwrap(), before);
+        // The exact argv setup/seal.mjs sends (after `seal trust`) must reach
+        // `init`, not the usage path.
+        let node_argv = ["init", "--json"].map(str::to_owned);
+        assert_eq!(run(node_argv.into_iter()), EXIT_OK);
+        assert_eq!(
+            run(["init", "--bogus"].map(str::to_owned).into_iter()),
+            EXIT_USAGE
+        );
 
         let code = run([
             "add".to_owned(),

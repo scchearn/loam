@@ -28,6 +28,7 @@ import { removeHarnesses } from './uninstall.mjs';
 import { verifyInstallation } from './verify.mjs';
 import { stageFederationService, federationDefinitionExists } from './federation.mjs';
 import { installShim } from './shim.mjs';
+import { provisionSealTrust } from './seal.mjs';
 import { configureIntegration } from './configure.mjs';
 import { CATALOG } from './integrations/catalog.mjs';
 import { readLedger as readIntegrationLedger } from './integrations/ledger.mjs';
@@ -120,6 +121,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
   const tilde = (p) => (typeof p === 'string' && p.startsWith(discovery.home) ? `~${p.slice(discovery.home.length)}` : p);
   await renderDiscovery(discovery, output, { action: refresh ? 'Update' : 'Install', dryRun: parsed.dryRun });
   if (parsed.dryRun) {
+    stepSkip(output, 'Would provision seal key through the runtime (dry-run: no call made)');
     finish(output, 'Dry run', 'no files, configuration, downloads, or mutating Skills CLI commands will run');
     return 0;
   }
@@ -524,6 +526,23 @@ export async function executeSetup(parsed, discovery, options = {}) {
       await options.beforeActivate?.({ install, metadataPath, integrationPath });
       await publishJson({ filePath: metadataPath, value: install });
       activated = true;
+
+      // Seal key provisioning runs only after the point of no rollback and
+      // outside every rollback path. It delegates to the runtime, never prompts,
+      // and a failure (older runtime without `seal`, no capable ssh-keygen) is a
+      // skipped step that leaves the exit code untouched.
+      if (runtime?.path) {
+        const seal = await provisionSealTrust({
+          runtimePath: runtime.path,
+          cwd: discovery.globalRoot,
+          runner: options.sealRunner,
+        });
+        if (seal.ready) {
+          if (seal.created.length) stepDone(output, `Seal key ready — ${seal.principal}`);
+        } else {
+          stepSkip(output, `Seal key not provisioned (${seal.category}${seal.detail ? `: ${seal.detail}` : ''})`);
+        }
+      }
 
       // Optional integrations are enabled only after the core install is
       // committed. Their registrar owns each integration's rollback, while a

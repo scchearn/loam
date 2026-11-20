@@ -10,6 +10,7 @@ import {
 } from './federation.mjs';
 import { catalogEntry, CATALOG } from './integrations/catalog.mjs';
 import { readLedger, resolveRuntimePath } from '../integration/ledger.mjs';
+import { provisionSealTrust } from './seal.mjs';
 import { announce, finish, stepStart, stepDone, stepDetail, confirmAction } from './wizard.mjs';
 
 // `setup` is the configurator for an EXISTING install: it toggles federation and
@@ -241,6 +242,25 @@ export async function runConfigure(parsed, options = {}) {
     // The runtime version is the ledger target now (schema-2 install.json drops
     // runtime_version); the schema-1 field is a display fallback only.
     const ledger = await readLedger({ home: discovery.home, platform: discovery.platform });
+
+    // Provision the agent seal key on any existing install, before the
+    // component-flag early return. Silent unless something was created; a skip
+    // (older runtime, no ssh-keygen) never fails or prints.
+    if (!parsed.dryRun) {
+      const runtimePath = (await resolveRuntimePath({
+        globalRoot: discovery.globalRoot,
+        home: discovery.home,
+        platform: discovery.platform,
+      }));
+      if (runtimePath) {
+        const seal = await provisionSealTrust({
+          runtimePath,
+          cwd: discovery.globalRoot,
+          runner: options.sealRunner,
+        });
+        if (seal.ready && seal.created.length) stepDone(output, `Seal key ready — ${seal.principal}`);
+      }
+    }
 
     // The integration actions to apply, as {id, mode}. Flag-driven from
     // --integration (enable) and --disable-integration (disable).
