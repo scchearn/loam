@@ -17,7 +17,7 @@ use crate::sha256;
 use std::fmt;
 use std::fs;
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Largest cited record `seal:<id>` evidence will read.
@@ -150,8 +150,9 @@ impl Code {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     pub kind: Kind,
-    /// Path (blob, file, capture source), full oid (commit), record id (seal)
-    /// or text (note). For a resolved capture it is the digest.
+    /// Repository-relative forward-slash path (blob, file), full oid
+    /// (commit), record id (seal), text (note), or the sha256 digest
+    /// (capture; the source path survives in `origin`).
     pub reference: String,
     /// Blob and commit: the allowed ref the item was checked against.
     pub git_ref: Option<String>,
@@ -246,7 +247,7 @@ impl Item {
         };
         let mut item = match kind {
             Kind::Blob => {
-                let mut item = Item::new(kind, required("path")?);
+                let mut item = Item::new(kind, recorded_path(&required("path")?)?);
                 let blob = required("gitBlob")?;
                 if !is_hex(&blob, 40, 64) {
                     return Err(format!("evidence gitBlob {blob:?} is not a git object id"));
@@ -257,7 +258,7 @@ impl Item {
                 item
             }
             Kind::File => {
-                let mut item = Item::new(kind, required("path")?);
+                let mut item = Item::new(kind, recorded_path(&required("path")?)?);
                 item.sha256 = Some(hex64("sha256")?);
                 item
             }
@@ -541,26 +542,87 @@ fn short_name(git_ref: &str) -> &str {
 
 // -------------------------------------------------------------- paths
 
-/// A blob path: repository-relative, forward slashes, no escape.
-fn blob_path(ctx: &Ctx, raw: &str) -> Result<String, String> {
-    let mut path = Path::new(raw);
-    if path.is_absolute() {
-        path = path
-            .strip_prefix(&ctx.repo_root)
-            .map_err(|_| format!("{raw:?} is outside the repository"))?;
+/// Cleans a relative path to repository-relative, forward-slash form.
+/// Rejects absolute paths, drive prefixes and any `..`.
+fn clean_rel(raw: &str) -> Result<String, String> {
+    let norm = raw.replace('\\', "/");
+    if norm.starts_with('/') {
+        return Err(format!("{raw:?} must be relative to the repository"));
     }
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
-            Component::CurDir => {}
-            _ => return Err(format!("{raw:?} must stay inside the repository")),
+    let mut parts: Vec<&str> = Vec::new();
+    for (index, part) in norm.split('/').enumerate() {
+        match part {
+            "" | "." => {}
+            ".." => return Err(format!("{raw:?} must stay inside the repository")),
+            p if index == 0 && p.len() == 2 && p.as_bytes()[1] == b':' => {
+                return Err(format!("{raw:?} must be relative to the repository"));
+            }
+            p => parts.push(p),
         }
     }
     if parts.is_empty() {
         return Err("empty path".to_owned());
     }
     Ok(parts.join("/"))
+}
+
+/// A recorded path must already be in the form `clean_rel` produces.
+fn recorded_path(raw: &str) -> Result<String, String> {
+    match clean_rel(raw) {
+        Ok(clean) if clean == raw => Ok(clean),
+        Ok(_) => Err(format!("evidence path {raw:?} is not normalized")),
+        Err(why) => Err(format!("evidence path: {why}")),
+    }
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// A path given at attest time: repository-relative, forward slashes, no
+/// escape. Absolute paths must lie inside the repository (as spelled or
+/// resolved).
+fn repo_rel(ctx: &Ctx, raw: &str) -> Result<String, String> {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        let roots = [ctx.repo_root.clone(), canonical(&ctx.repo_root)];
+        let spellings = [path.to_path_buf(), canonical(path)];
+        for spelling in &spellings {
+            for root in &roots {
+                if let Ok(rest) = spelling.strip_prefix(root) {
+                    return clean_rel(&rest.to_string_lossy());
+                }
+            }
+        }
+        return Err(format!("{raw:?} is outside the repository"));
+    }
+    clean_rel(raw)
+}
+
+fn fold(part: &std::ffi::OsStr) -> String {
+    let text = part.to_string_lossy();
+    if cfg!(any(windows, target_os = "macos")) {
+        text.to_lowercase()
+    } else {
+        text.into_owned()
+    }
+}
+
+fn starts_with_folded(path: &Path, prefix: &Path) -> bool {
+    let a: Vec<String> = path.components().map(|c| fold(c.as_os_str())).collect();
+    let b: Vec<String> = prefix.components().map(|c| fold(c.as_os_str())).collect();
+    a.len() >= b.len() && a[..b.len()] == b[..]
+}
+
+/// Whether a repository-relative path lies in the wiki, by spelling or after
+/// resolving symlinks, comparing case-insensitively where the file system is.
+fn in_wiki(ctx: &Ctx, rel: &str) -> bool {
+    let wikis = [ctx.wiki.clone(), canonical(&ctx.wiki)];
+    let lexical = [ctx.repo_root.join(rel), canonical(&ctx.repo_root).join(rel)];
+    lexical
+        .iter()
+        .flat_map(|path| [path.clone(), canonical(path)])
+        .any(|path| wikis.iter().any(|wiki| starts_with_folded(&path, wiki)))
 }
 
 fn local(ctx: &Ctx, raw: &str) -> PathBuf {
@@ -577,19 +639,18 @@ fn weight_of(item: &Item, ctx: &Ctx) -> Weight {
         Kind::Note => Weight::Zero,
         Kind::Seal => Weight::Derived,
         Kind::Commit | Kind::Capture => Weight::Primary,
-        Kind::Blob | Kind::File => {
-            if local(ctx, &item.reference).starts_with(&ctx.wiki) {
-                Weight::Zero
-            } else {
-                Weight::Primary
-            }
-        }
+        Kind::Blob | Kind::File => match clean_rel(&item.reference) {
+            Ok(rel) if !in_wiki(ctx, &rel) => Weight::Primary,
+            _ => Weight::Zero,
+        },
     }
 }
 
 fn local_input(item: &Item, ctx: &Ctx) -> Option<PathBuf> {
     match item.kind {
-        Kind::Blob | Kind::File => Some(local(ctx, &item.reference)),
+        Kind::Blob | Kind::File => recorded_path(&item.reference)
+            .ok()
+            .map(|rel| ctx.repo_root.join(rel)),
         Kind::Capture => item
             .sha256
             .as_deref()
@@ -629,7 +690,9 @@ fn resolve_one(item: &Item, ctx: &Ctx, options: &AttestOptions<'_>) -> Result<Re
     match item.kind {
         Kind::Blob => resolve_blob(&mut out, ctx, &label)?,
         Kind::File => {
-            let path = local(ctx, &item.reference);
+            let rel = repo_rel(ctx, &item.reference)
+                .map_err(|why| fail(&label, FailKind::Invalid, why))?;
+            let path = ctx.repo_root.join(&rel);
             if !path.is_file() {
                 return Err(fail(&label, FailKind::Missing, "file not found"));
             }
@@ -637,6 +700,7 @@ fn resolve_one(item: &Item, ctx: &Ctx, options: &AttestOptions<'_>) -> Result<Re
             if digest.is_empty() {
                 return Err(fail(&label, FailKind::Invalid, "file is unreadable"));
             }
+            out.reference = rel;
             out.sha256 = Some(digest);
         }
         Kind::Commit => resolve_commit(&mut out, ctx, &label)?,
@@ -665,7 +729,7 @@ fn resolve_one(item: &Item, ctx: &Ctx, options: &AttestOptions<'_>) -> Result<Re
 const NO_ALLOWED_REF: &str = "no origin/HEAD, main or master ref to check against";
 
 fn resolve_blob(item: &mut Item, ctx: &Ctx, label: &str) -> Result<(), Failure> {
-    let rel = blob_path(ctx, &item.reference).map_err(|why| fail(label, FailKind::Invalid, why))?;
+    let rel = repo_rel(ctx, &item.reference).map_err(|why| fail(label, FailKind::Invalid, why))?;
     if !ctx.repo_root.join(&rel).is_file() {
         return Err(fail(
             label,
@@ -713,7 +777,7 @@ fn resolve_commit(item: &mut Item, ctx: &Ctx, label: &str) -> Result<(), Failure
         return Err(fail(label, FailKind::NoAllowedRef, NO_ALLOWED_REF));
     };
     let git_ref = match item.git_ref.take() {
-        Some(requested) if short_name(&requested) != short_name(&allowed) => {
+        Some(requested) if requested != allowed => {
             return Err(fail(
                 label,
                 FailKind::Unreachable,
@@ -777,11 +841,16 @@ fn resolve_capture(
             format!("grew past capture_max_bytes {cap} while reading"),
         ));
     }
-    let origin = options
-        .origin
-        .map(str::to_owned)
-        .unwrap_or_else(|| item.reference.clone());
-    item.sha256 = Some(sha256::hex(&bytes));
+    let origin = options.origin.map(str::to_owned).unwrap_or_else(|| {
+        repo_rel(ctx, &item.reference).unwrap_or_else(|_| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "capture".to_owned())
+        })
+    });
+    let digest = sha256::hex(&bytes);
+    item.reference = digest.clone();
+    item.sha256 = Some(digest);
     item.origin = Some(origin);
     item.retrieved_at = Some(ctx.retrieved_at.clone());
     Ok(bytes)
@@ -845,7 +914,10 @@ fn check_code(item: &Item, ctx: &Ctx) -> (Code, String) {
             Err(why) => (Code::Unresolvable, why),
         },
         Kind::File => {
-            let path = local(ctx, &item.reference);
+            let Ok(rel) = recorded_path(&item.reference) else {
+                return unresolvable("path is not repository-relative");
+            };
+            let path = ctx.repo_root.join(rel);
             if !path.is_file() {
                 return unresolvable("file not found");
             }
@@ -859,8 +931,8 @@ fn check_code(item: &Item, ctx: &Ctx) -> (Code, String) {
             }
         }
         Kind::Blob => {
-            let Ok(rel) = blob_path(ctx, &item.reference) else {
-                return unresolvable("path leaves the repository");
+            let Ok(rel) = recorded_path(&item.reference) else {
+                return unresolvable("path is not repository-relative");
             };
             if !ctx.repo_root.join(&rel).is_file() {
                 return unresolvable("file not found in the worktree");
@@ -872,12 +944,18 @@ fn check_code(item: &Item, ctx: &Ctx) -> (Code, String) {
             }
         }
         Kind::Commit => {
-            let Some(git_ref) = item.git_ref.as_deref() else {
+            let Some(recorded) = item.git_ref.as_deref() else {
                 return unresolvable("no ref recorded");
             };
-            if commit_of(&ctx.repo_root, git_ref).is_none() {
-                return unresolvable(&format!("ref {git_ref} not found"));
+            let Some(git_ref) = allowed_ref(&ctx.repo_root) else {
+                return unresolvable(NO_ALLOWED_REF);
+            };
+            if short_name(recorded) != short_name(&git_ref) {
+                return unresolvable(&format!(
+                    "recorded ref {recorded} is not the allowed ref ({git_ref})"
+                ));
             }
+            let git_ref = git_ref.as_str();
             let reachable = commit_of(&ctx.repo_root, &item.reference).is_some()
                 && git_run(
                     &ctx.repo_root,
@@ -989,17 +1067,17 @@ mod tests {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
     }
 
-    /// A repo on `main` holding `src/a.txt`, or `None` without git.
-    fn repo(label: &str) -> Option<Tmp> {
-        git(Path::new("."), &["--version"])?;
+    /// A repo on `main` holding `src/a.txt`. Fails loudly without git.
+    fn repo(label: &str) -> Tmp {
+        git(Path::new("."), &["--version"]).expect("git must be installed to run these tests");
         let tmp = Tmp::new(label);
-        git(tmp.repo(), &["init", "-q"])?;
-        git(tmp.repo(), &["symbolic-ref", "HEAD", "refs/heads/main"])?;
+        git(tmp.repo(), &["init", "-q"]).unwrap();
+        git(tmp.repo(), &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
         fs::create_dir_all(tmp.repo().join("src")).unwrap();
         fs::write(tmp.repo().join("src/a.txt"), "alpha\n").unwrap();
-        git(tmp.repo(), &["add", "src/a.txt"])?;
-        git(tmp.repo(), &["commit", "-q", "-m", "first"])?;
-        Some(tmp)
+        git(tmp.repo(), &["add", "src/a.txt"]).unwrap();
+        git(tmp.repo(), &["commit", "-q", "-m", "first"]).unwrap();
+        tmp
     }
 
     fn parsed(arg: &str) -> Item {
@@ -1070,7 +1148,7 @@ mod tests {
 
     #[test]
     fn blob_resolves_and_round_trips_through_json() {
-        let Some(tmp) = repo("blob") else { return };
+        let tmp = repo("blob");
         let resolved = resolve(&tmp, &["blob:src/a.txt"]).unwrap();
         let item = &resolved[0].item;
         assert_eq!(item.git_ref.as_deref(), Some("main"));
@@ -1094,7 +1172,7 @@ mod tests {
 
     #[test]
     fn blob_failures_are_named() {
-        let Some(tmp) = repo("blobfail") else { return };
+        let tmp = repo("blobfail");
         let missing = only_failure(resolve(&tmp, &["blob:src/nope.txt"]));
         assert_eq!(missing.kind, FailKind::Missing);
         assert!(missing.to_string().contains("blob:src/nope.txt"));
@@ -1115,7 +1193,7 @@ mod tests {
 
     #[test]
     fn edited_blob_re_resolves_as_drifted_and_deleted_as_unresolvable() {
-        let Some(tmp) = repo("drift") else { return };
+        let tmp = repo("drift");
         let item = resolve(&tmp, &["blob:src/a.txt"]).unwrap().remove(0).item;
         fs::write(tmp.repo().join("src/a.txt"), "beta\n").unwrap();
         let drifted = check(&item, &tmp.ctx(1024));
@@ -1127,7 +1205,7 @@ mod tests {
 
     #[test]
     fn file_evidence_resolves_drifts_and_goes_missing() {
-        let Some(tmp) = repo("file") else { return };
+        let tmp = repo("file");
         fs::write(tmp.repo().join("raw.txt"), "raw bytes").unwrap();
         let resolved = resolve(&tmp, &["file:raw.txt"]).unwrap();
         let item = resolved[0].item.clone();
@@ -1146,7 +1224,7 @@ mod tests {
 
     #[test]
     fn commit_on_allowed_ref_resolves_and_branch_only_is_refused() {
-        let Some(tmp) = repo("commit") else { return };
+        let tmp = repo("commit");
         let head = git(tmp.repo(), &["rev-parse", "HEAD"]).unwrap();
         let resolved = resolve(&tmp, &[&format!("commit:{}", &head[..10])]).unwrap();
         assert_eq!(resolved[0].item.reference, head);
@@ -1173,7 +1251,7 @@ mod tests {
 
     #[test]
     fn squash_orphaned_commit_is_orphaned_never_current() {
-        let Some(tmp) = repo("orphan") else { return };
+        let tmp = repo("orphan");
         fs::write(tmp.repo().join("b.txt"), "b").unwrap();
         git(tmp.repo(), &["add", "b.txt"]).unwrap();
         git(tmp.repo(), &["commit", "-q", "-m", "second"]).unwrap();
@@ -1191,7 +1269,7 @@ mod tests {
 
     #[test]
     fn allowed_ref_prefers_origin_head_then_main_then_master() {
-        let Some(tmp) = repo("allowed") else { return };
+        let tmp = repo("allowed");
         assert_eq!(allowed_ref(tmp.repo()).as_deref(), Some("main"));
         git(tmp.repo(), &["branch", "-m", "main", "master"]).unwrap();
         assert_eq!(allowed_ref(tmp.repo()).as_deref(), Some("master"));
@@ -1361,9 +1439,7 @@ mod tests {
 
     #[test]
     fn unsealed_wiki_pages_weigh_zero() {
-        let Some(tmp) = repo("wikiweight") else {
-            return;
-        };
+        let tmp = repo("wikiweight");
         fs::write(tmp.wiki().join("page.md"), "# Page\n").unwrap();
         let resolved = resolve(&tmp, &["file:wiki/page.md", "file:src/a.txt"]).unwrap();
         assert_eq!(resolved[0].weight, Weight::Zero);
@@ -1372,8 +1448,185 @@ mod tests {
     }
 
     #[test]
+    fn wiki_pages_cannot_be_laundered_through_odd_paths() {
+        let tmp = repo("wikipaths");
+        fs::write(tmp.wiki().join("page.md"), "# Page\n").unwrap();
+        let abs = tmp.wiki().join("page.md");
+        let abs = abs.to_string_lossy().into_owned();
+        let dotted = "file:src/../wiki/page.md";
+        let noisy = "file:./wiki//page.md";
+        let back = "file:wiki\\page.md";
+        let abs_arg = format!("file:{abs}");
+        for arg in [dotted, noisy, back, abs_arg.as_str()] {
+            if arg == dotted {
+                let f = only_failure(resolve(&tmp, &[arg]));
+                assert_eq!(f.kind, FailKind::Invalid, "{arg}");
+                continue;
+            }
+            let r = resolve(&tmp, &[arg]).unwrap();
+            assert_eq!(r[0].item.reference, "wiki/page.md", "{arg}");
+            assert_eq!(r[0].weight, Weight::Zero, "{arg}");
+        }
+        if cfg!(any(windows, target_os = "macos")) {
+            let r = resolve(&tmp, &["file:Wiki/PAGE.md"]).unwrap();
+            assert_eq!(r[0].weight, Weight::Zero);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_wiki_pages_weigh_zero() {
+        let tmp = repo("wikilink");
+        fs::write(tmp.wiki().join("page.md"), "# Page\n").unwrap();
+        std::os::unix::fs::symlink(tmp.wiki(), tmp.repo().join("alias")).unwrap();
+        let r = resolve(&tmp, &["file:alias/page.md"]).unwrap();
+        assert_eq!(r[0].weight, Weight::Zero);
+        let spelled = Ctx {
+            repo_root: fs::canonicalize(tmp.repo()).unwrap(),
+            ..tmp.ctx(1024)
+        };
+        let items = [parsed("file:wiki/page.md")];
+        let r = resolve_all(&items, &spelled, &AttestOptions::default()).unwrap();
+        assert_eq!(r[0].weight, Weight::Zero);
+    }
+
+    #[test]
+    fn file_paths_are_stored_portably_and_checked_strictly() {
+        let tmp = repo("fileportable");
+        fs::create_dir_all(tmp.repo().join("raw")).unwrap();
+        fs::write(tmp.repo().join("raw/x.pdf"), "pdf").unwrap();
+        let backslash = resolve(&tmp, &["file:raw\\x.pdf"]).unwrap();
+        assert_eq!(backslash[0].item.reference, "raw/x.pdf");
+        let abs = tmp.repo().join("raw/x.pdf").to_string_lossy().into_owned();
+        let absolute = resolve(&tmp, &[&format!("file:{abs}")]).unwrap();
+        assert_eq!(absolute[0].item.reference, "raw/x.pdf");
+        let value = absolute[0].item.to_value();
+        assert_eq!(value.get("path").and_then(Value::as_str), Some("raw/x.pdf"));
+
+        let outside = only_failure(resolve(&tmp, &["file:../x.pdf"]));
+        assert_eq!(outside.kind, FailKind::Invalid);
+        let elsewhere = std::env::temp_dir().join("loam-evidence-elsewhere.txt");
+        fs::write(&elsewhere, "x").unwrap();
+        let f = only_failure(resolve(&tmp, &[&format!("file:{}", elsewhere.display())]));
+        let _ = fs::remove_file(&elsewhere);
+        assert_eq!(f.kind, FailKind::Invalid);
+
+        for bad in ["raw\\x.pdf", "../x.pdf", "/etc/passwd", "C:/x.pdf"] {
+            let json = format!(
+                "{{\"kind\":\"file\",\"path\":{},\"sha256\":\"{}\"}}",
+                Value::String(bad.to_owned()).to_json(),
+                "ab".repeat(32)
+            );
+            assert!(
+                Item::from_value(&crate::json::parse(&json).unwrap()).is_err(),
+                "{bad}"
+            );
+            let mut item = absolute[0].item.clone();
+            item.reference = bad.to_owned();
+            assert_eq!(
+                check(&item, &tmp.ctx(1024)).code,
+                Code::Unresolvable,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_ref_must_be_exactly_the_allowed_ref_at_attest() {
+        let tmp = repo("commitref");
+        let first = git(tmp.repo(), &["rev-parse", "HEAD"]).unwrap();
+        git(
+            tmp.repo(),
+            &["update-ref", "refs/remotes/origin/main", &first],
+        )
+        .unwrap();
+        git(
+            tmp.repo(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        )
+        .unwrap();
+        fs::write(tmp.repo().join("local.txt"), "x").unwrap();
+        git(tmp.repo(), &["add", "local.txt"]).unwrap();
+        git(tmp.repo(), &["commit", "-q", "-m", "unpushed"]).unwrap();
+        let local_only = git(tmp.repo(), &["rev-parse", "HEAD"]).unwrap();
+
+        let by_default = only_failure(resolve(&tmp, &[&format!("commit:{local_only}")]));
+        assert_eq!(by_default.kind, FailKind::Unreachable);
+        let by_short = only_failure(resolve(&tmp, &[&format!("commit:{local_only}@main")]));
+        assert_eq!(by_short.kind, FailKind::Unreachable);
+        let exact = resolve(&tmp, &[&format!("commit:{first}@origin/main")]).unwrap();
+        assert_eq!(exact[0].item.git_ref.as_deref(), Some("origin/main"));
+        let short_for_pushed = only_failure(resolve(&tmp, &[&format!("commit:{first}@main")]));
+        assert_eq!(short_for_pushed.kind, FailKind::Unreachable);
+    }
+
+    #[test]
+    fn commit_check_applies_the_readers_allowed_ref() {
+        let tmp = repo("commitverify");
+        git(tmp.repo(), &["checkout", "-q", "-b", "feature"]).unwrap();
+        fs::write(tmp.repo().join("b.txt"), "b").unwrap();
+        git(tmp.repo(), &["add", "b.txt"]).unwrap();
+        git(tmp.repo(), &["commit", "-q", "-m", "branch only"]).unwrap();
+        let branch_only = git(tmp.repo(), &["rev-parse", "HEAD"]).unwrap();
+        git(tmp.repo(), &["checkout", "-q", "main"]).unwrap();
+
+        let mut item = Item::new(Kind::Commit, branch_only.clone());
+        item.git_ref = Some("feature".to_owned());
+        let hand_made = check(&item, &tmp.ctx(1024));
+        assert_eq!(hand_made.code, Code::Unresolvable);
+        assert!(hand_made.detail.contains("not the allowed ref"));
+
+        item.git_ref = Some("main".to_owned());
+        assert_eq!(check(&item, &tmp.ctx(1024)).code, Code::Orphaned);
+    }
+
+    #[test]
+    fn resolved_items_equal_their_json_round_trip() {
+        let tmp = repo("roundtrip");
+        fs::write(tmp.repo().join("log.txt"), "out").unwrap();
+        fs::write(tmp.repo().join("raw.txt"), "raw").unwrap();
+        let head = git(tmp.repo(), &["rev-parse", "HEAD"]).unwrap();
+        let resolved = resolve(
+            &tmp,
+            &[
+                "capture:log.txt",
+                "file:raw.txt",
+                "blob:src/a.txt",
+                &format!("commit:{head}"),
+                "note:n",
+            ],
+        )
+        .unwrap();
+        for entry in &resolved {
+            let back =
+                Item::from_value(&crate::json::parse(&entry.item.to_value().to_json()).unwrap())
+                    .unwrap();
+            assert_eq!(back, entry.item, "{}", entry.item.label());
+        }
+        assert_eq!(resolved[0].item.origin.as_deref(), Some("log.txt"));
+    }
+
+    #[test]
+    fn capture_origin_never_leaks_an_outside_path() {
+        let tmp = repo("capturepath");
+        let outside = std::env::temp_dir().join("loam-evidence-outside.log");
+        fs::write(&outside, "x").unwrap();
+        let items = [parse(&format!("capture:{}", outside.display())).unwrap()];
+        let r = resolve_all(&items, &tmp.ctx(1024), &AttestOptions::default());
+        let _ = fs::remove_file(&outside);
+        assert_eq!(
+            r.unwrap()[0].item.origin.as_deref(),
+            Some("loam-evidence-outside.log")
+        );
+    }
+
+    #[test]
     fn every_failure_is_reported_not_just_the_first() {
-        let Some(tmp) = repo("many") else { return };
+        let tmp = repo("many");
         let failures = resolve(
             &tmp,
             &["blob:nope", "file:nope", "seal:00000000000000000000"],
