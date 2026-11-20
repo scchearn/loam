@@ -11,8 +11,10 @@
 //! - `records/<id>.json`: the exact Statement bytes.
 //! - `records/<id>.json.sig`: armored SSHSIG over those bytes.
 //! - `evidence/sha256/<hex>`: captured evidence, named by its digest.
-//! - `.gitattributes`: `** text eol=lf`, written only when the memory tree is
-//!   git-tracked and only when absent.
+//! - `.gitattributes`: `** text eol=lf` plus `evidence/** -text` (captures are
+//!   named by the digest of their raw bytes, so git must never normalise
+//!   them), written only when the memory tree is git-tracked and only when
+//!   absent.
 
 use crate::json::{self, Value};
 use crate::seal::canon::CANON_ID;
@@ -31,7 +33,11 @@ pub const PURPOSE: &str = "loam.seal.attest";
 /// Length of a record id in hex characters.
 pub const ID_LEN: usize = 20;
 const LOCATOR_EDGE: usize = 32;
-const GITATTRIBUTES: &str = "** text eol=lf\n";
+const GITATTRIBUTES: &str = "** text eol=lf\nevidence/** -text\n";
+const LEVELS: [&str; 3] = ["evidence", "audited", "canonical"];
+/// Largest record file `load_all` will read; anything bigger is reported as
+/// unreadable rather than pulled into memory.
+const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 const STATUS_TYPES: [&str; 4] = ["dispute", "demote", "supersede", "retract"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,6 +369,31 @@ fn array(value: &Value, key: &str) -> Result<Vec<Value>, RecordError> {
     }
 }
 
+/// Rejects any object that repeats a key. `Value::get` is first-wins while
+/// most other JSON tooling is last-wins, so an ambiguous signed record could be
+/// read two ways.
+fn reject_duplicate_keys(value: &Value, path: &str) -> Result<(), RecordError> {
+    match value {
+        Value::Object(entries) => {
+            for (i, (key, child)) in entries.iter().enumerate() {
+                if entries[..i].iter().any(|(earlier, _)| earlier == key) {
+                    return Err(RecordError::Malformed(format!(
+                        "duplicate key {key:?} in {}",
+                        if path.is_empty() { "<root>" } else { path }
+                    )));
+                }
+                reject_duplicate_keys(child, &format!("{path}/{key}"))?;
+            }
+            Ok(())
+        }
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .try_for_each(|(i, child)| reject_duplicate_keys(child, &format!("{path}/{i}"))),
+        _ => Ok(()),
+    }
+}
+
 /// Validates `bytes` as the record stored under `id` and returns a parsed
 /// view. Unknown fields are ignored.
 pub fn well_formed(id: &str, bytes: &[u8]) -> Result<View, RecordError> {
@@ -381,6 +412,7 @@ pub fn well_formed(id: &str, bytes: &[u8]) -> Result<View, RecordError> {
             "top level is not an object".to_owned(),
         ));
     }
+    reject_duplicate_keys(&document, "")?;
     let statement_type = text(&document, "", "_type")?;
     if statement_type != STATEMENT_TYPE {
         return Err(RecordError::Malformed(format!(
@@ -433,6 +465,23 @@ pub fn well_formed(id: &str, bytes: &[u8]) -> Result<View, RecordError> {
         return Err(RecordError::UnknownCanon(canon.to_owned()));
     }
     let anchor = nonempty(text(p, "predicate.", "anchor")?, "predicate.anchor")?.to_owned();
+    if subject_name.rsplit_once("#^").map(|(_, a)| a) != Some(anchor.as_str()) {
+        return Err(RecordError::Malformed(format!(
+            "subject[0].name {subject_name:?} does not end in #^{anchor}"
+        )));
+    }
+    // The soft locator is what recovers a span whose markers were stripped.
+    match p.get("locator") {
+        None | Some(Value::Null) => {
+            return Err(RecordError::MissingField("predicate.locator".to_owned()))
+        }
+        Some(Value::Object(_)) => {}
+        Some(_) => {
+            return Err(RecordError::Malformed(
+                "predicate.locator must be an object".to_owned(),
+            ))
+        }
+    }
 
     let verifier = p
         .get("verifier")
@@ -463,6 +512,13 @@ pub fn well_formed(id: &str, bytes: &[u8]) -> Result<View, RecordError> {
     let content = optional_text(p, "predicate.", "content")?;
     let requested_level = optional_text(p, "predicate.", "requested_level")?;
     let claim = optional_text(p, "predicate.", "claim")?;
+    if let Some(level) = &requested_level {
+        if !LEVELS.contains(&level.as_str()) {
+            return Err(RecordError::Malformed(format!(
+                "requested_level {level:?} is not one of evidence, audited, canonical"
+            )));
+        }
+    }
     match kind {
         RecordKind::Seal => {
             if content.is_none() {
@@ -587,6 +643,23 @@ pub fn valid_timestamp(value: &str) -> bool {
         && num(21..23) < 60
 }
 
+/// Removes a CommonMark closing `#` sequence, which only counts when preceded
+/// by whitespace (or is the whole title).
+fn strip_closing_hashes(title: &str) -> &str {
+    let without = title.trim_end_matches('#');
+    if without.len() == title.len() {
+        return title;
+    }
+    if without.is_empty() {
+        return "";
+    }
+    if without.ends_with([' ', '\t']) {
+        without.trim_end()
+    } else {
+        title
+    }
+}
+
 /// Heading text trail (outermost first) in force at byte `offset` of `source`.
 /// ATX headings only; fenced code blocks are skipped.
 pub fn heading_path(source: &str, offset: usize) -> Vec<String> {
@@ -630,7 +703,7 @@ pub fn heading_path(source: &str, offset: usize) -> Vec<String> {
         if (1..=6).contains(&level) {
             let rest = &body[level..];
             if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
-                let title = rest.trim().trim_end_matches('#').trim().to_owned();
+                let title = strip_closing_hashes(rest.trim()).to_owned();
                 while stack.last().is_some_and(|(l, _)| *l >= level) {
                     stack.pop();
                 }
@@ -680,31 +753,51 @@ fn io_error(context: &Path, error: io::Error) -> StoreError {
     StoreError::Io(format!("{}: {error}", context.display()))
 }
 
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Writes `bytes` to `path`, failing with `Exists(name)` when it is there.
+///
+/// The bytes go to a unique dot-prefixed temp file in the same directory, are
+/// synced, and are then published with a hard link, which fails atomically
+/// with `AlreadyExists`. A reader therefore never sees a partial file at the
+/// final name, and a crash leaves at worst a stray temp file that `load_all`
+/// ignores.
 fn create_only(path: &Path, bytes: &[u8], name: &str) -> Result<(), StoreError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
-    }
-    let mut file = match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(StoreError::Exists(name.to_owned()))
-        }
-        Err(e) => return Err(io_error(path, e)),
-    };
-    let written = file.write_all(bytes).and_then(|()| file.flush());
-    if let Err(e) = written {
-        // A half-written file under a new name is ours to remove; it was never
-        // a record because it did not exist a moment ago.
+    let parent = path
+        .parent()
+        .ok_or_else(|| StoreError::Io(format!("{}: no parent directory", path.display())))?;
+    fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| StoreError::Io(format!("{}: unusable file name", path.display())))?;
+    let tmp = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<(), StoreError> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| io_error(&tmp, e))?;
+        file.write_all(bytes)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| io_error(&tmp, e))?;
         drop(file);
-        let _ = fs::remove_file(path);
-        return Err(io_error(path, e));
-    }
-    Ok(())
+        match fs::hard_link(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                Err(StoreError::Exists(name.to_owned()))
+            }
+            Err(e) => Err(io_error(path, e)),
+        }
+    })();
+    // The temp file is ours in every outcome; the final name is never removed.
+    let _ = fs::remove_file(&tmp);
+    result
 }
 
 fn git_succeeds(dir: &Path, args: &[&str]) -> Option<bool> {
@@ -712,6 +805,9 @@ fn git_succeeds(dir: &Path, args: &[&str]) -> Option<bool> {
         .args(args)
         .current_dir(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -804,11 +900,25 @@ pub fn load_all(wiki: &Path) -> Result<Vec<Loaded>, String> {
             continue;
         };
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let view = well_formed(id, &bytes);
+        let read = match fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => continue,
+            Ok(meta) if meta.len() > MAX_RECORD_BYTES => Err(format!(
+                "{} bytes exceeds the {MAX_RECORD_BYTES}-byte record cap",
+                meta.len()
+            )),
+            Ok(_) => fs::read(&path).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let (bytes, view) = match read {
+            Ok(bytes) => {
+                let view = well_formed(id, &bytes);
+                (bytes, view)
+            }
+            Err(why) => (
+                Vec::new(),
+                Err(RecordError::Malformed(format!("unreadable: {why}"))),
+            ),
+        };
         loaded.push(Loaded {
             id: id.to_owned(),
             bytes,
@@ -829,9 +939,8 @@ mod tests {
     struct Tmp(PathBuf);
     impl Tmp {
         fn new(label: &str) -> Tmp {
-            let dir = fs::canonicalize(std::env::temp_dir())
-                .unwrap()
-                .join(format!("loam-record-{label}-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("loam-record-{label}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             Tmp(dir)
@@ -857,6 +966,9 @@ mod tests {
         Command::new("git")
             .args(args)
             .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env(
                 "GIT_CONFIG_GLOBAL",
@@ -879,7 +991,7 @@ mod tests {
                 suffix: "platform store.".to_owned(),
             },
             content: "line one\nline \"two\" \u{e9}\n".to_owned(),
-            requested_level: Some("attested".to_owned()),
+            requested_level: Some("audited".to_owned()),
             claim: Some("Trust order is env, bundled, platform".to_owned()),
             procedure_uri: "loam://seal/procedure/v1".to_owned(),
             principal: "agent.abc@local".to_owned(),
@@ -1064,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_must_carry_a_colon_free_canonical_offset() {
+    fn timestamps_require_canonical_colon_offset() {
         let (_, bytes) = build(&sample()).unwrap();
         for bad in [
             "2026-11-20 14:30",
@@ -1218,7 +1330,10 @@ mod tests {
         let (_, bytes) = build(&sample()).unwrap();
         write_record(&wiki, &bytes).unwrap();
         let attrs = seals_dir(&wiki).join(".gitattributes");
-        assert_eq!(fs::read_to_string(&attrs).unwrap(), "** text eol=lf\n");
+        assert_eq!(
+            fs::read_to_string(&attrs).unwrap(),
+            "** text eol=lf\nevidence/** -text\n"
+        );
         // Never overwritten when a human edited it.
         fs::write(&attrs, "custom\n").unwrap();
         let mut other = sample();
@@ -1240,6 +1355,112 @@ mod tests {
         let (_, bytes) = build(&sample()).unwrap();
         write_record(&wiki, &bytes).unwrap();
         assert!(!seals_dir(&wiki).join(".gitattributes").exists());
+    }
+
+    #[test]
+    fn duplicate_keys_are_rejected_anywhere() {
+        let (_, bytes) = build(&sample()).unwrap();
+        let dup = with_field(
+            &bytes,
+            "\"principal\":\"agent.abc@local\"",
+            "\"principal\":\"agent.abc@local\",\"principal\":\"evil@local\"",
+        );
+        assert!(
+            matches!(check(&dup), Err(RecordError::Malformed(ref m)) if m.contains("duplicate"))
+        );
+        let top = with_field(&bytes, "{\"_type\"", "{\"predicateType\":\"x\",\"_type\"");
+        assert!(matches!(check(&top), Err(RecordError::Malformed(_))));
+    }
+
+    #[test]
+    fn subject_anchor_and_predicate_anchor_must_agree() {
+        let (_, bytes) = build(&sample()).unwrap();
+        let broken = with_field(
+            &bytes,
+            "\"anchor\":\"s-tls-rung-order\"",
+            "\"anchor\":\"s-other\"",
+        );
+        assert!(matches!(check(&broken), Err(RecordError::Malformed(_))));
+    }
+
+    #[test]
+    fn requested_level_and_locator_are_validated() {
+        let mut r = sample();
+        r.requested_level = Some("attested".to_owned());
+        assert!(matches!(build(&r), Err(RecordError::Malformed(_))));
+        for level in ["evidence", "audited", "canonical"] {
+            let mut r = sample();
+            r.requested_level = Some(level.to_owned());
+            assert!(build(&r).is_ok(), "{level}");
+        }
+        let (_, bytes) = build(&sample()).unwrap();
+        let broken = with_field(&bytes, "\"locator\"", "\"locatorx\"");
+        assert!(matches!(check(&broken), Err(RecordError::MissingField(_))));
+    }
+
+    #[test]
+    fn gitattributes_does_not_normalise_evidence() {
+        assert!(GITATTRIBUTES.contains("** text eol=lf\n"));
+        assert!(GITATTRIBUTES.ends_with("evidence/** -text\n"));
+    }
+
+    #[test]
+    fn create_only_leaves_no_temp_files_and_load_all_skips_them() {
+        let tmp = Tmp::new("atomic");
+        let wiki = tmp.wiki();
+        let (id, bytes) = build(&sample()).unwrap();
+        write_record(&wiki, &bytes).unwrap();
+        let _ = write_record(&wiki, &bytes);
+        fs::write(records_dir(&wiki).join(".stray.json.1.0.tmp"), "partial").unwrap();
+        let names: Vec<String> = fs::read_dir(records_dir(&wiki))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert_eq!(names, vec![".stray.json.1.0.tmp".to_owned()]);
+        let loaded = load_all(&wiki).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, id);
+    }
+
+    #[test]
+    fn unreadable_record_is_reported_not_fatal() {
+        let tmp = Tmp::new("unreadable");
+        let wiki = tmp.wiki();
+        let (_, bytes) = build(&sample()).unwrap();
+        write_record(&wiki, &bytes).unwrap();
+        // A directory-like or oversized entry must not abort the load.
+        let big = records_dir(&wiki).join(format!("{}.json", "1".repeat(20)));
+        let file = fs::File::create(&big).unwrap();
+        file.set_len(MAX_RECORD_BYTES + 1).unwrap();
+        drop(file);
+        let loaded = load_all(&wiki).unwrap();
+        assert_eq!(loaded.len(), 2);
+        let bad = loaded.iter().find(|l| l.id == "1".repeat(20)).unwrap();
+        assert!(matches!(&bad.view, Err(RecordError::Malformed(m)) if m.contains("unreadable")));
+        assert!(loaded.iter().any(|l| l.view.is_ok()));
+    }
+
+    #[test]
+    fn heading_closing_hashes_need_leading_space() {
+        let page = "# C#
+## Intro ##
+## Tail #
+x
+";
+        let at = page.find('x').unwrap();
+        assert_eq!(
+            heading_path(page, at),
+            vec!["C#".to_owned(), "Tail".to_owned()]
+        );
+        assert_eq!(
+            heading_path(
+                "# Intro ##
+x",
+                11
+            ),
+            vec!["Intro".to_owned()]
+        );
     }
 
     #[test]
