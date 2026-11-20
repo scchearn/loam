@@ -2628,6 +2628,7 @@ mod tests {
             "provisioning.rs",
             // Seals: `sshsig.rs` and `trust.rs` run the reader's `ssh-keygen`;
             // `record.rs` runs git for tracked-tree detection.
+            "seal/evidence.rs",
             "seal/record.rs",
             "seal/sshsig.rs",
             "seal/trust.rs",
@@ -2665,6 +2666,7 @@ mod tests {
             "provisioning.rs",
             // Seals: the signed-record store and the reader trust files.
             "seal.rs",
+            "seal/evidence.rs",
             "seal/record.rs",
             "seal/sshsig.rs",
             "seal/trust.rs",
