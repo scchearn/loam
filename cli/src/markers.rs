@@ -101,7 +101,16 @@ const CLASS_TOKENS: [&str; 3] = ["local-only", "project", "hub-promotable"];
 pub fn scan(source: &str) -> Scan {
     let excluded = markdown::excluded_ranges(source);
     let mut scanner = Scanner::default();
-    let mut offset = 0usize;
+    // A leading BOM would hide a first-line marker; skip it but keep offsets
+    // into the original source.
+    let mut offset = if source.starts_with('\u{FEFF}') {
+        '\u{FEFF}'.len_utf8()
+    } else {
+        0
+    };
+    // Lines arrive in increasing offset order, so one cursor through the
+    // sorted excluded ranges suffices.
+    let mut cursor = 0usize;
     while offset < source.len() {
         let (line_end, next) = match source[offset..].find('\n') {
             Some(index) => (offset + index, offset + index + 1),
@@ -114,18 +123,19 @@ pub fn scan(source: &str) -> Scan {
             line_end
         };
         let line = &source[offset..line_end];
-        if !line.trim().is_empty() && !overlaps(&excluded, offset, line_end) {
+        while cursor < excluded.len() && excluded[cursor].end <= offset {
+            cursor += 1;
+        }
+        let in_code = excluded[cursor..]
+            .iter()
+            .take_while(|range| range.start < line_end)
+            .any(|range| range.start < line_end && offset < range.end);
+        if !line.trim().is_empty() && !in_code {
             scanner.line(line, offset..line_end, next);
         }
         offset = next;
     }
     scanner.finish()
-}
-
-fn overlaps(ranges: &[Range<usize>], start: usize, end: usize) -> bool {
-    ranges
-        .iter()
-        .any(|range| range.start < end && start < range.end)
 }
 
 struct Open {
@@ -138,14 +148,10 @@ struct Open {
     excluded: bool,
 }
 
-struct Candidate {
-    marker: Marker,
-}
-
 #[derive(Default)]
 struct Scanner {
     stack: Vec<Open>,
-    done: Vec<Candidate>,
+    done: Vec<Marker>,
     anchors: BTreeMap<String, Kind>,
     seen: HashMap<String, usize>,
     duplicated: HashSet<String>,
@@ -179,8 +185,8 @@ fn parse_comment(line: &str) -> Option<Comment<'_>> {
     })
 }
 
-/// Slug length in kebab words. D1 says 2-6, but the M1 acceptance page uses the
-/// one-word `c-payroll`; the lower bound is 1 until the spec reconciles them.
+/// Slug length in kebab words. One-word slugs are accepted (the M1 acceptance
+/// page uses `c-payroll`); the upper bound is six.
 const SLUG_WORDS: std::ops::RangeInclusive<usize> = 1..=6;
 
 /// `<prefix>-<slug>` with the slug kebab words of `[a-z0-9]`.
@@ -219,7 +225,7 @@ impl Scanner {
         });
     }
 
-    /// Register an anchor occurrence; returns whether the id is a duplicate.
+    /// Register an anchor occurrence, reporting MRK003 on every repeat.
     fn register(&mut self, kind: Kind, id: &str, range: &Range<usize>) {
         self.anchors.entry(id.to_owned()).or_insert(kind);
         let count = self.seen.entry(id.to_owned()).or_insert(0);
@@ -355,15 +361,13 @@ impl Scanner {
             );
         }
         if !open.excluded {
-            self.done.push(Candidate {
-                marker: Marker {
-                    kind: open.kind,
-                    id: open.id,
-                    class: open.class,
-                    content: open.content_start..range.start.max(open.content_start),
-                    opener: open.opener,
-                    closer: range,
-                },
+            self.done.push(Marker {
+                kind: open.kind,
+                id: open.id,
+                class: open.class,
+                content: open.content_start..range.start.max(open.content_start),
+                opener: open.opener,
+                closer: range,
             });
         }
     }
@@ -398,15 +402,13 @@ impl Scanner {
         }
         self.register(Kind::Question, id, &range);
         let end = range.end;
-        self.done.push(Candidate {
-            marker: Marker {
-                kind: Kind::Question,
-                id: id.to_owned(),
-                class: None,
-                opener: range,
-                content: end..end,
-                closer: end..end,
-            },
+        self.done.push(Marker {
+            kind: Kind::Question,
+            id: id.to_owned(),
+            class: None,
+            opener: range,
+            content: end..end,
+            closer: end..end,
         });
     }
 
@@ -427,7 +429,6 @@ impl Scanner {
         let mut markers = self
             .done
             .into_iter()
-            .map(|candidate| candidate.marker)
             .filter(|marker| !duplicated.contains(&marker.id))
             .collect::<Vec<_>>();
         markers.sort_by_key(|marker| marker.opener.start);
@@ -466,11 +467,11 @@ TLS tries the bundled rung first.\n\
 
     #[test]
     fn recognises_every_kind_with_ids_and_ranges() {
-        let scan = scan(M1);
-        assert!(scan.problems.is_empty(), "{:?}", scan.problems);
-        assert_eq!(scan.markers.len(), 3);
+        let result = scan(M1);
+        assert!(result.problems.is_empty(), "{:?}", result.problems);
+        assert_eq!(result.markers.len(), 3);
 
-        let class = &scan.markers[0];
+        let class = &result.markers[0];
         assert_eq!(class.kind, Kind::Class);
         assert_eq!(class.id, "c-payroll");
         assert_eq!(class.class.as_deref(), Some("local-only"));
@@ -480,7 +481,7 @@ TLS tries the bundled rung first.\n\
         );
         assert_eq!(&M1[class.closer.clone()], "<!-- /loam:class -->");
 
-        let seal = &scan.markers[1];
+        let seal = &result.markers[1];
         assert_eq!(seal.kind, Kind::Seal);
         assert_eq!(seal.id, "s-tls-rung-order");
         assert_eq!(seal.class, None);
@@ -494,7 +495,7 @@ TLS tries the bundled rung first.\n\
         );
         assert_eq!(&M1[seal.closer.clone()], "<!-- /loam:seal -->");
 
-        let question = &scan.markers[2];
+        let question = &result.markers[2];
         assert_eq!(question.kind, Kind::Question);
         assert_eq!(question.id, "q-hosting-signoff");
         assert_eq!(
@@ -502,23 +503,23 @@ TLS tries the bundled rung first.\n\
             "- [ ] Q: Who signs off hosting? ^q-hosting-signoff"
         );
 
-        assert_eq!(scan.anchors.len(), 3);
-        assert_eq!(scan.anchors["s-tls-rung-order"], Kind::Seal);
-        assert_eq!(scan.anchors["c-payroll"], Kind::Class);
-        assert_eq!(scan.anchors["q-hosting-signoff"], Kind::Question);
+        assert_eq!(result.anchors.len(), 3);
+        assert_eq!(result.anchors["s-tls-rung-order"], Kind::Seal);
+        assert_eq!(result.anchors["c-payroll"], Kind::Class);
+        assert_eq!(result.anchors["q-hosting-signoff"], Kind::Question);
     }
 
     #[test]
     fn question_records_accept_every_state_marker() {
         for state in [" ", "x", ">", "-"] {
             let source = format!("* [{state}] Q: why? ^q-some-reason\n");
-            let scan = scan(&source);
-            assert_eq!(scan.markers.len(), 1, "state {state:?}");
+            let result = scan(&source);
+            assert_eq!(result.markers.len(), 1, "state {state:?}");
         }
         // No anchor, or a generic block id, is not a marker and not a problem.
-        let scan = scan("- [ ] Q: why?\n- [ ] Q: why? ^plain\n- [ ] note ^q-some-reason\n");
-        assert!(scan.markers.is_empty());
-        assert!(scan.problems.is_empty());
+        let result = scan("- [ ] Q: why?\n- [ ] Q: why? ^plain\n- [ ] note ^q-some-reason\n");
+        assert!(result.markers.is_empty());
+        assert!(result.problems.is_empty());
     }
 
     #[test]
@@ -558,9 +559,9 @@ TLS tries the bundled rung first.\n\
     #[test]
     fn ignores_other_loam_comment_kinds() {
         let source = "<!-- loam:memory-map · generated from wiki/index.md · do not edit by hand -->\nmap\n<!-- /loam:memory-map -->\n<!-- loam:other x -->\n<!-- loam:sealed s-aa-bb -->\n<!-- plain comment -->\n";
-        let scan = scan(source);
-        assert!(scan.markers.is_empty());
-        assert!(scan.problems.is_empty());
+        let result = scan(source);
+        assert!(result.markers.is_empty());
+        assert!(result.problems.is_empty());
     }
 
     #[test]
@@ -589,9 +590,9 @@ TLS tries the bundled rung first.\n\
             "<!-- loam:seal -->",
         ] {
             let source = format!("{opener}\nbody\n<!-- /loam:seal -->\n");
-            let scan = scan(&source);
-            assert_eq!(codes(&scan), ["MRK001"], "{opener}");
-            assert!(scan.markers.is_empty(), "{opener}");
+            let result = scan(&source);
+            assert_eq!(codes(&result), ["MRK001"], "{opener}");
+            assert!(result.markers.is_empty(), "{opener}");
         }
 
         // Class token rules.
@@ -601,9 +602,9 @@ TLS tries the bundled rung first.\n\
             "<!-- loam:class c-aa-bb project local-only -->",
         ] {
             let source = format!("{opener}\nbody\n<!-- /loam:class -->\n");
-            let scan = scan(&source);
-            assert_eq!(codes(&scan), ["MRK001"], "{opener}");
-            assert!(scan.markers.is_empty(), "{opener}");
+            let result = scan(&source);
+            assert_eq!(codes(&result), ["MRK001"], "{opener}");
+            assert!(result.markers.is_empty(), "{opener}");
         }
 
         // Question anchors with the wrong prefix or a bad slug.
@@ -640,38 +641,36 @@ TLS tries the bundled rung first.\n\
     }
 
     #[test]
-    fn duplicate_anchor_across_kinds_reports_mrk003() {
+    fn duplicate_anchors_report_mrk003() {
+        // The prefix fixes the kind, so a duplicate can only occur within one
+        // kind; the same slug under different prefixes is distinct.
         let source = "<!-- loam:seal s-aa-bb -->\none\n<!-- /loam:seal -->\n<!-- loam:seal s-aa-bb -->\ntwo\n<!-- /loam:seal -->\n- [ ] Q: why? ^q-xx-yy\n- [ ] Q: again? ^q-xx-yy\n";
-        let scan = scan(source);
-        assert_eq!(codes(&scan), ["MRK003", "MRK003"]);
+        let result = scan(source);
+        assert_eq!(codes(&result), ["MRK003", "MRK003"]);
         // Reported at the later occurrence.
         let later = source.find("<!-- loam:seal s-aa-bb -->\ntwo").unwrap();
-        assert_eq!(scan.problems[0].range.start, later);
+        assert_eq!(result.problems[0].range.start, later);
         // No span or record sharing a duplicated id is returned, but the ids
         // register once so links still resolve.
-        assert!(scan.markers.is_empty());
-        assert_eq!(scan.anchors.len(), 2);
+        assert!(result.markers.is_empty());
+        assert_eq!(result.anchors.len(), 2);
 
         // The same slug under different prefixes is not a duplicate.
         let distinct =
             "<!-- loam:seal s-aa-bb -->\nx\n<!-- /loam:seal -->\n- [ ] Q: why? ^q-aa-bb\n";
-        let scan_distinct = scan_of(distinct);
-        assert!(scan_distinct.problems.is_empty());
-        assert_eq!(scan_distinct.markers.len(), 2);
-    }
-
-    fn scan_of(source: &str) -> Scan {
-        scan(source)
+        let distinct_scan = scan(distinct);
+        assert!(distinct_scan.problems.is_empty());
+        assert_eq!(distinct_scan.markers.len(), 2);
     }
 
     #[test]
     fn seal_opener_with_tokens_reports_sel001() {
         let source = "<!-- loam:seal s-aa-bb level=canonical -->\nbody\n<!-- /loam:seal -->\n";
-        let scan = scan(source);
+        let result = scan(source);
         // Paired with its closer: exactly one problem, no stray MRK001.
-        assert_eq!(codes(&scan), ["SEL001"]);
-        assert!(scan.markers.is_empty());
-        assert_eq!(scan.anchors["s-aa-bb"], Kind::Seal);
+        assert_eq!(codes(&result), ["SEL001"]);
+        assert!(result.markers.is_empty());
+        assert_eq!(result.anchors["s-aa-bb"], Kind::Seal);
     }
 
     #[test]
@@ -686,12 +685,12 @@ TLS tries the bundled rung first.\n\
             "<!-- loam:seal s-aa-bb -->\nx\n<!-- /loam:seal -->\n<!-- loam:seal s-aa-bb -->\ny\n<!-- /loam:seal -->\n",
         ];
         for case in cases {
-            let scan = scan_of(case);
-            assert!(!scan.problems.is_empty(), "{case}");
+            let result = scan(case);
+            assert!(!result.problems.is_empty(), "{case}");
             assert!(
-                scan.markers.iter().all(|m| m.kind != Kind::Seal),
+                result.markers.iter().all(|m| m.kind != Kind::Seal),
                 "{case}: {:?}",
-                scan.markers
+                result.markers
             );
         }
     }
@@ -699,11 +698,11 @@ TLS tries the bundled rung first.\n\
     #[test]
     fn crlf_ranges_exclude_marker_lines() {
         let source = M1.replace('\n', "\r\n");
-        let scan = scan(&source);
-        assert!(scan.problems.is_empty(), "{:?}", scan.problems);
-        assert_eq!(scan.markers.len(), 3);
+        let result = scan(&source);
+        assert!(result.problems.is_empty(), "{:?}", result.problems);
+        assert_eq!(result.markers.len(), 3);
 
-        let seal = &scan.markers[1];
+        let seal = &result.markers[1];
         assert_eq!(
             &source[seal.opener.clone()],
             "<!-- loam:seal s-tls-rung-order -->"
@@ -714,7 +713,7 @@ TLS tries the bundled rung first.\n\
             &source[seal.content.clone()],
             "TLS tries the bundled rung first.\r\n"
         );
-        let question = &scan.markers[2];
+        let question = &result.markers[2];
         assert_eq!(
             &source[question.opener.clone()],
             "- [ ] Q: Who signs off hosting? ^q-hosting-signoff"
@@ -724,13 +723,46 @@ TLS tries the bundled rung first.\n\
     #[test]
     fn empty_and_adjacent_spans_have_empty_content() {
         let source = "<!-- loam:seal s-aa-bb -->\n<!-- /loam:seal -->";
-        let scan = scan(source);
-        assert!(scan.problems.is_empty());
-        assert_eq!(scan.markers.len(), 1);
-        assert!(scan.markers[0].content.is_empty());
+        let result = scan(source);
+        assert!(result.problems.is_empty());
+        assert_eq!(result.markers.len(), 1);
+        assert!(result.markers[0].content.is_empty());
         assert_eq!(
-            &source[scan.markers[0].closer.clone()],
+            &source[result.markers[0].closer.clone()],
             "<!-- /loam:seal -->"
         );
+    }
+
+    #[test]
+    fn slug_word_count_boundary() {
+        let ok = |id: &str| {
+            let source = format!("<!-- loam:seal {id} -->\nx\n<!-- /loam:seal -->\n");
+            scan(&source).problems.is_empty()
+        };
+        assert!(ok("s-x"), "one word is accepted");
+        assert!(ok("s-a-b-c-d-e-f"), "six words are accepted");
+        assert!(!ok("s-a-b-c-d-e-f-g"), "seven words are rejected");
+        assert!(!ok("s-"), "an empty slug is rejected");
+    }
+
+    #[test]
+    fn leading_bom_does_not_hide_first_line_marker() {
+        let source = "\u{FEFF}<!-- loam:seal s-aa-bb -->\nx\n<!-- /loam:seal -->\n";
+        let result = scan(source);
+        assert!(result.problems.is_empty(), "{:?}", result.problems);
+        assert_eq!(result.markers.len(), 1);
+        assert_eq!(
+            &source[result.markers[0].opener.clone()],
+            "<!-- loam:seal s-aa-bb -->"
+        );
+    }
+
+    #[test]
+    fn malformed_first_occurrence_still_registers_the_id() {
+        let source = "<!-- loam:seal s-aa-bb level=x -->\na\n<!-- /loam:seal -->\n<!-- loam:seal s-aa-bb -->\nb\n<!-- /loam:seal -->\n";
+        let result = scan(source);
+        assert_eq!(codes(&result), ["SEL001", "MRK003"]);
+        assert!(result.markers.is_empty());
+        assert_eq!(result.anchors.len(), 1);
     }
 }
