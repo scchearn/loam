@@ -89,7 +89,7 @@ arguments or an unreadable input. `--only guidance|markdown|memory|seals|work` n
 the scan. The command is read-only except for `--fix`, which regenerates only
 the `AGENTS.md` memory-map region (see K below).
 
-Seals: run `<native-runtime-command> lint --only seals "$WORKSPACE_ROOT"` (satisfies `seals_attention`; see `loam-using/references/seals.md`). Report findings only: never re-hash or edit a seal record, and leave the legacy checkpoint rename off sealed spans.
+Seals: run `<native-runtime-command> lint --only seals "$WORKSPACE_ROOT"` (satisfies `seals_attention`; see `loam-using/references/seals.md`). Report findings only: never re-hash or edit a seal record.
 
 If it exits 75 or 78 the native runtime is not ready — stop and report
 `npx @scchearn/loam install`. Do not claim a clean result from a fallback check.
@@ -177,7 +177,7 @@ When `<wiki root>/checkpoints/` contains legacy slugged checkpoint filenames:
 
 1. identify files matching `checkpoint-YYYY-MM-DD-HHMM-<slug>.md`
 2. rename to `checkpoint-YYYY-MM-DD-HHMM.md`, using the smallest suffix only when a collision exists
-3. update checkpoint wikilinks that reference renamed notes
+3. update checkpoint wikilinks that reference renamed notes, except inside `<!-- loam:seal ... -->` spans: leave those bytes untouched and report the stale link (see `loam-using/references/seals.md`)
 4. apply the migration directly — it is mechanical and git-reversible, so it needs no approval; the `log.md` entry below is what makes it non-silent
 5. record the checkpoint filename migration in `<wiki root>/log.md`
 
@@ -210,7 +210,7 @@ Allowed direct fixes:
 9. normalizing internal links to canonical `[[kebab-case-note-name]]` form
 10. moving a misplaced nested `.obsidian/` to the parent root when that destination has none
 11. reconciling stale `.wiki-metadata.json` paths to the actual resolved wiki root
-12. renaming legacy slugged checkpoint files and their wikilinks when the mapping is collision-free and local
+12. renaming legacy slugged checkpoint files and their wikilinks when the mapping is collision-free and local (never inside sealed spans)
 13. moving stranded code pages from `entities/` to `code/`, rebuilding the hub, and logging the migration
 14. regenerating the `AGENTS.md` memory-map region with `<native-runtime-command> lint --only guidance --fix "$WORKSPACE_ROOT"` — never by hand-editing inside the markers
 

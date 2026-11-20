@@ -260,6 +260,7 @@ grep -Fq -- '--parent' "$amending" || fail "amending-memory must name re-seal wi
 grep -Fq 'dispute' "$amending" || fail "amending-memory must write a dispute instead of overwriting a contradicted seal"
 for seal_skill in \
   skills/loam-memory/loam-adding-to-memory \
+  skills/loam-memory/loam-linting-memory \
   skills/loam-memory/loam-learning-from-session \
   skills/loam-memory/loam-querying-memory \
   skills/loam-memory/loam-normalizing-memory \
