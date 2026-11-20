@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { ledgerPath } from '../../integration/ledger.mjs';
 
 const execFileAsync = promisify(execFile);
 // Core semver with optional semver 2.0.0 prerelease, same formulation as
@@ -27,20 +28,24 @@ try {
 
   const npxArgs = [
     ...(process.platform === 'win32' ? [join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npx-cli.js')] : []),
-    '--yes', `@scchearn/loam@${pluginVersion}`, 'setup', '--yes',
+    // First-time install is `install`; `setup` only configures an existing install (since v1.0.0).
+    '--yes', `@scchearn/loam@${pluginVersion}`, 'install', '--yes',
   ];
   const setup = await execFileAsync(npx, npxArgs, {
     cwd: workspace,
     env,
     maxBuffer: 4 * 1024 * 1024,
   });
-  const metadataPath = join(home, '.agents', 'loam', 'install.json');
-  const metadata = JSON.parse(await readFile(metadataPath, 'utf8'));
-  if (metadata.runtime_version !== runtimeVersion) {
-    throw new Error(`setup selected runtime ${metadata.runtime_version}, expected ${runtimeVersion}`);
+  // The runtime target and binary live in the config-dir ledger
+  // (<configRoot>/runtime/ledger.json), resolved exactly as the product does.
+  const ledgerFile = ledgerPath({ env, home });
+  if (!ledgerFile) throw new Error('no config root resolved for the runtime ledger');
+  const ledger = JSON.parse(await readFile(ledgerFile, 'utf8'));
+  if (ledger.target !== runtimeVersion) {
+    throw new Error(`install selected runtime ${ledger.target}, expected ${runtimeVersion}`);
   }
 
-  const state = await execFileAsync(metadata.runtime_path, ['state', '--fast', workspace], {
+  const state = await execFileAsync(ledger.store_path, ['state', '--fast', workspace], {
     cwd: workspace,
     env,
     maxBuffer: 4 * 1024 * 1024,
