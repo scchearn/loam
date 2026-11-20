@@ -39,6 +39,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Any unexpected terminating error honours the documented contract: exit 2, nothing on stdout.
+trap { [Console]::Error.WriteLine("seal-canon: $_"); exit 2 }
+
 function Fail([string]$Message) {
     [Console]::Error.WriteLine("seal-canon: $Message")
     exit 2
