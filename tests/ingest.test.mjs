@@ -1569,3 +1569,30 @@ test('ingest_commit: LOAM_MEMORY_COMMITS=0 performs no git staging or commit', a
     assert.equal('memory_commit_hash' in stored, false);
   } finally { await ws.cleanup(); }
 });
+
+test('ingest_commit: a live orphan child (busy) never commits and keeps the lease', async () => {
+  const { ws, globalRoot, skills } = await gitIngestFixture();
+  try {
+    const before = ws.commitCount();
+    const result = await runWorker({
+      harness: 'opencode', workspace: ws.root, globalRoot, skillsRoot: skills,
+      env: { ...ws.env, LOAM_INGEST_BACKGROUND: '1', LOAM_INGEST_TIMEOUT: '1' },
+      ...actionableRuntime(ws.wiki),
+      openCodeSession: {
+        parentSessionId: 'parent-1',
+        createChild: async () => { await ingestorWrites(ws.root); return { id: 'child-live' }; },
+        promptAsync: async () => {},
+        status: async () => ({ type: 'busy' }),
+      },
+    });
+    assert.equal(result.reason, 'busy');
+    assert.equal(ws.commitCount(), before);
+    assert.equal(ws.git(['diff', '--cached', '--name-only']).trim(), '');
+    assert.match(ws.git(['status', '--porcelain', '--', 'wiki']), /\?\? wiki\/code\/src\/|M wiki\/code\/_index\.md/);
+    const runPath = runRoot(globalRoot, ws.root);
+    assert.equal(JSON.parse(await readFile(join(runPath, 'lease.json'), 'utf8')).child_identity.session_id, 'child-live');
+    let last = {};
+    try { last = JSON.parse(await readFile(join(runPath, 'last-run.json'), 'utf8')); } catch { /* none recorded */ }
+    assert.notEqual(last.memory_commit, 'committed');
+  } finally { await ws.cleanup(); }
+});
