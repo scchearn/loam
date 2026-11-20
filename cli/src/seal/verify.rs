@@ -116,9 +116,12 @@ impl Env {
 }
 
 /// `<configRoot>/cache/seals` for a trust directory of `<configRoot>/seal`.
-fn cache_dir_beside(trust_dir: Option<&Path>) -> Option<PathBuf> {
+/// A relative root disables the cache: it would resolve against the working
+/// directory, possibly inside `wiki/`.
+pub(crate) fn cache_dir_beside(trust_dir: Option<&Path>) -> Option<PathBuf> {
     trust_dir
         .and_then(Path::parent)
+        .filter(|root| root.is_absolute())
         .map(|root| root.join("cache").join("seals"))
 }
 
@@ -833,7 +836,8 @@ impl Verifier<'_> {
         // copy), so a binding settled without it is not settled.
         if self.ctl.is_some()
             && (self.unhashed.iter().any(|name| same_page(name, &page))
-                || (binding == Binding::SpanMissing && !self.unhashed.is_empty()))
+                || (!self.unhashed.is_empty()
+                    && (binding == Binding::SpanMissing || (moved && binding != Binding::Matches))))
         {
             self.miss.set(true);
         }
@@ -1124,7 +1128,8 @@ impl Verifier<'_> {
     /// One evidence item's result code and weight. With a cache, a file,
     /// blob, capture or commit result is reused only while its inputs'
     /// `{mtime, size}` (or the repository's refs) are unchanged; the fast path
-    /// never recomputes, and reports a seal `unchecked` when it must.
+    /// recomputes only file and capture digests in process, and reports a seal
+    /// `unchecked` otherwise when it must.
     fn evidence_check(
         &self,
         item: &evidence::Item,
@@ -1172,6 +1177,23 @@ impl Verifier<'_> {
             if let Some((fingerprint, _)) = &stamp {
                 if let Some(code) = ctl.cached_evidence(&key, fingerprint) {
                     return (code, weight);
+                }
+            }
+            // File and capture evidence are re-hashed in process (no spawn,
+            // charged to the hash budget) when the stamp is racy or changed,
+            // so evidence stored moments before a check recovers on its own.
+            // Only an entry that exists is revisited: a cold cache stays
+            // unchecked.
+            if matches!(item.kind, Kind::File | Kind::Capture) && ctl.has_evidence(&key) {
+                if let Some((fingerprint, newest)) = stamp {
+                    let size = evidence::local_input(item, ctx)
+                        .and_then(|path| fs::metadata(path).ok())
+                        .map_or(0, |meta| meta.len());
+                    if ctl.spend(size) {
+                        let code = evidence::check_code(item, ctx).0;
+                        ctl.put_evidence(&key, fingerprint, newest, code);
+                        return (code, weight);
+                    }
                 }
             }
             ctl.note_miss();

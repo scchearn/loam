@@ -110,6 +110,12 @@ pub fn refs_fingerprint(repo_root: &Path) -> Option<(String, u128)> {
     add("HEAD".to_owned(), &gitdir.join("HEAD"));
     add("packed-refs".to_owned(), &commondir.join("packed-refs"));
     add("shallow".to_owned(), &commondir.join("shallow"));
+    // Reftable repositories keep refs here (`refs/heads` is a stub), and the
+    // list is rewritten on every ref update.
+    add(
+        "reftable".to_owned(),
+        &commondir.join("reftable").join("tables.list"),
+    );
     let mut stack = vec![(commondir.join("refs"), "refs".to_owned())];
     let mut files = 0usize;
     while let Some((dir, label)) = stack.pop() {
@@ -515,6 +521,10 @@ impl Ctl {
     pub fn cached_evidence(&self, key: &str, fingerprint: &str) -> Option<Code> {
         let entry = self.old.evidence.get(key)?;
         entry.stamp.trusted(fingerprint).then_some(entry.code)
+    }
+
+    pub fn has_evidence(&self, key: &str) -> bool {
+        self.old.evidence.contains_key(key)
     }
 
     pub fn put_evidence(&self, key: &str, fingerprint: String, newest: u128, code: Code) {
@@ -983,31 +993,66 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_evidence_file_is_unchecked_without_a_spawn() {
+    fn a_changed_evidence_file_is_rehashed_in_process_without_a_spawn() {
         let fx = Fx::new("evidence");
         fx.seal("alpha", "s-first-claim", "Body.", &["file:run.log"], None);
         fx.age();
         fx.full();
         assert_eq!(fast(&fx).citable, 1);
 
-        // Same bytes, newer mtime: the cached result is not reusable.
+        // Same bytes, newer mtime: re-hashed in process, still current.
         let log = fx.root.join("run.log");
         let same = fs::read(&log).unwrap();
         fs::write(&log, &same).unwrap();
         let before = spawn_count();
         let counts = fast(&fx);
         assert_eq!(spawn_count(), before);
-        assert_eq!((counts.citable, counts.unchecked), (0, 1), "{counts:?}");
+        assert_eq!((counts.citable, counts.unchecked), (1, 0), "{counts:?}");
+        assert!(counts.diag.hashed_bytes > 0, "{counts:?}");
 
-        // Different size.
+        // Different bytes: never a stale citable.
         fx.age();
         fx.full();
         assert_eq!(fast(&fx).citable, 1);
         fs::write(&log, b"changed and longer than before").unwrap();
+        let before = spawn_count();
         let counts = fast(&fx);
-        assert_eq!((counts.citable, counts.unchecked), (0, 1), "{counts:?}");
+        assert_eq!(spawn_count(), before);
+        assert_eq!(counts.citable, 0, "{counts:?}");
         let full = fx.counts(false);
         assert_eq!(full.citable, 0, "{full:?}");
+    }
+
+    #[test]
+    fn evidence_stored_just_before_the_check_recovers_on_the_fast_path() {
+        // Nothing is aged: the file evidence and the capture are younger than
+        // the racy window when the post-write check stamps them.
+        let fx = Fx::new("racy-evidence");
+        fx.seal(
+            "alpha",
+            "s-first-claim",
+            "Body.",
+            &["file:run.log", "capture:run.log"],
+            None,
+        );
+        let env = fx.env();
+        verify::verify_overlay(&env, &verify::Overlay::default(), &fx.only_id()).unwrap();
+        let before = spawn_count();
+        let counts = fast(&fx);
+        assert_eq!(spawn_count(), before);
+        assert_eq!((counts.citable, counts.unchecked), (1, 0), "{counts:?}");
+    }
+
+    #[test]
+    fn a_relative_cache_root_disables_the_cache() {
+        let rel = Path::new("cfg").join("seal");
+        assert!(verify::cache_dir_beside(Some(&rel)).is_none());
+        let abs = std::env::temp_dir().join("cfg").join("seal");
+        assert_eq!(
+            verify::cache_dir_beside(Some(&abs)),
+            Some(std::env::temp_dir().join("cfg").join("cache").join("seals"))
+        );
+        assert!(verify::cache_dir_beside(None).is_none());
     }
 
     #[test]
@@ -1105,6 +1150,20 @@ mod tests {
         let (second, _) = refs_fingerprint(&repo.0).unwrap();
         assert_ne!(first, second);
         assert!(refs_fingerprint(&repo.0.join("no-such-dir")).is_none());
+    }
+
+    #[test]
+    fn a_reftable_update_changes_the_refs_fingerprint() {
+        let Some(repo) = fixture::git_repo("reftable") else {
+            return;
+        };
+        let dir = repo.0.join(".git").join("reftable");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("tables.list"), "0x1-0x1-aaaa.ref\n").unwrap();
+        let (before, _) = refs_fingerprint(&repo.0).unwrap();
+        fs::write(dir.join("tables.list"), "0x1-0x2-bbbb.ref\n").unwrap();
+        let (after, _) = refs_fingerprint(&repo.0).unwrap();
+        assert_ne!(before, after);
     }
 
     #[test]
