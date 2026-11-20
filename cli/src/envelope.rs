@@ -2675,6 +2675,7 @@ mod tests {
             "seal/record.rs",
             "seal/sshsig.rs",
             "seal/trust.rs",
+            "seal/lint.rs",
             "seal/verify.rs",
             "service.rs",
             "sha256.rs",

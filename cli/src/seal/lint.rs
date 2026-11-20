@@ -99,11 +99,21 @@ fn finding(
 
 /// One finding per rule per seal, with every contributing verify code in the
 /// detail. Success codes never map to a lint rule.
-pub fn report_findings(report: &Report, out: &mut Vec<Finding>) {
+pub fn report_findings(report: &Report, spans: &[SpanRef], out: &mut Vec<Finding>) {
     if report.superseded_by.is_some() {
         return;
     }
     let file = file_for(report);
+    let line = report
+        .anchor
+        .as_deref()
+        .and_then(|anchor| {
+            let page = report.current_page.as_deref().or(report.page.as_deref())?;
+            spans
+                .iter()
+                .find(|span| span.page == page && span.anchor == anchor)
+        })
+        .map_or(0, |span| span.line);
     let codes = &report.outcome.codes;
     let mut by_rule: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
     for verify_code in codes.failure.iter().chain(&codes.informational) {
@@ -119,7 +129,7 @@ pub fn report_findings(report: &Report, out: &mut Vec<Finding>) {
         let Some((rule, severity)) = rule_for(lint_code) else {
             continue;
         };
-        let mut found = finding(rule, severity, &file, 0, list.join(", "))
+        let mut found = finding(rule, severity, &file, line, list.join(", "))
             .with_evidence("seal", &report.id)
             .with_evidence("verdict", report.outcome.verdict.as_str());
         if let Some(anchor) = &report.anchor {
@@ -134,7 +144,7 @@ pub fn report_findings(report: &Report, out: &mut Vec<Finding>) {
             RULE_UNPAIRED,
             Severity::Warning,
             &file,
-            0,
+            line,
             "record without anchor".to_owned(),
         )
         .with_evidence("seal", &report.id);
@@ -233,10 +243,11 @@ fn seal_pass(
 ) -> Result<(), String> {
     let env = Env::load(wiki, trust::seal_dir().ok(), now)?;
     let reports = verify::verify_all(&env)?;
+    let spans = collect_spans(wiki)?;
     for report in &reports {
-        report_findings(report, out);
+        report_findings(report, &spans, out);
     }
-    unpaired_markers(&collect_spans(wiki)?, &reports, out);
+    unpaired_markers(&spans, &reports, out);
     Ok(())
 }
 
@@ -273,7 +284,7 @@ mod tests {
 
     fn findings_of(report: &Report) -> Vec<Finding> {
         let mut out = Vec::new();
-        report_findings(report, &mut out);
+        report_findings(report, &[], &mut out);
         out
     }
 
@@ -378,7 +389,7 @@ mod tests {
         );
         let mut out = Vec::new();
         unpaired_markers(&[span], std::slice::from_ref(&citable), &mut out);
-        report_findings(&citable, &mut out);
+        report_findings(&citable, &[], &mut out);
         assert!(out.is_empty(), "{:?}", rules(&out));
     }
 
@@ -423,5 +434,19 @@ mod tests {
             rules(&found),
             vec![("SEL002", "warning"), ("SEL004", "warning")]
         );
+    }
+
+    #[test]
+    fn drift_findings_carry_the_anchor_line_when_the_span_exists() {
+        let drifted = report(Verdict::Forged, &[code::BINDING_MISMATCH], &[]);
+        let spans = [SpanRef {
+            page: "alpha".to_owned(),
+            anchor: "s-one".to_owned(),
+            line: 7,
+        }];
+        let mut out = Vec::new();
+        report_findings(&drifted, &spans, &mut out);
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|f| f.line == 7));
     }
 }

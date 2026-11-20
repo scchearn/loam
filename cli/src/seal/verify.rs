@@ -379,7 +379,8 @@ fn verify_with(env: &Env, overlay: Option<&Overlay>) -> Result<Vec<Report>, Stri
 
 /// Flags each drifted record that a sound child re-seal replaces. The child
 /// must itself bind to the live span, so a planted or broken child cannot hide
-/// real drift.
+/// real drift, and its own level must be at least the parent's so a weaker
+/// re-seal cannot silence drift on an audited or canonical record.
 fn mark_superseded(verifier: &Verifier<'_>, reports: &mut [Report]) {
     let drifts = |report: &Report| {
         let failure = &report.outcome.codes.failure;
@@ -416,9 +417,13 @@ fn mark_superseded(verifier: &Verifier<'_>, reports: &mut [Report]) {
         let found = children.iter().find(|(child, parent, subject)| {
             parent == &report.id
                 && report.subject.as_ref() == Some(subject)
-                && snapshot
-                    .iter()
-                    .any(|other| &other.id == child && sound(other))
+                && snapshot.iter().any(|other| {
+                    &other.id == child
+                        && sound(other)
+                        && other.base_level.is_some_and(|level| {
+                            report.base_level.is_none_or(|parent| level >= parent)
+                        })
+                })
         });
         if let Some((child, _, _)) = found {
             report.superseded_by = Some(child.clone());
