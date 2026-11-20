@@ -356,10 +356,8 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
     let cold_stdout = String::from_utf8(cold.stdout).expect("state output should be UTF-8");
     assert!(cold_stdout.contains("\"seals\":"), "{cold_stdout}");
     let cold_json = loam::json::parse(&cold_stdout).expect("state output should be JSON");
-    let diag = cold_json
-        .get("seals")
-        .and_then(|seals| seals.get("diag"))
-        .expect("seals.diag");
+    let cold_seals = cold_json.get("seals").expect("seals");
+    let diag = cold_seals.get("diag").expect("seals.diag");
     let hashed = counter(diag, "hashed_bytes");
     let over = counter(diag, "over_budget");
     assert!(
@@ -368,9 +366,24 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
     );
     assert!(hashed > 0, "cold run hashed nothing: {cold_stdout}");
     assert!(over > 0, "the hash cap never engaged: {cold_stdout}");
+    // The pre-warmed evidence entries must actually have been hit: a cache-key
+    // mismatch would show up as no_cache and silently turn seals unchecked.
+    assert_eq!(counter(diag, "no_cache"), 0, "{cold_stdout}");
+    let cold_citable = counter(cold_seals, "citable");
+    assert!(cold_citable > 0, "{cold_stdout}");
+    assert_eq!(
+        cold_citable + counter(cold_seals, "unchecked"),
+        SEALS as u64,
+        "{cold_stdout}"
+    );
 
     // One warmup so the page cache, not cold I/O, is what the budget measures.
+    let cold_started = Instant::now();
     state(&binary).output().expect("warmup should run");
+    assert!(
+        cold_started.elapsed().as_secs() < BUDGET_SECONDS,
+        "warmup run exceeded the hook budget"
+    );
 
     let started = Instant::now();
     let output = state(&binary).output().expect("state should run");
@@ -400,6 +413,10 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
     let stdout = String::from_utf8(output.stdout).expect("state output should be UTF-8");
     // Fast mode omits the date and codegraph probes and reports a null drift count.
     assert!(stdout.contains("\"drift_count\":null"), "{stdout}");
+    let warm_json = loam::json::parse(&stdout).expect("state output should be JSON");
+    let warm_seals = warm_json.get("seals").expect("seals");
+    assert_eq!(counter(warm_seals, "unchecked"), 0, "{stdout}");
+    assert_eq!(counter(warm_seals, "citable"), SEALS as u64, "{stdout}");
     assert!(!stdout.contains("date_drift_pending"), "{stdout}");
     assert!(!stdout.contains("code_ingest_pending"), "{stdout}");
     // The measured run really did walk the whole hcom ladder, spawn included —
