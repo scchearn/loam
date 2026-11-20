@@ -11,7 +11,9 @@ import { isAbsolute, join, resolve } from 'node:path';
 
 const GIT_TIMEOUT_MS = 30_000;
 const MAX_STDOUT = 16 * 1024 * 1024;
-const HOOKS = ['pre-commit', 'prepare-commit-msg', 'commit-msg'];
+// Every hook that `git add` plus `git commit --only` can fire. Any one present means we skip: the system never runs user hooks.
+const HOOKS = ['pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit', 'post-index-change', 'reference-transaction'];
+const KINDS = new Set(['harvest', 'ingest']);
 const MID_OPERATION = ['MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG'];
 
 export async function readMemoryCommitConfig(globalRoot, env = process.env) {
@@ -39,6 +41,7 @@ export function runGit(args, { cwd, env = {}, input, timeoutMs = GIT_TIMEOUT_MS 
   return new Promise((resolvePromise) => {
     let child;
     let stdout = Buffer.alloc(0);
+    let overflow = false;
     let stderr = '';
     let timedOut = false;
     let settled = false;
@@ -47,7 +50,7 @@ export function runGit(args, { cwd, env = {}, input, timeoutMs = GIT_TIMEOUT_MS 
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolvePromise({ stdout: stdout.toString('utf8'), stderr, timedOut, ...result });
+      resolvePromise({ stdout: stdout.toString('utf8'), stderr, timedOut, overflow, ...result });
     };
     try {
       child = spawn('git', args, {
@@ -60,6 +63,7 @@ export function runGit(args, { cwd, env = {}, input, timeoutMs = GIT_TIMEOUT_MS 
     timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs);
     child.on('error', (error) => finish({ code: null, error }));
     child.stdout.on('data', (chunk) => {
+      if (stdout.length + chunk.length > MAX_STDOUT) overflow = true;
       if (stdout.length >= MAX_STDOUT) return;
       stdout = Buffer.concat([stdout, chunk]).subarray(0, MAX_STDOUT);
     });
@@ -89,7 +93,7 @@ async function readStatus(git, { toplevel, prefix, env }) {
   );
   if (result.timedOut) return { skip: 'timeout' };
   if (unavailable(result)) return { skip: 'git_unavailable' };
-  if (result.code !== 0) return { skip: 'commit_failed' };
+  if (result.code !== 0 || result.overflow) return { skip: 'commit_failed' };
   const entries = {};
   for (const record of result.stdout.split('\0')) {
     if (record.length < 4) continue;
@@ -98,7 +102,21 @@ async function readStatus(git, { toplevel, prefix, env }) {
     const path = record.slice(3);
     entries[path] = { xy, sha256: await sha256Of(join(toplevel, path)) };
   }
-  return { entries };
+  // Ignored untracked files never appear in status. Track them separately (best effort, cheap stat
+  // signature) so a run that only wrote ignored files reports `untracked`, not `no_changes`.
+  const ignored = {};
+  const listed = await git(
+    ['--literal-pathspecs', '-c', 'core.quotepath=off', 'ls-files', '-o', '-i', '--exclude-standard', '-z', '--', prefix || '.'],
+    { cwd: toplevel, env: { ...env, GIT_OPTIONAL_LOCKS: '0' } },
+  );
+  if (listed.code === 0 && !listed.overflow && !listed.timedOut) {
+    for (const path of listed.stdout.split('\0')) {
+      if (!path) continue;
+      try { const info = await stat(join(toplevel, path)); ignored[path] = `${info.size}:${info.mtimeMs}`; }
+      catch { ignored[path] = 'unreadable'; }
+    }
+  }
+  return { entries, ignored };
 }
 
 export async function snapshotMemory({ wikiRoot, globalRoot, config, env = {}, git = runGit } = {}) {
@@ -115,7 +133,7 @@ export async function snapshotMemory({ wikiRoot, globalRoot, config, env = {}, g
     const prefix = lines[1] || '';
     if (!toplevel) return { skip: 'not_a_repo' };
     if (prefix) {
-      const ignored = await git(['check-ignore', '-q', '--', prefix], { cwd: toplevel, env });
+      const ignored = await git(['--literal-pathspecs', 'check-ignore', '-q', '--', prefix], { cwd: toplevel, env });
       if (ignored.code === 0) {
         const tracked = await git(['--literal-pathspecs', 'ls-files', '-z', '--', prefix], { cwd: toplevel, env });
         if (tracked.code === 0 && !tracked.stdout) return { skip: 'untracked' };
@@ -123,7 +141,7 @@ export async function snapshotMemory({ wikiRoot, globalRoot, config, env = {}, g
     }
     const status = await readStatus(git, { toplevel, prefix, env });
     if (status.skip) return { skip: status.skip };
-    return { enabled: true, toplevel, prefix, entries: status.entries };
+    return { enabled: true, toplevel, prefix, entries: status.entries, ignored: status.ignored };
   } catch { return { skip: 'commit_failed' }; }
 }
 
@@ -143,12 +161,13 @@ async function gitPaths(git, { toplevel, env }, names) {
   return Object.fromEntries(names.map((name, index) => [name, isAbsolute(lines[index]) ? lines[index] : resolve(toplevel, lines[index])]));
 }
 
+// Ask git the way commit does: env and config are honoured, hostname autodetection is not.
 async function hasIdentity(git, { toplevel, env }) {
-  const merged = { ...process.env, ...env };
-  if (merged.GIT_AUTHOR_NAME && merged.GIT_AUTHOR_EMAIL && merged.GIT_COMMITTER_NAME && merged.GIT_COMMITTER_EMAIL) return true;
-  const name = await git(['config', '--get', 'user.name'], { cwd: toplevel, env });
-  const email = await git(['config', '--get', 'user.email'], { cwd: toplevel, env });
-  return name.code === 0 && name.stdout.trim() !== '' && email.code === 0 && email.stdout.trim() !== '';
+  for (const name of ['GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT']) {
+    const result = await git(['-c', 'user.useConfigOnly=true', 'var', name], { cwd: toplevel, env });
+    if (result.code !== 0 || !result.stdout.trim()) return false;
+  }
+  return true;
 }
 
 const skipped = (reason) => ({ memory_commit: `commit_skipped:${reason}` });
@@ -157,26 +176,20 @@ export async function commitMemoryWrites({ snapshot, kind, summary, env = {}, gi
   try {
     if (!snapshot || snapshot.enabled === false) return { memory_commit: 'disabled' };
     if (snapshot.skip) return skipped(snapshot.skip);
+    if (!KINDS.has(kind)) return skipped('commit_failed');
     const { toplevel, prefix } = snapshot;
     const status = await readStatus(git, { toplevel, prefix, env });
     if (status.skip) return skipped(status.skip);
 
     // Written set: any path whose state or content differs from the snapshot. A path that was already
     // dirty and that the run changed is committed in full, including the human's earlier edits.
-    let written = Object.keys(status.entries).filter((path) => {
-      const before = snapshot.entries[path];
-      const after = status.entries[path];
-      return !before || before.xy !== after.xy || before.sha256 !== after.sha256;
+    const changed = (now, then) => Object.keys(now || {}).filter((path) => {
+      const before = then?.[path];
+      const after = now[path];
+      return before === undefined || JSON.stringify(before) !== JSON.stringify(after);
     });
-    if (written.length === 0) return skipped('no_changes');
-
-    const ignored = await git(['check-ignore', '--stdin', '-z'], { cwd: toplevel, env, input: written.join('\0') + '\0' });
-    if (ignored.timedOut) return skipped('timeout');
-    if (ignored.code === 0) {
-      const drop = new Set(ignored.stdout.split('\0').filter(Boolean));
-      written = written.filter((path) => !drop.has(path));
-    } else if (ignored.code !== 1) return skipped(failureReason(ignored));
-    if (written.length === 0) return skipped('untracked');
+    const written = changed(status.entries, snapshot.entries);
+    if (written.length === 0) return skipped(changed(status.ignored, snapshot.ignored).length > 0 ? 'untracked' : 'no_changes');
     written.sort();
 
     const paths = await gitPaths(git, { toplevel, env }, [...MID_OPERATION, 'index.lock', ...HOOKS.map((hook) => `hooks/${hook}`)]);
@@ -192,6 +205,11 @@ export async function commitMemoryWrites({ snapshot, kind, summary, env = {}, gi
     if (signing.code === 0 && signing.stdout.trim() === 'true') return skipped('signing_required');
 
     const input = written.join('\0') + '\0';
+    const staged = await git(['--literal-pathspecs', '-c', 'core.quotepath=off', 'ls-files', '-s', '-z', '--', prefix || '.'], { cwd: toplevel, env });
+    const writtenSet = new Set(written);
+    const priorIndex = staged.code === 0 && !staged.overflow
+      ? staged.stdout.split('\0').filter((record) => record && writtenSet.has(record.slice(record.indexOf('\t') + 1))).map((record) => `${record}\0`).join('')
+      : '';
     const message = `loam(${kind}): ${String(summary ?? '').replace(/\s+/g, ' ').trim()}`.trimEnd();
     const added = await git(['--literal-pathspecs', 'add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul'], { cwd: toplevel, env, input });
     if (added.code !== 0) return skipped(failureReason(added));
@@ -201,7 +219,9 @@ export async function commitMemoryWrites({ snapshot, kind, summary, env = {}, gi
     );
     if (committed.code !== 0) {
       // Best effort: do not leave the run's paths staged by our add. Never fail on this.
+      // then put back whatever the human had staged for those paths.
       await git(['--literal-pathspecs', 'reset', '-q', '--pathspec-from-file=-', '--pathspec-file-nul'], { cwd: toplevel, env, input }).catch(() => {});
+      if (priorIndex) await git(['update-index', '-z', '--index-info'], { cwd: toplevel, env, input: priorIndex }).catch(() => {});
       return skipped(failureReason(committed));
     }
     const hash = await git(['rev-parse', 'HEAD'], { cwd: toplevel, env });

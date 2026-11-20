@@ -1,16 +1,23 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile, appendFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile, appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { commitMemoryWrites, readMemoryCommitConfig, snapshotMemory } from '../integration/memory-commit.mjs';
+import { commitMemoryWrites, readMemoryCommitConfig, runGit, snapshotMemory } from '../integration/memory-commit.mjs';
 import { createGitWorkspace } from './fixtures/git-workspace.mjs';
 
+// Ambient identity and loam toggles in the developer's shell must never change a result.
+const AMBIENT = ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'EMAIL', 'LOAM_MEMORY_COMMITS'];
 async function withWorkspace(options, body) {
   if (typeof options === 'function') { body = options; options = {}; }
+  const saved = Object.fromEntries(AMBIENT.map((key) => [key, process.env[key]]));
+  for (const key of AMBIENT) delete process.env[key];
   const ws = await createGitWorkspace(options);
-  try { await body(ws); } finally { await ws.cleanup(); }
+  try { await body(ws); } finally {
+    await ws.cleanup();
+    for (const [key, value] of Object.entries(saved)) if (value !== undefined) process.env[key] = value;
+  }
 }
 
 const run = (ws, kind = 'harvest') => async () => {
@@ -138,6 +145,7 @@ test('memory_commit: merge, rebase, cherry-pick, index lock, missing identity, d
     ['mid_operation', (ws) => mkdir(join(ws.root, '.git', 'rebase-apply'), { recursive: true })],
     ['mid_operation', (ws) => ws.write('.git/CHERRY_PICK_HEAD', `${ws.head()}\n`)],
     ['mid_operation', (ws) => ws.write('.git/REVERT_HEAD', `${ws.head()}\n`)],
+    ['mid_operation', (ws) => ws.write('.git/BISECT_LOG', '')],
     ['locked', (ws) => ws.write('.git/index.lock', '')],
     ['detached_head', (ws) => ws.git(['checkout', '-q', '--detach'])],
   ]) {
@@ -173,7 +181,7 @@ test('memory_commit: a missing git binary records commit_skipped:git_unavailable
 });
 
 test('memory_commit: an active pre-commit hook records commit_skipped:hooks_present and commit.gpgsign=true records commit_skipped:signing_required, each with zero commits', async () => {
-  if (process.platform !== 'win32') {
+  {
     await withWorkspace(async (ws) => {
       await ws.addHook('pre-commit', 'exit 0');
       const before = ws.commitCount();
@@ -182,6 +190,21 @@ test('memory_commit: an active pre-commit hook records commit_skipped:hooks_pres
     });
     await withWorkspace(async (ws) => {
       await ws.addHook('commit-msg', 'exit 0');
+      await skipCase(ws, 'hooks_present');
+    });
+    for (const hook of ['post-commit', 'post-index-change', 'reference-transaction']) {
+      await withWorkspace(async (ws) => {
+        await ws.addHook(hook, 'exit 0');
+        const before = ws.commitCount();
+        await skipCase(ws, 'hooks_present');
+        assert.equal(ws.commitCount(), before);
+      });
+    }
+    await withWorkspace(async (ws) => {
+      const dir = await ws.tempDir('custom-hooks');
+      await writeFile(join(dir, 'pre-commit'), '#!/bin/sh\nexit 0\n');
+      await chmod(join(dir, 'pre-commit'), 0o755);
+      ws.git(['config', 'core.hooksPath', dir.replace(/\\/g, '/')]);
       await skipCase(ws, 'hooks_present');
     });
     await withWorkspace(async (ws) => {
@@ -283,4 +306,58 @@ test('memory_commit: readMemoryCommitConfig precedence: env override, then confi
     await writeFile(join(root, 'config.json'), '{not json');
     assert.equal((await readMemoryCommitConfig(root, {})).enabled, true);
   } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+});
+
+test('memory_commit: a run that writes only gitignored files inside a non-ignored wiki records commit_skipped:untracked and spawns no add or commit', async () => {
+  await withWorkspace(async (ws) => {
+    await ws.write('.gitignore', 'wiki/drafts/\n');
+    ws.git(['add', '.gitignore']);
+    ws.git(['commit', '-q', '-m', 'ignore']);
+    const calls = [];
+    const git = async (args, options) => { calls.push(args); return runGit(args, options); };
+    const snapshot = await snapshotMemory({ wikiRoot: ws.wiki, env: ws.env, git });
+    const before = ws.commitCount();
+    await ws.write('wiki/drafts/x.md', '# X\n');
+    const result = await commitMemoryWrites({ snapshot, kind: 'harvest', summary: 's', env: ws.env, git });
+    assert.equal(result.memory_commit, 'commit_skipped:untracked');
+    assert.equal(calls.some((args) => args.includes('add') || args.includes('commit')), false);
+    assert.equal(ws.commitCount(), before);
+  });
+});
+
+test('memory_commit: ignored files written beside committable ones are never added', async () => {
+  await withWorkspace(async (ws) => {
+    await ws.write('.gitignore', 'wiki/drafts/\n');
+    ws.git(['add', '.gitignore']);
+    ws.git(['commit', '-q', '-m', 'ignore']);
+    const { commit } = await run(ws)();
+    await ws.write('wiki/drafts/x.md', '# X\n');
+    await ws.write('wiki/topics/ok.md', '# OK\n');
+    const result = await commit();
+    assert.equal(result.memory_commit, 'committed');
+    assert.deepEqual(result.memory_commit_files, ['wiki/topics/ok.md']);
+  });
+});
+
+test('memory_commit: an unknown kind records commit_skipped:commit_failed', async () => {
+  await withWorkspace(async (ws) => {
+    const snapshot = await snapshotMemory({ wikiRoot: ws.wiki, env: ws.env });
+    await appendFile(join(ws.wiki, 'index.md'), 'x\n');
+    const result = await commitMemoryWrites({ snapshot, kind: 'bogus', summary: 's', env: ws.env });
+    assert.equal(result.memory_commit, 'commit_skipped:commit_failed');
+  });
+});
+
+test('memory_commit: a failed commit restores a human-staged version of a written path', async () => {
+  await withWorkspace(async (ws) => {
+    await appendFile(join(ws.wiki, 'log.md'), 'staged by human\n');
+    ws.git(['add', 'wiki/log.md']);
+    const stagedBlob = ws.git(['rev-parse', ':wiki/log.md']).trim();
+    const snapshot = await snapshotMemory({ wikiRoot: ws.wiki, env: ws.env });
+    await appendFile(join(ws.wiki, 'log.md'), 'run line\n');
+    const git = async (args, options) => (args.includes('commit') ? { code: 1, stdout: '', stderr: 'fatal: boom', timedOut: false } : runGit(args, options));
+    const result = await commitMemoryWrites({ snapshot, kind: 'harvest', summary: 's', env: ws.env, git });
+    assert.equal(result.memory_commit, 'commit_skipped:commit_failed');
+    assert.equal(ws.git(['rev-parse', ':wiki/log.md']).trim(), stagedBlob);
+  });
 });
