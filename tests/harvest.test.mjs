@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { copyFile, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { appendFile, copyFile, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { mkdtemp, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,6 +21,7 @@ import { readOpenCodeWindow, locateOpenCodeStore, openCodeMeasure } from '../int
 import { harvestRecursion, harvestTick, startHarvestWorker, runHarvest } from '../integration/harvest.mjs';
 import { harvestLastRunPath, readHarvestState as readHarvestStateFile } from '../integration/harvest-state.mjs';
 import { acquireLease, releaseLease } from '../integration/ingest.mjs';
+import { createGitWorkspace } from './fixtures/git-workspace.mjs';
 
 // mkdtemp under os.tmpdir() can land behind a symlink (macOS: /var/folders -> /private/var/folders);
 // canonicalWorkspace() in the implementation resolves through realpath, so tests must start from an
@@ -1084,4 +1085,111 @@ test('harvest_status: reports enabled state, per-session cursors, wiki cache, la
   assert.equal(status.lease_state, 'dead');
   assert.equal(status.queue.root.includes('harvest'), true);
   assert.ok(!JSON.stringify(status).includes('conversation'), 'status must be content-free');
+});
+
+// ---- harvest_commit: memory-write commits ----
+async function harvestCommitRun(ws, { env, launchWrites = true, sessionId = 'sess-commit' } = {}) {
+  const globalRoot = join(ws.base || join(ws.root, '..'), 'global');
+  await mkdir(globalRoot, { recursive: true });
+  await writeFile(join(globalRoot, 'config.json'), JSON.stringify({
+    background_harvest: { threshold_turns: 1, threshold_conversation_bytes: 1 },
+  }));
+  const storePath = join(await ws.tempDir('store'), 'store.jsonl');
+  await writeFile(storePath, 'user-1\nassistant-1\nuser-2\n');
+  const result = await runHarvest({
+    harness: 'claude', workspace: ws.root, sessionId, globalRoot,
+    env: env || ws.env,
+    probeFullState: async () => ({ ready: true, state: { wiki_root: ws.wiki, exists: true } }),
+    backend: {
+      locateStore: async () => ({ path: storePath, kind: 'jsonl' }),
+      readWindow: async ({ store, state, config }) => {
+        const tail = await readTail(store.path, state.cursor?.value || 0, { maxBytes: config.max_window_bytes });
+        return {
+          records: tail.lines.map((line, index) => ({ cursor: line.offset, kind: index === 1 ? 'assistant' : 'user', session_id: sessionId, text: line.text, timestamp: '' })),
+          boundaryCursor: tail.lines.length ? tail.lines[tail.lines.length - 1].endOffset : 0,
+        };
+      },
+    },
+    launch: async () => {
+      if (launchWrites) {
+        await ws.write('wiki/topics/new.md', '# New\n');
+        await appendFile(join(ws.wiki, 'index.md'), '- [[new]]\n');
+        await appendFile(join(ws.wiki, 'log.md'), '- harvested\n');
+      }
+      return { category: null, completion: Promise.resolve({ code: 0 }) };
+    },
+  });
+  assert.equal(result.reason, 'ok', JSON.stringify(result));
+  const lastRun = JSON.parse(await readFile(harvestLastRunPath(globalRoot, ws.root), 'utf8'));
+  return { result, lastRun, globalRoot };
+}
+
+test('harvest_commit: a successful run commits exactly its written paths and leaves an unrelated staged file staged-uncommitted', async () => {
+  const ws = await createGitWorkspace();
+  try {
+    await ws.write('src/unrelated.js', 'export const u = 1;\n');
+    ws.git(['add', 'src/unrelated.js']);
+    const before = ws.commitCount();
+    const { result, lastRun, globalRoot } = await harvestCommitRun(ws);
+    assert.equal(result.reason, 'ok');
+    assert.equal(ws.commitCount(), before + 1);
+    const names = ws.git(['show', '--name-only', '--format=', 'HEAD']).split('\n').filter(Boolean).sort();
+    assert.deepEqual(names, ['wiki/index.md', 'wiki/log.md', 'wiki/topics/new.md']);
+    assert.match(ws.git(['log', '-1', '--format=%s']), /^loam\(harvest\): 1 turns from session [0-9a-f]{8}, 3 memory files/);
+    assert.deepEqual(ws.git(['diff', '--cached', '--name-only']).split('\n').filter(Boolean), ['src/unrelated.js']);
+    assert.equal(result.memory_commit, 'committed');
+    assert.equal(lastRun.memory_commit, 'committed');
+    assert.equal(lastRun.memory_commit_hash, ws.head());
+    assert.deepEqual([...lastRun.memory_commit_files].sort(), names);
+    const { harvestStatus } = await import('../integration/harvest.mjs');
+    const status = await harvestStatus({ globalRoot, workspace: ws.root, env: ws.env });
+    assert.equal(status.last_run.memory_commit, 'committed');
+    assert.equal(status.last_run.memory_commit_hash, ws.head());
+  } finally { await ws.cleanup(); }
+});
+
+test('harvest_commit: an excluded wiki records commit_skipped:untracked with no new commit', async () => {
+  const ws = await createGitWorkspace({ seed: false });
+  try {
+    await ws.write('src/a.js', 'x\n');
+    await ws.write('.git/info/exclude', 'wiki/\n');
+    ws.git(['add', '-A']);
+    ws.git(['commit', '-q', '-m', 'seed']);
+    await ws.write('wiki/index.md', '# Index\n');
+    await ws.write('wiki/log.md', '# Log\n');
+    const before = ws.commitCount();
+    const { result, lastRun } = await harvestCommitRun(ws);
+    assert.equal(result.reason, 'ok');
+    assert.equal(ws.commitCount(), before);
+    assert.equal(lastRun.memory_commit, 'commit_skipped:untracked');
+  } finally { await ws.cleanup(); }
+});
+
+test('harvest_commit: a MERGE_HEAD present before launch still writes the page, finishes ok and records commit_skipped:mid_operation with the commit count unchanged', async () => {
+  const ws = await createGitWorkspace();
+  try {
+    await writeFile(join(ws.root, '.git', 'MERGE_HEAD'), `${ws.head()}\n`);
+    const before = ws.commitCount();
+    const { result, lastRun } = await harvestCommitRun(ws);
+    assert.equal(result.reason, 'ok');
+    assert.equal(ws.commitCount(), before);
+    assert.equal(await readFile(join(ws.wiki, 'topics', 'new.md'), 'utf8'), '# New\n');
+    assert.equal(lastRun.status, 'ok');
+    assert.equal(lastRun.memory_commit, 'commit_skipped:mid_operation');
+  } finally { await ws.cleanup(); }
+});
+
+test('harvest_commit: LOAM_MEMORY_COMMITS=0 leaves writes uncommitted, .git/index byte-identical and last_run.memory_commit === "disabled"', async () => {
+  const ws = await createGitWorkspace();
+  try {
+    const indexBefore = await readFile(join(ws.root, '.git', 'index'));
+    const before = ws.commitCount();
+    const { result, lastRun } = await harvestCommitRun(ws, { env: { ...ws.env, LOAM_MEMORY_COMMITS: '0' } });
+    assert.equal(result.reason, 'ok');
+    assert.equal(ws.commitCount(), before);
+    assert.ok(indexBefore.equals(await readFile(join(ws.root, '.git', 'index'))));
+    assert.equal(lastRun.memory_commit, 'disabled');
+    assert.equal('memory_commit_hash' in lastRun, false);
+    assert.match(ws.git(['status', '--porcelain']), /wiki\/topics\/new\.md/);
+  } finally { await ws.cleanup(); }
 });

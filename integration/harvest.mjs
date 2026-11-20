@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, stat as fsStat } from 'node:fs/promises';
 
 import { canonicalWorkspace } from './ingest.mjs';
+import { commitMemoryWrites, readMemoryCommitConfig, snapshotMemory } from './memory-commit.mjs';
 import {
   readHarvestConfig, readHarvestState, writeHarvestState,
   harvestLastRunPath, pruneHarvestSessions,
@@ -197,7 +198,7 @@ async function pruneWindowFiles(root, retainWindows) {
 export async function runHarvest({
   harness, workspace, sessionId, globalRoot, skillsRoot, env = process.env,
   probeFullState, backend, readWindow, launch, acquireLease: acquire, releaseLease: release,
-  writeSkip, launchModel: modelLauncher, openCodeSession,
+  writeSkip, launchModel: modelLauncher, openCodeSession, memoryCommit,
 } = {}) {
   const config = await readHarvestConfig(globalRoot, env);
   const canonical = await canonicalWorkspace(workspace);
@@ -336,6 +337,11 @@ export async function runHarvest({
         hard_deadline: new Date(Date.now() + config.timeout_seconds * 1000).toISOString(),
       });
     }
+    // Snapshot before the harvester runs so the commit covers only this run's writes.
+    const memory = memoryCommit || { snapshotMemory, commitMemoryWrites };
+    const memorySnapshot = await memory.snapshotMemory({
+      wikiRoot: wiki.root, globalRoot, config: await readMemoryCommitConfig(globalRoot, env), env,
+    });
     const launched = await launchFn({
       harness, workspace: canonical, sessionId, globalRoot, skillsRoot,
       lease, windowPath, config, env, openCodeSession, root,
@@ -348,6 +354,11 @@ export async function runHarvest({
       return { reason: 'busy', cursorChanged: false };
     }
 
+    const sessionTag = hash(sessionId).slice(0, 8);
+    const commit = await memory.commitMemoryWrites({
+      snapshot: memorySnapshot, kind: 'harvest', env,
+      summary: (written) => `${exchanges.length} turns from session ${sessionTag}, ${written.length} memory files`,
+    });
     const boundaryCursor = window.boundaryCursor ?? 0;
     const previousCursor = Number(effectiveState.cursor?.value || 0);
     const nextCursor = Math.max(previousCursor, boundaryCursor);
@@ -363,10 +374,11 @@ export async function runHarvest({
       schema: 1, completed_at: Date.now(), status: 'ok', reason: 'ok',
       session_id: sessionId, turns: exchanges.length, conversation_bytes: conversationBytes,
       zero_admission: exchanges.length === 0,
+      ...commit,
     });
     await pruneHarvestSessions(globalRoot, canonical, config);
     await pruneWindowFiles(root, config.retain_sessions);
-    return { reason: 'ok', sessionId, cursorChanged: true, boundaryCursor: nextCursor, turns: exchanges.length, conversation_bytes: conversationBytes };
+    return { reason: 'ok', sessionId, ...commit, cursorChanged: true, boundaryCursor: nextCursor, turns: exchanges.length, conversation_bytes: conversationBytes };
   } finally {
     if (!leaseHandled) await releaseFn(root, lease.lease_id);
   }

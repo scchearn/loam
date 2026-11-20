@@ -210,7 +210,9 @@ export async function commitMemoryWrites({ snapshot, kind, summary, env = {}, gi
     const priorIndex = staged.code === 0 && !staged.overflow
       ? staged.stdout.split('\0').filter((record) => record && writtenSet.has(record.slice(record.indexOf('\t') + 1))).map((record) => `${record}\0`).join('')
       : '';
-    const message = `loam(${kind}): ${String(summary ?? '').replace(/\s+/g, ' ').trim()}`.trimEnd();
+    // `summary` may be a function of the written set, for subjects that report the file count.
+    const text = typeof summary === 'function' ? summary(written) : summary;
+    const message = `loam(${kind}): ${String(text ?? '').replace(/\s+/g, ' ').trim()}`.trimEnd();
     const added = await git(['--literal-pathspecs', 'add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul'], { cwd: toplevel, env, input });
     if (added.code !== 0) return skipped(failureReason(added));
     const committed = await git(

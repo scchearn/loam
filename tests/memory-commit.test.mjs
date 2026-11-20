@@ -361,3 +361,14 @@ test('memory_commit: a failed commit restores a human-staged version of a writte
     assert.equal(ws.git(['rev-parse', ':wiki/log.md']).trim(), stagedBlob);
   });
 });
+
+test('memory_commit: a summary function receives the written set', async () => {
+  const ws = await createGitWorkspace();
+  try {
+    const snapshot = await snapshotMemory({ wikiRoot: ws.wiki, config: { enabled: true }, env: ws.env });
+    await ws.write('wiki/topics/n.md', '# N\n');
+    const result = await commitMemoryWrites({ snapshot, kind: 'harvest', summary: (w) => `${w.length} files`, env: ws.env });
+    assert.equal(result.memory_commit, 'committed');
+    assert.equal(ws.git(['log', '-1', '--format=%s']).trim(), 'loam(harvest): 1 files');
+  } finally { await ws.cleanup(); }
+});
