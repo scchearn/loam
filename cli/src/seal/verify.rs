@@ -94,6 +94,11 @@ pub struct Report {
     /// Where the sealed text probably is now, when its markers are gone.
     /// A hint only; never used to validate.
     pub likely_location: Option<String>,
+    /// The id of a later, well-formed seal of the same subject that names this
+    /// record as its `parent` and binds to the live span. Set only on a record
+    /// that drifted; a re-seal is the remedy for drift, so such a record is
+    /// history rather than a defect.
+    pub superseded_by: Option<String>,
 }
 
 impl Report {
@@ -368,7 +373,57 @@ fn verify_with(env: &Env, overlay: Option<&Overlay>) -> Result<Vec<Report>, Stri
             }
         }
     }
+    mark_superseded(&verifier, &mut reports);
     Ok(reports)
+}
+
+/// Flags each drifted record that a sound child re-seal replaces. The child
+/// must itself bind to the live span, so a planted or broken child cannot hide
+/// real drift.
+fn mark_superseded(verifier: &Verifier<'_>, reports: &mut [Report]) {
+    let drifts = |report: &Report| {
+        let failure = &report.outcome.codes.failure;
+        failure.contains(&code::BINDING_MISMATCH) || failure.contains(&code::SPAN_MISSING)
+    };
+    let sound = |report: &Report| {
+        let failure = &report.outcome.codes.failure;
+        !failure.contains(&code::MALFORMED)
+            && !failure.contains(&code::SIGNATURE_INVALID)
+            && !drifts(report)
+            && !matches!(
+                report.outcome.verdict,
+                Verdict::Forged | Verdict::Untrusted | Verdict::Retracted
+            )
+    };
+    let children: Vec<(String, String, String)> = verifier
+        .records
+        .iter()
+        .filter_map(|loaded| {
+            let view = loaded.view.as_ref().ok()?;
+            if view.kind != record::RecordKind::Seal {
+                return None;
+            }
+            let parent = view.parent.as_ref()?;
+            Some((
+                loaded.id.clone(),
+                parent.id.clone(),
+                view.subject_name.clone(),
+            ))
+        })
+        .collect();
+    let snapshot: Vec<Report> = reports.to_vec();
+    for report in reports.iter_mut().filter(|report| drifts(report)) {
+        let found = children.iter().find(|(child, parent, subject)| {
+            parent == &report.id
+                && report.subject.as_ref() == Some(subject)
+                && snapshot
+                    .iter()
+                    .any(|other| &other.id == child && sound(other))
+        });
+        if let Some((child, _, _)) = found {
+            report.superseded_by = Some(child.clone());
+        }
+    }
 }
 
 fn build_verifier<'a>(env: &'a Env, overlay: Option<&'a Overlay>) -> Result<Verifier<'a>, String> {
@@ -467,6 +522,7 @@ impl Verifier<'_> {
             signer: None,
             time_verified: view.map(|v| v.time_verified.clone()),
             likely_location: None,
+            superseded_by: None,
         }
     }
 
@@ -614,6 +670,7 @@ impl Verifier<'_> {
             signer,
             time_verified: Some(view.time_verified.clone()),
             likely_location,
+            superseded_by: None,
         }
     }
 

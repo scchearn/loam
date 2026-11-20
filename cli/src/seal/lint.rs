@@ -100,6 +100,9 @@ fn finding(
 /// One finding per rule per seal, with every contributing verify code in the
 /// detail. Success codes never map to a lint rule.
 pub fn report_findings(report: &Report, out: &mut Vec<Finding>) {
+    if report.superseded_by.is_some() {
+        return;
+    }
     let file = file_for(report);
     let codes = &report.outcome.codes;
     let mut by_rule: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
@@ -244,6 +247,7 @@ mod tests {
             signer: None,
             time_verified: None,
             likely_location: None,
+            superseded_by: None,
         }
     }
 

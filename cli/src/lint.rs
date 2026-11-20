@@ -53,23 +53,26 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         return 1;
     }
 
-    let now_stamp = now.clone();
-    let today = match now {
-        Some(value) => match memory::timestamp_days(&value) {
+    let bad_now = || {
+        eprintln!("loam lint: --now must be 'YYYY-MM-DD HH:MM ±HH:MM'");
+    };
+    let today = match now.as_deref() {
+        Some(value) => match memory::timestamp_days(value) {
             Some(days) => days,
             None => {
-                eprintln!("loam lint: --now must be 'YYYY-MM-DD HH:MM ±HH:MM'");
+                bad_now();
                 return 1;
             }
         },
         None => memory::today_utc(),
     };
-
-    let seal_now = match now_stamp.as_deref() {
+    let seal_now = match now.as_deref() {
+        // `parse_stamp` accepts a superset of `timestamp_days`, so after that
+        // gate this cannot fail unless the two parsers drift apart.
         Some(value) => match crate::seal::policy::parse_stamp(value) {
             Some(parsed) => parsed,
             None => {
-                eprintln!("loam lint: --now must be 'YYYY-MM-DD HH:MM ±HH:MM'");
+                bad_now();
                 return 1;
             }
         },

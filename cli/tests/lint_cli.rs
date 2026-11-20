@@ -24,8 +24,12 @@ fn write(path: &Path, content: &str) {
 
 fn loam(args: &[&str]) -> std::process::Output {
     let binary = std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide the loam binary");
+    // Default lint loads the seal trust store, so keep it off the real config.
+    let config = std::env::temp_dir().join(format!("loam-lint-config-{}", std::process::id()));
     Command::new(binary)
         .args(args)
+        .env("LOAM_CONFIG_DIR", config)
+        .env("LOAM_WORKSPACES", "off")
         .output()
         .expect("loam should run")
 }
@@ -308,9 +312,15 @@ mod seals {
         }
 
         fn seal_over(&self, evidence_item: &str) -> String {
-            fs::write(self.page(), PAGE).unwrap();
-            let scan = loam::markers::scan(PAGE);
-            let content = &PAGE.as_bytes()[scan.markers[0].content.clone()];
+            self.seal_page(evidence_item, PAGE, None)
+        }
+
+        /// Seals the span in `page` (written to `alpha.md`), optionally as a
+        /// re-seal naming `parent`.
+        fn seal_page(&self, evidence_item: &str, page: &str, parent: Option<&str>) -> String {
+            fs::write(self.page(), page).unwrap();
+            let scan = loam::markers::scan(page);
+            let content = &page.as_bytes()[scan.markers[0].content.clone()];
             let ctx = evidence::Ctx {
                 repo_root: self.0.clone(),
                 wiki: self.wiki(),
@@ -342,7 +352,10 @@ mod seals {
                 review_by: None,
                 evidence: resolved.iter().map(|r| r.item.to_value()).collect(),
                 redacted: Vec::new(),
-                parent: None,
+                parent: parent.map(|id| record::Parent {
+                    id: id.to_owned(),
+                    verdict: "drifted".to_owned(),
+                }),
                 status: None,
             })
             .unwrap();
@@ -427,7 +440,8 @@ mod seals {
     fn a_forged_record_yields_an_sel003_error() {
         let ws = Workspace::new("forged");
         let id = ws.seal();
-        record::write_sig(&ws.wiki(), &id, b"not a signature").unwrap();
+        // Larger than the verifier's signature cap: forged without ssh-keygen.
+        record::write_sig(&ws.wiki(), &id, &vec![b'x'; 70 * 1024]).unwrap();
         let before = ws.seals_snapshot();
         let output = ws.lint(&["--only", "seals"]);
         assert_eq!(output.status.code(), Some(2), "{output:?}");
@@ -437,6 +451,25 @@ mod seals {
         let severities = field_values(&text, "severity");
         assert!(severities.contains(&"error".to_owned()), "{text}");
         assert_eq!(ws.seals_snapshot(), before);
+    }
+
+    #[test]
+    fn a_re_seal_with_a_parent_clears_the_drift() {
+        let ws = Workspace::new("reseal");
+        let old = ws.seal();
+        let edited = PAGE.replace("Bundled", "System");
+        fs::write(ws.page(), &edited).unwrap();
+        let drifted = ws.lint(&["--only", "seals"]);
+        assert_eq!(drifted.status.code(), Some(2), "{drifted:?}");
+        ws.seal_page("capture:run.log", &edited, Some(&old));
+        let output = ws.lint(&["--only", "seals"]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{output:?} {}",
+            stdout(&output)
+        );
+        assert_eq!(stdout(&output), "");
     }
 
     #[test]
