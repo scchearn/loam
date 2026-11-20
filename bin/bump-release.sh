@@ -163,6 +163,25 @@ stage_literal() {
   ' "$src" > "$STAGE/$(printf '%s' "$file" | tr '/' '_')" || fail "$file: rewrite failed"
 }
 
+# Cargo.lock holds one [[package]] block per crate; only loam's version moves.
+stage_cargo_lock() {
+  local src="$ROOT/Cargo.lock"
+  [[ -f "$src" ]] || fail "missing Cargo.lock"
+  local staged="$STAGE/Cargo.lock" count
+  count="$(awk -v old="version = \"$OLD\"" -v new="version = \"$NEW\"" -v out="$staged" '
+    /^\[\[package\]\]$/ { in_loam = 0 }
+    $0 == "name = \"loam\"" { in_loam = 1 }
+    {
+      line = $0
+      if (in_loam && line == old) { n++; line = new; in_loam = 0 }
+      print line > out
+    }
+    END { print n + 0 }
+  ' "$src")" || fail "Cargo.lock: rewrite failed"
+  [[ "$count" == "1" ]] \
+    || fail "Cargo.lock: expected the loam package at $OLD exactly once, found $count"
+}
+
 # Cargo.toml needs a whole-line match: a dependency pin such as
 # `chrono = { version = "0.4" }` would otherwise collide with a runtime
 # version of 0.4.
@@ -223,9 +242,10 @@ if [[ "$DOMAIN" == "plugin" ]]; then
   stage_literal ".cursor-plugin/plugin.json"      1 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
 else
   stage_cargo_line
-  # Cargo.lock is generated with one exact copy of the crate version. Refuse
-  # if a dependency shares it rather than rewriting an unrelated package.
-  stage_literal "Cargo.lock" 1 "version = \"$OLD\"" "version = \"$NEW\""
+  # Cargo.lock: rewrite only the version line of the [[package]] named loam.
+  # A dependency may share the version string (e.g. cfg-if 1.0.4), so a plain
+  # string match is not enough; refuse unless exactly one loam entry matches.
+  stage_cargo_lock
   # RUNTIME_VERSION is the package-baked runtime target the channel ledger
   # records; it must move in lockstep with cli/Cargo.toml [package] (check.rs
   # gates the two into agreement). Same exact-string staging as Cargo.lock.
