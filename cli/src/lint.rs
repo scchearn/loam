@@ -126,10 +126,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         memory::wiki_findings(workspace, &mut findings);
     }
     if selected("seals") {
-        if let Err(error) = crate::seal::lint::lint_findings(workspace, seal_now, &mut findings) {
-            eprintln!("loam lint: {error}");
-            return 1;
-        }
+        crate::seal::lint::lint_findings(workspace, seal_now, &mut findings);
     }
     if selected("work") {
         memory::work_findings(workspace, today, &mut findings);

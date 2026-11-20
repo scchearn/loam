@@ -412,6 +412,57 @@ mod seals {
         String::from_utf8(output.stdout.clone()).unwrap()
     }
 
+    fn malformed_trust(ws: &Workspace) {
+        let dir = ws.0.join("config").join("seal");
+        fs::create_dir_all(&dir).unwrap();
+        // Unquoted option value: refused by the allowed_signers parser.
+        fs::write(
+            dir.join("allowed_signers"),
+            "a@l namespaces=loam-seal ssh-ed25519 AAAA\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_malformed_trust_file_is_one_warning_and_other_domains_still_print() {
+        let ws = Workspace::new("badtrust");
+        ws.seal();
+        malformed_trust(&ws);
+        // A markdown/memory defect proves other domains are not aborted.
+        fs::write(
+            ws.wiki().join("index.md"),
+            "# Index\n\n## Overview\n\nSee [[ghost-page]].\n\n## Overview\n",
+        )
+        .unwrap();
+        let output = ws.lint(&[]);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let text = stdout(&output);
+        let seals: Vec<_> = text
+            .lines()
+            .filter(|l| l.contains("\"domain\":\"seals\""))
+            .collect();
+        assert_eq!(seals.len(), 1, "{text}");
+        assert!(seals[0].contains("\"severity\":\"warning\""), "{text}");
+        assert!(seals[0].contains("seal.trust.unreadable"), "{text}");
+        assert!(seals[0].contains("allowed_signers"), "{text}");
+        assert!(
+            domains(&text).iter().any(|d| d != "seals"),
+            "other domains must still report: {text}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_trust_file_under_only_seals_is_a_finding_not_exit_1() {
+        let ws = Workspace::new("badtrust-only");
+        ws.seal();
+        malformed_trust(&ws);
+        let output = ws.lint(&["--only", "seals"]);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let text = stdout(&output);
+        assert_eq!(domains(&text), vec!["seals"], "{text}");
+        assert!(text.contains("seal.trust.unreadable"), "{text}");
+    }
+
     #[test]
     fn a_citable_seal_lints_clean() {
         let ws = Workspace::new("clean");

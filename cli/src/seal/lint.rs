@@ -200,23 +200,43 @@ fn collect_spans(wiki: &Path) -> Result<Vec<SpanRef>, String> {
     Ok(spans)
 }
 
+const RULE_TRUST: (&str, &str, &str) = (
+    "SEL009",
+    "seal-trust-unreadable",
+    "Seal pass could not run: trust files or records unreadable",
+);
+
 /// Appends SEL002–SEL008 for the workspace's wiki. A workspace with no
-/// `wiki/` has nothing to check. Reads only.
-pub fn lint_findings(
-    workspace: &Path,
+/// `wiki/` has nothing to check. Reads only. An error in the pass (malformed
+/// `allowed_signers`, policy or revocation list, unreadable records) never
+/// aborts the caller: it becomes one warning finding and the other domains
+/// still report.
+pub fn lint_findings(workspace: &Path, now: DateTime<FixedOffset>, out: &mut Vec<Finding>) {
+    let wiki = workspace.join("wiki");
+    if !wiki.is_dir() {
+        return;
+    }
+    let mut found = Vec::new();
+    match seal_pass(&wiki, now, &mut found) {
+        Ok(()) => out.append(&mut found),
+        Err(error) => out.push(
+            finding(RULE_TRUST, Severity::Warning, "wiki", 0, error)
+                .with_evidence("code", "seal.trust.unreadable"),
+        ),
+    }
+}
+
+fn seal_pass(
+    wiki: &Path,
     now: DateTime<FixedOffset>,
     out: &mut Vec<Finding>,
 ) -> Result<(), String> {
-    let wiki = workspace.join("wiki");
-    if !wiki.is_dir() {
-        return Ok(());
-    }
-    let env = Env::load(&wiki, trust::seal_dir().ok(), now)?;
+    let env = Env::load(wiki, trust::seal_dir().ok(), now)?;
     let reports = verify::verify_all(&env)?;
     for report in &reports {
         report_findings(report, out);
     }
-    unpaired_markers(&collect_spans(&wiki)?, &reports, out);
+    unpaired_markers(&collect_spans(wiki)?, &reports, out);
     Ok(())
 }
 
