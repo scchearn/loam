@@ -362,8 +362,14 @@ export async function runHarvest({
       try {
         writer = await waiter({ launched, lease, workspace: canonical, env, openCodeSession, deadline });
       } catch { writer = { state: 'unknown' }; }
-      if (writer?.state !== 'terminal') {
+      // Same rule as ingest's finalizeWorkerRun: only 'live'/'unknown' keep the lease;
+      // 'terminal' and 'dead' (seen live, then gone) mean the writer has exited.
+      if (writer?.state !== 'terminal' && writer?.state !== 'dead') {
         leaseHandled = true; // retain the lease: a writer may still be running
+        await atomicJson(harvestLastRunPath(globalRoot, canonical), {
+          schema: 1, completed_at: Date.now(), status: 'skipped', reason: 'busy',
+          session_id: sessionId, memory_commit: 'commit_skipped:writer_unconfirmed',
+        });
         return { reason: 'busy', cursorChanged: false, memory_commit: 'commit_skipped:writer_unconfirmed' };
       }
     }

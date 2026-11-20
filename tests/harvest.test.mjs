@@ -1088,7 +1088,7 @@ test('harvest_status: reports enabled state, per-session cursors, wiki cache, la
 });
 
 // ---- harvest_commit: memory-write commits ----
-async function harvestCommitRun(ws, { env, launchWrites = true, sessionId = 'sess-commit', background = null, expectReason = 'ok' } = {}) {
+async function harvestCommitRun(ws, { env, launchWrites = true, sessionId = 'sess-commit', background = null, expectReason = 'ok', openCodeSession } = {}) {
   const globalRoot = join(ws.root, '..', 'global');
   await mkdir(globalRoot, { recursive: true });
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({
@@ -1110,14 +1110,15 @@ async function harvestCommitRun(ws, { env, launchWrites = true, sessionId = 'ses
         };
       },
     },
-    ...(background ? { waitForWriter: background.waitForWriter } : {}),
+    ...(background?.waitForWriter ? { waitForWriter: background.waitForWriter } : {}),
+    ...(openCodeSession ? { openCodeSession } : {}),
     launch: async () => {
       const write = async () => {
         await ws.write('wiki/topics/new.md', '# New\n');
         await appendFile(join(ws.wiki, 'index.md'), '- [[new]]\n');
         await appendFile(join(ws.wiki, 'log.md'), '- harvested\n');
       };
-      if (background) return { category: null, background: true, completion: Promise.resolve({ code: 0 }), write };
+      if (background) return { category: null, background: true, sessionId: 'oc-child', completion: Promise.resolve({ code: 0 }), write };
       if (launchWrites) await write();
       return { category: null, completion: Promise.resolve({ code: 0 }) };
     },
@@ -1231,5 +1232,42 @@ test('harvest_commit: an unconfirmed background writer yields no commit and no c
     assert.equal(ws.commitCount(), before);
     assert.equal(result.memory_commit, 'commit_skipped:writer_unconfirmed');
     assert.equal(result.cursorChanged, false);
+    const lr = JSON.parse(await readFile(harvestLastRunPath(join(ws.root, '..', 'global'), ws.root), 'utf8'));
+    assert.equal(lr.memory_commit, 'commit_skipped:writer_unconfirmed');
+    assert.equal(lr.status, 'skipped');
+  } finally { await ws.cleanup(); }
+});
+
+test('harvest_commit: a writer reported dead (seen live, then gone) is confirmed exited and the run commits', async () => {
+  const ws = await createGitWorkspace();
+  try {
+    const before = ws.commitCount();
+    const { result } = await harvestCommitRun(ws, {
+      background: { waitForWriter: async ({ launched }) => { await launched.write(); return { state: 'dead' }; } },
+    });
+    assert.equal(ws.commitCount(), before + 1);
+    assert.equal(result.memory_commit, 'committed');
+    assert.equal(result.cursorChanged, true);
+  } finally { await ws.cleanup(); }
+});
+
+test('harvest_commit: the default writer wait polls an OpenCode child until idle, then commits', async () => {
+  const ws = await createGitWorkspace();
+  try {
+    const before = ws.commitCount();
+    let calls = 0;
+    let written = false;
+    const openCodeSession = {
+      status: async () => {
+        calls += 1;
+        if (calls < 2) return { type: 'busy' };
+        if (!written) { written = true; await ws.write('wiki/topics/new.md', '# New\n'); }
+        return { type: 'idle' };
+      },
+    };
+    const { result } = await harvestCommitRun(ws, { background: {}, openCodeSession });
+    assert.ok(calls >= 2);
+    assert.equal(ws.commitCount(), before + 1);
+    assert.equal(result.memory_commit, 'committed');
   } finally { await ws.cleanup(); }
 });
