@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 
 import { runConfigure } from '../setup/configure.mjs';
 
@@ -39,6 +39,14 @@ function federationRunner({ home, active = false } = {}) {
   return { runner, calls, definitionPath, state };
 }
 
+// Pin config resolution to the fixture home so no test can reach a real
+// runtime or seal dir through the ambient environment.
+const ORIGINAL_LOAM_CONFIG_DIR = process.env.LOAM_CONFIG_DIR;
+afterEach(() => {
+  if (ORIGINAL_LOAM_CONFIG_DIR === undefined) delete process.env.LOAM_CONFIG_DIR;
+  else process.env.LOAM_CONFIG_DIR = ORIGINAL_LOAM_CONFIG_DIR;
+});
+
 async function installedFixture({ active = false } = {}) {
   const home = await mkdtemp(join(tmpdir(), 'loam-configure-home-'));
   const workspace = await mkdtemp(join(tmpdir(), 'loam-configure-workspace-'));
@@ -53,6 +61,7 @@ async function installedFixture({ active = false } = {}) {
     configured_harnesses: [],
   }));
   const fed = federationRunner({ home, active });
+  process.env.LOAM_CONFIG_DIR = join(home, '.config', 'loam');
   return { home, workspace, globalRoot, runtimePath, fed };
 }
 
@@ -62,6 +71,7 @@ const baseOptions = (fixture, capture, fed) => ({
   packageRoot,
   platform: 'linux',
   federationRunner: (fed || fixture.fed).runner,
+  sealRunner: async () => ({ code: 127, stdout: '', stderr: 'stub' }),
   output: capture.output,
   errorOutput: capture.output,
 });

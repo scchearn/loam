@@ -151,6 +151,8 @@ async function baseFixture() {
     release,
     releaseBaseUrl: release.url,
     runner,
+    // Default: never spawn the fixture runtime for seal provisioning.
+    sealRunner: async () => ({ code: 127, stdout: '', stderr: 'stub' }),
     detected: {
       opencode: { id: 'opencode', state: 'absent' },
       claude: { id: 'claude', state: 'absent' },

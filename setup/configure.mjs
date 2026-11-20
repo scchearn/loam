@@ -251,7 +251,7 @@ export async function runConfigure(parsed, options = {}) {
         globalRoot: discovery.globalRoot,
         home: discovery.home,
         platform: discovery.platform,
-      })) ?? install.runtime_path;
+      }));
       if (runtimePath) {
         const seal = await provisionSealTrust({
           runtimePath,
