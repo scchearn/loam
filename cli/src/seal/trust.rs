@@ -425,23 +425,41 @@ fn read_optional(path: &Path, file: &'static str) -> Result<Option<String>, Trus
 
 /// Load trust from `dir`; absent files yield empty lists and default policy.
 pub fn load(dir: &Path) -> Result<Trust, TrustError> {
-    let signers = match read_optional(&dir.join(ALLOWED_FILE), ALLOWED_FILE)? {
+    load_digested(dir).map(|(trust, _)| trust)
+}
+
+/// [`load`], plus the trust digest of the exact bytes that were parsed, so a
+/// cache keyed by the digest can never describe different trust than the
+/// verdict was computed from.
+pub fn load_digested(dir: &Path) -> Result<(Trust, String), TrustError> {
+    let allowed = read_optional(&dir.join(ALLOWED_FILE), ALLOWED_FILE)?;
+    let revoked = read_optional(&dir.join(REVOKED_FILE), REVOKED_FILE)?;
+    let policy = read_optional(&dir.join(POLICY_FILE), POLICY_FILE)?;
+    let digest = crate::seal_cache::digest_of([
+        allowed.as_deref().unwrap_or("").as_bytes(),
+        revoked.as_deref().unwrap_or("").as_bytes(),
+        policy.as_deref().unwrap_or("").as_bytes(),
+    ]);
+    let signers = match allowed {
         Some(text) => parse_allowed_signers(&text)?,
         None => Vec::new(),
     };
-    let revoked = match read_optional(&dir.join(REVOKED_FILE), REVOKED_FILE)? {
+    let revoked = match revoked {
         Some(text) => parse_revoked(&text)?,
         None => Vec::new(),
     };
-    let policy = match read_optional(&dir.join(POLICY_FILE), POLICY_FILE)? {
+    let policy = match policy {
         Some(text) => parse_policy(&text)?,
         None => Policy::default(),
     };
-    Ok(Trust {
-        signers,
-        revoked,
-        policy,
-    })
+    Ok((
+        Trust {
+            signers,
+            revoked,
+            policy,
+        },
+        digest,
+    ))
 }
 
 /// Identity inputs for `init`: the enrolled instance id and org when this

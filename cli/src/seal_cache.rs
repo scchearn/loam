@@ -64,7 +64,18 @@ impl Stamp {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A ticking fake clock for tests: each read returns the next integer.
+    static TEST_CLOCK: Cell<Option<u128>> = const { Cell::new(None) };
+}
+
 pub fn now_ns() -> u128 {
+    #[cfg(test)]
+    if let Some(tick) = TEST_CLOCK.with(Cell::get) {
+        TEST_CLOCK.with(|c| c.set(Some(tick + 1)));
+        return tick;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos())
@@ -83,86 +94,125 @@ pub fn file_fingerprint(path: &Path) -> Option<(String, u128)> {
     Some((format!("{mtime}:{}", meta.len()), mtime))
 }
 
-/// A fingerprint of the repository's refs, read without spawning git, so a
-/// cached "commit is reachable" dies when a branch moves. `None` when the git
-/// directory cannot be understood (the caller then reports `unchecked`).
+/// Largest ref-related file the fingerprint will read; more and it declines.
+const MAX_REF_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The content of `path`: `Some(None)` when absent, `None` when it cannot be
+/// read or is too large to hash here.
+fn ref_bytes(path: &Path) -> Option<Option<Vec<u8>>> {
+    match fs::metadata(path) {
+        Ok(meta) if meta.is_file() && meta.len() <= MAX_REF_BYTES => fs::read(path).ok().map(Some),
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
+}
+
+/// A fingerprint of what `allowed_ref` and commit reachability depend on,
+/// read without spawning git, so a cached "commit is reachable" dies when the
+/// allowed branch moves: `packed-refs`, `shallow`, the reftable table list,
+/// `refs/remotes/origin/HEAD` and the ref it points at, `refs/heads/main`,
+/// `refs/heads/master` and `refs/replace/*`. By content, not by stamp, so
+/// there is no racy window and the second value is always 0. Unrelated refs
+/// (other branches, tags, remotes, stash) and `HEAD` do not enter it. `None`
+/// when the git directory cannot be understood (the caller then reports
+/// `unchecked`).
 pub fn refs_fingerprint(repo_root: &Path) -> Option<(String, u128)> {
     let dot_git = repo_root.join(".git");
-    let (gitdir, commondir) = if dot_git.is_dir() {
-        (dot_git.clone(), dot_git)
+    let commondir = if dot_git.is_dir() {
+        dot_git
     } else {
         let text = fs::read_to_string(&dot_git).ok()?;
         let target = text.trim().strip_prefix("gitdir:")?.trim();
         let gitdir = repo_root.join(target);
-        let common = match fs::read_to_string(gitdir.join("commondir")) {
+        match fs::read_to_string(gitdir.join("commondir")) {
             Ok(rel) => gitdir.join(rel.trim()),
-            Err(_) => gitdir.clone(),
-        };
-        (gitdir, common)
+            Err(_) => gitdir,
+        }
     };
     let mut parts: Vec<(String, String)> = Vec::new();
-    let mut newest = 0u128;
-    let mut add = |label: String, path: &Path| {
-        let (fp, mtime) = file_fingerprint(path).unwrap_or_else(|| ("absent".to_owned(), 0));
-        newest = newest.max(mtime);
-        parts.push((label, fp));
+    let mut add = |label: String, path: &Path| -> Option<Option<Vec<u8>>> {
+        let bytes = ref_bytes(path)?;
+        let digest = bytes
+            .as_deref()
+            .map_or_else(|| "absent".to_owned(), crate::sha256::hex);
+        parts.push((label, digest));
+        Some(bytes)
     };
-    add("HEAD".to_owned(), &gitdir.join("HEAD"));
-    add("packed-refs".to_owned(), &commondir.join("packed-refs"));
-    add("shallow".to_owned(), &commondir.join("shallow"));
+    add("packed-refs".to_owned(), &commondir.join("packed-refs"))?;
+    add("shallow".to_owned(), &commondir.join("shallow"))?;
     // Reftable repositories keep refs here (`refs/heads` is a stub), and the
     // list is rewritten on every ref update.
     add(
         "reftable".to_owned(),
         &commondir.join("reftable").join("tables.list"),
-    );
-    let mut stack = vec![(commondir.join("refs"), "refs".to_owned())];
-    let mut files = 0usize;
-    while let Some((dir, label)) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let child = format!("{label}/{name}");
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_dir() {
-                stack.push((entry.path(), child));
-            } else {
-                files += 1;
-                if files > MAX_REF_FILES {
-                    return None;
-                }
-                add(child, &entry.path());
+    )?;
+    add("main".to_owned(), &commondir.join("refs/heads/main"))?;
+    add("master".to_owned(), &commondir.join("refs/heads/master"))?;
+    let origin = add(
+        "origin-head".to_owned(),
+        &commondir.join("refs/remotes/origin/HEAD"),
+    )?;
+    if let Some(text) = origin.and_then(|b| String::from_utf8(b).ok()) {
+        if let Some(target) = text.trim().strip_prefix("ref:").map(str::trim) {
+            let safe = target.starts_with("refs/")
+                && !target.contains("..")
+                && !target.contains('\\')
+                && !target.contains(':');
+            if !safe {
+                return None;
             }
+            add(format!("origin-target={target}"), &commondir.join(target))?;
+        }
+    }
+    let mut files = 0usize;
+    if let Ok(entries) = fs::read_dir(commondir.join("refs").join("replace")) {
+        for entry in entries.flatten() {
+            files += 1;
+            if files > MAX_REF_FILES {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            add(format!("replace/{name}"), &entry.path())?;
         }
     }
     parts.sort();
     let mut text = String::new();
-    for (label, fp) in &parts {
+    for (label, digest) in &parts {
         text.push_str(label);
         text.push('=');
-        text.push_str(fp);
+        text.push_str(digest);
         text.push('\n');
     }
-    Some((crate::sha256::hex(text.as_bytes()), newest))
+    Some((crate::sha256::hex(text.as_bytes()), 0))
 }
 
 /// sha256 over the three trust files: for each, its name, byte length and
 /// bytes (an absent file counts as empty). The length prefix keeps bytes
 /// moved from one file to the next from cancelling out.
 pub fn trust_digest(dir: Option<&Path>) -> String {
+    let read = |name: &str| {
+        dir.and_then(|d| fs::read(d.join(name)).ok())
+            .unwrap_or_default()
+    };
+    let allowed = read(trust::ALLOWED_FILE);
+    let revoked = read(trust::REVOKED_FILE);
+    let policy = read(trust::POLICY_FILE);
+    digest_of([&allowed[..], &revoked[..], &policy[..]])
+}
+
+/// The digest of the three trust files' bytes, in `allowed_signers`,
+/// `revoked`, `policy.json` order.
+pub fn digest_of(files: [&[u8]; 3]) -> String {
     let mut data = Vec::new();
-    for name in [trust::ALLOWED_FILE, trust::REVOKED_FILE, trust::POLICY_FILE] {
-        let bytes = dir
-            .and_then(|d| fs::read(d.join(name)).ok())
-            .unwrap_or_default();
+    for (name, bytes) in [trust::ALLOWED_FILE, trust::REVOKED_FILE, trust::POLICY_FILE]
+        .into_iter()
+        .zip(files)
+    {
         data.extend_from_slice(name.as_bytes());
         data.push(0);
         data.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-        data.extend_from_slice(&bytes);
+        data.extend_from_slice(bytes);
     }
     crate::sha256::hex(&data)
 }
@@ -418,8 +468,9 @@ pub fn save(path: &Path, cache: &SealCache) -> std::io::Result<()> {
     let dir = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
     fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(
-        ".{}.{:x}.tmp",
+        ".{}.{}.{:x}.tmp",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("cache"),
+        std::process::id(),
         now_ns()
     ));
     let written = fs::write(&tmp, cache.to_json()).and_then(|()| fs::rename(&tmp, path));
@@ -438,7 +489,9 @@ pub fn save(path: &Path, cache: &SealCache) -> std::io::Result<()> {
 /// digests within the hash budget).
 pub struct Ctl {
     pub fast: bool,
+    /// Digest of the trust bytes the verdicts were computed from.
     pub trust_digest: String,
+    trust_dir: Option<PathBuf>,
     path: Option<PathBuf>,
     old: SealCache,
     new: RefCell<SealCache>,
@@ -452,6 +505,7 @@ impl Ctl {
         cache_dir: Option<&Path>,
         wiki: &Path,
         trust_dir: Option<&Path>,
+        trust_digest: &str,
         fast: bool,
     ) -> Ctl {
         let path = cache_dir.map(|dir| cache_file(dir, wiki));
@@ -463,7 +517,8 @@ impl Ctl {
         }
         Ctl {
             fast,
-            trust_digest: trust_digest(trust_dir),
+            trust_digest: trust_digest.to_owned(),
+            trust_dir: trust_dir.map(Path::to_path_buf),
             path,
             old,
             new: RefCell::new(new),
@@ -527,25 +582,26 @@ impl Ctl {
         self.old.evidence.contains_key(key)
     }
 
-    pub fn put_evidence(&self, key: &str, fingerprint: String, newest: u128, code: Code) {
-        self.new.borrow_mut().evidence.insert(
-            key.to_owned(),
-            EvidenceEntry {
-                stamp: Stamp {
-                    fingerprint,
-                    newest,
-                    checked_at: now_ns(),
-                },
-                code,
-            },
-        );
+    /// Records `code` under `stamp`, which must have been taken (with its
+    /// `checked_at` read from the clock) before the input was read.
+    pub fn put_evidence(&self, key: &str, stamp: Stamp, code: Code) {
+        self.new
+            .borrow_mut()
+            .evidence
+            .insert(key.to_owned(), EvidenceEntry { stamp, code });
     }
 
     /// Writes the cache back. A fast run that learned nothing writes nothing.
     /// Failures are ignored: the cache is derived and best-effort.
     pub fn finish(self) {
         let Some(path) = &self.path else { return };
-        let new = self.new.into_inner();
+        let mut new = self.new.into_inner();
+        // The trust files are read again by `ssh-keygen` and may have moved
+        // since they were digested. If they did, none of this run's
+        // signature results is known to describe the trust now on disk.
+        if !self.fast && trust_digest(self.trust_dir.as_deref()) != self.trust_digest {
+            new.signatures.clear();
+        }
         if self.fast && new == self.old {
             return;
         }
@@ -1140,6 +1196,158 @@ mod tests {
     }
 
     #[test]
+    fn a_trust_file_changed_after_the_environment_loaded_is_never_a_citable_entry() {
+        let fx = Fx::new("trust-race");
+        let Some(signer) = fx.signer() else { return };
+        fx.seal(
+            "alpha",
+            "s-first-claim",
+            "Body.",
+            &["file:run.log"],
+            Some(&signer),
+        );
+        fx.age();
+        let env = fx.env();
+        // A trust change lands after the verdict's trust was read.
+        let allowed = fx.trust_dir.join(trust::ALLOWED_FILE);
+        let mut text = fs::read_to_string(&allowed).unwrap();
+        text.push_str("# a revocation lands here\n");
+        fs::write(&allowed, text).unwrap();
+        let reports = verify::verify_and_cache(&env).unwrap();
+        assert_eq!(reports.len(), 1);
+        let counts = fast(&fx);
+        assert_eq!(
+            (counts.citable, counts.unchecked),
+            (0, 1),
+            "stale trust must not be served as citable: {counts:?}"
+        );
+        assert!(
+            load(&fx.cache_file()).signatures.is_empty(),
+            "signature results of a run whose trust moved are dropped"
+        );
+    }
+
+    #[test]
+    fn stamps_are_taken_from_the_clock_before_the_read_they_vouch_for() {
+        let fx = Fx::new("clock");
+        fx.seal("alpha", "s-first-claim", "Body.", &["file:run.log"], None);
+        fx.age();
+        let env = fx.env();
+        let base = now_ns();
+        TEST_CLOCK.with(|c| c.set(Some(base)));
+        let result = verify::verify_and_cache(&env);
+        TEST_CLOCK.with(|c| c.set(None));
+        result.unwrap();
+        let cache = load(&fx.cache_file());
+        assert!(!cache.evidence.is_empty());
+        // Exactly one clock read per stamp, taken when it is stamped, and
+        // none again at write time (which would be later than the read).
+        let mut ticks: Vec<u128> = cache
+            .pages
+            .values()
+            .map(|p| p.stamp.checked_at)
+            .chain(cache.evidence.values().map(|e| e.stamp.checked_at))
+            .collect();
+        ticks.sort_unstable();
+        let expected: Vec<u128> = (base..).take(ticks.len()).collect();
+        assert_eq!(ticks, expected);
+    }
+
+    /// A repository at the fixture root with `main` and two commits; returns
+    /// the two commit ids, or `None` without git.
+    fn repo_at(fx: &Fx) -> Option<(String, String)> {
+        let git_out = |args: &[&str]| {
+            let empty = fx.root.join(".git-empty-config");
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "commit.gpgsign=false", "-c", "core.hooksPath=none"])
+                .args(args)
+                .current_dir(&fx.root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", &empty)
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        };
+        fs::write(fx.root.join(".git-empty-config"), "").ok()?;
+        git_out(&["init", "-q", "-b", "main"])?;
+        git_out(&["add", "run.log"])?;
+        git_out(&["commit", "-q", "-m", "first"])?;
+        let first = git_out(&["rev-parse", "HEAD"])?;
+        git_out(&["commit", "-q", "--allow-empty", "-m", "second"])?;
+        let second = git_out(&["rev-parse", "HEAD"])?;
+        Some((first, second))
+    }
+
+    fn git_in(fx: &Fx, args: &[&str]) {
+        assert!(fixture::git(&fx.root, args), "git {args:?} failed");
+    }
+
+    #[test]
+    fn commit_evidence_is_citable_on_the_fast_path_right_after_a_commit() {
+        let fx = Fx::new("commit-fast");
+        let Some((_, head)) = repo_at(&fx) else {
+            return;
+        };
+        // Nothing is aged: the refs were written moments ago.
+        fx.seal(
+            "alpha",
+            "s-first-claim",
+            "Body.",
+            &[&format!("commit:{head}")],
+            None,
+        );
+        let full = fx.full();
+        assert_eq!(full.len(), 1);
+        assert!(full[0].is_citable(), "{:?}", full[0]);
+        let before = spawn_count();
+        let counts = fast(&fx);
+        assert_eq!(spawn_count(), before, "the fast path started a process");
+        assert_eq!((counts.citable, counts.unchecked), (1, 0), "{counts:?}");
+
+        // Unrelated ref traffic leaves it citable.
+        git_in(&fx, &["branch", "other"]);
+        git_in(&fx, &["tag", "v1"]);
+        git_in(&fx, &["update-ref", "refs/remotes/origin/feature", "HEAD"]);
+        git_in(&fx, &["update-ref", "refs/stash", "HEAD"]);
+        let counts = fast(&fx);
+        assert_eq!((counts.citable, counts.unchecked), (1, 0), "{counts:?}");
+        assert_eq!(spawn_count(), before);
+
+        // Rewinding the allowed ref makes it unchecked, with no spawn.
+        git_in(&fx, &["reset", "-q", "--hard", "HEAD~1"]);
+        let counts = fast(&fx);
+        assert_eq!((counts.citable, counts.unchecked), (0, 1), "{counts:?}");
+        assert_eq!(spawn_count(), before);
+        // A full run sees the commit is no longer reachable.
+        let full = fx.counts(false);
+        assert_eq!(full.citable, 0, "{full:?}");
+    }
+
+    #[test]
+    fn blob_evidence_is_cached_on_the_fast_path_and_dies_with_its_file() {
+        let fx = Fx::new("blob-fast");
+        if repo_at(&fx).is_none() {
+            return;
+        }
+        fx.seal("alpha", "s-first-claim", "Body.", &["blob:run.log"], None);
+        fx.age();
+        let full = fx.full();
+        assert!(full[0].is_citable(), "{:?}", full[0]);
+        let before = spawn_count();
+        let counts = fast(&fx);
+        assert_eq!(spawn_count(), before);
+        assert_eq!((counts.citable, counts.unchecked), (1, 0), "{counts:?}");
+
+        fs::write(fx.root.join("run.log"), b"edited after the commit").unwrap();
+        let counts = fast(&fx);
+        assert_eq!(counts.citable, 0, "{counts:?}");
+        assert_eq!(spawn_count(), before);
+    }
+
+    #[test]
     fn commit_evidence_fingerprint_follows_the_repository_refs() {
         let Some(repo) = fixture::git_repo("refs") else {
             return;
@@ -1150,6 +1358,35 @@ mod tests {
         let (second, _) = refs_fingerprint(&repo.0).unwrap();
         assert_ne!(first, second);
         assert!(refs_fingerprint(&repo.0.join("no-such-dir")).is_none());
+    }
+
+    #[test]
+    fn the_refs_fingerprint_ignores_refs_the_allowed_ref_does_not_depend_on() {
+        let Some(repo) = fixture::git_repo("refs-narrow") else {
+            return;
+        };
+        let (before, newest) = refs_fingerprint(&repo.0).unwrap();
+        assert_eq!(newest, 0, "a content fingerprint has no racy window");
+        fixture::git(&repo.0, &["branch", "other"]);
+        fixture::git(&repo.0, &["tag", "v1"]);
+        fixture::git(&repo.0, &["update-ref", "refs/remotes/origin/x", "HEAD"]);
+        assert_eq!(refs_fingerprint(&repo.0).unwrap().0, before);
+        // Same size, different content: only a content fingerprint sees it.
+        let main = repo.0.join(".git/refs/heads").join(
+            ["main", "master"]
+                .into_iter()
+                .find(|b| repo.0.join(".git/refs/heads").join(b).is_file())
+                .unwrap(),
+        );
+        let text = fs::read_to_string(&main).unwrap();
+        let flipped: String = text
+            .chars()
+            .map(|c| if c == '0' { '1' } else { '0' })
+            .take(1)
+            .chain(text.chars().skip(1))
+            .collect();
+        fs::write(&main, flipped).unwrap();
+        assert_ne!(refs_fingerprint(&repo.0).unwrap().0, before);
     }
 
     #[test]

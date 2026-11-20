@@ -40,6 +40,9 @@ pub struct Env {
     /// Blob and file evidence resolves against this, not the wiki root.
     pub repo_root: PathBuf,
     pub trust: Trust,
+    /// Digest of the exact trust bytes `trust` was parsed from; keys the
+    /// signature cache.
+    pub trust_digest: String,
     /// `<configRoot>/seal`; `None` when no config root resolves, in which
     /// case no key is trusted.
     pub trust_dir: Option<PathBuf>,
@@ -57,14 +60,7 @@ impl Env {
         trust_dir: Option<PathBuf>,
         now: DateTime<FixedOffset>,
     ) -> Result<Env, String> {
-        let trust = match &trust_dir {
-            Some(dir) => trust::load(dir).map_err(|e| e.to_string())?,
-            None => Trust {
-                signers: Vec::new(),
-                revoked: Vec::new(),
-                policy: trust::Policy::default(),
-            },
-        };
+        let (trust, trust_digest) = load_trust(trust_dir.as_deref())?;
         let repo_root = evidence::repo_root(wiki)
             .or_else(|| wiki.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| wiki.to_path_buf());
@@ -73,6 +69,7 @@ impl Env {
             wiki: wiki.to_path_buf(),
             repo_root,
             trust,
+            trust_digest,
             trust_dir,
             keygen: sshsig::keygen_binary(),
             now,
@@ -89,14 +86,7 @@ impl Env {
         cache_dir: Option<PathBuf>,
         now: DateTime<FixedOffset>,
     ) -> Result<Env, String> {
-        let trust = match &trust_dir {
-            Some(dir) => trust::load(dir).map_err(|e| e.to_string())?,
-            None => Trust {
-                signers: Vec::new(),
-                revoked: Vec::new(),
-                policy: trust::Policy::default(),
-            },
-        };
+        let (trust, trust_digest) = load_trust(trust_dir.as_deref())?;
         let repo_root = wiki
             .ancestors()
             .find(|dir| dir.join(".git").exists())
@@ -107,11 +97,34 @@ impl Env {
             wiki: wiki.to_path_buf(),
             repo_root,
             trust,
+            trust_digest,
             trust_dir,
             keygen: PathBuf::new(),
             now,
             cache_dir,
         })
+    }
+}
+
+fn load_trust(trust_dir: Option<&Path>) -> Result<(Trust, String), String> {
+    match trust_dir {
+        Some(dir) => trust::load_digested(dir).map_err(|e| e.to_string()),
+        None => Ok((
+            Trust {
+                signers: Vec::new(),
+                revoked: Vec::new(),
+                policy: trust::Policy::default(),
+            },
+            seal_cache::trust_digest(None),
+        )),
+    }
+}
+
+fn new_stamp(fingerprint: String, newest: u128, checked_at: u128) -> seal_cache::Stamp {
+    seal_cache::Stamp {
+        fingerprint,
+        newest,
+        checked_at,
     }
 }
 
@@ -407,8 +420,18 @@ fn collect_spans(
             .filter(|(page, _)| page == name)
             .map(|(_, bytes)| bytes.clone());
         // Stamp before reading: a write that lands after the stamp changes
-        // the next stamp, never hides behind this one.
+        // the next stamp, never hides behind this one. The clock is read
+        // first for the same reason: `checked_at` must not be later than the
+        // read, or a same-size rewrite on a coarse-mtime file system could
+        // hide in between.
+        let read_at = seal_cache::now_ns();
         let stamp = ctl.and_then(|_| seal_cache::file_fingerprint(path));
+        // A page the fast path cannot stamp cannot be charged to the hash
+        // budget either, so it is left unhashed rather than read for free.
+        if ctl.is_some_and(|c| c.fast) && stamp.is_none() {
+            unhashed.push(name.clone());
+            continue;
+        }
         if let (Some(ctl), Some((fingerprint, _))) = (ctl, &stamp) {
             if ctl.fast {
                 if let Some(entry) = ctl.cached_page(name, fingerprint) {
@@ -422,7 +445,10 @@ fn collect_spans(
                     ctl.put_page(name, entry);
                     continue;
                 }
-                let size = fs::metadata(path).map_or(0, |m| m.len());
+                let Ok(size) = fs::metadata(path).map(|m| m.len()) else {
+                    unhashed.push(name.clone());
+                    continue;
+                };
                 if !ctl.spend(size) {
                     unhashed.push(name.clone());
                     continue;
@@ -454,7 +480,7 @@ fn collect_spans(
                     stamp: seal_cache::Stamp {
                         fingerprint,
                         newest,
-                        checked_at: seal_cache::now_ns(),
+                        checked_at: read_at,
                     },
                     spans: spans[first..]
                         .iter()
@@ -538,6 +564,7 @@ fn verify_with(
             env.cache_dir.as_deref(),
             &env.wiki,
             env.trust_dir.as_deref(),
+            &env.trust_digest,
             mode == Mode::Fast,
         )
     });
@@ -1144,34 +1171,41 @@ impl Verifier<'_> {
         if matches!(item.kind, Kind::Note | Kind::Seal) {
             return (evidence::check_code(item, ctx).0, weight);
         }
+        // The key names the resolved local input (or the repository), so a
+        // different root is a miss, never a comparison against another
+        // file's stamp.
         let key = match item.kind {
             Kind::Commit => format!(
-                "commit:{}@{}",
+                "commit:{}@{}#{}",
                 item.reference,
-                item.git_ref.as_deref().unwrap_or("")
+                item.git_ref.as_deref().unwrap_or(""),
+                ctx.repo_root.display()
             ),
-            _ => format!(
-                "{}:{}:{}",
-                item.kind.as_str(),
-                item.reference,
-                item.git_blob
-                    .as_deref()
-                    .or(item.sha256.as_deref())
-                    .unwrap_or("")
-            ),
+            _ => {
+                // An invalid recorded path resolves (to unresolvable) without
+                // touching the file system or git.
+                let Some(path) = evidence::local_input(item, ctx).filter(|p| p.is_file()) else {
+                    return (evidence::check_code(item, ctx).0, weight);
+                };
+                format!(
+                    "{}:{}:{}#{}",
+                    item.kind.as_str(),
+                    item.reference,
+                    item.git_blob
+                        .as_deref()
+                        .or(item.sha256.as_deref())
+                        .unwrap_or(""),
+                    path.display()
+                )
+            }
         };
+        // The clock is read before the stamp, which is taken before the
+        // check, so `checked_at` is never later than the read it vouches for.
+        let read_at = seal_cache::now_ns();
         let stamp = if item.kind == Kind::Commit {
             seal_cache::refs_fingerprint(&ctx.repo_root)
         } else {
-            match evidence::local_input(item, ctx) {
-                // An invalid recorded path resolves (to unresolvable) without
-                // touching the file system or git.
-                None => return (evidence::check_code(item, ctx).0, weight),
-                Some(path) if !path.is_file() => {
-                    return (evidence::check_code(item, ctx).0, weight)
-                }
-                Some(path) => seal_cache::file_fingerprint(&path),
-            }
+            evidence::local_input(item, ctx).and_then(|path| seal_cache::file_fingerprint(&path))
         };
         if ctl.fast {
             if let Some((fingerprint, _)) = &stamp {
@@ -1188,10 +1222,12 @@ impl Verifier<'_> {
                 if let Some((fingerprint, newest)) = stamp {
                     let size = evidence::local_input(item, ctx)
                         .and_then(|path| fs::metadata(path).ok())
-                        .map_or(0, |meta| meta.len());
-                    if ctl.spend(size) {
+                        .map(|meta| meta.len());
+                    // A size that cannot be read cannot be charged: leave
+                    // the item unchecked.
+                    if size.is_some_and(|size| ctl.spend(size)) {
                         let code = evidence::check_code(item, ctx).0;
-                        ctl.put_evidence(&key, fingerprint, newest, code);
+                        ctl.put_evidence(&key, new_stamp(fingerprint, newest, read_at), code);
                         return (code, weight);
                     }
                 }
@@ -1203,7 +1239,7 @@ impl Verifier<'_> {
         // Stamped before the check, so a change during it is never hidden.
         let code = evidence::check(item, ctx).code;
         if let Some((fingerprint, newest)) = stamp {
-            ctl.put_evidence(&key, fingerprint, newest, code);
+            ctl.put_evidence(&key, new_stamp(fingerprint, newest, read_at), code);
         }
         (code, weight)
     }
