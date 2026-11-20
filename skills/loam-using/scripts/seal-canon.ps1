@@ -138,6 +138,13 @@ function Test-QuestionAnchor([string]$s) {
     return (Test-ValidId 'q-' $tok.Substring(1))
 }
 
+# Does the line hold a loam:seal token and the id as a whole space/tab-delimited
+# token? The id s-x-y must not count s-x-y-2.
+function Test-Mention([string]$s, [string]$id) {
+    if (-not $s.Contains('loam:seal')) { return $false }
+    return (@($s -split '[ \t]+') -ccontains $id)
+}
+
 $uws = '[\u000B\u000C\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
 
 $fmEnd = -1
@@ -162,12 +169,13 @@ $amb = $false
 $mention = $false
 $badws = $false
 $pre = $false
+$prevPre = $false
 $mcount = 0
-foreach ($l in $lines) { if ($l.Contains('loam:seal') -and $l.Contains($Anchor)) { $mcount++ } }
+foreach ($l in $lines) { if (Test-Mention $l $Anchor) { $mcount++ } }
 
 for ($i = $fmEnd + 1; $i -lt $n; $i++) {
     $line = $lines[$i]
-    if ($line.Contains('loam:seal') -and $line.Contains($Anchor)) { $mention = $true }
+    if (Test-Mention $line $Anchor) { $mention = $true }
     if (($line.Contains('loam:') -or $line.Contains('] Q: ')) -and $line -match $uws) { $badws = $true }
     $blank = ($line.Trim($ws).Length -eq 0)
     $ind = Get-Width $line
@@ -180,9 +188,13 @@ for ($i = $fmEnd + 1; $i -lt $n; $i++) {
     }
     if ($blank) { $pb = $true; continue }
     if ($ind -ge 4 -and ($pb -or $icode)) { $icode = $true; $pb = $false; if ($cont) { $amb = $true }; continue }
+    $pbp = $pb
+    $icp = $icode
+    $prp = $prevPre
     $icode = $false
     $pb = $false
     $s2 = Remove-Prefix $line
+    $prevPre = $pre
     $b2 = $s2.TrimStart($ws)
     if ($b2.StartsWith('<', [StringComparison]::Ordinal)) {
         $t3 = $b2.Trim($ws)
@@ -203,11 +215,19 @@ for ($i = $fmEnd + 1; $i -lt $n; $i++) {
     }
     $t2 = $body -replace '[ \t]', ''
     $isHeading = ($body -match '^#+([ \t]|$)') -and ((Get-Run $body '#') -le 6)
-    $isBreak = ($t2.Length -ge 3 -and $t2 -match '^(-+|\*+|_+)$') -or ($t2 -match '^(=+|-+)$')
+    $isBreak = ($t2.Length -ge 3 -and $t2 -match '^(-+|\*+|_+)$')
     if ($ind -le 3 -and ($isHeading -or $isBreak)) { $pb = $true; continue }
+    # "=", "==", "-", "--" underline a paragraph (setext heading) only straight
+    # after paragraph text; elsewhere they are plain text. After code or a
+    # prefixed line the reading is unclear: ambiguous.
+    if ($ind -le 3 -and $body -match '^(=+|-+)[ \t]*$' -and -not $pbp) {
+        if ($icp -or $prp) { $amb = $true }
+        $pb = $true
+        continue
+    }
 
     $t = $line.Trim($ws)
-    if ($t.StartsWith('<!--', [StringComparison]::Ordinal) -and $t.EndsWith('-->', [StringComparison]::Ordinal)) { $pb = $true }
+    if ($ind -le 3 -and $t.StartsWith('<!--', [StringComparison]::Ordinal) -and $t.EndsWith('-->', [StringComparison]::Ordinal)) { $pb = $true }
     if ($stack.Count -gt 0 -and (Test-QuestionAnchor $line)) {
         for ($s = $stack.Count - 1; $s -ge 0; $s--) {
             if ($stack[$s].Kind -eq 'seal') { $stack[$s].Ex = $true; break }

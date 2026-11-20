@@ -114,6 +114,14 @@ function valid_id(prefix, id,   slug, k, nw, w) {
     for (k = 1; k <= nw; k++) if (w[k] !~ /^[a-z0-9]+$/) return 0
     return 1
 }
+# Does the line hold a loam:seal token and the id as a whole space/tab-delimited
+# token? The id s-x-y must not count s-x-y-2.
+function mentions(s, id,   m, k, w) {
+    if (!index(s, "loam:seal")) return 0
+    m = split(s, w, /[ \t]+/)
+    for (k = 1; k <= m; k++) if (w[k] == id) return 1
+    return 0
+}
 # Strip block-quote and list-item prefixes; sets the global pre when any went.
 function unprefix(s,   b, guard) {
     pre = 0
@@ -175,6 +183,7 @@ END {
     fence = 0
     icode = 0
     pb = 1
+    prevpre = 0
     cont = 0
     amb = 0
     mention = 0
@@ -182,10 +191,10 @@ END {
     # Any structure the line scanner misreads can hide a decoy copy, so the
     # target opener text may appear on one line of the whole file, no more.
     mcount = 0
-    for (i = 1; i <= n; i++) if (index(lines[i], "loam:seal") && index(lines[i], id)) mcount++
+    for (i = 1; i <= n; i++) if (mentions(lines[i], id)) mcount++
     for (i = fm_end + 1; i <= n; i++) {
         L = lines[i]
-        if (index(L, "loam:seal") && index(L, id)) mention = 1
+        if (mentions(L, id)) mention = 1
         if ((index(L, "loam:") || index(L, "] Q: ")) && L ~ uws) badws = 1
         blank = (L ~ /^[ \t]*$/)
         ind = width(L)
@@ -197,11 +206,15 @@ END {
         }
         if (blank) { pb = 1; continue }
         if (ind >= 4 && (pb || icode)) { icode = 1; pb = 0; if (cont) amb = 1; continue }
+        pbp = pb
+        icp = icode
+        prp = prevpre
         icode = 0
         pb = 0
         body = substr(L, lead(L))
         c = substr(body, 1, 1)
         s2 = unprefix(L)
+        prevpre = pre
         b2 = substr(s2, lead(s2))
         c2 = substr(b2, 1, 1)
         fl = 0
@@ -224,10 +237,20 @@ END {
         }
         t2 = body
         gsub(/[ \t]/, "", t2)
-        if (ind <= 3 && ((body ~ /^#+([ \t]|$)/ && run(body, "#") <= 6) || (length(t2) >= 3 && t2 ~ /^(-+|\*+|_+)$/) || t2 ~ /^(=+|-+)$/)) { pb = 1; continue }
+        if (ind <= 3 && ((body ~ /^#+([ \t]|$)/ && run(body, "#") <= 6) || (length(t2) >= 3 && t2 ~ /^(-+|\*+|_+)$/))) { pb = 1; continue }
+        # "=", "==", "-", "--" underline a paragraph (setext heading) only
+        # straight after paragraph text; elsewhere they are plain text. After
+        # code or a prefixed line the reading is unclear: ambiguous.
+        if (ind <= 3 && body ~ /^(=+|-+)[ \t]*$/) {
+            if (!pbp) {
+                if (icp || prp) amb = 1
+                pb = 1
+                continue
+            }
+        }
 
         t = trim(L)
-        if (substr(t, 1, 4) == "<!--" && substr(t, length(t) - 2) == "-->") pb = 1
+        if (ind <= 3 && substr(t, 1, 4) == "<!--" && substr(t, length(t) - 2) == "-->") pb = 1
         if (sp && question_anchor(L)) {
             for (s = sp; s >= 1; s--) if (sk_kind[s] == "seal") { sk_ex[s] = 1; break }
             continue

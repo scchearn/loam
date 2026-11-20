@@ -464,6 +464,30 @@ fn floor_never_certifies_a_span_the_runtime_would_not() {
             format!("{open}\nBODY\n{close}\n---\n{open}\nC\n{close}\n{close}\n"),
         ),
         (
+            "paragraph-continuation-comment",
+            format!("intro\n{open}\n    {close}\nORIGINAL\n{close}\n"),
+        ),
+        (
+            "indented-opener-after-paragraph",
+            format!("intro\n    {open}\n    {close}\nORIGINAL\n{close}\n"),
+        ),
+        (
+            "equals-after-blank",
+            format!("{open}\nx\n\n===\n    {close}\ny\n{close}\n"),
+        ),
+        (
+            "dashes-after-blank",
+            format!("{open}\nx\n\n--\n    {close}\ny\n{close}\n"),
+        ),
+        (
+            "setext-after-paragraph",
+            format!("{open}\nx\n==\n    {close}\ny\n{close}\n"),
+        ),
+        (
+            "suffixed-id-neighbour",
+            format!("{open}\nx\n{close}\n\n<!-- loam:seal s-floor-span-2 -->\ny\n{close}\n"),
+        ),
+        (
             "list-adjacent-fences",
             format!("<!-- x -->\nBODY\n{close}\n---\n{open}\nC\n{close}\n{close}\n<!-- x -->\n- item\n```\n~~~\n{open}\n{open}\n---\n"),
         ),
@@ -471,7 +495,7 @@ fn floor_never_certifies_a_span_the_runtime_would_not() {
     let dir = TempDir::new("never-certifies");
     check_never_certifies(&dir, &cases);
     // Ordinary pages still verify.
-    for name in ["plain", "front-matter"] {
+    for name in ["plain", "front-matter", "suffixed-id-neighbour"] {
         let file = dir.0.join(format!("{name}.md"));
         for floor in floors() {
             assert_eq!(
@@ -510,6 +534,13 @@ fn floor_never_certifies_generated_pages() {
         "text\r".into(),
         "```\r".into(),
         "---".into(),
+        "==".into(),
+        "===".into(),
+        "--".into(),
+        "-".into(),
+        "intro".into(),
+        format!("    {open}"),
+        format!("    {close}"),
         "text".into(),
         "".into(),
         open.into(),
