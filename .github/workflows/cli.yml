@@ -6,6 +6,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - cli/**
+      - skills/loam-using/scripts/**
       - dist-workspace.toml
       - .github/workflows/cli.yml
       - .github/scripts/**
@@ -18,6 +19,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - cli/**
+      - skills/loam-using/scripts/**
       - dist-workspace.toml
       - .github/workflows/cli.yml
       - .github/scripts/**
