@@ -405,21 +405,21 @@ pub struct AppliedUpdate {
     pub at: DateTime<FixedOffset>,
 }
 
-/// The newest verified `link-retarget` update for the seal `id`, if any.
-pub fn latest_update_for(env: &Env, id: &str) -> Result<Option<AppliedUpdate>, String> {
+/// Every verified `link-retarget` update for the seal `id`.
+pub fn updates_for(env: &Env, id: &str) -> Result<Vec<AppliedUpdate>, String> {
     let verifier = build_verifier(env, None)?;
     let Some(loaded) = verifier.records.iter().find(|l| l.id == id) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let Ok(view) = &loaded.view else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let requested = view
         .requested_level
         .as_deref()
         .and_then(Level::parse)
         .unwrap_or(Level::Evidence);
-    Ok(verifier.latest_update(id, view, requested))
+    Ok(verifier.verified_updates(id, view, requested))
 }
 
 struct Verifier<'a> {
@@ -500,11 +500,10 @@ impl Verifier<'_> {
         // Binding. A verified `link-retarget` update moves the digest the
         // span must match; the sealed digest itself stays acceptable, so
         // undoing the retarget does not drift the seal.
-        let carried = self.latest_update(&loaded.id, view, requested);
+        let carried = self.verified_updates(&loaded.id, view, requested);
         let accepts = |digest: Option<&str>| {
-            digest.is_some_and(|d| {
-                d == view.subject_sha256 || carried.as_ref().is_some_and(|u| u.digest == d)
-            })
+            digest
+                .is_some_and(|d| d == view.subject_sha256 || carried.iter().any(|u| u.digest == d))
         };
         let candidates: Vec<&Span> = self
             .spans
@@ -624,15 +623,15 @@ impl Verifier<'_> {
     /// act on the seal (the sealer, or a ceiling that reaches its level), on
     /// the seal's anchor, with a digest that is the hash of its own content.
     /// An update only rebinds the span; it never changes evidence or level.
-    fn latest_update(
+    fn verified_updates(
         &self,
         target: &str,
         target_view: &View,
         requested: Level,
-    ) -> Option<AppliedUpdate> {
+    ) -> Vec<AppliedUpdate> {
         let policy = &self.env.trust.policy;
         let ceiling = status::authority_level(policy, requested, &target_view.principal);
-        let mut best: Option<AppliedUpdate> = None;
+        let mut found: Vec<AppliedUpdate> = Vec::new();
         for loaded in &self.records {
             let Ok(view) = &loaded.view else { continue };
             let Some(info) = view
@@ -652,6 +651,14 @@ impl Verifier<'_> {
                 continue;
             };
             if crate::sha256::hex(content.as_bytes()) != view.subject_sha256 {
+                continue;
+            }
+            // An update is only a retarget if it differs from the as-sealed
+            // text by link targets alone; a signature cannot widen that.
+            let Some(sealed) = target_view.content.as_deref() else {
+                continue;
+            };
+            if crate::seal::carry::link_changes(sealed, content).is_err() {
                 continue;
             }
             let (standing, _) = self.signature(loaded, view);
@@ -677,14 +684,10 @@ impl Verifier<'_> {
                 content: content.to_owned(),
                 at,
             };
-            let newer = best
-                .as_ref()
-                .is_none_or(|b| (candidate.at, &candidate.id) > (b.at, &b.id));
-            if newer {
-                best = Some(candidate);
-            }
+            found.push(candidate);
         }
-        best
+        found.sort_by(|a, b| (a.at, &a.id).cmp(&(b.at, &b.id)));
+        found
     }
 
     /// Status records that name `target`, sit on its anchor and carry a

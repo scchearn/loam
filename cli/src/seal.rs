@@ -2403,4 +2403,86 @@ mod tests {
             AttestError::Usage(_)
         ));
     }
+    /// A hand-signed update carrying a semantic edit never rebinds the seal.
+    #[test]
+    fn verify_refuses_update_that_edits_text() {
+        let world = World::new();
+        let Some(one) = world.attest_context() else {
+            return;
+        };
+        world.page_with("alpha", LINKED);
+        let x = attest::attest(&one, &request(&["capture:run.log"])).unwrap();
+        let sealed = fs::read_to_string(world.page_path("alpha")).unwrap();
+        world.page_with("alpha", &sealed.replace("first", "second"));
+        assert_eq!(
+            report_for(&world, "2026-11-21 10:06 +02:00", &x.id)
+                .outcome
+                .verdict,
+            Verdict::Drifted
+        );
+        let (key, principal) = attest::signing_identity(&one).unwrap();
+        let page_text = fs::read_to_string(world.page_path("alpha")).unwrap();
+        let scan = crate::markers::scan(&page_text);
+        let marker = scan
+            .markers
+            .iter()
+            .find(|m| m.kind == crate::markers::Kind::Seal)
+            .unwrap();
+        let span = &page_text.as_bytes()[marker.content.clone()];
+        let content = String::from_utf8(super::canon::canonicalize(span).unwrap()).unwrap();
+        let (id, bytes) = record::build(&record::NewRecord {
+            kind: record::RecordKind::Update,
+            page: "alpha".to_owned(),
+            anchor: "s-trust-order".to_owned(),
+            subject_sha256: super::canon::digest(span).unwrap(),
+            locator: record::soft_locator(&[], &content),
+            content,
+            requested_level: None,
+            claim: None,
+            procedure_uri: attest::PROCEDURE_URI.to_owned(),
+            principal,
+            acted_on_behalf_of: None,
+            generator: record::Generator {
+                name: "loam".to_owned(),
+                version: "1.0.0".to_owned(),
+                harness: "test".to_owned(),
+            },
+            time_verified: "2026-11-21 10:05 +02:00".to_owned(),
+            review_by: None,
+            evidence: Vec::new(),
+            redacted: Vec::new(),
+            parent: None,
+            status: Some(record::StatusInfo {
+                type_: record::UPDATE_TYPE_LINK_RETARGET.to_owned(),
+                updates: x.id.clone(),
+                reason: "forged retarget".to_owned(),
+            }),
+        })
+        .unwrap();
+        let signature = super::sshsig::sign(&one.keygen, &key, &bytes).unwrap();
+        record::write_record(&world.wiki, &bytes).unwrap();
+        record::write_sig(&world.wiki, &id, signature.as_bytes()).unwrap();
+        assert_eq!(
+            report_for(&world, "2026-11-21 10:10 +02:00", &x.id)
+                .outcome
+                .verdict,
+            Verdict::Drifted
+        );
+    }
+
+    #[test]
+    fn carry_cli_usage_exit_codes() {
+        assert_eq!(
+            carry::run(Vec::<String>::new().into_iter()),
+            super::EXIT_USAGE
+        );
+        assert_eq!(
+            carry::run(["--bogus".to_owned()].into_iter()),
+            super::EXIT_USAGE
+        );
+        assert_eq!(
+            carry::run(["a".to_owned(), "b".to_owned()].into_iter()),
+            super::EXIT_USAGE
+        );
+    }
 }

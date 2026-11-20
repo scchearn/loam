@@ -157,11 +157,29 @@ fn closure(renames: &[Rename]) -> Vec<Rename> {
 /// from `sealed` only by wikilink targets that `renames` explain; otherwise
 /// the reason it does not.
 fn prove(sealed: &str, live: &str, renames: &[Rename]) -> Result<Vec<(String, String)>, String> {
+    let changes = link_changes(sealed, live)?;
+    let pairs = closure(renames);
+    for (from, to) in &changes {
+        let explained = pairs
+            .iter()
+            .any(|rename| names(from, &rename.old) && names(to, &rename.new));
+        if !explained {
+            return Err(format!(
+                "[[{from}]] became [[{to}]] but git records no rename from one to the other since the seal was committed"
+            ));
+        }
+    }
+    Ok(changes)
+}
+
+/// The offline half of the proof, enforced by carry and by verify: `live`
+/// differs from `sealed` only in wikilink targets (identical text, aliases,
+/// fragments and segment structure). Returns the distinct `(old, new)` pairs.
+pub(crate) fn link_changes(sealed: &str, live: &str) -> Result<Vec<(String, String)>, String> {
     let (old, new) = (tokenise(sealed), tokenise(live));
     if old.len() != new.len() {
         return Err("the span's text changed, not only its links".to_owned());
     }
-    let pairs = closure(renames);
     let mut retargets: Vec<(String, String)> = Vec::new();
     for (a, b) in old.iter().zip(&new) {
         match (a, b) {
@@ -187,14 +205,6 @@ fn prove(sealed: &str, live: &str, renames: &[Rename]) -> Result<Vec<(String, St
                 if from == to {
                     continue;
                 }
-                let explained = pairs
-                    .iter()
-                    .any(|rename| names(from, &rename.old) && names(to, &rename.new));
-                if !explained {
-                    return Err(format!(
-                        "[[{from}]] became [[{to}]] but git records no rename from one to the other since the seal was committed"
-                    ));
-                }
                 if !retargets.iter().any(|(f, t)| f == from && t == to) {
                     retargets.push((from.clone(), to.clone()));
                 }
@@ -214,10 +224,16 @@ struct GitOut {
 
 fn git(repo: &Path, args: &[&str]) -> Result<GitOut, String> {
     let output = Command::new("git")
-        .args(["-c", "core.quotepath=false"])
+        .args([
+            "-c",
+            "core.quotepath=false",
+            "-c",
+            "log.showSignature=false",
+        ])
         .args(args)
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -241,18 +257,28 @@ fn relative_to(root: &Path, path: &Path) -> Option<String> {
 }
 
 fn parse_renames(log: &str) -> Vec<Rename> {
-    let mut renames: Vec<Rename> = log
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split('\t');
-            let status = fields.next()?;
-            let (old, new) = (fields.next()?, fields.next()?);
-            (status.starts_with('R') && fields.next().is_none()).then(|| Rename {
+    // `-z`: NUL-separated `status NUL path [NUL path]`; renames carry two
+    // paths, everything else one. Tolerate stray newlines between commits.
+    let mut renames: Vec<Rename> = Vec::new();
+    let mut fields = log.split('\0').map(|f| f.trim_start_matches('\n'));
+    while let Some(status) = fields.next() {
+        if status.is_empty() {
+            continue;
+        }
+        let paths = if status.starts_with('R') || status.starts_with('C') {
+            2
+        } else {
+            1
+        };
+        let first = fields.next();
+        let second = (paths == 2).then(|| fields.next()).flatten();
+        if let (true, Some(old), Some(new)) = (status.starts_with('R'), first, second) {
+            renames.push(Rename {
                 old: old.to_owned(),
                 new: new.to_owned(),
-            })
-        })
-        .collect();
+            });
+        }
+    }
     // `git log` lists newest first.
     renames.reverse();
     renames
@@ -331,15 +357,17 @@ pub fn carry(ctx: &Context, request: &Request) -> Result<Carried, AttestError> {
             .map_err(|_| refuse("span is not valid UTF-8"))?;
 
     // What the seal is bound to now: the newest verified update, else the seal.
-    let latest = verify::latest_update_for(&env, &request.id).map_err(refuse)?;
-    let (bound_digest, bound_content) = match &latest {
-        Some(update) => (update.digest.clone(), update.content.clone()),
-        None => (
-            view.subject_sha256.clone(),
-            view.content.clone().unwrap_or_default(),
-        ),
-    };
-    if live_digest == bound_digest || live_digest == view.subject_sha256 {
+    // Every verified update is a proven retarget of the original text, so the
+    // proof always starts from the as-sealed content; renames since the
+    // record was committed cover chained carries.
+    let updates = verify::updates_for(&env, &request.id).map_err(refuse)?;
+    let bound_content = view.content.clone().ok_or_else(|| {
+        refuse(format!(
+            "seal {} stores no content, so a retarget cannot be proven; re-seal with loam seal attest {page}#^{anchor} … --parent {}",
+            request.id, request.id
+        ))
+    })?;
+    if live_digest == view.subject_sha256 || updates.iter().any(|u| u.digest == live_digest) {
         return Err(refuse(format!(
             "seal {} still matches its span; nothing to carry",
             request.id
@@ -377,6 +405,7 @@ pub fn carry(ctx: &Context, request: &Request) -> Result<Carried, AttestError> {
             "log",
             "--diff-filter=R",
             "--name-status",
+            "-z",
             "-M",
             "--format=",
             &range,
@@ -427,7 +456,7 @@ pub fn carry(ctx: &Context, request: &Request) -> Result<Carried, AttestError> {
     );
     let (id, bytes) = record::build(&NewRecord {
         kind: RecordKind::Update,
-        page: page.to_owned(),
+        page: current.to_owned(),
         anchor: anchor.clone(),
         subject_sha256: live_digest,
         locator: record::soft_locator(&record::heading_path(page_text, marker.opener.start), &live),
@@ -675,7 +704,7 @@ mod tests {
 
     #[test]
     fn parses_name_status_log() {
-        let log = "R100\twiki/a.md\twiki/b.md\nR087\twiki/b.md\twiki/c.md\nM\twiki/x.md\n";
+        let log = "R100\0wiki/a.md\0wiki/b.md\0\nR087\0wiki/b.md\0wiki/c.md\0M\0wiki/x.md\0";
         assert_eq!(
             parse_renames(log),
             vec![
