@@ -65,13 +65,19 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         None => memory::today_utc(),
     };
 
-    let seal_now = now_stamp
-        .as_deref()
-        .and_then(crate::seal::policy::parse_stamp)
-        .unwrap_or_else(|| {
+    let seal_now = match now_stamp.as_deref() {
+        Some(value) => match crate::seal::policy::parse_stamp(value) {
+            Some(parsed) => parsed,
+            None => {
+                eprintln!("loam lint: --now must be 'YYYY-MM-DD HH:MM ±HH:MM'");
+                return 1;
+            }
+        },
+        None => {
             let utc = chrono::FixedOffset::east_opt(0).expect("zero offset is valid");
             chrono::Utc::now().with_timezone(&utc)
-        });
+        }
+    };
     let selected = |domain: &str| only.as_deref().map(|value| value == domain).unwrap_or(true);
     let mut findings = Vec::new();
 

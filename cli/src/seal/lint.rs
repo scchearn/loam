@@ -148,12 +148,17 @@ pub fn report_findings(report: &Report, out: &mut Vec<Finding>) {
 /// SEL002 for a seal marker whose anchor no seal record names. (The reverse,
 /// a record without an anchor, comes from [`report_findings`].)
 pub fn unpaired_markers(spans: &[SpanRef], reports: &[Report], out: &mut Vec<Finding>) {
-    let recorded: BTreeSet<&str> = reports
+    // Anchors are unique per page only, so pair on (page, anchor). A carried
+    // or moved span pairs through the page it currently sits on.
+    let recorded: BTreeSet<(&str, &str)> = reports
         .iter()
-        .filter_map(|report| report.anchor.as_deref())
+        .filter_map(|report| {
+            let page = report.current_page.as_deref().or(report.page.as_deref())?;
+            Some((page, report.anchor.as_deref()?))
+        })
         .collect();
     for span in spans {
-        if recorded.contains(span.anchor.as_str()) {
+        if recorded.contains(&(span.page.as_str(), span.anchor.as_str())) {
             continue;
         }
         out.push(
@@ -351,6 +356,21 @@ mod tests {
         unpaired_markers(&[span], std::slice::from_ref(&citable), &mut out);
         report_findings(&citable, &mut out);
         assert!(out.is_empty(), "{:?}", rules(&out));
+    }
+
+    #[test]
+    fn the_same_anchor_on_two_pages_pairs_per_page() {
+        let span = |page: &str| SpanRef {
+            page: page.to_owned(),
+            anchor: "s-one".to_owned(),
+            line: 3,
+        };
+        let recorded = report(Verdict::Citable, &[], &[]);
+        let mut out = Vec::new();
+        unpaired_markers(&[span("alpha"), span("beta")], &[recorded], &mut out);
+        assert_eq!(out.len(), 1, "{:?}", rules(&out));
+        assert_eq!(out[0].file, "wiki/beta.md");
+        assert_eq!(rules(&out), vec![("SEL002", "warning")]);
     }
 
     #[test]

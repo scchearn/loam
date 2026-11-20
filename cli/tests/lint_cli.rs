@@ -304,6 +304,10 @@ mod seals {
 
         /// An unsigned evidence-level seal over `alpha.md`; returns its id.
         fn seal(&self) -> String {
+            self.seal_over("capture:run.log")
+        }
+
+        fn seal_over(&self, evidence_item: &str) -> String {
             fs::write(self.page(), PAGE).unwrap();
             let scan = loam::markers::scan(PAGE);
             let content = &PAGE.as_bytes()[scan.markers[0].content.clone()];
@@ -313,7 +317,7 @@ mod seals {
                 retrieved_at: STAMP.to_owned(),
                 capture_max_bytes: 262_144,
             };
-            let items = [evidence::parse("capture:run.log").unwrap()];
+            let items = [evidence::parse(evidence_item).unwrap()];
             let resolved =
                 evidence::resolve_all(&items, &ctx, &evidence::AttestOptions::default()).unwrap();
             evidence::store_captures(&self.wiki(), &resolved).unwrap();
@@ -444,6 +448,42 @@ mod seals {
         let text = stdout(&output);
         assert_eq!(field_values(&text, "rule"), vec!["SEL002"], "{text}");
         assert_eq!(field_values(&text, "domain"), vec!["seals"]);
+    }
+
+    #[test]
+    fn the_same_anchor_on_two_pages_flags_only_the_unrecorded_marker() {
+        let ws = Workspace::new("twopages");
+        ws.seal();
+        fs::write(ws.wiki().join("beta.md"), PAGE.replace("Alpha", "Beta")).unwrap();
+        let output = ws.lint(&["--only", "seals"]);
+        let text = stdout(&output);
+        assert_eq!(field_values(&text, "rule"), vec!["SEL002"], "{text}");
+        assert_eq!(field_values(&text, "file"), vec!["wiki/beta.md"], "{text}");
+    }
+
+    #[test]
+    fn a_record_whose_span_was_removed_yields_sel002_and_sel004() {
+        let ws = Workspace::new("removed");
+        ws.seal();
+        fs::write(ws.page(), "# Alpha\n\nNo seal here.\n").unwrap();
+        let output = ws.lint(&["--only", "seals"]);
+        let text = stdout(&output);
+        let rules = field_values(&text, "rule");
+        assert!(rules.contains(&"SEL002".to_owned()), "{text}");
+        assert!(rules.contains(&"SEL004".to_owned()), "{text}");
+    }
+
+    #[test]
+    fn drifted_evidence_yields_sel005() {
+        let ws = Workspace::new("evidence");
+        ws.seal_over("file:run.log");
+        fs::write(ws.0.join("run.log"), b"tests now fail").unwrap();
+        let output = ws.lint(&["--only", "seals"]);
+        let text = stdout(&output);
+        assert!(
+            field_values(&text, "rule").contains(&"SEL005".to_owned()),
+            "{text}"
+        );
     }
 
     #[test]
