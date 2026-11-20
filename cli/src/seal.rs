@@ -4,6 +4,7 @@
 //! land do not trip `dead_code`.
 
 pub mod canon;
+pub mod record;
 
 use crate::markers::{self, Kind};
 use std::fs;
