@@ -1088,8 +1088,8 @@ test('harvest_status: reports enabled state, per-session cursors, wiki cache, la
 });
 
 // ---- harvest_commit: memory-write commits ----
-async function harvestCommitRun(ws, { env, launchWrites = true, sessionId = 'sess-commit' } = {}) {
-  const globalRoot = join(ws.base || join(ws.root, '..'), 'global');
+async function harvestCommitRun(ws, { env, launchWrites = true, sessionId = 'sess-commit', background = null, expectReason = 'ok' } = {}) {
+  const globalRoot = join(ws.root, '..', 'global');
   await mkdir(globalRoot, { recursive: true });
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({
     background_harvest: { threshold_turns: 1, threshold_conversation_bytes: 1 },
@@ -1110,17 +1110,20 @@ async function harvestCommitRun(ws, { env, launchWrites = true, sessionId = 'ses
         };
       },
     },
+    ...(background ? { waitForWriter: background.waitForWriter } : {}),
     launch: async () => {
-      if (launchWrites) {
+      const write = async () => {
         await ws.write('wiki/topics/new.md', '# New\n');
         await appendFile(join(ws.wiki, 'index.md'), '- [[new]]\n');
         await appendFile(join(ws.wiki, 'log.md'), '- harvested\n');
-      }
+      };
+      if (background) return { category: null, background: true, completion: Promise.resolve({ code: 0 }), write };
+      if (launchWrites) await write();
       return { category: null, completion: Promise.resolve({ code: 0 }) };
     },
   });
-  assert.equal(result.reason, 'ok', JSON.stringify(result));
-  const lastRun = JSON.parse(await readFile(harvestLastRunPath(globalRoot, ws.root), 'utf8'));
+  assert.equal(result.reason, expectReason, JSON.stringify(result));
+  const lastRun = expectReason === 'ok' ? JSON.parse(await readFile(harvestLastRunPath(globalRoot, ws.root), 'utf8')) : null;
   return { result, lastRun, globalRoot };
 }
 
@@ -1135,7 +1138,7 @@ test('harvest_commit: a successful run commits exactly its written paths and lea
     assert.equal(ws.commitCount(), before + 1);
     const names = ws.git(['show', '--name-only', '--format=', 'HEAD']).split('\n').filter(Boolean).sort();
     assert.deepEqual(names, ['wiki/index.md', 'wiki/log.md', 'wiki/topics/new.md']);
-    assert.match(ws.git(['log', '-1', '--format=%s']), /^loam\(harvest\): 1 turns from session [0-9a-f]{8}, 3 memory files/);
+    assert.match(ws.git(['log', '-1', '--format=%s']), /^loam\(harvest\): 1 turn from session [0-9a-f]{8}, 3 memory files/);
     assert.deepEqual(ws.git(['diff', '--cached', '--name-only']).split('\n').filter(Boolean), ['src/unrelated.js']);
     assert.equal(result.memory_commit, 'committed');
     assert.equal(lastRun.memory_commit, 'committed');
@@ -1191,5 +1194,42 @@ test('harvest_commit: LOAM_MEMORY_COMMITS=0 leaves writes uncommitted, .git/inde
     assert.equal(lastRun.memory_commit, 'disabled');
     assert.equal('memory_commit_hash' in lastRun, false);
     assert.match(ws.git(['status', '--porcelain']), /wiki\/topics\/new\.md/);
+  } finally { await ws.cleanup(); }
+});
+
+test('harvest_commit: a background launch is not committed until the writer is confirmed terminal', async () => {
+  const ws = await createGitWorkspace();
+  try {
+    const before = ws.commitCount();
+    const seen = [];
+    const { result, lastRun } = await harvestCommitRun(ws, {
+      background: {
+        // Writes happen only once the wait runs, i.e. after `completion` already resolved.
+        waitForWriter: async ({ launched }) => {
+          seen.push(ws.commitCount());
+          await launched.write();
+          return { state: 'terminal' };
+        },
+      },
+    });
+    assert.deepEqual(seen, [before], 'no commit may happen before the writer wait');
+    assert.equal(ws.commitCount(), before + 1);
+    assert.equal(result.memory_commit, 'committed');
+    assert.deepEqual(ws.git(['show', '--name-only', '--format=', 'HEAD']).split('\n').filter(Boolean).sort(), ['wiki/index.md', 'wiki/log.md', 'wiki/topics/new.md']);
+    assert.equal(lastRun.memory_commit, 'committed');
+  } finally { await ws.cleanup(); }
+});
+
+test('harvest_commit: an unconfirmed background writer yields no commit and no cursor advance', async () => {
+  const ws = await createGitWorkspace();
+  try {
+    const before = ws.commitCount();
+    const { result } = await harvestCommitRun(ws, {
+      expectReason: 'busy',
+      background: { waitForWriter: async ({ launched }) => { await launched.write(); return { state: 'live' }; } },
+    });
+    assert.equal(ws.commitCount(), before);
+    assert.equal(result.memory_commit, 'commit_skipped:writer_unconfirmed');
+    assert.equal(result.cursorChanged, false);
   } finally { await ws.cleanup(); }
 });

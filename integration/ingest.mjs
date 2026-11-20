@@ -1283,4 +1283,4 @@ export async function ingestStatus({ globalRoot, workspace, env = process.env } 
   };
 }
 
-export { inspectIntent, resolveExclusions, launchModel, acquireLease, releaseLease, updateLease, writeSkip, liveOwnedChild, launchPlan };
+export { waitForClaude, stopClaude, waitForOpenCode, inspectIntent, resolveExclusions, launchModel, acquireLease, releaseLease, updateLease, writeSkip, liveOwnedChild, launchPlan };
