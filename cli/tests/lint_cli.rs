@@ -318,6 +318,16 @@ mod seals {
         /// Seals the span in `page` (written to `alpha.md`), optionally as a
         /// re-seal naming `parent`.
         fn seal_page(&self, evidence_item: &str, page: &str, parent: Option<&str>) -> String {
+            self.seal_page_at("evidence", evidence_item, page, parent)
+        }
+
+        fn seal_page_at(
+            &self,
+            level: &str,
+            evidence_item: &str,
+            page: &str,
+            parent: Option<&str>,
+        ) -> String {
             fs::write(self.page(), page).unwrap();
             let scan = loam::markers::scan(page);
             let content = &page.as_bytes()[scan.markers[0].content.clone()];
@@ -338,7 +348,7 @@ mod seals {
                 subject_sha256: canon::digest(content).unwrap(),
                 locator: record::soft_locator(&["Alpha".to_owned()], "Bundled rung first."),
                 content: "Bundled rung first.\n".to_owned(),
-                requested_level: Some("evidence".to_owned()),
+                requested_level: Some(level.to_owned()),
                 claim: Some("Rung order".to_owned()),
                 procedure_uri: "loam://seal/procedure/v1".to_owned(),
                 principal: "agent.one@local".to_owned(),
@@ -521,6 +531,21 @@ mod seals {
             stdout(&output)
         );
         assert_eq!(stdout(&output), "");
+    }
+
+    #[test]
+    fn a_weaker_re_seal_does_not_clear_drift_on_a_higher_level_parent() {
+        let ws = Workspace::new("reseal-weaker");
+        let old = ws.seal_page_at("audited", "capture:run.log", PAGE, None);
+        let edited = PAGE.replace("Bundled", "System");
+        ws.seal_page_at("evidence", "capture:run.log", &edited, Some(&old));
+        let output = ws.lint(&["--only", "seals"]);
+        let text = stdout(&output);
+        assert!(
+            field_values(&text, "rule").contains(&"SEL004".to_owned()),
+            "{text}"
+        );
+        assert_eq!(output.status.code(), Some(2), "{text}");
     }
 
     #[test]

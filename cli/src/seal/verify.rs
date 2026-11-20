@@ -420,9 +420,9 @@ fn mark_superseded(verifier: &Verifier<'_>, reports: &mut [Report]) {
                 && snapshot.iter().any(|other| {
                     &other.id == child
                         && sound(other)
-                        && other.base_level.is_some_and(|level| {
-                            report.base_level.is_none_or(|parent| level >= parent)
-                        })
+                        && other
+                            .base_level
+                            .is_some_and(|level| level >= report.outcome.requested_level)
                 })
         });
         if let Some((child, _, _)) = found {
