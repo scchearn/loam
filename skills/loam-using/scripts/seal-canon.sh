@@ -68,6 +68,15 @@ while :; do
 done
 [ -n "$anchor" ] || usage
 
+# NUL bytes: some awks (BWK, macOS) truncate a record at NUL, which would
+# certify a digest of truncated text. Refuse before awk sees the file.
+total=$(wc -c <"$file") || exit 2
+clean=$(LC_ALL=C tr -d '\000' <"$file" | wc -c) || exit 2
+if [ "$((total + 0))" -ne "$((clean + 0))" ]; then
+    echo "seal-canon: $file contains NUL bytes; use the loam runtime" >&2
+    exit 2
+fi
+
 run_awk() {
     LC_ALL=C SEAL_ID=$anchor awk '
 function width(s,   k, w, c) {
@@ -282,7 +291,7 @@ report() {
         3) echo "seal-canon: $file is not valid UTF-8" >&2 ;;
         4) echo "seal-canon: no well-formed seal span ^$anchor in $file" >&2 ;;
         5) echo "seal-canon: unsupported whitespace in a marker line of $file; use the loam runtime" >&2 ;;
-        6) echo "seal-canon: ambiguous list or block-quote structure around ^$anchor in $file; use the loam runtime" >&2 ;;
+        6) echo "seal-canon: ambiguous markdown structure around ^$anchor in $file; use the loam runtime" >&2 ;;
         7) echo "seal-canon: ^$anchor opens on more than one line of $file; use the loam runtime" >&2 ;;
         *) echo "seal-canon: awk failed on $file (status $1)" >&2 ;;
     esac

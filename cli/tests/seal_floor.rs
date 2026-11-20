@@ -87,7 +87,13 @@ fn ps1_prefix() -> Vec<String> {
     ]
 }
 
-fn floors() -> Vec<Floor> {
+/// Probed once per process: each probe is a PowerShell cold start on Windows.
+fn floors() -> &'static [Floor] {
+    static FLOORS: std::sync::OnceLock<Vec<Floor>> = std::sync::OnceLock::new();
+    FLOORS.get_or_init(probe_floors)
+}
+
+fn probe_floors() -> Vec<Floor> {
     let mut floors = Vec::new();
     if cfg!(unix) {
         floors.push(Floor {
@@ -497,6 +503,12 @@ fn floor_never_certifies_generated_pages() {
         "> quote".into(),
         "[^n]: ```".into(),
         "    indented".into(),
+        "\tindented".into(),
+        "- outer\n  - nested".into(),
+        "1. ordered".into(),
+        "> ```".into(),
+        "text\r".into(),
+        "```\r".into(),
         "---".into(),
         "text".into(),
         "".into(),
@@ -513,7 +525,9 @@ fn floor_never_certifies_generated_pages() {
             .wrapping_add(1_442_695_040_888_963_407);
         (state >> 33) as usize
     };
-    let pages: Vec<(String, String)> = (0..600)
+    // Each Windows case is a PowerShell cold start: fewer pages there.
+    let pages = if cfg!(windows) { 60 } else { 600 };
+    let pages: Vec<(String, String)> = (0..pages)
         .map(|index| {
             let count = 4 + next() % 12;
             let mut body = String::new();

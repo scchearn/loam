@@ -262,7 +262,7 @@ for ($i = $fmEnd + 1; $i -lt $n; $i++) {
 
 if ($badws) { Fail "unsupported whitespace in a marker line of $File; use the loam runtime" }
 if ($mcount -gt 1) { Fail "^$Anchor opens on more than one line of $File; use the loam runtime" }
-if ($amb -and $mention) { Fail "ambiguous list or block-quote structure around ^$Anchor in $File; use the loam runtime" }
+if ($amb -and $mention) { Fail "ambiguous markdown structure around ^$Anchor in $File; use the loam runtime" }
 if (-not $found.ContainsKey($Anchor) -or $dup.ContainsKey($Anchor)) {
     Fail "no well-formed seal span ^$Anchor in $File"
 }
