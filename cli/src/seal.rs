@@ -132,12 +132,34 @@ mod tests {
         let got = c.run();
         assert_eq!(got.verdict, Verdict::Unverifiable);
         assert_eq!(got.effective_level, None);
+        assert!(!got.codes.success.contains(&code::EVIDENCE_CURRENT));
 
         // A wiki page is zero-weight too (the resolver assigns the weight).
         let mut page = primary(Kind::File);
         page.weight = super::evidence::Weight::Zero;
         c.evidence = vec![page, note()];
         assert_eq!(c.run().effective_level, None);
+    }
+
+    /// A fresh seal without `review_by` raises nothing that lint surfaces.
+    #[test]
+    fn fresh_seal_without_review_by_has_no_lint_code() {
+        let c = Case::citable();
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Citable);
+        for code in got.codes.informational.iter().chain(&got.codes.failure) {
+            assert_ne!(code::lint_code(code), Some("SEL006"), "{code}");
+        }
+    }
+
+    /// Levels are cumulative: a canonical-only grant reaches canonical.
+    #[test]
+    fn level_ceiling_canonical_only_grant_implies_audited() {
+        let mut c = Case::citable();
+        c.requested = Level::Canonical;
+        c.signature = verified("carol@example.com", "sk-ssh-ed25519@openssh.com");
+        c.policy.canonical_principals = vec!["carol@example.com".into()];
+        assert_eq!(c.run().effective_level, Some(Level::Canonical));
     }
 
     /// S6 (b): canonical requested by a principal granted only audited.
@@ -324,7 +346,7 @@ mod tests {
         c.now = at("2027-05-19 14:29 +02:00");
         let got = c.run();
         assert_eq!(got.verdict, Verdict::Citable);
-        assert!(got.codes.informational.contains(&code::REVIEW_BY_CAPPED));
+        assert!(got.codes.informational.contains(&code::REVIEW_BY_CLAMPED));
 
         c.now = at("2027-05-19 14:31 +02:00");
         let got = c.run();
@@ -357,7 +379,7 @@ mod tests {
         c.now = at("2027-05-19 14:29 +02:00");
         let got = c.run();
         assert_eq!(got.verdict, Verdict::Citable);
-        assert!(got.codes.informational.contains(&code::REVIEW_BY_CAPPED));
+        assert!(got.codes.informational.contains(&code::REVIEW_BY_CLAMPED));
         c.now = at("2027-05-19 14:31 +02:00");
         let got = c.run();
         assert_eq!(got.verdict, Verdict::Stale);

@@ -39,8 +39,10 @@ impl Level {
     }
 }
 
-/// Parse a stamp in loam's canonical `YYYY-MM-DD HH:MM ±HH:MM` form, the
+/// Parse a stamp for injected clocks (`--now`) and policy tests: loam's canonical `YYYY-MM-DD HH:MM ±HH:MM` form, the
 /// unambiguous `±HHMM` variant, or RFC 3339. Offset-less stamps are rejected.
+/// Record stamps are validated elsewhere and must not go through this parser,
+/// whose accepted forms are deliberately broader.
 pub fn parse_stamp(stamp: &str) -> Option<DateTime<FixedOffset>> {
     DateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M %:z")
         .or_else(|_| DateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M %z"))
@@ -66,7 +68,7 @@ impl EvidenceState {
     }
 
     /// Resolves and (for derived items) the cited seal still holds.
-    fn holds(&self) -> bool {
+    pub(crate) fn holds(&self) -> bool {
         self.code == Code::Current && (!self.is_derived() || self.cited.is_some())
     }
 
@@ -216,9 +218,14 @@ pub fn ceiling(input: &CeilingInputs<'_>) -> Ceiling {
         ..
     } = input.signature
     {
-        if all_hold && listed(&input.policy.audited_principals, matched_principal) {
+        // Levels are cumulative: a canonical grant implies audited, so a
+        // principal listed only for canonical still reaches audited.
+        let canonical_listed = listed(&input.policy.canonical_principals, matched_principal);
+        if all_hold
+            && (canonical_listed || listed(&input.policy.audited_principals, matched_principal))
+        {
             level = Level::Audited;
-            if listed(&input.policy.canonical_principals, matched_principal) {
+            if canonical_listed {
                 let mut signers: Vec<&str> = vec![matched_principal.as_str()];
                 for other in input.cosigners {
                     if listed(&input.policy.canonical_principals, other)
@@ -324,7 +331,11 @@ const FUTURE_SKEW_MINUTES: i64 = 5;
 /// untrusted input cannot panic the verifier.
 pub fn freshness(input: &FreshnessInputs<'_>) -> Freshness {
     let mut expired = Vec::new();
-    if input.time_verified > input.now + Duration::minutes(FUTURE_SKEW_MINUTES) {
+    let in_future = input
+        .now
+        .checked_add_signed(Duration::minutes(FUTURE_SKEW_MINUTES))
+        .is_some_and(|limit| input.time_verified > limit);
+    if in_future {
         expired.push(Expiry::TimeVerifiedInFuture);
     }
     let cap = input

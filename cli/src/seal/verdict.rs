@@ -127,6 +127,9 @@ pub mod code {
     pub const CITED_NOT_CITABLE: &str = "seal.evidence.cited_not_citable";
     pub const REVIEW_BY_PASSED: &str = "seal.freshness.review_by_passed";
     pub const REVIEW_BY_CAPPED: &str = "seal.freshness.review_by_capped";
+    /// Informational: the reader's `max_review` window applies (absent or
+    /// over-long `review_by`) and has not yet lapsed. Not a lint code.
+    pub const REVIEW_BY_CLAMPED: &str = "seal.freshness.review_by_clamped";
     pub const RECHECK_DUE: &str = "seal.freshness.recheck_due";
     pub const TIME_VERIFIED_FUTURE: &str = "seal.freshness.time_verified_future";
     pub const FRESH: &str = "seal.freshness.current";
@@ -259,7 +262,7 @@ pub fn evaluate(input: &Inputs<'_>) -> Outcome {
             stale = true;
         }
     }
-    if !stale && !input.evidence.is_empty() {
+    if !stale && effective.is_some() && input.evidence.iter().all(|e| e.holds()) {
         codes.success.push(code::EVIDENCE_CURRENT);
     }
 
@@ -284,7 +287,7 @@ pub fn evaluate(input: &Inputs<'_>) -> Outcome {
         );
     }
     if fresh.review_by_capped && !fresh.expired.contains(&Expiry::ReviewByCapped) {
-        codes.informational.push(code::REVIEW_BY_CAPPED);
+        codes.informational.push(code::REVIEW_BY_CLAMPED);
     }
     if fresh.expired.is_empty() {
         codes.success.push(code::FRESH);
@@ -569,6 +572,7 @@ mod tests {
         let got = c.run();
         assert_eq!(got.verdict, Verdict::Unverifiable);
         assert_eq!(got.effective_level, None);
+        assert!(!got.codes.success.contains(&code::EVIDENCE_CURRENT));
     }
 
     #[test]
