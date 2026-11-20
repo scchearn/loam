@@ -3,3 +3,6 @@ tests/fixtures/harvest/**/*.txt text eol=lf
 tests/fixtures/harvest/**/*.json text eol=lf
 tests/fixtures/harvest/**/*.jsonl text eol=lf
 tests/fixtures/harvest/**/*.db -text
+cli/tests/fixtures/seal/** text eol=lf
+cli/tests/fixtures/seal/crlf.md -text
+cli/tests/fixtures/seal/invalid-utf8.md -text
