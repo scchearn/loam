@@ -10,6 +10,7 @@ import {
   spawnDetached, startTracked, terminateChild,
 } from './ingest-process.mjs';
 import { FingerprintError, fingerprintActionable } from './ingest-fingerprint.mjs';
+import { commitMemoryWrites, readMemoryCommitConfig, snapshotMemory } from './memory-commit.mjs';
 
 export const PROMPT = 'Run the existing loam::ingesting-codebase skill for the provided workspace. Do not modify source files, commit, or push. Do not spawn other agents or subagents.';
 const DEFAULTS = Object.freeze({ enabled: true, min_interval_seconds: 300, timeout_seconds: 900, lease_ttl_seconds: 1800, visibility: 'native', require_visible_worker: false });
@@ -332,11 +333,13 @@ export async function bindNativeAgent({ globalRoot, workspace, agentId, now = Da
 function persistedPreparation(prepared) {
   const {
     action, harness, workspace, globalRoot, skillsRoot, platform, root,
-    config, lease, readiness, exclusionsPath, fingerprint, events,
+    config, lease, readiness, exclusionsPath, fingerprint, events, memorySnapshot,
   } = prepared;
   return {
     action, harness, workspace, globalRoot, skillsRoot, platform, root,
     config, lease, readiness, exclusionsPath, fingerprint,
+    // Plain JSON, so the pre-run wiki snapshot survives the native prepare/stop boundary.
+    ...(memorySnapshot ? { memorySnapshot } : {}),
     // Carry the buffered preparation event across the native prepare/stop
     // process boundary so finalization can find its causal parent.
     events: Array.isArray(events) ? events : [],
@@ -626,7 +629,7 @@ async function actionablePreflight({
   const fields = { actionable_count: fingerprint.count, actionable_fingerprint: fingerprint.fingerprint };
   if (fingerprint.count === 0) return { action: 'skip', reason: 'no_actionable_work', fields };
   if (!fingerprint.complete) return { action: 'skip', reason: 'fingerprint_unavailable', fields };
-  return { action: 'run', readiness: ready, exclusionsPath, fingerprint };
+  return { action: 'run', readiness: ready, exclusionsPath, fingerprint, wikiRoot: state.wiki_root };
 }
 
 async function leaseOwner() {
@@ -958,7 +961,7 @@ async function launchModel({ launchMode: mode, workspace, env, timeoutMs, lease,
   return { category: null, completion: started.completion };
 }
 
-async function recordProgress(root, pre, post, count, lease) {
+async function recordProgress(root, pre, post, count, lease, commitFields = {}) {
   try {
     const current = await json(join(root, 'lease.json'));
     if (current?.lease_id !== lease.lease_id) return { recorded: false, status: 'failed' };
@@ -976,6 +979,7 @@ async function recordProgress(root, pre, post, count, lease) {
       fingerprint_complete: post.complete, actionable_count: count,
       failure_count: failureCount, backoff_until: backoff,
       ...(lease.downgrade_reason ? { downgrade_reason: lease.downgrade_reason } : {}),
+      ...commitFields,
     });
     return { recorded: true, status, failureCount, backoff };
   } catch {
@@ -1024,9 +1028,16 @@ export async function prepareWorkerRun({
       workspace: canonical, globalRoot, skillsRoot, env, platform, runtimeRunner, readiness,
     });
     if (checked.action !== 'run') return await skip(checked.reason, checked.fields);
-    const { readiness: ready, exclusionsPath, fingerprint } = checked;
+    const { readiness: ready, exclusionsPath, fingerprint, wikiRoot } = checked;
     const previousRecord = await json(join(root, 'last-run.json'));
     if (previousRecord && previousRecord.schema !== 1) return await skip('schema_unknown');
+    // Snapshot the wiki before any writer runs so the later commit covers only this run's writes.
+    let memorySnapshot;
+    try {
+      memorySnapshot = await snapshotMemory({
+        wikiRoot, globalRoot, config: await readMemoryCommitConfig(globalRoot, env), env,
+      });
+    } catch { memorySnapshot = { skip: 'commit_failed' }; }
     const selectedLaunch = nativeAgentId ? { mode: 'codex_native' } : await launchPlan({ harness, workspace: canonical, env });
     const selectedLaunchMode = selectedLaunch.mode;
     const plannedIdentity = selectedLaunchMode === 'codex_native'
@@ -1081,7 +1092,7 @@ export async function prepareWorkerRun({
     return {
       action: 'run', harness, workspace: canonical, globalRoot, skillsRoot, env, platform,
       runtimeRunner, openCodeSession, notify, root, config, lease, readiness: ready,
-      exclusionsPath, fingerprint, events,
+      exclusionsPath, fingerprint, events, memorySnapshot,
       intent: {
         schema: 1, lease_id: lease.lease_id, workspace: canonical, harness,
         actionable_fingerprint: fingerprint.fingerprint, actionable_count: fingerprint.count,
@@ -1152,7 +1163,18 @@ export async function finalizeWorkerRun(prepared, {
       }
     } catch {}
     if (result.category || (typeof result.code === 'number' && result.code !== 0)) post.complete = false;
-    const recorded = await recordProgress(root, fingerprint, post, fingerprint.count, lease);
+    // The writer is confirmed terminal here (orphan_live/orphan_unknown returned above), so its
+    // writes can be committed before the lease is released. Never throws or blocks the run.
+    let commitFields = {};
+    if (prepared.memorySnapshot) {
+      try {
+        commitFields = await commitMemoryWrites({
+          snapshot: prepared.memorySnapshot, kind: 'ingest', env,
+          summary: (written) => `code graph, ${fingerprint.count} source ${fingerprint.count === 1 ? 'file' : 'files'}, ${written.length} memory ${written.length === 1 ? 'file' : 'files'}`,
+        });
+      } catch { commitFields = { memory_commit: 'commit_skipped:commit_failed' }; }
+    }
+    const recorded = await recordProgress(root, fingerprint, post, fingerprint.count, lease, commitFields);
     // Finalization telemetry: omit the event entirely when either digest is
     // unavailable rather than storing a sentinel or invalid digest (S6).
     if (recorded.recorded && /^[a-f0-9]{64}$/i.test(fingerprint.fingerprint) && /^[a-f0-9]{64}$/i.test(post.fingerprint)) {

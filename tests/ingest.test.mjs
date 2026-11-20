@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 
 import { fingerprintActionable } from '../integration/ingest-fingerprint.mjs';
+import { createGitWorkspace } from './fixtures/git-workspace.mjs';
 import {
   bindNativeAgent, claudeSessionName, dispatchBoundary, finalizeNativeAgentRun,
   finalizeWorkerRun, gate, ingestStatus, inspectIntent, prepareNativeAgentRun, prepareWorkerRun,
@@ -1439,4 +1440,132 @@ test('ingestStatus always returns JSON-shaped state, including malformed leases'
   const status = await ingestStatus({ globalRoot: root, workspace, env: { LOAM_INGEST_BACKGROUND: '1' } });
   assert.equal(JSON.parse(JSON.stringify(status)).lease_state, 'unknown');
   assert.equal(status.intent_state, 'unknown');
+});
+
+// ---- ingest_commit: memory-write commits ----
+async function gitIngestFixture() {
+  const ws = await createGitWorkspace();
+  await ws.write('wiki/code/_index.md', '# Code\n');
+  ws.git(['add', '-A']);
+  ws.git(['commit', '-q', '-m', 'codegraph']);
+  const globalRoot = await ws.tempDir('global');
+  const skills = await ws.tempDir('skills');
+  await mkdir(join(skills, 'loam-ingesting-codebase', 'references'), { recursive: true });
+  await writeFile(join(skills, 'loam-ingesting-codebase', 'references', 'ingestion-exclusions.md'), '# exclusions\n');
+  return { ws, globalRoot, skills };
+}
+
+// Stand-in for the ingestor child: writes memory pages and, wrongly, edits a source file.
+async function ingestorWrites(dir) {
+  await mkdir(join(dir, 'wiki', 'code', 'src'), { recursive: true });
+  await writeFile(join(dir, 'wiki', 'code', 'src', 'a.js.md'), '# a.js\n');
+  await appendFile(join(dir, 'wiki', 'code', '_index.md'), '- [[a.js]]\n');
+  await appendFile(join(dir, 'src', 'a.js'), 'export const b = 2;\n');
+}
+
+test('ingest_commit: git log -1 --name-only lists only memory paths and source edits stay unstaged', async () => {
+  const { ws, globalRoot, skills } = await gitIngestFixture();
+  try {
+    const before = ws.commitCount();
+    const result = await runWorker({
+      harness: 'opencode', workspace: ws.root, globalRoot, skillsRoot: skills, env: ws.env,
+      ...actionableRuntime(ws.wiki),
+      modelRunner: async () => { await ingestorWrites(ws.root); return { completion: Promise.resolve({ code: 0 }) }; },
+    });
+    assert.equal(result.reason, 'ok');
+    assert.equal(ws.commitCount(), before + 1);
+    const names = ws.git(['show', '--name-only', '--format=', 'HEAD']).split('\n').filter(Boolean).sort();
+    assert.deepEqual(names, ['wiki/code/_index.md', 'wiki/code/src/a.js.md']);
+    assert.match(ws.git(['log', '-1', '--format=%s']), /^loam\(ingest\): code graph, 1 source file, 2 memory files/);
+    assert.equal(ws.git(['diff', '--cached', '--name-only']).trim(), '');
+    assert.match(ws.git(['status', '--porcelain']), /^ M src\/a\.js$/m);
+    const stored = JSON.parse(await readFile(join(runRoot(globalRoot, ws.root), 'last-run.json'), 'utf8'));
+    assert.equal(stored.memory_commit, 'committed');
+    assert.equal(stored.memory_commit_hash, ws.head());
+    assert.deepEqual([...stored.memory_commit_files].sort(), names);
+    const status = await ingestStatus({ globalRoot, workspace: ws.root, env: ws.env });
+    assert.equal(status.last_run.memory_commit, 'committed');
+    assert.equal(status.last_run.memory_commit_hash, ws.head());
+  } finally { await ws.cleanup(); }
+});
+
+test('ingest_commit: a linked worktree on a feature branch commits only there', async () => {
+  const { ws, globalRoot, skills } = await gitIngestFixture();
+  try {
+    const parent = await ws.tempDir('linked');
+    const tree = join(parent, 'feature-tree');
+    ws.git(['worktree', 'add', tree, '-b', 'feature']);
+    assert.equal(ws.git(['log', '-1', '--format=%s'], { cwd: tree }).trim(), 'codegraph');
+    const mainHead = ws.head();
+    const treeWorkspace = await realpath(tree);
+    const result = await runWorker({
+      harness: 'opencode', workspace: treeWorkspace, globalRoot, skillsRoot: skills, env: ws.env,
+      ...actionableRuntime(join(treeWorkspace, 'wiki')),
+      modelRunner: async () => { await ingestorWrites(treeWorkspace); return { completion: Promise.resolve({ code: 0 }) }; },
+    });
+    assert.equal(result.reason, 'ok');
+    assert.equal(ws.head(), mainHead, 'main checkout HEAD must not move');
+    assert.equal(ws.git(['rev-parse', 'main']).trim(), mainHead);
+    assert.equal(ws.git(['log', 'main..feature', '--format=%s']).trim().split('\n').length, 1);
+    assert.match(ws.git(['log', '-1', '--format=%s'], { cwd: tree }), /^loam\(ingest\): /);
+    const names = ws.git(['show', '--name-only', '--format=', 'feature']).split('\n').filter(Boolean).sort();
+    assert.deepEqual(names, ['wiki/code/_index.md', 'wiki/code/src/a.js.md']);
+    assert.equal(ws.git(['status', '--porcelain', '--', 'wiki']).trim(), '');
+  } finally { await ws.cleanup(); }
+});
+
+test('ingest_commit: Codex native prepare/finalize carries the snapshot and commits', async () => {
+  const { ws, globalRoot, skills } = await gitIngestFixture();
+  try {
+    await nativeInstall(globalRoot);
+    const { readiness, runtimeRunner } = actionableRuntime(ws.wiki);
+    const boundary = {
+      harness: 'codex', payload: { cwd: ws.root, session_id: 'parent-1' },
+      globalRoot, skillsRoot: skills, readiness, runtimeRunner, env: ws.env,
+    };
+    assert.equal((await dispatchBoundary(boundary)).native_continuation.decision, 'block');
+    assert.equal((await bindNativeAgent({ globalRoot, workspace: ws.root, agentId: 'agent-1' })).status, 'bound');
+    assert.deepEqual(await prepareNativeAgentRun({
+      globalRoot, workspace: ws.root, agentId: 'agent-1', skillsRoot: skills, readiness, runtimeRunner, env: ws.env,
+    }), { action: 'run' });
+    const dir = runRoot(globalRoot, ws.root);
+    const agentFile = (await readdir(dir)).find((name) => name.startsWith('native-agent-'));
+    const record = JSON.parse(await readFile(join(dir, agentFile), 'utf8'));
+    assert.equal(record.prepared.memorySnapshot.enabled, true, 'snapshot persisted as plain JSON');
+    assert.ok(record.prepared.memorySnapshot.toplevel);
+
+    const before = ws.commitCount();
+    await ingestorWrites(ws.root);
+    const finalized = await finalizeNativeAgentRun({
+      globalRoot, workspace: ws.root, agentId: 'agent-1', runtimeRunner, env: ws.env,
+    });
+    assert.equal(finalized.reason, 'ok');
+    assert.equal(ws.commitCount(), before + 1);
+    const names = ws.git(['show', '--name-only', '--format=', 'HEAD']).split('\n').filter(Boolean).sort();
+    assert.deepEqual(names, ['wiki/code/_index.md', 'wiki/code/src/a.js.md']);
+    assert.match(ws.git(['status', '--porcelain']), /^ M src\/a\.js$/m);
+    const stored = JSON.parse(await readFile(join(dir, 'last-run.json'), 'utf8'));
+    assert.equal(stored.memory_commit, 'committed');
+    assert.equal(stored.memory_commit_hash, ws.head());
+  } finally { await ws.cleanup(); }
+});
+
+test('ingest_commit: LOAM_MEMORY_COMMITS=0 performs no git staging or commit', async () => {
+  const { ws, globalRoot, skills } = await gitIngestFixture();
+  try {
+    const indexBefore = await readFile(join(ws.root, '.git', 'index'));
+    const before = ws.commitCount();
+    const env = { ...ws.env, LOAM_MEMORY_COMMITS: '0' };
+    const result = await runWorker({
+      harness: 'opencode', workspace: ws.root, globalRoot, skillsRoot: skills, env,
+      ...actionableRuntime(ws.wiki),
+      modelRunner: async () => { await ingestorWrites(ws.root); return { completion: Promise.resolve({ code: 0 }) }; },
+    });
+    assert.equal(result.reason, 'ok');
+    assert.equal(ws.commitCount(), before);
+    assert.ok(indexBefore.equals(await readFile(join(ws.root, '.git', 'index'))), 'index must be untouched');
+    const stored = JSON.parse(await readFile(join(runRoot(globalRoot, ws.root), 'last-run.json'), 'utf8'));
+    assert.equal(stored.memory_commit, 'disabled');
+    assert.equal('memory_commit_hash' in stored, false);
+  } finally { await ws.cleanup(); }
 });
