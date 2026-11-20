@@ -269,7 +269,15 @@ request to the matching workflow:
 
 Background memory maintenance is enabled by default. To opt out, set
 `LOAM_HARVEST_BACKGROUND=0` or set `background_harvest.enabled: false` in
-Loam's `config.json` under the platform configuration directory.
+`config.json` (`~/.agents/loam/config.json`, or under `$LOAM_HOME`).
+
+The background workers commit only the memory paths they wrote, in place on
+your current branch, as `loam(harvest): ...` or `loam(ingest): ...`. They never
+commit source files and never push. If git hooks or commit signing are
+configured, or HEAD is detached, no identity is set, or the repo is mid-merge,
+they skip the commit rather than bypass anything, and record
+`commit_skipped:<reason>` in the status output. Opt out of memory commits with
+`memory_commits.enabled: false` in `config.json` or `LOAM_MEMORY_COMMITS=0`.
 
 ## Skill metrics
 
