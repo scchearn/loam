@@ -19,11 +19,47 @@ const SEAL_PAGES: usize = 120;
 const SEALS: usize = 500;
 const SEAL_SPAN_BYTES: usize = 1500;
 const HASH_CAP: u64 = 512 * 1024;
+/// How many of the 500 records carry a real SSHSIG (unix, capable keygen only).
+const SIGNED: usize = 50;
+
+/// A test signer: the key `trust init` minted and the principal it trusts.
+#[cfg_attr(not(unix), allow(dead_code))]
+struct Signer {
+    keygen: std::path::PathBuf,
+    key: std::path::PathBuf,
+    principal: String,
+}
+
+/// Mints a test key into the pinned trust dir through `loam seal trust init`'s
+/// own code path, when a capable `ssh-keygen` (`-Y` with `verify-time` and
+/// `find-principals`) is on PATH. Unix only; elsewhere, or with no capable
+/// keygen, the fixture stays unsigned and says so. The real binary is used for
+/// setup only; the timed runs get the recording stub.
+#[cfg(unix)]
+fn test_signer(trust_dir: &Path) -> Option<Signer> {
+    use loam::seal::{sshsig, trust};
+
+    let keygen = std::path::PathBuf::from("ssh-keygen");
+    if sshsig::capability_of(&keygen) != sshsig::Capability::Available {
+        return None;
+    }
+    let report = trust::init(trust_dir, &trust::Enrolled::default(), &keygen).expect("trust init");
+    Some(Signer {
+        keygen,
+        key: trust_dir.join(trust::KEY_FILE),
+        principal: report.principal,
+    })
+}
+
+#[cfg(not(unix))]
+fn test_signer(_trust_dir: &Path) -> Option<Signer> {
+    None
+}
 
 /// Writes 500 sealed spans across 120 pages under `wiki/decisions/`, one
 /// well-formed record per span, each carrying a `blob:` evidence item over
 /// `src/evidence.txt`. Returns the total bytes of sealed span text.
-fn seed_seals(root: &Path) -> usize {
+fn seed_seals(root: &Path, signer: Option<&Signer>) -> usize {
     use loam::seal::{canon, evidence, record};
 
     let wiki = root.join("wiki");
@@ -68,6 +104,7 @@ fn seed_seals(root: &Path) -> usize {
             let content = &text.as_bytes()[marker.content.clone()];
             let canonical = String::from_utf8(canon::canonicalize(content).expect("canon"))
                 .expect("canonical text is UTF-8");
+            let signed = signer.is_some() && made < SIGNED;
             let mut item = evidence::parse("blob:src/evidence.txt").expect("blob item");
             item.git_blob = Some(git_blob.clone());
             item.sha256 = Some(loam::sha256::hex(evidence_bytes));
@@ -82,14 +119,25 @@ fn seed_seals(root: &Path) -> usize {
                 requested_level: Some("evidence".to_owned()),
                 claim: Some("a claim".to_owned()),
                 procedure_uri: "loam://seal/procedure/v1".to_owned(),
-                principal: "agent.one@local".to_owned(),
+                principal: match (signer, signed) {
+                    (Some(s), true) => s.principal.clone(),
+                    _ => "agent.one@local".to_owned(),
+                },
                 acted_on_behalf_of: None,
                 generator: record::Generator {
                     name: "loam".to_owned(),
                     version: "1.0.0".to_owned(),
                     harness: "test".to_owned(),
                 },
-                time_verified: "2026-11-20 14:30 +02:00".to_owned(),
+                // A signed record is verified as of its own stamp, which must
+                // not precede the signer's `valid-after` (today, UTC).
+                time_verified: if signed {
+                    chrono::Utc::now()
+                        .format("%Y-%m-%d %H:%M +00:00")
+                        .to_string()
+                } else {
+                    "2026-11-20 14:30 +02:00".to_owned()
+                },
                 review_by: None,
                 evidence: vec![item.to_value()],
                 redacted: Vec::new(),
@@ -97,7 +145,11 @@ fn seed_seals(root: &Path) -> usize {
                 status: None,
             })
             .expect("record builds");
-            record::write_record(&wiki, &bytes).expect("record written");
+            let id = record::write_record(&wiki, &bytes).expect("record written");
+            if let (Some(s), true) = (signer, signed) {
+                let armored = loam::seal::sshsig::sign(&s.keygen, &s.key, &bytes).expect("sign");
+                record::write_sig(&wiki, &id, armored.as_bytes()).expect("signature written");
+            }
             made += 1;
         }
     }
@@ -140,7 +192,7 @@ fn age(dir: &Path) {
 /// Pre-warms the signature and evidence entries for every record by running a
 /// full verification into the pinned cache, then drops the page entries so the
 /// only source of cold-run `unchecked` is the hash budget.
-fn prewarm_cache(root: &Path, config: &Path) {
+fn prewarm_cache(root: &Path, config: &Path, signed: usize) {
     use loam::seal::verify;
 
     let wiki = root.join("wiki");
@@ -157,10 +209,13 @@ fn prewarm_cache(root: &Path, config: &Path) {
         !cache.evidence.is_empty(),
         "evidence entries were not cached"
     );
-    // The records are unsigned, so there is no signature to verify or cache;
-    // the fast path settles them without `ssh-keygen`. The signature-cache
-    // hit path is outside this budget fixture (signing 500 records needs
-    // ssh-keygen and is platform-sensitive); the seals_counts tests cover it.
+    // The signed records' standings are cached by the full run above; the
+    // unsigned ones settle on the fast path without any signature entry.
+    assert_eq!(
+        cache.signatures.len(),
+        signed,
+        "every signed record needs a cached signature standing"
+    );
     cache.pages.clear();
     loam::seal_cache::save(&file, &cache).expect("cache rewritten");
 }
@@ -256,13 +311,21 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
 
     // 500 seals over 120 pages, a pinned config dir (trust, cache) under the
     // fixture root, and a cache pre-warmed for signatures and evidence only.
-    let sealed_bytes = seed_seals(&root);
+    let config = root.join("config");
+    fs::create_dir_all(config.join("seal")).expect("trust dir");
+    let signer = test_signer(&config.join("seal"));
+    let signed = if signer.is_some() { SIGNED } else { 0 };
+    if signer.is_none() {
+        eprintln!(
+            "state_budget: no capable ssh-keygen (or not unix); all {SEALS} records are unsigned, \
+             so the signature-cache lookup path is not exercised"
+        );
+    }
+    let sealed_bytes = seed_seals(&root, signer.as_ref());
     assert!(
         sealed_bytes as u64 > HASH_CAP,
         "sealed spans must exceed the hash cap, got {sealed_bytes}"
     );
-    let config = root.join("config");
-    fs::create_dir_all(config.join("seal")).expect("trust dir");
     fs::write(
         config.join("seal").join(loam::seal::trust::POLICY_FILE),
         loam::seal::trust::Policy {
@@ -276,7 +339,7 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
     age(&root.join("wiki/decisions"));
     age(&root.join("wiki/.seals"));
     age(&root.join("src/evidence.txt"));
-    prewarm_cache(&root, &config);
+    prewarm_cache(&root, &config, signed);
 
     // `git` and `ssh-keygen` stand-ins that record every call. The `git` stub
     // hands off to the real git so the timed run still pays for the probe;
@@ -403,6 +466,11 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
             "the seal path spawned a subprocess: {unexpected:?}"
         );
         assert_eq!(spawned.lines().count(), 3, "{spawned}");
+        // The stub ssh-keygen was never called, signed records included.
+        assert!(
+            !spawned.lines().any(|line| line.starts_with("ssh-keygen")),
+            "the fast path spawned ssh-keygen: {spawned}"
+        );
     }
 
     assert!(
