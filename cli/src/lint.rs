@@ -53,17 +53,34 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         return 1;
     }
 
-    let today = match now {
-        Some(value) => match memory::timestamp_days(&value) {
+    let bad_now = || {
+        eprintln!("loam lint: --now must be 'YYYY-MM-DD HH:MM ±HH:MM'");
+    };
+    let today = match now.as_deref() {
+        Some(value) => match memory::timestamp_days(value) {
             Some(days) => days,
             None => {
-                eprintln!("loam lint: --now must be 'YYYY-MM-DD HH:MM ±HH:MM'");
+                bad_now();
                 return 1;
             }
         },
         None => memory::today_utc(),
     };
-
+    let seal_now = match now.as_deref() {
+        // `parse_stamp` accepts a superset of `timestamp_days`, so after that
+        // gate this cannot fail unless the two parsers drift apart.
+        Some(value) => match crate::seal::policy::parse_stamp(value) {
+            Some(parsed) => parsed,
+            None => {
+                bad_now();
+                return 1;
+            }
+        },
+        None => {
+            let utc = chrono::FixedOffset::east_opt(0).expect("zero offset is valid");
+            chrono::Utc::now().with_timezone(&utc)
+        }
+    };
     let selected = |domain: &str| only.as_deref().map(|value| value == domain).unwrap_or(true);
     let mut findings = Vec::new();
 
@@ -107,6 +124,9 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     }
     if selected("memory") {
         memory::wiki_findings(workspace, &mut findings);
+    }
+    if selected("seals") {
+        crate::seal::lint::lint_findings(workspace, seal_now, &mut findings);
     }
     if selected("work") {
         memory::work_findings(workspace, today, &mut findings);
@@ -244,7 +264,7 @@ impl Finding {
 
     /// Rule prefixes are the single source of truth for which domain a finding
     /// belongs to, so no call site has to repeat it.
-    fn domain(&self) -> &'static str {
+    pub(crate) fn domain(&self) -> &'static str {
         match &self.rule[..3] {
             "GDN" => "guidance",
             "MEM" => "memory",

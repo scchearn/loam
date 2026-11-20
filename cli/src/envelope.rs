@@ -2626,6 +2626,14 @@ mod tests {
             "federation.rs",
             "main.rs",
             "provisioning.rs",
+            // Seals: `sshsig.rs` and `trust.rs` run the reader's `ssh-keygen`;
+            // `record.rs` runs git for tracked-tree detection; `evidence.rs`
+            // runs git for blob/commit resolution and reads evidence files.
+            "seal/carry.rs",
+            "seal/evidence.rs",
+            "seal/record.rs",
+            "seal/sshsig.rs",
+            "seal/trust.rs",
             "service.rs",
             "state.rs",
             "transport.rs",
@@ -2658,6 +2666,19 @@ mod tests {
             // Reads only, and only two things: the per-project peer roster that
             // decides whom a session admits, and the identity-path PEMs.
             "provisioning.rs",
+            // Seals: the signed-record store and the reader trust files.
+            "seal.rs",
+            // Attest: the page it seals and the record store it creates.
+            "seal/attest.rs",
+            "seal/carry.rs",
+            "seal/evidence.rs",
+            "seal/record.rs",
+            "seal/sshsig.rs",
+            "seal/trust.rs",
+            "seal/lint.rs",
+            "seal/verify.rs",
+            // Derived seal cache under the config dir; never reads or writes the wiki.
+            "seal_cache.rs",
             "service.rs",
             "sha256.rs",
             "state.rs",
@@ -2707,6 +2728,7 @@ mod tests {
                     "network surface introduced in {path}: {forbidden}"
                 );
             }
+            // `std::process::id` (a number) is likewise harmless.
             // `std::process::abort` and `std::process::exit` are not subprocess
             // capabilities: each ends this process, neither starts another. The
             // Windows IPC fail-safe aborts when a cancelled overlapped operation
@@ -2717,7 +2739,8 @@ mod tests {
             // subprocess-spawning `std::process` reach.
             let spawn_reach = production
                 .replace("std::process::abort", "")
-                .replace("std::process::exit", "");
+                .replace("std::process::exit", "")
+                .replace("std::process::id", "");
             if spawn_reach.contains("std::process") || spawn_reach.contains("Command::new") {
                 assert!(
                     process_files.contains(&path.as_str()),
