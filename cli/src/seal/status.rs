@@ -58,6 +58,13 @@ pub fn may_act(policy: &Policy, signer: &str, sealer: &str, level: Level) -> boo
     signer == sealer || policy::principal_ceiling(policy, signer) >= level
 }
 
+/// The level a status record's authority is judged against: what the seal
+/// asked for, capped by its sealer's policy ceiling. It does not depend on
+/// drift or evidence freshness, so a span edit cannot lower the bar.
+pub fn authority_level(policy: &Policy, requested: Level, sealer: &str) -> Level {
+    requested.min(policy::principal_ceiling(policy, sealer))
+}
+
 /// One status record that verified, ready to fold.
 #[derive(Debug, Clone)]
 pub struct Applied {
@@ -233,7 +240,14 @@ pub fn mark(ctx: &Context, request: &Request) -> Result<Marked, AttestError> {
     };
 
     let (key, principal) = signing_identity(ctx)?;
-    let base = target.base_level.unwrap_or(Level::Evidence);
+    let base = authority_level(
+        &env.trust.policy,
+        view.requested_level
+            .as_deref()
+            .and_then(Level::parse)
+            .unwrap_or(Level::Evidence),
+        &view.principal,
+    );
     let sufficient =
         requested == Mark::Dispute || may_act(&env.trust.policy, &principal, &view.principal, base);
     let recorded = if sufficient { requested } else { Mark::Dispute };
@@ -337,7 +351,7 @@ fn took_effect(report: &Report, recorded: Mark) -> bool {
 
 fn usage_text() -> i32 {
     eprintln!(
-        "Usage: loam seal mark <id> <dispute|demote|supersede|retract> --reason <text> [--to <evidence|audited>]"
+        "Usage: loam seal mark <id> <dispute|demote|supersede|retract> --reason <text> [--to <level>]"
     );
     crate::seal::EXIT_USAGE
 }

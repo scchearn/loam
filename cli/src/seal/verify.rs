@@ -559,7 +559,7 @@ impl Verifier<'_> {
                 &mut applied,
                 &self.env.trust.policy,
                 &view.principal,
-                base_level.unwrap_or(Level::Evidence),
+                status::authority_level(&self.env.trust.policy, requested, &view.principal),
             );
             evaluate(folded.lifecycle, folded.demoted_to)
         };

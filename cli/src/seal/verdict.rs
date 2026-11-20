@@ -226,6 +226,13 @@ pub fn evaluate(input: &Inputs<'_>) -> Outcome {
         return outcome(Verdict::Retracted, requested, effective, codes);
     }
 
+    // Lifecycle flags hold even when the span has drifted.
+    match input.lifecycle {
+        Lifecycle::Disputed => codes.informational.push(code::DISPUTED),
+        Lifecycle::Superseded => codes.informational.push(code::SUPERSEDED),
+        _ => {}
+    }
+
     if input.binding != Binding::Matches {
         codes.failure.push(match input.binding {
             Binding::SpanMissing => code::SPAN_MISSING,
@@ -313,11 +320,6 @@ pub fn evaluate(input: &Inputs<'_>) -> Outcome {
         if requested > level {
             codes.informational.push(code::LEVEL_ABOVE_ATTAINABLE);
         }
-    }
-    match input.lifecycle {
-        Lifecycle::Disputed => codes.informational.push(code::DISPUTED),
-        Lifecycle::Superseded => codes.informational.push(code::SUPERSEDED),
-        _ => {}
     }
 
     if stale {

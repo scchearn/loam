@@ -1955,7 +1955,12 @@ mod tests {
                 org: None,
                 harness: None,
             };
-            assert!(status::mark(&ctx, &mark("retract", "0123456789abcdef0123")).is_err());
+            // An empty wiki has no such seal, so this is a usage error; the
+            // point is that it returns an error instead of panicking.
+            assert!(matches!(
+                status::mark(&ctx, &mark("retract", "0123456789abcdef0123")).unwrap_err(),
+                AttestError::Usage(_)
+            ));
             return;
         };
         world.page_with("alpha", UNMARKED);
@@ -2100,6 +2105,47 @@ mod tests {
             status::mark(&one, &mark("bogus", &x.id)).unwrap_err(),
             AttestError::Usage(_)
         ));
+    }
+
+    /// Authority does not shrink when a span drifts: a low-ceiling signer
+    /// cannot edit an audited span and then retract the seal, and a dispute
+    /// on a drifted seal is written, verifies and is reported.
+    #[test]
+    fn status_records_on_drifted_seal() {
+        let world = World::new();
+        let Some(one) = world.attest_context() else {
+            return;
+        };
+        world.page_with("alpha", UNMARKED);
+        let mut audited = request(&["capture:run.log"]);
+        audited.level = "audited".to_owned();
+        let x = attest::attest(&one, &audited).unwrap();
+        let principal_one = x.report.signer.clone().unwrap();
+        world.policy(&[principal_one.as_str()]);
+        share_trust(&world, &one);
+        let mut two = second_signer(&world, &one);
+        share_trust(&world, &two);
+
+        // Edit the sealed span: the seal drifts.
+        world.page_with(
+            "alpha",
+            "# Alpha\n\nTLS now tries something else.\nThen the system store. ^s-trust-order\n\nTail.\n",
+        );
+        two.now = super::policy::parse_stamp("2026-11-21 11:00 +02:00").unwrap();
+        let done = status::mark(&two, &mark("retract", &x.id)).unwrap();
+        assert_eq!(done.recorded, Mark::Dispute);
+        assert!(done.downgraded);
+        let report = report_for(&world, "2026-11-21 11:05 +02:00", &x.id);
+        assert_eq!(report.outcome.verdict, Verdict::Drifted);
+        assert!(report.is_disputed());
+
+        // The sealer's own retract still takes effect on the drifted seal.
+        let mut one = one;
+        one.now = super::policy::parse_stamp("2026-11-21 11:10 +02:00").unwrap();
+        let done = status::mark(&one, &mark("retract", &x.id)).unwrap();
+        assert_eq!(done.recorded, Mark::Retract);
+        let report = report_for(&world, "2026-11-21 11:15 +02:00", &x.id);
+        assert_eq!(report.outcome.verdict, Verdict::Retracted);
     }
 
     /// A status record nobody trusts, or that names no signature, changes nothing.
