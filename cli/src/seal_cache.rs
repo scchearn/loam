@@ -944,6 +944,25 @@ mod tests {
         assert_eq!((counts.citable, counts.unchecked), (1, 0), "{counts:?}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_root_reached_through_an_alias_still_agrees_with_the_fast_path() {
+        let fx = Fx::new("alias");
+        fx.seal("alpha", "s-first-claim", "Body.", &["file:run.log"], None);
+        fx.age();
+        let alias = fx.root.parent().unwrap().join(format!(
+            "loam-alias-{}",
+            fx.root.file_name().unwrap().to_string_lossy()
+        ));
+        std::os::unix::fs::symlink(&fx.root, &alias).unwrap();
+        let mut env = fx.env();
+        env.repo_root = crate::seal::verify::normalized_root(alias.clone());
+        verify::verify_overlay(&env, &verify::Overlay::default(), &fx.only_id()).unwrap();
+        let _ = fs::remove_file(&alias);
+        let counts = fast(&fx);
+        assert_eq!((counts.citable, counts.unchecked), (1, 0), "{counts:?}");
+    }
+
     #[test]
     fn a_hypothetical_overlay_never_fills_the_cache() {
         let fx = Fx::new("overlay");
@@ -1501,6 +1520,10 @@ pub(crate) mod fixture {
             let root =
                 std::env::temp_dir().join(format!("loam-sealcache-{label}-{}-{n}", now_ns()));
             let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            // One spelling of the root (macOS /var -> /private/var, Windows 8.3
+            // names) so fixture paths and normalized evidence keys agree.
+            let root = crate::seal::verify::normalized_root(root);
             let wiki = root.join("wiki");
             let trust_dir = root.join("config").join("seal");
             let cache_dir = root.join("config").join("cache").join("seals");
@@ -1708,7 +1731,7 @@ pub(crate) mod fixture {
                 crate::seal::policy::parse_stamp(NOW).unwrap(),
             )
             .unwrap();
-            env.repo_root = self.root.clone();
+            env.repo_root = crate::seal::verify::normalized_root(self.root.clone());
             env.keygen = self
                 .bin
                 .clone()

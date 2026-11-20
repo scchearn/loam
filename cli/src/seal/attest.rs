@@ -565,7 +565,7 @@ pub fn attest(ctx: &Context, request: &Request) -> Result<Attested, AttestError>
 
     let mut env = Env::load(&ctx.wiki, Some(ctx.trust_dir.clone()), ctx.now)
         .map_err(|e| refuse(format!("cannot load trust: {e}")))?;
-    env.repo_root = ctx.repo_root.clone();
+    env.repo_root = verify::normalized_root(ctx.repo_root.clone());
     env.keygen = ctx.keygen.clone();
 
     // 3. Evidence: every failure, listed together.

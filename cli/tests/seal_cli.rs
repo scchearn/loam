@@ -499,6 +499,27 @@ mod attest {
     }
 
     #[test]
+    fn state_fast_is_citable_right_after_attest_alone() {
+        let Some(ws) = Workspace::new("fastcache") else {
+            return;
+        };
+        fs::write(ws.dir.join("wiki").join("index.md"), "# Index\n").unwrap();
+        ws.trust_init();
+        let output = ws.attest(&["--evidence", "file:run.log"]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let state = ws.run(&["state", "--fast", ws.dir.to_str().unwrap()]);
+        assert_eq!(state.status.code(), Some(0), "{state:?}");
+        let parsed = json::parse(&stdout(&state)).unwrap();
+        let seals = parsed.get("seals").expect("seals present");
+        let number = |key: &str| match seals.get(key) {
+            Some(Value::Number(n)) => n.parse::<u64>().unwrap(),
+            other => panic!("{key}: {other:?}"),
+        };
+        assert_eq!(number("citable"), 1, "{seals:?}");
+        assert_eq!(number("unchecked"), 0, "{seals:?}");
+    }
+
+    #[test]
     fn attest_inserts_markers_writes_the_record_and_verifies_citable() {
         let Some(ws) = Workspace::new("ok") else {
             return;

@@ -383,7 +383,7 @@ pub fn carry(ctx: &Context, request: &Request) -> Result<Carried, AttestError> {
 
     let mut env = Env::load(&ctx.wiki, Some(ctx.trust_dir.clone()), ctx.now)
         .map_err(|e| refuse(format!("cannot load trust: {e}")))?;
-    env.repo_root = ctx.repo_root.clone();
+    env.repo_root = verify::normalized_root(ctx.repo_root.clone());
     env.keygen = ctx.keygen.clone();
 
     let reports = verify::verify_all(&env).map_err(|e| refuse(e.to_string()))?;

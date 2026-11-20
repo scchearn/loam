@@ -114,11 +114,26 @@ impl Env {
 /// walk-up (`\\?\C:\x` once canonicalized) must agree or every
 /// file/blob/commit seal is `unchecked` after a full run. Falls back to the
 /// raw path when it cannot be canonicalized.
-fn normalized_root(path: PathBuf) -> PathBuf {
+pub(crate) fn normalized_root(path: PathBuf) -> PathBuf {
     match std::fs::canonicalize(&path) {
         Ok(canonical) => crate::enrollment::dos_compatible(canonical),
         Err(_) => path,
     }
+}
+
+/// Digest of the repository-root `.gitattributes` and `.git/info/attributes`
+/// (absent files hash as empty), so a changed filter or eol rule invalidates
+/// cached blob results. Core autocrlf in git config is not covered.
+fn attributes_digest(repo_root: &Path) -> String {
+    let mut bytes = Vec::new();
+    for path in [
+        repo_root.join(".gitattributes"),
+        repo_root.join(".git").join("info").join("attributes"),
+    ] {
+        bytes.extend_from_slice(&fs::read(&path).unwrap_or_default());
+        bytes.push(0);
+    }
+    crate::sha256::hex(&bytes)
 }
 
 fn load_trust(trust_dir: Option<&Path>) -> Result<(Trust, String), String> {
@@ -1220,7 +1235,20 @@ impl Verifier<'_> {
         let stamp = if item.kind == Kind::Commit {
             seal_cache::refs_fingerprint(&ctx.repo_root)
         } else {
-            evidence::local_input(item, ctx).and_then(|path| seal_cache::file_fingerprint(&path))
+            evidence::local_input(item, ctx)
+                .and_then(|path| seal_cache::file_fingerprint(&path))
+                .map(|(fingerprint, newest)| {
+                    // `git hash-object` also depends on attributes (filters,
+                    // eol), so a blob result is stamped with their digest too.
+                    if item.kind == Kind::Blob {
+                        (
+                            format!("{fingerprint}|attr:{}", attributes_digest(&ctx.repo_root)),
+                            newest,
+                        )
+                    } else {
+                        (fingerprint, newest)
+                    }
+                })
         };
         if ctl.fast {
             if let Some((fingerprint, _)) = &stamp {
