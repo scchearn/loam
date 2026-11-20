@@ -160,12 +160,15 @@ fn closure(renames: &[Rename]) -> Vec<Rename> {
 /// `base_pages` are the markdown paths that existed when the seal was
 /// committed. A retargeted link must have named exactly one of them, and that
 /// page must be the one renamed: a same-named page elsewhere never justifies
-/// the substitution.
+/// the substitution. `post_pages` are the markdown paths in the index now
+/// (staged renames included); the new target must name exactly one of them,
+/// and it must be the renamed page's new path.
 fn prove(
     sealed: &str,
     live: &str,
     renames: &[Rename],
     base_pages: &[String],
+    post_pages: &[String],
 ) -> Result<Vec<(String, String)>, String> {
     let changes = link_changes(sealed, live)?;
     let pairs = closure(renames);
@@ -177,10 +180,17 @@ fn prove(
                 named.len()
             ));
         }
+        let landed: Vec<&String> = post_pages.iter().filter(|p| names(to, p)).collect();
+        if landed.len() > 1 {
+            return Err(format!(
+                "[[{to}]] is ambiguous after the rename: {} pages answer to that name, so it need not mean the renamed page",
+                landed.len()
+            ));
+        }
         let explained = pairs.iter().any(|rename| {
             names(from, &rename.old)
-                && names(to, &rename.new)
                 && named.first().is_some_and(|p| **p == rename.old)
+                && landed.first().is_some_and(|p| **p == rename.new)
         });
         if !explained {
             return Err(format!(
@@ -508,7 +518,23 @@ pub fn carry(ctx: &Context, request: &Request) -> Result<Carried, AttestError> {
         .map(str::to_owned)
         .collect();
 
-    let retargets = prove(&bound_content, &live, &renames, &base_pages).map_err(|why| {
+    // The markdown pages in the index now, staged renames included.
+    let mut index_args = vec!["ls-files", "-z", "--full-name"];
+    if let Some(rel) = wiki_rel.as_deref() {
+        index_args.extend(["--", rel]);
+    }
+    let index = git(repo, &index_args).map_err(refuse)?;
+    if !index.ok() {
+        return Err(refuse(index.error("ls-files")));
+    }
+    let post_pages: Vec<String> = index
+        .stdout
+        .split('\0')
+        .filter(|p| p.ends_with(".md"))
+        .map(str::to_owned)
+        .collect();
+
+    let retargets = prove(&bound_content, &live, &renames, &base_pages, &post_pages).map_err(|why| {
         refuse(format!(
             "not a pure link retarget: {why}; if the rename is not committed or staged yet, commit or stage it (git add -A) and run carry again, otherwise re-seal with loam seal attest {current}#^{anchor} … --parent {}",
             request.id
@@ -746,11 +772,13 @@ mod tests {
     fn proves_only_renamed_targets() {
         let renames = [rename("wiki/topics/old.md", "wiki/topics/new.md")];
         let base = pages(&["wiki/topics/old.md"]);
+        let post = pages(&["wiki/topics/new.md"]);
         let got = prove(
             "See [[old]] and [[topics/old|al]].\n",
             "See [[new]] and [[topics/new|al]].\n",
             &renames,
             &base,
+            &post,
         )
         .unwrap();
         assert_eq!(
@@ -773,7 +801,8 @@ mod tests {
                     "See [[old]] and [[topics/old|al]].\n",
                     live,
                     &renames,
-                    &base
+                    &base,
+                    &post
                 )
                 .is_err(),
                 "{live}"
@@ -785,11 +814,12 @@ mod tests {
             "[[topics/new]]\n",
             &[rename("wiki/other/old.md", "wiki/other/new.md")],
             &pages(&["wiki/other/old.md"]),
+            &pages(&["wiki/other/new.md", "wiki/topics/new.md"]),
         )
         .is_err());
         // Identical text carries nothing.
         assert_eq!(
-            prove("[[a]]\n", "[[a]]\n", &renames, &base).unwrap(),
+            prove("[[a]]\n", "[[a]]\n", &renames, &base, &post).unwrap(),
             vec![]
         );
     }
@@ -803,16 +833,30 @@ mod tests {
         let renames = [rename("wiki/x/old.md", "wiki/x/new.md")];
         // Two pages answer to `old`: which one the link meant is unknowable.
         let both = pages(&["wiki/x/old.md", "wiki/y/old.md"]);
-        let why = prove("[[old]]\n", "[[new]]\n", &renames, &both).unwrap_err();
+        let post = pages(&["wiki/x/new.md", "wiki/y/old.md"]);
+        let why = prove("[[old]]\n", "[[new]]\n", &renames, &both, &post).unwrap_err();
         assert!(why.contains("ambiguous"), "{why}");
         // Only the other page existed: the rename is of a page the link never named.
         let other = pages(&["wiki/y/old.md"]);
-        assert!(prove("[[old]]\n", "[[new]]\n", &renames, &other).is_err());
+        assert!(prove("[[old]]\n", "[[new]]\n", &renames, &other, &post).is_err());
         // A path-qualified link disambiguates.
-        assert!(prove("[[x/old]]\n", "[[x/new]]\n", &renames, &both).is_ok());
-        assert!(prove("[[y/old]]\n", "[[x/new]]\n", &renames, &both).is_err());
+        assert!(prove("[[x/old]]\n", "[[x/new]]\n", &renames, &both, &post).is_ok());
+        assert!(prove("[[y/old]]\n", "[[x/new]]\n", &renames, &both, &post).is_err());
         // A link to a page that did not exist at the seal is never explained.
-        assert!(prove("[[old]]\n", "[[new]]\n", &renames, &[]).is_err());
+        assert!(prove("[[old]]\n", "[[new]]\n", &renames, &[], &post).is_err());
+    }
+
+    #[test]
+    fn refuses_a_new_target_that_is_ambiguous_after_the_rename() {
+        let renames = [rename("wiki/x/old.md", "wiki/x/new.md")];
+        let base = pages(&["wiki/x/old.md", "wiki/y/new.md"]);
+        let post = pages(&["wiki/x/new.md", "wiki/y/new.md"]);
+        let why = prove("[[old]]\n", "[[new]]\n", &renames, &base, &post).unwrap_err();
+        assert!(why.contains("ambiguous"), "{why}");
+        // A path-qualified new target names exactly the renamed page.
+        assert!(prove("[[old]]\n", "[[x/new]]\n", &renames, &base, &post).is_ok());
+        // ...and not the other same-named page.
+        assert!(prove("[[old]]\n", "[[y/new]]\n", &renames, &base, &post).is_err());
     }
 
     #[test]
@@ -844,9 +888,11 @@ mod tests {
             rename("wiki/b.md", "wiki/c.md"),
         ];
         let base = pages(&["wiki/a.md"]);
-        assert!(prove("[[a]]\n", "[[c]]\n", &renames, &base).is_ok());
-        assert!(prove("[[a]]\n", "[[b]]\n", &renames, &base).is_ok());
-        assert!(prove("[[c]]\n", "[[a]]\n", &renames, &base).is_err());
+        let post = pages(&["wiki/c.md"]);
+        assert!(prove("[[a]]\n", "[[c]]\n", &renames, &base, &post).is_ok());
+        // The intermediate page no longer exists, so it is not a valid target.
+        assert!(prove("[[a]]\n", "[[b]]\n", &renames, &base, &post).is_err());
+        assert!(prove("[[c]]\n", "[[a]]\n", &renames, &base, &post).is_err());
     }
 
     #[test]
