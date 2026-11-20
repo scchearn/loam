@@ -237,6 +237,17 @@ elif ! grep -Fq 'Do not add individual code pages to root `index.md`.' "$lint_hu
   fail "memory lint code-hub reference must forbid direct root entries"
 fi
 
+seals_ref="skills/loam-using/references/seals.md"
+if [ ! -f "$seals_ref" ]; then
+  fail "seals single-definition reference is missing: $seals_ref"
+else
+  grep -Fq 'does not mean' "$seals_ref" || fail "seals reference must say what a seal does not mean"
+  grep -Fq "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <Skill root>/scripts/seal-canon.ps1" "$seals_ref" \
+    || fail "seals reference must pin the PowerShell floor form"
+fi
+grep -Fq 'seals_attention' skills/loam-using/references/runtime.md \
+  || fail "runtime reference must register the seals_attention hint"
+
 if [ "$failures" -ne 0 ]; then
   exit 1
 fi

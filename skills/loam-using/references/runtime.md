@@ -77,8 +77,8 @@ Skill-relevant subcommands (all run through `<native-runtime-command>`):
 - `state [--fast] <workspace-root>` — workspace state JSON: `wiki_root`,
   qmd readiness, checkpoints, drift, signals. `--fast` skips expensive
   aggregation; prefer the injected block before re-running it.
-- `lint [--only guidance|markdown|memory|work] [--fix] <workspace-root>` —
-  four-domain lint; default runs all four, `--only` runs exactly one. `--fix`
+- `lint [--only guidance|markdown|memory|seals|work] [--fix] <workspace-root>` —
+  five-domain lint; default runs all five, `--only` runs exactly one. `--fix`
   regenerates the `AGENTS.md` `loam:memory-map` region and writes nothing
   outside its markers.
 - `datecheck <check|fix> <wiki-root> [--offset +HH:MM]` — timestamp lint and
@@ -179,7 +179,8 @@ For each hint, emit one Markdown list item in this form:
 Rules:
 
 - **`plan_reconcilable`** — aggregate workflow hint for completed plans with open acceptance criteria; route listed plans to `/loam::amending-plan`.
-- **Suppress satisfied hints.** Skip any hint whose `kind` your skill body names as one it satisfies. A skill may satisfy more than one (e.g. `linting-memory` satisfies `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, and `legacy_structure_pending`); suppress all of them.
+- **`seals_attention`** — aggregate maintenance hint raised only when non-citable seals exist; command `lint --only seals`, run as `<native-runtime-command> lint --only seals`. Satisfied by `/loam::linting-memory`; definitions in `references/seals.md`.
+- **Suppress satisfied hints.** Skip any hint whose `kind` your skill body names as one it satisfies. A skill may satisfy more than one (e.g. `linting-memory` satisfies `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, `legacy_structure_pending`, and `seals_attention`); suppress all of them.
 - **Only surface hints with a non-null `command`.** Hints without a command (e.g. `retrieval_not_ready`) are informational; mention them only if the user asks for state.
 - **Do not auto-run the suggested skill.** Hints are advisory; the user decides whether to act. End your turn or hand back to the user after surfacing.
 - **Empty `hints[]` → say nothing.** Do not invent suggestions or pad the report.
