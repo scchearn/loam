@@ -8,8 +8,8 @@
 # of the seal span `<anchor>` (a leading `^` or `#` is accepted), or with
 # --digest only the lowercase sha256 hex of those bytes.
 #
-# loam.canon/v1: strict UTF-8; CRLF becomes LF (a file with a lone CR is refused); trailing spaces and
-# tabs are stripped per line; leading and trailing blank lines are dropped;
+# loam.canon/v1: strict UTF-8; CRLF becomes LF (a file with a lone CR is refused); trailing
+# spaces and tabs are stripped per line; leading and trailing blank lines are dropped;
 # exactly one final LF; an all-blank span is the empty byte string. No NFC,
 # no reflow, no re-escaping.
 #
@@ -26,8 +26,10 @@
 # mentioned in a file holding one the span is refused. So is any marker or
 # question line carrying whitespace beyond space and tab (form feed, NBSP, U+2000..): the runtime
 # trims Unicode white space, this script does not. NUL bytes are refused
-# on purpose as invalid text. So is any lone CR (a CR not followed by LF). The floor may refuse a span the runtime
-# accepts; it must never print a digest the runtime would not.
+# on purpose as invalid text. So is any lone CR (a CR not followed by LF):
+# generated pages showed the runtime picking a different span than a
+# line-based reader once lone CRs sit near marker lines, so the floor fails
+# closed. The floor may refuse a span the runtime accepts; it must never print a digest the runtime would not.
 #
 # Exit: 0 ok, 2 usage, missing file, missing/ambiguous anchor, invalid UTF-8.
 # Needs only POSIX sh and awk, plus sha256sum or `shasum -a 256` for --digest.
@@ -78,7 +80,7 @@ if [ "$((total + 0))" -ne "$((clean + 0))" ]; then
 fi
 
 # A lone CR at end of file is invisible to awk records; check the last byte.
-lastbyte=$(tail -c 1 "$file" | od -An -tx1 | tr -d ' \n')
+lastbyte=$(tail -c 1 <"$file" | od -An -tx1 | tr -d ' \n')
 if [ "$lastbyte" = "0d" ]; then
     echo "seal-canon: $file contains a lone CR; use the loam runtime" >&2
     exit 2
@@ -315,7 +317,7 @@ END {
     }
     for (i = first; first && i <= last; i++) printf "%s\n", lines[i]
 }
-' "$file"
+' <"$file"
 }
 
 report() {

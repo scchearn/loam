@@ -341,6 +341,30 @@ fn failures_exit_2_with_nothing_on_stdout() {
 }
 
 #[test]
+fn sh_floor_reads_files_named_like_awk_assignments_or_options() {
+    let sh = floors().iter().find(|floor| floor.label == "sh");
+    let Some(sh) = sh else { return };
+    let dir = TempDir::new("odd-names");
+    let page = "<!-- loam:seal s-floor-span -->\nbody\n<!-- /loam:seal -->\n";
+    for name in ["a=b.md", "-dash.md"] {
+        std::fs::write(dir.0.join(name), page).unwrap();
+        let output = Command::new(&sh.program)
+            .arg(script("seal-canon.sh"))
+            .args(["--digest", name, ANCHOR])
+            .current_dir(&dir.0)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{name}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            loam_hash(&dir.0.join(name)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn missing_arguments_exit_2() {
     for floor in floors() {
         let output = floor.exec(&floor.prefix.clone());
