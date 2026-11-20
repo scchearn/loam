@@ -50,12 +50,57 @@ pub struct Verified {
     pub fingerprint: Option<String>,
 }
 
-/// `LOAM_SSH_KEYGEN` when set and non-empty, else `ssh-keygen` from PATH.
-pub fn keygen_binary() -> PathBuf {
-    match std::env::var("LOAM_SSH_KEYGEN") {
-        Ok(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
-        _ => PathBuf::from("ssh-keygen"),
+/// Where Git for Windows bundles an OpenSSH new enough for SSHSIG verification.
+#[cfg(windows)]
+const GIT_FOR_WINDOWS_KEYGEN: &str = r"C:\Program Files\Git\usr\bin\ssh-keygen.exe";
+
+/// Candidate verifiers in preference order: `LOAM_SSH_KEYGEN` (when set and
+/// non-empty), `ssh-keygen` from PATH, then (Windows only) Git for Windows'
+/// bundled binary. The Windows in-box OpenSSH usually lacks `verify-time` and
+/// `find-principals` and sits first on PATH, hence the last rung.
+fn keygen_candidates_for(env_value: Option<&str>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(value) = env_value.map(str::trim).filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(value));
     }
+    candidates.push(PathBuf::from("ssh-keygen"));
+    #[cfg(windows)]
+    candidates.push(PathBuf::from(GIT_FOR_WINDOWS_KEYGEN));
+    candidates
+}
+
+/// The first candidate for which `capable` holds; when none is, the first
+/// candidate, so errors name what the operator configured.
+fn select_keygen(candidates: &[PathBuf], capable: impl Fn(&Path) -> bool) -> PathBuf {
+    candidates
+        .iter()
+        .find(|bin| capable(bin))
+        .or_else(|| candidates.first())
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("ssh-keygen"))
+}
+
+/// The first capable `ssh-keygen` (see [`keygen_candidates_for`]). Capability
+/// is probed once per binary and the choice cached per process for a given
+/// `LOAM_SSH_KEYGEN` value. With no capable binary the first candidate is
+/// returned and callers see [`Capability::Unavailable`].
+pub fn keygen_binary() -> PathBuf {
+    static CHOSEN: Mutex<Vec<(Option<String>, PathBuf)>> = Mutex::new(Vec::new());
+    let env_value = std::env::var("LOAM_SSH_KEYGEN").ok();
+    {
+        let cache = CHOSEN.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, bin)) = cache.iter().find(|(key, _)| *key == env_value) {
+            return bin.clone();
+        }
+    }
+    let chosen = select_keygen(&keygen_candidates_for(env_value.as_deref()), |bin| {
+        capability_of(bin) == Capability::Available
+    });
+    CHOSEN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push((env_value, chosen.clone()));
+    chosen
 }
 
 /// Capability of the configured binary, probed once per binary path.
@@ -375,19 +420,7 @@ impl Drop for Scratch {
 /// then PATH. `None` means the test must assert the degraded path instead.
 #[cfg(test)]
 fn keygen_candidates() -> Vec<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(value) = std::env::var("LOAM_SSH_KEYGEN") {
-        if !value.trim().is_empty() {
-            candidates.push(PathBuf::from(value.trim()));
-        }
-    }
-    if cfg!(windows) {
-        candidates.push(PathBuf::from(
-            r"C:\Program Files\Git\usr\bin\ssh-keygen.exe",
-        ));
-    }
-    candidates.push(PathBuf::from("ssh-keygen"));
-    candidates
+    keygen_candidates_for(std::env::var("LOAM_SSH_KEYGEN").ok().as_deref())
 }
 
 /// Any `ssh-keygen` that can generate an ed25519 key and print its public half
@@ -465,6 +498,48 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_prefers_first_capable_candidate() {
+        let a = PathBuf::from("a");
+        let b = PathBuf::from("b");
+        let c = PathBuf::from("c");
+        let all = [a.clone(), b.clone(), c.clone()];
+        assert_eq!(select_keygen(&all, |_| true), a);
+        assert_eq!(select_keygen(&all, |p| p != Path::new("a")), b);
+        assert_eq!(select_keygen(&all, |p| p == Path::new("c")), c);
+        assert_eq!(select_keygen(&all, |_| false), a, "none capable: first");
+        assert_eq!(select_keygen(&[], |_| true), PathBuf::from("ssh-keygen"));
+    }
+
+    #[test]
+    fn candidate_order_is_env_then_path_then_git() {
+        let with_env = keygen_candidates_for(Some(" /x/kg "));
+        assert_eq!(with_env[0], PathBuf::from("/x/kg"));
+        assert_eq!(with_env[1], PathBuf::from("ssh-keygen"));
+        assert_eq!(
+            keygen_candidates_for(Some("  "))[0],
+            PathBuf::from("ssh-keygen")
+        );
+        assert_eq!(keygen_candidates_for(None)[0], PathBuf::from("ssh-keygen"));
+        #[cfg(windows)]
+        assert_eq!(
+            keygen_candidates_for(None).last().unwrap(),
+            &PathBuf::from(GIT_FOR_WINDOWS_KEYGEN)
+        );
+    }
+
+    #[test]
+    fn stub_binaries_are_skipped_for_a_capable_one() {
+        let Some(real) = keygen_for_tests() else {
+            return;
+        };
+        let dir = tmp("select");
+        let stub = test_support::stub_without_y(dir.path());
+        let capable = |bin: &Path| capability_of(bin) == Capability::Available;
+        assert_eq!(select_keygen(&[stub.clone(), real.clone()], capable), real);
+        assert_eq!(select_keygen(std::slice::from_ref(&stub), capable), stub);
+    }
 
     fn tmp(label: &str) -> Scratch {
         Scratch::new(label).unwrap()

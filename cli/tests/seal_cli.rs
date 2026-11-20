@@ -382,19 +382,47 @@ mod attest {
     const PAGE: &str =
         "# Alpha\n\nBundled rung first.\nThen the system store. ^s-rung-order\n\nTail.\n";
 
-    struct Workspace(PathBuf);
+    /// The first capable `ssh-keygen`: `LOAM_SSH_KEYGEN`, PATH, then Git for
+    /// Windows' bundled one (the Windows in-box OpenSSH lacks verify-time).
+    fn capable_keygen() -> Option<PathBuf> {
+        static FOUND: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+        FOUND
+            .get_or_init(|| {
+                let mut candidates = Vec::new();
+                if let Ok(value) = std::env::var("LOAM_SSH_KEYGEN") {
+                    if !value.trim().is_empty() {
+                        candidates.push(PathBuf::from(value.trim()));
+                    }
+                }
+                candidates.push(PathBuf::from("ssh-keygen"));
+                if cfg!(windows) {
+                    candidates.push(PathBuf::from(
+                        r"C:\Program Files\Git\usr\bin\ssh-keygen.exe",
+                    ));
+                }
+                candidates
+                    .into_iter()
+                    .find(|bin| sshsig::capability_of(bin) == Capability::Available)
+            })
+            .clone()
+    }
+
+    struct Workspace {
+        dir: PathBuf,
+        keygen: PathBuf,
+    }
 
     impl Workspace {
         /// `None` when this machine has no ssh-keygen able to sign (the
         /// CI legs that must have one set `LOAM_REQUIRE_SSHSIG=1`).
         fn new(label: &str) -> Option<Workspace> {
-            if sshsig::capability() != Capability::Available {
+            let Some(keygen) = capable_keygen() else {
                 assert!(
                     std::env::var("LOAM_REQUIRE_SSHSIG").map_or(true, |v| v != "1"),
                     "LOAM_REQUIRE_SSHSIG=1 but no capable ssh-keygen was found"
                 );
                 return None;
-            }
+            };
             let dir = std::env::temp_dir()
                 .join(format!("loam-seal-attest-{label}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
@@ -402,20 +430,21 @@ mod attest {
             fs::create_dir_all(dir.join("config")).unwrap();
             fs::write(dir.join("run.log"), b"all tests pass").unwrap();
             fs::write(dir.join("wiki").join("alpha.md"), PAGE).unwrap();
-            Some(Workspace(dir))
+            Some(Workspace { dir, keygen })
         }
 
         fn page(&self) -> PathBuf {
-            self.0.join("wiki").join("alpha.md")
+            self.dir.join("wiki").join("alpha.md")
         }
 
         fn run(&self, args: &[&str]) -> Output {
             Command::new(env!("CARGO_BIN_EXE_loam"))
                 .args(args)
-                .current_dir(&self.0)
+                .current_dir(&self.dir)
                 .env("LOAM_WORKSPACES", "off")
-                .env("LOAM_CONFIG_DIR", self.0.join("config"))
+                .env("LOAM_CONFIG_DIR", self.dir.join("config"))
                 .env("LOAM_HARNESS", "cli-test")
+                .env("LOAM_SSH_KEYGEN", &self.keygen)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env(
                     "GIT_CONFIG_GLOBAL",
@@ -449,7 +478,7 @@ mod attest {
     impl Drop for Workspace {
         fn drop(&mut self) {
             for _ in 0..10 {
-                if fs::remove_dir_all(&self.0).is_ok() {
+                if fs::remove_dir_all(&self.dir).is_ok() {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -466,7 +495,7 @@ mod attest {
     }
 
     fn seals_exist(ws: &Workspace) -> bool {
-        Path::new(&ws.0.join("wiki").join(".seals")).exists()
+        Path::new(&ws.dir.join("wiki").join(".seals")).exists()
     }
 
     #[test]
@@ -488,7 +517,7 @@ mod attest {
             Some("citable")
         );
 
-        let records = ws.0.join("wiki/.seals/records");
+        let records = ws.dir.join("wiki/.seals/records");
         let bytes = fs::read(records.join(format!("{id}.json"))).unwrap();
         assert_eq!(id, loam::sha256::hex(&bytes)[..20]);
         assert!(records.join(format!("{id}.json.sig")).is_file());
@@ -539,7 +568,7 @@ mod attest {
             .to_owned();
         assert_ne!(id, next);
         let text =
-            fs::read_to_string(ws.0.join(format!("wiki/.seals/records/{next}.json"))).unwrap();
+            fs::read_to_string(ws.dir.join(format!("wiki/.seals/records/{next}.json"))).unwrap();
         assert!(text.contains(&format!(
             "\"parent\":{{\"id\":\"{id}\",\"verdict\":\"citable\"}}"
         )));

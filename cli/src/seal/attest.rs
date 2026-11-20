@@ -676,7 +676,11 @@ pub fn attest(ctx: &Context, request: &Request) -> Result<Attested, AttestError>
                 return refuse(format!("{why}; and the page could not be restored: {e}"));
             }
         }
-        refuse(format!("{why}; page restored"))
+        if edited {
+            refuse(format!("{why}; page restored"))
+        } else {
+            refuse(why)
+        }
     };
     // Captures are content-addressed, not records: if a later write fails,
     // newly stored capture files stay behind harmlessly. Two concurrent

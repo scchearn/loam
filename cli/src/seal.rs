@@ -1325,20 +1325,14 @@ mod tests {
             Sig::Raw("-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n"),
         );
 
-        let previous = std::env::var_os("LOAM_SSH_KEYGEN");
-        std::env::set_var("LOAM_SSH_KEYGEN", &stub);
         let env = Env::load(
             &world.wiki,
             Some(world.trust_dir.clone()),
             super::policy::parse_stamp(NOW).unwrap(),
         );
-        match previous {
-            Some(value) => std::env::set_var("LOAM_SSH_KEYGEN", value),
-            None => std::env::remove_var("LOAM_SSH_KEYGEN"),
-        }
         let mut env = env.unwrap();
         env.repo_root = world.root.clone();
-        assert_eq!(env.keygen, stub, "LOAM_SSH_KEYGEN selects the verifier");
+        env.keygen = stub;
 
         let reports = verify::verify_all(&env).unwrap();
         let report = &reports[0];
