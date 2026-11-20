@@ -287,8 +287,16 @@ fn tracked_verdict(out: &GitOut) -> Result<bool, String> {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<GitOut, String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    // Tests must not inherit a developer's git config.
+    #[cfg(test)]
+    command.env("GIT_CONFIG_NOSYSTEM", "1").env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    );
+    let output = command
         .args([
+            "--literal-pathspecs",
             "-c",
             "core.quotepath=false",
             "-c",
@@ -515,6 +523,8 @@ pub fn carry(ctx: &Context, request: &Request) -> Result<Carried, AttestError> {
     // The markdown pages that existed when the seal was committed.
     let mut tree_args = vec!["ls-tree", "-r", "-z", "--name-only", "--full-name", &base];
     let wiki_rel = relative_to(repo, &ctx.wiki);
+    // An empty rel means the wiki is the toplevel: git rejects `-- ""`.
+    let wiki_rel = wiki_rel.filter(|rel| !rel.is_empty());
     if let Some(rel) = wiki_rel.as_deref() {
         tree_args.extend(["--", rel]);
     }

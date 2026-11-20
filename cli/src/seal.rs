@@ -2218,23 +2218,28 @@ mod tests {
         }
     }
 
+    /// Degraded path: with no capable ssh-keygen, carry must refuse, not panic.
+    fn assert_carry_refuses_without_keygen(world: &World) {
+        assert!(world.bin.is_none(), "keygen present but no context");
+        let ctx = attest::Context {
+            wiki: world.wiki.clone(),
+            repo_root: world.root.clone(),
+            trust_dir: world.trust_dir.clone(),
+            keygen: world.root.join("no-such-keygen"),
+            now: super::policy::parse_stamp(NOW).unwrap(),
+            org: None,
+            harness: None,
+        };
+        assert!(carry::carry(&ctx, &carry_request("0123456789abcdef0123")).is_err());
+    }
+
     /// AC-S11: a git-renamed link target is carried, a semantic edit is
     /// refused, and an untracked page is refused with the re-seal hint.
     #[test]
     fn carry() {
         let world = World::new();
         let Some(mut one) = world.attest_context() else {
-            // No capable ssh-keygen: carry must refuse, not panic.
-            let ctx = attest::Context {
-                wiki: world.wiki.clone(),
-                repo_root: world.root.clone(),
-                trust_dir: world.trust_dir.clone(),
-                keygen: world.root.join("no-such-keygen"),
-                now: super::policy::parse_stamp(NOW).unwrap(),
-                org: None,
-                harness: None,
-            };
-            assert!(carry::carry(&ctx, &carry_request("0123456789abcdef0123")).is_err());
+            assert_carry_refuses_without_keygen(&world);
             return;
         };
         world.init_repo();
@@ -2409,7 +2414,7 @@ mod tests {
     fn carry_untracked_wiki_outside_git() {
         let world = World::new();
         let Some(mut one) = world.attest_context() else {
-            assert!(world.bin.is_none(), "keygen present but no context");
+            assert_carry_refuses_without_keygen(&world);
             return;
         };
         world.page_with("topics/old-name", "# Old name\n\nTarget page.\n");
@@ -2425,13 +2430,75 @@ mod tests {
         );
     }
 
+    /// A wiki kept in its own repository (wiki is the git toplevel) carries.
+    #[test]
+    fn carry_wiki_is_its_own_repo() {
+        let world = World::new();
+        let Some(mut one) = world.attest_context() else {
+            assert_carry_refuses_without_keygen(&world);
+            return;
+        };
+        let wiki_git = |args: &[&str]| git(&world.wiki, args);
+        wiki_git(&["init", "-q"]);
+        wiki_git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        fs::write(world.wiki.join("run.log"), b"all tests pass").unwrap();
+        one.repo_root = world.wiki.clone();
+        world.page_with("topics/old-name", "# Old name\n\nTarget page.\n");
+        world.page_with("alpha", LINKED);
+        let x = attest::attest(&one, &request(&["capture:run.log"])).unwrap();
+        wiki_git(&["add", "-A", "-f", "."]);
+        wiki_git(&["commit", "-q", "-m", "seal"]);
+        let sealed = fs::read_to_string(world.page_path("alpha")).unwrap();
+        wiki_git(&["mv", "topics/old-name.md", "topics/new-name.md"]);
+        let retargeted = sealed
+            .replace("[[old-name]]", "[[new-name]]")
+            .replace("[[topics/old-name|", "[[topics/new-name|")
+            .replace("[[old-name#Heading]]", "[[new-name#Heading]]");
+        world.page_with("alpha", &retargeted);
+        wiki_git(&["add", "-A", "-f", "."]);
+        one.now = super::policy::parse_stamp("2026-11-21 10:10 +02:00").unwrap();
+        let done = carry::carry(&one, &carry_request(&x.id)).unwrap();
+        assert!(done.report.is_citable(), "{:?}", done.report.outcome);
+    }
+
+    /// A page named with glob characters is a literal path, not a pattern.
+    #[test]
+    fn carry_page_named_with_glob_characters() {
+        let world = World::new();
+        let Some(mut one) = world.attest_context() else {
+            assert_carry_refuses_without_keygen(&world);
+            return;
+        };
+        world.init_repo();
+        world.page_with("topics/old-name", "# Old name\n\nTarget page.\n");
+        world.page_with("[draft]", LINKED);
+        let mut req = request(&["capture:run.log"]);
+        req.page = "[draft]".to_owned();
+        let x = attest::attest(&one, &req).unwrap();
+        commit_all(&world, "seal");
+        let sealed = fs::read_to_string(world.page_path("[draft]")).unwrap();
+        git(
+            &world.root,
+            &["mv", "wiki/topics/old-name.md", "wiki/topics/new-name.md"],
+        );
+        let retargeted = sealed
+            .replace("[[old-name]]", "[[new-name]]")
+            .replace("[[topics/old-name|", "[[topics/new-name|")
+            .replace("[[old-name#Heading]]", "[[new-name#Heading]]");
+        world.page_with("[draft]", &retargeted);
+        commit_all(&world, "rename");
+        one.now = super::policy::parse_stamp("2026-11-21 10:10 +02:00").unwrap();
+        let done = carry::carry(&one, &carry_request(&x.id)).unwrap();
+        assert!(done.report.is_citable(), "{:?}", done.report.outcome);
+    }
+
     /// A rename already staged is accepted; one that exists only on disk is
     /// refused with a hint to commit or stage it, not to re-seal first.
     #[test]
     fn carry_staged_and_disk_only_renames() {
         let world = World::new();
         let Some(mut one) = world.attest_context() else {
-            assert!(world.bin.is_none(), "keygen present but no context");
+            assert_carry_refuses_without_keygen(&world);
             return;
         };
         world.init_repo();
@@ -2468,7 +2535,7 @@ mod tests {
     fn carry_refuses_same_basename_rename() {
         let world = World::new();
         let Some(mut one) = world.attest_context() else {
-            assert!(world.bin.is_none(), "keygen present but no context");
+            assert_carry_refuses_without_keygen(&world);
             return;
         };
         world.init_repo();
