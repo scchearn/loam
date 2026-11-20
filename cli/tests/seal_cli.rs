@@ -542,6 +542,24 @@ mod attest {
     }
 
     #[test]
+    fn attest_rejects_now_and_a_parent_on_another_anchor() {
+        let Some(ws) = Workspace::new("now") else {
+            return;
+        };
+        ws.trust_init();
+        let output = ws.attest(&[
+            "--evidence",
+            "capture:run.log",
+            "--now",
+            "2020-01-01 00:00 +00:00",
+        ]);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(stderr(&output).contains("unknown option --now"));
+        assert_eq!(fs::read_to_string(ws.page()).unwrap(), PAGE);
+        assert!(!seals_exist(&ws));
+    }
+
+    #[test]
     fn a_refused_attest_exits_1_and_leaves_no_trace() {
         let Some(ws) = Workspace::new("refused") else {
             return;

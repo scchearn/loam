@@ -37,7 +37,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
 
 fn usage() -> i32 {
     eprintln!(
-        "Usage:\n  loam seal hash <file> <anchor>\n  loam seal attest <page>#^<anchor> --level <l> --claim <text> --evidence <kind:ref>...\n  loam seal verify [<page>[#^anchor]] [--json] [--now <stamp>]\n  loam seal status [--json] [--now <stamp>]\n  loam seal trust init|add <principal> <pubkey>|show"
+        "Usage:\n  loam seal hash <file> <anchor>\n  loam seal attest <page>#^<anchor> --level <l> --claim <text> --evidence <kind:ref>... (see `loam seal attest` for the optional flags)\n  loam seal verify [<page>[#^anchor]] [--json] [--now <stamp>]\n  loam seal status [--json] [--now <stamp>]\n  loam seal trust init|add <principal> <pubkey>|show"
     );
     EXIT_USAGE
 }
@@ -159,7 +159,7 @@ fn level_text(level: Option<Level>) -> &'static str {
     level.map_or("none", Level::as_str)
 }
 
-/// `loam seal attest <page>#^<anchor> --level <l> --claim <text> --evidence <kind:ref>...\n  loam seal verify [<page>[#^anchor]] [--json] [--now <stamp>]`.
+/// `loam seal verify [<page>[#^anchor]] [--json] [--now <stamp>]`.
 fn verify_command(args: impl Iterator<Item = String>) -> i32 {
     let options = match parse_read_options("verify", args, true) {
         Ok(options) => options,

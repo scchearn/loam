@@ -131,6 +131,37 @@ fn is_heading(text: &str) -> bool {
             .is_none_or(char::is_whitespace)
 }
 
+/// A CommonMark list item start: `-`, `*`, `+` or `1.`/`1)` then a space.
+fn is_list_item(text: &str) -> bool {
+    let body = text.trim_start_matches([' ', '\t']);
+    let rest = match body.chars().next() {
+        Some('-' | '*' | '+') => &body[1..],
+        Some(c) if c.is_ascii_digit() => {
+            let digits = body.chars().take_while(char::is_ascii_digit).count();
+            match body[digits..].chars().next() {
+                Some('.' | ')') if digits <= 9 => &body[digits + 1..],
+                _ => return false,
+            }
+        }
+        _ => return false,
+    };
+    rest.is_empty() || rest.starts_with([' ', '\t'])
+}
+
+/// Whether the line ends in an Obsidian block-id token (`^some-id`).
+fn ends_with_block_id(text: &str) -> bool {
+    let word = text
+        .trim_end()
+        .rsplit(char::is_whitespace)
+        .next()
+        .unwrap_or("");
+    word.len() > 1
+        && word.starts_with('^')
+        && word[1..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 fn is_marker_comment(text: &str) -> bool {
     let trimmed = text.trim();
     trimmed.starts_with("<!--") && trimmed.ends_with("-->") && trimmed.contains("loam:")
@@ -210,7 +241,15 @@ pub fn insert_markers(source: &str, anchor: &str) -> Result<Option<String>, Stri
 
     // Walk back to the first line of the block: a blank line, a heading, a
     // marker comment or code ends it.
+    let list_refusal = || {
+        format!(
+            "block id ^{anchor} is on or beside a list item; a seal cannot scope a single item automatically. Place the `<!-- loam:seal {anchor} -->` markers by hand"
+        )
+    };
     let mut first = last;
+    if is_list_item(last_content) {
+        return Err(list_refusal());
+    }
     if !is_heading(last_content) {
         while first > 0 {
             let previous = &lines[first - 1];
@@ -221,6 +260,14 @@ pub fn insert_markers(source: &str, anchor: &str) -> Result<Option<String>, Stri
                 || in_code(previous)
             {
                 break;
+            }
+            if is_list_item(text) {
+                return Err(list_refusal());
+            }
+            if ends_with_block_id(text) {
+                return Err(format!(
+                    "the line above ^{anchor} carries another block id; separate the blocks with a blank line or place the markers by hand"
+                ));
             }
             first -= 1;
         }
@@ -443,6 +490,12 @@ pub fn attest(ctx: &Context, request: &Request) -> Result<Attested, AttestError>
                 .iter()
                 .find(|report| &report.id == id)
                 .ok_or_else(|| usage(format!("--parent {id} is not a seal record in this wiki")))?;
+            if report.anchor.as_deref() != Some(request.anchor.as_str()) {
+                return Err(usage(format!(
+                    "--parent {id} seals a different anchor; a parent must seal ^{}",
+                    request.anchor
+                )));
+            }
             let loaded = record::load_all(&ctx.wiki).map_err(|e| refuse(e.to_string()))?;
             let parent_items = loaded
                 .iter()
@@ -548,6 +601,9 @@ pub fn attest(ctx: &Context, request: &Request) -> Result<Attested, AttestError>
         if edited {
             if let Err(e) = write_page(&path, &original) {
                 return refuse(format!("{why}; and the page could not be restored: {e}"));
+                // Captures are content-addressed, not records: if the record write below
+                // fails, newly stored capture files stay behind harmlessly. Signing-identity
+                // checks run before evidence resolution by design.
             }
         }
         refuse(format!("{why}; page restored"))
@@ -583,7 +639,7 @@ pub fn attest(ctx: &Context, request: &Request) -> Result<Attested, AttestError>
 
 fn usage_text() -> i32 {
     eprintln!(
-        "Usage: loam seal attest <page>#^<anchor> --level <evidence|audited|canonical> --claim <text> --evidence <kind:ref>... [--review-by <stamp>] [--parent <id>] [--origin <text>] [--redacted <label>]... [--now <stamp>]"
+        "Usage: loam seal attest <page>#^<anchor> --level <evidence|audited|canonical> --claim <text> --evidence <kind:ref>... [--review-by <stamp>] [--parent <id>] [--origin <text>] [--redacted <label>]..."
     );
     crate::seal::EXIT_USAGE
 }
@@ -591,7 +647,6 @@ fn usage_text() -> i32 {
 struct Parsed {
     selector: verify::Selector,
     request: Request,
-    now: Option<DateTime<FixedOffset>>,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
@@ -599,7 +654,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
     let mut request = Request::default();
     let mut level = None;
     let mut claim = None;
-    let mut now = None;
     let mut args = args;
     while let Some(arg) = args.next() {
         let mut value = |flag: &str| args.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -611,12 +665,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
             "--parent" => request.parent = Some(value("--parent")?),
             "--origin" => request.origin = Some(value("--origin")?),
             "--redacted" => request.redacted.push(value("--redacted")?),
-            "--now" => {
-                let text = value("--now")?;
-                now = Some(policy::parse_stamp(&text).ok_or_else(|| {
-                    format!("--now `{text}` must be `YYYY-MM-DD HH:MM +HH:MM` or RFC 3339 with an offset")
-                })?);
-            }
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ if selector.is_none() => selector = Some(verify::Selector::parse(&arg)?),
             _ => return Err(format!("unexpected argument `{arg}`")),
@@ -625,11 +673,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
     let selector = selector.ok_or("a <page>#^<anchor> target is required")?;
     request.level = level.ok_or("--level is required")?;
     request.claim = claim.ok_or("--claim is required")?;
-    Ok(Parsed {
-        selector,
-        request,
-        now,
-    })
+    Ok(Parsed { selector, request })
 }
 
 pub fn run(args: impl Iterator<Item = String>) -> i32 {
@@ -662,10 +706,11 @@ pub fn run(args: impl Iterator<Item = String>) -> i32 {
             return EXIT_REFUSED;
         }
     };
-    let now = parsed.now.unwrap_or_else(|| {
+    // Always the wall clock: the signed `time_verified` must not be settable.
+    let now = {
         let local = chrono::Local::now();
         local.with_timezone(local.offset())
-    });
+    };
     let repo_root = evidence::repo_root(&wiki)
         .or_else(|| wiki.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| wiki.clone());
@@ -731,8 +776,8 @@ mod tests {
     #[test]
     fn keeps_crlf_indentation_and_a_missing_final_newline() {
         assert_eq!(
-            inserted("a\r\n\r\n  - item ^s-trust-order\r\n"),
-            "a\r\n\r\n  <!-- loam:seal s-trust-order -->\r\n  - item\r\n  <!-- /loam:seal -->\r\n"
+            inserted("a\r\n\r\n  item ^s-trust-order\r\n"),
+            "a\r\n\r\n  <!-- loam:seal s-trust-order -->\r\n  item\r\n  <!-- /loam:seal -->\r\n"
         );
         assert_eq!(
             inserted("a\n\nlast ^s-trust-order"),
@@ -754,6 +799,18 @@ mod tests {
             inserted("\u{FEFF}one\ntwo ^s-trust-order\n"),
             "\u{FEFF}<!-- loam:seal s-trust-order -->\none\ntwo\n<!-- /loam:seal -->\n"
         );
+    }
+
+    #[test]
+    fn refuses_list_items_and_neighbouring_block_ids() {
+        let err = |source: &str| insert_markers(source, "s-trust-order").unwrap_err();
+        assert!(err("- a\n- b ^s-trust-order\n").contains("list item"));
+        assert!(err("1. only ^s-trust-order\n").contains("list item"));
+        assert!(err("- a\n  more ^s-trust-order\n").contains("list item"));
+        assert!(err("one ^s-other\ntwo ^s-trust-order\n").contains("another block id"));
+        // A blank line separates the blocks, so neither rule fires.
+        assert!(insert_markers("one ^s-other\n\ntwo ^s-trust-order\n", "s-trust-order").is_ok());
+        assert!(!is_list_item("-dash") && !is_list_item("2024 was") && is_list_item("  * x"));
     }
 
     #[test]
