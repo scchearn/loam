@@ -161,6 +161,8 @@ pub enum StoreError {
     /// A record, signature or evidence file with that id already exists.
     Exists(String),
     InvalidId(String),
+    /// The bytes are not a well-formed record (malformed input, not I/O).
+    Invalid(RecordError),
     Io(String),
 }
 
@@ -169,6 +171,7 @@ impl fmt::Display for StoreError {
         match self {
             StoreError::Exists(id) => write!(f, "{id} already exists; records are append-only"),
             StoreError::InvalidId(id) => write!(f, "invalid id or digest {id:?}"),
+            StoreError::Invalid(e) => write!(f, "refusing to store record: {e}"),
             StoreError::Io(why) => write!(f, "{why}"),
         }
     }
@@ -427,10 +430,19 @@ pub fn well_formed(id: &str, bytes: &[u8]) -> Result<View, RecordError> {
         return Err(RecordError::UnknownPredicate(predicate_type.to_owned()));
     }
 
-    let subject = document
+    // Exactly one subject: other in-toto tooling treats every subject as
+    // attested, so extra entries would be read two ways.
+    let subjects = document
         .get("subject")
-        .and_then(|s| s.at(0))
+        .and_then(Value::as_array)
         .ok_or_else(|| RecordError::MissingField("subject".to_owned()))?;
+    if subjects.len() != 1 {
+        return Err(RecordError::Malformed(format!(
+            "subject must have exactly one entry, found {}",
+            subjects.len()
+        )));
+    }
+    let subject = &subjects[0];
     let subject_name =
         nonempty(text(subject, "subject[0].", "name")?, "subject[0].name")?.to_owned();
     let digest = subject
@@ -481,6 +493,22 @@ pub fn well_formed(id: &str, bytes: &[u8]) -> Result<View, RecordError> {
                 "predicate.locator must be an object".to_owned(),
             ))
         }
+    }
+
+    // Provenance fields the writer always emits; required on read so a record
+    // cannot silently drop them.
+    let procedure = p
+        .get("procedure")
+        .ok_or_else(|| RecordError::MissingField("predicate.procedure".to_owned()))?;
+    nonempty(
+        text(procedure, "predicate.procedure.", "uri")?,
+        "predicate.procedure.uri",
+    )?;
+    let generator = p
+        .get("generator")
+        .ok_or_else(|| RecordError::MissingField("predicate.generator".to_owned()))?;
+    for key in ["name", "version", "harness"] {
+        text(generator, "predicate.generator.", key)?;
     }
 
     let verifier = p
@@ -761,8 +789,48 @@ static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// synced, and are then published with a hard link, which fails atomically
 /// with `AlreadyExists`. A reader therefore never sees a partial file at the
 /// final name, and a crash leaves at worst a stray temp file that `load_all`
-/// ignores.
+/// ignores. When hard links are unsupported it degrades to `create_new` on the
+/// final name (see `create_new_direct`).
 fn create_only(path: &Path, bytes: &[u8], name: &str) -> Result<(), StoreError> {
+    create_only_with(path, bytes, name, &|from, to| fs::hard_link(from, to))
+}
+
+/// Fallback publish for filesystems without hard links: `create_new` on the
+/// final name keeps the create-only and append-only guarantees and gives up
+/// only atomic visibility. A failed write removes the file this call created
+/// (and only that one).
+fn create_new_direct(path: &Path, bytes: &[u8], name: &str) -> Result<(), StoreError> {
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(StoreError::Exists(name.to_owned()))
+        }
+        Err(e) => return Err(io_error(path, e)),
+    };
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written {
+        let _ = fs::remove_file(path);
+        return Err(io_error(path, e));
+    }
+    Ok(())
+}
+
+type LinkFn<'a> = &'a dyn Fn(&Path, &Path) -> io::Result<()>;
+
+fn create_only_with(
+    path: &Path,
+    bytes: &[u8],
+    name: &str,
+    link: LinkFn<'_>,
+) -> Result<(), StoreError> {
     let parent = path
         .parent()
         .ok_or_else(|| StoreError::Io(format!("{}: no parent directory", path.display())))?;
@@ -787,12 +855,14 @@ fn create_only(path: &Path, bytes: &[u8], name: &str) -> Result<(), StoreError> 
             .and_then(|()| file.sync_all())
             .map_err(|e| io_error(&tmp, e))?;
         drop(file);
-        match fs::hard_link(&tmp, path) {
+        match link(&tmp, path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 Err(StoreError::Exists(name.to_owned()))
             }
-            Err(e) => Err(io_error(path, e)),
+            // No hard links here (exFAT/FAT, some SMB/FUSE and cloud-drive
+            // mounts). Fall back to create-only on the final name.
+            Err(_) => create_new_direct(path, bytes, name),
         }
     })();
     // The temp file is ours in every outcome; the final name is never removed.
@@ -854,8 +924,7 @@ fn ensure_gitattributes(wiki: &Path) -> Result<(), StoreError> {
 /// are a well-formed record. Returns the id.
 pub fn write_record(wiki: &Path, bytes: &[u8]) -> Result<String, StoreError> {
     let id = id_of(bytes);
-    well_formed(&id, bytes)
-        .map_err(|e| StoreError::Io(format!("refusing to store record: {e}")))?;
+    well_formed(&id, bytes).map_err(StoreError::Invalid)?;
     ensure_gitattributes(wiki)?;
     create_only(&record_path(wiki, &id), bytes, &id)?;
     Ok(id)
@@ -1163,6 +1232,61 @@ mod tests {
     }
 
     #[test]
+    fn extra_subjects_and_missing_provenance_are_rejected() {
+        let (_, bytes) = build(&sample()).unwrap();
+        let two = with_field(
+            &bytes,
+            "\"subject\":[{",
+            "\"subject\":[{\"name\":\"a#^b\",\"digest\":{}},{",
+        );
+        assert!(
+            matches!(check(&two), Err(RecordError::Malformed(_))),
+            "{:?}",
+            check(&two)
+        );
+        let none = with_field(&bytes, "\"subject\":[", "\"subject\":[],\"x\":[");
+        assert!(check(&none).is_err());
+        for (from, to) in [
+            ("\"procedure\"", "\"proc\""),
+            ("\"generator\"", "\"gen\""),
+            ("\"harness\"", "\"h\""),
+            ("\"uri\"", "\"u\""),
+        ] {
+            let broken = with_field(&bytes, from, to);
+            assert!(
+                matches!(check(&broken), Err(RecordError::MissingField(_))),
+                "{from}: {:?}",
+                check(&broken)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_record_is_a_typed_invalid_error() {
+        let tmp = Tmp::new("invalid");
+        let err = write_record(&tmp.wiki(), b"{}").unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err}");
+    }
+
+    #[test]
+    fn link_failure_falls_back_to_create_new_and_stays_create_only() {
+        let tmp = Tmp::new("nolink");
+        let path = tmp.wiki().join("out").join("file");
+        let no_link =
+            |_: &Path, _: &Path| Err(io::Error::new(io::ErrorKind::Unsupported, "no hard links"));
+        create_only_with(&path, b"one", "file", &no_link).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"one");
+        let err = create_only_with(&path, b"two", "file", &no_link).unwrap_err();
+        assert!(matches!(err, StoreError::Exists(_)), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), b"one");
+        let strays: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(strays.len(), 1, "temp file left behind");
+    }
+
+    #[test]
     fn unknown_fields_are_ignored() {
         let (_, bytes) = build(&sample()).unwrap();
         let extra = with_field(
@@ -1311,6 +1435,10 @@ mod tests {
     fn untracked_memory_tree_writes_no_gitattributes_and_no_error() {
         let tmp = Tmp::new("untracked");
         let wiki = tmp.wiki();
+        // A TMPDIR inside some repository would make the tree tracked.
+        if git_succeeds(&wiki, &["rev-parse", "--is-inside-work-tree"]) == Some(true) {
+            return;
+        }
         // Not a git repository at all.
         let (_, bytes) = build(&sample()).unwrap();
         write_record(&wiki, &bytes).unwrap();
