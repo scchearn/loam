@@ -185,9 +185,9 @@ fn parse_comment(line: &str) -> Option<Comment<'_>> {
     })
 }
 
-/// Slug length in kebab words. One-word slugs are accepted (the M1 acceptance
-/// page uses `c-payroll`); the upper bound is six.
-const SLUG_WORDS: std::ops::RangeInclusive<usize> = 1..=6;
+/// Slug length in kebab words: 2-6 (spec D1). A `-2` collision suffix counts
+/// as one of the words.
+const SLUG_WORDS: std::ops::RangeInclusive<usize> = 2..=6;
 
 /// `<prefix>-<slug>` with the slug kebab words of `[a-z0-9]`.
 fn valid_id(kind: Kind, id: &str) -> bool {
@@ -395,7 +395,7 @@ impl Scanner {
         if !valid_id(Kind::Question, id) {
             self.problem(
                 ProblemCode::Mrk001,
-                format!("question anchor needs 1-6 kebab words of [a-z0-9], found `{id}`"),
+                format!("question anchor needs 2-6 kebab words of [a-z0-9], found `{id}`"),
                 range,
             );
             return;
@@ -447,7 +447,7 @@ mod tests {
     use super::*;
 
     const M1: &str = "---\ntitle: T\n---\n\n# Page\n\n\
-<!-- loam:class c-payroll local-only -->\n\
+<!-- loam:class c-payroll-notes local-only -->\n\
 Payroll notes.\n\
 \n\
 <!-- loam:seal s-tls-rung-order -->\n\
@@ -473,11 +473,11 @@ TLS tries the bundled rung first.\n\
 
         let class = &result.markers[0];
         assert_eq!(class.kind, Kind::Class);
-        assert_eq!(class.id, "c-payroll");
+        assert_eq!(class.id, "c-payroll-notes");
         assert_eq!(class.class.as_deref(), Some("local-only"));
         assert_eq!(
             &M1[class.opener.clone()],
-            "<!-- loam:class c-payroll local-only -->"
+            "<!-- loam:class c-payroll-notes local-only -->"
         );
         assert_eq!(&M1[class.closer.clone()], "<!-- /loam:class -->");
 
@@ -505,7 +505,7 @@ TLS tries the bundled rung first.\n\
 
         assert_eq!(result.anchors.len(), 3);
         assert_eq!(result.anchors["s-tls-rung-order"], Kind::Seal);
-        assert_eq!(result.anchors["c-payroll"], Kind::Class);
+        assert_eq!(result.anchors["c-payroll-notes"], Kind::Class);
         assert_eq!(result.anchors["q-hosting-signoff"], Kind::Question);
     }
 
@@ -641,7 +641,7 @@ TLS tries the bundled rung first.\n\
     }
 
     #[test]
-    fn duplicate_anchors_report_mrk003() {
+    fn duplicate_anchor_across_kinds_reports_mrk003() {
         // The prefix fixes the kind, so a duplicate can only occur within one
         // kind; the same slug under different prefixes is distinct.
         let source = "<!-- loam:seal s-aa-bb -->\none\n<!-- /loam:seal -->\n<!-- loam:seal s-aa-bb -->\ntwo\n<!-- /loam:seal -->\n- [ ] Q: why? ^q-xx-yy\n- [ ] Q: again? ^q-xx-yy\n";
@@ -661,6 +661,12 @@ TLS tries the bundled rung first.\n\
         let distinct_scan = scan(distinct);
         assert!(distinct_scan.problems.is_empty());
         assert_eq!(distinct_scan.markers.len(), 2);
+
+        // A question reusing a span's id across kinds has the wrong prefix for
+        // its kind, so it reports MRK001 rather than MRK003.
+        let crossed =
+            "<!-- loam:seal s-aa-bb -->\nx\n<!-- /loam:seal -->\n- [ ] Q: why? ^s-aa-bb\n";
+        assert_eq!(codes(&scan(crossed)), ["MRK001"]);
     }
 
     #[test]
@@ -739,7 +745,8 @@ TLS tries the bundled rung first.\n\
             let source = format!("<!-- loam:seal {id} -->\nx\n<!-- /loam:seal -->\n");
             scan(&source).problems.is_empty()
         };
-        assert!(ok("s-x"), "one word is accepted");
+        assert!(!ok("s-x"), "one word is rejected");
+        assert!(ok("s-x-y"), "two words are accepted");
         assert!(ok("s-a-b-c-d-e-f"), "six words are accepted");
         assert!(!ok("s-a-b-c-d-e-f-g"), "seven words are rejected");
         assert!(!ok("s-"), "an empty slug is rejected");
