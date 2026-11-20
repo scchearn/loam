@@ -53,6 +53,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         return 1;
     }
 
+    let now_stamp = now.clone();
     let today = match now {
         Some(value) => match memory::timestamp_days(&value) {
             Some(days) => days,
@@ -64,6 +65,13 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         None => memory::today_utc(),
     };
 
+    let seal_now = now_stamp
+        .as_deref()
+        .and_then(crate::seal::policy::parse_stamp)
+        .unwrap_or_else(|| {
+            let utc = chrono::FixedOffset::east_opt(0).expect("zero offset is valid");
+            chrono::Utc::now().with_timezone(&utc)
+        });
     let selected = |domain: &str| only.as_deref().map(|value| value == domain).unwrap_or(true);
     let mut findings = Vec::new();
 
@@ -107,6 +115,12 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     }
     if selected("memory") {
         memory::wiki_findings(workspace, &mut findings);
+    }
+    if selected("seals") {
+        if let Err(error) = crate::seal::lint::lint_findings(workspace, seal_now, &mut findings) {
+            eprintln!("loam lint: {error}");
+            return 1;
+        }
     }
     if selected("work") {
         memory::work_findings(workspace, today, &mut findings);
@@ -244,7 +258,7 @@ impl Finding {
 
     /// Rule prefixes are the single source of truth for which domain a finding
     /// belongs to, so no call site has to repeat it.
-    fn domain(&self) -> &'static str {
+    pub(crate) fn domain(&self) -> &'static str {
         match &self.rule[..3] {
             "GDN" => "guidance",
             "MEM" => "memory",

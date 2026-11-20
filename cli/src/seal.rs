@@ -7,6 +7,7 @@ pub mod attest;
 pub mod canon;
 pub mod carry;
 pub mod evidence;
+pub mod lint;
 pub mod policy;
 pub mod record;
 pub mod sshsig;

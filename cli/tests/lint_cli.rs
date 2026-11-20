@@ -268,3 +268,200 @@ fn now_requires_the_documented_timestamp_shape() {
     assert_eq!(accepted.status.code(), Some(0));
     assert_eq!(negative_offset.status.code(), Some(0));
 }
+
+mod seals {
+    use super::{domains, field_values};
+    use loam::seal::{canon, evidence, record};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+
+    const STAMP: &str = "2026-11-20 14:30 +02:00";
+    const NOW: &str = "2026-11-21 10:00 +02:00";
+    const PAGE: &str =
+        "# Alpha\n\n<!-- loam:seal s-rung-order -->\nBundled rung first.\n<!-- /loam:seal -->\n";
+
+    struct Workspace(PathBuf);
+
+    impl Workspace {
+        fn new(label: &str) -> Workspace {
+            let dir = std::env::temp_dir()
+                .join(format!("loam-lint-seals-{label}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(dir.join("wiki")).unwrap();
+            fs::create_dir_all(dir.join("config")).unwrap();
+            fs::write(dir.join("run.log"), b"all tests pass").unwrap();
+            Workspace(dir)
+        }
+
+        fn wiki(&self) -> PathBuf {
+            self.0.join("wiki")
+        }
+
+        fn page(&self) -> PathBuf {
+            self.wiki().join("alpha.md")
+        }
+
+        /// An unsigned evidence-level seal over `alpha.md`; returns its id.
+        fn seal(&self) -> String {
+            fs::write(self.page(), PAGE).unwrap();
+            let scan = loam::markers::scan(PAGE);
+            let content = &PAGE.as_bytes()[scan.markers[0].content.clone()];
+            let ctx = evidence::Ctx {
+                repo_root: self.0.clone(),
+                wiki: self.wiki(),
+                retrieved_at: STAMP.to_owned(),
+                capture_max_bytes: 262_144,
+            };
+            let items = [evidence::parse("capture:run.log").unwrap()];
+            let resolved =
+                evidence::resolve_all(&items, &ctx, &evidence::AttestOptions::default()).unwrap();
+            evidence::store_captures(&self.wiki(), &resolved).unwrap();
+            let (id, bytes) = record::build(&record::NewRecord {
+                kind: record::RecordKind::Seal,
+                page: "alpha".to_owned(),
+                anchor: "s-rung-order".to_owned(),
+                subject_sha256: canon::digest(content).unwrap(),
+                locator: record::soft_locator(&["Alpha".to_owned()], "Bundled rung first."),
+                content: "Bundled rung first.\n".to_owned(),
+                requested_level: Some("evidence".to_owned()),
+                claim: Some("Rung order".to_owned()),
+                procedure_uri: "loam://seal/procedure/v1".to_owned(),
+                principal: "agent.one@local".to_owned(),
+                acted_on_behalf_of: None,
+                generator: record::Generator {
+                    name: "loam".to_owned(),
+                    version: "1.0.0".to_owned(),
+                    harness: "test".to_owned(),
+                },
+                time_verified: STAMP.to_owned(),
+                review_by: None,
+                evidence: resolved.iter().map(|r| r.item.to_value()).collect(),
+                redacted: Vec::new(),
+                parent: None,
+                status: None,
+            })
+            .unwrap();
+            record::write_record(&self.wiki(), &bytes).unwrap();
+            id
+        }
+
+        fn lint(&self, extra: &[&str]) -> Output {
+            Command::new(env!("CARGO_BIN_EXE_loam"))
+                .arg("lint")
+                .args(extra)
+                .arg(&self.0)
+                .args(["--now", NOW])
+                .env("LOAM_WORKSPACES", "off")
+                .env("LOAM_CONFIG_DIR", self.0.join("config"))
+                .output()
+                .expect("loam should run")
+        }
+
+        /// Every file under `wiki/.seals` with its bytes, for before/after.
+        fn seals_snapshot(&self) -> Vec<(PathBuf, Vec<u8>)> {
+            fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+                let Ok(entries) = fs::read_dir(dir) else {
+                    return;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, out);
+                    } else {
+                        out.push((path.clone(), fs::read(&path).unwrap()));
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&self.wiki().join(".seals"), &mut out);
+            out.sort();
+            out
+        }
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            for _ in 0..10 {
+                if fs::remove_dir_all(&self.0).is_ok() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+
+    fn stdout(output: &Output) -> String {
+        String::from_utf8(output.stdout.clone()).unwrap()
+    }
+
+    #[test]
+    fn a_citable_seal_lints_clean() {
+        let ws = Workspace::new("clean");
+        ws.seal();
+        let output = ws.lint(&["--only", "seals"]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(stdout(&output), "");
+    }
+
+    #[test]
+    fn a_drifted_seal_yields_one_sel004_warning_and_exit_2() {
+        let ws = Workspace::new("drift");
+        ws.seal();
+        fs::write(ws.page(), PAGE.replace("Bundled", "System")).unwrap();
+        let before = ws.seals_snapshot();
+        let output = ws.lint(&["--only", "seals"]);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let text = stdout(&output);
+        assert_eq!(field_values(&text, "rule"), vec!["SEL004"], "{text}");
+        assert_eq!(field_values(&text, "severity"), vec!["warning"]);
+        assert_eq!(domains(&text), vec!["seals"]);
+        assert_eq!(ws.seals_snapshot(), before, "lint must not write records");
+    }
+
+    #[test]
+    fn a_forged_record_yields_an_sel003_error() {
+        let ws = Workspace::new("forged");
+        let id = ws.seal();
+        record::write_sig(&ws.wiki(), &id, b"not a signature").unwrap();
+        let before = ws.seals_snapshot();
+        let output = ws.lint(&["--only", "seals"]);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let text = stdout(&output);
+        let rules = field_values(&text, "rule");
+        assert!(rules.contains(&"SEL003".to_owned()), "{text}");
+        let severities = field_values(&text, "severity");
+        assert!(severities.contains(&"error".to_owned()), "{text}");
+        assert_eq!(ws.seals_snapshot(), before);
+    }
+
+    #[test]
+    fn a_marker_without_a_record_yields_sel002() {
+        let ws = Workspace::new("unpaired");
+        fs::write(ws.page(), PAGE).unwrap();
+        let output = ws.lint(&["--only", "seals"]);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let text = stdout(&output);
+        assert_eq!(field_values(&text, "rule"), vec!["SEL002"], "{text}");
+        assert_eq!(field_values(&text, "domain"), vec!["seals"]);
+    }
+
+    #[test]
+    fn only_seals_excludes_other_domains_and_default_includes_seals() {
+        let ws = Workspace::new("domains");
+        ws.seal();
+        fs::write(ws.page(), PAGE.replace("Bundled", "System")).unwrap();
+        // A markdown defect that must not appear under `--only seals`.
+        fs::write(
+            ws.wiki().join("index.md"),
+            "# Index\n\n## Overview\n\nSee [[ghost-page]].\n\n## Overview\n",
+        )
+        .unwrap();
+        let only = ws.lint(&["--only", "seals"]);
+        assert!(domains(&stdout(&only)).iter().all(|d| d == "seals"));
+        let all = ws.lint(&[]);
+        let all_domains = domains(&stdout(&all));
+        assert!(all_domains.contains(&"seals".to_owned()));
+        assert!(all_domains.contains(&"markdown".to_owned()));
+    }
+}
