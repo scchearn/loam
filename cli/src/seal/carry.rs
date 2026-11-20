@@ -156,13 +156,32 @@ fn closure(renames: &[Rename]) -> Vec<Rename> {
 /// `Ok` with the retargeted `(old, new)` link targets when `live` differs
 /// from `sealed` only by wikilink targets that `renames` explain; otherwise
 /// the reason it does not.
-fn prove(sealed: &str, live: &str, renames: &[Rename]) -> Result<Vec<(String, String)>, String> {
+///
+/// `base_pages` are the markdown paths that existed when the seal was
+/// committed. A retargeted link must have named exactly one of them, and that
+/// page must be the one renamed: a same-named page elsewhere never justifies
+/// the substitution.
+fn prove(
+    sealed: &str,
+    live: &str,
+    renames: &[Rename],
+    base_pages: &[String],
+) -> Result<Vec<(String, String)>, String> {
     let changes = link_changes(sealed, live)?;
     let pairs = closure(renames);
     for (from, to) in &changes {
-        let explained = pairs
-            .iter()
-            .any(|rename| names(from, &rename.old) && names(to, &rename.new));
+        let named: Vec<&String> = base_pages.iter().filter(|p| names(from, p)).collect();
+        if named.len() > 1 {
+            return Err(format!(
+                "[[{from}]] is ambiguous: {} pages answer to that name, so a rename cannot show which one it meant",
+                named.len()
+            ));
+        }
+        let explained = pairs.iter().any(|rename| {
+            names(from, &rename.old)
+                && names(to, &rename.new)
+                && named.first().is_some_and(|p| **p == rename.old)
+        });
         if !explained {
             return Err(format!(
                 "[[{from}]] became [[{to}]] but git records no rename from one to the other since the seal was committed"
@@ -218,8 +237,38 @@ pub(crate) fn link_changes(sealed: &str, live: &str) -> Result<Vec<(String, Stri
 // ------------------------------------------------------------------- git
 
 struct GitOut {
-    ok: bool,
+    code: Option<i32>,
     stdout: String,
+    stderr: String,
+}
+
+impl GitOut {
+    fn ok(&self) -> bool {
+        self.code == Some(0)
+    }
+
+    /// The failure as a message that carries git's own words.
+    fn error(&self, what: &str) -> String {
+        let detail = self.stderr.trim();
+        let code = self
+            .code
+            .map_or_else(|| "a signal".to_owned(), |c| format!("exit {c}"));
+        if detail.is_empty() {
+            format!("git {what} failed ({code})")
+        } else {
+            format!("git {what} failed ({code}): {detail}")
+        }
+    }
+}
+
+/// `ls-files --error-unmatch` exits 1 for an untracked path; any other
+/// failure is git itself breaking and must not read as "untracked".
+fn tracked_verdict(out: &GitOut) -> Result<bool, String> {
+    match out.code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(out.error("ls-files")),
+    }
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<GitOut, String> {
@@ -233,17 +282,17 @@ fn git(repo: &Path, args: &[&str]) -> Result<GitOut, String> {
         .args(args)
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .map_err(|e| format!("cannot run git: {e}"))?;
     Ok(GitOut {
-        ok: output.status.success(),
+        code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
 
@@ -279,7 +328,12 @@ fn parse_renames(log: &str) -> Vec<Rename> {
             });
         }
     }
-    // `git log` lists newest first.
+    renames
+}
+
+/// `git log` lists newest first; carry wants oldest first.
+fn parse_log_renames(log: &str) -> Vec<Rename> {
+    let mut renames = parse_renames(log);
     renames.reverse();
     renames
 }
@@ -382,7 +436,7 @@ pub fn carry(ctx: &Context, request: &Request) -> Result<Carried, AttestError> {
         .ok_or_else(|| untracked(&request.id, "the record is outside the repository"))?;
     let tracked = git(repo, &["ls-files", "--error-unmatch", "--", &page_rel])
         .map_err(|e| refuse(format!("{e}; carry needs git")))?;
-    if !tracked.ok {
+    if !tracked_verdict(&tracked).map_err(refuse)? {
         return Err(untracked(&request.id, "git does not track the page"));
     }
     let added = git(
@@ -390,12 +444,14 @@ pub fn carry(ctx: &Context, request: &Request) -> Result<Carried, AttestError> {
         &["log", "--diff-filter=A", "--format=%H", "--", &record_rel],
     )
     .map_err(refuse)?;
+    if !added.ok() {
+        return Err(refuse(added.error("log")));
+    }
     let base = added
         .stdout
         .lines()
         .map(str::trim)
         .rfind(|line| !line.is_empty())
-        .filter(|_| added.ok)
         .ok_or_else(|| untracked(&request.id, "the seal record is not committed"))?
         .to_owned();
     let range = format!("{base}..HEAD");
@@ -412,14 +468,49 @@ pub fn carry(ctx: &Context, request: &Request) -> Result<Carried, AttestError> {
         ],
     )
     .map_err(refuse)?;
-    if !log.ok {
-        return Err(refuse(format!("git could not list renames in {range}")));
+    if !log.ok() {
+        return Err(refuse(log.error("log")));
     }
-    let renames = parse_renames(&log.stdout);
+    let mut renames = parse_log_renames(&log.stdout);
+    // Renames already staged (`git mv`, `git add -A`) are newer than HEAD.
+    let staged = git(
+        repo,
+        &[
+            "diff",
+            "--cached",
+            "-M",
+            "--diff-filter=R",
+            "--name-status",
+            "-z",
+            "HEAD",
+        ],
+    )
+    .map_err(refuse)?;
+    if !staged.ok() {
+        return Err(refuse(staged.error("diff --cached")));
+    }
+    renames.extend(parse_renames(&staged.stdout));
 
-    let retargets = prove(&bound_content, &live, &renames).map_err(|why| {
+    // The markdown pages that existed when the seal was committed.
+    let mut tree_args = vec!["ls-tree", "-r", "-z", "--name-only", "--full-name", &base];
+    let wiki_rel = relative_to(repo, &ctx.wiki);
+    if let Some(rel) = wiki_rel.as_deref() {
+        tree_args.extend(["--", rel]);
+    }
+    let tree = git(repo, &tree_args).map_err(refuse)?;
+    if !tree.ok() {
+        return Err(refuse(tree.error("ls-tree")));
+    }
+    let base_pages: Vec<String> = tree
+        .stdout
+        .split('\0')
+        .filter(|p| p.ends_with(".md"))
+        .map(str::to_owned)
+        .collect();
+
+    let retargets = prove(&bound_content, &live, &renames, &base_pages).map_err(|why| {
         refuse(format!(
-            "not a pure link retarget: {why}; re-seal with loam seal attest {current}#^{anchor} … --parent {}",
+            "not a pure link retarget: {why}; if the rename is not committed or staged yet, commit or stage it (git add -A) and run carry again, otherwise re-seal with loam seal attest {current}#^{anchor} … --parent {}",
             request.id
         ))
     })?;
@@ -654,10 +745,12 @@ mod tests {
     #[test]
     fn proves_only_renamed_targets() {
         let renames = [rename("wiki/topics/old.md", "wiki/topics/new.md")];
+        let base = pages(&["wiki/topics/old.md"]);
         let got = prove(
             "See [[old]] and [[topics/old|al]].\n",
             "See [[new]] and [[topics/new|al]].\n",
             &renames,
+            &base,
         )
         .unwrap();
         assert_eq!(
@@ -676,7 +769,13 @@ mod tests {
             "See new and [[topics/new|al]].\n",
         ] {
             assert!(
-                prove("See [[old]] and [[topics/old|al]].\n", live, &renames).is_err(),
+                prove(
+                    "See [[old]] and [[topics/old|al]].\n",
+                    live,
+                    &renames,
+                    &base
+                )
+                .is_err(),
                 "{live}"
             );
         }
@@ -684,11 +783,58 @@ mod tests {
         assert!(prove(
             "[[old]]\n",
             "[[topics/new]]\n",
-            &[rename("wiki/other/old.md", "wiki/other/new.md")]
+            &[rename("wiki/other/old.md", "wiki/other/new.md")],
+            &pages(&["wiki/other/old.md"]),
         )
         .is_err());
         // Identical text carries nothing.
-        assert_eq!(prove("[[a]]\n", "[[a]]\n", &renames).unwrap(), vec![]);
+        assert_eq!(
+            prove("[[a]]\n", "[[a]]\n", &renames, &base).unwrap(),
+            vec![]
+        );
+    }
+
+    fn pages(list: &[&str]) -> Vec<String> {
+        list.iter().map(|p| (*p).to_owned()).collect()
+    }
+
+    #[test]
+    fn refuses_a_rename_of_a_different_page_with_the_same_basename() {
+        let renames = [rename("wiki/x/old.md", "wiki/x/new.md")];
+        // Two pages answer to `old`: which one the link meant is unknowable.
+        let both = pages(&["wiki/x/old.md", "wiki/y/old.md"]);
+        let why = prove("[[old]]\n", "[[new]]\n", &renames, &both).unwrap_err();
+        assert!(why.contains("ambiguous"), "{why}");
+        // Only the other page existed: the rename is of a page the link never named.
+        let other = pages(&["wiki/y/old.md"]);
+        assert!(prove("[[old]]\n", "[[new]]\n", &renames, &other).is_err());
+        // A path-qualified link disambiguates.
+        assert!(prove("[[x/old]]\n", "[[x/new]]\n", &renames, &both).is_ok());
+        assert!(prove("[[y/old]]\n", "[[x/new]]\n", &renames, &both).is_err());
+        // A link to a page that did not exist at the seal is never explained.
+        assert!(prove("[[old]]\n", "[[new]]\n", &renames, &[]).is_err());
+    }
+
+    #[test]
+    fn separates_untracked_from_git_failures() {
+        let out = |code| GitOut {
+            code,
+            stdout: String::new(),
+            stderr: "fatal: detected dubious ownership".to_owned(),
+        };
+        assert_eq!(tracked_verdict(&out(Some(0))), Ok(true));
+        assert_eq!(tracked_verdict(&out(Some(1))), Ok(false));
+        let err = tracked_verdict(&out(Some(128))).unwrap_err();
+        assert!(
+            err.contains("dubious ownership") && err.contains("128"),
+            "{err}"
+        );
+        assert!(tracked_verdict(&out(None)).is_err());
+        // A real git failure (bad option) is not exit 1 and keeps its stderr.
+        let real = git(&std::env::temp_dir(), &["ls-files", "--no-such-flag"]).unwrap();
+        assert!(!real.ok());
+        assert!(tracked_verdict(&real).is_err(), "{:?}", real.code);
+        assert!(!real.stderr.trim().is_empty());
     }
 
     #[test]
@@ -697,16 +843,17 @@ mod tests {
             rename("wiki/a.md", "wiki/b.md"),
             rename("wiki/b.md", "wiki/c.md"),
         ];
-        assert!(prove("[[a]]\n", "[[c]]\n", &renames).is_ok());
-        assert!(prove("[[a]]\n", "[[b]]\n", &renames).is_ok());
-        assert!(prove("[[c]]\n", "[[a]]\n", &renames).is_err());
+        let base = pages(&["wiki/a.md"]);
+        assert!(prove("[[a]]\n", "[[c]]\n", &renames, &base).is_ok());
+        assert!(prove("[[a]]\n", "[[b]]\n", &renames, &base).is_ok());
+        assert!(prove("[[c]]\n", "[[a]]\n", &renames, &base).is_err());
     }
 
     #[test]
     fn parses_name_status_log() {
         let log = "R100\0wiki/a.md\0wiki/b.md\0\nR087\0wiki/b.md\0wiki/c.md\0M\0wiki/x.md\0";
         assert_eq!(
-            parse_renames(log),
+            parse_log_renames(log),
             vec![
                 rename("wiki/b.md", "wiki/c.md"),
                 rename("wiki/a.md", "wiki/b.md")

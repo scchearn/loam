@@ -2403,11 +2403,101 @@ mod tests {
             AttestError::Usage(_)
         ));
     }
+    /// A rename already staged is accepted; one that exists only on disk is
+    /// refused with a hint to commit or stage it, not to re-seal first.
+    #[test]
+    fn carry_staged_and_disk_only_renames() {
+        let world = World::new();
+        let Some(mut one) = world.attest_context() else {
+            return;
+        };
+        world.init_repo();
+        world.page_with("topics/old-name", "# Old name\n\nTarget page.\n");
+        world.page_with("alpha", LINKED);
+        let x = attest::attest(&one, &request(&["capture:run.log"])).unwrap();
+        commit_all(&world, "seal");
+        let sealed = fs::read_to_string(world.page_path("alpha")).unwrap();
+        let retargeted = sealed
+            .replace("[[old-name]]", "[[new-name]]")
+            .replace("[[topics/old-name|", "[[topics/new-name|")
+            .replace("[[old-name#Heading]]", "[[new-name#Heading]]");
+        one.now = super::policy::parse_stamp("2026-11-21 10:10 +02:00").unwrap();
+
+        // On disk only: git has not seen the rename.
+        fs::rename(
+            world.page_path("topics/old-name"),
+            world.page_path("topics/new-name"),
+        )
+        .unwrap();
+        world.page_with("alpha", &retargeted);
+        let text = refused_text(carry::carry(&one, &carry_request(&x.id)).unwrap_err());
+        assert!(text.contains("commit or stage it (git add -A)"), "{text}");
+
+        // Staged: git records the rename in the index.
+        git(&world.root, &["add", "-A", "-f", "wiki"]);
+        let done = carry::carry(&one, &carry_request(&x.id)).unwrap();
+        assert!(done.report.is_citable(), "{:?}", done.report.outcome);
+    }
+
+    /// A rename of a different page with the same file name never justifies
+    /// the substitution.
+    #[test]
+    fn carry_refuses_same_basename_rename() {
+        let world = World::new();
+        let Some(mut one) = world.attest_context() else {
+            return;
+        };
+        world.init_repo();
+        world.page_with("x/old-name", "# X\n");
+        world.page_with("y/old-name", "# Y\n");
+        world.page_with("alpha", LINKED);
+        let x = attest::attest(&one, &request(&["capture:run.log"])).unwrap();
+        commit_all(&world, "seal");
+        let sealed = fs::read_to_string(world.page_path("alpha")).unwrap();
+        git(
+            &world.root,
+            &["mv", "wiki/x/old-name.md", "wiki/x/new-name.md"],
+        );
+        let retargeted = sealed.replace("[[old-name]]", "[[new-name]]");
+        world.page_with("alpha", &retargeted);
+        commit_all(&world, "rename");
+        one.now = super::policy::parse_stamp("2026-11-21 10:10 +02:00").unwrap();
+        let text = refused_text(carry::carry(&one, &carry_request(&x.id)).unwrap_err());
+        assert!(text.contains("ambiguous"), "{text}");
+    }
+
     /// A hand-signed update carrying a semantic edit never rebinds the seal.
     #[test]
     fn verify_refuses_update_that_edits_text() {
         let world = World::new();
         let Some(one) = world.attest_context() else {
+            // Degraded path: a verifier that cannot verify caps a seal at
+            // evidence and says so; no update could ever be accepted.
+            let _guard = crate::env_lock();
+            let stub = sshsig::test_support::stub_without_y(&world.root);
+            world.allow(&[]);
+            world.policy(&[PRINCIPAL]);
+            let mut spec = Spec::new(PRINCIPAL);
+            spec.requested = "audited";
+            world.seal(
+                &spec,
+                Sig::Raw("-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n"),
+            );
+            let mut env = Env::load(
+                &world.wiki,
+                Some(world.trust_dir.clone()),
+                super::policy::parse_stamp(NOW).unwrap(),
+            )
+            .unwrap();
+            env.repo_root = world.root.clone();
+            env.keygen = stub;
+            let reports = verify::verify_all(&env).unwrap();
+            assert!(reports[0].outcome.effective_level <= Some(Level::Evidence));
+            assert!(reports[0]
+                .outcome
+                .codes
+                .informational
+                .contains(&code::VERIFIER_UNAVAILABLE));
             return;
         };
         world.page_with("alpha", LINKED);

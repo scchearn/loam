@@ -398,10 +398,9 @@ fn build_verifier<'a>(env: &'a Env, overlay: Option<&'a Overlay>) -> Result<Veri
 #[derive(Debug, Clone)]
 pub struct AppliedUpdate {
     pub id: String,
-    /// `loam.canon/v1` digest of `content`.
+    /// `loam.canon/v1` digest of the updated span.
     pub digest: String,
-    /// Canonical as-sealed text after the update.
-    pub content: String,
+    /// When the update was verified; orders updates oldest first.
     pub at: DateTime<FixedOffset>,
 }
 
@@ -618,7 +617,8 @@ impl Verifier<'_> {
         }
     }
 
-    /// The newest `link-retarget` update for `target` that itself verifies:
+    /// Every `link-retarget` update for `target` that itself verifies, oldest
+    /// first. Each is:
     /// signed by a trusted signer who is its claimed principal and who may
     /// act on the seal (the sealer, or a ceiling that reaches its level), on
     /// the seal's anchor, with a digest that is the hash of its own content.
@@ -681,7 +681,6 @@ impl Verifier<'_> {
             let candidate = AppliedUpdate {
                 id: loaded.id.clone(),
                 digest: view.subject_sha256.clone(),
-                content: content.to_owned(),
                 at,
             };
             found.push(candidate);
