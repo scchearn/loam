@@ -95,6 +95,24 @@ pub struct Scan {
     pub problems: Vec<Problem>,
 }
 
+/// SEL008 (domain `seals`, severity info): a rewriting tool skipped a sealed
+/// span. Shared by every fixer so the rule has one definition.
+pub const SEL008_CODE: &str = "SEL008";
+pub const SEL008_NAME: &str = "sealed-span-skipped";
+pub const SEL008_DESCRIPTION: &str = "rewriting tool skipped a sealed span";
+
+/// Byte ranges (opener line start through closer line end) and anchors of the
+/// well-formed seal spans in `source`. Malformed spans are never included, so
+/// rewriting tools only ever protect spans the scanner accepts.
+pub fn sealed_spans(source: &str) -> Vec<(Range<usize>, String)> {
+    scan(source)
+        .markers
+        .into_iter()
+        .filter(|marker| marker.kind == Kind::Seal)
+        .map(|marker| (marker.opener.start..marker.closer.end, marker.id))
+        .collect()
+}
+
 const CLASS_TOKENS: [&str; 3] = ["local-only", "project", "hub-promotable"];
 
 /// Scan `source` for markers.

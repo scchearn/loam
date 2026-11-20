@@ -10,6 +10,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::lint::{Finding, Severity};
+use crate::markers;
 use crate::memory;
 use crate::state;
 
@@ -121,12 +122,21 @@ fn stale_evidence(current: &str, generated: &str, wiki_root: &Path) -> Vec<(Stri
         .collect()
 }
 
+/// What `fix` did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FixOutcome {
+    Unchanged,
+    Written,
+    /// The region overlaps a sealed span (anchor given), so nothing was written.
+    SealSkipped(String),
+}
+
 /// Inserts or regenerates the region in the workspace `AGENTS.md`, creating the
-/// file when it does not exist. Returns whether the file changed. A workspace
-/// with no wiki is a no-op.
-pub fn fix(workspace: &Path) -> Result<bool, String> {
+/// file when it does not exist. A workspace with no wiki is a no-op. A region
+/// that overlaps a well-formed seal span is never rewritten.
+pub fn fix(workspace: &Path) -> Result<FixOutcome, String> {
     let Some(wiki_root) = state::resolve_wiki_root(workspace) else {
-        return Ok(false);
+        return Ok(FixOutcome::Unchanged);
     };
     let path = workspace.join("AGENTS.md");
     let existing = fs::read_to_string(&path).unwrap_or_default();
@@ -142,7 +152,13 @@ pub fn fix(workspace: &Path) -> Result<bool, String> {
         // them is free.
         Some((start, end)) => {
             if existing[start..end] == generated {
-                return Ok(false);
+                return Ok(FixOutcome::Unchanged);
+            }
+            if let Some((_, anchor)) = markers::sealed_spans(&existing)
+                .into_iter()
+                .find(|(span, _)| span.start < end && start < span.end)
+            {
+                return Ok(FixOutcome::SealSkipped(anchor));
             }
             format!("{}{generated}{}", &existing[..start], &existing[end..])
         }
@@ -163,7 +179,7 @@ pub fn fix(workspace: &Path) -> Result<bool, String> {
     };
 
     fs::write(&path, updated).map_err(|error| format!("{}: {error}", path.display()))?;
-    Ok(true)
+    Ok(FixOutcome::Written)
 }
 
 /// The generated region, markers included, LF-terminated.

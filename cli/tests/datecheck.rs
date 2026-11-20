@@ -133,3 +133,49 @@ fn datecheck_ignores_unicode_bullets_without_panicking() {
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
 }
+
+#[test]
+fn datecheck_fix_skips_sealed_spans_and_reports_sel008() {
+    let wiki = temporary_wiki("sealed");
+    let sealed = "<!-- loam:seal s-pay-terms -->\n- 2026-06-26 - x\n<!-- /loam:seal -->\n";
+    fs::write(wiki.join("note.md"), format!("{sealed}- 2026-06-26 - y\n")).unwrap();
+
+    let binary = std::env::var("CARGO_BIN_EXE_loam").expect("cargo should provide the loam binary");
+    let output = Command::new(&binary)
+        .args([
+            "datecheck",
+            "fix",
+            wiki.to_str().unwrap(),
+            "--offset",
+            "+02:00",
+        ])
+        .output()
+        .expect("loam should run");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let after = fs::read_to_string(wiki.join("note.md")).unwrap();
+    let check = Command::new(&binary)
+        .args([
+            "datecheck",
+            "check",
+            wiki.to_str().unwrap(),
+            "--offset",
+            "+02:00",
+        ])
+        .output()
+        .expect("loam should run");
+    let _ = fs::remove_dir_all(&wiki);
+
+    assert!(output.status.success());
+    assert_eq!(after, format!("{sealed}- 2026-06-26 \u{2014} y\n"));
+    assert!(
+        stdout.contains(
+            "{\"rule\":\"SEL008\",\"severity\":\"info\",\"file\":\"note.md\",\"anchor\":\"s-pay-terms\",\"description\":\"rewriting tool skipped a sealed span\"}"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout
+        .trim_end()
+        .ends_with("{\"mode\":\"fix\",\"offset\":\"+02:00\",\"files_fixed\":1}"));
+    // The sealed line is no longer counted as drift.
+    assert_eq!(check.status.code(), Some(0));
+}

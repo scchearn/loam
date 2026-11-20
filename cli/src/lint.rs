@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::guidance;
 use crate::markdown;
+use crate::markers;
 use crate::memory;
 
 const DOMAINS: [&str; 5] = ["guidance", "markdown", "memory", "seals", "work"];
@@ -67,9 +68,22 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     let mut findings = Vec::new();
 
     if fix && selected("guidance") {
-        if let Err(error) = guidance::fix(workspace) {
-            eprintln!("loam lint: {error}");
-            return 1;
+        match guidance::fix(workspace) {
+            Ok(guidance::FixOutcome::SealSkipped(anchor)) => findings.push(
+                Finding::file(
+                    markers::SEL008_CODE,
+                    markers::SEL008_NAME,
+                    Severity::Info,
+                    "AGENTS.md",
+                    markers::SEL008_DESCRIPTION,
+                )
+                .with_evidence("anchor", &anchor),
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("loam lint: {error}");
+                return 1;
+            }
         }
     }
     if selected("guidance") {
@@ -334,5 +348,73 @@ mod tests {
             Finding::cmp(&left, &finding(&["wiki/a.md"])),
             std::cmp::Ordering::Equal
         );
+    }
+
+    fn temp_workspace(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "loam-lintfix-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("wiki/topics")).unwrap();
+        std::fs::write(dir.join("wiki/index.md"), "# Index\n\n## Overview\n").unwrap();
+        std::fs::write(dir.join("wiki/topics/auth.md"), "# Auth\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn fix_skips_sealed() {
+        let dir = temp_workspace("sealed");
+        let agents = format!(
+            "<!-- loam:seal s-map-copy -->\n{}\nTopics (1): stale\n{}\n<!-- /loam:seal -->\n",
+            guidance::MAP_OPEN,
+            guidance::MAP_CLOSE
+        );
+        std::fs::write(dir.join("AGENTS.md"), &agents).unwrap();
+        let wiki_before = std::fs::read(dir.join("wiki/topics/auth.md")).unwrap();
+
+        let outcome = guidance::fix(&dir).unwrap();
+        assert_eq!(
+            outcome,
+            guidance::FixOutcome::SealSkipped("s-map-copy".to_owned())
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("AGENTS.md")).unwrap(),
+            agents
+        );
+        assert_eq!(
+            std::fs::read(dir.join("wiki/topics/auth.md")).unwrap(),
+            wiki_before
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fix_rewrites_an_unsealed_region_and_never_writes_under_wiki() {
+        let dir = temp_workspace("unsealed");
+        let agents = format!(
+            "<!-- loam:seal s-other-note -->\nkept\n<!-- /loam:seal -->\n\n{}\nTopics (1): stale\n{}\n",
+            guidance::MAP_OPEN,
+            guidance::MAP_CLOSE
+        );
+        std::fs::write(dir.join("AGENTS.md"), &agents).unwrap();
+        let snapshot = |root: &std::path::Path| {
+            let mut out = Vec::new();
+            for entry in ["index.md", "topics/auth.md"] {
+                out.push(std::fs::read(root.join("wiki").join(entry)).unwrap());
+            }
+            out
+        };
+        let wiki_before = snapshot(&dir);
+
+        assert_eq!(guidance::fix(&dir).unwrap(), guidance::FixOutcome::Written);
+        let after = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(after.starts_with("<!-- loam:seal s-other-note -->\nkept\n<!-- /loam:seal -->\n"));
+        assert!(after.contains("Topics (1): auth"));
+        assert_eq!(snapshot(&dir), wiki_before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
