@@ -135,7 +135,10 @@ fn parse_read_options(
 
 /// Verifies every seal in the nearest wiki. `Err` carries an exit code
 /// after the diagnostic has been printed.
-fn verify_wiki(verb: &str, options: &ReadOptions) -> Result<Vec<verify::Report>, i32> {
+fn verify_wiki(
+    verb: &str,
+    options: &ReadOptions,
+) -> Result<(Vec<verify::Report>, verify::Selector), i32> {
     let fail = |message: String| {
         eprintln!("loam seal {verb}: {message}");
         EXIT_USAGE
@@ -145,7 +148,9 @@ fn verify_wiki(verb: &str, options: &ReadOptions) -> Result<Vec<verify::Report>,
     let wiki = find_wiki(&cwd)
         .ok_or_else(|| fail(format!("no wiki/ directory at or above {}", cwd.display())))?;
     let env = verify::Env::load(&wiki, trust::seal_dir().ok(), options.now).map_err(&fail)?;
-    verify::verify_all(&env).map_err(fail)
+    let selector = options.selector.clone().resolve(&wiki, &cwd);
+    let reports = verify::verify_all(&env).map_err(fail)?;
+    Ok((reports, selector))
 }
 
 fn level_text(level: Option<Level>) -> &'static str {
@@ -161,15 +166,15 @@ fn verify_command(args: impl Iterator<Item = String>) -> i32 {
             return usage();
         }
     };
-    let reports = match verify_wiki("verify", &options) {
-        Ok(reports) => reports,
+    let (reports, selector) = match verify_wiki("verify", &options) {
+        Ok(found) => found,
         Err(code) => return code,
     };
     let selected: Vec<&verify::Report> = reports
         .iter()
-        .filter(|report| report.matches(&options.selector))
+        .filter(|report| report.matches(&selector))
         .collect();
-    let targeted = options.selector != verify::Selector::default();
+    let targeted = selector != verify::Selector::default();
     if targeted && selected.is_empty() {
         eprintln!("loam seal verify: no seal record matches the selector");
         return EXIT_USAGE;
@@ -219,7 +224,7 @@ fn status_command(args: impl Iterator<Item = String>) -> i32 {
         }
     };
     let reports = match verify_wiki("status", &options) {
-        Ok(reports) => reports,
+        Ok((reports, _)) => reports,
         Err(code) => return code,
     };
     let counts = verify::Counts::of(&reports);
@@ -1180,14 +1185,17 @@ mod tests {
         }
         let (key, public) = world.make_key("one");
         world.policy(&[PRINCIPAL]);
-        let spec = Spec::new(PRINCIPAL);
-        let sealed = |world: &World| {
+        // Fixed dates only: the window is closed on the real clock but was
+        // open at the seal's `time_verified`.
+        let sealed = |world: &World, time_verified: &'static str| {
             for entry in fs::read_dir(record::records_dir(&world.wiki))
                 .into_iter()
                 .flatten()
             {
                 fs::remove_file(entry.unwrap().path()).unwrap();
             }
+            let mut spec = Spec::new(PRINCIPAL);
+            spec.time_verified = time_verified;
             world.seal(
                 &spec,
                 Sig::Key {
@@ -1196,29 +1204,23 @@ mod tests {
                 },
             )
         };
+        let window = ",valid-before=\"20260601Z\"";
+        world.allow(&[allowed_line(PRINCIPAL, &public, window)]);
 
         // Window closed after the seal was made: still valid.
-        world.allow(&[allowed_line(
-            PRINCIPAL,
-            &public,
-            ",valid-before=\"20261201Z\"",
-        )]);
-        sealed(&world);
-        let report = world.only("2027-01-10 10:00 +02:00");
+        sealed(&world, "2026-01-10 10:00 +00:00");
+        let report = world.only("2026-01-11 10:00 +00:00");
         assert_eq!(report.outcome.verdict, Verdict::Citable, "{report:?}");
         assert_eq!(report.signer.as_deref(), Some(PRINCIPAL));
 
-        // Window closed before the seal claims to have been made.
-        world.allow(&[allowed_line(
-            PRINCIPAL,
-            &public,
-            ",valid-before=\"20260101Z\"",
-        )]);
-        let report = world.only(NOW);
+        // Seal claims a time after the window closed.
+        sealed(&world, "2026-07-10 10:00 +00:00");
+        let report = world.only("2026-07-11 10:00 +00:00");
         assert_eq!(report.outcome.verdict, Verdict::Untrusted);
         assert_eq!(report.cite_as(), None);
 
         // Revoked key.
+        sealed(&world, STAMP);
         world.allow(&[allowed_line(PRINCIPAL, &public, "")]);
         assert_eq!(world.only(NOW).outcome.verdict, Verdict::Citable);
         fs::write(

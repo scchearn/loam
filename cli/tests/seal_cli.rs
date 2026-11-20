@@ -301,6 +301,27 @@ mod verify {
     }
 
     #[test]
+    fn verify_accepts_wiki_prefixed_absolute_and_cwd_relative_page_paths() {
+        let ws = Workspace::new("paths");
+        ws.seal();
+        let sub = ws.wiki().join("deep");
+        fs::create_dir_all(&sub).unwrap();
+        let absolute = ws.page().to_string_lossy().into_owned();
+        let cases: [(&Path, String); 4] = [
+            (&ws.0, "wiki/alpha.md#^s-rung-order".to_owned()),
+            (&ws.0, "wiki/alpha#^s-rung-order".to_owned()),
+            (&sub, "../alpha.md#^s-rung-order".to_owned()),
+            (&sub, format!("{absolute}#^s-rung-order")),
+        ];
+        for (dir, selector) in cases {
+            let output = ws.run_in(dir, &["seal", "verify", &selector, "--now", NOW]);
+            assert_eq!(output.status.code(), Some(0), "{selector}: {output:?}");
+        }
+        let output = ws.run(&["seal", "verify", "wiki/beta.md#^s-rung-order", "--now", NOW]);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+    }
+
+    #[test]
     fn verify_with_no_seals_exits_0() {
         let ws = Workspace::new("empty");
         let output = ws.run(&["seal", "verify", "--now", NOW]);

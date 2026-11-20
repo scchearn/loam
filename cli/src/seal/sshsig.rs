@@ -129,7 +129,7 @@ fn probe(bin: &Path) -> bool {
         return false;
     };
     let now = Utc::now().format("%Y%m%d%H%MZ").to_string();
-    find_principals(bin, &allowed, &signature).is_ok()
+    find_principals(bin, &allowed, &signature, &now).is_ok()
         && verify(bin, &allowed, "probe", &signature, b"probe", &now, None).is_ok()
 }
 
@@ -233,14 +233,18 @@ pub fn find_principals(
     bin: &Path,
     allowed_signers: &Path,
     signature: &str,
+    verify_time: &str,
 ) -> Result<Vec<String>, SshsigError> {
     let scratch = Scratch::new("find").map_err(SshsigError::Local)?;
     let sig_path = scratch.write("sig", signature.as_bytes())?;
+    let time_option = format!("verify-time={verify_time}");
     let output = run(
         bin,
         &[
             "-Y".as_ref(),
             "find-principals".as_ref(),
+            "-O".as_ref(),
+            time_option.as_ref(),
             "-f".as_ref(),
             allowed_signers.as_os_str(),
             "-s".as_ref(),
@@ -605,7 +609,7 @@ mod tests {
         .unwrap();
         let signature = sign(&bin, &key, b"x").unwrap();
         assert_eq!(
-            find_principals(&bin, &allowed, &signature).unwrap(),
+            find_principals(&bin, &allowed, &signature, "202601010000Z").unwrap(),
             vec!["agent.two@local".to_owned()]
         );
     }

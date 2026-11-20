@@ -163,6 +163,9 @@ impl Report {
 /// `<page>[#^anchor]` as typed on the command line.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Selector {
+    /// The page argument as typed, kept so [`Selector::resolve`] can treat it
+    /// as a filesystem path.
+    raw_page: Option<String>,
     pub page: Option<String>,
     pub anchor: Option<String>,
 }
@@ -182,9 +185,44 @@ impl Selector {
             return Err("empty page selector".to_owned());
         }
         Ok(Selector {
+            raw_page: (page.is_some())
+                .then(|| arg.split('#').next().unwrap_or("").trim().to_owned()),
             page,
             anchor: anchor.map(str::to_owned),
         })
+    }
+}
+
+impl Selector {
+    /// Resolves the page the way `attest` will: a path naming an existing
+    /// file (absolute, or relative to `cwd`) becomes its wiki-relative name;
+    /// otherwise a leading `wiki/` is dropped.
+    pub fn resolve(mut self, wiki: &Path, cwd: &Path) -> Selector {
+        let Some(raw) = self.raw_page.take() else {
+            return self;
+        };
+        let typed = Path::new(&raw);
+        let joined = if typed.is_absolute() {
+            typed.to_path_buf()
+        } else {
+            cwd.join(typed)
+        };
+        let canon = |p: &Path| fs::canonicalize(p).map(crate::enrollment::dos_compatible);
+        if joined.is_file() {
+            if let (Ok(file), Ok(root)) = (canon(&joined), canon(wiki)) {
+                if let Ok(rel) = file.strip_prefix(&root) {
+                    let name = rel.to_string_lossy().replace('\\', "/");
+                    self.page = Some(normalize_page(&name));
+                    return self;
+                }
+            }
+        }
+        if let Some(page) = &self.page {
+            if let Some(rest) = page.strip_prefix("wiki/") {
+                self.page = Some(rest.to_owned());
+            }
+        }
+        self
     }
 }
 
@@ -384,10 +422,12 @@ impl Verifier<'_> {
             .filter(|s| s.anchor == view.anchor)
             .collect();
         let bound = |s: &&&Span| s.digest.as_deref() == Some(view.subject_sha256.as_str());
+        // The recorded page wins, so an edit there is not hidden by a verbatim
+        // copy of the anchor elsewhere; a moved page falls back to the digest.
         let picked = candidates
             .iter()
-            .find(bound)
-            .or_else(|| candidates.iter().find(|s| same_page(&s.name, &page)))
+            .find(|s| same_page(&s.name, &page))
+            .or_else(|| candidates.iter().find(bound))
             .or_else(|| candidates.first())
             .copied();
         let binding = match picked {
@@ -532,7 +572,7 @@ impl Verifier<'_> {
         let Some(allowed) = allowed else {
             return not_trusted();
         };
-        let principals = match sshsig::find_principals(bin, &allowed, signature) {
+        let principals = match sshsig::find_principals(bin, &allowed, signature, &verify_time) {
             Ok(principals) => principals,
             Err(e) if unavailable(&e) => return S::VerifierUnavailable,
             Err(_) => return not_trusted(),
