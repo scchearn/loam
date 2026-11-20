@@ -1272,9 +1272,9 @@ mod tests {
         let path = tmp.wiki().join("out").join("file");
         let no_link =
             |_: &Path, _: &Path| Err(io::Error::new(io::ErrorKind::Unsupported, "no hard links"));
-        create_only_with(&path, b"one", "file", &no_link).unwrap();
+        create_only_with(&path, b"one", "file", no_link).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"one");
-        let err = create_only_with(&path, b"two", "file", &no_link).unwrap_err();
+        let err = create_only_with(&path, b"two", "file", no_link).unwrap_err();
         assert!(matches!(err, StoreError::Exists(_)), "{err}");
         assert_eq!(fs::read(&path).unwrap(), b"one");
         let strays: Vec<_> = fs::read_dir(path.parent().unwrap())
