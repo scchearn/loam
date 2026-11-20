@@ -100,9 +100,12 @@ fn finding(
 /// One finding per rule per seal, with every contributing verify code in the
 /// detail. Success codes never map to a lint rule.
 pub fn report_findings(report: &Report, spans: &[SpanRef], out: &mut Vec<Finding>) {
-    if report.superseded_by.is_some() {
-        return;
-    }
+    // A superseded record is drift history: only drift-derived output is
+    // suppressed, so a forged parent or stale evidence still reports.
+    let superseded = report.superseded_by.is_some();
+    let drift_derived = |verify_code: &str| {
+        superseded && matches!(verify_code, code::BINDING_MISMATCH | code::SPAN_MISSING)
+    };
     let file = file_for(report);
     let line = report
         .anchor
@@ -117,6 +120,9 @@ pub fn report_findings(report: &Report, spans: &[SpanRef], out: &mut Vec<Finding
     let codes = &report.outcome.codes;
     let mut by_rule: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
     for verify_code in codes.failure.iter().chain(&codes.informational) {
+        if drift_derived(verify_code) {
+            continue;
+        }
         let Some(lint_code) = code::lint_code(verify_code) else {
             continue;
         };
@@ -139,7 +145,7 @@ pub fn report_findings(report: &Report, spans: &[SpanRef], out: &mut Vec<Finding
     }
     // A record whose anchor no longer resolves to a well-formed span is also
     // a record without an anchor (SEL002), whatever else it reports.
-    if codes.failure.contains(&code::SPAN_MISSING) {
+    if codes.failure.contains(&code::SPAN_MISSING) && !superseded {
         let mut found = finding(
             RULE_UNPAIRED,
             Severity::Warning,
@@ -434,6 +440,33 @@ mod tests {
             rules(&found),
             vec![("SEL002", "warning"), ("SEL004", "warning")]
         );
+    }
+
+    #[test]
+    fn superseded_drift_is_silent_but_forgery_still_reports_sel003() {
+        let mut drifted = report(Verdict::Drifted, &[code::BINDING_MISMATCH], &[]);
+        drifted.superseded_by = Some("child1".to_owned());
+        assert!(findings_of(&drifted).is_empty());
+
+        let mut missing = report(Verdict::Drifted, &[code::SPAN_MISSING], &[]);
+        missing.superseded_by = Some("child1".to_owned());
+        assert!(findings_of(&missing).is_empty());
+
+        let mut forged = report(
+            Verdict::Forged,
+            &[code::BINDING_MISMATCH, code::SIGNATURE_INVALID],
+            &[],
+        );
+        forged.superseded_by = Some("child1".to_owned());
+        assert_eq!(rules(&findings_of(&forged)), vec![("SEL003", "error")]);
+    }
+
+    #[test]
+    fn a_retracted_record_reports_no_sel007_but_a_citing_seal_does() {
+        let retracted = report(Verdict::Retracted, &[code::RETRACTED], &[]);
+        assert!(findings_of(&retracted).is_empty());
+        let citing = report(Verdict::Stale, &[code::CITED_NOT_CITABLE], &[]);
+        assert_eq!(rules(&findings_of(&citing)), vec![("SEL007", "warning")]);
     }
 
     #[test]

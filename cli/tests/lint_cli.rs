@@ -534,6 +534,24 @@ mod seals {
     }
 
     #[test]
+    fn a_two_hop_re_seal_chain_clears_the_original_drift() {
+        let ws = Workspace::new("reseal-two-hop");
+        let first = ws.seal();
+        let once = PAGE.replace("Bundled", "System");
+        let second = ws.seal_page("capture:run.log", &once, Some(&first));
+        let twice = PAGE.replace("Bundled", "Kernel");
+        ws.seal_page("capture:run.log", &twice, Some(&second));
+        let output = ws.lint(&["--only", "seals"]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{output:?} {}",
+            stdout(&output)
+        );
+        assert_eq!(stdout(&output), "");
+    }
+
+    #[test]
     fn a_weaker_re_seal_does_not_clear_drift_on_a_higher_level_parent() {
         let ws = Workspace::new("reseal-weaker");
         let old = ws.seal_page_at("audited", "capture:run.log", PAGE, None);

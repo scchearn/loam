@@ -6,6 +6,8 @@
 //! hands everything to the verdict engine. Nothing here writes under `wiki/`
 //! or the trust directory, and nothing ever refuses or reverts a page edit.
 
+use std::collections::BTreeSet;
+
 use crate::json::Value;
 use crate::markers::{self, Kind as MarkerKind};
 use crate::seal::canon;
@@ -164,6 +166,20 @@ impl Report {
         ];
         if let Some(location) = &self.likely_location {
             fields.push(("likely_location".to_owned(), text(location)));
+        }
+        if let Some(child) = &self.superseded_by {
+            // Informational only: the verdict and failure codes are untouched,
+            // so a consumer can exclude superseded drift from its counts.
+            if let Some((_, Value::Object(codes))) =
+                fields.iter_mut().find(|(key, _)| key == "codes")
+            {
+                if let Some((_, Value::Array(info))) =
+                    codes.iter_mut().find(|(key, _)| key == "informational")
+                {
+                    info.push(text(code::SUPERSEDED_BY_RESEAL));
+                }
+            }
+            fields.push(("superseded_by".to_owned(), text(child)));
         }
         Value::Object(fields)
     }
@@ -413,21 +429,49 @@ fn mark_superseded(verifier: &Verifier<'_>, reports: &mut [Report]) {
         })
         .collect();
     let snapshot: Vec<Report> = reports.to_vec();
+    let by_id = |id: &str| snapshot.iter().find(|other| other.id == id);
     for report in reports.iter_mut().filter(|report| drifts(report)) {
-        let found = children.iter().find(|(child, parent, subject)| {
-            parent == &report.id
-                && report.subject.as_ref() == Some(subject)
-                && snapshot.iter().any(|other| {
-                    &other.id == child
-                        && sound(other)
-                        && other
-                            .base_level
-                            .is_some_and(|level| level >= report.outcome.requested_level)
-                })
-        });
-        if let Some((child, _, _)) = found {
-            report.superseded_by = Some(child.clone());
+        // Walk the re-seal chain (each hop a same-subject child naming the
+        // previous record as `parent`). A sound node ends its branch: it
+        // supersedes the ancestor only if its level is high enough. Drifted
+        // or otherwise unsound nodes are passed through, so a chain of
+        // re-seals after repeated edits still resolves.
+        let mut visited: BTreeSet<&str> = BTreeSet::new();
+        visited.insert(report.id.as_str());
+        let mut found: Option<String> = None;
+        for (first, first_parent, subject) in &children {
+            if first_parent != &report.id || report.subject.as_ref() != Some(subject) {
+                continue;
+            }
+            let mut stack: Vec<&str> = vec![first.as_str()];
+            let mut hit = false;
+            while let Some(node) = stack.pop() {
+                if !visited.insert(node) {
+                    continue;
+                }
+                let Some(other) = by_id(node) else { continue };
+                if sound(other) {
+                    if other
+                        .base_level
+                        .is_some_and(|level| level >= report.outcome.requested_level)
+                    {
+                        hit = true;
+                        break;
+                    }
+                    continue;
+                }
+                for (next, parent, next_subject) in &children {
+                    if parent == node && next_subject == subject {
+                        stack.push(next.as_str());
+                    }
+                }
+            }
+            if hit {
+                found = Some(first.clone());
+                break;
+            }
         }
+        report.superseded_by = found;
     }
 }
 
@@ -1015,5 +1059,54 @@ impl Counts {
             ("retracted", self.retracted),
             ("disputed", self.disputed),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::seal::verdict::Codes;
+
+    #[test]
+    fn a_superseded_report_exposes_the_reseal_in_json_without_touching_verdict() {
+        let report = Report {
+            id: "old".to_owned(),
+            subject: Some("alpha#^s-one".to_owned()),
+            page: Some("alpha".to_owned()),
+            anchor: Some("s-one".to_owned()),
+            current_page: Some("alpha".to_owned()),
+            outcome: Outcome {
+                verdict: Verdict::Drifted,
+                effective_level: None,
+                requested_level: Level::Evidence,
+                codes: Codes {
+                    success: vec![],
+                    informational: vec![],
+                    failure: vec![code::BINDING_MISMATCH],
+                },
+            },
+            base_level: None,
+            signer: None,
+            time_verified: None,
+            likely_location: None,
+            superseded_by: Some("child1".to_owned()),
+        };
+        let value = report.to_value();
+        let info = value.get("codes").and_then(|c| c.get("informational"));
+        let listed: Vec<&str> = info
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(listed, vec!["seal.superseded_by_reseal"]);
+        assert_eq!(
+            value.get("superseded_by").and_then(Value::as_str),
+            Some("child1")
+        );
+        assert_eq!(
+            value.get("verdict").and_then(Value::as_str),
+            Some("drifted")
+        );
     }
 }

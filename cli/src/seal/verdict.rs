@@ -142,6 +142,9 @@ pub mod code {
     pub const DISPUTED: &str = "seal.disputed";
     pub const SUPERSEDED: &str = "seal.superseded";
     pub const RETRACTED: &str = "seal.retracted";
+    /// Informational, JSON only: a drifted record replaced by a sound re-seal
+    /// chain. Never part of a verdict's code lists and not a lint code.
+    pub const SUPERSEDED_BY_RESEAL: &str = "seal.superseded_by_reseal";
 
     /// The lint code a verify code reports under (spec D9), or `None` for
     /// codes lint does not surface.
@@ -152,7 +155,7 @@ pub mod code {
             BINDING_MISMATCH | SPAN_MISSING => "SEL004",
             EVIDENCE_DRIFTED | EVIDENCE_UNRESOLVABLE => "SEL005",
             REVIEW_BY_PASSED | REVIEW_BY_CAPPED | RECHECK_DUE | TIME_VERIFIED_FUTURE => "SEL006",
-            CITED_NOT_CITABLE | RETRACTED => "SEL007",
+            CITED_NOT_CITABLE => "SEL007",
             LEVEL_ABOVE_ATTAINABLE
             | CAPPED_DERIVED
             | CAPPED_REDACTION
