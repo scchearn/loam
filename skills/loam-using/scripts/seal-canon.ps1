@@ -20,7 +20,8 @@ question record, is not found.
 
 It is not a CommonMark parser, so it refuses (exit 2) rather than guesses: a
 fence opener inside a list item or block quote, or code indented inside a list,
-is ambiguous, and when the target id is mentioned in a file holding one the
+is ambiguous, as are an HTML block and a footnote definition; the target opener
+appearing on more than one line is refused outright, and when the target id is mentioned in a file holding one the
 span is refused. So is any marker or question line carrying whitespace beyond
 space and tab (the runtime trims Unicode white space). The floor may refuse a
 span the runtime accepts; it must never print a digest the runtime would not.
@@ -161,6 +162,8 @@ $amb = $false
 $mention = $false
 $badws = $false
 $pre = $false
+$mcount = 0
+foreach ($l in $lines) { if ($l.Contains('loam:seal') -and $l.Contains($Anchor)) { $mcount++ } }
 
 for ($i = $fmEnd + 1; $i -lt $n; $i++) {
     $line = $lines[$i]
@@ -181,6 +184,11 @@ for ($i = $fmEnd + 1; $i -lt $n; $i++) {
     $pb = $false
     $s2 = Remove-Prefix $line
     $b2 = $s2.TrimStart($ws)
+    if ($b2.StartsWith('<', [StringComparison]::Ordinal)) {
+        $t3 = $b2.Trim($ws)
+        if (-not ($t3.Length -ge 7 -and $t3.StartsWith('<!--', [StringComparison]::Ordinal) -and $t3.EndsWith('-->', [StringComparison]::Ordinal))) { $amb = $true }
+    }
+    if ($b2 -match '^\[\^[^\]]+\]:') { $amb = $true }
     $fl = $false
     if ($b2.Length -gt 0 -and ($b2[0] -eq '`' -or $b2[0] -eq '~')) {
         $c2 = $b2[0]
@@ -253,6 +261,7 @@ for ($i = $fmEnd + 1; $i -lt $n; $i++) {
 }
 
 if ($badws) { Fail "unsupported whitespace in a marker line of $File; use the loam runtime" }
+if ($mcount -gt 1) { Fail "^$Anchor opens on more than one line of $File; use the loam runtime" }
 if ($amb -and $mention) { Fail "ambiguous list or block-quote structure around ^$Anchor in $File; use the loam runtime" }
 if (-not $found.ContainsKey($Anchor) -or $dup.ContainsKey($Anchor)) {
     Fail "no well-formed seal span ^$Anchor in $File"

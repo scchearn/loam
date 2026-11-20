@@ -19,8 +19,10 @@
 # span, or one holding a question record, is not found.
 #
 # This is not a CommonMark parser, so it refuses (exit 2) rather than guess:
-# a fence opener inside a list item or block quote, or code indented inside a
-# list, is ambiguous, and when the target id is mentioned in a file holding
+# a fence opener inside a list item or block quote, code indented inside a
+# list, an HTML block (a line starting with "<" other than a one-line comment)
+# or a footnote definition is ambiguous, the target opener text appearing on
+# more than one line anywhere is refused outright, and when the target id is mentioned in a file holding
 # one the span is refused. So is any marker or question line carrying
 # whitespace beyond space and tab (form feed, NBSP, U+2000..): the runtime
 # trims Unicode white space, this script does not. NUL bytes are refused
@@ -168,6 +170,10 @@ END {
     amb = 0
     mention = 0
     badws = 0
+    # Any structure the line scanner misreads can hide a decoy copy, so the
+    # target opener text may appear on one line of the whole file, no more.
+    mcount = 0
+    for (i = 1; i <= n; i++) if (index(lines[i], "loam:seal") && index(lines[i], id)) mcount++
     for (i = fm_end + 1; i <= n; i++) {
         L = lines[i]
         if (index(L, "loam:seal") && index(L, id)) mention = 1
@@ -194,6 +200,13 @@ END {
             r2 = run(b2, c2)
             if (r2 >= 3 && !(c2 == "`" && index(substr(b2, r2 + 1), "`"))) fl = 1
         }
+        # HTML blocks and footnote definitions change what counts as code in
+        # ways this scanner does not model: ambiguous.
+        if (substr(b2, 1, 1) == "<") {
+            t3 = trim(b2)
+            if (!(substr(t3, 1, 4) == "<!--" && length(t3) >= 7 && substr(t3, length(t3) - 2) == "-->")) amb = 1
+        }
+        if (b2 ~ /^\[\^[^]]+\]:/) amb = 1
         if (fl && (pre || (ind >= 1 && cont))) amb = 1
         if (pre) cont = 1
         if (ind <= 3 && !pre && fl) {
@@ -247,6 +260,7 @@ END {
         }
     }
     if (badws) exit 5
+    if (mcount > 1) exit 7
     if (amb && mention) exit 6
     if (!(id in cstart) || (id in dup)) exit 4
 
@@ -269,6 +283,7 @@ report() {
         4) echo "seal-canon: no well-formed seal span ^$anchor in $file" >&2 ;;
         5) echo "seal-canon: unsupported whitespace in a marker line of $file; use the loam runtime" >&2 ;;
         6) echo "seal-canon: ambiguous list or block-quote structure around ^$anchor in $file; use the loam runtime" >&2 ;;
+        7) echo "seal-canon: ^$anchor opens on more than one line of $file; use the loam runtime" >&2 ;;
         *) echo "seal-canon: awk failed on $file (status $1)" >&2 ;;
     esac
     exit 2

@@ -7,7 +7,7 @@ title: Floor
 A sample, not a span:
 
 ```md
-<!-- loam:seal s-floor-span -->
+<!-- loam:seal s-other-span -->
 Decoy content that must never be hashed.
 <!-- /loam:seal -->
 ```

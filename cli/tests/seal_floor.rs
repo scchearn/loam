@@ -430,9 +430,110 @@ fn floor_never_certifies_a_span_the_runtime_would_not() {
             format!("---\ntitle: t\n---\n\n{open}\nx\n{close}\n"),
         ),
         ("plain", format!("intro\n\n{open}\nx\n{close}\n")),
+        // HTML blocks hide a fence line from the runtime's code view.
+        (
+            "pre-swap",
+            format!(
+                "<pre>\n```\n</pre>\n\n{open}\nALTERED\n{close}\n\n```\n{open}\nORIGINAL\n{close}\n```\n"
+            ),
+        ),
+        (
+            "div-fence-refused",
+            format!("<div>\n```\n</div>\n\n```\n{open}\nx\n{close}\n```\n"),
+        ),
+        (
+            "multiline-comment-fence",
+            format!("<!--\n```\n-->\n\n{open}\nALTERED\n{close}\n\n```\n{open}\nORIGINAL\n{close}\n```\n"),
+        ),
+        (
+            "footnote-fence",
+            format!("[^n]: ```\n\n{open}\nALTERED\n{close}\n\n```\n{open}\nORIGINAL\n{close}\n```\n"),
+        ),
+        (
+            "fenced-same-id-decoy",
+            format!("```\n{open}\nORIGINAL\n{close}\n```\n\n{open}\nALTERED\n{close}\n"),
+        ),
+        (
+            "duplicate-decoy",
+            format!("{open}\nBODY\n{close}\n---\n{open}\nC\n{close}\n{close}\n"),
+        ),
+        (
+            "list-adjacent-fences",
+            format!("<!-- x -->\nBODY\n{close}\n---\n{open}\nC\n{close}\n{close}\n<!-- x -->\n- item\n```\n~~~\n{open}\n{open}\n---\n"),
+        ),
     ];
     let dir = TempDir::new("never-certifies");
-    for (name, body) in &cases {
+    check_never_certifies(&dir, &cases);
+    // Ordinary pages still verify.
+    for name in ["plain", "front-matter"] {
+        let file = dir.0.join(format!("{name}.md"));
+        for floor in floors() {
+            assert_eq!(
+                floor.run(true, &file, ANCHOR).status.code(),
+                Some(0),
+                "{} {name}",
+                floor.label
+            );
+        }
+    }
+}
+
+#[test]
+fn floor_never_certifies_generated_pages() {
+    // Deterministic seeded pages built from structure snippets: whatever the
+    // floor prints with status 0 must be the runtime's digest.
+    let open = "<!-- loam:seal s-floor-span -->";
+    let close = "<!-- /loam:seal -->";
+    let snippets: Vec<String> = vec![
+        "```".into(),
+        "~~~".into(),
+        "<pre>".into(),
+        "</pre>".into(),
+        "<div>".into(),
+        "<!--".into(),
+        "-->".into(),
+        "<!-- x -->".into(),
+        "- item".into(),
+        "> quote".into(),
+        "[^n]: ```".into(),
+        "    indented".into(),
+        "---".into(),
+        "text".into(),
+        "".into(),
+        open.into(),
+        open.into(),
+        close.into(),
+        close.into(),
+        "BODY".into(),
+    ];
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) as usize
+    };
+    let pages: Vec<(String, String)> = (0..600)
+        .map(|index| {
+            let count = 4 + next() % 12;
+            let mut body = String::new();
+            for _ in 0..count {
+                body.push_str(&snippets[next() % snippets.len()]);
+                body.push('\n');
+            }
+            (format!("gen-{index}"), body)
+        })
+        .collect();
+    let cases: Vec<(&str, String)> = pages
+        .iter()
+        .map(|(name, body)| (name.as_str(), body.clone()))
+        .collect();
+    let dir = TempDir::new("never-certifies-gen");
+    check_never_certifies(&dir, &cases);
+}
+
+fn check_never_certifies(dir: &TempDir, cases: &[(&str, String)]) {
+    for (name, body) in cases {
         let file = dir.0.join(format!("{name}.md"));
         std::fs::write(&file, body).unwrap();
         let runtime = runtime_hash(&file);
@@ -468,18 +569,6 @@ fn floor_never_certifies_a_span_the_runtime_would_not() {
                     floor.label
                 );
             }
-        }
-    }
-    // Ordinary pages still verify.
-    for name in ["plain", "front-matter"] {
-        let file = dir.0.join(format!("{name}.md"));
-        for floor in floors() {
-            assert_eq!(
-                floor.run(true, &file, ANCHOR).status.code(),
-                Some(0),
-                "{} {name}",
-                floor.label
-            );
         }
     }
 }
