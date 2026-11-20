@@ -258,6 +258,17 @@ grep -Fq 'seals_attention' skills/loam-using/references/runtime.md \
 amending="skills/loam-memory/loam-amending-memory/SKILL.md"
 grep -Fq -- '--parent' "$amending" || fail "amending-memory must name re-seal with --parent"
 grep -Fq 'dispute' "$amending" || fail "amending-memory must write a dispute instead of overwriting a contradicted seal"
+for seal_skill in \
+  skills/loam-memory/loam-adding-to-memory \
+  skills/loam-memory/loam-learning-from-session \
+  skills/loam-memory/loam-querying-memory \
+  skills/loam-memory/loam-normalizing-memory \
+  skills/loam-work/loam-resuming \
+  skills/loam-work/loam-setting-goals \
+  skills/loam-work/loam-planning; do
+  grep -Eq 'seals\.md|sealing-memory' "$seal_skill/SKILL.md" \
+    || fail "$seal_skill must point at seals.md or sealing-memory"
+done
 
 if [ "$failures" -ne 0 ]; then
   exit 1
