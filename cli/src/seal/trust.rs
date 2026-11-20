@@ -848,7 +848,7 @@ fn cmd_show() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::seal::sshsig::{keygen_for_tests, test_support};
+    use crate::seal::sshsig::{keygen_any_for_tests, keygen_for_tests, test_support};
 
     struct Tmp(PathBuf);
     impl Tmp {
@@ -956,7 +956,7 @@ mod tests {
 
     #[test]
     fn init_is_idempotent_and_adds_a_quoted_line() {
-        let Some(bin) = keygen_for_tests() else {
+        let Some(bin) = keygen_any_for_tests() else {
             eprintln!("no capable ssh-keygen; init needs one");
             return;
         };
@@ -1018,7 +1018,11 @@ mod tests {
         assert!(trust.signers[0].valid_after.is_some());
         assert_eq!(trust.policy, Policy::default());
 
-        // The key really signs and verifies under the generated line.
+        // The key really signs and verifies under the generated line (needs a
+        // verifier new enough for `verify-time`).
+        let Some(bin) = keygen_for_tests() else {
+            return;
+        };
         let sig = sshsig::sign(&bin, &dir.join(KEY_FILE), b"hello").unwrap();
         let now = sshsig::verify_time_utc(&chrono::Utc::now().to_rfc3339()).unwrap();
         // valid-after is today's date at 00:00 UTC (explicit `Z`), so now is inside it.
@@ -1036,7 +1040,7 @@ mod tests {
 
     #[test]
     fn init_uses_the_enrolled_instance_and_org_once() {
-        let Some(bin) = keygen_for_tests() else {
+        let Some(bin) = keygen_any_for_tests() else {
             return;
         };
         let tmp = Tmp::new("enrolled");
@@ -1059,7 +1063,7 @@ mod tests {
 
     #[test]
     fn init_refuses_a_bad_org_and_a_malformed_trust_file() {
-        let Some(bin) = keygen_for_tests() else {
+        let Some(bin) = keygen_any_for_tests() else {
             return;
         };
         let tmp = Tmp::new("bad");
@@ -1090,7 +1094,17 @@ mod tests {
     fn init_without_a_keygen_binary_fails_cleanly() {
         let tmp = Tmp::new("nokeygen");
         let stub = test_support::stub_without_y(&tmp.0);
-        let error = init(&tmp.0.join("seal"), &Enrolled::default(), &stub).unwrap_err();
+        // A freshly written script can hit ETXTBSY while a parallel test forks;
+        // that is the harness racing, so retry before judging the message.
+        let mut error = String::new();
+        for attempt in 0..20 {
+            let dir = tmp.0.join(format!("seal-try{attempt}"));
+            error = init(&dir, &Enrolled::default(), &stub).unwrap_err();
+            if !error.contains("busy") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         assert!(error.contains("ssh-keygen failed"), "{error}");
         let missing = init(
             &tmp.0.join("seal3"),
@@ -1158,6 +1172,11 @@ mod tests {
         fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> EnvGuard {
             let prior = std::env::var_os(name);
             std::env::set_var(name, value);
+            EnvGuard(name, prior)
+        }
+        fn unset(name: &'static str) -> EnvGuard {
+            let prior = std::env::var_os(name);
+            std::env::remove_var(name);
             EnvGuard(name, prior)
         }
     }
@@ -1241,13 +1260,16 @@ mod tests {
 
     #[test]
     fn cli_init_and_add_run_under_pinned_env() {
-        let Some(bin) = keygen_for_tests() else {
+        let Some(bin) = keygen_any_for_tests() else {
             return;
         };
         let _guard = crate::env_lock();
         let tmp = Tmp::new("cli-init");
         let _cfg = EnvGuard::set("LOAM_CONFIG_DIR", &tmp.0);
         let _kg = EnvGuard::set("LOAM_SSH_KEYGEN", &bin);
+        let _id = EnvGuard::unset("LOAM_FEDERATION_IDENTITY_DIR");
+        let _org = EnvGuard::unset("LOAM_FEDERATION_ORG");
+        let _home = EnvGuard::set("LOAM_HOME", tmp.0.join("home"));
         let dir = tmp.0.join("seal");
         assert_eq!(run(["init".to_owned()].into_iter()), EXIT_OK);
         for name in [
@@ -1260,6 +1282,10 @@ mod tests {
             assert!(dir.join(name).is_file(), "{name} missing");
         }
         let before = fs::read(dir.join(ALLOWED_FILE)).unwrap();
+        assert!(
+            String::from_utf8_lossy(&before).contains("@local "),
+            "principal must be local when not enrolled"
+        );
         assert_eq!(run(["init".to_owned()].into_iter()), EXIT_OK);
         assert_eq!(fs::read(dir.join(ALLOWED_FILE)).unwrap(), before);
 

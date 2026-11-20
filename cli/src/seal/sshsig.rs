@@ -261,6 +261,10 @@ fn diagnostic(output: &Output) -> String {
 fn run(bin: &Path, args: &[&std::ffi::OsStr], stdin: Option<&[u8]>) -> Result<Output, SshsigError> {
     let mut child = Command::new(bin)
         .args(args)
+        // A passphrase-protected key must fail fast, not block on a prompt.
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .env_remove("DISPLAY")
+        .env_remove("SSH_ASKPASS")
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -290,13 +294,27 @@ impl Scratch {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
-        let dir = std::env::temp_dir().join(format!(
-            "loam-sshsig-{label}-{}-{n}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir)
-            .map_err(|e| format!("cannot create scratch dir {}: {e}", dir.display()))?;
-        Ok(Scratch(dir))
+        for attempt in 0..16u32 {
+            let dir = std::env::temp_dir().join(format!(
+                "loam-sshsig-{label}-{}-{n}-{nanos}-{attempt}",
+                std::process::id()
+            ));
+            // `create_dir` refuses an existing directory, so a pre-planted one
+            // in the shared temp dir is never reused.
+            match fs::create_dir(&dir) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+                    }
+                    return Ok(Scratch(dir));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(format!("cannot create scratch dir {}: {e}", dir.display())),
+            }
+        }
+        Err("cannot create a unique scratch dir".to_owned())
     }
 
     fn path(&self) -> &Path {
@@ -326,7 +344,7 @@ impl Drop for Scratch {
 /// signatures. Tries `LOAM_SSH_KEYGEN`, the Git-for-Windows bundled binary,
 /// then PATH. `None` means the test must assert the degraded path instead.
 #[cfg(test)]
-pub(crate) fn keygen_for_tests() -> Option<PathBuf> {
+fn keygen_candidates() -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(value) = std::env::var("LOAM_SSH_KEYGEN") {
         if !value.trim().is_empty() {
@@ -339,7 +357,43 @@ pub(crate) fn keygen_for_tests() -> Option<PathBuf> {
         ));
     }
     candidates.push(PathBuf::from("ssh-keygen"));
-    let found = candidates
+    candidates
+}
+
+/// Any `ssh-keygen` that can generate an ed25519 key and print its public half
+/// (what `trust init` needs), even when it is too old for SSHSIG verification.
+#[cfg(test)]
+pub(crate) fn keygen_any_for_tests() -> Option<PathBuf> {
+    if let Some(bin) = keygen_for_tests() {
+        return Some(bin);
+    }
+    let found = keygen_candidates().into_iter().find(|bin| {
+        let Ok(scratch) = Scratch::new("anykg") else {
+            return false;
+        };
+        let key = scratch.path().join("probe");
+        let made = Command::new(bin)
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success());
+        made && Command::new(bin)
+            .args(["-y", "-f"])
+            .arg(&key)
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success())
+    });
+    if found.is_none() && std::env::var("LOAM_REQUIRE_SSHSIG").is_ok_and(|v| v == "1") {
+        panic!("LOAM_REQUIRE_SSHSIG=1 but no ssh-keygen able to generate keys was found");
+    }
+    found
+}
+
+#[cfg(test)]
+pub(crate) fn keygen_for_tests() -> Option<PathBuf> {
+    let found = keygen_candidates()
         .into_iter()
         .find(|bin| capability_of(bin) == Capability::Available);
     // Needs OpenSSH 9.1+ (`verify-time` with a `Z` suffix); ubuntu-22.04 ships
