@@ -99,28 +99,37 @@ const CLASS_TOKENS: [&str; 3] = ["local-only", "project", "hub-promotable"];
 
 /// Scan `source` for markers.
 pub fn scan(source: &str) -> Scan {
-    let excluded = markdown::excluded_ranges(source);
-    let mut scanner = Scanner::default();
-    // A leading BOM would hide a first-line marker; skip it but keep offsets
-    // into the original source.
-    let mut offset = if source.starts_with('\u{FEFF}') {
+    // A leading BOM would hide a first-line marker or fence: scan the stripped
+    // text and shift every offset back so ranges index the original source.
+    let bom = if source.starts_with('\u{FEFF}') {
         '\u{FEFF}'.len_utf8()
     } else {
         0
     };
+    let body = &source[bom..];
+    let excluded = markdown::excluded_ranges(body)
+        .into_iter()
+        .map(|range| range.start + bom..range.end + bom)
+        .collect::<Vec<_>>();
+    let mut scanner = Scanner::default();
+    let mut offset = bom;
     // Lines arrive in increasing offset order, so one cursor through the
     // sorted excluded ranges suffices.
     let mut cursor = 0usize;
     while offset < source.len() {
-        let (line_end, next) = match source[offset..].find('\n') {
-            Some(index) => (offset + index, offset + index + 1),
+        // `\n`, `\r\n` and a lone `\r` all terminate a line.
+        let (line_end, next) = match source[offset..].find(['\n', '\r']) {
+            Some(index) => {
+                let end = offset + index;
+                let bytes = source.as_bytes();
+                let next = if bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n') {
+                    end + 2
+                } else {
+                    end + 1
+                };
+                (end, next)
+            }
             None => (source.len(), source.len()),
-        };
-        // A trailing `\r` belongs to the terminator, not the line.
-        let line_end = if line_end > offset && source.as_bytes()[line_end - 1] == b'\r' {
-            line_end - 1
-        } else {
-            line_end
         };
         let line = &source[offset..line_end];
         while cursor < excluded.len() && excluded[cursor].end <= offset {
@@ -400,6 +409,14 @@ impl Scanner {
             );
             return;
         }
+        if let Some(index) = self.stack.iter().rposition(|open| open.kind == Kind::Seal) {
+            self.stack[index].excluded = true;
+            self.problem(
+                ProblemCode::Mrk002,
+                "question record inside a seal",
+                range.clone(),
+            );
+        }
         self.register(Kind::Question, id, &range);
         let end = range.end;
         self.done.push(Marker {
@@ -636,6 +653,14 @@ TLS tries the bundled rung first.\n\
         assert_eq!(codes(&scan_c), ["MRK002"]);
         assert!(scan_c.markers.is_empty());
 
+        // A question record inside a seal is illegal too; the seal is dropped.
+        let question_in_seal =
+            "<!-- loam:seal s-aa-bb -->\n- [ ] Q: why? ^q-some-reason\n<!-- /loam:seal -->\n";
+        let scan_d = scan(question_in_seal);
+        assert_eq!(codes(&scan_d), ["MRK002"]);
+        assert!(scan_d.markers.iter().all(|m| m.kind != Kind::Seal));
+        assert_eq!(scan_d.anchors.len(), 2);
+
         // A class may contain seals: that is legal (M1 page).
         assert!(scan(M1).problems.is_empty());
     }
@@ -762,6 +787,45 @@ TLS tries the bundled rung first.\n\
             &source[result.markers[0].opener.clone()],
             "<!-- loam:seal s-aa-bb -->"
         );
+    }
+
+    #[test]
+    fn bom_shifts_front_matter_and_fence_exclusions() {
+        let front = "\u{FEFF}---\nnote: |\n  <!-- loam:seal s-front-matter -->\n---\n\nBody\n";
+        let result = scan(front);
+        assert!(result.markers.is_empty());
+        assert!(result.problems.is_empty(), "{:?}", result.problems);
+
+        let fence = format!("\u{FEFF}{}", fenced("<!-- loam:seal s-aa-bb -->\nx\n"));
+        let result = scan(&fence);
+        assert!(result.markers.is_empty());
+        assert!(result.problems.is_empty(), "{:?}", result.problems);
+
+        // Ranges still index the original, BOM-prefixed source.
+        let page = format!(
+            "{}---\ntitle: T
+---
+{M1}",
+            "\u{FEFF}"
+        );
+        let result = scan(&page);
+        assert!(result.problems.is_empty(), "{:?}", result.problems);
+        let seal = &result.markers[1];
+        assert_eq!(
+            &page[seal.opener.clone()],
+            "<!-- loam:seal s-tls-rung-order -->"
+        );
+    }
+
+    #[test]
+    fn lone_cr_terminates_lines() {
+        let source = "<!-- loam:seal s-aa-bb -->\rbody\r<!-- /loam:seal -->\r";
+        let result = scan(source);
+        assert!(result.problems.is_empty(), "{:?}", result.problems);
+        assert_eq!(result.markers.len(), 1);
+        let seal = &result.markers[0];
+        assert_eq!(&source[seal.content.clone()], "body\r");
+        assert_eq!(&source[seal.closer.clone()], "<!-- /loam:seal -->");
     }
 
     #[test]
