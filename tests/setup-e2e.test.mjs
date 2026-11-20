@@ -1272,7 +1272,7 @@ test('seal: a seal skip leaves the exit code unchanged', async () => {
   });
   assert.equal(code, 0, capture.text());
   assert.equal(seal.calls.length, 1);
-  assert.match(capture.text(), /Seal key not provisioned \(seal_unavailable\)/);
+  assert.match(capture.text(), /Seal key not provisioned \(seal_unavailable(: [^)]+)?\)/);
 });
 
 test('seal: update makes exactly one seal call', async () => {

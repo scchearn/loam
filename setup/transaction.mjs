@@ -540,7 +540,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
         if (seal.ready) {
           if (seal.created.length) stepDone(output, `Seal key ready — ${seal.principal}`);
         } else {
-          stepSkip(output, `Seal key not provisioned (${seal.category})`);
+          stepSkip(output, `Seal key not provisioned (${seal.category}${seal.detail ? `: ${seal.detail}` : ''})`);
         }
       }
 
