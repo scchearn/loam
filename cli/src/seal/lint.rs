@@ -235,21 +235,43 @@ pub fn lint_findings(workspace: &Path, now: DateTime<FixedOffset>, out: &mut Vec
     let mut found = Vec::new();
     match seal_pass(&wiki, now, &mut found) {
         Ok(()) => out.append(&mut found),
-        Err(error) => out.push(
-            finding(RULE_TRUST, Severity::Warning, "wiki", 0, error)
-                .with_evidence("code", "seal.trust.unreadable"),
+        Err((code, error)) => out.push(
+            finding(RULE_TRUST, Severity::Warning, "wiki", 0, error).with_evidence("code", code),
         ),
     }
+}
+
+/// Evidence code for a trust-file failure.
+const CODE_TRUST: &str = "seal.trust.unreadable";
+/// Evidence code for an unreadable record directory or wiki tree.
+const CODE_READ: &str = "seal.records.unreadable";
+
+fn has_records(wiki: &Path) -> bool {
+    fs::read_dir(wiki.join(".seals").join("records")).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+    })
 }
 
 fn seal_pass(
     wiki: &Path,
     now: DateTime<FixedOffset>,
     out: &mut Vec<Finding>,
-) -> Result<(), String> {
-    let env = Env::load(wiki, trust::seal_dir().ok(), now)?;
-    let reports = verify::verify_all(&env)?;
-    let spans = collect_spans(wiki)?;
+) -> Result<(), (&'static str, String)> {
+    let trust_dir = trust::seal_dir().ok();
+    // Trust files are still parsed so a malformed one reports as SEL009, but
+    // the verify environment (ssh-keygen probe, git) is only built when
+    // there is something to verify.
+    if let Some(dir) = &trust_dir {
+        trust::load(dir).map_err(|e| (CODE_TRUST, e.to_string()))?;
+    }
+    let spans = collect_spans(wiki).map_err(|e| (CODE_READ, e))?;
+    if spans.is_empty() && !has_records(wiki) {
+        return Ok(());
+    }
+    let env = Env::load(wiki, trust_dir, now).map_err(|e| (CODE_TRUST, e))?;
+    let reports = verify::verify_all(&env).map_err(|e| (CODE_READ, e))?;
     for report in &reports {
         report_findings(report, &spans, out);
     }

@@ -473,6 +473,33 @@ mod seals {
         assert!(text.contains("seal.trust.unreadable"), "{text}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_with_no_seals_never_probes_ssh_keygen() {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = Workspace::new("nokeygen");
+        fs::write(ws.wiki().join("index.md"), "# Index\n").unwrap();
+        let log = ws.0.join("keygen.log");
+        let script = ws.0.join("keygen.sh");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\necho called >> '{}'\nexit 1\n", log.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_loam"))
+            .args(["lint", "--only", "seals"])
+            .arg(&ws.0)
+            .args(["--now", NOW])
+            .env("LOAM_WORKSPACES", "off")
+            .env("LOAM_CONFIG_DIR", ws.0.join("config"))
+            .env("LOAM_SSH_KEYGEN", &script)
+            .output()
+            .expect("loam should run");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(!log.exists(), "ssh-keygen must not be invoked");
+    }
+
     #[test]
     fn a_citable_seal_lints_clean() {
         let ws = Workspace::new("clean");
