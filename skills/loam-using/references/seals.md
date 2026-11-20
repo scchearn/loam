@@ -87,7 +87,7 @@ Verdict is computed on every read, never typed:
 | `drifted` | Span text or evidence changed since sealing | Do not cite as sealed; re-check, then re-seal or amend |
 | `stale` | `review_by` or a recheck interval has passed | Do not cite as sealed; re-verify evidence, then re-seal |
 | `unverifiable` | Evidence or tooling cannot be checked here | Treat as provisional; say what could not be checked |
-| `untrusted` | Valid signature from a key not in the reader's `allowed_signers` | Provisional; trust is the reader's decision |
+| `untrusted` | Signing key is revoked, or a valid signature from a key not in the reader's `allowed_signers` | Provisional; trust is the reader's decision |
 | `forged` | Bad signature, wrong namespace, id mismatch or signer differs from the stated verifier | Never rely on it; report it, do not repair it |
 | `retracted` | A status record withdrew it | Never cite as sealed |
 
@@ -120,13 +120,15 @@ hand. It approximates `<native-runtime-command> seal verify`; only a pass of eve
    - Linux or macOS: `sh <Skill root>/scripts/seal-canon.sh --digest <page> <anchor>`
    - Windows, on one line: `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <Skill root>/scripts/seal-canon.ps1 -Digest <page> <anchor>`
 2. Signature.
-   - Linux or macOS: `ssh-keygen -Y verify -f <configRoot>/seal/allowed_signers -I <principal> -n loam-seal -O verify-time=<time_verified> -s <id>.json.sig < <id>.json`
-   - Windows: `cmd /c "ssh-keygen -Y verify -f <configRoot>\seal\allowed_signers -I <principal> -n loam-seal -O verify-time=<time_verified> -s <id>.json.sig < <id>.json"`; PowerShell 5.1 has no `<` redirection and re-encodes piped bytes.
+   - Linux or macOS: `ssh-keygen -Y verify -f <configRoot>/seal/allowed_signers -I <principal> -n loam-seal -O verify-time=<time_verified> [-r <configRoot>/seal/revoked] -s <id>.json.sig < <id>.json`
+   - Windows: `cmd /c ""C:\Program Files\Git\usr\bin\ssh-keygen.exe" -Y verify -f <configRoot>\seal\allowed_signers -I <principal> -n loam-seal -O verify-time=<time_verified> [-r <configRoot>\seal\revoked] -s <id>.json.sig < <id>.json"`; PowerShell 5.1 has no `<` redirection and re-encodes piped bytes. Use `LOAM_SSH_KEYGEN` instead of the Git for Windows path when it is set. The in-box Windows OpenSSH 8.x cannot do `verify-time`, so do not call the bare `ssh-keygen`.
 3. Evidence: `git hash-object <path>`, and `sha256sum <path>` (Linux), `shasum -a 256 <path>` (macOS) or `certutil -hashfile <path> SHA256` (Windows).
 
-`<time_verified>` is the record's `time_verified` converted to
-`YYYYMMDDHHMMSS` in UTC (apply the stamp's offset). It matters because rotated
-keys keep a closed validity window in `allowed_signers`.
+`<time_verified>` is the record's `time_verified` converted to UTC and written
+`YYYYMMDDHHMMZ`, with the trailing `Z` (without it ssh-keygen reads local time),
+the same as the runtime. Example: `2026-11-20 14:05 +02:00` becomes `202611201205Z`. It matters because rotated
+keys keep a closed validity window in `allowed_signers`. Pass `-r` only when
+the `revoked` file exists; a signer it lists is `untrusted`.
 
 4. Standing. Confirm that no `status` record in `wiki/.seals/records/` names
    this id in `updates` with retract, supersede or demote; that `review_by`
@@ -155,7 +157,7 @@ All run through `<native-runtime-command>`: `seal hash <file> <anchor>`,
 
 ## Gotchas
 
-- Trigger: a marker or a file under `wiki/.seals/` needs fixing by hand. Mistake: editing it, which makes the record verify as `forged`. Fix: never hand-edit; re-seal with `seal attest` or retract with `seal mark`.
+- Trigger: a marker or a file under `wiki/.seals/` needs fixing by hand. Mistake: editing it; a hand-edited record or `.sig` verifies as `forged`, and a hand-edited marker orphans the seal (SEL002) or drifts it. Fix: never hand-edit; re-seal with `seal attest` or retract with `seal mark`.
 - Trigger: tidying text inside a sealed span (re-wrapping, smart quotes, escapes). Mistake: any byte change drifts the seal. Fix: edit deliberately, then resolve the seal in the same change through `/loam::amending-memory`.
 - Trigger: reporting a section as sealed or verified. Mistake: claiming it from memory or from the marker alone. Fix: run `seal verify` and quote the verdict.
 - Trigger: `datecheck fix` or `lint --fix` over a sealed page. Mistake: expecting spans to be rewritten. Fix: they skip sealed spans and report SEL008; change span text only by amending.
