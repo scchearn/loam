@@ -158,7 +158,9 @@ fn prewarm_cache(root: &Path, config: &Path) {
         "evidence entries were not cached"
     );
     // The records are unsigned, so there is no signature to verify or cache;
-    // the fast path settles them without `ssh-keygen`.
+    // the fast path settles them without `ssh-keygen`. The signature-cache
+    // hit path is outside this budget fixture (signing 500 records needs
+    // ssh-keygen and is platform-sensitive); the seals_counts tests cover it.
     cache.pages.clear();
     loam::seal_cache::save(&file, &cache).expect("cache rewritten");
 }
@@ -177,6 +179,19 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
         .expect("clock")
         .as_nanos();
     let root = std::env::temp_dir().join(format!("loam-state-budget-{nonce}"));
+    // Removes the fixture even when an assertion panics.
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for _ in 0..5 {
+                if fs::remove_dir_all(&self.0).is_ok() || !self.0.exists() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
     let wiki = root.join("wiki");
     fs::create_dir_all(wiki.join("checkpoints")).expect("checkpoints");
     fs::create_dir_all(wiki.join("code")).expect("code pages");
@@ -263,20 +278,33 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
     age(&root.join("src/evidence.txt"));
     prewarm_cache(&root, &config);
 
-    // `ssh-keygen` and `git` stand-ins that record every call and fail. The
-    // fast path must never spawn either. Unix only: a Windows stub would need
-    // a committed `.exe`, the same caveat as the hcom stub above.
+    // `git` and `ssh-keygen` stand-ins that record every call. The `git` stub
+    // hands off to the real git so the timed run still pays for the probe;
+    // the `ssh-keygen` stub fails. The fast path must never spawn the latter.
+    // Unix only: a Windows stub would need a committed `.exe`, the same
+    // caveat as the hcom stub above.
+    #[cfg(unix)]
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("a real git on PATH");
     let stubs = root.join("stubs");
+    #[cfg(unix)]
     let calls = root.join("stub-calls.log");
     fs::create_dir_all(&stubs).expect("stubs directory");
     #[cfg(unix)]
     for name in ["git", "ssh-keygen"] {
         use std::os::unix::fs::PermissionsExt;
         let stub = stubs.join(name);
+        let tail = if name == "git" {
+            format!("exec '{}' \"$@\"\n", real_git.display())
+        } else {
+            "exit 1\n".to_string()
+        };
         fs::write(
             &stub,
             format!(
-                "#!/bin/sh\necho \"{name} $*\" >> '{}'\nexit 1\n",
+                "#!/bin/sh\necho \"{name} $*\" >> '{}'\n{tail}",
                 calls.display()
             ),
         )
@@ -347,21 +375,22 @@ fn fast_state_stays_within_the_five_second_hook_budget() {
     let started = Instant::now();
     let output = state(&binary).output().expect("state should run");
     let elapsed = started.elapsed();
-    let spawned = fs::read_to_string(&calls).unwrap_or_default();
-    fs::remove_dir_all(&root).ok();
-
     // `state` itself runs one `git status --porcelain` per run (the working
     // tree probe, three runs here); the seal path adds no other git call and
     // never reaches `ssh-keygen`.
-    let unexpected: Vec<_> = spawned
-        .lines()
-        .filter(|line| !(line.starts_with("git -C ") && line.ends_with(" status --porcelain")))
-        .collect();
-    assert!(
-        unexpected.is_empty(),
-        "the seal path spawned a subprocess: {unexpected:?}"
-    );
-    assert_eq!(spawned.lines().count(), 3, "{spawned}");
+    #[cfg(unix)]
+    {
+        let spawned = fs::read_to_string(&calls).unwrap_or_default();
+        let unexpected: Vec<_> = spawned
+            .lines()
+            .filter(|line| !(line.starts_with("git -C ") && line.ends_with(" status --porcelain")))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "the seal path spawned a subprocess: {unexpected:?}"
+        );
+        assert_eq!(spawned.lines().count(), 3, "{spawned}");
+    }
 
     assert!(
         output.status.success(),
