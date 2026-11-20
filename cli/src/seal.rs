@@ -1841,4 +1841,51 @@ mod tests {
         assert_eq!(fs::read(&beta).unwrap(), beta_before);
         assert_eq!(world.reports(NOW).len(), count);
     }
+
+    /// Re-sealing a drifted span with `--parent` records the parent as
+    /// drifted; `--review-by` and `--redacted` land in the record and the
+    /// redaction caps the level at evidence.
+    #[test]
+    fn parent_after_drift_review_by_and_redacted() {
+        let world = World::new();
+        let Some(mut ctx) = world.attest_context() else {
+            return;
+        };
+        let page = world.page_with("alpha", UNMARKED);
+        let first = attest::attest(&ctx, &request(&["capture:run.log"])).unwrap();
+
+        let drifted = fs::read_to_string(&page)
+            .unwrap()
+            .replace("bundled rung", "bundled rung (edited)");
+        fs::write(&page, drifted).unwrap();
+        ctx.now = super::policy::parse_stamp("2026-11-21 11:00 +02:00").unwrap();
+        let mut again = request(&["capture:run.log"]);
+        again.parent = Some(first.id.clone());
+        again.review_by = Some("2026-12-01 09:00 +02:00".to_owned());
+        again.redacted = vec!["api token".to_owned()];
+        again.level = "audited".to_owned();
+        let second = attest::attest(&ctx, &again).unwrap();
+
+        let bytes = fs::read(record::record_path(&world.wiki, &second.id)).unwrap();
+        let view = record::well_formed(&second.id, &bytes).unwrap();
+        let parent = view.parent.expect("parent recorded");
+        assert_eq!(parent.id, first.id);
+        assert_eq!(parent.verdict, "drifted");
+        assert_eq!(view.review_by.as_deref(), Some("2026-12-01 09:00 +02:00"));
+        assert_eq!(view.redacted.len(), 1);
+        let report = world
+            .reports("2026-11-21 12:00 +02:00")
+            .into_iter()
+            .find(|r| r.id == second.id)
+            .expect("second report");
+        assert!(report
+            .outcome
+            .codes
+            .informational
+            .contains(&super::verdict::code::CAPPED_REDACTION));
+        assert_eq!(
+            report.outcome.effective_level,
+            Some(super::policy::Level::Evidence)
+        );
+    }
 }

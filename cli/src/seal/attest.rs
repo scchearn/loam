@@ -131,6 +131,21 @@ fn is_heading(text: &str) -> bool {
             .is_none_or(char::is_whitespace)
 }
 
+/// A CommonMark thematic break: up to 3 spaces of indent, then 3 or more of
+/// the same `*`, `-` or `_`, with only spaces or tabs between them.
+fn is_thematic_break(text: &str) -> bool {
+    let indent = text.chars().take_while(|c| *c == ' ').count();
+    if indent > 3 {
+        return false;
+    }
+    let body = text[indent..].trim_end();
+    let Some(mark) = body.chars().next().filter(|c| matches!(c, '*' | '-' | '_')) else {
+        return false;
+    };
+    body.chars().all(|c| c == mark || matches!(c, ' ' | '\t'))
+        && body.chars().filter(|c| *c == mark).count() >= 3
+}
+
 /// A CommonMark list item start: `-`, `*`, `+` or `1.`/`1)` then a space.
 fn is_list_item(text: &str) -> bool {
     let body = text.trim_start_matches([' ', '\t']);
@@ -253,16 +268,17 @@ pub fn insert_markers(source: &str, anchor: &str) -> Result<Option<String>, Stri
         )
     };
     let mut first = last;
-    if is_list_item(last_content) {
+    if !is_thematic_break(last_content) && is_list_item(last_content) {
         return Err(list_refusal());
     }
-    if !is_heading(last_content) {
+    if !is_heading(last_content) && !is_thematic_break(last_content) {
         while first > 0 {
             let previous = &lines[first - 1];
             let text = &source[previous.start..previous.end];
             if text.trim().is_empty()
                 || is_heading(text)
                 || is_marker_comment(text)
+                || is_thematic_break(text)
                 || is_setext_underline(text)
                 || in_code(previous)
             {
@@ -888,8 +904,20 @@ mod tests {
 
     #[test]
     fn page_names_resolve_to_the_on_disk_case() {
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for _ in 0..10 {
+                    if fs::remove_dir_all(&self.0).is_ok() || !self.0.exists() {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
         let dir = std::env::temp_dir().join(format!("loam-attest-resolve-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
+        let _cleanup = Cleanup(dir.clone());
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("alpha.md"), "x").unwrap();
         let (name, _) = resolve_page(&dir, "Alpha").unwrap();
@@ -897,7 +925,22 @@ mod tests {
         assert!(resolve_page(&dir, "beta").is_err());
         fs::write(dir.join("Gamma.md"), "x").unwrap();
         assert_eq!(resolve_page(&dir, "gamma").unwrap().0, "Gamma");
-        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thematic_breaks_bound_a_block() {
+        for rule in ["***", "___", "* * *", "- - -", "---", "  ***"] {
+            let source = format!("A\n{rule}\npara ^s-after-rule\n");
+            let out = insert_markers(&source, "s-after-rule").unwrap().unwrap();
+            assert!(
+                out.starts_with(&format!("A\n{rule}\n<!-- loam:seal s-after-rule -->\npara")),
+                "{rule}: {out}"
+            );
+        }
+        assert!(
+            is_thematic_break("_ _ _") && !is_thematic_break("**") && !is_thematic_break("*-*")
+        );
+        assert!(!is_thematic_break("    ***") && !is_thematic_break("*** x"));
     }
 
     #[test]
