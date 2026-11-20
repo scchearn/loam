@@ -21,7 +21,8 @@ question record, is not found.
 It is not a CommonMark parser, so it refuses (exit 2) rather than guesses: a
 fence opener inside a list item or block quote, or code indented inside a list,
 is ambiguous, as are an HTML block and a footnote definition; the target opener
-appearing on more than one line is refused outright, and when the target id is mentioned in a file holding one the
+appearing on more than one line is refused outright, and when the target id
+is mentioned in a file holding one the
 span is refused. So is any marker or question line carrying whitespace beyond
 space and tab (the runtime trims Unicode white space). The floor may refuse a
 span the runtime accepts; it must never print a digest the runtime would not.
@@ -32,7 +33,8 @@ Targets Windows PowerShell 5.1.
 param(
     [switch]$Digest,
     [Parameter(Position = 0)][string]$File,
-    [Parameter(Position = 1)][string]$Anchor
+    [Parameter(Position = 1)][string]$Anchor,
+    [Parameter(ValueFromRemainingArguments = $true)][string[]]$Rest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,7 +44,7 @@ function Fail([string]$Message) {
     exit 2
 }
 
-if ([string]::IsNullOrEmpty($File) -or [string]::IsNullOrEmpty($Anchor)) {
+if ([string]::IsNullOrEmpty($File) -or [string]::IsNullOrEmpty($Anchor) -or ($Rest -and $Rest.Count -gt 0)) {
     [Console]::Error.WriteLine('usage: seal-canon.ps1 [-Digest] <file> <anchor>')
     exit 2
 }
@@ -139,9 +141,11 @@ function Test-QuestionAnchor([string]$s) {
 }
 
 # Does the line hold a loam:seal token and the id as a whole space/tab-delimited
-# token? The id s-x-y must not count s-x-y-2.
+# token? The id s-x-y must not count s-x-y-2. Comment delimiters count as
+# separators, as in the runtime: <!--loam:seal s-x-y--> is a marker.
 function Test-Mention([string]$s, [string]$id) {
     if (-not $s.Contains('loam:seal')) { return $false }
+    $s = $s.Replace('<!--', ' ').Replace('-->', ' ')
     return (@($s -split '[ \t]+') -ccontains $id)
 }
 

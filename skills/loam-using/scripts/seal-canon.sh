@@ -22,9 +22,9 @@
 # a fence opener inside a list item or block quote, code indented inside a
 # list, an HTML block (a line starting with "<" other than a one-line comment)
 # or a footnote definition is ambiguous, the target opener text appearing on
-# more than one line anywhere is refused outright, and when the target id is mentioned in a file holding
-# one the span is refused. So is any marker or question line carrying
-# whitespace beyond space and tab (form feed, NBSP, U+2000..): the runtime
+# more than one line anywhere is refused outright, and when the target id is
+# mentioned in a file holding one the span is refused. So is any marker or
+# question line carrying whitespace beyond space and tab (form feed, NBSP, U+2000..): the runtime
 # trims Unicode white space, this script does not. NUL bytes are refused
 # on purpose as invalid text. The floor may refuse a span the runtime
 # accepts; it must never print a digest the runtime would not.
@@ -115,9 +115,11 @@ function valid_id(prefix, id,   slug, k, nw, w) {
     return 1
 }
 # Does the line hold a loam:seal token and the id as a whole space/tab-delimited
-# token? The id s-x-y must not count s-x-y-2.
+# token? The id s-x-y must not count s-x-y-2. Comment delimiters count as
+# separators, as in the runtime: <!--loam:seal s-x-y--> is a marker.
 function mentions(s, id,   m, k, w) {
     if (!index(s, "loam:seal")) return 0
+    gsub(/<!--|-->/, " ", s)
     m = split(s, w, /[ \t]+/)
     for (k = 1; k <= m; k++) if (w[k] == id) return 1
     return 0

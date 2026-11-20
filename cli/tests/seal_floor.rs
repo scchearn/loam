@@ -444,6 +444,14 @@ fn floor_never_certifies_a_span_the_runtime_would_not() {
             ),
         ),
         (
+            "compact-pre-swap",
+            "<pre>\n```\n</pre>\n\n<!--loam:seal s-floor-span-->\nALTERED\n<!--/loam:seal-->\n\n```\n<!--loam:seal s-floor-span-->\nORIGINAL\n<!--/loam:seal-->\n```\n".to_string(),
+        ),
+        (
+            "half-compact-pre-swap",
+            "<pre>\n```\n</pre>\n\n<!-- loam:seal s-floor-span-->\nALTERED\n<!-- /loam:seal-->\n\n```\n<!-- loam:seal s-floor-span-->\nORIGINAL\n<!-- /loam:seal-->\n```\n".to_string(),
+        ),
+        (
             "div-fence-refused",
             format!("<div>\n```\n</div>\n\n```\n{open}\nx\n{close}\n```\n"),
         ),
@@ -493,7 +501,7 @@ fn floor_never_certifies_a_span_the_runtime_would_not() {
         ),
     ];
     let dir = TempDir::new("never-certifies");
-    check_never_certifies(&dir, &cases);
+    check_never_certifies(&dir, &cases, usize::MAX, usize::MAX);
     // Ordinary pages still verify.
     for name in ["plain", "front-matter", "suffixed-id-neighbour"] {
         let file = dir.0.join(format!("{name}.md"));
@@ -541,6 +549,9 @@ fn floor_never_certifies_generated_pages() {
         "intro".into(),
         format!("    {open}"),
         format!("    {close}"),
+        "<!--loam:seal s-floor-span-->".into(),
+        "<!-- loam:seal s-floor-span-->".into(),
+        "<!--/loam:seal-->".into(),
         "text".into(),
         "".into(),
         open.into(),
@@ -556,9 +567,7 @@ fn floor_never_certifies_generated_pages() {
             .wrapping_add(1_442_695_040_888_963_407);
         (state >> 33) as usize
     };
-    // Each Windows case is a PowerShell cold start: fewer pages there.
-    let pages = if cfg!(windows) { 60 } else { 600 };
-    let pages: Vec<(String, String)> = (0..pages)
+    let pages: Vec<(String, String)> = (0..600)
         .map(|index| {
             let count = 4 + next() % 12;
             let mut body = String::new();
@@ -574,16 +583,31 @@ fn floor_never_certifies_generated_pages() {
         .map(|(name, body)| (name.as_str(), body.clone()))
         .collect();
     let dir = TempDir::new("never-certifies-gen");
-    check_never_certifies(&dir, &cases);
+    check_never_certifies(&dir, &cases, 600, 60);
 }
 
-fn check_never_certifies(dir: &TempDir, cases: &[(&str, String)]) {
-    for (name, body) in cases {
+/// Each ps1 case is a PowerShell cold start, so a ps1 floor only sees the
+/// first `ps1_limit` cases; the sh floor sees up to `sh_limit`.
+fn check_never_certifies(
+    dir: &TempDir,
+    cases: &[(&str, String)],
+    sh_limit: usize,
+    ps1_limit: usize,
+) {
+    for (index, (name, body)) in cases.iter().enumerate() {
         let file = dir.0.join(format!("{name}.md"));
         std::fs::write(&file, body).unwrap();
         let runtime = runtime_hash(&file);
         let runtime_ok = runtime.status.code() == Some(0);
         for floor in floors() {
+            let limit = if floor.label.contains("ps1") {
+                ps1_limit
+            } else {
+                sh_limit
+            };
+            if index >= limit {
+                continue;
+            }
             let output = floor.run(true, &file, ANCHOR);
             match output.status.code() {
                 Some(0) => {
