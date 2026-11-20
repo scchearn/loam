@@ -193,6 +193,19 @@ fn listed(patterns: &[String], principal: &str) -> bool {
     patterns.iter().any(|p| glob_match(p, principal))
 }
 
+/// The highest level `principal` may vouch for under `policy`, ignoring
+/// `canonical_min_signers` (a quorum is about one seal, not a person). Decides
+/// who may demote, supersede or retract (spec Q: ceiling >= the seal's level).
+pub fn principal_ceiling(policy: &Policy, principal: &str) -> Level {
+    if listed(&policy.canonical_principals, principal) {
+        Level::Canonical
+    } else if listed(&policy.audited_principals, principal) {
+        Level::Audited
+    } else {
+        Level::Evidence
+    }
+}
+
 fn is_hardware_key(key_type: &str) -> bool {
     key_type.starts_with("sk-")
 }

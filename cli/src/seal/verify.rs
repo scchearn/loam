@@ -13,6 +13,7 @@ use crate::seal::evidence::{self, Ctx};
 use crate::seal::policy::{self, EvidenceState, ForgeReason, Level, SignatureStanding};
 use crate::seal::record::{self, Loaded, View};
 use crate::seal::sshsig::{self, Capability, SshsigError};
+use crate::seal::status;
 use crate::seal::trust::{self, Trust};
 use crate::seal::verdict::{self, code, Binding, Inputs, Lifecycle, Outcome, Verdict};
 use chrono::{DateTime, FixedOffset};
@@ -84,6 +85,9 @@ pub struct Report {
     /// The page the live span was found on, when it was found.
     pub current_page: Option<String>,
     pub outcome: Outcome,
+    /// The level the evidence and signature support before any status record
+    /// applies: what decides who may demote, supersede or retract.
+    pub base_level: Option<Level>,
     /// The principal the signature verified as, when it did.
     pub signer: Option<String>,
     pub time_verified: Option<String>,
@@ -428,6 +432,7 @@ impl Verifier<'_> {
                 requested_level: Level::Evidence,
                 codes,
             },
+            base_level: None,
             signer: None,
             time_verified: view.map(|v| v.time_verified.clone()),
             likely_location: None,
@@ -524,21 +529,40 @@ impl Verifier<'_> {
             })
             .collect();
 
-        let mut outcome = verdict::evaluate(&Inputs {
-            well_formed: true,
-            binding,
-            signature,
-            requested,
-            evidence: &states,
-            redacted: &view.redacted,
-            lifecycle: Lifecycle::Active,
-            demoted_to: None,
-            cosigners: &[],
-            time_verified,
-            review_by,
-            now: self.env.now,
-            policy: &self.env.trust.policy,
-        });
+        let evaluate = |lifecycle: Lifecycle, demoted_to: Option<Level>| {
+            verdict::evaluate(&Inputs {
+                well_formed: true,
+                binding,
+                signature: signature.clone(),
+                requested,
+                evidence: &states,
+                redacted: &view.redacted,
+                lifecycle,
+                demoted_to,
+                cosigners: &[],
+                time_verified,
+                review_by,
+                now: self.env.now,
+                policy: &self.env.trust.policy,
+            })
+        };
+        // Status records apply only when they themselves verify; whether a
+        // signer may demote, supersede or retract is judged against the level
+        // the seal had before any status record (spec D5).
+        let mut applied = self.applied_statuses(&loaded.id, view);
+        let base = evaluate(Lifecycle::Active, None);
+        let base_level = base.effective_level;
+        let mut outcome = if applied.is_empty() {
+            base
+        } else {
+            let folded = status::fold(
+                &mut applied,
+                &self.env.trust.policy,
+                &view.principal,
+                base_level.unwrap_or(Level::Evidence),
+            );
+            evaluate(folded.lifecycle, folded.demoted_to)
+        };
         if moved {
             outcome.codes.informational.push(SUBJECT_MOVED);
         }
@@ -550,10 +574,56 @@ impl Verifier<'_> {
             anchor: Some(view.anchor.clone()),
             current_page: picked.map(|s| s.name.clone()),
             outcome,
+            base_level,
             signer,
             time_verified: Some(view.time_verified.clone()),
             likely_location,
         }
+    }
+
+    /// Status records that name `target`, sit on its anchor and carry a
+    /// signature that verifies as a trusted signer's own.
+    fn applied_statuses(&self, target: &str, target_view: &View) -> Vec<status::Applied> {
+        let mut applied = Vec::new();
+        for loaded in &self.records {
+            let Ok(view) = &loaded.view else { continue };
+            let Some(info) = view
+                .status
+                .as_ref()
+                .filter(|_| view.kind == record::RecordKind::Status)
+            else {
+                continue;
+            };
+            if info.updates != target || view.anchor != target_view.anchor {
+                continue;
+            }
+            let (standing, _) = self.signature(loaded, view);
+            let SignatureStanding::Verified {
+                matched_principal,
+                claimed_principal,
+                ..
+            } = standing
+            else {
+                continue;
+            };
+            if matched_principal != claimed_principal {
+                continue;
+            }
+            let (Some(mark), Some(at)) = (
+                status::Mark::parse(&info.type_),
+                policy::parse_stamp(&view.time_verified),
+            ) else {
+                continue;
+            };
+            applied.push(status::Applied {
+                id: loaded.id.clone(),
+                mark,
+                to: view.requested_level.as_deref().and_then(Level::parse),
+                signer: matched_principal,
+                at,
+            });
+        }
+        applied
     }
 
     /// Reports the page whose canonical text still holds both edges of the

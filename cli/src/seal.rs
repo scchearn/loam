@@ -9,6 +9,7 @@ pub mod evidence;
 pub mod policy;
 pub mod record;
 pub mod sshsig;
+pub mod status;
 pub mod trust;
 pub mod verdict;
 pub mod verify;
@@ -29,6 +30,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         Some("hash") => hash(args),
         Some("trust") => trust::run(args),
         Some("attest") => attest::run(args),
+        Some("mark") => status::run(args),
         Some("verify") => verify_command(args),
         Some("status") => status_command(args),
         _ => usage(),
@@ -37,7 +39,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
 
 fn usage() -> i32 {
     eprintln!(
-        "Usage:\n  loam seal hash <file> <anchor>\n  loam seal attest <page>#^<anchor> --level <l> --claim <text> --evidence <kind:ref>... (see `loam seal attest` for the optional flags)\n  loam seal verify [<page>[#^anchor]] [--json] [--now <stamp>]\n  loam seal status [--json] [--now <stamp>]\n  loam seal trust init|add <principal> <pubkey>|show"
+        "Usage:\n  loam seal hash <file> <anchor>\n  loam seal attest <page>#^<anchor> --level <l> --claim <text> --evidence <kind:ref>... (see `loam seal attest` for the optional flags)\n  loam seal mark <id> dispute|demote|supersede|retract --reason <text> [--to <level>]\n  loam seal verify [<page>[#^anchor]] [--json] [--now <stamp>]\n  loam seal status [--json] [--now <stamp>]\n  loam seal trust init|add <principal> <pubkey>|show"
     );
     EXIT_USAGE
 }
@@ -1881,5 +1883,268 @@ mod tests {
             report.outcome.effective_level,
             Some(super::policy::Level::Evidence)
         );
+    }
+
+    // ----------------------------------------------------------- status
+
+    use super::status::{self, Mark};
+
+    /// A second signing identity in its own trust directory. Both
+    /// directories trust both keys and share one policy, as two enrolled
+    /// instances of one org would.
+    fn second_signer(world: &World, first: &attest::Context) -> attest::Context {
+        let dir = world.root.join("config2").join("seal");
+        fs::create_dir_all(&dir).unwrap();
+        let report = trust::init(&dir, &trust::Enrolled::default(), &first.keygen).unwrap();
+        let public = fs::read_to_string(dir.join(trust::PUBLIC_FILE)).unwrap();
+        let mut parts = public.split_whitespace();
+        let line = format!("{} {}", parts.next().unwrap(), parts.next().unwrap());
+        let allowed = world.trust_dir.join(trust::ALLOWED_FILE);
+        let mut text = fs::read_to_string(&allowed).unwrap();
+        text.push_str(&allowed_line(&report.principal, &line, ""));
+        text.push('\n');
+        fs::write(&allowed, text).unwrap();
+        attest::Context {
+            trust_dir: dir,
+            ..first.clone()
+        }
+    }
+
+    fn share_trust(world: &World, other: &attest::Context) {
+        if other.trust_dir == world.trust_dir {
+            return;
+        }
+        for name in [trust::ALLOWED_FILE, trust::POLICY_FILE] {
+            let from = world.trust_dir.join(name);
+            if from.is_file() {
+                fs::copy(&from, other.trust_dir.join(name)).unwrap();
+            }
+        }
+    }
+
+    fn mark(kind: &str, id: &str) -> status::Request {
+        status::Request {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            reason: format!("{kind} for the test"),
+            to: None,
+        }
+    }
+
+    fn report_for(world: &World, now: &str, id: &str) -> verify::Report {
+        world
+            .reports(now)
+            .into_iter()
+            .find(|r| r.id == id)
+            .expect("report")
+    }
+
+    /// AC-S12: dispute and retraction fold in, an insufficient retract
+    /// becomes a dispute, citing seals fail with SEL007, originals never change.
+    #[test]
+    fn status_records() {
+        let world = World::new();
+        let Some(mut one) = world.attest_context() else {
+            // No capable ssh-keygen: marking must refuse, not panic.
+            let ctx = attest::Context {
+                wiki: world.wiki.clone(),
+                repo_root: world.root.clone(),
+                trust_dir: world.trust_dir.clone(),
+                keygen: world.root.join("no-such-keygen"),
+                now: super::policy::parse_stamp(NOW).unwrap(),
+                org: None,
+                harness: None,
+            };
+            assert!(status::mark(&ctx, &mark("retract", "0123456789abcdef0123")).is_err());
+            return;
+        };
+        world.page_with("alpha", UNMARKED);
+        world.page_with("beta", "# Beta\n\nBeta rests on alpha. ^s-beta-claim\n");
+        let mut audited = request(&["capture:run.log"]);
+        audited.level = "audited".to_owned();
+        let x = attest::attest(&one, &audited).unwrap();
+        assert_eq!(x.report.outcome.effective_level, Some(Level::Audited));
+        let principal_one = x.report.signer.clone().unwrap();
+        world.policy(&[principal_one.as_str()]);
+        share_trust(&world, &one);
+
+        let mut cite = request(&["capture:run.log"]);
+        cite.page = "beta".to_owned();
+        cite.anchor = "s-beta-claim".to_owned();
+        cite.evidence.push(format!("seal:{}", x.id));
+        let y = attest::attest(&one, &cite).unwrap();
+        assert!(y.report.is_citable());
+
+        let original = fs::read(record::record_path(&world.wiki, &x.id)).unwrap();
+        let two = second_signer(&world, &one);
+        share_trust(&world, &two);
+        let at = |ctx: &mut attest::Context, stamp: &str| {
+            ctx.now = super::policy::parse_stamp(stamp).unwrap();
+        };
+
+        // Anyone trusted may dispute: a flag only, the level is unchanged.
+        let mut two = two;
+        at(&mut two, "2026-11-21 11:00 +02:00");
+        let done = status::mark(&two, &mark("dispute", &x.id)).unwrap();
+        assert_eq!(done.recorded, Mark::Dispute);
+        assert!(!done.downgraded);
+        let now = "2026-11-21 11:05 +02:00";
+        let report = report_for(&world, now, &x.id);
+        assert!(report.is_disputed());
+        assert_eq!(report.outcome.verdict, Verdict::Citable);
+        assert_eq!(report.outcome.effective_level, Some(Level::Audited));
+        assert!(report_for(&world, now, &y.id).is_citable());
+
+        // A retract by a principal below the seal's level is a dispute.
+        at(&mut two, "2026-11-21 11:10 +02:00");
+        let done = status::mark(&two, &mark("retract", &x.id)).unwrap();
+        assert_eq!(done.recorded, Mark::Dispute);
+        assert_eq!(done.requested, Mark::Retract);
+        assert!(done.downgraded);
+        let now = "2026-11-21 11:15 +02:00";
+        let report = report_for(&world, now, &x.id);
+        assert_eq!(report.outcome.verdict, Verdict::Citable);
+        assert!(report.is_disputed());
+
+        // The same signer may not demote or supersede either.
+        at(&mut two, "2026-11-21 11:16 +02:00");
+        assert!(
+            status::mark(&two, &mark("demote", &x.id))
+                .unwrap()
+                .downgraded
+        );
+        assert!(
+            status::mark(&two, &mark("supersede", &x.id))
+                .unwrap()
+                .downgraded
+        );
+
+        // The original sealer demotes: a level cap, still citable.
+        at(&mut one, "2026-11-21 11:20 +02:00");
+        let mut demote = mark("demote", &x.id);
+        demote.to = Some("evidence".to_owned());
+        let done = status::mark(&one, &demote).unwrap();
+        assert_eq!(done.recorded, Mark::Demote);
+        let report = report_for(&world, "2026-11-21 11:25 +02:00", &x.id);
+        assert_eq!(report.outcome.effective_level, Some(Level::Evidence));
+        assert!(report
+            .outcome
+            .codes
+            .informational
+            .contains(&super::verdict::code::CAPPED_DEMOTED));
+        // Demoting to the level it already has, or below evidence, is refused.
+        at(&mut one, "2026-11-21 11:26 +02:00");
+        assert!(matches!(
+            status::mark(&one, &demote).unwrap_err(),
+            AttestError::Usage(_)
+        ));
+
+        // A sufficient retract: X is retracted, Y fails with SEL007.
+        at(&mut one, "2026-11-21 11:30 +02:00");
+        let done = status::mark(&one, &mark("retract", &x.id)).unwrap();
+        assert_eq!(done.recorded, Mark::Retract);
+        assert!(!done.downgraded);
+        let now = "2026-11-21 11:35 +02:00";
+        let report = report_for(&world, now, &x.id);
+        assert_eq!(report.outcome.verdict, Verdict::Retracted);
+        assert!(!report.is_citable() && report.cite_as().is_none());
+        let citing = report_for(&world, now, &y.id);
+        assert!(!citing.is_citable());
+        assert!(citing
+            .outcome
+            .codes
+            .failure
+            .contains(&super::verdict::code::CITED_NOT_CITABLE));
+        assert_eq!(
+            super::verdict::code::lint_code(super::verdict::code::CITED_NOT_CITABLE),
+            Some("SEL007")
+        );
+
+        // Append-only: the original bytes never changed and nothing was lost.
+        assert_eq!(
+            fs::read(record::record_path(&world.wiki, &x.id)).unwrap(),
+            original
+        );
+        let records = fs::read_dir(record::records_dir(&world.wiki))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".json")
+            })
+            .count();
+        assert_eq!(records, 2 + 6);
+
+        // Unknown and malformed targets are usage errors that write nothing.
+        for bad in ["0123456789abcdef0123", "nope", y.id.as_str()] {
+            at(&mut one, "2026-11-21 12:00 +02:00");
+            let outcome = status::mark(&one, &mark("dispute", bad));
+            if bad == y.id {
+                assert!(outcome.is_ok());
+            } else {
+                assert!(
+                    matches!(outcome.unwrap_err(), AttestError::Usage(_)),
+                    "{bad}"
+                );
+            }
+        }
+        let mut empty = mark("dispute", &x.id);
+        empty.reason = "  ".to_owned();
+        assert!(matches!(
+            status::mark(&one, &empty).unwrap_err(),
+            AttestError::Usage(_)
+        ));
+        assert!(matches!(
+            status::mark(&one, &mark("bogus", &x.id)).unwrap_err(),
+            AttestError::Usage(_)
+        ));
+    }
+
+    /// A status record nobody trusts, or that names no signature, changes nothing.
+    #[test]
+    fn status_records_need_a_verified_signature() {
+        let world = World::new();
+        let Some(one) = world.attest_context() else {
+            return;
+        };
+        world.page_with("alpha", UNMARKED);
+        let x = attest::attest(&one, &request(&["capture:run.log"])).unwrap();
+
+        // Hand-written, unsigned retract.
+        let (id, bytes) = record::build(&record::NewRecord {
+            kind: record::RecordKind::Status,
+            page: "alpha".to_owned(),
+            anchor: "s-trust-order".to_owned(),
+            subject_sha256: "0".repeat(64),
+            locator: record::soft_locator(&[], "x"),
+            content: String::new(),
+            requested_level: None,
+            claim: None,
+            procedure_uri: attest::PROCEDURE_URI.to_owned(),
+            principal: x.report.signer.clone().unwrap(),
+            acted_on_behalf_of: None,
+            generator: record::Generator {
+                name: "loam".to_owned(),
+                version: "1.0.0".to_owned(),
+                harness: "test".to_owned(),
+            },
+            time_verified: "2026-11-21 10:30 +02:00".to_owned(),
+            review_by: None,
+            evidence: Vec::new(),
+            redacted: Vec::new(),
+            parent: None,
+            status: Some(record::StatusInfo {
+                type_: "retract".to_owned(),
+                updates: x.id.clone(),
+                reason: "forged".to_owned(),
+            }),
+        })
+        .unwrap();
+        record::write_record(&world.wiki, &bytes).unwrap();
+        let report = report_for(&world, "2026-11-21 11:00 +02:00", &x.id);
+        assert_eq!(report.outcome.verdict, Verdict::Citable);
+        assert!(!report.is_disputed(), "{id}");
     }
 }

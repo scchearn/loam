@@ -70,7 +70,7 @@ pub enum AttestError {
     Refused(Vec<String>),
 }
 
-fn refuse(message: impl Into<String>) -> AttestError {
+pub(super) fn refuse(message: impl Into<String>) -> AttestError {
     AttestError::Refused(vec![message.into()])
 }
 
@@ -424,15 +424,62 @@ fn write_page(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 // ------------------------------------------------------------- attest
 
-fn stamp(now: &DateTime<FixedOffset>) -> String {
+pub(super) fn stamp(now: &DateTime<FixedOffset>) -> String {
     now.format("%Y-%m-%d %H:%M %:z").to_string()
 }
 
-fn is_record_id(value: &str) -> bool {
+pub(super) fn is_record_id(value: &str) -> bool {
     value.len() == record::ID_LEN
         && value
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The instance's signing key and principal, or the refusal that tells the
+/// caller how to get one. Shared by every verb that signs a record.
+pub(super) fn signing_identity(ctx: &Context) -> Result<(PathBuf, String), AttestError> {
+    let key = ctx.trust_dir.join(trust::KEY_FILE);
+    let instance = fs::read_to_string(ctx.trust_dir.join(trust::INSTANCE_FILE))
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|id| !id.is_empty());
+    let (true, Some(instance)) = (key.is_file(), instance) else {
+        return Err(refuse(format!(
+            "no signing identity under {}: {SETUP_HINT}",
+            ctx.trust_dir.display()
+        )));
+    };
+    if sshsig::capability_of(&ctx.keygen) != Capability::Available {
+        return Err(refuse(format!(
+            "{} cannot sign (needs OpenSSH 9.1+ ssh-keygen with -Y support)",
+            ctx.keygen.display()
+        )));
+    }
+    let principal = format!("agent.{instance}@{}", ctx.org.as_deref().unwrap_or("local"));
+    Ok((key, principal))
+}
+
+/// A [`Context`] from the process environment: the real trust directory,
+/// the wall clock (the signed `time_verified` must not be settable) and the
+/// enrolled org. The error text already carries the setup hint.
+pub(super) fn ambient_context(wiki: PathBuf) -> Result<Context, String> {
+    let trust_dir = trust::seal_dir().map_err(|message| format!("{message}; {SETUP_HINT}"))?;
+    let now = {
+        let local = chrono::Local::now();
+        local.with_timezone(local.offset())
+    };
+    let repo_root = evidence::repo_root(&wiki)
+        .or_else(|| wiki.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| wiki.clone());
+    Ok(Context {
+        wiki,
+        repo_root,
+        trust_dir,
+        keygen: sshsig::keygen_binary(),
+        now,
+        org: trust::Enrolled::from_environment().org,
+        harness: std::env::var("LOAM_HARNESS").ok(),
+    })
 }
 
 /// Seals `request.page#^request.anchor`. See the module docs for the order of
@@ -514,25 +561,7 @@ pub fn attest(ctx: &Context, request: &Request) -> Result<Attested, AttestError>
         &canonical,
     );
 
-    // Signing identity.
-    let key = ctx.trust_dir.join(trust::KEY_FILE);
-    let instance = fs::read_to_string(ctx.trust_dir.join(trust::INSTANCE_FILE))
-        .ok()
-        .map(|text| text.trim().to_owned())
-        .filter(|id| !id.is_empty());
-    let (true, Some(instance)) = (key.is_file(), instance) else {
-        return Err(refuse(format!(
-            "no signing identity under {}: {SETUP_HINT}",
-            ctx.trust_dir.display()
-        )));
-    };
-    if sshsig::capability_of(&ctx.keygen) != Capability::Available {
-        return Err(refuse(format!(
-            "{} cannot sign (needs OpenSSH 9.1+ ssh-keygen with -Y support)",
-            ctx.keygen.display()
-        )));
-    }
-    let principal = format!("agent.{instance}@{}", ctx.org.as_deref().unwrap_or("local"));
+    let (key, principal) = signing_identity(ctx)?;
 
     let mut env = Env::load(&ctx.wiki, Some(ctx.trust_dir.clone()), ctx.now)
         .map_err(|e| refuse(format!("cannot load trust: {e}")))?;
@@ -777,29 +806,12 @@ pub fn run(args: impl Iterator<Item = String>) -> i32 {
     let (Some(page), Some(anchor)) = (selector.page, selector.anchor) else {
         return fail("the target must be `<page>#^<anchor>`".to_owned());
     };
-    let trust_dir = match trust::seal_dir() {
-        Ok(dir) => dir,
+    let ctx = match ambient_context(wiki) {
+        Ok(ctx) => ctx,
         Err(message) => {
-            eprintln!("loam seal attest: {message}; {SETUP_HINT}");
+            eprintln!("loam seal attest: {message}");
             return EXIT_REFUSED;
         }
-    };
-    // Always the wall clock: the signed `time_verified` must not be settable.
-    let now = {
-        let local = chrono::Local::now();
-        local.with_timezone(local.offset())
-    };
-    let repo_root = evidence::repo_root(&wiki)
-        .or_else(|| wiki.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| wiki.clone());
-    let ctx = Context {
-        wiki,
-        repo_root,
-        trust_dir,
-        keygen: sshsig::keygen_binary(),
-        now,
-        org: trust::Enrolled::from_environment().org,
-        harness: std::env::var("LOAM_HARNESS").ok(),
     };
     let request = Request {
         page,

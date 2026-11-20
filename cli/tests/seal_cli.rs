@@ -677,4 +677,77 @@ mod attest {
         assert_eq!(fs::read_to_string(ws.page()).unwrap(), PAGE);
         assert!(!seals_exist(&ws));
     }
+
+    #[test]
+    fn mark_writes_status_records_and_retract_takes_effect() {
+        let Some(ws) = Workspace::new("mark") else {
+            return;
+        };
+        ws.trust_init();
+        let attested = ws.attest(&["--evidence", "capture:run.log"]);
+        assert_eq!(attested.status.code(), Some(0), "{attested:?}");
+        let id = json::parse(stdout(&attested).lines().next().unwrap())
+            .unwrap()
+            .get("seal")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_owned();
+        let original = fs::read(ws.dir.join(format!("wiki/.seals/records/{id}.json"))).unwrap();
+
+        let dispute = ws.run(&["seal", "mark", &id, "dispute", "--reason", "looks off"]);
+        assert_eq!(dispute.status.code(), Some(0), "{dispute:?}");
+        let value = json::parse(stdout(&dispute).lines().next().unwrap()).unwrap();
+        assert_eq!(value.get("type").and_then(Value::as_str), Some("dispute"));
+        assert_eq!(value.get("downgraded"), Some(&Value::Bool(false)));
+
+        let retract = ws.run(&["seal", "mark", &id, "retract", "--reason", "wrong"]);
+        assert_eq!(retract.status.code(), Some(0), "{retract:?}");
+        let value = json::parse(stdout(&retract).lines().next().unwrap()).unwrap();
+        assert_eq!(value.get("type").and_then(Value::as_str), Some("retract"));
+        assert_eq!(
+            value
+                .get("seal")
+                .and_then(|seal| seal.get("verdict"))
+                .and_then(Value::as_str),
+            Some("retracted")
+        );
+        assert_eq!(
+            fs::read(ws.dir.join(format!("wiki/.seals/records/{id}.json"))).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn mark_usage_errors_exit_2() {
+        let Some(ws) = Workspace::new("mark-usage") else {
+            return;
+        };
+        ws.trust_init();
+        let cases: [&[&str]; 5] = [
+            &["seal", "mark"],
+            &["seal", "mark", "0123456789abcdef0123", "dispute"],
+            &[
+                "seal",
+                "mark",
+                "0123456789abcdef0123",
+                "bogus",
+                "--reason",
+                "r",
+            ],
+            &[
+                "seal",
+                "mark",
+                "0123456789abcdef0123",
+                "retract",
+                "--reason",
+                "r",
+            ],
+            &["seal", "mark", "x", "retract", "--reason", "r", "--bogus"],
+        ];
+        for args in cases {
+            let output = ws.run(args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        }
+        assert!(!seals_exist(&ws));
+    }
 }
