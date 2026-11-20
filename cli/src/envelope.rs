@@ -2626,6 +2626,11 @@ mod tests {
             "federation.rs",
             "main.rs",
             "provisioning.rs",
+            // Seals: `sshsig.rs` and `trust.rs` run the reader's `ssh-keygen`;
+            // `record.rs` runs git for tracked-tree detection.
+            "seal/record.rs",
+            "seal/sshsig.rs",
+            "seal/trust.rs",
             "service.rs",
             "state.rs",
             "transport.rs",
@@ -2658,6 +2663,11 @@ mod tests {
             // Reads only, and only two things: the per-project peer roster that
             // decides whom a session admits, and the identity-path PEMs.
             "provisioning.rs",
+            // Seals: the signed-record store and the reader trust files.
+            "seal.rs",
+            "seal/record.rs",
+            "seal/sshsig.rs",
+            "seal/trust.rs",
             "service.rs",
             "sha256.rs",
             "state.rs",

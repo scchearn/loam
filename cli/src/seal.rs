@@ -5,6 +5,8 @@
 
 pub mod canon;
 pub mod record;
+pub mod sshsig;
+pub mod trust;
 
 use crate::markers::{self, Kind};
 use std::fs;
@@ -18,12 +20,13 @@ pub const EXIT_USAGE: i32 = 2;
 pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     match args.next().as_deref() {
         Some("hash") => hash(args),
+        Some("trust") => trust::run(args),
         _ => usage(),
     }
 }
 
 fn usage() -> i32 {
-    eprintln!("Usage:\n  loam seal hash <file> <anchor>");
+    eprintln!("Usage:\n  loam seal hash <file> <anchor>\n  loam seal trust init|add <principal> <pubkey>|show");
     EXIT_USAGE
 }
 

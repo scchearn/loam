@@ -570,7 +570,7 @@ pub fn base64_encode(bytes: &[u8]) -> Vec<u8> {
 
 /// Decode one PEM block body into DER. Written here rather than taken as a
 /// dependency: the crate ships four dependencies and the guard checks that list.
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
     let mut output = Vec::with_capacity(input.len() * 3 / 4);
     let mut accumulator = 0u32;
     let mut bits = 0u32;

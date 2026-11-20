@@ -792,7 +792,7 @@ static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// ignores. When hard links are unsupported it degrades to `create_new` on the
 /// final name (see `create_new_direct`).
 fn create_only(path: &Path, bytes: &[u8], name: &str) -> Result<(), StoreError> {
-    create_only_with(path, bytes, name, &|from, to| fs::hard_link(from, to))
+    create_only_with(path, bytes, name, |from, to| fs::hard_link(from, to))
 }
 
 /// Fallback publish for filesystems without hard links: `create_new` on the
@@ -823,13 +823,11 @@ fn create_new_direct(path: &Path, bytes: &[u8], name: &str) -> Result<(), StoreE
     Ok(())
 }
 
-type LinkFn<'a> = &'a dyn Fn(&Path, &Path) -> io::Result<()>;
-
 fn create_only_with(
     path: &Path,
     bytes: &[u8],
     name: &str,
-    link: LinkFn<'_>,
+    link: impl Fn(&Path, &Path) -> io::Result<()>,
 ) -> Result<(), StoreError> {
     let parent = path
         .parent()
