@@ -87,8 +87,9 @@ Verdict is computed on every read, never typed:
 | `drifted` | Span text or evidence changed since sealing | Do not cite as sealed; re-check, then re-seal or amend |
 | `stale` | `review_by` or a recheck interval has passed | Do not cite as sealed; re-verify evidence, then re-seal |
 | `unverifiable` | Evidence or tooling cannot be checked here | Treat as provisional; say what could not be checked |
-| `untrusted` | Signing key is revoked, or a valid signature from a key not in the reader's `allowed_signers` | Provisional; trust is the reader's decision |
-| `forged` | Bad signature, wrong namespace, id mismatch or signer differs from the stated verifier | Never rely on it; report it, do not repair it |
+| `untrusted` (tampered: malformed record or id mismatch, SEL003) | The record is not well formed, or its id is not the first 20 hex characters of its SHA-256 | Never rely on it; report it, do not repair it |
+| `untrusted` (key) | Signing key is revoked, or a valid signature from a key not in the reader's `allowed_signers` | Provisional; trust is the reader's decision |
+| `forged` | Bad signature, wrong namespace, or `verifier.principal` differs from the signer | Never rely on it; report it, do not repair it |
 | `retracted` | A status record withdrew it | Never cite as sealed |
 
 Lifecycle is separate: `active`, `disputed` (flag only), `superseded`,
@@ -115,8 +116,13 @@ from this session.
 
 When the native runtime is unavailable, a reader can still check a seal by
 hand. It approximates `<native-runtime-command> seal verify`; only a pass of
-every step below, including step 4, is a `citable`-quality check.
+every step below, including steps 0 and 4, is a `citable`-quality check.
 
+0. Identity. Hash `<id>.json` (same tools as step 3) and require the first 20
+   hex characters to equal `<id>`. Read `subject[0].name` (`<page>#^<anchor>`)
+   from the record and require it to match the page and anchor you were
+   given; use the record's values in step 1. A mismatch is tampering: do not
+   rely on the seal and report it.
 1. Span digest.
    - Linux or macOS: `sh <Skill root>/scripts/seal-canon.sh --digest <page> <anchor>`
    - Windows, on one line: `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <Skill root>/scripts/seal-canon.ps1 -Digest <page> <anchor>`
@@ -128,13 +134,24 @@ every step below, including step 4, is a `citable`-quality check.
      -I <principal> -n loam-seal -O verify-time=<time_verified> \
      [-r <configRoot>/seal/revoked] -s <id>.json.sig < <id>.json
    ```
+   `<configRoot>` is the loam config root: `LOAM_CONFIG_DIR` when set,
+   otherwise the per-user config directory that holds the runtime ledger (see
+   `runtime.md`); Git Bash users translate the Windows path to its POSIX form.
    This needs OpenSSH 9.1 or newer for `verify-time` (check `ssh -V`; Ubuntu
    22.04 ships 8.9, in-box Windows OpenSSH is 8.x). `LOAM_SSH_KEYGEN`, when
    set, names the binary to use on any OS. With no capable binary the result
    is `unverifiable`, not a failed signature.
-3. Evidence: `git hash-object <path>`, and `sha256sum <path>` (Linux),
-   `shasum -a 256 <path>` (macOS) or `certutil -hashfile <path> SHA256`
-   (Windows).
+3. Evidence, per kind. `blob`: `git hash-object <path>`. `file`: sha256 of
+   `<path>` via `sha256sum` (Linux), `shasum -a 256` (macOS) or
+   `certutil -hashfile <path> SHA256` (Windows). Compare digests
+   case-insensitively with spaces removed, since older `certutil` prints
+   uppercase, space-separated hex. `commit`: `git merge-base --is-ancestor
+   <oid> <ref>`; an orphaned commit is `unverifiable`. `capture`: hash
+   `wiki/.seals/evidence/sha256/<hex>` and require it to equal both the file
+   name and the recorded value. `seal`: apply this whole procedure to the
+   referenced seal; the result caps the level. `note`: no check, and it never
+   counts toward a level. If you cannot run a check for a kind, the result is
+   `unverifiable`.
 
 `<time_verified>` is the record's `time_verified` converted to UTC and written
 `YYYYMMDDHHMMZ`, with the trailing `Z` (without it ssh-keygen reads local
@@ -144,7 +161,11 @@ in `allowed_signers`. Pass `-r` only when the `revoked` file exists; a signer
 it lists is `untrusted`.
 
 4. Standing. Confirm that no `status` record in `wiki/.seals/records/` names
-   this id in `updates` with retract, supersede or demote; that freshness holds
+   this id in `updates` with retract, supersede or demote (the floor is
+   deliberately stricter than the runtime, which keeps a superseded or
+   demoted seal citable, at the capped level for demote, and ignores
+   unauthorised status records; treat any such record as a reason to run
+   `seal verify` when the runtime returns); that freshness holds
    (the earlier of `review_by` and `time_verified` plus the policy max_review
    has not passed; no evidence recheck is due); and that `verifier.principal`
    equals the `-I` principal.
@@ -162,16 +183,16 @@ key fingerprint to confirm first.
 ## Commands
 
 All run through `<native-runtime-command>`: `seal hash <file> <anchor>`,
-`seal verify [<page>[#^anchor]] [--json]`, `seal status`,
+`seal verify [<page>[#^anchor]] [--json] [--now <stamp>]`, `seal status`,
 `seal attest <page>#^<anchor> --level <l> --claim <text> --evidence <kind:ref>...
 [--review-by <stamp>] [--parent <id>]`, `seal carry <id>`,
-`seal mark <id> dispute|demote|supersede|retract --reason <text>`,
+`seal mark <id> dispute|demote|supersede|retract --reason <text> [--to <evidence|audited>]`,
 `seal trust init|add|show`. Verify exits 0 when citable, 1 when any seal is not,
 2 on usage errors. Lint: `lint --only seals`.
 
 ## Gotchas
 
-- Trigger: a marker or a file under `wiki/.seals/` needs fixing by hand. Mistake: editing it; a hand-edited record or `.sig` verifies as `forged`, and a hand-edited marker orphans the seal (SEL002) or drifts it. Fix: never hand-edit; re-seal with `seal attest` or retract with `seal mark`.
+- Trigger: a marker or a file under `wiki/.seals/` needs fixing by hand. Mistake: editing it; a hand-edited record verifies as `untrusted` (malformed or id mismatch, SEL003) and a hand-edited `.sig` as `forged`; neither may be relied on, and a hand-edited marker orphans the seal (SEL002) or drifts it. Fix: never hand-edit; re-seal with `seal attest` or retract with `seal mark`.
 - Trigger: tidying text inside a sealed span (re-wrapping, smart quotes, escapes). Mistake: any byte change drifts the seal. Fix: edit deliberately, then resolve the seal in the same change through `/loam::amending-memory`.
 - Trigger: reporting a section as sealed or verified. Mistake: claiming it from memory or from the marker alone. Fix: run `seal verify` and quote the verdict.
 - Trigger: `datecheck fix` or `lint --fix` over a sealed page. Mistake: expecting spans to be rewritten. Fix: they skip sealed spans and report SEL008; change span text only by amending.
