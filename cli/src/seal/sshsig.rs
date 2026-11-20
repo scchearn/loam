@@ -233,10 +233,14 @@ pub fn find_principals(
         .collect())
 }
 
-/// Convert an RFC 3339 stamp (`±HH:MM`, or the unambiguous `±HHMM`) to the UTC
-/// `YYYYMMDDHHMMZ` form `-O verify-time` takes.
+/// Convert a stamp to the UTC `YYYYMMDDHHMMZ` form `-O verify-time` takes.
+/// Accepts loam's canonical `YYYY-MM-DD HH:MM ±HH:MM` (and the unambiguous
+/// `±HHMM`), plus RFC 3339 and seconds-bearing variants. A stamp without an
+/// offset is an error.
 pub fn verify_time_utc(stamp: &str) -> Result<String, SshsigError> {
-    let parsed = DateTime::parse_from_rfc3339(stamp)
+    let parsed = DateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M %:z")
+        .or_else(|_| DateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M %z"))
+        .or_else(|_| DateTime::parse_from_rfc3339(stamp))
         .or_else(|_| DateTime::parse_from_str(stamp, "%Y-%m-%dT%H:%M:%S%z"))
         .or_else(|_| DateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S %z"))
         .map_err(|_| SshsigError::Local(format!("unparseable timestamp `{stamp}`")))?;
@@ -335,9 +339,16 @@ pub(crate) fn keygen_for_tests() -> Option<PathBuf> {
         ));
     }
     candidates.push(PathBuf::from("ssh-keygen"));
-    candidates
+    let found = candidates
         .into_iter()
-        .find(|bin| capability_of(bin) == Capability::Available)
+        .find(|bin| capability_of(bin) == Capability::Available);
+    // Needs OpenSSH 9.1+ (`verify-time` with a `Z` suffix); ubuntu-22.04 ships
+    // 8.9, so there the real-signature tests would silently assert nothing.
+    // CI sets LOAM_REQUIRE_SSHSIG=1 where a capable ssh-keygen must exist.
+    if found.is_none() && std::env::var("LOAM_REQUIRE_SSHSIG").is_ok_and(|v| v == "1") {
+        panic!("LOAM_REQUIRE_SSHSIG=1 but no capable ssh-keygen (OpenSSH >= 9.1) was found");
+    }
+    found
 }
 
 #[cfg(test)]
@@ -414,7 +425,20 @@ mod tests {
             verify_time_utc("2026-11-20T23:30:00-05:00").unwrap(),
             "202611210430Z"
         );
+        assert_eq!(
+            verify_time_utc("2026-11-20 14:30 +02:00").unwrap(),
+            "202611201230Z"
+        );
+        assert_eq!(
+            verify_time_utc("2026-11-20 14:30 +0200").unwrap(),
+            "202611201230Z"
+        );
+        assert_eq!(
+            verify_time_utc("2026-11-20 23:30 -05:00").unwrap(),
+            "202611210430Z"
+        );
         assert!(verify_time_utc("2026-11-20T10:30:00").is_err());
+        assert!(verify_time_utc("2026-11-20 14:30").is_err());
     }
 
     #[test]

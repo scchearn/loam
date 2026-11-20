@@ -49,6 +49,7 @@ jobs:
           - os: macos-15
             artifact: loam-macos
             binary: target/release/loam
+            require_sshsig: "1"
           - os: windows-2022
             artifact: loam-windows
             binary: target/release/loam.exe
@@ -58,7 +59,11 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install 1.94.1 --profile minimal --component clippy
       - run: cargo +1.94.1 clippy --locked --workspace --all-targets -- -D warnings
+      # Real-signature seal tests need OpenSSH >= 9.1 (ubuntu-22.04 has 8.9 and
+      # exercises the degraded path); where one must exist, skipping is a failure.
       - run: cargo +1.94.1 test --workspace --locked
+        env:
+          LOAM_REQUIRE_SSHSIG: ${{ matrix.require_sshsig }}
       - run: cargo +1.94.1 build --release --locked --package loam
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

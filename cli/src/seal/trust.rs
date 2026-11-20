@@ -234,6 +234,8 @@ pub fn parse_revoked(text: &str) -> Result<Vec<String>, TrustError> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
+    /// Free-form mode name. Unknown values are not rejected here; consumers
+    /// treat anything they do not recognise as `warn` (the default).
     pub enforcement: String,
     pub max_review: String,
     pub audited_principals: Vec<String>,
@@ -472,9 +474,9 @@ pub struct InitReport {
 
 fn principal_ok(principal: &str) -> bool {
     !principal.is_empty()
-        && !principal
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == ',')
+        && !principal.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '"' | ',' | '*' | '?' | '!')
+        })
 }
 
 fn create_private_dir(dir: &Path) -> Result<(), String> {
@@ -608,7 +610,7 @@ pub fn init(dir: &Path, enrolled: &Enrolled, keygen: &Path) -> Result<InitReport
         .iter()
         .any(|s| s.principals == principal && s.key == material);
     if !present {
-        let today = chrono::Utc::now().format("%Y%m%d");
+        let today = chrono::Utc::now().format("%Y%m%dZ");
         append_line(
             &dir.join(ALLOWED_FILE),
             &format!(
@@ -699,7 +701,7 @@ pub fn add(dir: &Path, principal: &str, pubkey: &str) -> Result<String, String> 
     {
         return Ok(print);
     }
-    let today = chrono::Utc::now().format("%Y%m%d");
+    let today = chrono::Utc::now().format("%Y%m%dZ");
     append_line(
         &dir.join(ALLOWED_FILE),
         &format!(
@@ -1019,7 +1021,7 @@ mod tests {
         // The key really signs and verifies under the generated line.
         let sig = sshsig::sign(&bin, &dir.join(KEY_FILE), b"hello").unwrap();
         let now = sshsig::verify_time_utc(&chrono::Utc::now().to_rfc3339()).unwrap();
-        // valid-after is today's date at 00:00 UTC, so now is inside it.
+        // valid-after is today's date at 00:00 UTC (explicit `Z`), so now is inside it.
         sshsig::verify(
             &bin,
             &dir.join(ALLOWED_FILE),
@@ -1150,12 +1152,73 @@ mod tests {
         assert_eq!(trust.policy, Policy::default());
     }
 
+    /// Restores an environment variable on drop, panic or not.
+    struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+    impl EnvGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> EnvGuard {
+            let prior = std::env::var_os(name);
+            std::env::set_var(name, value);
+            EnvGuard(name, prior)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
     #[test]
-    fn cli_show_exits_2_on_an_unquoted_window_and_init_runs_under_pinned_env() {
+    fn principals_with_pattern_metacharacters_are_refused() {
+        let tmp = Tmp::new("meta");
+        let dir = tmp.0.join("seal");
+        for bad in ["*", "!a@org", "a?@org", "*@org"] {
+            assert!(
+                add(&dir, bad, &format!("ssh-ed25519 {KEY}")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn init_window_is_explicit_utc_whatever_the_reader_time_zone() {
+        let Some(bin) = keygen_for_tests() else {
+            return;
+        };
+        let _guard = crate::env_lock();
+        let tmp = Tmp::new("tz");
+        let dir = tmp.0.join("seal");
+        let first = init(&dir, &Enrolled::default(), &bin).unwrap();
+        let text = fs::read_to_string(dir.join(ALLOWED_FILE)).unwrap();
+        assert!(
+            text.contains("Z\" "),
+            "valid-after must carry an explicit Z: {text}"
+        );
+        let sig = sshsig::sign(&bin, &dir.join(KEY_FILE), b"hello").unwrap();
+        let start = format!("{}0001Z", chrono::Utc::now().format("%Y%m%d"));
+        // A negative-offset reader reads a Z-less date as local midnight, hours
+        // after the UTC start; with `Z` the verdict is the same everywhere.
+        #[cfg(unix)]
+        let _tz = EnvGuard::set("TZ", "America/New_York");
+        sshsig::verify(
+            &bin,
+            &dir.join(ALLOWED_FILE),
+            &first.principal,
+            &sig,
+            b"hello",
+            &start,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cli_show_exits_2_on_an_unquoted_window() {
         let _guard = crate::env_lock();
         let tmp = Tmp::new("cli");
-        let prior = std::env::var("LOAM_CONFIG_DIR").ok();
-        std::env::set_var("LOAM_CONFIG_DIR", &tmp.0);
+        let _cfg = EnvGuard::set("LOAM_CONFIG_DIR", &tmp.0);
         let dir = tmp.0.join("seal");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -1171,12 +1234,49 @@ mod tests {
         .unwrap();
         let ok = run(["show".to_owned()].into_iter());
         let usage = run(["bogus".to_owned()].into_iter());
-        match prior {
-            Some(v) => std::env::set_var("LOAM_CONFIG_DIR", v),
-            None => std::env::remove_var("LOAM_CONFIG_DIR"),
-        }
         assert_eq!(code, EXIT_USAGE);
         assert_eq!(ok, EXIT_OK);
         assert_eq!(usage, EXIT_USAGE);
+    }
+
+    #[test]
+    fn cli_init_and_add_run_under_pinned_env() {
+        let Some(bin) = keygen_for_tests() else {
+            return;
+        };
+        let _guard = crate::env_lock();
+        let tmp = Tmp::new("cli-init");
+        let _cfg = EnvGuard::set("LOAM_CONFIG_DIR", &tmp.0);
+        let _kg = EnvGuard::set("LOAM_SSH_KEYGEN", &bin);
+        let dir = tmp.0.join("seal");
+        assert_eq!(run(["init".to_owned()].into_iter()), EXIT_OK);
+        for name in [
+            INSTANCE_FILE,
+            KEY_FILE,
+            PUBLIC_FILE,
+            ALLOWED_FILE,
+            POLICY_FILE,
+        ] {
+            assert!(dir.join(name).is_file(), "{name} missing");
+        }
+        let before = fs::read(dir.join(ALLOWED_FILE)).unwrap();
+        assert_eq!(run(["init".to_owned()].into_iter()), EXIT_OK);
+        assert_eq!(fs::read(dir.join(ALLOWED_FILE)).unwrap(), before);
+
+        let code = run([
+            "add".to_owned(),
+            "alice@org".to_owned(),
+            format!("ssh-ed25519 {KEY}"),
+        ]
+        .into_iter());
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(load(&dir).unwrap().signers.len(), 2);
+        let bad = run([
+            "add".to_owned(),
+            "*".to_owned(),
+            format!("ssh-ed25519 {KEY}"),
+        ]
+        .into_iter());
+        assert_eq!(bad, EXIT_REFUSED);
     }
 }
