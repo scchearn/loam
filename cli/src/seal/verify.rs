@@ -293,10 +293,16 @@ fn markdown_files(wiki: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     Ok(files)
 }
 
-fn collect_spans(files: &[(String, PathBuf)]) -> Vec<Span> {
+fn collect_spans(files: &[(String, PathBuf)], overlay: Option<&Overlay>) -> Vec<Span> {
     let mut spans = Vec::new();
     for (name, path) in files {
-        let Ok(bytes) = fs::read(path) else { continue };
+        let replaced = overlay
+            .and_then(|o| o.page.as_ref())
+            .filter(|(page, _)| page == name)
+            .map(|(_, bytes)| bytes.clone());
+        let Some(bytes) = replaced.or_else(|| fs::read(path).ok()) else {
+            continue;
+        };
         let Ok(source) = std::str::from_utf8(&bytes) else {
             continue;
         };
@@ -315,16 +321,54 @@ fn collect_spans(files: &[(String, PathBuf)]) -> Vec<Span> {
     spans
 }
 
+/// In-memory state verified in place of what is on disk, so `attest` can
+/// prove its round trip before it writes anything: the page as it will be,
+/// the record and its signature as they will be, and the captures it will
+/// store (content-addressed, so correct by construction).
+#[derive(Debug, Default, Clone)]
+pub struct Overlay {
+    /// Wiki-relative page name (no `.md`) and its replacement bytes.
+    pub page: Option<(String, Vec<u8>)>,
+    /// Record id and exact bytes.
+    pub record: Option<(String, Vec<u8>)>,
+    /// Armored signature for the overlay record.
+    pub signature: Option<String>,
+    /// sha256 digests of captures about to be stored.
+    pub captures: Vec<String>,
+}
+
 /// Verifies every seal record in the wiki, sorted by id.
 pub fn verify_all(env: &Env) -> Result<Vec<Report>, String> {
+    verify_with(env, None)
+}
+
+/// Verifies the single seal `id` as it would stand once `overlay` is applied.
+pub fn verify_overlay(env: &Env, overlay: &Overlay, id: &str) -> Result<Report, String> {
+    verify_with(env, Some(overlay))?
+        .into_iter()
+        .find(|report| report.id == id)
+        .ok_or_else(|| format!("seal {id} did not verify as a seal record"))
+}
+
+fn verify_with(env: &Env, overlay: Option<&Overlay>) -> Result<Vec<Report>, String> {
     let files = markdown_files(&env.wiki)?;
-    let spans = collect_spans(&files);
-    let records = record::load_all(&env.wiki)?;
+    let spans = collect_spans(&files, overlay);
+    let mut records = record::load_all(&env.wiki)?;
+    if let Some((id, bytes)) = overlay.and_then(|o| o.record.as_ref()) {
+        records.retain(|loaded| &loaded.id != id);
+        records.push(Loaded {
+            id: id.clone(),
+            bytes: bytes.clone(),
+            view: record::well_formed(id, bytes),
+        });
+        records.sort_by(|a, b| a.id.cmp(&b.id));
+    }
     let verifier = Verifier {
         env,
         files,
         spans,
         records,
+        overlay,
         cache: RefCell::new(HashMap::new()),
     };
     let mut reports = Vec::new();
@@ -347,6 +391,7 @@ struct Verifier<'a> {
     files: Vec<(String, PathBuf)>,
     spans: Vec<Span>,
     records: Vec<Loaded>,
+    overlay: Option<&'a Overlay>,
     cache: RefCell<HashMap<String, Report>>,
 }
 
@@ -455,7 +500,15 @@ impl Verifier<'_> {
         let states: Vec<EvidenceState> = items
             .iter()
             .map(|item| {
-                let check = evidence::check(item, &ctx);
+                let mut check = evidence::check(item, &ctx);
+                let pending = item.kind == evidence::Kind::Capture
+                    && item.sha256.as_ref().is_some_and(|digest| {
+                        self.overlay
+                            .is_some_and(|o| o.captures.iter().any(|c| c == digest))
+                    });
+                if pending {
+                    check.code = evidence::Code::Current;
+                }
                 let cited = (item.kind == evidence::Kind::Seal)
                     .then(|| self.report(&item.reference, stack))
                     .flatten()
@@ -519,12 +572,20 @@ impl Verifier<'_> {
 
     fn signature(&self, loaded: &Loaded, view: &View) -> (SignatureStanding, Option<String>) {
         let sig_file = record::sig_path(&self.env.wiki, &loaded.id);
-        let signature = match fs::metadata(&sig_file) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return (SignatureStanding::Unsigned, None)
-            }
-            Ok(meta) if meta.len() <= MAX_SIGNATURE_BYTES => fs::read_to_string(&sig_file).ok(),
-            _ => None,
+        let pending = self
+            .overlay
+            .and_then(|o| o.record.as_ref().zip(o.signature.as_ref()))
+            .filter(|((id, _), _)| id == &loaded.id)
+            .map(|(_, signature)| signature.clone());
+        let signature = match pending {
+            Some(signature) => Some(signature),
+            None => match fs::metadata(&sig_file) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return (SignatureStanding::Unsigned, None)
+                }
+                Ok(meta) if meta.len() <= MAX_SIGNATURE_BYTES => fs::read_to_string(&sig_file).ok(),
+                _ => None,
+            },
         };
         let Some(signature) = signature else {
             return (SignatureStanding::Forged(ForgeReason::BadSignature), None);

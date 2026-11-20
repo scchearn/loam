@@ -369,3 +369,260 @@ mod verify {
         );
     }
 }
+
+// ---------------------------------------------------------------- attest
+
+mod attest {
+    use super::*;
+    use loam::json::{self, Value};
+    use loam::seal::sshsig::{self, Capability};
+    use std::fs;
+    use std::path::Path;
+
+    const PAGE: &str =
+        "# Alpha\n\nBundled rung first.\nThen the system store. ^s-rung-order\n\nTail.\n";
+
+    struct Workspace(PathBuf);
+
+    impl Workspace {
+        /// `None` when this machine has no ssh-keygen able to sign (the
+        /// CI legs that must have one set `LOAM_REQUIRE_SSHSIG=1`).
+        fn new(label: &str) -> Option<Workspace> {
+            if sshsig::capability() != Capability::Available {
+                assert!(
+                    std::env::var("LOAM_REQUIRE_SSHSIG").map_or(true, |v| v != "1"),
+                    "LOAM_REQUIRE_SSHSIG=1 but no capable ssh-keygen was found"
+                );
+                return None;
+            }
+            let dir = std::env::temp_dir()
+                .join(format!("loam-seal-attest-{label}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(dir.join("wiki")).unwrap();
+            fs::create_dir_all(dir.join("config")).unwrap();
+            fs::write(dir.join("run.log"), b"all tests pass").unwrap();
+            fs::write(dir.join("wiki").join("alpha.md"), PAGE).unwrap();
+            Some(Workspace(dir))
+        }
+
+        fn page(&self) -> PathBuf {
+            self.0.join("wiki").join("alpha.md")
+        }
+
+        fn run(&self, args: &[&str]) -> Output {
+            Command::new(env!("CARGO_BIN_EXE_loam"))
+                .args(args)
+                .current_dir(&self.0)
+                .env("LOAM_WORKSPACES", "off")
+                .env("LOAM_CONFIG_DIR", self.0.join("config"))
+                .env("LOAM_HARNESS", "cli-test")
+                .env_remove("LOAM_FEDERATION_ORG")
+                .output()
+                .expect("loam should run")
+        }
+
+        fn trust_init(&self) {
+            let output = self.run(&["seal", "trust", "init"]);
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+        }
+
+        fn attest(&self, extra: &[&str]) -> Output {
+            let mut args = vec![
+                "seal",
+                "attest",
+                "alpha#^s-rung-order",
+                "--level",
+                "evidence",
+                "--claim",
+                "Rung order",
+            ];
+            args.extend_from_slice(extra);
+            self.run(&args)
+        }
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            for _ in 0..10 {
+                if fs::remove_dir_all(&self.0).is_ok() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+
+    fn stdout(output: &Output) -> String {
+        String::from_utf8(output.stdout.clone()).unwrap()
+    }
+
+    fn stderr(output: &Output) -> String {
+        String::from_utf8(output.stderr.clone()).unwrap()
+    }
+
+    fn seals_exist(ws: &Workspace) -> bool {
+        Path::new(&ws.0.join("wiki").join(".seals")).exists()
+    }
+
+    #[test]
+    fn attest_inserts_markers_writes_the_record_and_verifies_citable() {
+        let Some(ws) = Workspace::new("ok") else {
+            return;
+        };
+        ws.trust_init();
+        let output = ws.attest(&["--evidence", "capture:run.log"]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let value = json::parse(stdout(&output).lines().next().unwrap()).unwrap();
+        let id = value
+            .get("seal")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            value.get("verdict").and_then(Value::as_str),
+            Some("citable")
+        );
+
+        let records = ws.0.join("wiki/.seals/records");
+        let bytes = fs::read(records.join(format!("{id}.json"))).unwrap();
+        assert_eq!(id, loam::sha256::hex(&bytes)[..20]);
+        assert!(records.join(format!("{id}.json.sig")).is_file());
+        assert!(String::from_utf8_lossy(&bytes).contains("\"harness\":\"cli-test\""));
+        assert_eq!(
+            fs::read_to_string(ws.page()).unwrap(),
+            "# Alpha\n\n<!-- loam:seal s-rung-order -->\nBundled rung first.\nThen the system store.\n<!-- /loam:seal -->\n\nTail.\n"
+        );
+
+        let verify = ws.run(&["seal", "verify", "alpha#^s-rung-order"]);
+        assert_eq!(verify.status.code(), Some(0), "{verify:?}");
+        assert!(stdout(&verify).contains("citable"));
+    }
+
+    #[test]
+    fn attest_resolves_page_paths_and_chains_a_parent() {
+        let Some(ws) = Workspace::new("parent") else {
+            return;
+        };
+        ws.trust_init();
+        let first = ws.run(&[
+            "seal",
+            "attest",
+            "wiki/alpha.md#^s-rung-order",
+            "--level",
+            "evidence",
+            "--claim",
+            "Rung order",
+            "--evidence",
+            "capture:run.log",
+            "--origin",
+            "ci job 7",
+        ]);
+        assert_eq!(first.status.code(), Some(0), "{first:?}");
+        let id = json::parse(stdout(&first).lines().next().unwrap())
+            .unwrap()
+            .get("seal")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_owned();
+        let second = ws.attest(&["--evidence", "capture:run.log", "--parent", &id]);
+        assert_eq!(second.status.code(), Some(0), "{second:?}");
+        let next = json::parse(stdout(&second).lines().next().unwrap())
+            .unwrap()
+            .get("seal")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_owned();
+        assert_ne!(id, next);
+        let text =
+            fs::read_to_string(ws.0.join(format!("wiki/.seals/records/{next}.json"))).unwrap();
+        assert!(text.contains(&format!(
+            "\"parent\":{{\"id\":\"{id}\",\"verdict\":\"citable\"}}"
+        )));
+        assert!(text.contains("ci job 7"), "carried capture origin: {text}");
+    }
+
+    #[test]
+    fn a_refused_attest_exits_1_and_leaves_no_trace() {
+        let Some(ws) = Workspace::new("refused") else {
+            return;
+        };
+        ws.trust_init();
+        let output = ws.attest(&[
+            "--evidence",
+            "blob:nope.txt",
+            "--evidence",
+            "capture:run.log",
+        ]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(stderr(&output).contains("blob:nope.txt"), "{output:?}");
+        assert_eq!(fs::read_to_string(ws.page()).unwrap(), PAGE);
+        assert!(!seals_exist(&ws));
+    }
+
+    #[test]
+    fn missing_identity_exits_1_with_the_setup_hint() {
+        let Some(ws) = Workspace::new("identity") else {
+            return;
+        };
+        let output = ws.attest(&["--evidence", "capture:run.log"]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(stderr(&output).contains("npx @scchearn/loam setup"));
+        assert_eq!(fs::read_to_string(ws.page()).unwrap(), PAGE);
+        assert!(!seals_exist(&ws));
+    }
+
+    #[test]
+    fn bad_arguments_and_targets_exit_2() {
+        let Some(ws) = Workspace::new("usage") else {
+            return;
+        };
+        ws.trust_init();
+        let cases: [&[&str]; 6] = [
+            &["seal", "attest"],
+            &["seal", "attest", "alpha#^s-rung-order"],
+            &[
+                "seal", "attest", "alpha", "--level", "evidence", "--claim", "c",
+            ],
+            &[
+                "seal",
+                "attest",
+                "alpha#^s-rung-order",
+                "--level",
+                "gold",
+                "--claim",
+                "c",
+                "--evidence",
+                "note:x",
+            ],
+            &[
+                "seal",
+                "attest",
+                "alpha#^s-no-such-anchor",
+                "--level",
+                "evidence",
+                "--claim",
+                "c",
+                "--evidence",
+                "capture:run.log",
+            ],
+            &[
+                "seal",
+                "attest",
+                "alpha#^s-rung-order",
+                "--level",
+                "evidence",
+                "--claim",
+                "c",
+                "--evidence",
+                "nonsense",
+                "--bogus",
+            ],
+        ];
+        for args in cases {
+            let output = ws.run(args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        }
+        assert_eq!(fs::read_to_string(ws.page()).unwrap(), PAGE);
+        assert!(!seals_exist(&ws));
+    }
+}

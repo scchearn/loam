@@ -2667,6 +2667,8 @@ mod tests {
             "provisioning.rs",
             // Seals: the signed-record store and the reader trust files.
             "seal.rs",
+            // Attest: the page it seals and the record store it creates.
+            "seal/attest.rs",
             "seal/evidence.rs",
             "seal/record.rs",
             "seal/sshsig.rs",

@@ -3,6 +3,7 @@
 //! This module is public so items consumed only by tests until the CLI verbs
 //! land do not trip `dead_code`.
 
+pub mod attest;
 pub mod canon;
 pub mod evidence;
 pub mod policy;
@@ -27,6 +28,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     match args.next().as_deref() {
         Some("hash") => hash(args),
         Some("trust") => trust::run(args),
+        Some("attest") => attest::run(args),
         Some("verify") => verify_command(args),
         Some("status") => status_command(args),
         _ => usage(),
@@ -35,7 +37,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
 
 fn usage() -> i32 {
     eprintln!(
-        "Usage:\n  loam seal hash <file> <anchor>\n  loam seal verify [<page>[#^anchor]] [--json] [--now <stamp>]\n  loam seal status [--json] [--now <stamp>]\n  loam seal trust init|add <principal> <pubkey>|show"
+        "Usage:\n  loam seal hash <file> <anchor>\n  loam seal attest <page>#^<anchor> --level <l> --claim <text> --evidence <kind:ref>...\n  loam seal verify [<page>[#^anchor]] [--json] [--now <stamp>]\n  loam seal status [--json] [--now <stamp>]\n  loam seal trust init|add <principal> <pubkey>|show"
     );
     EXIT_USAGE
 }
@@ -85,7 +87,7 @@ fn hash(args: impl Iterator<Item = String>) -> i32 {
 
 /// The wiki the command runs against: the nearest `wiki/` directory at or
 /// above the current directory.
-fn find_wiki(start: &Path) -> Option<PathBuf> {
+pub(crate) fn find_wiki(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
         .map(|dir| dir.join("wiki"))
@@ -157,7 +159,7 @@ fn level_text(level: Option<Level>) -> &'static str {
     level.map_or("none", Level::as_str)
 }
 
-/// `loam seal verify [<page>[#^anchor]] [--json] [--now <stamp>]`.
+/// `loam seal attest <page>#^<anchor> --level <l> --claim <text> --evidence <kind:ref>...\n  loam seal verify [<page>[#^anchor]] [--json] [--now <stamp>]`.
 fn verify_command(args: impl Iterator<Item = String>) -> i32 {
     let options = match parse_read_options("verify", args, true) {
         Ok(options) => options,
@@ -1448,5 +1450,349 @@ mod tests {
         }
         assert!(verify::Selector::parse("alpha#^").is_err());
         assert!(verify::Selector::parse("").is_err());
+    }
+
+    // ----------------------------------------------------------- attest
+
+    use super::attest::{self, AttestError, Request};
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .output()
+            .expect("git must be installed to run these tests");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    impl World {
+        /// A signing identity under the trust directory, trusted by an
+        /// `allowed_signers` window that opens long before `NOW`. `None`
+        /// when no capable ssh-keygen exists here.
+        fn attest_context(&self) -> Option<attest::Context> {
+            let bin = self.bin.clone()?;
+            let report = trust::init(&self.trust_dir, &trust::Enrolled::default(), &bin).unwrap();
+            let public = fs::read_to_string(self.trust_dir.join(trust::PUBLIC_FILE)).unwrap();
+            let mut parts = public.split_whitespace();
+            let line = format!("{} {}", parts.next().unwrap(), parts.next().unwrap());
+            self.allow(&[allowed_line(&report.principal, &line, "")]);
+            Some(attest::Context {
+                wiki: self.wiki.clone(),
+                repo_root: self.root.clone(),
+                trust_dir: self.trust_dir.clone(),
+                keygen: bin,
+                now: super::policy::parse_stamp(NOW).unwrap(),
+                org: None,
+                harness: Some("test".to_owned()),
+            })
+        }
+
+        fn page_with(&self, name: &str, text: &str) -> PathBuf {
+            let path = self.page_path(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, text).unwrap();
+            path
+        }
+
+        fn init_repo(&self) {
+            git(&self.root, &["init", "-q"]);
+            git(&self.root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+            fs::write(self.root.join("a.txt"), "alpha\n").unwrap();
+            git(&self.root, &["add", "a.txt", "run.log"]);
+            git(&self.root, &["commit", "-q", "-m", "first"]);
+        }
+    }
+
+    fn request(evidence: &[&str]) -> Request {
+        Request {
+            page: "alpha".to_owned(),
+            anchor: "s-trust-order".to_owned(),
+            level: "evidence".to_owned(),
+            claim: "TLS order".to_owned(),
+            evidence: evidence.iter().map(|e| (*e).to_owned()).collect(),
+            ..Request::default()
+        }
+    }
+
+    const UNMARKED: &str =
+        "# Alpha\n\nTLS tries the bundled rung first.\nThen the system store. ^s-trust-order\n\nTail.\n";
+
+    fn has_no_seal_store(world: &World) -> bool {
+        !record::seals_dir(&world.wiki).exists()
+    }
+
+    /// AC-S1: an un-marked `^s-` block gains markers, a record named by the
+    /// sha256 prefix and its signature, and verifies citable.
+    #[test]
+    fn attest_roundtrip() {
+        let world = World::new();
+        let Some(ctx) = world.attest_context() else {
+            // No capable ssh-keygen: attest must refuse with the setup hint.
+            let ctx = attest::Context {
+                wiki: world.wiki.clone(),
+                repo_root: world.root.clone(),
+                trust_dir: world.trust_dir.clone(),
+                keygen: world.root.join("no-such-keygen"),
+                now: super::policy::parse_stamp(NOW).unwrap(),
+                org: None,
+                harness: None,
+            };
+            world.page_with("alpha", UNMARKED);
+            let AttestError::Refused(lines) =
+                attest::attest(&ctx, &request(&["capture:run.log"])).unwrap_err()
+            else {
+                panic!("expected a refusal");
+            };
+            assert!(lines.join("\n").contains("npx @scchearn/loam setup"));
+            return;
+        };
+        let page = world.page_with("alpha", UNMARKED);
+        let done = attest::attest(&ctx, &request(&["capture:run.log"])).unwrap();
+
+        let record_bytes = fs::read(record::record_path(&world.wiki, &done.id)).unwrap();
+        assert_eq!(done.id, crate::sha256::hex(&record_bytes)[..20]);
+        assert_eq!(done.id, record::id_of(&record_bytes));
+        assert!(record::sig_path(&world.wiki, &done.id).is_file());
+        assert!(done.inserted_markers);
+        assert_eq!(done.report.outcome.verdict, Verdict::Citable);
+        assert_eq!(done.report.outcome.effective_level, Some(Level::Evidence));
+        assert_eq!(done.report.cite_as(), Some(format!("seal:{}", done.id)));
+        assert_eq!(
+            fs::read_to_string(&page).unwrap(),
+            "# Alpha\n\n<!-- loam:seal s-trust-order -->\nTLS tries the bundled rung first.\nThen the system store.\n<!-- /loam:seal -->\n\nTail.\n"
+        );
+        let view = record::well_formed(&done.id, &record_bytes).unwrap();
+        assert_eq!(view.claim.as_deref(), Some("TLS order"));
+        assert_eq!(view.requested_level.as_deref(), Some("evidence"));
+        assert!(view.principal.starts_with("agent."));
+        let generator = view
+            .document
+            .get("predicate")
+            .unwrap()
+            .get("generator")
+            .unwrap();
+        assert_eq!(
+            generator.get("harness").and_then(Value::as_str),
+            Some("test")
+        );
+        assert_eq!(
+            generator.get("version").and_then(Value::as_str),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+
+        // A fresh verifier agrees, and the captured evidence is stored.
+        let again = world.only(NOW);
+        assert_eq!(again.id, done.id);
+        assert_eq!(again.outcome.verdict, Verdict::Citable);
+        assert_eq!(again.signer, Some(view.principal.clone()));
+        assert!(
+            record::evidence_path(&world.wiki, &crate::sha256::hex(b"all tests pass")).is_file()
+        );
+
+        // The same claim in the same minute is refused, not overwritten.
+        let AttestError::Refused(lines) =
+            attest::attest(&ctx, &request(&["capture:run.log"])).unwrap_err()
+        else {
+            panic!("expected a refusal");
+        };
+        assert!(lines.join("\n").contains("already exists"), "{lines:?}");
+        assert_eq!(
+            fs::read(record::record_path(&world.wiki, &done.id)).unwrap(),
+            record_bytes
+        );
+    }
+
+    /// Existing markers are used as they are: the page is not touched, and a
+    /// CRLF page keeps its line endings.
+    #[test]
+    fn attest_uses_existing_markers_and_preserves_crlf() {
+        let world = World::new();
+        let Some(ctx) = world.attest_context() else {
+            return;
+        };
+        let marked =
+            "# Alpha\r\n\r\n<!-- loam:seal s-trust-order -->\r\nBundled first.\r\n<!-- /loam:seal -->\r\n";
+        let page = world.page_with("alpha", marked);
+        let done = attest::attest(&ctx, &request(&["capture:run.log"])).unwrap();
+        assert!(!done.inserted_markers);
+        assert_eq!(fs::read(&page).unwrap(), marked.as_bytes());
+
+        let world = World::new();
+        let ctx = world.attest_context().unwrap();
+        let crlf = UNMARKED.replace('\n', "\r\n");
+        let page = world.page_with("alpha", &crlf);
+        attest::attest(&ctx, &request(&["capture:run.log"])).unwrap();
+        let after = fs::read_to_string(&page).unwrap();
+        assert_eq!(
+            after,
+            "# Alpha\r\n\r\n<!-- loam:seal s-trust-order -->\r\nTLS tries the bundled rung first.\r\nThen the system store.\r\n<!-- /loam:seal -->\r\n\r\nTail.\r\n"
+        );
+        assert!(!after.replace("\r\n", "").contains('\n'));
+    }
+
+    /// AC-S4 (runtime half), AC-S19: every unresolvable item is refused, all
+    /// of them are named, and the page and the seal store are untouched.
+    #[test]
+    fn attest_refuses() {
+        let world = World::new();
+        let Some(ctx) = world.attest_context() else {
+            return;
+        };
+        world.init_repo();
+        git(&world.root, &["checkout", "-q", "-b", "feature"]);
+        fs::write(world.root.join("b.txt"), "b").unwrap();
+        git(&world.root, &["add", "b.txt"]);
+        git(&world.root, &["commit", "-q", "-m", "branch only"]);
+        let branch_only = git(&world.root, &["rev-parse", "HEAD"]);
+        git(&world.root, &["checkout", "-q", "main"]);
+        fs::write(world.root.join("a.txt"), "edited after commit\n").unwrap();
+        fs::write(world.root.join("big.bin"), vec![b'x'; 300_000]).unwrap();
+
+        let page = world.page_with("alpha", UNMARKED);
+        let before = fs::read(&page).unwrap();
+        let commit = format!("commit:{branch_only}");
+        let cases: [(&str, Vec<&str>, usize); 5] = [
+            ("missing blob", vec!["blob:nope.txt"], 1),
+            ("unreachable commit", vec![commit.as_str()], 1),
+            ("over-cap capture", vec!["capture:big.bin"], 1),
+            ("sha mismatch", vec!["blob:a.txt"], 1),
+            (
+                "several at once",
+                vec!["blob:nope.txt", "capture:big.bin", "capture:run.log"],
+                2,
+            ),
+        ];
+        for (name, evidence, failing) in cases {
+            let AttestError::Refused(lines) =
+                attest::attest(&ctx, &request(&evidence)).unwrap_err()
+            else {
+                panic!("{name}: expected a refusal");
+            };
+            assert_eq!(lines.len(), failing, "{name}: {lines:?}");
+            assert_eq!(fs::read(&page).unwrap(), before, "{name}: page changed");
+            assert!(has_no_seal_store(&world), "{name}: wrote under .seals");
+        }
+
+        // Usage-class problems also write nothing.
+        let mut bad = request(&["capture:run.log"]);
+        bad.anchor = "s-no-such-anchor".to_owned();
+        assert!(matches!(
+            attest::attest(&ctx, &bad).unwrap_err(),
+            AttestError::Usage(_)
+        ));
+        let mut bad = request(&["capture:run.log"]);
+        bad.page = "missing".to_owned();
+        assert!(matches!(
+            attest::attest(&ctx, &bad).unwrap_err(),
+            AttestError::Usage(_)
+        ));
+        let mut bad = request(&["capture:run.log"]);
+        bad.level = "gold".to_owned();
+        assert!(matches!(
+            attest::attest(&ctx, &bad).unwrap_err(),
+            AttestError::Usage(_)
+        ));
+        assert!(matches!(
+            attest::attest(&ctx, &request(&[])).unwrap_err(),
+            AttestError::Usage(_)
+        ));
+        let mut bad = request(&["capture:run.log"]);
+        bad.review_by = Some("2026-11-20 14:30 +02:00".to_owned());
+        assert!(matches!(
+            attest::attest(&ctx, &bad).unwrap_err(),
+            AttestError::Usage(_)
+        ));
+        assert_eq!(fs::read(&page).unwrap(), before);
+        assert!(has_no_seal_store(&world));
+
+        // A note-only seal would not be citable: refused before any write.
+        let AttestError::Refused(lines) =
+            attest::attest(&ctx, &request(&["note:because I said so"])).unwrap_err()
+        else {
+            panic!("expected a refusal");
+        };
+        assert!(
+            lines.join("\n").contains("would not be citable"),
+            "{lines:?}"
+        );
+        assert_eq!(fs::read(&page).unwrap(), before);
+        assert!(has_no_seal_store(&world));
+
+        // No signing identity: refused with the setup hint.
+        let mut no_identity = ctx.clone();
+        no_identity.trust_dir = world.root.join("nowhere");
+        let AttestError::Refused(lines) =
+            attest::attest(&no_identity, &request(&["capture:run.log"])).unwrap_err()
+        else {
+            panic!("expected a refusal");
+        };
+        assert!(lines.join("\n").contains("npx @scchearn/loam setup"));
+        assert_eq!(fs::read(&page).unwrap(), before);
+        assert!(has_no_seal_store(&world));
+    }
+
+    /// `--parent` records the parent's id and verdict at attest time and
+    /// keeps the provenance of an unchanged capture.
+    #[test]
+    fn parent_chain() {
+        let world = World::new();
+        let Some(mut ctx) = world.attest_context() else {
+            return;
+        };
+        world.page_with("alpha", UNMARKED);
+        let first = attest::attest(&ctx, &request(&["capture:run.log"])).unwrap();
+
+        ctx.now = super::policy::parse_stamp("2026-11-21 11:00 +02:00").unwrap();
+        let mut again = request(&["capture:run.log"]);
+        again.parent = Some(first.id.clone());
+        let second = attest::attest(&ctx, &again).unwrap();
+        assert_ne!(second.id, first.id);
+
+        let bytes = fs::read(record::record_path(&world.wiki, &second.id)).unwrap();
+        let view = record::well_formed(&second.id, &bytes).unwrap();
+        let parent = view.parent.expect("parent recorded");
+        assert_eq!(parent.id, first.id);
+        assert_eq!(parent.verdict, "citable");
+        let capture = &view.evidence[0];
+        assert_eq!(
+            capture.get("retrieved_at").and_then(Value::as_str),
+            Some("2026-11-21 10:00 +02:00"),
+            "an unchanged capture keeps its first retrieval time"
+        );
+
+        // The first record is untouched and both stay citable.
+        assert!(record::record_path(&world.wiki, &first.id).is_file());
+        let reports = world.reports("2026-11-21 12:00 +02:00");
+        assert_eq!(reports.len(), 2);
+        assert!(reports.iter().all(verify::Report::is_citable));
+
+        // An unknown or malformed parent is a usage error that writes nothing.
+        for parent in ["0123456789abcdef0123", "not-an-id"] {
+            let mut bad = request(&["capture:run.log"]);
+            bad.parent = Some(parent.to_owned());
+            ctx.now = super::policy::parse_stamp("2026-11-21 12:30 +02:00").unwrap();
+            assert!(matches!(
+                attest::attest(&ctx, &bad).unwrap_err(),
+                AttestError::Usage(_)
+            ));
+        }
+        assert_eq!(world.reports(NOW).len(), 2);
     }
 }
