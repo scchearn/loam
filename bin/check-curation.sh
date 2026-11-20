@@ -255,6 +255,9 @@ grep -Fq 'make a verified claim citable → `sealing-memory`' "$router" \
   || fail "router must route citable claims to sealing-memory"
 grep -Fq 'seals_attention' skills/loam-using/references/runtime.md \
   || fail "runtime reference must register the seals_attention hint"
+amending="skills/loam-memory/loam-amending-memory/SKILL.md"
+grep -Fq -- '--parent' "$amending" || fail "amending-memory must name re-seal with --parent"
+grep -Fq 'dispute' "$amending" || fail "amending-memory must write a dispute instead of overwriting a contradicted seal"
 
 if [ "$failures" -ne 0 ]; then
   exit 1

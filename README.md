@@ -295,7 +295,7 @@ the skill runs. The table below shows how much space each skill uses against the
 | loam::initializing-vault | 206 | 51 | 9 | 73 |
 | loam::scaffolding-wiki | 445 | 90 | 207 | 2,400 |
 | loam::adding-to-memory | 592 | 116 | 217 | 2,312 |
-| loam::amending-memory | 505 | 114 | 180 | 1,958 |
+| loam::amending-memory | 505 | 114 | 182 | 2,122 |
 | loam::auditing-guidance | 410 | 85 | 304 | 3,256 |
 | loam::ingesting-codebase | 329 | 76 | 288 | 3,660 |
 | loam::learning-from-session | 487 | 101 | 365 | 4,213 |
