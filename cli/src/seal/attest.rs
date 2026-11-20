@@ -162,6 +162,12 @@ fn ends_with_block_id(text: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+/// A line made only of `=` or `-` (setext underline or rule) ends a block.
+fn is_setext_underline(text: &str) -> bool {
+    let t = text.trim();
+    !t.is_empty() && (t.bytes().all(|b| b == b'=') || t.bytes().all(|b| b == b'-'))
+}
+
 fn is_marker_comment(text: &str) -> bool {
     let trimmed = text.trim();
     trimmed.starts_with("<!--") && trimmed.ends_with("-->") && trimmed.contains("loam:")
@@ -257,6 +263,7 @@ pub fn insert_markers(source: &str, anchor: &str) -> Result<Option<String>, Stri
             if text.trim().is_empty()
                 || is_heading(text)
                 || is_marker_comment(text)
+                || is_setext_underline(text)
                 || in_code(previous)
             {
                 break;
@@ -329,6 +336,29 @@ fn page_file(wiki: &Path, page: &str) -> Result<PathBuf, String> {
         return Err(format!("`{page}` is not a wiki page name"));
     }
     Ok(wiki.join(format!("{page}.md")))
+}
+
+/// Resolves a requested page name to the exact on-disk name and path. On
+/// case-insensitive filesystems a wrong-case name would otherwise read fine
+/// yet be recorded verbatim, so the name must match a listed page: exactly, or
+/// by a unique case-insensitive match.
+fn resolve_page(wiki: &Path, page: &str) -> Result<(String, PathBuf), String> {
+    page_file(wiki, page)?;
+    let files = verify::markdown_files(wiki)?;
+    if let Some((name, path)) = files.iter().find(|(name, _)| name == page) {
+        return Ok((name.clone(), path.clone()));
+    }
+    let lower = page.to_lowercase();
+    let mut folded = files
+        .iter()
+        .filter(|(name, _)| name.to_lowercase() == lower);
+    match (folded.next(), folded.next()) {
+        (Some((name, path)), None) => Ok((name.clone(), path.clone())),
+        (Some(_), Some(_)) => Err(format!(
+            "page `{page}` matches several pages that differ only in case; use the exact name"
+        )),
+        _ => Err(format!("cannot read page {page}: no such page")),
+    }
 }
 
 fn write_page(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -416,11 +446,10 @@ pub fn attest(ctx: &Context, request: &Request) -> Result<Attested, AttestError>
     }
 
     // 2. The page, as it will be.
-    let path = page_file(&ctx.wiki, &request.page).map_err(&usage)?;
-    let original =
-        fs::read(&path).map_err(|e| usage(format!("cannot read page {}: {e}", request.page)))?;
+    let (page, path) = resolve_page(&ctx.wiki, &request.page).map_err(&usage)?;
+    let original = fs::read(&path).map_err(|e| usage(format!("cannot read page {}: {e}", page)))?;
     let source = std::str::from_utf8(&original)
-        .map_err(|e| usage(format!("page {} is not valid UTF-8 ({e})", request.page)))?;
+        .map_err(|e| usage(format!("page {} is not valid UTF-8 ({e})", page)))?;
     let rewritten = insert_markers(source, &request.anchor).map_err(&usage)?;
     let page_text = rewritten.as_deref().unwrap_or(source);
     let page_bytes: Vec<u8> = page_text.as_bytes().to_vec();
@@ -526,7 +555,7 @@ pub fn attest(ctx: &Context, request: &Request) -> Result<Attested, AttestError>
     // 4. The record, signed, and the whole round trip verified in memory.
     let (id, bytes) = record::build(&NewRecord {
         kind: RecordKind::Seal,
-        page: request.page.clone(),
+        page: page.clone(),
         anchor: request.anchor.clone(),
         subject_sha256,
         locator,
@@ -564,7 +593,7 @@ pub fn attest(ctx: &Context, request: &Request) -> Result<Attested, AttestError>
     let overlay = Overlay {
         page: rewritten
             .as_ref()
-            .map(|_| (request.page.clone(), page_bytes.clone())),
+            .map(|_| (page.clone(), page_bytes.clone())),
         record: Some((id.clone(), bytes.clone())),
         signature: Some(signature.clone()),
         captures: resolved
@@ -590,7 +619,7 @@ pub fn attest(ctx: &Context, request: &Request) -> Result<Attested, AttestError>
     if fs::read(&path).ok().as_deref() != Some(original.as_slice()) {
         return Err(refuse(format!(
             "page {} changed while attesting; nothing written",
-            request.page
+            page
         )));
     }
     let edited = rewritten.is_some();
@@ -601,13 +630,14 @@ pub fn attest(ctx: &Context, request: &Request) -> Result<Attested, AttestError>
         if edited {
             if let Err(e) = write_page(&path, &original) {
                 return refuse(format!("{why}; and the page could not be restored: {e}"));
-                // Captures are content-addressed, not records: if the record write below
-                // fails, newly stored capture files stay behind harmlessly. Signing-identity
-                // checks run before evidence resolution by design.
             }
         }
         refuse(format!("{why}; page restored"))
     };
+    // Captures are content-addressed, not records: if a later write fails,
+    // newly stored capture files stay behind harmlessly. Two concurrent
+    // attests on one page can both pass the changed-while-attesting check
+    // above and overwrite each other's markers; that window is accepted.
     if let Err(e) = evidence::store_captures(&ctx.wiki, &resolved) {
         return Err(restore(e));
     }
@@ -852,6 +882,27 @@ mod tests {
             .markers
             .iter()
             .any(|m| m.kind == MarkerKind::Seal && m.id == "s-trust-order"));
+    }
+
+    #[test]
+    fn page_names_resolve_to_the_on_disk_case() {
+        let dir = std::env::temp_dir().join(format!("loam-attest-resolve-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("alpha.md"), "x").unwrap();
+        let (name, _) = resolve_page(&dir, "Alpha").unwrap();
+        assert_eq!(name, "alpha");
+        assert!(resolve_page(&dir, "beta").is_err());
+        fs::write(dir.join("Gamma.md"), "x").unwrap();
+        assert_eq!(resolve_page(&dir, "gamma").unwrap().0, "Gamma");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setext_underlines_bound_a_block() {
+        let source = "Title\n=====\nbody text ^s-one-two\n";
+        let out = insert_markers(source, "s-one-two").unwrap().unwrap();
+        assert!(out.starts_with("Title\n=====\n<!-- loam:seal"), "{out}");
     }
 
     #[test]

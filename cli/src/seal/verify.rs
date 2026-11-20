@@ -260,7 +260,7 @@ struct Span {
     digest: Option<String>,
 }
 
-fn markdown_files(wiki: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+pub(super) fn markdown_files(wiki: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) -> Result<(), String> {
         let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         for entry in entries {

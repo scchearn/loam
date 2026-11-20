@@ -542,7 +542,7 @@ mod attest {
     }
 
     #[test]
-    fn attest_rejects_now_and_a_parent_on_another_anchor() {
+    fn attest_rejects_now() {
         let Some(ws) = Workspace::new("now") else {
             return;
         };

@@ -1794,5 +1794,29 @@ mod tests {
             ));
         }
         assert_eq!(world.reports(NOW).len(), 2);
+
+        // A parent that seals a different anchor is a usage error that
+        // writes nothing.
+        let page = world.page_path("alpha");
+        let other_text = format!(
+            "{}\nOther claim. ^s-other-anchor\n",
+            fs::read_to_string(&page).unwrap()
+        );
+        fs::write(&page, other_text).unwrap();
+        let mut other = request(&["capture:run.log"]);
+        other.anchor = "s-other-anchor".to_owned();
+        ctx.now = super::policy::parse_stamp("2026-11-21 13:00 +02:00").unwrap();
+        let other_id = attest::attest(&ctx, &other).unwrap().id;
+        let page_before = fs::read(&page).unwrap();
+        let count = world.reports(NOW).len();
+        let mut crossed = request(&["capture:run.log"]);
+        crossed.parent = Some(other_id);
+        ctx.now = super::policy::parse_stamp("2026-11-21 13:30 +02:00").unwrap();
+        assert!(matches!(
+            attest::attest(&ctx, &crossed).unwrap_err(),
+            AttestError::Usage(_)
+        ));
+        assert_eq!(fs::read(&page).unwrap(), page_before);
+        assert_eq!(world.reports(NOW).len(), count);
     }
 }
