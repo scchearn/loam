@@ -10,10 +10,11 @@
 //!
 //! 1. `untrusted`: the record is not well-formed or its id does not match
 //!    its bytes.
-//! 2. `forged`: bad signature, wrong namespace, unknown signer, or
-//!    `verifier.principal` differing from the signer the key matched (the
-//!    harness name is diagnostic only).
-//! 3. `untrusted`: the signing key is revoked.
+//! 2. `forged`: bad signature, wrong namespace, or `verifier.principal`
+//!    differing from the signer the key matched (the harness name is
+//!    diagnostic only).
+//! 3. `untrusted`: the signing key is revoked, or the signature is valid
+//!    but its key is not in this reader's `allowed_signers`.
 //! 4. `retracted`: a retract status record applies.
 //! 5. `drifted`: the span's current canonical hash differs from the sealed
 //!    one, or the span is gone.
@@ -112,7 +113,7 @@ pub mod code {
     pub const SIGNATURE_VALID: &str = "seal.signature.valid";
     pub const SIGNATURE_INVALID: &str = "seal.signature.invalid";
     pub const NAMESPACE_WRONG: &str = "seal.signature.namespace";
-    pub const SIGNER_UNKNOWN: &str = "seal.signature.unknown_signer";
+    pub const UNTRUSTED_SIGNER: &str = "seal.signature.untrusted_signer";
     pub const PRINCIPAL_MISMATCH: &str = "seal.signature.principal_mismatch";
     pub const VERIFIER_UNAVAILABLE: &str = "seal.signature.verifier_unavailable";
     pub const SIGNER_REVOKED: &str = "seal.signer.revoked";
@@ -146,8 +147,8 @@ pub mod code {
     /// codes lint does not surface.
     pub fn lint_code(code: &str) -> Option<&'static str> {
         Some(match code {
-            MALFORMED | SIGNATURE_INVALID | NAMESPACE_WRONG | SIGNER_UNKNOWN
-            | PRINCIPAL_MISMATCH | SIGNER_REVOKED => "SEL003",
+            MALFORMED | SIGNATURE_INVALID | NAMESPACE_WRONG | PRINCIPAL_MISMATCH
+            | SIGNER_REVOKED => "SEL003",
             BINDING_MISMATCH | SPAN_MISSING => "SEL004",
             EVIDENCE_DRIFTED | EVIDENCE_UNRESOLVABLE => "SEL005",
             REVIEW_BY_PASSED | REVIEW_BY_CAPPED | RECHECK_DUE | TIME_VERIFIED_FUTURE => "SEL006",
@@ -187,7 +188,6 @@ pub fn evaluate(input: &Inputs<'_>) -> Outcome {
             codes.failure.push(match reason {
                 ForgeReason::BadSignature => code::SIGNATURE_INVALID,
                 ForgeReason::WrongNamespace => code::NAMESPACE_WRONG,
-                ForgeReason::UnknownSigner => code::SIGNER_UNKNOWN,
             });
             return outcome(Verdict::Forged, requested, None, codes);
         }
@@ -198,6 +198,10 @@ pub fn evaluate(input: &Inputs<'_>) -> Outcome {
         } if matched_principal != claimed_principal => {
             codes.failure.push(code::PRINCIPAL_MISMATCH);
             return outcome(Verdict::Forged, requested, None, codes);
+        }
+        SignatureStanding::Untrusted => {
+            codes.failure.push(code::UNTRUSTED_SIGNER);
+            return outcome(Verdict::Untrusted, requested, None, codes);
         }
         SignatureStanding::Revoked => {
             codes.failure.push(code::SIGNER_REVOKED);
@@ -463,7 +467,7 @@ mod tests {
             c
         };
         type Tweak = fn(&mut Case);
-        let rows: [(&str, Tweak, Verdict, &str); 9] = [
+        let rows: [(&str, Tweak, Verdict, &str); 11] = [
             (
                 "malformed beats forged",
                 |c| {
@@ -490,6 +494,21 @@ mod tests {
                 },
                 Verdict::Forged,
                 code::PRINCIPAL_MISMATCH,
+            ),
+            (
+                "untrusted signer is untrusted, not forged",
+                |c| c.signature = SignatureStanding::Untrusted,
+                Verdict::Untrusted,
+                code::UNTRUSTED_SIGNER,
+            ),
+            (
+                "malformed beats untrusted signer",
+                |c| {
+                    c.well_formed = false;
+                    c.signature = SignatureStanding::Untrusted;
+                },
+                Verdict::Untrusted,
+                code::MALFORMED,
             ),
             (
                 "revoked beats retracted",
@@ -552,6 +571,17 @@ mod tests {
                 .collect();
             assert!(all.contains(&expected_code), "{name}: {:?}", got.codes);
         }
+    }
+
+    #[test]
+    fn untrusted_signer_has_no_forgery_lint_code() {
+        assert_eq!(code::UNTRUSTED_SIGNER, "seal.signature.untrusted_signer");
+        assert_eq!(code::lint_code(code::UNTRUSTED_SIGNER), None);
+        let mut c = Case::citable();
+        c.signature = SignatureStanding::Untrusted;
+        let got = c.run();
+        assert_eq!(got.verdict, Verdict::Untrusted);
+        assert_eq!(got.codes.failure, vec![code::UNTRUSTED_SIGNER]);
     }
 
     #[test]

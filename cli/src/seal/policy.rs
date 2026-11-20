@@ -98,8 +98,12 @@ pub enum SignatureStanding {
         /// Key type of the signing key, e.g. `ssh-ed25519`, `sk-ssh-ed25519@openssh.com`.
         key_type: String,
     },
-    /// Bad signature, wrong namespace, or an unknown signer.
+    /// Bad signature or wrong namespace.
     Forged(ForgeReason),
+    /// A cryptographically valid `loam-seal` signature from a key that is
+    /// not in this reader's `allowed_signers`. Not forged: valid but not
+    /// trusted by this reader.
+    Untrusted,
     /// The signer's key is listed in the reader's `revoked` file.
     Revoked,
     /// No usable `ssh-keygen -Y` on this machine: the signature could not be
@@ -111,7 +115,6 @@ pub enum SignatureStanding {
 pub enum ForgeReason {
     BadSignature,
     WrongNamespace,
-    UnknownSigner,
 }
 
 /// Why a level fell below the evidence-derived base.
