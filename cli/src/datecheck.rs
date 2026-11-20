@@ -167,6 +167,8 @@ fn scan_file(relative: &str, path: &Path, offset: &str) -> Vec<String> {
     let sealed = markers::sealed_spans(&content);
     let mut line_start = 0usize;
 
+    // Lines split on \n only; markers::scan also treats a lone CR as a line end,
+    // so the overlap check deliberately protects the whole line in that rare case.
     for (index, raw_line) in content.split('\n').enumerate() {
         let line_number = index + 1;
         let start = line_start;

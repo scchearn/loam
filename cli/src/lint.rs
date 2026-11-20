@@ -67,6 +67,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
     let selected = |domain: &str| only.as_deref().map(|value| value == domain).unwrap_or(true);
     let mut findings = Vec::new();
 
+    // SEL008 from the fixer follows the fixer's domain selection (guidance),
+    // not the seals domain, so the skip stays visible under `--only guidance`.
     if fix && selected("guidance") {
         match guidance::fix(workspace) {
             Ok(guidance::FixOutcome::SealSkipped(anchor)) => findings.push(
