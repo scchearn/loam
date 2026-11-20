@@ -49,8 +49,19 @@ idle worker. The worker acquires a workspace lease before probing, requires
 full state and `code_ingest_pending.evidence.pending_count > 0`, resolves the
 installed ingestion exclusions, and needs a complete actionable fingerprint.
 Missing or unreadable exclusions, uncertain process identity, live workers,
-and stat/read/deadline races fail closed. It never changes source files,
-commits, or pushes. Inspect it with the installed integration's
+and stat/read/deadline races fail closed. It never changes source files.
+It commits only the memory paths it wrote, as `loam(ingest): ...` on the
+current branch, before releasing the lease. It never commits source files and
+never pushes, and it commits in full any memory path you had already edited
+(no held-path or partial-commit handling). Commits are skipped, never forced,
+when hooks or commit signing are configured, HEAD is detached, no git identity
+is set, the repo is mid-merge or locked, or the memory is untracked. Skips are
+recorded as `commit_skipped:<reason>` (for example `hooks_present`,
+`signing_required`, `detached_head`, `no_identity`, `mid_operation`, `locked`,
+`untracked`, `not_a_repo`, `writer_unconfirmed`, `commit_failed`) in the
+`ingest-status` `last_run`. Harvest does the same as `loam(harvest): ...`. Opt
+out with `memory_commits.enabled: false` in `<globalRoot>/config.json` or
+`LOAM_MEMORY_COMMITS=0`. Inspect it with the installed integration's
 `ingest-status --workspace <path> --json` command.
 
 For native operations, invoke the same native command directly:
