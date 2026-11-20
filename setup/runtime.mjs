@@ -139,8 +139,17 @@ function isNotPublished(error) {
   return error?.code === 'ENOENT' || /download failed \(404\)/.test(message) || /ENOENT/.test(message);
 }
 
+// A freshly-written binary can transiently fail to spawn on Windows while an
+// antivirus scanner (Defender, Norton, …) holds a short-lived lock on the file,
+// surfacing as `spawn EPERM`/`EBUSY`/`ETXTBSY`/`EACCES` with no exit code
+// (category `runtime_error`, code === null). This is a race a brief backoff
+// defeats — it must not fail an otherwise-complete install. A real failure
+// (non-zero exit, timeout, bad JSON, wrong version) still hard-fails below.
+const TRANSIENT_SPAWN = /\b(EPERM|EBUSY|ETXTBSY|EACCES)\b/i;
+const SMOKE_SPAWN_RETRIES = 5;
+
 async function smoke({ runtimePath: executable, workspace, smokeRunner, timeoutMs, version }) {
-  const result = await (smokeRunner
+  const invoke = () => (smokeRunner
     ? smokeRunner({ runtimePath: executable, args: ['state', '--fast', resolve(workspace || process.cwd())], cwd: workspace || process.cwd(), timeoutMs })
     : invokeRuntime({
         runtimePath: executable,
@@ -148,6 +157,17 @@ async function smoke({ runtimePath: executable, workspace, smokeRunner, timeoutM
         cwd: workspace || process.cwd(),
         timeoutMs,
       }));
+  let result;
+  for (let attempt = 0; attempt < SMOKE_SPAWN_RETRIES; attempt += 1) {
+    result = await invoke();
+    // Retry only a transient spawn lock (no exit code + AV-style errno). Any
+    // result that actually ran the binary breaks out immediately.
+    if (result?.code === null && TRANSIENT_SPAWN.test(result?.stderr || '')) {
+      await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+      continue;
+    }
+    break;
+  }
   if (result?.category === 'timeout' || result?.code !== 0) {
     throw new Error(`runtime smoke failed: ${result?.stderr || `exit ${result?.code}`}`);
   }
