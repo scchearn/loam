@@ -297,17 +297,36 @@ fn walk_root(
     Ok(())
 }
 
-fn parse_document(source: &str) -> ParsedDocument {
-    let options = Options::ENABLE_GFM
+fn parser_options() -> Options {
+    Options::ENABLE_GFM
         | Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_HEADING_ATTRIBUTES
-        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+}
+
+/// Byte ranges of code blocks (fenced or indented) and front-matter metadata
+/// blocks, parsed with the same options as `parse_document`.
+pub(crate) fn excluded_ranges(source: &str) -> Vec<Range<usize>> {
+    Parser::new_with_broken_link_callback(
+        source,
+        parser_options(),
+        Some(|_: BrokenLink<'_>| Some(("".into(), "".into()))),
+    )
+    .into_offset_iter()
+    .filter_map(|(event, range)| match event {
+        Event::Start(Tag::CodeBlock(_)) | Event::Start(Tag::MetadataBlock(_)) => Some(range),
+        _ => None,
+    })
+    .collect()
+}
+
+fn parse_document(source: &str) -> ParsedDocument {
     let mut parser = Parser::new_with_broken_link_callback(
         source,
-        options,
+        parser_options(),
         Some(|_: BrokenLink<'_>| Some(("".into(), "".into()))),
     )
     .into_offset_iter();

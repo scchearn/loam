@@ -14,6 +14,7 @@ pub mod ipc;
 pub mod json;
 mod lint;
 mod markdown;
+pub mod markers;
 mod memory;
 pub mod provisioning;
 mod service;
