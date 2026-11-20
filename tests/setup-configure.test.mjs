@@ -286,3 +286,60 @@ test('setup --integration grep registers the MCP and --disable-integration grep 
   assert.equal(claudeAfter.mcpServers.grep, undefined, 'grep MCP deregistered from claude');
   await assert.doesNotMatch(await readFile(join(fixture.home, '.codex', 'config.toml'), 'utf8').catch(() => ''), /\[mcp_servers\.grep\]/);
 });
+
+function sealStub(created) {
+  const calls = [];
+  const runner = async (request) => {
+    calls.push(request);
+    return { code: 0, stdout: JSON.stringify({ principal: 'agent.x@org', created }), stderr: '' };
+  };
+  return { runner, calls };
+}
+
+test('seal: keyless setup makes one seal trust init call, no prompt, and still reaches Nothing to configure', async () => {
+  const fixture = await installedFixture();
+  const seal = sealStub(['agent_ed25519']);
+  const capture = outputCapture();
+  const code = await runConfigure(
+    { command: 'setup', federation: null, integrations: [], dryRun: false, yes: false, purge: false },
+    { ...baseOptions(fixture, capture), sealRunner: seal.runner, confirm: async () => { throw new Error('prompted'); } },
+  );
+  assert.equal(code, 0, capture.text());
+  assert.equal(seal.calls.length, 1);
+  assert.deepEqual(seal.calls[0].args, ['seal', 'trust', 'init', '--json']);
+  assert.match(capture.text(), /Seal key ready/);
+  assert.match(capture.text(), /Nothing to configure/);
+});
+
+test('seal: with the key present setup reports nothing', async () => {
+  const fixture = await installedFixture();
+  const seal = sealStub([]);
+  const capture = outputCapture();
+  const code = await runConfigure(
+    { command: 'setup', federation: null, integrations: [], dryRun: false, yes: false, purge: false },
+    { ...baseOptions(fixture, capture), sealRunner: seal.runner },
+  );
+  assert.equal(code, 0, capture.text());
+  assert.doesNotMatch(capture.text(), /Seal key/);
+});
+
+test('seal: dry-run setup makes no seal call', async () => {
+  const fixture = await installedFixture();
+  const seal = sealStub(['agent_ed25519']);
+  const capture = outputCapture();
+  await runConfigure(
+    { command: 'setup', federation: null, integrations: [], dryRun: true, yes: false, purge: false },
+    { ...baseOptions(fixture, capture), sealRunner: seal.runner },
+  );
+  assert.equal(seal.calls.length, 0);
+});
+
+test('seal: a failing runtime never fails setup', async () => {
+  const fixture = await installedFixture();
+  const capture = outputCapture();
+  const code = await runConfigure(
+    { command: 'setup', federation: null, integrations: [], dryRun: false, yes: false, purge: false },
+    { ...baseOptions(fixture, capture), sealRunner: async () => ({ code: 2, stdout: '', stderr: 'unknown command' }) },
+  );
+  assert.equal(code, 0, capture.text());
+});

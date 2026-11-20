@@ -1201,3 +1201,87 @@ test('setup harness reconciliation refuses a version mismatch and points to upda
   // The install version pin is untouched by the refusal.
   assert.equal(JSON.parse(await readFile(metadataPath, 'utf8')).plugin_version, '0.0.1');
 });
+
+function sealStub({ code = 0, created = ['agent_ed25519'] } = {}) {
+  const calls = [];
+  const runner = async (request) => {
+    calls.push(request);
+    if (code !== 0) return { code, stdout: '', stderr: 'unknown command: seal' };
+    return { code: 0, stdout: JSON.stringify({ principal: 'agent.x@org', created }), stderr: '' };
+  };
+  return { runner, calls };
+}
+
+test('seal: install makes exactly one seal trust init call and reports the key', async () => {
+  const fixture = await baseFixture();
+  const seal = sealStub();
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['install', '--yes']), {
+    ...fixture, packageRoot, sealRunner: seal.runner, output: capture.output, errorOutput: capture.output,
+  });
+  assert.equal(code, 0, capture.text());
+  assert.equal(seal.calls.length, 1);
+  assert.deepEqual(seal.calls[0].args, ['seal', 'trust', 'init', '--json']);
+  assert.match(capture.text(), /Seal key ready/);
+});
+
+test('seal: dry-run issues no seal call', async () => {
+  const fixture = await baseFixture();
+  const seal = sealStub();
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['install', '--dry-run']), {
+    ...fixture, packageRoot, sealRunner: seal.runner, output: capture.output, errorOutput: capture.output,
+  });
+  assert.equal(code, 0);
+  assert.equal(seal.calls.length, 0);
+  assert.match(capture.text(), /Would provision seal key/);
+});
+
+test('seal: a failed final verification issues no seal call', async () => {
+  const fixture = await baseFixture();
+  const seal = sealStub();
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['install', '--yes']), {
+    ...fixture,
+    packageRoot,
+    sealRunner: seal.runner,
+    finalVerify: async () => ({
+      ready: false,
+      install: { plugin_version: PACKAGE_VERSION },
+      skills: { ready: false, category: 'skills_missing' },
+      runtime: { ready: true },
+      harnesses: {},
+      ingestExclusions: { ready: true },
+      migration: { ready: true },
+    }),
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+  assert.equal(code, 1);
+  assert.equal(seal.calls.length, 0);
+});
+
+test('seal: a seal skip leaves the exit code unchanged', async () => {
+  const fixture = await baseFixture();
+  const seal = sealStub({ code: 2 });
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['install', '--yes']), {
+    ...fixture, packageRoot, sealRunner: seal.runner, output: capture.output, errorOutput: capture.output,
+  });
+  assert.equal(code, 0, capture.text());
+  assert.equal(seal.calls.length, 1);
+  assert.match(capture.text(), /Seal key not provisioned \(seal_unavailable\)/);
+});
+
+test('seal: update makes exactly one seal call', async () => {
+  const fixture = await baseFixture();
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, sealRunner: sealStub().runner, output: outputCapture().output });
+  const seal = sealStub({ created: [] });
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['update']), {
+    ...fixture, packageRoot, sealRunner: seal.runner, output: capture.output, errorOutput: capture.output,
+  });
+  assert.equal(code, 0, capture.text());
+  assert.equal(seal.calls.length, 1);
+  assert.doesNotMatch(capture.text(), /Seal key ready/);
+});
