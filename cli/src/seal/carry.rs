@@ -13,6 +13,11 @@
 //! carries no evidence of its own, and the seal is re-judged from its
 //! original record, so the result is at most the level it had before the
 //! rename.
+//!
+//! Scope: link targets are matched case-sensitively and only against
+//! markdown pages, so a case-only retarget or a renamed asset embed is
+//! refused (fail closed) and needs a re-seal. Verify is offline and does not
+//! re-prove the rename, so an update is trusted as far as its signer is.
 
 use crate::markers::{self, Kind as MarkerKind};
 use crate::seal::attest::{
@@ -444,6 +449,12 @@ pub fn carry(ctx: &Context, request: &Request) -> Result<Carried, AttestError> {
         .ok_or_else(|| untracked(&request.id, "the page is outside the repository"))?;
     let record_rel = relative_to(repo, &record::record_path(&ctx.wiki, &request.id))
         .ok_or_else(|| untracked(&request.id, "the record is outside the repository"))?;
+    if crate::seal::evidence::repo_root(&ctx.wiki).is_none() {
+        return Err(untracked(
+            &request.id,
+            "the wiki is not in a git repository",
+        ));
+    }
     let tracked = git(repo, &["ls-files", "--error-unmatch", "--", &page_rel])
         .map_err(|e| refuse(format!("{e}; carry needs git")))?;
     if !tracked_verdict(&tracked).map_err(refuse)? {

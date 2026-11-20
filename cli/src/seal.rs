@@ -2403,12 +2403,35 @@ mod tests {
             AttestError::Usage(_)
         ));
     }
+    /// A wiki outside any git repository is untracked memory: refused with
+    /// the re-seal hint, not a raw git failure.
+    #[test]
+    fn carry_untracked_wiki_outside_git() {
+        let world = World::new();
+        let Some(mut one) = world.attest_context() else {
+            assert!(world.bin.is_none(), "keygen present but no context");
+            return;
+        };
+        world.page_with("topics/old-name", "# Old name\n\nTarget page.\n");
+        world.page_with("alpha", LINKED);
+        let x = attest::attest(&one, &request(&["capture:run.log"])).unwrap();
+        let sealed = fs::read_to_string(world.page_path("alpha")).unwrap();
+        world.page_with("alpha", &sealed.replace("[[old-name]]", "[[new-name]]"));
+        one.now = super::policy::parse_stamp("2026-11-21 10:10 +02:00").unwrap();
+        let text = refused_text(carry::carry(&one, &carry_request(&x.id)).unwrap_err());
+        assert!(
+            text.contains("untracked memory: re-seal with loam seal attest"),
+            "{text}"
+        );
+    }
+
     /// A rename already staged is accepted; one that exists only on disk is
     /// refused with a hint to commit or stage it, not to re-seal first.
     #[test]
     fn carry_staged_and_disk_only_renames() {
         let world = World::new();
         let Some(mut one) = world.attest_context() else {
+            assert!(world.bin.is_none(), "keygen present but no context");
             return;
         };
         world.init_repo();
@@ -2445,6 +2468,7 @@ mod tests {
     fn carry_refuses_same_basename_rename() {
         let world = World::new();
         let Some(mut one) = world.attest_context() else {
+            assert!(world.bin.is_none(), "keygen present but no context");
             return;
         };
         world.init_repo();
