@@ -2629,6 +2629,7 @@ mod tests {
             // Seals: `sshsig.rs` and `trust.rs` run the reader's `ssh-keygen`;
             // `record.rs` runs git for tracked-tree detection; `evidence.rs`
             // runs git for blob/commit resolution and reads evidence files.
+            "seal/carry.rs",
             "seal/evidence.rs",
             "seal/record.rs",
             "seal/sshsig.rs",
@@ -2669,6 +2670,7 @@ mod tests {
             "seal.rs",
             // Attest: the page it seals and the record store it creates.
             "seal/attest.rs",
+            "seal/carry.rs",
             "seal/evidence.rs",
             "seal/record.rs",
             "seal/sshsig.rs",

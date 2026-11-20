@@ -39,6 +39,9 @@ const LEVELS: [&str; 3] = ["evidence", "audited", "canonical"];
 /// unreadable rather than pulled into memory.
 const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 const STATUS_TYPES: [&str; 4] = ["dispute", "demote", "supersede", "retract"];
+/// The only update type: a carry that proved a link-target-only change.
+pub const UPDATE_TYPE_LINK_RETARGET: &str = "link-retarget";
+const UPDATE_TYPES: [&str; 1] = [UPDATE_TYPE_LINK_RETARGET];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordKind {
@@ -90,9 +93,10 @@ pub struct Parent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusInfo {
-    /// `dispute | demote | supersede | retract`.
+    /// `dispute | demote | supersede | retract` for a status record;
+    /// `link-retarget` for an update record.
     pub type_: String,
-    /// Id of the record this status record applies to.
+    /// Id of the record this status or update record applies to.
     pub updates: String,
     pub reason: String,
 }
@@ -586,6 +590,26 @@ pub fn well_formed(id: &str, bytes: &[u8]) -> Result<View, RecordError> {
     };
 
     let status = match kind {
+        RecordKind::Update => {
+            let type_ = text(p, "predicate.", "type")?.to_owned();
+            if !UPDATE_TYPES.contains(&type_.as_str()) {
+                return Err(RecordError::Malformed(format!(
+                    "unknown update type {type_:?}"
+                )));
+            }
+            let updates = text(p, "predicate.", "updates")?.to_owned();
+            if !is_id(&updates) {
+                return Err(RecordError::Malformed(
+                    "predicate.updates is not a record id".to_owned(),
+                ));
+            }
+            let reason = nonempty(text(p, "predicate.", "reason")?, "predicate.reason")?.to_owned();
+            Some(StatusInfo {
+                type_,
+                updates,
+                reason,
+            })
+        }
         RecordKind::Status => {
             let type_ = text(p, "predicate.", "type")?.to_owned();
             if !STATUS_TYPES.contains(&type_.as_str()) {

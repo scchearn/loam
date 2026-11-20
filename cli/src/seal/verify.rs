@@ -355,26 +355,7 @@ pub fn verify_overlay(env: &Env, overlay: &Overlay, id: &str) -> Result<Report, 
 }
 
 fn verify_with(env: &Env, overlay: Option<&Overlay>) -> Result<Vec<Report>, String> {
-    let files = markdown_files(&env.wiki)?;
-    let spans = collect_spans(&files, overlay);
-    let mut records = record::load_all(&env.wiki)?;
-    if let Some((id, bytes)) = overlay.and_then(|o| o.record.as_ref()) {
-        records.retain(|loaded| &loaded.id != id);
-        records.push(Loaded {
-            id: id.clone(),
-            bytes: bytes.clone(),
-            view: record::well_formed(id, bytes),
-        });
-        records.sort_by(|a, b| a.id.cmp(&b.id));
-    }
-    let verifier = Verifier {
-        env,
-        files,
-        spans,
-        records,
-        overlay,
-        cache: RefCell::new(HashMap::new()),
-    };
+    let verifier = build_verifier(env, overlay)?;
     let mut reports = Vec::new();
     for loaded in &verifier.records {
         let is_seal = match &loaded.view {
@@ -388,6 +369,57 @@ fn verify_with(env: &Env, overlay: Option<&Overlay>) -> Result<Vec<Report>, Stri
         }
     }
     Ok(reports)
+}
+
+fn build_verifier<'a>(env: &'a Env, overlay: Option<&'a Overlay>) -> Result<Verifier<'a>, String> {
+    let files = markdown_files(&env.wiki)?;
+    let spans = collect_spans(&files, overlay);
+    let mut records = record::load_all(&env.wiki)?;
+    if let Some((id, bytes)) = overlay.and_then(|o| o.record.as_ref()) {
+        records.retain(|loaded| &loaded.id != id);
+        records.push(Loaded {
+            id: id.clone(),
+            bytes: bytes.clone(),
+            view: record::well_formed(id, bytes),
+        });
+        records.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+    Ok(Verifier {
+        env,
+        files,
+        spans,
+        records,
+        overlay,
+        cache: RefCell::new(HashMap::new()),
+    })
+}
+
+/// A verified `link-retarget` update: the span the seal is bound to now.
+#[derive(Debug, Clone)]
+pub struct AppliedUpdate {
+    pub id: String,
+    /// `loam.canon/v1` digest of `content`.
+    pub digest: String,
+    /// Canonical as-sealed text after the update.
+    pub content: String,
+    pub at: DateTime<FixedOffset>,
+}
+
+/// The newest verified `link-retarget` update for the seal `id`, if any.
+pub fn latest_update_for(env: &Env, id: &str) -> Result<Option<AppliedUpdate>, String> {
+    let verifier = build_verifier(env, None)?;
+    let Some(loaded) = verifier.records.iter().find(|l| l.id == id) else {
+        return Ok(None);
+    };
+    let Ok(view) = &loaded.view else {
+        return Ok(None);
+    };
+    let requested = view
+        .requested_level
+        .as_deref()
+        .and_then(Level::parse)
+        .unwrap_or(Level::Evidence);
+    Ok(verifier.latest_update(id, view, requested))
 }
 
 struct Verifier<'a> {
@@ -465,13 +497,21 @@ impl Verifier<'_> {
             .map_or(view.subject_name.as_str(), |(page, _)| page)
             .to_owned();
 
-        // Binding.
+        // Binding. A verified `link-retarget` update moves the digest the
+        // span must match; the sealed digest itself stays acceptable, so
+        // undoing the retarget does not drift the seal.
+        let carried = self.latest_update(&loaded.id, view, requested);
+        let accepts = |digest: Option<&str>| {
+            digest.is_some_and(|d| {
+                d == view.subject_sha256 || carried.as_ref().is_some_and(|u| u.digest == d)
+            })
+        };
         let candidates: Vec<&Span> = self
             .spans
             .iter()
             .filter(|s| s.anchor == view.anchor)
             .collect();
-        let bound = |s: &&&Span| s.digest.as_deref() == Some(view.subject_sha256.as_str());
+        let bound = |s: &&&Span| accepts(s.digest.as_deref());
         // The recorded page wins, so an edit there is not hidden by a verbatim
         // copy of the anchor elsewhere; a moved page falls back to the digest.
         let picked = candidates
@@ -482,9 +522,7 @@ impl Verifier<'_> {
             .copied();
         let binding = match picked {
             None => Binding::SpanMissing,
-            Some(span) if span.digest.as_deref() == Some(view.subject_sha256.as_str()) => {
-                Binding::Matches
-            }
+            Some(span) if accepts(span.digest.as_deref()) => Binding::Matches,
             Some(_) => Binding::Mismatch,
         };
         let moved = picked.is_some_and(|s| !same_page(&s.name, &page));
@@ -579,6 +617,74 @@ impl Verifier<'_> {
             time_verified: Some(view.time_verified.clone()),
             likely_location,
         }
+    }
+
+    /// The newest `link-retarget` update for `target` that itself verifies:
+    /// signed by a trusted signer who is its claimed principal and who may
+    /// act on the seal (the sealer, or a ceiling that reaches its level), on
+    /// the seal's anchor, with a digest that is the hash of its own content.
+    /// An update only rebinds the span; it never changes evidence or level.
+    fn latest_update(
+        &self,
+        target: &str,
+        target_view: &View,
+        requested: Level,
+    ) -> Option<AppliedUpdate> {
+        let policy = &self.env.trust.policy;
+        let ceiling = status::authority_level(policy, requested, &target_view.principal);
+        let mut best: Option<AppliedUpdate> = None;
+        for loaded in &self.records {
+            let Ok(view) = &loaded.view else { continue };
+            let Some(info) = view
+                .status
+                .as_ref()
+                .filter(|_| view.kind == record::RecordKind::Update)
+            else {
+                continue;
+            };
+            if info.updates != target
+                || info.type_ != record::UPDATE_TYPE_LINK_RETARGET
+                || view.anchor != target_view.anchor
+            {
+                continue;
+            }
+            let Some(content) = view.content.as_deref() else {
+                continue;
+            };
+            if crate::sha256::hex(content.as_bytes()) != view.subject_sha256 {
+                continue;
+            }
+            let (standing, _) = self.signature(loaded, view);
+            let SignatureStanding::Verified {
+                matched_principal,
+                claimed_principal,
+                ..
+            } = standing
+            else {
+                continue;
+            };
+            if matched_principal != claimed_principal
+                || !status::may_act(policy, &matched_principal, &target_view.principal, ceiling)
+            {
+                continue;
+            }
+            let Some(at) = policy::parse_stamp(&view.time_verified) else {
+                continue;
+            };
+            let candidate = AppliedUpdate {
+                id: loaded.id.clone(),
+                digest: view.subject_sha256.clone(),
+                content: content.to_owned(),
+                at,
+            };
+            let newer = best
+                .as_ref()
+                .is_none_or(|b| (candidate.at, &candidate.id) > (b.at, &b.id));
+            if newer {
+                best = Some(candidate);
+            }
+        }
+        best
     }
 
     /// Status records that name `target`, sit on its anchor and carry a

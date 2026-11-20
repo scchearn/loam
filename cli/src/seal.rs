@@ -5,6 +5,7 @@
 
 pub mod attest;
 pub mod canon;
+pub mod carry;
 pub mod evidence;
 pub mod policy;
 pub mod record;
@@ -31,6 +32,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         Some("trust") => trust::run(args),
         Some("attest") => attest::run(args),
         Some("mark") => status::run(args),
+        Some("carry") => carry::run(args),
         Some("verify") => verify_command(args),
         Some("status") => status_command(args),
         _ => usage(),
@@ -39,7 +41,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
 
 fn usage() -> i32 {
     eprintln!(
-        "Usage:\n  loam seal hash <file> <anchor>\n  loam seal attest <page>#^<anchor> --level <l> --claim <text> --evidence <kind:ref>... (see `loam seal attest` for the optional flags)\n  loam seal mark <id> dispute|demote|supersede|retract --reason <text> [--to <level>]\n  loam seal verify [<page>[#^anchor]] [--json] [--now <stamp>]\n  loam seal status [--json] [--now <stamp>]\n  loam seal trust init|add <principal> <pubkey>|show"
+        "Usage:\n  loam seal hash <file> <anchor>\n  loam seal attest <page>#^<anchor> --level <l> --claim <text> --evidence <kind:ref>... (see `loam seal attest` for the optional flags)\n  loam seal mark <id> dispute|demote|supersede|retract --reason <text> [--to <level>]\n  loam seal carry <id>\n  loam seal verify [<page>[#^anchor]] [--json] [--now <stamp>]\n  loam seal status [--json] [--now <stamp>]\n  loam seal trust init|add <principal> <pubkey>|show"
     );
     EXIT_USAGE
 }
@@ -2192,5 +2194,213 @@ mod tests {
         let report = report_for(&world, "2026-11-21 11:00 +02:00", &x.id);
         assert_eq!(report.outcome.verdict, Verdict::Citable);
         assert!(!report.is_disputed(), "{id}");
+    }
+
+    // ------------------------------------------------------------ carry
+
+    use super::carry;
+
+    const LINKED: &str = "# Alpha\n\nTLS tries [[old-name]] first.\nThen [[topics/old-name|the store]] and [[old-name#Heading]]. ^s-trust-order\n\nTail.\n";
+
+    fn commit_all(world: &World, message: &str) {
+        git(&world.root, &["add", "wiki", "run.log", "a.txt"]);
+        git(&world.root, &["commit", "-q", "-m", message]);
+    }
+
+    fn carry_request(id: &str) -> carry::Request {
+        carry::Request { id: id.to_owned() }
+    }
+
+    fn refused_text(err: AttestError) -> String {
+        match err {
+            AttestError::Refused(lines) => lines.join("\n"),
+            AttestError::Usage(message) => panic!("expected a refusal, got usage: {message}"),
+        }
+    }
+
+    /// AC-S11: a git-renamed link target is carried, a semantic edit is
+    /// refused, and an untracked page is refused with the re-seal hint.
+    #[test]
+    fn carry() {
+        let world = World::new();
+        let Some(mut one) = world.attest_context() else {
+            // No capable ssh-keygen: carry must refuse, not panic.
+            let ctx = attest::Context {
+                wiki: world.wiki.clone(),
+                repo_root: world.root.clone(),
+                trust_dir: world.trust_dir.clone(),
+                keygen: world.root.join("no-such-keygen"),
+                now: super::policy::parse_stamp(NOW).unwrap(),
+                org: None,
+                harness: None,
+            };
+            assert!(carry::carry(&ctx, &carry_request("0123456789abcdef0123")).is_err());
+            return;
+        };
+        world.init_repo();
+        world.page_with("topics/old-name", "# Old name\n\nTarget page.\n");
+        world.page_with("alpha", LINKED);
+        let mut audited = request(&["capture:run.log"]);
+        audited.level = "audited".to_owned();
+        let x = attest::attest(&one, &audited).unwrap();
+        let principal = x.report.signer.clone().unwrap();
+        world.policy(&[principal.as_str()]);
+        share_trust(&world, &one);
+        assert_eq!(x.report.outcome.effective_level, Some(Level::Audited));
+        commit_all(&world, "seal");
+        let sealed_text = fs::read_to_string(world.page_path("alpha")).unwrap();
+        assert!(sealed_text.contains("loam:seal"));
+        let original = fs::read(record::record_path(&world.wiki, &x.id)).unwrap();
+        let at = |ctx: &mut attest::Context, stamp: &str| {
+            ctx.now = super::policy::parse_stamp(stamp).unwrap();
+        };
+
+        // Nothing drifted yet: nothing to carry.
+        at(&mut one, "2026-11-21 10:05 +02:00");
+        assert!(carry::carry(&one, &carry_request(&x.id)).is_err());
+
+        // Obsidian renames the page and rewrites both link forms.
+        git(
+            &world.root,
+            &["mv", "wiki/topics/old-name.md", "wiki/topics/new-name.md"],
+        );
+        let retargeted = sealed_text
+            .replace("[[old-name]]", "[[new-name]]")
+            .replace("[[topics/old-name|", "[[topics/new-name|")
+            .replace("[[old-name#Heading]]", "[[new-name#Heading]]");
+        world.page_with("alpha", &retargeted);
+        commit_all(&world, "rename");
+        let drifted = report_for(&world, "2026-11-21 10:06 +02:00", &x.id);
+        assert_eq!(drifted.outcome.verdict, Verdict::Drifted);
+
+        // A one-word edit riding along with the retarget is refused.
+        let edited = retargeted.replace("first", "second");
+        world.page_with("alpha", &edited);
+        commit_all(&world, "edit");
+        at(&mut one, "2026-11-21 10:10 +02:00");
+        let before = fs::read_dir(record::records_dir(&world.wiki))
+            .unwrap()
+            .count();
+        let text = refused_text(carry::carry(&one, &carry_request(&x.id)).unwrap_err());
+        assert!(text.contains("re-seal with loam seal attest"), "{text}");
+        assert!(text.contains(&x.id), "{text}");
+        assert_eq!(
+            fs::read_dir(record::records_dir(&world.wiki))
+                .unwrap()
+                .count(),
+            before,
+            "a refusal writes nothing"
+        );
+
+        // A retarget no recorded rename explains is refused too.
+        world.page_with(
+            "alpha",
+            &retargeted.replace("[[new-name]]", "[[elsewhere]]"),
+        );
+        commit_all(&world, "wrong target");
+        assert!(carry::carry(&one, &carry_request(&x.id)).is_err());
+
+        // An alias or fragment change is not a target-only change.
+        world.page_with("alpha", &retargeted.replace("the store", "the cache"));
+        commit_all(&world, "alias");
+        assert!(carry::carry(&one, &carry_request(&x.id)).is_err());
+        world.page_with("alpha", &retargeted.replace("#Heading", "#Other"));
+        commit_all(&world, "fragment");
+        assert!(carry::carry(&one, &carry_request(&x.id)).is_err());
+
+        // The pure retarget is carried at the prior level, by the sealer only.
+        world.page_with("alpha", &retargeted);
+        commit_all(&world, "pure retarget");
+        let mut two = second_signer(&world, &one);
+        share_trust(&world, &two);
+        at(&mut two, "2026-11-21 10:15 +02:00");
+        let text = refused_text(carry::carry(&two, &carry_request(&x.id)).unwrap_err());
+        assert!(text.contains("may not carry"), "{text}");
+        assert_eq!(
+            report_for(&world, "2026-11-21 10:16 +02:00", &x.id)
+                .outcome
+                .verdict,
+            Verdict::Drifted
+        );
+        at(&mut one, "2026-11-21 10:20 +02:00");
+        let done = carry::carry(&one, &carry_request(&x.id)).unwrap();
+        assert!(done.report.is_citable(), "{:?}", done.report.outcome);
+        assert_eq!(done.report.outcome.effective_level, Some(Level::Audited));
+        let now = "2026-11-21 10:25 +02:00";
+        let report = report_for(&world, now, &x.id);
+        assert!(report.is_citable());
+        assert_eq!(report.outcome.effective_level, Some(Level::Audited));
+        assert_eq!(
+            fs::read(record::record_path(&world.wiki, &x.id)).unwrap(),
+            original,
+            "the original record is never edited"
+        );
+        let update = record::load_all(&world.wiki)
+            .unwrap()
+            .into_iter()
+            .find(|l| l.id == done.id)
+            .and_then(|l| l.view.ok())
+            .unwrap();
+        assert_eq!(update.kind, record::RecordKind::Update);
+        let info = update.status.unwrap();
+        assert_eq!(info.type_, "link-retarget");
+        assert_eq!(info.updates, x.id);
+
+        // A second rename carries on top of the first update.
+        git(
+            &world.root,
+            &["mv", "wiki/topics/new-name.md", "wiki/topics/newest.md"],
+        );
+        let again = retargeted
+            .replace("[[new-name]]", "[[newest]]")
+            .replace("[[topics/new-name|", "[[topics/newest|")
+            .replace("[[new-name#Heading]]", "[[newest#Heading]]");
+        world.page_with("alpha", &again);
+        commit_all(&world, "second rename");
+        assert_eq!(
+            report_for(&world, "2026-11-21 10:30 +02:00", &x.id)
+                .outcome
+                .verdict,
+            Verdict::Drifted
+        );
+        at(&mut one, "2026-11-21 10:40 +02:00");
+        carry::carry(&one, &carry_request(&x.id)).unwrap();
+        assert!(report_for(&world, "2026-11-21 10:45 +02:00", &x.id).is_citable());
+
+        // Untracked memory: a page git does not know is refused with the hint.
+        world.page_with("beta", "# Beta\n\nBeta links [[old-name]]. ^s-beta-claim\n");
+        let mut beta = request(&["capture:run.log"]);
+        beta.page = "beta".to_owned();
+        beta.anchor = "s-beta-claim".to_owned();
+        at(&mut one, "2026-11-21 11:00 +02:00");
+        let y = attest::attest(&one, &beta).unwrap();
+        world.page_with(
+            "beta",
+            &fs::read_to_string(world.page_path("beta"))
+                .unwrap()
+                .replace("[[old-name]]", "[[newest]]"),
+        );
+        at(&mut one, "2026-11-21 11:10 +02:00");
+        let text = refused_text(carry::carry(&one, &carry_request(&y.id)).unwrap_err());
+        assert!(
+            text.contains("untracked memory: re-seal with loam seal attest"),
+            "{text}"
+        );
+
+        // A tracked page whose record was never committed is refused the same way.
+        git(&world.root, &["add", "-f", "wiki/beta.md"]);
+        git(&world.root, &["commit", "-q", "-m", "beta page only"]);
+        let text = refused_text(carry::carry(&one, &carry_request(&y.id)).unwrap_err());
+        assert!(text.contains("untracked memory"), "{text}");
+
+        // Bad ids are usage errors.
+        assert!(matches!(
+            carry::carry(&one, &carry_request("nope")).unwrap_err(),
+            AttestError::Usage(_)
+        ));
+        assert!(matches!(
+            carry::carry(&one, &carry_request("0123456789abcdef0123")).unwrap_err(),
+            AttestError::Usage(_)
+        ));
     }
 }
