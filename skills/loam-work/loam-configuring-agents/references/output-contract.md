@@ -15,7 +15,7 @@ The skill always produces a prepared debate plan. If the user approves running i
 - the forcing-field deliverable spec
 - scope facts the debate must respect
 - assumptions, if defaults were chosen
-- the **exact first hcom action** that would fire if approved — a verbatim `hcom send` or spawn command, not a placeholder
+- the **exact first coordinator action** that would fire if approved — a verbatim `loam-coordinator send` or `spawn` command, not a placeholder
 
 If the skill cannot produce any of these, it has not finished gathering parameters — go back to the interview, do not emit a partial plan.
 
@@ -50,7 +50,7 @@ Place the prepared debate plan under a literal heading line `## Prepared debate 
 
 Do not replace the prepared debate plan with:
 
-- prose-only design notes without the exact first hcom action
+- prose-only design notes without the exact first coordinator action
 - a saved `agents/<slug>.toml` or `agents/<slug>.md` — that contract is retired
 - shell scripts (unless the user explicitly asked for executable automation, and even then only alongside the prepared plan)
 - repo setup tasks

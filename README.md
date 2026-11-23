@@ -41,6 +41,12 @@ tools or machines.
 - **Automatic session delivery** in Claude Code, Codex CLI, and OpenCode. Cursor
   gets the skills and the federation CLI, but no automatic collaboration claim
   is made there yet.
+- **Direct coordinator integration** through the `loam-coordinator` command. The
+  command invokes a ready implementation of the transport-neutral coordinator
+  interface without a compatibility layer. Set `LOAM_COORDINATOR_URL` and
+  `LOAM_COORDINATOR_TOKEN` for the long-lived loopback service, or set
+  `LOAM_COORDINATOR_MODULE` to an absolute path or `file://` URL for an embedded
+  module.
 - **Independent plugin and runtime releases**, so a skills or integration
   change does not require a native-binary release. See
   [RELEASING.md](./docs/RELEASING.md).
@@ -104,6 +110,21 @@ npx @scchearn/loam doctor
 Enabling federation installs and starts the connector service. Disabling it
 stops and removes that service definition but preserves the identity and
 enrollments, so it can be enabled again later.
+
+### Direct coordinator
+
+Loam's agent-work skills can call the owned coordinator interface directly:
+
+```bash
+loam-coordinator status --json '{"actorId":"<actor-id>"}'
+loam-coordinator send --json '{"sender":"<actor-id>","recipients":["<recipient-id>"],"body":"...","intent":"request"}'
+loam-coordinator spawn --json '{"runtime":"opencode","workspace":"<absolute-path>","taskId":"T1","body":"..."}'
+```
+
+The command fails closed when neither coordinator source is set, when a remote
+URL is not loopback HTTP, or when a loaded module does not expose every method
+in the `Coordinator` interface. The loopback service keeps identity and worker
+state alive between commands.
 
 ## Federation
 
