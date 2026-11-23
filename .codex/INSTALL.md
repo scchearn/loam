@@ -71,10 +71,17 @@ the full text written to a file Codex links in the same message.
 
 ## Background ingestion
 
-Background code ingestion is enabled by default. To opt out, set
-`LOAM_INGEST_BACKGROUND=0` as the unconditional kill switch, or set
-`background_ingest.enabled` to `false` in `~/.agents/loam/config.json`.
-`LOAM_INGEST_BACKGROUND=1` explicitly overrides a disabled config. The adapter
+Background code ingestion is off by default from plugin 1.1.1 (after
+re-running setup). Opt a workspace in with
+`npx @scchearn/loam ingest enable [path]`, remove it with `ingest disable`, and
+see why it is or is not running with `ingest status [path]`. The list lives in
+`background_ingest.workspaces` in the config-dir `config.json`
+(`~/.config/loam/config.json`, macOS
+`~/Library/Application Support/loam/config.json`, Windows
+`%APPDATA%\loam\config.json`, or `$LOAM_CONFIG_DIR`) and survives uninstall
+(only `--purge` removes it). `background_ingest.enabled: true` opts in every
+workspace and `false` is a kill switch; `LOAM_INGEST_BACKGROUND=0` or `=1`
+overrides both, and delegated hcom lanes are always skipped. The adapter
 reads only the documented stop payload (`cwd`, `session_id`, and
 `stop_hook_active`), closes handoff stdin, and writes `{}` to stdout. It never
 reads a transcript.

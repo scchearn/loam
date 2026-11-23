@@ -11,7 +11,8 @@ import {
 import { catalogEntry, CATALOG } from './integrations/catalog.mjs';
 import { readLedger, resolveRuntimePath } from '../integration/ledger.mjs';
 import { provisionSealTrust } from './seal.mjs';
-import { announce, finish, stepStart, stepDone, stepDetail, confirmAction } from './wizard.mjs';
+import { ingestUpgradeNotice } from './ingest-config.mjs';
+import { announce, finish, summaryNote, stepStart, stepDone, stepDetail, confirmAction } from './wizard.mjs';
 
 // `setup` is the configurator for an EXISTING install: it toggles federation and
 // optional integrations, and selects harnesses. It never installs or updates
@@ -308,6 +309,11 @@ export async function runConfigure(parsed, options = {}) {
     }
 
     if (!ok) return 1;
+    if (!parsed.dryRun) {
+      // setup requires an existing install, so this is always an upgrade path.
+      const ingestNotice = await ingestUpgradeNotice({ earlierInstall: true, env: discovery.env || process.env, home: discovery.home, platform: discovery.platform });
+      if (ingestNotice) summaryNote(output, 'Background ingest', ingestNotice);
+    }
     finish(output, parsed.dryRun ? 'Dry run complete' : '🌱 Loam configured');
     return 0;
   } catch (error) {

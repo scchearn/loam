@@ -55,6 +55,7 @@ Usage:
   npx @scchearn/loam install [--integration <id>]... [--yes] [--dry-run]
   npx @scchearn/loam update [--yes] [--dry-run]
   npx @scchearn/loam setup [--federation enable|disable] [--integration <id>]... [--purge] [--yes] [--dry-run]
+  npx @scchearn/loam ingest enable|disable|status [path] [--json]
   npx @scchearn/loam doctor
   npx @scchearn/loam uninstall [--yes] [--purge]
   npx @scchearn/loam --help
@@ -72,6 +73,11 @@ Commands:
               Refuses with a hint when no install exists; changes nothing else.
   setup       Configure an existing install without touching versions: enable or
               disable federation and optional integrations, and select harnesses.
+  ingest      Opt a workspace in or out of background code ingest (default off), or
+              explain why it is or is not running. enable/disable edit the
+              background_ingest.workspaces list in the config-dir config.json;
+              status [path] prints enabled, enabled_by, config_path, config_error and
+              ignored_entries (--json for machine output). Path defaults to the cwd.
   doctor      Check the global Loam installation without changing it.
   uninstall   Remove global Loam skills, runtime, integration, and hook entries
               (preserves the federation profile; --purge destroys it).

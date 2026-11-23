@@ -6,6 +6,37 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Background code ingest is now opt-in (behaviour change for existing
+  installs).** It no longer starts unless the workspace is listed or ingest is
+  enabled globally, and delegated hcom lanes (`HCOM_LAUNCHED_BY` set and not
+  `user`) are always skipped. Opt in with
+  `npx @scchearn/loam ingest enable [path]`; the list lives in
+  `background_ingest.workspaces` in the config-dir `config.json` and survives
+  uninstall and update. `ingest status` explains why it is or is not running,
+  and setup prints a one-time notice for earlier installs. To restore the old
+  behaviour set `"background_ingest": { "enabled": true }`. Harvest stays on by
+  default.
+
+## [1.1.0]
+
+Plugin 1.1.0 and runtime 1.1.0 ship together.
+
+### Added
+
+- **Background memory writers commit their own writes.** ([#227])
+- **Marker system with a block-id registry and marker lint** in the native
+  runtime. ([#228])
+- **Seals: hash-bound, signed, citable memory sections** in the native
+  runtime. ([#229])
+- **`loam::sealing-memory` skill and router entries** for seals, with a seals
+  reference. ([#232])
+
+### Changed
+
+- **Release 1.1.0 of the plugin and runtime.** ([#231])
+
 ## [1.0.6]
 
 Plugin 1.0.6 ships alone; the runtime stays at 1.0.4.
@@ -246,3 +277,8 @@ Release entries are maintained as part of release work; see
 [#213]: https://github.com/scchearn/loam/pull/213
 [#220]: https://github.com/scchearn/loam/issues/220
 [#221]: https://github.com/scchearn/loam/pull/221
+[#227]: https://github.com/scchearn/loam/pull/227
+[#228]: https://github.com/scchearn/loam/pull/228
+[#229]: https://github.com/scchearn/loam/pull/229
+[#231]: https://github.com/scchearn/loam/pull/231
+[#232]: https://github.com/scchearn/loam/pull/232

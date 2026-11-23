@@ -5,7 +5,7 @@ import { UsageError } from './errors.mjs';
 //   update   — version bump of an existing install, and only that.
 //   setup    — the configurator (federation + integrations + harness selection);
 //              never installs or updates core loam, never touches versions.
-const COMMANDS = new Set(['install', 'update', 'setup', 'doctor', 'uninstall']);
+const COMMANDS = new Set(['install', 'update', 'setup', 'doctor', 'uninstall', 'ingest']);
 
 // Flags each command accepts. Unknown command/flag combinations are a usage error
 // so automation fails loud instead of silently ignoring a misplaced flag.
@@ -15,12 +15,29 @@ const FLAGS_BY_COMMAND = {
   setup: new Set(['--yes', '--dry-run', '--purge']),
   doctor: new Set([]),
   uninstall: new Set(['--yes', '--purge']),
+  ingest: new Set([]),
 };
 
 // setup value flags (configurator): --federation enable|disable, repeatable
 // --integration <id> (enable) and --disable-integration <id>. Parsed positionally
 // as `<flag> <value>`.
 const SETUP_VALUE_FLAGS = new Set(['--federation', '--integration', '--disable-integration']);
+
+const INGEST_ACTIONS = new Set(['enable', 'disable', 'status']);
+
+// `ingest enable|disable|status [path]` — one verb, optional path, --json for status.
+function parseIngest(rest, parsed) {
+  const [action, ...tail] = rest;
+  if (!INGEST_ACTIONS.has(action)) throw new UsageError('ingest needs a subcommand: enable|disable|status');
+  const result = { ...parsed, action, path: null, json: false };
+  for (const arg of tail) {
+    if (arg === '--json' && action === 'status') result.json = true;
+    else if (arg.startsWith('--')) throw new UsageError(`unknown option for ingest ${action}: ${arg}`);
+    else if (result.path !== null) throw new UsageError('ingest takes at most one path');
+    else result.path = arg;
+  }
+  return result;
+}
 
 export function parseArgs(argv) {
   const args = [...argv];
@@ -50,6 +67,7 @@ export function parseArgs(argv) {
   }
 
   const rest = args.slice(1);
+  if (command === 'ingest') return parseIngest(rest, parsed);
   for (let i = 0; i < rest.length; i += 1) {
     const flag = rest[i];
     if (command === 'install' && flag === '--integration') {

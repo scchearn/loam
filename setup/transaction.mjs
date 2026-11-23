@@ -20,6 +20,7 @@ import {
 } from './wizard.mjs';
 import { ensureGlobalSkills, verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
 import { installRuntime } from './runtime.mjs';
+import { ingestUpgradeNotice } from './ingest-config.mjs';
 import { ledgerPath, readLedgerLenient, samePath } from '../integration/ledger.mjs';
 import { detectHarnesses, installHarnesses } from './harnesses.mjs';
 import { installMarketplacePlugins } from './marketplace.mjs';
@@ -144,6 +145,15 @@ export async function executeSetup(parsed, discovery, options = {}) {
     existingMetadata = existing;
     if (Array.isArray(existing.configured_harnesses)) previouslyConfigured = existing.configured_harnesses;
   } catch {}
+  // An earlier install is also evidenced by a runtime ledger alone.
+  // `update` refuses fresh machines, so it always implies an earlier install
+  // (a legacy machine may have no install.json or ledger yet at this point).
+  let earlierInstall = refresh || existingInstall;
+  if (!earlierInstall) {
+    try {
+      earlierInstall = Boolean((await readLedgerLenient({ home: discovery.home, platform: discovery.platform, env: discovery.env || process.env })).ledger);
+    } catch {}
+  }
   const preserveExisting = refresh || existingInstall;
 
   const selection = await selectHarnesses({
@@ -262,6 +272,8 @@ export async function executeSetup(parsed, discovery, options = {}) {
         ? optionalIntegrationSummary(integrationCatalog, integrations.enabled, previouslyEnabledIntegrations)
         : '';
       if (integrationSummary) summaryNote(output, 'Installed', integrationSummary);
+      const ingestNotice = await ingestUpgradeNotice({ earlierInstall, env: discovery.env || process.env, home: discovery.home, platform: discovery.platform });
+      if (ingestNotice) summaryNote(output, 'Background ingest', ingestNotice);
       finish(output, integrations.failed ? '🌱 Loam core is ready' : '🌱 Loam is ready', 'already ready; no replacement or network operation required');
       return integrations.failed ? 1 : 0;
     }
@@ -577,6 +589,8 @@ export async function executeSetup(parsed, discovery, options = {}) {
         : '';
       if (integrationSummary) summary.push('', integrationSummary);
       summaryNote(output, 'Installed', summary.join('\n'));
+      const ingestNotice = await ingestUpgradeNotice({ earlierInstall, env: setupEnv, home: discovery.home, platform: discovery.platform });
+      if (ingestNotice) summaryNote(output, 'Background ingest', ingestNotice);
       const failed = marketplaceFailed || integrations.failed;
       finish(output, failed ? '🌱 Loam core is ready' : '🌱 Loam is ready');
       return failed ? 1 : 0;
