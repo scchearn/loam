@@ -6,6 +6,10 @@ All notable changes to loam are documented here. This file follows
 
 ## [Unreleased]
 
+## [1.1.1]
+
+Plugin 1.1.1 ships alone; the runtime stays at 1.1.0.
+
 ### Changed
 
 - **Background code ingest is now opt-in (behaviour change for existing
@@ -256,7 +260,9 @@ Plugin 1.0.3 and runtime 1.0.2 ship together.
 Release entries are maintained as part of release work; see
 [RELEASING.md](./docs/RELEASING.md).
 
-[Unreleased]: https://github.com/scchearn/loam/compare/v1.0.6...HEAD
+[Unreleased]: https://github.com/scchearn/loam/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/scchearn/loam/releases/tag/v1.1.1
+[1.1.0]: https://github.com/scchearn/loam/releases/tag/v1.1.0
 [1.0.6]: https://github.com/scchearn/loam/releases/tag/v1.0.6
 [1.0.3]: https://github.com/scchearn/loam/releases/tag/v1.0.3
 [1.0.2]: https://github.com/scchearn/loam/releases/tag/v1.0.2
