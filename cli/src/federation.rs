@@ -110,11 +110,68 @@ fn workspace_key(workspace: &std::path::Path) -> Result<String, i32> {
 /// Resolution failure keeps the original required-flag refusal.
 fn resolve_global_root(command: &str, explicit: Option<PathBuf>) -> Result<PathBuf, i32> {
     match explicit {
-        Some(root) => Ok(root),
+        Some(root) => {
+            if command == "connect" {
+                if let Ok(installed) = crate::hooks::installed_global_root() {
+                    if !same_global_root(&root, &installed) {
+                        eprintln!(
+                            "federation connect: --global-root must match the harness-resolved global root"
+                        );
+                        return Err(64);
+                    }
+                }
+            }
+            Ok(root)
+        }
         None => crate::hooks::installed_global_root().map_err(|_| {
             eprintln!("federation {command}: --global-root is required");
             64
         }),
+    }
+}
+
+fn same_global_root(left: &std::path::Path, right: &std::path::Path) -> bool {
+    let normalize = |path: &std::path::Path| {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        };
+        std::fs::canonicalize(&absolute).unwrap_or(absolute)
+    };
+    normalize(left) == normalize(right)
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    #[test]
+    fn connect_refuses_a_global_root_that_diverges_from_harness_root() {
+        let _env = crate::env_lock();
+        let harness_root =
+            std::env::temp_dir().join(format!("loam-connect-harness-root-{}", std::process::id()));
+        let divergent_root = harness_root.with_file_name("loam-connect-divergent-root");
+        std::fs::create_dir_all(&harness_root).expect("harness root");
+        std::fs::create_dir_all(&divergent_root).expect("divergent root");
+
+        let previous = std::env::var("LOAM_HOME").ok();
+        std::env::set_var("LOAM_HOME", &harness_root);
+        let resolved_harness_root = crate::harness::HookPaths::from_env().global_root;
+        let resolved = resolve_global_root("connect", Some(divergent_root));
+        match previous {
+            Some(value) => std::env::set_var("LOAM_HOME", value),
+            None => std::env::remove_var("LOAM_HOME"),
+        }
+
+        assert_eq!(resolved_harness_root, harness_root);
+        assert_eq!(
+            resolved,
+            Err(64),
+            "connect must refuse a root the hook cannot see"
+        );
     }
 }
 
@@ -712,7 +769,10 @@ fn connect(mut args: impl Iterator<Item = String>) -> i32 {
     };
 
     let global_root = match global_root {
-        Some(root) => Some(root),
+        Some(root) => match resolve_global_root("connect", Some(root)) {
+            Ok(root) => Some(root),
+            Err(code) => return code,
+        },
         None if token.is_some() => match crate::hooks::installed_global_root() {
             Ok(root) => Some(root),
             Err(_) => {

@@ -80,6 +80,13 @@ test('install is a distinct command (not an alias) and doctor is supported', () 
     yes: false,
     purge: false,
   });
+  assert.deepEqual(parseArgs(['install', '--integration', 'qmd', '--yes']), {
+    command: 'install',
+    dryRun: false,
+    yes: true,
+    purge: false,
+    integrations: ['qmd'],
+  });
   // Configurator value flags belong to setup only.
   assert.throws(() => parseArgs(['install', '--federation', 'enable']), UsageError);
   assert.throws(() => parseArgs(['update', '--integration', 'qmd']), UsageError);

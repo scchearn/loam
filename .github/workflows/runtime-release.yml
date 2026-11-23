@@ -46,18 +46,24 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          PRERELEASE_FLAG: ${{ contains(github.ref_name, '-') && '--prerelease' || '' }}
         shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#cli-v}"
-          # shellcheck disable=SC2086
+          # Prerelease is decided by the version, not the tag: every runtime tag
+          # carries a hyphen in its `cli-v` prefix, so testing the ref name
+          # marked every stable runtime as a prerelease and left the repo's
+          # "Latest" release pinned to an old one.
+          # The plugin tag owns the repository's "Latest" release; a runtime
+          # release never claims it.
+          prerelease=(--latest=false)
+          [[ "$version" == *-* ]] && prerelease=(--prerelease)
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Loam runtime $version" \
             --generate-notes \
-            $PRERELEASE_FLAG \
+            "${prerelease[@]}" \
             raw-runtimes/*
 
       - name: Verify published runtime resolution

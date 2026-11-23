@@ -1,14 +1,14 @@
 # Federation broker setup
 
 This walkthrough is for an operator starting with a new Linux host and no
-project history. It documents the intended path; production deployment is
-currently blocked by the hard stop below.
+project history. Deploy with the manual render sequence in section 5; the
+automated `acceptance-gate.sh provision` stage is not yet available (see the
+note there).
 
 1. install the host prerequisites and set deployment parameters;
 2. point DNS at the host and obtain the public server certificate;
 3. create the organization's private client CA;
-4. render Mosquitto's TLS configuration and ACL, then start the broker after
-   the current blockers are cleared;
+4. render Mosquitto's TLS configuration and ACL, then start the broker;
 5. install the HTTPS enrollment signer and its password;
 6. connect the first machine with `loam federation connect`;
 7. verify the recorded enrollment without confusing it with live-session health.
@@ -18,13 +18,13 @@ The repository scripts remain the source of truth for provisioning. This page
 explains their order and the checks around them; it does not replace their
 permissions, backups, or host-safety checks.
 
-> **HARD STOP — do not deploy or enable this production broker yet.** The
-> checked-in `deploy/mqtt-broker/acl` is incompatible with the current
-> connector: it lacks grants for project-membership subscriptions, organization
-> member-card subscription/publication, and the agent inbox, and its project
-> wildcards cannot enforce cross-project denial. `loam federation connect` may
-> succeed while the connector loops offline. There is no supported ACL
-> workaround yet. See the [acceptance blockers](../../deploy/mqtt-broker/ACCEPTANCE.md#current-blockers).
+The checked-in `deploy/mqtt-broker/acl` grants every live surface the connector
+needs, proven by [`acl-contract.sh`](../../deploy/mqtt-broker/acl-contract.sh);
+the broker is a dumb pipe scoped to one organization. See the
+[settled trust model](../../deploy/mqtt-broker/ACCEPTANCE.md#trust-model-settled).
+One caveat remains: the automated `acceptance-gate.sh provision` stage is not
+available (template-rendering defect), so deploy with the manual `envsubst`
+sequence in section 5.
 
 ## 1. Host prerequisites
 
@@ -150,10 +150,9 @@ them after sourcing `params.env`; do not copy the unresolved templates to
 The `acceptance-gate.sh provision` stage is currently unavailable/unsafe: its
 live path copies these tracked templates without rendering `${VARS}`. Do not
 run it, even with `LOAM_LIVE_GO=1`. The explicit `envsubst` sequence below is
-reference-only while the hard stop remains; it may be executed only after the
-connector/ACL blockers and the template-rendering defect are cleared. The
-gate's `dryrun` remains the safe off-host check; its `health` stage is limited
-to DNS and public TLS verification.
+the supported render-and-install path until that defect is fixed. The gate's
+`dryrun` remains the safe off-host check; its `health` stage is limited to DNS
+and public TLS verification.
 Do not use `./acceptance-gate.sh rollback` on a pre-existing host: it
 unconditionally disables/removes the broker unit and removes its firewall rule
 and certbot lineage. Use the manual restore below instead.
@@ -688,8 +687,7 @@ the adjacent message/detail usually names the input or stage that needs repair.
 
 ## Final checks
 
-After the hard stop is cleared and before handing the broker to other machines,
-capture:
+Before handing the broker to other machines, capture:
 
 ```sh
 ./acceptance-gate.sh dryrun

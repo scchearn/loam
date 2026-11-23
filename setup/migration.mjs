@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 import { assertPhysicalInside, detectTarget } from '../integration/paths.mjs';
-import { readLedger, runtimeStorePath, writeLedger } from '../integration/ledger.mjs';
+import { readLedgerLenient, runtimeStorePath, writeLedger } from '../integration/ledger.mjs';
 import { loadSkillInventory } from './inventory.mjs';
 import { publishJson } from './atomic.mjs';
 import { configRoot } from './profile.mjs';
@@ -39,7 +39,11 @@ export async function migrateRuntimeLedger({
 } = {}) {
   const config = configRoot({ env, home, platform });
   if (!config) return { migrated: false, reason: 'no_config_dir' };
-  if (await readLedger({ root: config })) return { migrated: false, reason: 'ledger_present' };
+  const { ledger, invalid } = await readLedgerLenient({ root: config });
+  if (ledger) return { migrated: false, reason: 'ledger_present' };
+  // An invalid ledger is not seeded over here: the transaction's own ledger
+  // read ignores it and installRuntime writes the replacement.
+  if (invalid) return { migrated: false, reason: 'ledger_invalid' };
 
   const legacyRoot = resolve(globalRoot);
   const executable = platform === 'win32' ? 'loam.exe' : 'loam';
@@ -135,10 +139,12 @@ export async function migrateEnrollment({
   return { migrated: true, from: legacy, to: destination };
 }
 
-// True when this machine has a runtime `update` can bump: a config-dir ledger,
-// or migratable legacy state (install.json, or a binary under bin/). The
-// verb-dispatch refusal uses this so a legacy machine is upgraded (its ledger
-// is seeded up front in the transaction), not refused as if it were fresh.
+// True when this machine has a runtime `update` can bump: a config-dir ledger
+// (valid or not — an invalid one still means an install exists, and the
+// transaction replaces it), or migratable legacy state (install.json, or a
+// binary under bin/). The verb-dispatch refusal uses this so a legacy machine
+// is upgraded (its ledger is seeded up front in the transaction), not refused
+// as if it were fresh.
 export async function hasMigratableRuntime({
   globalRoot,
   env = process.env,
@@ -148,7 +154,10 @@ export async function hasMigratableRuntime({
   target,
 } = {}) {
   const config = configRoot({ env, home, platform });
-  if (config && await readLedger({ root: config })) return true;
+  if (config) {
+    const { ledger, invalid } = await readLedgerLenient({ root: config });
+    if (ledger || invalid) return true;
+  }
   const legacyRoot = resolve(globalRoot);
   try {
     const install = JSON.parse(await readFile(join(legacyRoot, 'install.json'), 'utf8'));

@@ -4,16 +4,34 @@ import { randomUUID } from 'node:crypto';
 
 import { cleanupStaging, createStagingDirectory, writeAtomicFile, publishJson } from './atomic.mjs';
 import { resolveRuntimeTarget } from './constants.mjs';
-import { confirmSetup, finish, harnessLabel, renderDiscovery, selectHarnesses, stepDetail, stepDone, stepSkip, stepStart, summaryNote } from './wizard.mjs';
+import {
+  confirmSetup,
+  finish,
+  harnessLabel,
+  optionalIntegrationSummary,
+  renderDiscovery,
+  selectHarnesses,
+  selectIntegrations,
+  stepDetail,
+  stepDone,
+  stepSkip,
+  stepStart,
+  summaryNote,
+} from './wizard.mjs';
 import { ensureGlobalSkills, verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
 import { installRuntime } from './runtime.mjs';
-import { ledgerPath, readLedger } from '../integration/ledger.mjs';
+import { ledgerPath, readLedgerLenient, samePath } from '../integration/ledger.mjs';
 import { detectHarnesses, installHarnesses } from './harnesses.mjs';
 import { installMarketplacePlugins } from './marketplace.mjs';
 import { migrateEnrollment, migrateLegacyProject, migrateRuntimeLedger } from './migration.mjs';
 import { removeHarnesses } from './uninstall.mjs';
 import { verifyInstallation } from './verify.mjs';
 import { stageFederationService, federationDefinitionExists } from './federation.mjs';
+import { installShim } from './shim.mjs';
+import { provisionSealTrust } from './seal.mjs';
+import { configureIntegration } from './configure.mjs';
+import { CATALOG } from './integrations/catalog.mjs';
+import { readLedger as readIntegrationLedger } from './integrations/ledger.mjs';
 
 // #97 fix 1 — a destructive rollback decision must name its reason. Turn the
 // per-check breakdown the verifier already computes into one operator-readable
@@ -28,6 +46,10 @@ function verifyFailureDetail(result, discovery) {
     // The runtime check now fails on the config-dir ledger/store: name the
     // category and, when present, the verb that converges it (install/update).
     failed.push(`runtime (${result.runtime.category || 'not ready'}${result.runtime.hint ? `, run ${result.runtime.hint}` : ''})`);
+  }
+  if (result?.shim && !result.shim.ready) {
+    const detail = result.shim.detail ? `: ${result.shim.detail}` : '';
+    failed.push(`launcher (${result.shim.category || 'not ready'}${detail})`);
   }
   for (const [id, harness] of Object.entries(result?.harnesses || {})) {
     if (!harness.ready) failed.push(`harness ${id} (${harness.category || 'not ready'})`);
@@ -81,14 +103,25 @@ async function stageIntegration({ packageRoot, globalRoot, pluginVersion }) {
   return { root: candidateRoot, path: join(candidateRoot, 'loam.mjs') };
 }
 
+async function enableSelectedIntegrations(ids, { discovery, install, parsed, options }) {
+  const enabled = [];
+  for (const id of ids) {
+    const result = await configureIntegration(id, 'enable', { discovery, install, parsed, options });
+    if (result.ok) enabled.push(id);
+  }
+  return { enabled, failed: enabled.length !== ids.length };
+}
+
 export async function executeSetup(parsed, discovery, options = {}) {
   const output = options.output || process.stdout;
   const errorOutput = options.errorOutput || process.stderr;
   const refresh = parsed.command === 'update';
   const yes = parsed.yes || refresh;
+  const integrationCatalog = options.integrationCatalog ?? CATALOG;
   const tilde = (p) => (typeof p === 'string' && p.startsWith(discovery.home) ? `~${p.slice(discovery.home.length)}` : p);
   await renderDiscovery(discovery, output, { action: refresh ? 'Update' : 'Install', dryRun: parsed.dryRun });
   if (parsed.dryRun) {
+    stepSkip(output, 'Would provision seal key through the runtime (dry-run: no call made)');
     finish(output, 'Dry run', 'no files, configuration, downloads, or mutating Skills CLI commands will run');
     return 0;
   }
@@ -104,9 +137,11 @@ export async function executeSetup(parsed, discovery, options = {}) {
   // refreshes an existing one instead of skipping the preservation the `refresh`
   // flag gated.
   let existingInstall = false;
+  let existingMetadata = null;
   try {
     const existing = JSON.parse(await readFile(join(discovery.globalRoot, 'install.json'), 'utf8'));
     existingInstall = true;
+    existingMetadata = existing;
     if (Array.isArray(existing.configured_harnesses)) previouslyConfigured = existing.configured_harnesses;
   } catch {}
   const preserveExisting = refresh || existingInstall;
@@ -124,6 +159,24 @@ export async function executeSetup(parsed, discovery, options = {}) {
     finish(output, 'Setup cancelled');
     return 130;
   }
+  const explicitIntegrations = parsed.command === 'install' && Array.isArray(parsed.integrations)
+    ? [...new Set(parsed.integrations)]
+    : [];
+  const selectedIntegrations = explicitIntegrations.length
+    ? explicitIntegrations
+    : await selectIntegrations({
+        yes,
+        catalog: integrationCatalog,
+        select: options.integrationSelect,
+        input: options.input,
+        output,
+      });
+  if (selectedIntegrations === null) {
+    finish(output, 'Setup cancelled');
+    return 130;
+  }
+  const previousIntegrationLedger = await readIntegrationLedger(discovery.globalRoot);
+  const previouslyEnabledIntegrations = Object.keys(previousIntegrationLedger.integrations || {});
   const selectedSet = new Set(selection.selected);
   const toRemove = selection.toRemove;
   const selectedMarketplaceHarnesses = selection.selected.filter((id) => id === 'claude' || id === 'codex');
@@ -199,8 +252,18 @@ export async function executeSetup(parsed, discovery, options = {}) {
       legacy: migratedLegacy,
     });
     if (alreadyReady.ready && !refresh && toRemove.length === 0) {
-      finish(output, '🌱 Loam is ready', 'already ready; no replacement or network operation required');
-      return 0;
+      const integrations = await enableSelectedIntegrations(selectedIntegrations, {
+        discovery,
+        install: alreadyReady.install,
+        parsed,
+        options,
+      });
+      const integrationSummary = !refresh
+        ? optionalIntegrationSummary(integrationCatalog, integrations.enabled, previouslyEnabledIntegrations)
+        : '';
+      if (integrationSummary) summaryNote(output, 'Installed', integrationSummary);
+      finish(output, integrations.failed ? '🌱 Loam core is ready' : '🌱 Loam is ready', 'already ready; no replacement or network operation required');
+      return integrations.failed ? 1 : 0;
     }
 
     stepStart(output, 'Checking environment');
@@ -209,6 +272,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
     let candidateIntegration;
     let harnessInstall;
     let federationRollback;
+    let shimInstall;
     let activated = false;
     let skillCount;
     let runtime;
@@ -235,15 +299,22 @@ export async function executeSetup(parsed, discovery, options = {}) {
       // never the skills tree. A `channel: pinned` ledger keeps its target on a
       // plain update without LOAM_RUNTIME_VERSION (locked-ref semantics), noted
       // volta-style; the env var moves the pin.
-      priorLedger = await readLedger({ home: discovery.home, platform: discovery.platform });
-      let resolved = resolveRuntimeTarget({ env: process.env });
-      if (priorLedger?.channel === 'pinned' && !process.env.LOAM_RUNTIME_VERSION) {
+      const setupEnv = discovery.env || process.env;
+      // An invalid prior ledger is replaced, not trusted: priorLedger stays null,
+      // so its unvalidated store_path is never reused or deleted, and
+      // installRuntime writes a fresh ledger.
+      const prior = await readLedgerLenient({ home: discovery.home, platform: discovery.platform, env: setupEnv });
+      priorLedger = prior.ledger;
+      if (prior.invalid) stepDetail(output, `ignoring invalid runtime ledger (${prior.invalid}); reinstalling`);
+      let resolved = resolveRuntimeTarget({ env: setupEnv });
+      if (priorLedger?.channel === 'pinned' && !setupEnv.LOAM_RUNTIME_VERSION) {
         resolved = { target: priorLedger.target, channel: 'pinned' };
         stepDetail(output, `runtime pinned at ${resolved.target}; set LOAM_RUNTIME_VERSION to move or release the pin`);
       }
       stepStart(output, `Preparing native runtime v${resolved.target} (${discovery.target})`);
       runtime = await installRuntime({
         home: discovery.home,
+        env: setupEnv,
         version: resolved.target,
         target: discovery.target,
         platform: discovery.platform,
@@ -262,7 +333,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
       }
       // A new store/ledger was staged only when the target differs from the prior
       // ledger's store; a same-version reuse restages nothing to roll back.
-      ledgerStaged = !priorLedger || priorLedger.store_path !== runtime.storePath;
+      ledgerStaged = !priorLedger || !samePath(priorLedger.store_path, runtime.storePath);
       const shortSha = typeof runtime.sha256 === 'string' ? runtime.sha256.slice(0, 12) : '';
       if (runtime.reused) {
         stepDetail(output, `reused verified binary${shortSha ? ` (sha256 ${shortSha}…)` : ''}`);
@@ -345,6 +416,16 @@ export async function executeSetup(parsed, discovery, options = {}) {
       }
       if (marketplaceFailed) errorOutput.write('Marketplace plugin installation is incomplete.\n');
 
+      shimInstall = await installShim({
+        home: discovery.home,
+        globalRoot: discovery.globalRoot,
+        platform: discovery.platform,
+        env: discovery.env || process.env,
+        pathRunner: options.pathRunner,
+        update: refresh,
+        existing: existingMetadata?.shim,
+      });
+
       if (toRemove.length) {
         stepStart(output, 'Removing deselected harnesses');
         await removeHarnesses({
@@ -382,6 +463,7 @@ export async function executeSetup(parsed, discovery, options = {}) {
         integration_path: integrationPath,
         skills_scope: 'global',
         skills_source: 'scchearn/loam',
+        shim: shimInstall.record,
         configured_harnesses: Object.entries(harnesses)
           .filter(([, harness]) => harness.state === 'ready')
           .map(([id]) => id),
@@ -445,28 +527,64 @@ export async function executeSetup(parsed, discovery, options = {}) {
       await publishJson({ filePath: metadataPath, value: install });
       activated = true;
 
+      // Seal key provisioning runs only after the point of no rollback and
+      // outside every rollback path. It delegates to the runtime, never prompts,
+      // and a failure (older runtime without `seal`, no capable ssh-keygen) is a
+      // skipped step that leaves the exit code untouched.
+      if (runtime?.path) {
+        const seal = await provisionSealTrust({
+          runtimePath: runtime.path,
+          cwd: discovery.globalRoot,
+          runner: options.sealRunner,
+        });
+        if (seal.ready) {
+          if (seal.created.length) stepDone(output, `Seal key ready — ${seal.principal}`);
+        } else {
+          stepSkip(output, `Seal key not provisioned (${seal.category}${seal.detail ? `: ${seal.detail}` : ''})`);
+        }
+      }
+
+      // Optional integrations are enabled only after the core install is
+      // committed. Their registrar owns each integration's rollback, while a
+      // failure leaves the verified core install available for retry.
+      const integrations = await enableSelectedIntegrations(selectedIntegrations, {
+        discovery,
+        install,
+        parsed,
+        options,
+      });
+
       // Old-store removal — the LAST commit, best-effort and non-fatal. Both
       // commits (ledger, install.json) are in; now retire only a PRIOR store
       // entry at a different version. A delete that fails (e.g. Windows EBUSY on
       // a running connector binary) leaves a named orphan, never a failed
       // update; the config dir and the current store are never touched.
-      if (priorLedger?.store_path && runtime?.storePath && priorLedger.store_path !== runtime.storePath) {
+      if (priorLedger?.store_path && runtime?.storePath && !samePath(priorLedger.store_path, runtime.storePath)) {
         await rm(dirname(dirname(priorLedger.store_path)), { recursive: true, force: true }).catch(() => {});
       }
 
       const configuredLabels = install.configured_harnesses.map((id) => harnessLabel(id));
-      summaryNote(output, 'Installed', [
+      const summary = [
         `Plugin     v${discovery.packageVersion}`,
         `Runtime    v${resolved.target}  (${discovery.target})`,
         `Skills     ${skillCount ?? '?'} · ${tilde(discovery.skillsRoot)}`,
         `Harnesses  ${configuredLabels.length ? configuredLabels.join(', ') : 'none'}`,
         '',
         'Next: open a coding session and say "set up a wiki" or "plan this work".',
-      ].join('\n'));
-      finish(output, marketplaceFailed ? '🌱 Loam core is ready' : '🌱 Loam is ready');
-      return marketplaceFailed ? 1 : 0;
+      ];
+      const integrationSummary = !refresh
+        ? optionalIntegrationSummary(integrationCatalog, integrations.enabled, previouslyEnabledIntegrations)
+        : '';
+      if (integrationSummary) summary.push('', integrationSummary);
+      summaryNote(output, 'Installed', summary.join('\n'));
+      const failed = marketplaceFailed || integrations.failed;
+      finish(output, failed ? '🌱 Loam core is ready' : '🌱 Loam is ready');
+      return failed ? 1 : 0;
     } finally {
       if (!activated) {
+        try {
+          await shimInstall?.rollback?.();
+        } catch {}
         // #97 — the rollback restores ONLY what this run staged, never a prior
         // ledger or store. A hard crash (finally never runs) instead leaves the
         // ledger ahead of install.json, which readiness reports as runtime_stale
@@ -477,12 +595,12 @@ export async function executeSetup(parsed, discovery, options = {}) {
         // is unchanged (publishJson is atomic), so state stays safe/convergent —
         // a harmless disk leak, not skew. Reclaim it here only if it ever matters.
         if (ledgerStaged) {
-          const file = ledgerPath({ home: discovery.home, platform: discovery.platform });
+          const file = ledgerPath({ home: discovery.home, platform: discovery.platform, env: discovery.env || process.env });
           try {
             if (priorLedger) await writeFile(file, `${JSON.stringify(priorLedger, null, 2)}\n`, { mode: 0o600 });
             else if (file) await rm(file, { force: true });
           } catch {}
-          if (runtime?.storePath && (!priorLedger || priorLedger.store_path !== runtime.storePath)) {
+          if (runtime?.storePath && (!priorLedger || !samePath(priorLedger.store_path, runtime.storePath))) {
             // Remove ONLY this run's <version>/<target> dir. Then drop the
             // <version> parent only when it is now empty — a sibling <target>
             // staged by a prior same-machine LOAM_TARGET run is not ours to

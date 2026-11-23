@@ -3,7 +3,7 @@ name: loam::amending-memory
 description: "Correct or update existing wiki content when newer evidence shows the wiki is wrong, stale, incomplete, or contradicted. Use this when the agent discovers the wiki says X but we now know Y, when code or real-world changes invalidate a wiki claim, or when the user asks to fix or amend the wiki. Not for adding new sources, routine learnings capture, structural normalization, or health checks; use /loam::adding-to-memory, /loam::learning-from-session, /loam::normalizing-memory, or /loam::linting-memory."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.3.1"
+  version: "1.4.0"
   author: scchearn
   argument-hint: <what changed or what needs correcting>
 ---
@@ -44,14 +44,14 @@ If no wiki exists, stop. There is nothing to amend.
 3. If qmd is still not ready: use Grep/Glob to find affected pages.
 4. Runtime guard: if any qmd command fails or returns stale results, treat as degraded — fall back to Grep/Glob.
 
-If qmd is ready, follow the **qmd and code-graph discovery** protocol in `loam::using` (the router) for broadening affected-page discovery — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (search terms for "what changed and why", archive exclusion) if you want it.
+If qmd is ready, follow the discovery protocol in `loam-using/references/discovery.md` for broadening affected-page discovery — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (search terms for "what changed and why", archive exclusion) if you want it.
 
 ### Identify affected pages
 
 1. Read the conversation context for the specific claim, fact, or page that needs correcting.
 2. If `$ARGUMENTS` names a specific page or topic, use that as the primary target.
 3. If `$ARGUMENTS` is descriptive, search `index.md` and use `Grep` to find pages that contain the stale or wrong content.
-4. **If qmd is ready**, follow the qmd search protocol in `loam::using` (search terms: what changed and why — derive 2-4 terms from the evidence) to find all notes likely influenced by the stale or wrong claim.
+4. **If qmd is ready**, follow the qmd search protocol in `loam-using/references/discovery.md` (search terms: what changed and why — derive 2-4 terms from the evidence) to find all notes likely influenced by the stale or wrong claim.
 5. Read each candidate page to confirm it actually contains the issue before changing it.
 6. If qmd results are noisy or irrelevant, ignore them and rely on Grep and Glob.
 
@@ -112,6 +112,8 @@ Never archive material that failed the admission rubric and was never durable.
 **Handle completion**: Add missing content in the appropriate section. Link to new or existing pages. Do not rewrite the entire page.
 
 **Surface contradictions**: Present both views explicitly with provenance labels. Add an open question if not resolvable.
+
+**Sealed spans**: an edit inside a `<!-- loam:seal … -->` span drifts its seal, so resolve it in the same change and log it (details: `loam-using/references/seals.md`). Using the injected `<native-runtime-command>`: re-seal with `seal attest … --parent <old-id>`; carry with `seal carry <id>` for a tracked link-retarget only; or `seal mark <id> demote|retract --reason …`. If the edit contradicts an `audited` or `canonical` seal, write a `dispute` (`seal mark <id> dispute --reason …`) plus an open-question record instead of overwriting silently. Never hand-edit markers or `wiki/.seals/`.
 
 **Update related pages**: Pages that link to the amended page. Entity, topic, or concept pages that reference superseded info. `index.md` if descriptions changed. Do not over-propagate — only touch pages materially affected.
 

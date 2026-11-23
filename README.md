@@ -251,7 +251,7 @@ not the whole Loam config directory.
 
 ## Workflow skills
 
-21 skills, grouped by what they're for:
+22 skills, grouped by what they're for:
 
 You can ask for an outcome in ordinary language; the Using skill routes the
 request to the matching workflow:
@@ -261,15 +261,24 @@ request to the matching workflow:
 - **Goals and decisions:** define a measurable goal or run a structured debate
   before choosing an approach.
 - **Project memory:** add a source, ask what the memory says, correct stale
-  knowledge, normalize or lint a notes corpus, review open questions, and
-  capture useful session learnings.
+  knowledge, normalize or lint a notes corpus, review open questions,
+  capture useful session learnings, and seal a verified claim so it can be
+  cited.
 - **Code understanding:** ingest a codebase into the memory graph and reconcile
   that graph after planned changes.
 - **Setup:** scaffold a wiki or initialize an Obsidian vault.
 
 Background memory maintenance is enabled by default. To opt out, set
 `LOAM_HARVEST_BACKGROUND=0` or set `background_harvest.enabled: false` in
-Loam's `config.json` under the platform configuration directory.
+`config.json` (`~/.agents/loam/config.json`, or under `$LOAM_HOME`).
+
+The background workers commit only the memory paths they wrote, in place on
+your current branch, as `loam(harvest): ...` or `loam(ingest): ...`. They never
+commit source files and never push. If git hooks or commit signing are
+configured, or HEAD is detached, no identity is set, or the repo is mid-merge,
+they skip the commit rather than bypass anything, and record
+`commit_skipped:<reason>` in the status output. Opt out of memory commits with
+`memory_commits.enabled: false` in `config.json` or `LOAM_MEMORY_COMMITS=0`.
 
 ## Skill metrics
 
@@ -284,26 +293,27 @@ the skill runs. The table below shows how much space each skill uses against the
 | Skill | Desc chars (max 1,024) | Desc tokens (~100) | Body lines (max 500) | Body tokens (< 5,000) |
 |-------|---:|---:|---:|---:|
 | loam::initializing-vault | 206 | 51 | 9 | 73 |
-| loam::scaffolding-wiki | 445 | 90 | 198 | 2,196 |
-| loam::adding-to-memory | 592 | 116 | 217 | 2,311 |
-| loam::amending-memory | 505 | 114 | 180 | 1,961 |
-| loam::auditing-guidance | 410 | 85 | 252 | 2,528 |
+| loam::scaffolding-wiki | 445 | 90 | 207 | 2,400 |
+| loam::adding-to-memory | 592 | 116 | 218 | 2,362 |
+| loam::amending-memory | 505 | 114 | 182 | 2,122 |
+| loam::auditing-guidance | 410 | 85 | 304 | 3,256 |
 | loam::ingesting-codebase | 329 | 76 | 288 | 3,660 |
-| loam::learning-from-session | 487 | 101 | 365 | 4,212 |
-| loam::linting-memory | 471 | 102 | 312 | 4,980 |
-| loam::normalizing-memory | 457 | 101 | 261 | 2,665 |
-| loam::querying-memory | 530 | 105 | 175 | 1,596 |
-| loam::reviewing-memory | 510 | 113 | 137 | 1,787 |
+| loam::learning-from-session | 487 | 101 | 366 | 4,249 |
+| loam::linting-memory | 471 | 102 | 303 | 4,961 |
+| loam::normalizing-memory | 457 | 101 | 262 | 2,712 |
+| loam::querying-memory | 530 | 105 | 208 | 2,078 |
+| loam::reviewing-memory | 510 | 113 | 137 | 1,799 |
+| loam::sealing-memory | 518 | 125 | 87 | 1,521 |
 | loam::syncing-code-graph | 363 | 84 | 223 | 2,780 |
-| loam::using | 368 | 77 | 252 | 4,187 |
+| loam::using | 368 | 77 | 75 | 1,750 |
 | loam::amending-plan | 437 | 88 | 273 | 3,059 |
-| loam::checkpointing | 365 | 69 | 177 | 2,091 |
+| loam::checkpointing | 365 | 69 | 177 | 2,094 |
 | loam::configuring-agents | 459 | 91 | 225 | 3,237 |
-| loam::planning | 327 | 62 | 323 | 4,314 |
-| loam::resuming | 376 | 77 | 142 | 1,847 |
-| loam::setting-goals | 473 | 101 | 184 | 1,883 |
-| loam::starting | 166 | 34 | 356 | 4,985 |
-| loam::writing-spec | 332 | 66 | 253 | 3,002 |
+| loam::planning | 327 | 62 | 325 | 4,347 |
+| loam::resuming | 376 | 77 | 144 | 1,903 |
+| loam::setting-goals | 473 | 101 | 186 | 1,921 |
+| loam::starting | 166 | 34 | 356 | 4,989 |
+| loam::writing-spec | 332 | 66 | 261 | 3,323 |
 <!-- END skill-metrics -->
 
 ## Documentation

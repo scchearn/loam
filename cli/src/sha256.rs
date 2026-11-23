@@ -141,6 +141,13 @@ impl Sha256 {
     }
 }
 
+/// Lowercase hex SHA-256 of an in-memory byte slice.
+pub fn hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::default();
+    hasher.update(data);
+    hasher.finish()
+}
+
 /// Empty string on any read error, matching the previous `sha256sum` shell-out
 /// behaviour: an unreadable file is treated as "no usable hash", never a match.
 pub fn file_hex(path: &Path) -> String {

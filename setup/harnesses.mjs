@@ -104,6 +104,19 @@ async function codexMarketplaceInstall(root, name, pluginVersion) {
   return { installed: true, ready, pluginRoot: readyIndex >= 0 ? join(pluginRoot, candidates[readyIndex].name) : null };
 }
 
+async function claudeMarketplaceRegistered(root) {
+  try {
+    const config = JSON.parse(await readFile(join(root, 'plugins', 'known_marketplaces.json'), 'utf8'));
+    return Boolean(config && typeof config === 'object' && !Array.isArray(config) && Object.hasOwn(config, 'loam'));
+  } catch {
+    return false;
+  }
+}
+
+function codexMarketplaceRegistered(config) {
+  return config.split(/\r?\n/).some((line) => /^\s*\[marketplaces\.loam\]\s*(?:#.*)?$/.test(line));
+}
+
 export async function detectHarnesses({ home = homedir(), pluginVersion } = {}) {
   const roots = {
     opencode: join(home, '.config', 'opencode'),
@@ -119,10 +132,12 @@ export async function detectHarnesses({ home = homedir(), pluginVersion } = {}) 
     let marketplaceInstalled = false;
     let marketplaceReady = false;
     let marketplaceRoot = null;
+    let marketplaceRegistered = false;
     if (state === 'detected' && id === 'claude') {
       const install = await claudeMarketplaceInstall(root, 'loam@loam', pluginVersion);
       marketplaceInstalled = install.installed;
       marketplaceRoot = install.pluginRoot;
+      marketplaceRegistered = await claudeMarketplaceRegistered(root);
       try {
         const settings = JSON.parse(await readFile(join(root, 'settings.json'), 'utf8'));
         marketplaceConfigured = Object.hasOwn(settings.enabledPlugins || {}, 'loam@loam');
@@ -137,6 +152,7 @@ export async function detectHarnesses({ home = homedir(), pluginVersion } = {}) 
       marketplaceRoot = install.pluginRoot;
       try {
         const config = await readFile(join(root, 'config.toml'), 'utf8');
+        marketplaceRegistered = codexMarketplaceRegistered(config);
         let loamPlugin = '';
         // ponytail: parse the table form Codex writes; unsupported TOML forms fail closed to setup ownership.
         for (const line of config.split(/\r?\n/)) {
@@ -157,7 +173,7 @@ export async function detectHarnesses({ home = homedir(), pluginVersion } = {}) 
         marketplaceOwned = false;
       }
     }
-    result[id] = { id, root, state, marketplaceOwned, marketplaceConfigured, marketplaceInstalled, marketplaceReady, marketplaceRoot };
+    result[id] = { id, root, state, marketplaceOwned, marketplaceConfigured, marketplaceInstalled, marketplaceReady, marketplaceRoot, marketplaceRegistered };
   }
   return result;
 }
@@ -199,6 +215,16 @@ export function nativeHookEntry(runtimePath, harness, event, { timeout } = {}) {
 }
 
 const RUNTIME_EXECUTABLES = new Set(['loam', 'loam.exe']);
+
+function comparablePath(value) {
+  const resolved = resolve(value);
+  return process.platform === 'win32' ? resolved.replaceAll('\\', '/').toLowerCase() : resolved;
+}
+
+function pathInside(root, candidate) {
+  const relativePath = relative(comparablePath(root), comparablePath(candidate));
+  return Boolean(relativePath) && !relativePath.startsWith('..') && !isAbsolute(relativePath);
+}
 
 // The runtime path inside one of our native hook commands, in either form:
 // the current `"<runtime>" hook <harness> --event <event>` string, or the
@@ -276,8 +302,7 @@ export function isOwnedNativeHook(item, globalRoot) {
   const runtimePath = nativeHookRuntimePath(item);
   if (!runtimePath) return false;
   const resolved = resolve(runtimePath);
-  const relativePath = relative(resolve(globalRoot), resolved);
-  if (Boolean(relativePath) && !relativePath.startsWith('..') && !isAbsolute(relativePath)) return true;
+  if (pathInside(globalRoot, resolved)) return true;
   // The staged runtime lives in the config-dir runtime store, not under the
   // global root, and that store is versioned:
   // `<config>/runtime/<version>/<target>/loam`. Recognizing ownership by the
@@ -302,8 +327,7 @@ export function isOwnedCommand(item, globalRoot, assetName) {
   if (typeof commandPath !== 'string') return false;
   const pluginRoot = resolve(globalRoot, 'plugins');
   const candidate = resolve(commandPath);
-  const relativePath = relative(pluginRoot, candidate);
-  return relativePath && !relativePath.startsWith('..') && !isAbsolute(relativePath) && basename(candidate) === assetName;
+  return pathInside(pluginRoot, candidate) && basename(candidate) === assetName;
 }
 
 function mergeClaudeHooks(existing, entry, globalRoot, assetName = 'claude-session-start.mjs') {

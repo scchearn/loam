@@ -64,6 +64,7 @@ runtime_docs=(
   "skills/loam-memory/loam-querying-memory/SKILL.md"
   "skills/loam-memory/loam-learning-from-session/SKILL.md"
   "skills/loam-memory/loam-linting-memory/SKILL.md"
+  "skills/loam-memory/loam-sealing-memory/SKILL.md"
   "skills/loam-memory/loam-ingesting-codebase/SKILL.md"
   "skills/loam-memory/loam-syncing-code-graph/SKILL.md"
   "skills/loam-work/loam-resuming/SKILL.md"
@@ -236,6 +237,39 @@ if [ ! -f "$lint_hub_reference" ]; then
 elif ! grep -Fq 'Do not add individual code pages to root `index.md`.' "$lint_hub_reference"; then
   fail "memory lint code-hub reference must forbid direct root entries"
 fi
+
+seals_ref="skills/loam-using/references/seals.md"
+if [ ! -f "$seals_ref" ]; then
+  fail "seals single-definition reference is missing: $seals_ref"
+else
+  grep -Fq 'does not mean' "$seals_ref" || fail "seals reference must say what a seal does not mean"
+  grep -Fq "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <Skill root>/scripts/seal-canon.ps1" "$seals_ref" \
+    || fail "seals reference must pin the PowerShell floor form"
+fi
+router="skills/loam-using/SKILL.md"
+grep -Fq 'Cite sealed text only when `seal verify`/state reports `citable`; everything else is provisional.' "$router" \
+  || fail "router must carry the cite-only-citable non-negotiable"
+grep -Fq 'Never hand-edit seal markers or `wiki/.seals/`; editing sealed text is allowed and breaks the seal' "$router" \
+  || fail "router must carry the no-hand-edit-seals non-negotiable"
+grep -Fq 'make a verified claim citable → `sealing-memory`' "$router" \
+  || fail "router must route citable claims to sealing-memory"
+grep -Fq 'seals_attention' skills/loam-using/references/runtime.md \
+  || fail "runtime reference must register the seals_attention hint"
+amending="skills/loam-memory/loam-amending-memory/SKILL.md"
+grep -Fq -- '--parent' "$amending" || fail "amending-memory must name re-seal with --parent"
+grep -Fq 'dispute' "$amending" || fail "amending-memory must write a dispute instead of overwriting a contradicted seal"
+for seal_skill in \
+  skills/loam-memory/loam-adding-to-memory \
+  skills/loam-memory/loam-linting-memory \
+  skills/loam-memory/loam-learning-from-session \
+  skills/loam-memory/loam-querying-memory \
+  skills/loam-memory/loam-normalizing-memory \
+  skills/loam-work/loam-resuming \
+  skills/loam-work/loam-setting-goals \
+  skills/loam-work/loam-planning; do
+  grep -Eq 'seals\.md|sealing-memory' "$seal_skill/SKILL.md" \
+    || fail "$seal_skill must point at seals.md or sealing-memory"
+done
 
 if [ "$failures" -ne 0 ]; then
   exit 1

@@ -10,7 +10,7 @@ const COMMANDS = new Set(['install', 'update', 'setup', 'doctor', 'uninstall']);
 // Flags each command accepts. Unknown command/flag combinations are a usage error
 // so automation fails loud instead of silently ignoring a misplaced flag.
 const FLAGS_BY_COMMAND = {
-  install: new Set(['--yes', '--dry-run']),
+  install: new Set(['--yes', '--dry-run', '--integration']),
   update: new Set(['--yes', '--dry-run']),
   setup: new Set(['--yes', '--dry-run', '--purge']),
   doctor: new Set([]),
@@ -52,6 +52,14 @@ export function parseArgs(argv) {
   const rest = args.slice(1);
   for (let i = 0; i < rest.length; i += 1) {
     const flag = rest[i];
+    if (command === 'install' && flag === '--integration') {
+      const value = rest[i + 1];
+      if (value === undefined || value.startsWith('--')) throw new UsageError(`${flag} needs a value`);
+      i += 1;
+      if (!parsed.integrations) parsed.integrations = [];
+      parsed.integrations.push(value);
+      continue;
+    }
     if (command === 'setup' && SETUP_VALUE_FLAGS.has(flag)) {
       const value = rest[i + 1];
       if (value === undefined || value.startsWith('--')) {

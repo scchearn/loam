@@ -1,3 +1,5 @@
+use crate::lint::Severity;
+use crate::markers;
 use pulldown_cmark::{BrokenLink, Event, LinkType, Options, Parser, Tag, TagEnd};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -30,6 +32,7 @@ struct ParsedDocument {
     definitions: Vec<Definition>,
     wikilinks: Vec<Wikilink>,
     fragments: HashSet<String>,
+    markers: markers::Scan,
 }
 
 struct Heading {
@@ -78,6 +81,7 @@ pub struct Diagnostic {
     pub end_column: usize,
     pub rule: &'static str,
     pub rule_name: &'static str,
+    pub severity: Severity,
     pub description: &'static str,
     pub detail: String,
     pub context: String,
@@ -89,48 +93,88 @@ pub struct Diagnostic {
 struct RuleSpec {
     code: &'static str,
     name: &'static str,
+    severity: Severity,
     description: &'static str,
 }
 
 const RULE_MD024: RuleSpec = RuleSpec {
     code: "MD024",
     name: "no-duplicate-heading",
+    severity: Severity::Error,
     description: "Multiple headings with the same content",
 };
 const RULE_MD042: RuleSpec = RuleSpec {
     code: "MD042",
     name: "no-empty-links",
+    severity: Severity::Error,
     description: "No empty links",
 };
 const RULE_MD051: RuleSpec = RuleSpec {
     code: "MD051",
     name: "link-fragments",
+    severity: Severity::Error,
     description: "Link fragments should be valid",
 };
 const RULE_MD052: RuleSpec = RuleSpec {
     code: "MD052",
     name: "reference-links-images",
+    severity: Severity::Error,
     description: "Reference links and images should use a label that is defined",
 };
 const RULE_LMD001: RuleSpec = RuleSpec {
     code: "LMD001",
     name: "missing-document",
+    severity: Severity::Error,
     description: "Internal document reference does not resolve",
 };
 const RULE_LMD002: RuleSpec = RuleSpec {
     code: "LMD002",
     name: "ambiguous-document",
+    severity: Severity::Error,
     description: "Wikilink resolves to multiple documents",
 };
 const RULE_LMD003: RuleSpec = RuleSpec {
     code: "LMD003",
     name: "missing-cross-document-anchor",
+    severity: Severity::Error,
     description: "Cross-document anchor target does not exist",
 };
 const RULE_LMD004: RuleSpec = RuleSpec {
     code: "LMD004",
     name: "ambiguous-heading",
+    severity: Severity::Error,
     description: "Wikilink heading target is ambiguous",
+};
+
+const RULE_MRK001: RuleSpec = RuleSpec {
+    code: "MRK001",
+    name: "marker-unbalanced",
+    severity: Severity::Error,
+    description: "Marker is unbalanced or malformed",
+};
+const RULE_MRK002: RuleSpec = RuleSpec {
+    code: "MRK002",
+    name: "marker-nesting",
+    severity: Severity::Error,
+    description: "Marker nesting is not allowed",
+};
+const RULE_MRK003: RuleSpec = RuleSpec {
+    code: "MRK003",
+    name: "duplicate-anchor",
+    severity: Severity::Error,
+    description: "Marker anchor is duplicated on this page",
+};
+const RULE_MRK010: RuleSpec = RuleSpec {
+    code: "MRK010",
+    name: "class-reserved",
+    severity: Severity::Info,
+    description: "class marker recognised; classification not enforced (reserved)",
+};
+const RULE_SEL001: RuleSpec = RuleSpec {
+    code: "SEL001",
+    name: "seal-opener-tokens",
+    severity: Severity::Error,
+    description: "Seal opener carries tokens after the id",
 };
 
 pub fn lint_workspace(workspace: &Path) -> Result<Vec<Diagnostic>, String> {
@@ -146,6 +190,34 @@ pub fn lint_workspace(workspace: &Path) -> Result<Vec<Diagnostic>, String> {
     let mut diagnostics = Vec::new();
     for document in &index.documents {
         lint_document(&index, document, &mut diagnostics);
+    }
+    // One MRK010 per run, at the first well-formed class span in sorted path
+    // order (documents are indexed in sorted order, but sort defensively).
+    let first_class = index
+        .documents
+        .iter()
+        .filter_map(|document| {
+            document
+                .parsed
+                .markers
+                .markers
+                .iter()
+                .find(|marker| marker.kind == markers::Kind::Class)
+                .map(|marker| (document, marker))
+        })
+        .min_by(|left, right| left.0.workspace_relative.cmp(&right.0.workspace_relative));
+    if let Some((document, marker)) = first_class {
+        diagnostics.push(diagnostic(
+            document,
+            marker.opener.clone(),
+            RULE_MRK010,
+            format!(
+                "Class marker `{}` found; classification is not enforced yet",
+                marker.id
+            ),
+            Some(marker.id.clone()),
+            Vec::new(),
+        ));
     }
     Ok(diagnostics)
 }
@@ -297,17 +369,36 @@ fn walk_root(
     Ok(())
 }
 
-fn parse_document(source: &str) -> ParsedDocument {
-    let options = Options::ENABLE_GFM
+fn parser_options() -> Options {
+    Options::ENABLE_GFM
         | Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_HEADING_ATTRIBUTES
-        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+}
+
+/// Byte ranges of code blocks (fenced or indented) and front-matter metadata
+/// blocks, parsed with the same options as `parse_document`.
+pub(crate) fn excluded_ranges(source: &str) -> Vec<Range<usize>> {
+    Parser::new_with_broken_link_callback(
+        source,
+        parser_options(),
+        Some(|_: BrokenLink<'_>| Some(("".into(), "".into()))),
+    )
+    .into_offset_iter()
+    .filter_map(|(event, range)| match event {
+        Event::Start(Tag::CodeBlock(_)) | Event::Start(Tag::MetadataBlock(_)) => Some(range),
+        _ => None,
+    })
+    .collect()
+}
+
+fn parse_document(source: &str) -> ParsedDocument {
     let mut parser = Parser::new_with_broken_link_callback(
         source,
-        options,
+        parser_options(),
         Some(|_: BrokenLink<'_>| Some(("".into(), "".into()))),
     )
     .into_offset_iter();
@@ -446,6 +537,10 @@ fn parse_document(source: &str) -> ParsedDocument {
     for anchor in html_anchors {
         fragments.insert(anchor);
     }
+    let markers = markers::scan(source);
+    for id in markers.anchors.keys() {
+        fragments.insert(format!("#^{id}"));
+    }
 
     ParsedDocument {
         headings,
@@ -453,6 +548,7 @@ fn parse_document(source: &str) -> ParsedDocument {
         definitions,
         wikilinks,
         fragments,
+        markers,
     }
 }
 
@@ -515,6 +611,23 @@ fn lint_document(index: &WorkspaceIndex, document: &Document, diagnostics: &mut 
                 diagnostics,
             );
         }
+    }
+
+    for problem in &document.parsed.markers.problems {
+        let rule = match problem.code {
+            markers::ProblemCode::Mrk001 => RULE_MRK001,
+            markers::ProblemCode::Mrk002 => RULE_MRK002,
+            markers::ProblemCode::Mrk003 => RULE_MRK003,
+            markers::ProblemCode::Sel001 => RULE_SEL001,
+        };
+        diagnostics.push(diagnostic(
+            document,
+            problem.range.clone(),
+            rule,
+            problem.message.clone(),
+            None,
+            Vec::new(),
+        ));
     }
 
     for definition in &document.parsed.definitions {
@@ -734,6 +847,19 @@ fn lint_wikilink(
         return;
     };
     let heading = heading.trim();
+    if let Some(id) = heading.strip_prefix('^') {
+        if !target_document.parsed.markers.anchors.contains_key(id) {
+            diagnostics.push(diagnostic(
+                document,
+                wikilink.range.clone(),
+                RULE_LMD003,
+                format!("Block id \"^{id}\" does not exist in \"{target}\""),
+                Some(format!("{target}#{heading}")),
+                Vec::new(),
+            ));
+        }
+        return;
+    }
     let heading_matches = target_document
         .parsed
         .headings
@@ -1543,6 +1669,7 @@ fn diagnostic(
         end_column,
         rule: rule.code,
         rule_name: rule.name,
+        severity: rule.severity,
         description: rule.description,
         detail,
         context: document.lines.context(&document.source, start),

@@ -71,6 +71,24 @@ goal: # optional: goals/<slug>.md provenance; omit when not goal-backed
 
 - <Constraint or none>
 
+## Quality anchor
+
+<!-- External reference that defines "good" for judged work: reference implementation, gold outputs, screenshot set, style reference — and how a judge compares against it. Required for judged-oracle specs. Use `none` for hard-oracle or trivial specs. -->
+
+- <reference and comparison method, or none>
+
+## Verification oracle
+
+<!-- How done-ness is established beyond unit tests. Required for judged-oracle specs. Use `none` for hard-oracle or trivial specs. -->
+
+- Oracle type: judged | hard
+- Evidence contract: <artifact that proves done, e.g. harness screenshots at N presets plus console/perf log, or none>
+- Judge: <agent/tool/person that scores evidence; must not be the producer>
+- Pass threshold: <e.g. ≥8.5/10 with zero errors>
+- Convergence: <stop condition, e.g. all modules pass, then blind A/B vs anchor>
+- Retry budget: <rounds per unit before escalation, and what happens on exhaustion>
+- Harness in scope: <what must be built before the judged work, or none>
+
 ## Acceptance criteria
 
 <!-- Summary checkboxes derived from Scenarios. For behavior-changing specs, each criterion MUST trace to one or more scenarios. Do not introduce behavior absent from Scenarios. EARS-style phrasing (WHEN...THE SYSTEM SHALL...) is acceptable for conditional behavior. -->
@@ -113,6 +131,8 @@ goal: # optional: goals/<slug>.md provenance; omit when not goal-backed
 | Integrations | pass / n/a / gap-non-blocking / gap-blocking | |
 | Operations / rollout | pass / n/a / gap-non-blocking / gap-blocking | |
 | Verification | pass / n/a / gap-non-blocking / gap-blocking | |
+| Quality anchor | pass / n/a / gap-non-blocking / gap-blocking | |
+| Convergence / retry economics | pass / n/a / gap-non-blocking / gap-blocking | |
 | Planning inputs | pass / n/a / gap-non-blocking / gap-blocking | |
 | Open questions | pass / gap-non-blocking / gap-blocking | |
 
@@ -126,4 +146,4 @@ goal: # optional: goals/<slug>.md provenance; omit when not goal-backed
 
 ## Minimal spec guidance
 
-For trivial changes, `## Problem`, `## Acceptance criteria`, and `## Decision` are the only mandatory body sections with substantive content. For behavior-changing changes, `## Clarifications` (or `none`), `## Scenarios`, and `## Completeness checklist` are also required. Other sections may contain `none`, but keeping the headings makes loam::planning parsing reliable.
+For trivial changes, `## Problem`, `## Acceptance criteria`, and `## Decision` are the only mandatory body sections with substantive content. For behavior-changing changes, `## Clarifications` (or `none`), `## Scenarios`, and `## Completeness checklist` are also required. For judged-oracle specs, `## Quality anchor` and `## Verification oracle` are additionally required (never `none`). Other sections may contain `none`, but keeping the headings makes loam::planning parsing reliable.

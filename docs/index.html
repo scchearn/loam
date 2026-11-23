@@ -728,7 +728,7 @@
       </div>
       <figcaption><b>Fail-closed by default.</b> Three gates decide whether a background helper even starts: an on/off flag (<code>LOAM_HARVEST_BACKGROUND</code> / <code>LOAM_INGEST_BACKGROUND</code>), a guard so a worker can't spawn a worker, and a debounce. Only then does it reach for the lease. Uncertain process identity, a live lease, or any race makes it skip rather than risk a double write.</figcaption>
     </figure>
-    <p class="prose" style="color:var(--ink-faint);font-size:.92rem">The harvester only fires when enough <em>new</em> conversation has accumulated since last time; it measures the transcript's growth and skips below a threshold. The ingestor only fires when the code graph reports files pending. Neither ever changes your source, commits, or pushes. On Codex, which can't spawn detached children, the same logic instead instructs Codex to run its own subagent, one brain, adapted per harness again.</p>
+    <p class="prose" style="color:var(--ink-faint);font-size:.92rem">The harvester only fires when enough <em>new</em> conversation has accumulated since last time; it measures the transcript's growth and skips below a threshold. The ingestor only fires when the code graph reports files pending. Neither ever changes your source or pushes; each commits only its own memory writes, in place, and skips the commit when hooks or signing are configured (opt out with <code>LOAM_MEMORY_COMMITS=0</code>). On Codex, which can't spawn detached children, the same logic instead instructs Codex to run its own subagent, one brain, adapted per harness again.</p>
   </div>
 </section>
 

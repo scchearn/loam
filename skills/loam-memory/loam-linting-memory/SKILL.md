@@ -3,7 +3,7 @@ name: loam::linting-memory
 description: "Run a health check on existing memory (the wiki substrate) and goal artifacts. Use this when the user wants to lint the wiki, health-check the knowledge base, find orphan pages, spot broken or missing cross-links, clean up stale claims and unresolved wikilinks with safe local fixes, consolidate a legacy root `overview.md` into `index.md`, or health-check goal artifacts. Not for adding new material; use /loam::adding-to-memory or /loam::learning-from-session for that."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.11.1"
+  version: "1.12.0"
   author: scchearn
   argument-hint: [wiki root, goal path, or focus area]
 ---
@@ -52,9 +52,9 @@ If `exists` is false, check whether `goals/` exists (`ls goals/*.md 2>/dev/null`
 
 If the target was a single `goals/<slug>.md` path, skip all wiki-only steps and run only the goal-health pass for that file.
 
-If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. Use `wiki_root` as the resolved wiki root (resolved from on-disk contract files, not qmd metadata). If `has_overview` is true, note it as a legacy root-hub file to fold into `index.md`. Then resolve the lint scope: if the user named a wiki root, subdirectory, topic, or entity, use that. If no scope given, lint the whole wiki.
+If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam install`; do not fabricate state or use a project-local fallback. Use `wiki_root` as the resolved wiki root (resolved from on-disk contract files, not qmd metadata). If `has_overview` is true, note it as a legacy root-hub file to fold into `index.md`. Then resolve the lint scope: if the user named a wiki root, subdirectory, topic, or entity, use that. If no scope given, lint the whole wiki.
 
-This skill satisfies the `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, and `legacy_structure_pending` hints (see the hint contract in `loam::using`); treat them as advisory scope, not extra mandatory work. Fast state omits date drift, which the lint pass checks directly later.
+This skill satisfies the `memory_lint_stale`, `date_drift_pending`, `log_rotation_due`, `legacy_structure_pending`, and `seals_attention` hints (see the hint contract in `loam-using/references/runtime.md`); treat them as advisory scope, not extra mandatory work. Fast state omits date drift, which the lint pass checks directly later.
 
 ### Read the wiki contract
 
@@ -85,11 +85,14 @@ reading pages, so manual review is spent on judgement rather than link chasing:
 
 Each line is one JSON finding with `rule`, `file`, `line`, `description`,
 `target`, and `candidates`. Exit 0 is clean, 2 means findings, 1 means bad
-arguments or an unreadable input. `--only markdown|memory|work` narrows the
-scan. The command is read-only and never fixes anything.
+arguments or an unreadable input. `--only guidance|markdown|memory|seals|work` narrows
+the scan. The command is read-only except for `--fix`, which regenerates only
+the `AGENTS.md` memory-map region (see K below).
+
+Seals: run `<native-runtime-command> lint --only seals "$WORKSPACE_ROOT"` (satisfies `seals_attention`; see `loam-using/references/seals.md`). Report findings only: never re-hash or edit a seal record.
 
 If it exits 75 or 78 the native runtime is not ready — stop and report
-`npx @scchearn/loam setup`. Do not claim a clean result from a fallback check.
+`npx @scchearn/loam install`. Do not claim a clean result from a fallback check.
 The linter reports; **you** classify findings and apply safe fixes directly,
 recording each in `log.md`. Memory writes are agent-owned — the log entry is
 the audit trail, not a human gate. Never report a mechanical, reversible fix
@@ -128,11 +131,13 @@ Keep structural checks Glob/Grep-led and follow the qmd search protocol in
 
 **I. Stranded code pages in `entities/`** — Check whether `entities/` contains pages with `source_path:` front matter. These are code-graph pages that belong in `code/`, not `entities/`. Prose entity pages never carry `source_path:`. See Step 2 for the migration procedure.
 
-**J. Legacy code identity fields** — Check code-graph pages under `code/` and legacy `entities/` pages with `source_path:` front matter for missing `source_size:`, `content_hash:`, `content_id:`, `source_state:`, or `generator_version:`. Native rule `MEM008` retains the `legacy-hash-fields` alias for compatibility and reports these omissions as informational. Do not require `blob_oid:` or `source_commit:` because non-Git and provisional files legitimately lack Git provenance. Do not backfill during lint; run `/loam::ingesting-codebase <codebase root>` until the incremental migration is complete. Updating Loam itself never mutates a project's wiki.
+**J. Legacy code identity fields** — Check `code/` pages and legacy `entities/` pages carrying `source_path:` for missing `source_size:`, `content_hash:`, `content_id:`, `source_state:`, or `generator_version:` (`MEM008` / `legacy-hash-fields`, informational). `blob_oid:` and `source_commit:` stay optional — non-Git and provisional files legitimately lack Git provenance. Do not backfill during lint; migrate incrementally with `/loam::ingesting-codebase <codebase root>`.
+
+**K. Guidance memory map** — Three warn-level `guidance` diagnostics against root `AGENTS.md`, silent without a wiki: `guidance-map-missing`, `guidance-map-stale`, `guidance-claude-shim`. See [references/lint-checklist.md](references/lint-checklist.md) "Guidance memory map" for the checks and the fix route.
 
 Distinguish: **fix now** (safe from existing wiki evidence) vs **annotate now** (mark but don't resolve) vs **follow-up** (needs future evidence/research/user direction).
 
-**Expand with qmd (content, if ready)**: Follow the qmd search protocol in `loam::using` to find related-note neighborhoods for orphan pages, missing cross-links, stale claims, and contradictions (structural steps A, B, E above stay Glob/Grep-led).
+**Expand with qmd (content, if ready)**: Follow the qmd search protocol in `loam-using/references/discovery.md` to find related-note neighborhoods for orphan pages, missing cross-links, stale claims, and contradictions (structural steps A, B, E above stay Glob/Grep-led).
 
 ---
 
@@ -172,7 +177,7 @@ When `<wiki root>/checkpoints/` contains legacy slugged checkpoint filenames:
 
 1. identify files matching `checkpoint-YYYY-MM-DD-HHMM-<slug>.md`
 2. rename to `checkpoint-YYYY-MM-DD-HHMM.md`, using the smallest suffix only when a collision exists
-3. update checkpoint wikilinks that reference renamed notes
+3. update checkpoint wikilinks that reference renamed notes, except inside `<!-- loam:seal ... -->` spans: leave those bytes untouched and report the stale link (see `loam-using/references/seals.md`)
 4. apply the migration directly — it is mechanical and git-reversible, so it needs no approval; the `log.md` entry below is what makes it non-silent
 5. record the checkpoint filename migration in `<wiki root>/log.md`
 
@@ -203,10 +208,11 @@ Allowed direct fixes:
 7. adding contradiction or stale-claim notes when wiki already contains the evidence
 8. improving headings or descriptions for index navigability
 9. normalizing internal links to canonical `[[kebab-case-note-name]]` form
-10. moving only a misplaced nested `<wiki root>/.obsidian/` directory to the parent directory root when the destination has no `.obsidian/` directory
-11. reconciling stale `<wiki root>/.wiki-metadata.json` paths to the actual resolved wiki root
-12. renaming legacy checkpoint files from `checkpoint-YYYY-MM-DD-HHMM-<slug>.md` to `checkpoint-YYYY-MM-DD-HHMM.md` and updating their checkpoint wikilinks when the mapping is collision-free and local
+10. moving a misplaced nested `.obsidian/` to the parent root when that destination has none
+11. reconciling stale `.wiki-metadata.json` paths to the actual resolved wiki root
+12. renaming legacy slugged checkpoint files and their wikilinks when the mapping is collision-free and local (never inside sealed spans)
 13. moving stranded code pages from `entities/` to `code/`, rebuilding the hub, and logging the migration
+14. regenerating the `AGENTS.md` memory-map region with `<native-runtime-command> lint --only guidance --fix "$WORKSPACE_ROOT"` — never by hand-editing inside the markers
 
 Do not: ingest new raw sources, invent facts, silently merge/rename notes, silently delete disagreement/uncertainty, leave redundant `overview.md`, overwrite or merge an existing parent `.obsidian/`, move or rename `<wiki root>` or any wiki content directory, perform broad rewrites, or modify raw-source files.
 
@@ -232,22 +238,7 @@ This is the stable evidence the native state probe reads for the `memory_lint_st
 
 ### Check date format drift
 
-Run `datecheck` to scan all markdown files for date-format drift:
-
-```bash
-<native-runtime-command> datecheck check "$WIKI_ROOT"
-```
-
-The script reports drift as JSON: front matter point-in-time fields missing timezone offsets, legacy TZ labels (`SAST`, `GMT+N`, `UTC`), and decisions-log entries using non-em-dash separators.
-
-Canonical formats are defined in `loam-using/references/date-formats.md`.
-
-If drift is found:
-1. Run `<native-runtime-command> datecheck fix "$WIKI_ROOT"`. `--offset` is optional and defaults to the machine's local offset, so no human input is needed.
-2. Re-run `datecheck check "$WIKI_ROOT"` to confirm zero drift.
-3. Record it in `<wiki root>/log.md` and report under "Fixed now".
-
-`check` never writes. `fix` is idempotent and loses no information — run it directly, never report date drift as needing approval.
+Run `<native-runtime-command> datecheck check "$WIKI_ROOT"`; if it reports drift, run `<native-runtime-command> datecheck fix "$WIKI_ROOT"` directly (never ask approval), re-check, and log it. Read `references/date-drift.md` for drift kinds, the fix steps and log wording.
 
 ### Refresh qmd after writes
 
@@ -259,7 +250,7 @@ After wiki writes, run `qmd update -c <collection>` then `qmd embed -c <collecti
 
 The goal pass runs when `goals/` exists (`ls goals/*.md 2>/dev/null`), even if native state reports no wiki. It is structurally separate from wiki linting, report-only, and does not alter files or append a wiki lint log entry solely for goal checks.
 
-Read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/lint-checklist.md` and apply the **Goal health** section. It checks: missing required front matter or sections, invalid lifecycle status, stale drafts (30 days), overdue or stale active goals (`next_review_at`, otherwise `reviewed_at` or fallback `updated_at` at 90 days), broken linked spec/plan paths, inconsistent `goals/INDEX.md` rows, achieved without a passing review, and `reviewed_at` inconsistent with the newest review entry (compare date portion only).
+Read `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/lint-checklist.md` and apply its **Goal health** section, which carries the full check list (front matter and sections, lifecycle status, draft and active staleness, linked-path resolution, `goals/INDEX.md` consistency, review evidence).
 
 Paused, achieved, and abandoned goals are exempt from staleness checks. Report goal findings in a separate section. Do not alter goal files. Route corrections through `/loam::setting-goals`.
 
@@ -308,14 +299,14 @@ If the pass found no significant issues, say so explicitly and still note any re
 - Treat `<wiki root>/.obsidian/` as misplaced Obsidian config when `<wiki root>` is a subdirectory. Move only `.obsidian/` to the parent directory root when that destination has no `.obsidian/` directory.
 - Reconcile stale `.wiki-metadata.json` to the actual resolved wiki root. Lint updates metadata to match the on-disk wiki; it never moves the on-disk wiki to match metadata.
 - Own checkpoint filename migration. New checkpoints should be named `checkpoint-YYYY-MM-DD-HHMM.md`; lint may rename legacy slugged checkpoint files and update checkpoint wikilinks when the mapping is collision-free and local.
-- Own code-page migration. Lint may move `entities/*.md` pages with `source_path:` front matter to `code/` and rebuild the generated hub. Wikilinks need no change (Obsidian resolves by filename). On collision with an existing `code/<slug>.md`, do not overwrite; report unresolved. Append a `## [YYYY-MM-DD] migrate | code entities → code/` log entry (structural change exception to the no-per-pass-entry rule).
+- Own code-page migration. Lint may move `entities/*.md` pages carrying `source_path:` to `code/` and rebuild the generated hub; wikilinks resolve by filename and need no change. On collision with an existing `code/<slug>.md`, report unresolved rather than overwrite. Append a `## [YYYY-MM-DD] migrate | code entities → code/` log entry (a structural exception to the no-per-pass-entry rule).
 - Never move or rename `<wiki root>` or any wiki content directory as part of `.obsidian/` placement or qmd metadata repair.
 - Rotate `<wiki root>/log.md` when it exceeds 500 lines; lint does not append per-pass entries to `log.md`.
 - Check date format drift with `<native-runtime-command> datecheck check`; canonical formats are in `loam-using/references/date-formats.md`. Apply only unambiguous local normalizations and report ambiguous drift.
 - Check that qmd excludes `.archive/**`; flag missing archive exclusion as a health issue.
 - Flag pages older than 90 days that cite volatile surfaces for re-validation; do not auto-archive them.
 - Keep the note graph traversable, not just the index accurate.
-- qmd is secondary. Structural checks (inventory, orphans, wikilinks, .obsidian placement, checkpoint filenames) remain Glob- and Grep-led. Use qmd (the protocol in `loam::using`) only for content discovery: stale claims, contradictions, and related-note neighborhoods.
+- qmd is secondary. Structural checks (inventory, orphans, wikilinks, .obsidian placement, checkpoint filenames) remain Glob- and Grep-led. Use qmd (the protocol in `loam-using/references/discovery.md`) only for content discovery: stale claims, contradictions, and related-note neighborhoods.
 - After wiki edits, refresh qmd if the collection is ready. If refresh fails, report it but do not roll back.
 - If qmd is unavailable, unmapped, or degraded, continue without it. The skill must not fail.
 - Goal lint is report-only. It runs when `goals/` exists, even without a wiki. It does not alter goal files or append a wiki lint log entry. Route corrections through `/loam::setting-goals`.

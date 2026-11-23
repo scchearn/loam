@@ -4,20 +4,27 @@ Federation lets Loam installations share work state and messages through an
 MQTT broker. This directory is the operator-facing reference for the identity,
 enrollment, and broker contracts.
 
-## Production broker hard stop
+## Production broker status
 
-> **Do not deploy or enable the checked-in production broker yet.** Its
-> `deploy/mqtt-broker/acl` is incompatible with the current connector: it lacks
-> grants for project-membership subscriptions, organization member-card
-> subscription/publication, and the agent inbox, while its project wildcards
-> cannot enforce cross-project denial. `loam federation connect` may succeed
-> while the connector loops offline. There is no supported ACL workaround yet.
+The checked-in `deploy/mqtt-broker/acl` grants every live surface the connector
+needs — project-membership and agent-inbox reads, and organization member-card
+subscription (`members/+`) and retained publication (`members/%c`) — proven by
+[`acl-contract.sh`](../../deploy/mqtt-broker/acl-contract.sh) against a
+throwaway Mosquitto. The broker is a dumb pipe: organization is the only trust
+boundary, project is a routing/capability concept, and the org-scoped project
+`+` wildcard is correct. Cross-project filtering lives in the connector
+application layer, not the ACL; see the
+[settled trust model](../../deploy/mqtt-broker/ACCEPTANCE.md#trust-model-settled).
+
+> **Automated `provision` stage still unavailable.** The gate's `provision`
+> path copies the tracked templates without rendering `${VARS}`. Deploy with
+> the manual `envsubst` sequence in [Broker setup](BROKER-SETUP.md), section 5,
+> not `LOAM_LIVE_GO=1 ./acceptance-gate.sh provision`.
 
 Start here:
 
 1. A broker operator follows [Broker setup](BROKER-SETUP.md). It is the
-   intended newcomer path from a new host to a broker and enrollment signer;
-   do not execute its production steps until the hard stop above is cleared.
+   intended newcomer path from a new host to a broker and enrollment signer.
 2. A machine operator follows the [first connection](BROKER-SETUP.md#8-first-machine-connection)
    section, then verifies the local inventory with `status` and `list`.
 3. For details, use the [broker deployment reference](../../deploy/mqtt-broker/README.md),
@@ -94,8 +101,7 @@ session.
 
 The scripts that provision broker-side material live in
 [`deploy/mqtt-broker/`](../../deploy/mqtt-broker/). The [broker setup
-walkthrough](BROKER-SETUP.md) links each intended step to the script that would
-perform it once the blocker is cleared;
+walkthrough](BROKER-SETUP.md) links each step to the script that performs it;
 the contract pages above explain the values those scripts must produce.
 
 ## Common operator mistakes

@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const DATABASE_NAME: &str = "loam.sqlite3";
+pub(crate) const DATABASE_NAME: &str = "loam.sqlite3";
 // A lifecycle batch rides one bounded stdin frame; producers project each event
 // at its observation point so this stays diagnostic metadata, never a payload.
 const EVENT_BATCH_MAX_BYTES: usize = 16 * 1024;
@@ -1184,7 +1184,18 @@ fn absolute_path(value: Option<String>, name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn absolute_env(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(name)?);
+    path.is_absolute().then_some(path)
+}
+
 pub(crate) fn installed_global_root() -> Result<PathBuf, String> {
+    // `LOAM_HOME` is the harness resolver's explicit root. Honor it first so
+    // connect, the native hook, and the plugin never split across roots.
+    if let Some(root) = absolute_env("LOAM_HOME") {
+        return Ok(root);
+    }
+
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let expected_name = if cfg!(windows) { "loam.exe" } else { "loam" };
     let target = executable.parent();
@@ -1212,7 +1223,31 @@ pub(crate) fn installed_global_root() -> Result<PathBuf, String> {
             return Ok(root);
         }
     }
+
+    // Schema-2 installs stage the runtime in the durable config-dir store, not
+    // under `<global-root>/bin`. When this process is that staged runtime, the
+    // harness root is the canonical home install root.
+    if crate::provisioning::configured_runtime_store_root()
+        .is_some_and(|store| path_is_inside(&executable, &store))
+    {
+        if let Some(home) = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+        {
+            let root = home.join(".agents").join("loam");
+            if root.join("install.json").is_file() {
+                return Ok(root);
+            }
+        }
+    }
+
     Err(inferred_root_error())
+}
+
+fn path_is_inside(path: &Path, root: &Path) -> bool {
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    path.starts_with(root)
 }
 
 fn inferred_root_error() -> String {
@@ -1834,6 +1869,40 @@ fn writable_store(root: &Path) -> Result<Connection, String> {
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| error.to_string())?;
     Ok(connection)
+}
+
+/// Distinct `workspace` values recorded in the hook ledger at `database`,
+/// opened read-only. `Ok(None)` when no ledger file exists. Never writes.
+pub(crate) fn ledger_workspaces(database: &Path) -> Result<Option<Vec<Option<String>>>, String> {
+    if !database.is_file() {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    connection
+        .busy_timeout(BUSY_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    let has_table = connection
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hook_run'")
+        .and_then(|mut statement| statement.exists([]))
+        .map_err(|error| error.to_string())?;
+    if !has_table {
+        return Ok(None);
+    }
+    let mut statement = connection
+        .prepare("SELECT DISTINCT workspace FROM hook_run WHERE workspace IS NOT NULL ORDER BY workspace")
+        .map_err(|error| error.to_string())?;
+    // `None` marks a row that is not valid UTF-8.
+    let rows = statement
+        .query_map([], |row| {
+            Ok(String::from_utf8(row.get_ref(0)?.as_bytes()?.to_vec()).ok())
+        })
+        .map_err(|error| error.to_string())?;
+    let mut workspaces = Vec::new();
+    for row in rows {
+        workspaces.push(row.map_err(|error| error.to_string())?);
+    }
+    Ok(Some(workspaces))
 }
 
 fn list(args: ListArgs) -> Result<(), String> {

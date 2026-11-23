@@ -3,7 +3,7 @@ name: loam::setting-goals
 description: "Create, review, and manage first-class goal artifacts that turn a broad ambition into an externally verifiable outcome. Goals are optional, long-lived workflow artifacts stored at goals/<slug>.md. They own intent, a validation contract, lifecycle, concise review evidence, and linked work. Use when the user wants to set a goal, review a goal, pause or reactivate a goal, achieve or abandon a goal, or change what a goal means. Not for specs, plans, memory, or checkpoints."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: scchearn
   argument-hint: "[goal path or topic]"
 ---
@@ -120,6 +120,8 @@ Append to `## Reviews` in the goal file:
 - Evidence: <concise proof or useful existing reference>
 - Decision: <status/next-action decision>
 ```
+
+`Evidence: seal:<id>` is a valid acceptance-criterion evidence form; cite it only with a `seal verify` result (`loam-using/references/seals.md`).
 
 Update `reviewed_at` to the review date. Update `updated_at`. Update `goals/INDEX.md`.
 

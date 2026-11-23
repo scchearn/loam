@@ -3,7 +3,7 @@ name: loam::adding-to-memory
 description: "Read a local source file or synthesize conversation context, then integrate admitted content directly into topic, entity, concept, and analysis pages in existing memory (the wiki substrate). Use this when the user wants to add a source to the wiki, add a document, ingest a local note, transcript, article, report, or PDF, or explicitly preserve the current conversation as a topic note. For session-learning routing across wiki, guidance, checkpoint, task annotation, or discard, use /loam::learning-from-session. Must not ingest a goal wholesale; admit only independently reusable findings."
 allowed-tools: Read Glob Grep Write Edit Bash
 metadata:
-  version: "1.5.2"
+  version: "1.6.0"
   author: scchearn
   argument-hint: <local source path | topic or summary from chat>
 ---
@@ -60,9 +60,9 @@ If `exists` is true, use `wiki_root` as the resolved wiki root and `qmd_ready` +
 
 If multiple wiki roots are present and the target is ambiguous, ask the smallest possible follow-up question.
 
-If qmd is ready (`qmd_ready: true`), use the `collection` name and follow the **qmd and code-graph discovery** protocol in `loam::using` (the router) to find existing related notes — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (deriving search terms, archive exclusion) if you want it. If qmd is not ready, use Grep/Glob to find existing notes.
+If qmd is ready (`qmd_ready: true`), use the `collection` name and follow the discovery protocol in `loam-using/references/discovery.md` to find existing related notes — no per-skill reference read needed. The per-skill `references/qmd-usage.md` adds skill-specific depth (deriving search terms, archive exclusion) if you want it. If qmd is not ready, use Grep/Glob to find existing notes.
 
-If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. If qmd is not ready, use Grep/Glob for existing notes.
+If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam install`; do not fabricate state or use a project-local fallback. If qmd is not ready, use Grep/Glob for existing notes.
 
 ### Mode detection
 
@@ -81,7 +81,7 @@ Read before editing:
 5. `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/ingest-checklist.md`
 6. if chat-context mode: `${LOAM_SKILL_DIR:-${CLAUDE_SKILL_DIR}}/references/chat-context-ingest.md`
 
-**If qmd is ready**, follow the qmd search protocol in `loam::using` (search terms: 2-4 terms derived from the source content or topic) to find existing related notes before editing.
+**If qmd is ready**, follow the qmd search protocol in `loam-using/references/discovery.md` (search terms: 2-4 terms derived from the source content or topic) to find existing related notes before editing.
 
 **If qmd is not ready**, use Grep and Glob to find existing notes that mention the same entities, topics, or concepts.
 
@@ -207,7 +207,7 @@ If the source was already represented and you refreshed it, say so explicitly.
 - Chat-context mode: synthesize from the current conversation context only.
 - Prefer one source per run.
 - Read the wiki schema before editing.
-- If qmd is ready, use the qmd search protocol in `loam::using` to find existing related notes; otherwise fall back to Grep/Glob.
+- If qmd is ready, use the qmd search protocol in `loam-using/references/discovery.md` to find existing related notes; otherwise fall back to Grep/Glob.
 - Never edit a wiki page based only on qmd output. Always read the actual wiki files first.
 - Durable category notes use canonical kebab-case filenames.
 - Internal note links use `[[kebab-case-note-name]]`.
@@ -222,5 +222,6 @@ If the source was already represented and you refreshed it, say so explicitly.
   Incidents → `/loam::checkpointing`; durable kernels → wiki. If the
   conversation is mostly incident, say so and recommend
   `/loam::learning-from-session` instead.
+- Seals: offer to seal decision-grade facts via `/loam::sealing-memory` (pointer: `loam-using/references/seals.md`). Never add seal markers without attesting through the injected `<native-runtime-command> seal …`.
 - After wiki writes, refresh qmd if the collection is ready. If refresh fails, report it but do not roll back.
 - Do not ingest a goal (`goals/<slug>.md`) wholesale. Goals are operational workflow artifacts, not wiki content. Admit only independently reusable findings that pass the durable-memory rubric.

@@ -1311,6 +1311,7 @@ fn run_hook(id: &str, stdin: &[u8], root: &Path, skills: &Path, workspace: &Path
         .args(["hook", id])
         .env("LOAM_HOME", root)
         .env("LOAM_SKILLS_ROOT", skills)
+        .env("LOAM_WORKSPACES", "off")
         .current_dir(workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

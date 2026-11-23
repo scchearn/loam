@@ -1,3 +1,4 @@
+use crate::markers;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -92,10 +93,20 @@ fn check(files: &[(String, PathBuf)], offset: &str) -> i32 {
 fn fix(files: &[(String, PathBuf)], offset: &str) -> i32 {
     let mut fixed = 0;
     for (relative, path) in files {
-        if scan_file(relative, path, offset).is_empty() {
-            continue;
+        // A file whose only drift sits inside sealed spans has nothing to
+        // fix, but each skipped span is still reported.
+        let drifted = !scan_file(relative, path, offset).is_empty();
+        let (changed, skipped) = fix_file(path, offset, drifted);
+        for anchor in &skipped {
+            println!(
+                "{{\"rule\":\"{}\",\"severity\":\"info\",\"file\":\"{}\",\"anchor\":\"{}\",\"description\":\"{}\"}}",
+                markers::SEL008_CODE,
+                json_escape(relative),
+                json_escape(anchor),
+                markers::SEL008_DESCRIPTION
+            );
         }
-        if fix_file(path, offset) {
+        if changed {
             println!("{}", json_escape(relative));
             fixed += 1;
         }
@@ -153,9 +164,18 @@ fn scan_file(relative: &str, path: &Path, offset: &str) -> Vec<String> {
     };
     let mut findings = Vec::new();
     let mut in_frontmatter = false;
+    let sealed = markers::sealed_spans(&content);
+    let mut line_start = 0usize;
 
+    // Lines split on \n only; markers::scan also treats a lone CR as a line end,
+    // so the overlap check deliberately protects the whole line in that rare case.
     for (index, raw_line) in content.split('\n').enumerate() {
         let line_number = index + 1;
+        let start = line_start;
+        line_start += raw_line.len() + 1;
+        if overlaps_seal(&sealed, start..start + raw_line.len() + 1) {
+            continue;
+        }
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
 
         if line_number == 1 && line == "---" {
@@ -362,12 +382,43 @@ fn is_date(value: &str) -> bool {
         && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
-fn fix_file(path: &Path, offset: &str) -> bool {
+/// True when `range` shares any byte with a sealed span.
+fn overlaps_seal(
+    sealed: &[(std::ops::Range<usize>, String)],
+    range: std::ops::Range<usize>,
+) -> bool {
+    sealed
+        .iter()
+        .any(|(span, _)| span.start < range.end && range.start < span.end)
+}
+
+/// Rewrites drifted lines outside sealed spans. Returns whether the file
+/// changed (only when `write`) and the anchors of the sealed spans that were skipped.
+fn fix_file(path: &Path, offset: &str, write: bool) -> (bool, Vec<String>) {
     let Ok(before) = fs::read_to_string(path) else {
-        return false;
+        return (false, Vec::new());
     };
+    let sealed = markers::sealed_spans(&before);
+    let mut skipped: Vec<String> = Vec::new();
     let mut after = String::with_capacity(before.len() + 32);
+    let mut segment_start = 0usize;
     for segment in before.split_inclusive('\n') {
+        let range = segment_start..segment_start + segment.len();
+        segment_start = range.end;
+        if overlaps_seal(&sealed, range.clone()) {
+            for (span, anchor) in &sealed {
+                if span.start < range.end
+                    && range.start < span.end
+                    && normalize_line(segment.trim_end_matches(['\n', '\r']), offset)
+                        != segment.trim_end_matches(['\n', '\r'])
+                    && !skipped.contains(anchor)
+                {
+                    skipped.push(anchor.clone());
+                }
+            }
+            after.push_str(segment);
+            continue;
+        }
         let has_newline = segment.ends_with('\n');
         let without_newline = segment.strip_suffix('\n').unwrap_or(segment);
         let has_carriage_return = without_newline.ends_with('\r');
@@ -382,10 +433,10 @@ fn fix_file(path: &Path, offset: &str) -> bool {
             after.push('\n');
         }
     }
-    if before == after || fs::write(path, after).is_err() {
-        return false;
+    if !write || before == after || fs::write(path, after).is_err() {
+        return (false, skipped);
     }
-    true
+    (true, skipped)
 }
 
 fn normalize_line(line: &str, offset: &str) -> String {
@@ -459,7 +510,7 @@ fn json_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::default_offset;
+    use super::*;
 
     #[test]
     fn default_offset_matches_the_local_zone_in_hh_mm_form() {
@@ -480,5 +531,70 @@ mod tests {
             .iter()
             .chain(&bytes[4..6])
             .all(u8::is_ascii_digit));
+    }
+
+    const SEALED: &str = "<!-- loam:seal s-pay-terms -->\n- 2026-06-26 - x\n<!-- /loam:seal -->\n";
+
+    fn page(label: &str, body: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "loam-dc-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+        fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
+    fn cleanup(dir: &Path) {
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn skips_sealed() {
+        let body = format!("{SEALED}- 2026-06-26 - y\n");
+        let (dir, path) = page("skip", &body);
+        assert!(fix_file(&path, "+02:00", true).0);
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after,
+            format!("{SEALED}- 2026-06-26 \u{2014} y\n"),
+            "sealed bytes untouched, outside line fixed"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn skip_is_reported_with_anchor() {
+        let (dir, path) = page("report", SEALED);
+        let (changed, skipped) = fix_file(&path, "+02:00", true);
+        assert!(!changed);
+        assert_eq!(skipped, vec!["s-pay-terms".to_owned()]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), SEALED);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn scan_excludes_sealed_lines_and_keeps_crlf() {
+        let body = format!("{}- 2026-06-26 - y\r\n", SEALED.replace('\n', "\r\n"));
+        let (dir, path) = page("crlf", &body);
+        assert_eq!(scan_file("note.md", &path, "+02:00").len(), 1);
+        fix_file(&path, "+02:00", true);
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with(&SEALED.replace('\n', "\r\n")));
+        assert!(after.ends_with("\u{2014} y\r\n"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn malformed_seal_is_not_protected() {
+        let body = "<!-- loam:seal s-pay-terms -->\n- 2026-06-26 - x\n";
+        let (dir, path) = page("malformed", body);
+        assert!(fix_file(&path, "+02:00", true).0);
+        cleanup(&dir);
     }
 }

@@ -10,11 +10,12 @@ import { inspectIntent } from '../integration/ingest.mjs';
 import { loadSkillInventory } from './inventory.mjs';
 import { listSkills, skillEntryAliases, skillEntrySource } from './skills.mjs';
 import { runSkills } from './process.mjs';
-import { announce, confirmUninstall, finish } from './wizard.mjs';
+import { announce, confirmUninstall, finish, harnessLabel } from './wizard.mjs';
 import { removeMarketplacePlugins } from './marketplace.mjs';
 import { removeFederationService } from './federation.mjs';
 import { readLedger } from './integrations/ledger.mjs';
 import { catalogEntry } from './integrations/catalog.mjs';
+import { removeShim, shimLocations } from './shim.mjs';
 
 const codexAgentMarker = '# Managed by @scchearn/loam setup.';
 
@@ -91,6 +92,237 @@ function cleanCursorConfig(config, globalRoot) {
       sessionStart: stripLoamHooks(config.hooks.sessionStart, globalRoot, 'cursor-session-start.mjs'),
     },
   };
+}
+
+function lineWithoutEnding(line) {
+  return line.endsWith('\r\n') ? line.slice(0, -2)
+    : line.endsWith('\n') || line.endsWith('\r') ? line.slice(0, -1) : line;
+}
+
+function tomlLineWithoutComment(line) {
+  let quote = null;
+  let triple = false;
+  let escaped = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const next = line.slice(index, index + 3);
+    if (triple) {
+      if (next === triple) {
+        triple = false;
+        index += 2;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') quote = null;
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") quote = null;
+      continue;
+    }
+    if (next === '"""' || next === "'''") {
+      triple = next;
+      index += 2;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '#') return line.slice(0, index);
+  }
+  return line;
+}
+
+function tomlHeader(line) {
+  const text = tomlLineWithoutComment(lineWithoutEnding(line)).trim();
+  if (!text.startsWith('[')) return null;
+  const array = text.startsWith('[[');
+  const close = array ? ']]' : ']';
+  if (!text.endsWith(close)) return false;
+  const inner = text.slice(array ? 2 : 1, -close.length).trim();
+  if (!inner) return false;
+  let quote = null;
+  let escaped = false;
+  for (const char of inner) {
+    if (quote === '"') {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') quote = null;
+    } else if (quote === "'") {
+      if (char === "'") quote = null;
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === '[' || char === ']') {
+      return false;
+    }
+  }
+  return quote === null ? { text, array } : false;
+}
+
+function isLoamCodexHookState(line) {
+  const header = tomlHeader(line);
+  return Boolean(header && !header.array
+    && /^\[hooks\.state\."loam@loam:[^"]*"\]$/.test(header.text));
+}
+
+function updateTomlTripleState(line, initial = null) {
+  let triple = initial;
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const next = line.slice(index, index + 3);
+    if (triple) {
+      if (next === triple) {
+        triple = null;
+        index += 2;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') quote = null;
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") quote = null;
+      continue;
+    }
+    if (next === '"""' || next === "'''") {
+      triple = next;
+      index += 2;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '#') break;
+  }
+  return triple;
+}
+
+function isValidToml(contents) {
+  const lines = contents.split(/(?<=\n)/);
+  const stack = [];
+  let triple = null;
+
+  for (const rawLine of lines) {
+    const line = lineWithoutEnding(rawLine);
+    const header = tomlHeader(rawLine);
+    const trimmed = tomlLineWithoutComment(line).trim();
+    const continuationAtStart = Boolean(triple || stack.length);
+    if (header === false && !continuationAtStart) return false;
+    if (header && !continuationAtStart) {
+      continue;
+    }
+    if (!trimmed && !triple) continue;
+
+    let assignment = false;
+    let valueMeaningful = false;
+    let meaningful = false;
+    let quote = null;
+    let escaped = false;
+    let continuation = continuationAtStart;
+    for (let index = 0; index < line.length; index += 1) {
+      const char = line[index];
+      const next = line.slice(index, index + 3);
+      if (triple) {
+        if (next === triple) {
+          triple = null;
+          index += 2;
+        }
+        continue;
+      }
+      if (quote === '"') {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === '"') quote = null;
+        continue;
+      }
+      if (quote === "'") {
+        if (char === "'") quote = null;
+        continue;
+      }
+      if (next === '"""' || next === "'''") {
+        triple = next;
+        continuation = true;
+        meaningful = true;
+        if (assignment) valueMeaningful = true;
+        index += 2;
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        quote = char;
+        meaningful = true;
+        if (assignment) valueMeaningful = true;
+        continue;
+      }
+      if (char === '#') break;
+      if (!/\s/.test(char)) meaningful = true;
+      if (char === '=' && !stack.length) assignment = true;
+      else if (assignment && !/\s/.test(char)) valueMeaningful = true;
+      if (char === '[' || char === '{') stack.push(char);
+      else if (char === ']' || char === '}') {
+        const expected = char === ']' ? '[' : '{';
+        if (stack.pop() !== expected) return false;
+      }
+    }
+    if (quote || escaped) return false;
+    if (meaningful && !assignment && !continuation && !triple && !stack.length) return false;
+    if (assignment && !valueMeaningful && !triple && !stack.length) return false;
+  }
+  return !triple && stack.length === 0;
+}
+
+function stripCodexLoamHookState(contents) {
+  if (!isValidToml(contents)) return { action: 'skipped', reason: 'malformed TOML' };
+  const lines = contents.split(/(?<=\n)/);
+  const kept = [];
+  let removing = false;
+  let removed = false;
+  let triple = null;
+  for (const line of lines) {
+    if (triple) {
+      if (!removing) kept.push(line);
+      triple = updateTomlTripleState(line, triple);
+      continue;
+    }
+    if (tomlHeader(line)) {
+      removing = isLoamCodexHookState(line);
+      if (removing) removed = true;
+    }
+    if (!removing) kept.push(line);
+    triple = updateTomlTripleState(line);
+  }
+  return removed
+    ? { action: 'cleaned', contents: kept.join('') }
+    : { action: 'untouched', contents };
+}
+
+async function cleanCodexMarketplaceConfig(path) {
+  let contents;
+  try {
+    contents = await readFile(path, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { path, action: 'absent' };
+    return { path, action: 'skipped', reason: `read failed: ${error?.message || String(error)}` };
+  }
+
+  const cleaned = stripCodexLoamHookState(contents);
+  if (cleaned.action !== 'cleaned') return { path, ...cleaned };
+  try {
+    const mode = (await stat(path)).mode & 0o777;
+    await writeAtomicFile(path, cleaned.contents, { mode });
+    return { path, action: 'cleaned' };
+  } catch (error) {
+    return { path, action: 'skipped', reason: `write failed: ${error?.message || String(error)}` };
+  }
 }
 
 async function hasBackup(dir) {
@@ -271,6 +503,9 @@ export async function removeHarnesses({
     const detected = await detectHarnesses({ home });
     const scoped = Object.fromEntries(marketIds.map((id) => [id, detected[id]]));
     result.marketplace = await removeMarketplacePlugins({ harnesses: scoped, cwd, runner });
+    if (idSet.has('codex') && !Object.values(result.marketplace).some((entry) => entry.state === 'partial')) {
+      result.codexMarketplaceConfig = await cleanCodexMarketplaceConfig(join(home, '.codex', 'config.toml'));
+    }
   }
 
   for (const id of ids) {
@@ -304,11 +539,15 @@ export async function uninstall({
   yes = false,
   confirm,
   purge = false,
+  platform = process.platform,
+  env = process.env,
+  pathRunner,
   input = process.stdin,
   output = process.stdout,
 } = {}) {
   const root = resolve(globalRoot || join(home, '.agents', 'loam'));
   const metadataPath = join(root, 'install.json');
+  const locations = shimLocations({ home, env, platform });
 
   let install = null;
   try {
@@ -329,8 +568,12 @@ export async function uninstall({
   const detectedHarnesses = await detectHarnesses({ home });
   const codexAgentProfile = await inspectCodexAgentProfile(home);
   const hasMarketplacePlugin = ['claude', 'codex'].some((id) =>
-    detectedHarnesses[id]?.marketplaceInstalled || detectedHarnesses[id]?.marketplaceConfigured);
-  if (!install && !listedSkills.names.length && !hasMarketplacePlugin
+    detectedHarnesses[id]?.marketplaceInstalled
+      || detectedHarnesses[id]?.marketplaceConfigured
+      || detectedHarnesses[id]?.marketplaceRegistered);
+  const shimPresent = await exists(locations.shimPath)
+    || (platform === 'win32' && await exists(locations.scriptPath));
+  if (!install && !listedSkills.names.length && !hasMarketplacePlugin && !shimPresent
     && !codexAgentProfile.owned && codexAgentProfile.backup === undefined) {
     output.write('No Loam installation found at %s. Nothing to uninstall.\n'.replace('%s', root));
     return 0;
@@ -344,15 +587,17 @@ export async function uninstall({
   // `federation/` subtree: scoping there would force every future addition to
   // register itself with uninstall's purge list.
   const { configRoot } = await import('./profile.mjs');
-  const configDir = configRoot({ env: process.env, home, platform: process.platform });
+  const configDir = configRoot({ env, home, platform });
 
   await announce(output, 'Loam uninstall will:', [
     `- Remove ${listedSkills.names.length || 'any remaining'} globally installed Loam skills via the Skills CLI`,
     '- Remove Loam-owned hook entries from the Claude, Codex, and Cursor configs',
     '- Remove the Loam-owned Codex ingestion profile, restoring any pre-existing profile preserved by setup',
     '- Remove the Loam plugin file from OpenCode, which integrates by plugin rather than hooks',
-    '- Remove installed Claude and Codex marketplace plugins through their native CLIs',
+    '- Remove installed Claude and Codex marketplace plugins and the Loam marketplace registration through their native CLIs',
     `- Remove the global Loam root (install.json, runtime, integration, plugins, local operational history) at: ${root}`,
+    `- Remove the stable loam launcher at: ${locations.shimPath}`,
+    ...(platform === 'win32' ? ['- Remove the per-user PATH entry only when Loam added it'] : []),
     configDir
       ? `- PRESERVE the Loam config dir (federation identity, rosters, enrollment, registry, member cards, runtime store + ledger) at: ${configDir} so a reinstall resumes with the same identity and runtime`
       : '- PRESERVE the Loam config dir (none resolved)',
@@ -372,7 +617,7 @@ export async function uninstall({
     return 1;
   }
 
-  const results = { configs: [], codexAgentProfile: null, opencode: null, globalRoot: null, backups: [], skills: null, marketplace: null, federation: null };
+  const results = { configs: [], codexAgentProfile: null, opencode: null, globalRoot: null, backups: [], skills: null, marketplace: null, federation: null, shim: null };
 
   results.marketplace = await removeMarketplacePlugins({
     harnesses: detectedHarnesses,
@@ -380,8 +625,30 @@ export async function uninstall({
     runner,
   });
   if (Object.values(results.marketplace).some((entry) => entry.state === 'partial')) {
+    for (const [id, entry] of Object.entries(results.marketplace)) {
+      if (entry.state === 'partial') {
+        output.write(`${harnessLabel(id)} marketplace removal failed: ${entry.detail || 'unknown failure'}\n`);
+      }
+    }
     output.write('Marketplace plugin removal failed; Loam core was preserved.\n');
     return 1;
+  }
+  for (const [id, entry] of Object.entries(results.marketplace)) {
+    for (const warning of entry.warnings || []) {
+      output.write(`${harnessLabel(id)} marketplace registration cleanup warning: ${warning.detail}\n`);
+    }
+  }
+
+  const shouldCleanCodexMarketplaceConfig = install?.configured_harnesses?.includes('codex')
+    || detectedHarnesses.codex?.marketplaceInstalled
+    || detectedHarnesses.codex?.marketplaceConfigured
+    || detectedHarnesses.codex?.marketplaceRegistered;
+  if (shouldCleanCodexMarketplaceConfig) {
+    const codexMarketplaceConfig = await cleanCodexMarketplaceConfig(join(home, '.codex', 'config.toml'));
+    results.codexMarketplaceConfig = codexMarketplaceConfig;
+    if (codexMarketplaceConfig.action === 'skipped') {
+      output.write(`Codex config cleanup warning: ${codexMarketplaceConfig.reason}\n`);
+    }
   }
 
   results.skills = await removeGlobalSkills({
@@ -431,7 +698,7 @@ export async function uninstall({
     const entry = catalogEntry(id);
     if (!entry) continue;
     results.integrations[id] = await entry.disable({
-      discovery: { globalRoot: root, home, platform: process.platform, harnesses: {} },
+      discovery: { globalRoot: root, home, platform, env, harnesses: {} },
       install,
       dryRun: false,
       purge,
@@ -451,6 +718,14 @@ export async function uninstall({
       runner: federationRunner,
     });
   }
+
+  results.shim = await removeShim({
+    home,
+    env,
+    platform,
+    pathRunner,
+    record: install?.shim,
+  });
 
   // The federation identity now lives in the config-dir profile (the whole
   // `federation/` subtree relocated there per the config-dir spec), NOT under

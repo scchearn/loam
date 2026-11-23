@@ -6,6 +6,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - cli/**
+      - skills/loam-using/scripts/**
       - dist-workspace.toml
       - .github/workflows/cli.yml
       - .github/scripts/**
@@ -18,6 +19,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - cli/**
+      - skills/loam-using/scripts/**
       - dist-workspace.toml
       - .github/workflows/cli.yml
       - .github/scripts/**
@@ -46,19 +48,26 @@ jobs:
           - os: ubuntu-22.04
             artifact: loam-ubuntu
             binary: target/release/loam
-          - os: macos-14
+          - os: macos-15
             artifact: loam-macos
             binary: target/release/loam
+            require_sshsig: "1"
           - os: windows-2022
             artifact: loam-windows
             binary: target/release/loam.exe
+            # Git for Windows' bundled ssh-keygen (OpenSSH 9.x) is the signer.
+            require_sshsig: "1"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         run: rustup toolchain install 1.94.1 --profile minimal --component clippy
       - run: cargo +1.94.1 clippy --locked --workspace --all-targets -- -D warnings
+      # Real-signature seal tests need OpenSSH >= 9.1 (ubuntu-22.04 has 8.9 and
+      # exercises the degraded path); where one must exist, skipping is a failure.
       - run: cargo +1.94.1 test --workspace --locked
+        env:
+          LOAM_REQUIRE_SSHSIG: ${{ matrix.require_sshsig }}
       - run: cargo +1.94.1 build --release --locked --package loam
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -80,7 +89,7 @@ jobs:
           - os: ubuntu-22.04
             binary: target/release/loam
             run: bash .github/scripts/linux-service-smoke.sh target/release/loam
-          - os: macos-14
+          - os: macos-15
             binary: target/release/loam
             run: bash .github/scripts/macos-service-smoke.sh target/release/loam
           - os: windows-2022
@@ -124,7 +133,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14]
+        os: [ubuntu-22.04, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

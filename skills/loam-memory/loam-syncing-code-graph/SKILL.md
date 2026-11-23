@@ -42,7 +42,7 @@ If the injected state cannot be reused, refresh native state through the injecte
 <native-runtime-command> state --fast "$(pwd)"
 ```
 
-If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam setup`; do not fabricate state or use a project-local fallback. If `exists` is false, stop — there is nothing to sync. Use `wiki_root` from the resolved state; do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh.
+If the native runtime reports unavailable or does not provide real state, stop and recommend `npx @scchearn/loam install`; do not fabricate state or use a project-local fallback. If `exists` is false, stop — there is nothing to sync. Use `wiki_root` from the resolved state; do not substitute the codebase root, workspace root, or parent directory. If `qmd_ready` is true, note the `collection` name for later refresh.
 
 ### Codebase resolution
 
@@ -229,4 +229,4 @@ Code graph synced from <codebase root>
 - Read the wiki schema before editing the index or log.
 - When re-summarizing, reuse the ingestion skill's role templates and classification rubric — do not improvise a different node format.
 - Edge links are untyped `[[slug]]`. Consistent with `/loam::ingesting-codebase`.
-- If the codegraph forwarder or the native runtime is missing or fails, stop and recommend `npx @scchearn/loam setup`; do not substitute a project-local fallback.
+- If the codegraph forwarder or the native runtime is missing or fails, stop and recommend `npx @scchearn/loam install`; do not substitute a project-local fallback.

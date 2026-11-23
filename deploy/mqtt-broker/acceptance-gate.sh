@@ -30,7 +30,7 @@ dryrun() {
   local need="params.env.example mosquitto.conf acl loam-mosquitto.service
     backup-restore.sh cert-monitor.sh preflight.sh postflight-assert.sh
     resolve-credentials.sh provision-peer-roster.sh provision-instance-id.sh
-    certbot-deploy-hook.sh pki/init-ca.sh pki/issue-client.sh pki/revoke-client.sh
+    certbot-deploy-hook.sh acl-contract.sh pki/init-ca.sh pki/issue-client.sh pki/revoke-client.sh
     pki/obtain-server-cert.sh pki/selfcheck.sh
     enroll/signer.py enroll/test_signer.py enroll/install-signer.sh enroll/loam-enroll-signer.service
     ACCEPTANCE.md"
@@ -63,7 +63,27 @@ dryrun() {
   # The signer's availability contract: it must keep serving behind a stalled
   # client. Needs python3 + openssl, both already required by this tree.
   python3 "$HERE/enroll/test_signer.py" >/dev/null 2>&1 || { echo "selfcheck: enroll-signer"; ok=0; }
-  [ "$ok" -eq 1 ] && { echo "DRYRUN GREEN"; return 0; } || { echo "DRYRUN RED"; return 1; }
+  # The ACL contract stands up a throwaway mosquitto against the rendered
+  # production ACL (own tmp dirs — no host mutation, so it belongs in dryrun).
+  # It needs a mosquitto toolchain; if any tool is missing we SKIP it EXPLICITLY
+  # (never a silent pass) rather than red the off-host gate on a test-only dep.
+  local c acl_deps=1 acl_skipped=0
+  for c in mosquitto mosquitto_pub mosquitto_sub mosquitto_passwd envsubst python3 timeout; do
+    command -v "$c" >/dev/null 2>&1 || acl_deps=0
+  done
+  if [ "$acl_deps" -eq 1 ]; then
+    "$HERE/acl-contract.sh" selfcheck >/dev/null 2>&1 || { echo "selfcheck: acl-contract"; ok=0; }
+  else
+    echo "SKIP: acl-contract selfcheck (missing mosquitto toolchain — install mosquitto + clients to run it)"
+    acl_skipped=1
+  fi
+  # Tag the summary when a test-only dep forced a skip so CI can tell a fully
+  # green gate from one that couldn't run the ACL contract (still never RED).
+  if [ "$ok" -eq 1 ]; then
+    [ "$acl_skipped" -eq 1 ] && echo "DRYRUN GREEN (SKIPPED: acl-contract)" || echo "DRYRUN GREEN"
+    return 0
+  fi
+  echo "DRYRUN RED"; return 1
 }
 
 # ---------------------------------------------------------------------------

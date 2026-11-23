@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 
 import { runConfigure } from '../setup/configure.mjs';
 
@@ -39,6 +39,14 @@ function federationRunner({ home, active = false } = {}) {
   return { runner, calls, definitionPath, state };
 }
 
+// Pin config resolution to the fixture home so no test can reach a real
+// runtime or seal dir through the ambient environment.
+const ORIGINAL_LOAM_CONFIG_DIR = process.env.LOAM_CONFIG_DIR;
+afterEach(() => {
+  if (ORIGINAL_LOAM_CONFIG_DIR === undefined) delete process.env.LOAM_CONFIG_DIR;
+  else process.env.LOAM_CONFIG_DIR = ORIGINAL_LOAM_CONFIG_DIR;
+});
+
 async function installedFixture({ active = false } = {}) {
   const home = await mkdtemp(join(tmpdir(), 'loam-configure-home-'));
   const workspace = await mkdtemp(join(tmpdir(), 'loam-configure-workspace-'));
@@ -53,6 +61,7 @@ async function installedFixture({ active = false } = {}) {
     configured_harnesses: [],
   }));
   const fed = federationRunner({ home, active });
+  process.env.LOAM_CONFIG_DIR = join(home, '.config', 'loam');
   return { home, workspace, globalRoot, runtimePath, fed };
 }
 
@@ -62,6 +71,7 @@ const baseOptions = (fixture, capture, fed) => ({
   packageRoot,
   platform: 'linux',
   federationRunner: (fed || fixture.fed).runner,
+  sealRunner: async () => ({ code: 127, stdout: '', stderr: 'stub' }),
   output: capture.output,
   errorOutput: capture.output,
 });
@@ -285,4 +295,61 @@ test('setup --integration grep registers the MCP and --disable-integration grep 
   const claudeAfter = JSON.parse(await readFile(join(fixture.home, '.claude.json'), 'utf8'));
   assert.equal(claudeAfter.mcpServers.grep, undefined, 'grep MCP deregistered from claude');
   await assert.doesNotMatch(await readFile(join(fixture.home, '.codex', 'config.toml'), 'utf8').catch(() => ''), /\[mcp_servers\.grep\]/);
+});
+
+function sealStub(created) {
+  const calls = [];
+  const runner = async (request) => {
+    calls.push(request);
+    return { code: 0, stdout: JSON.stringify({ principal: 'agent.x@org', created }), stderr: '' };
+  };
+  return { runner, calls };
+}
+
+test('seal: keyless setup makes one seal trust init call, no prompt, and still reaches Nothing to configure', async () => {
+  const fixture = await installedFixture();
+  const seal = sealStub(['agent_ed25519']);
+  const capture = outputCapture();
+  const code = await runConfigure(
+    { command: 'setup', federation: null, integrations: [], dryRun: false, yes: false, purge: false },
+    { ...baseOptions(fixture, capture), sealRunner: seal.runner, confirm: async () => { throw new Error('prompted'); } },
+  );
+  assert.equal(code, 0, capture.text());
+  assert.equal(seal.calls.length, 1);
+  assert.deepEqual(seal.calls[0].args, ['seal', 'trust', 'init', '--json']);
+  assert.match(capture.text(), /Seal key ready/);
+  assert.match(capture.text(), /Nothing to configure/);
+});
+
+test('seal: with the key present setup reports nothing', async () => {
+  const fixture = await installedFixture();
+  const seal = sealStub([]);
+  const capture = outputCapture();
+  const code = await runConfigure(
+    { command: 'setup', federation: null, integrations: [], dryRun: false, yes: false, purge: false },
+    { ...baseOptions(fixture, capture), sealRunner: seal.runner },
+  );
+  assert.equal(code, 0, capture.text());
+  assert.doesNotMatch(capture.text(), /Seal key/);
+});
+
+test('seal: dry-run setup makes no seal call', async () => {
+  const fixture = await installedFixture();
+  const seal = sealStub(['agent_ed25519']);
+  const capture = outputCapture();
+  await runConfigure(
+    { command: 'setup', federation: null, integrations: [], dryRun: true, yes: false, purge: false },
+    { ...baseOptions(fixture, capture), sealRunner: seal.runner },
+  );
+  assert.equal(seal.calls.length, 0);
+});
+
+test('seal: a failing runtime never fails setup', async () => {
+  const fixture = await installedFixture();
+  const capture = outputCapture();
+  const code = await runConfigure(
+    { command: 'setup', federation: null, integrations: [], dryRun: false, yes: false, purge: false },
+    { ...baseOptions(fixture, capture), sealRunner: async () => ({ code: 2, stdout: '', stderr: 'unknown command' }) },
+  );
+  assert.equal(code, 0, capture.text());
 });

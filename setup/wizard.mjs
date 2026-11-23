@@ -175,6 +175,102 @@ export async function selectHarnesses({
   return finalize(Array.isArray(chosen) ? chosen : []);
 }
 
+function cleanCatalogText(value) {
+  return typeof value === 'string' ? value.replace(/\s+/gu, ' ').trim() : '';
+}
+
+function catalogOptions(catalog) {
+  if (!Array.isArray(catalog)) return [];
+  return catalog
+    .map((entry) => ({
+      id: cleanCatalogText(entry?.id),
+      label: cleanCatalogText(entry?.label),
+      capability: cleanCatalogText(entry?.capability),
+    }))
+    .filter(({ id }) => id);
+}
+
+// Interactive installs may opt into integrations; --yes and non-TTY installs
+// deliberately select none so automation never enables an egressing service or
+// downloads a large companion tool without an explicit human choice.
+export async function selectIntegrations({
+  yes = false,
+  catalog = [],
+  select,
+  input = process.stdin,
+  output = process.stdout,
+} = {}) {
+  if (yes) return [];
+  const entries = catalogOptions(catalog);
+  if (!entries.length) return [];
+  const options = entries.map(({ id, label, capability }) => ({
+    value: id,
+    label: label || capability || id,
+    ...(capability && label ? { hint: capability } : {}),
+  }));
+  const valid = new Set(entries.map(({ id }) => id));
+  const normalize = (chosen) => Array.isArray(chosen)
+    ? [...new Set(chosen.filter((id) => valid.has(id)))]
+    : [];
+
+  if (select) {
+    const chosen = await select({
+      message: 'Enable optional integrations',
+      options,
+      initialValues: [],
+      required: false,
+    });
+    return chosen === null ? null : normalize(chosen);
+  }
+  if (!input?.isTTY) return [];
+
+  const ui = await loadPrompts(output);
+  if (ui) {
+    const chosen = await ui.multiselect({
+      message: 'Enable optional integrations',
+      options,
+      initialValues: [],
+      required: false,
+    });
+    return ui.isCancel(chosen) ? null : normalize(chosen);
+  }
+
+  // Readline fallback keeps the choice explicit when the presentation dependency
+  // is unavailable; blank input means no integrations.
+  const prompt = readline.createInterface({ input, output });
+  try {
+    const answer = await prompt.question(
+      `Enable optional integrations (${options.map(({ value }) => value).join(', ')})? Enter ids separated by commas, or press Enter for none: `,
+    );
+    return normalize(answer.split(',').map((id) => id.trim()));
+  } finally {
+    prompt.close();
+  }
+}
+
+export function optionalIntegrationSummary(catalog = [], enabled = [], previouslyEnabled = []) {
+  const entries = catalogOptions(catalog);
+  if (!entries.length) return '';
+  const enabledIds = new Set(Array.isArray(enabled) ? enabled : []);
+  const hiddenIds = new Set([
+    ...enabledIds,
+    ...(Array.isArray(previouslyEnabled) ? previouslyEnabled : []),
+  ]);
+  const enabledEntries = entries.filter(({ id }) => enabledIds.has(id));
+  const remaining = entries.filter(({ id }) => !hiddenIds.has(id));
+  const lines = [];
+  if (enabledEntries.length) lines.push(`Integrations enabled: ${enabledEntries.map(({ id }) => id).join(', ')}`);
+  if (remaining.length) {
+    if (lines.length) lines.push('');
+    lines.push('Optional integrations — enable anytime:');
+    for (const { id, label, capability } of remaining) {
+      const purpose = [label, capability].filter(Boolean).filter((value, index, values) => values.indexOf(value) === index).join(' · ');
+      lines.push(`npx @scchearn/loam setup --integration ${id}${purpose ? ` — ${purpose}` : ''}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 export function stage(output, name, detail = '') {
   const line = `${name}${detail ? `: ${detail}` : ''}`;
   const ui = styled(output);

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,8 +16,12 @@ import { discover } from '../setup/discovery.mjs';
 import { verifyInstallation } from '../setup/verify.mjs';
 import { detectTarget, runtimePath } from '../setup/target.mjs';
 import { uninstall } from '../setup/uninstall.mjs';
+import { runDoctor } from '../setup/doctor.mjs';
+import { shimLocations } from '../setup/shim.mjs';
 import { federationDefinitionPath } from '../setup/federation.mjs';
 import { ledgerPath } from '../integration/ledger.mjs';
+import { CATALOG } from '../setup/integrations/catalog.mjs';
+import { managedBinPath } from '../setup/integrations/tools.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 // #137: an installed marketplace plugin carries the shipped hooks.json (with the
@@ -74,9 +78,53 @@ function outputCapture() {
   return { output: { write: (chunk) => chunks.push(String(chunk)) }, text: () => chunks.join('') };
 }
 
+function qmdToolRunner(globalRoot, { installCode = 0 } = {}) {
+  const calls = [];
+  return {
+    calls,
+    runner: async ({ args = [] }) => {
+      calls.push(args);
+      if (args.includes('install')) {
+        if (installCode === 0) {
+          const bin = managedBinPath(globalRoot, 'qmd', 'qmd', process.platform);
+          await mkdir(join(bin, '..'), { recursive: true });
+          await writeFile(bin, process.platform === 'win32' ? 'qmd' : '#!/bin/sh\necho qmd\n');
+          await chmod(bin, 0o755);
+        }
+        return { code: installCode, stdout: '', stderr: installCode === 0 ? '' : 'npm ERR! 404 Not Found' };
+      }
+      if (args.includes('--version')) return { code: 0, stdout: 'qmd 1.2.3\n', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  };
+}
+
+function assertOptionalIntegrationHints(text) {
+  assert.match(text, /Optional integrations — enable anytime:/u);
+  for (const entry of CATALOG) {
+    assert.match(text, new RegExp(`npx @scchearn/loam setup --integration ${entry.id}`));
+    assert.match(text, new RegExp(entry.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
+}
+
 async function baseFixture() {
   const home = await mkdtemp(join(tmpdir(), 'loam-setup-home-'));
   pinConfigDir(home);
+  const env = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    LOCALAPPDATA: join(home, 'AppData', 'Local'),
+    APPDATA: join(home, 'AppData', 'Roaming'),
+  };
+  let userPath = '';
+  const pathRunner = async ({ action, entry }) => {
+    if (action === 'read') return { code: 0, stdout: userPath };
+    const delimiter = process.platform === 'win32' ? ';' : ':';
+    if (action === 'add') userPath = [userPath, entry].filter(Boolean).join(delimiter);
+    if (action === 'remove') userPath = userPath.split(delimiter).filter((part) => part !== entry).join(delimiter);
+    return { code: 0, stdout: '' };
+  };
   const workspace = await mkdtemp(join(tmpdir(), 'loam-setup-workspace-'));
   const release = await releaseFixture();
   const list = await fullList();
@@ -98,9 +146,13 @@ async function baseFixture() {
   return {
     home,
     workspace,
+    env,
+    pathRunner,
     release,
     releaseBaseUrl: release.url,
     runner,
+    // Default: never spawn the fixture runtime for seal provisioning.
+    sealRunner: async () => ({ code: 127, stdout: '', stderr: 'stub' }),
     detected: {
       opencode: { id: 'opencode', state: 'absent' },
       claude: { id: 'claude', state: 'absent' },
@@ -163,16 +215,24 @@ test('harvest_packaging: upgrade stages harvest modules idempotently and final v
 test('clean --yes setup completes and publishes verified install metadata', async () => {
   const fixture = await baseFixture();
   const capture = outputCapture();
+  let prompted = false;
   const code = await runSetup(parseArgs(['install', '--yes']), {
     ...fixture,
     packageRoot,
+    integrationSelect: async () => {
+      prompted = true;
+      return ['qmd'];
+    },
     output: capture.output,
     errorOutput: capture.output,
   });
 
   assert.equal(code, 0, capture.text());
+  assert.equal(prompted, false);
   assert.match(capture.text(), /Loam is ready/);
+  assertOptionalIntegrationHints(capture.text());
   const globalRoot = join(fixture.home, '.agents', 'loam');
+  await assert.rejects(() => readFile(join(globalRoot, 'integrations.json')), { code: 'ENOENT' });
   const metadata = JSON.parse(await readFile(join(globalRoot, 'install.json'), 'utf8'));
   // Schema 2: install.json carries no runtime_* fields — the config-dir ledger
   // is the runtime authority.
@@ -184,10 +244,88 @@ test('clean --yes setup completes and publishes verified install metadata', asyn
   assert.equal(metadata.skills_scope, 'global');
   const ledger = await readLedgerFor(fixture.home);
   assert.equal(ledger.schema_version, 1);
-  assert.equal(ledger.channel, 'next');
+  // Channel follows the package constant's lane: prerelease → next, final → latest.
+  assert.equal(ledger.channel, RUNTIME_VERSION.includes('-') ? 'next' : 'latest');
   assert.equal(ledger.target, RUNTIME_VERSION);
   assert.equal(ledger.sha256, createHash('sha256').update(fixture.release.bytes).digest('hex'));
   assert.equal(await readFile(ledger.store_path, 'utf8'), fixture.release.bytes);
+});
+
+test('clean interactive install prints optional integration hints', async () => {
+  const fixture = await baseFixture();
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['install']), {
+    ...fixture,
+    packageRoot,
+    confirm: async () => true,
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+
+  assert.equal(code, 0, capture.text());
+  assertOptionalIntegrationHints(capture.text());
+});
+
+test('interactive install can select qmd and registers its managed MCP before completion', async () => {
+  const fixture = await baseFixture();
+  await mkdir(join(fixture.home, '.config', 'opencode'), { recursive: true });
+  const capture = outputCapture();
+  const globalRoot = join(fixture.home, '.agents', 'loam');
+  const tool = qmdToolRunner(globalRoot);
+  const code = await runSetup(parseArgs(['install']), {
+    ...fixture,
+    env: { ...fixture.env, PATH: '' },
+    packageRoot,
+    confirm: async () => true,
+    marketplaceSelect: async () => ['opencode'],
+    integrationSelect: async ({ options }) => {
+      assert.deepEqual(options.map(({ value }) => value), CATALOG.map((entry) => entry.id));
+      return ['qmd'];
+    },
+    toolRunner: tool.runner,
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+
+  assert.equal(code, 0, capture.text());
+  assert.ok(tool.calls.some((args) => args.includes('install') && args.includes('@tobilu/qmd')));
+  assert.ok(tool.calls.some((args) => args.includes('--version')));
+  const install = JSON.parse(await readFile(join(globalRoot, 'install.json'), 'utf8'));
+  assert.deepEqual(install.configured_harnesses, ['opencode']);
+  const bin = managedBinPath(globalRoot, 'qmd', 'qmd', process.platform);
+  await assert.doesNotReject(() => stat(bin));
+  const opencode = JSON.parse(await readFile(join(fixture.home, '.config', 'opencode', 'opencode.json'), 'utf8'));
+  assert.deepEqual(opencode.mcp.qmd, { type: 'local', command: [bin, 'mcp'], enabled: true });
+  assert.match(capture.text(), /Integrations enabled: qmd/);
+  assert.match(capture.text(), /setup --integration grep/);
+  assert.match(capture.text(), /setup --integration hcom/);
+  assert.doesNotMatch(capture.text(), /setup --integration qmd/);
+});
+
+test('failed interactive integration leaves the committed core install and reports an exact retry command', async () => {
+  const fixture = await baseFixture();
+  await mkdir(join(fixture.home, '.config', 'opencode'), { recursive: true });
+  const capture = outputCapture();
+  const globalRoot = join(fixture.home, '.agents', 'loam');
+  const tool = qmdToolRunner(globalRoot, { installCode: 1 });
+  const code = await runSetup(parseArgs(['install']), {
+    ...fixture,
+    env: { ...fixture.env, PATH: '' },
+    packageRoot,
+    confirm: async () => true,
+    marketplaceSelect: async () => ['opencode'],
+    integrationSelect: async () => ['qmd'],
+    toolRunner: tool.runner,
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+
+  assert.equal(code, 1, capture.text());
+  await assert.doesNotReject(() => readFile(join(globalRoot, 'install.json')));
+  await assert.rejects(() => stat(managedBinPath(globalRoot, 'qmd', 'qmd', process.platform)), { code: 'ENOENT' });
+  assert.match(capture.text(), /Integration qmd enable failed/);
+  assert.match(capture.text(), /npx @scchearn\/loam setup --integration qmd/);
+  assert.match(capture.text(), /Loam core is ready/);
 });
 
 test('complete ready rerun is local-only and does not call Skills CLI or download', async () => {
@@ -229,8 +367,49 @@ test('update refreshes a ready installation without prompting', async () => {
   assert.equal(code, 0, capture.text());
   assert.equal(skillAdds, 1);
   assert.match(capture.text(), /Loam Update/);
+  assert.doesNotMatch(capture.text(), /Optional integrations — enable anytime:/u);
+  await assert.rejects(() => readFile(join(fixture.home, '.agents', 'loam', 'integrations.json')), { code: 'ENOENT' });
   const current = JSON.parse(await readFile(metadataPath, 'utf8'));
   assert.notEqual(current.integration_path, previous.integration_path);
+});
+
+test('the installed launcher stays byte-stable through update and doctor reports it healthy', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('Windows PATH registry verification runs in the native CI smoke');
+    return;
+  }
+  const fixture = await baseFixture();
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, output: outputCapture().output });
+  const shimPath = join(fixture.home, '.local', 'bin', 'loam');
+  const before = await readFile(shimPath);
+  const updateCode = await runSetup(parseArgs(['update']), {
+    ...fixture,
+    packageRoot,
+    output: outputCapture().output,
+    errorOutput: outputCapture().output,
+  });
+  assert.equal(updateCode, 0);
+  assert.deepEqual(await readFile(shimPath), before);
+
+  const capture = outputCapture();
+  const doctorCode = await runDoctor({
+    home: fixture.home,
+    workspace: fixture.workspace,
+    packageRoot,
+    env: {
+      ...process.env,
+      HOME: fixture.home,
+      USERPROFILE: fixture.home,
+      PATH: `${join(fixture.home, '.local', 'bin')}:${process.env.PATH || ''}`,
+    },
+    runner: fixture.runner,
+    runtimeRunner: fixture.smokeRunner,
+    toolRunner: async () => ({ code: 1, stdout: '', stderr: 'tool absent' }),
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+  assert.equal(doctorCode, 0, capture.text());
+  assert.match(capture.text(), /PATH launcher: ok/);
 });
 
 test('setup reconciles an install from an older plugin version', async () => {
@@ -676,6 +855,7 @@ test('failed later setup stages preserve the active integration and metadata', a
 
 async function readyHarnessFixture() {
   const fixture = await baseFixture();
+  const { env, pathRunner } = fixture;
   await mkdir(join(fixture.home, '.config', 'opencode'), { recursive: true });
   await mkdir(join(fixture.home, '.claude'), { recursive: true });
   await mkdir(join(fixture.home, '.cursor'), { recursive: true });
@@ -693,15 +873,69 @@ async function readyHarnessFixture() {
     }
     return { code: 0, stdout: '', stderr: '' };
   };
-  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, runner, output: outputCapture().output });
+  const setupOutput = outputCapture();
+  const setupCode = await runSetup(parseArgs(['install', '--yes']), {
+    ...fixture,
+    packageRoot,
+    runner,
+    env,
+    pathRunner,
+    output: setupOutput.output,
+    errorOutput: setupOutput.output,
+  });
+  assert.equal(setupCode, 0, setupOutput.text());
+  const settings = JSON.parse(await readFile(join(fixture.home, '.claude', 'settings.json'), 'utf8'));
+  assert.ok(settings.hooks, 'a ready Claude install must preserve its hooks object');
+  if (process.platform === 'win32') {
+    const locations = shimLocations({ home: fixture.home, env, platform: 'win32' });
+    await readFile(locations.shimPath);
+  }
   const discovery = await discover({
     home: fixture.home,
     workspace: fixture.workspace,
     packageRoot,
     runner: fixture.runner,
+    env,
   });
   return { fixture, discovery };
 }
+
+// #220: a ledger whose store_path lies outside the config dir (a Windows case
+// variant, or a hand-edited file) used to make install/update throw. It is now
+// replaced by a fresh ledger, and the stale store_path is never acted on.
+test('install and update replace an out-of-root ledger without touching its store_path', async () => {
+  const { fixture } = await readyHarnessFixture();
+  const configDir = join(fixture.home, '.config', 'loam');
+  const outside = await mkdtemp(join(tmpdir(), 'loam-setup-outside-'));
+  const sentinel = join(outside, 'sentinel');
+  await writeFile(sentinel, 'keep');
+  const invalidLedger = async () => {
+    const ledger = await readLedgerFor(fixture.home);
+    const storePath = join(outside, '9.9.9', target, ledger.store_path.endsWith('.exe') ? 'loam.exe' : 'loam');
+    await writeFile(ledgerPath({ root: configDir }), `${JSON.stringify({ ...ledger, store_path: storePath })}\n`);
+  };
+
+  await invalidLedger();
+  const install = outputCapture();
+  const installCode = await runSetup(parseArgs(['install', '--yes']), {
+    ...fixture, packageRoot, output: install.output, errorOutput: install.output,
+  });
+  assert.equal(installCode, 0, install.text());
+  assert.match(install.text(), /ignoring invalid runtime ledger/);
+  const repaired = await readLedgerFor(fixture.home);
+  assert.ok(repaired.store_path.startsWith(configDir), repaired.store_path);
+  assert.equal(await readFile(sentinel, 'utf8'), 'keep');
+
+  await invalidLedger();
+  const update = outputCapture();
+  const updateCode = await runSetup(parseArgs(['update', '--yes']), {
+    ...fixture, packageRoot, output: update.output, errorOutput: update.output,
+  });
+  assert.equal(updateCode, 0, update.text());
+  assert.doesNotMatch(update.text(), /No Loam installation found/);
+  assert.ok((await readLedgerFor(fixture.home)).store_path.startsWith(configDir));
+  assert.equal(await readFile(sentinel, 'utf8'), 'keep');
+});
 
 test('harness readiness ignores hook paths outside the setup-owned root', async () => {
   const { fixture, discovery } = await readyHarnessFixture();
@@ -968,4 +1202,88 @@ test('setup harness reconciliation refuses a version mismatch and points to upda
   assert.match(capture.text(), /update` first/);
   // The install version pin is untouched by the refusal.
   assert.equal(JSON.parse(await readFile(metadataPath, 'utf8')).plugin_version, '0.0.1');
+});
+
+function sealStub({ code = 0, created = ['agent_ed25519'] } = {}) {
+  const calls = [];
+  const runner = async (request) => {
+    calls.push(request);
+    if (code !== 0) return { code, stdout: '', stderr: 'unknown command: seal' };
+    return { code: 0, stdout: JSON.stringify({ principal: 'agent.x@org', created }), stderr: '' };
+  };
+  return { runner, calls };
+}
+
+test('seal: install makes exactly one seal trust init call and reports the key', async () => {
+  const fixture = await baseFixture();
+  const seal = sealStub();
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['install', '--yes']), {
+    ...fixture, packageRoot, sealRunner: seal.runner, output: capture.output, errorOutput: capture.output,
+  });
+  assert.equal(code, 0, capture.text());
+  assert.equal(seal.calls.length, 1);
+  assert.deepEqual(seal.calls[0].args, ['seal', 'trust', 'init', '--json']);
+  assert.match(capture.text(), /Seal key ready/);
+});
+
+test('seal: dry-run issues no seal call', async () => {
+  const fixture = await baseFixture();
+  const seal = sealStub();
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['install', '--dry-run']), {
+    ...fixture, packageRoot, sealRunner: seal.runner, output: capture.output, errorOutput: capture.output,
+  });
+  assert.equal(code, 0);
+  assert.equal(seal.calls.length, 0);
+  assert.match(capture.text(), /Would provision seal key/);
+});
+
+test('seal: a failed final verification issues no seal call', async () => {
+  const fixture = await baseFixture();
+  const seal = sealStub();
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['install', '--yes']), {
+    ...fixture,
+    packageRoot,
+    sealRunner: seal.runner,
+    finalVerify: async () => ({
+      ready: false,
+      install: { plugin_version: PACKAGE_VERSION },
+      skills: { ready: false, category: 'skills_missing' },
+      runtime: { ready: true },
+      harnesses: {},
+      ingestExclusions: { ready: true },
+      migration: { ready: true },
+    }),
+    output: capture.output,
+    errorOutput: capture.output,
+  });
+  assert.equal(code, 1);
+  assert.equal(seal.calls.length, 0);
+});
+
+test('seal: a seal skip leaves the exit code unchanged', async () => {
+  const fixture = await baseFixture();
+  const seal = sealStub({ code: 2 });
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['install', '--yes']), {
+    ...fixture, packageRoot, sealRunner: seal.runner, output: capture.output, errorOutput: capture.output,
+  });
+  assert.equal(code, 0, capture.text());
+  assert.equal(seal.calls.length, 1);
+  assert.match(capture.text(), /Seal key not provisioned \(seal_unavailable(: [^)]+)?\)/);
+});
+
+test('seal: update makes exactly one seal call', async () => {
+  const fixture = await baseFixture();
+  await runSetup(parseArgs(['install', '--yes']), { ...fixture, packageRoot, sealRunner: sealStub().runner, output: outputCapture().output });
+  const seal = sealStub({ created: [] });
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['update']), {
+    ...fixture, packageRoot, sealRunner: seal.runner, output: capture.output, errorOutput: capture.output,
+  });
+  assert.equal(code, 0, capture.text());
+  assert.equal(seal.calls.length, 1);
+  assert.doesNotMatch(capture.text(), /Seal key ready/);
 });

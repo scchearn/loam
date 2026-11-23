@@ -2626,6 +2626,14 @@ mod tests {
             "federation.rs",
             "main.rs",
             "provisioning.rs",
+            // Seals: `sshsig.rs` and `trust.rs` run the reader's `ssh-keygen`;
+            // `record.rs` runs git for tracked-tree detection; `evidence.rs`
+            // runs git for blob/commit resolution and reads evidence files.
+            "seal/carry.rs",
+            "seal/evidence.rs",
+            "seal/record.rs",
+            "seal/sshsig.rs",
+            "seal/trust.rs",
             "service.rs",
             "state.rs",
             "transport.rs",
@@ -2639,6 +2647,10 @@ mod tests {
             // The federation CLI reads the identity bundle and the registry for
             // the one-command connect surface and the lifecycle verbs.
             "federation.rs",
+            // Reads the wiki page tree and the guidance files, and writes back
+            // exactly one thing: the fenced `loam:memory-map` region inside the
+            // workspace `AGENTS.md`. `CLAUDE.md` is read-only here.
+            "guidance.rs",
             // The harness read path reads the installed skill body,
             // `install.json`, and the workspace state that the retired Node
             // integration used to assemble. Reads only — it opens no file for
@@ -2646,11 +2658,27 @@ mod tests {
             "harness.rs",
             "hooks.rs",
             "ipc/unix.rs",
+            // Machine-local workspaces store under the config dir; never reads
+            // federation state.
+            "workspaces.rs",
             "markdown.rs",
             "memory.rs",
             // Reads only, and only two things: the per-project peer roster that
             // decides whom a session admits, and the identity-path PEMs.
             "provisioning.rs",
+            // Seals: the signed-record store and the reader trust files.
+            "seal.rs",
+            // Attest: the page it seals and the record store it creates.
+            "seal/attest.rs",
+            "seal/carry.rs",
+            "seal/evidence.rs",
+            "seal/record.rs",
+            "seal/sshsig.rs",
+            "seal/trust.rs",
+            "seal/lint.rs",
+            "seal/verify.rs",
+            // Derived seal cache under the config dir; never reads or writes the wiki.
+            "seal_cache.rs",
             "service.rs",
             "sha256.rs",
             "state.rs",
@@ -2700,6 +2728,7 @@ mod tests {
                     "network surface introduced in {path}: {forbidden}"
                 );
             }
+            // `std::process::id` (a number) is likewise harmless.
             // `std::process::abort` and `std::process::exit` are not subprocess
             // capabilities: each ends this process, neither starts another. The
             // Windows IPC fail-safe aborts when a cancelled overlapped operation
@@ -2710,7 +2739,8 @@ mod tests {
             // subprocess-spawning `std::process` reach.
             let spawn_reach = production
                 .replace("std::process::abort", "")
-                .replace("std::process::exit", "");
+                .replace("std::process::exit", "")
+                .replace("std::process::id", "");
             if spawn_reach.contains("std::process") || spawn_reach.contains("Command::new") {
                 assert!(
                     process_files.contains(&path.as_str()),
@@ -2747,6 +2777,31 @@ mod tests {
             assert!(
                 !production.contains("impl ExtensionView"),
                 "ExtensionView acquired behavior in {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn federation_never_reads_workspaces_store() {
+        // The machine-local workspaces store must stay invisible to federation code.
+        // Production text is cut at the test module, so these needles do not self-trip.
+        const FEDERATION_FILES: [&str; 8] = [
+            "federation.rs",
+            "envelope.rs",
+            "connector.rs",
+            "enrollment.rs",
+            "enrollment_auto.rs",
+            "transport.rs",
+            "service.rs",
+            "ipc.rs",
+        ];
+        for (path, production) in crate_production_sources() {
+            if !(FEDERATION_FILES.contains(&path.as_str()) || path.starts_with("ipc/")) {
+                continue;
+            }
+            assert!(
+                !production.contains("crate::workspaces") && !production.contains("workspaces::"),
+                "federation module {path} references the workspaces store"
             );
         }
     }

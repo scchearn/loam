@@ -55,7 +55,9 @@ test('LoamPlugin logs a loading breadcrumb through the opencode app logger and r
   const logs = [];
   const client = { app: { log: async (entry) => { logs.push(entry); } } };
   const plugin = await LoamPlugin({ client, directory: '/workspace' });
-  assert.equal(typeof plugin['experimental.chat.messages.transform'], 'function', 'the server returns the hooks object');
+  assert.equal(typeof plugin['experimental.chat.system.transform'], 'function', 'the server returns the hooks object');
+  assert.equal(typeof plugin['chat.message'], 'function', 'the per-turn hook is registered');
+  assert.equal(typeof plugin['experimental.session.compacting'], 'function', 'the compaction hook is registered');
 
   const loading = logs.find((entry) => entry?.body?.message === 'plugin loading');
   assert.ok(loading, 'a plugin-loading breadcrumb is logged');
@@ -85,9 +87,8 @@ test('the wake-server open is instrumented: opened(port) on success, failed(err)
   // session that never woke gave no clue why. It now names the outcome in the log.
   const logs = [];
   const client = { app: { log: async (entry) => { logs.push(entry); } }, session: { promptAsync: async () => ({}) } };
-  const fire = (plugin, sessionID) => plugin['experimental.chat.messages.transform']({}, {
-    messages: [{ info: { role: 'user', sessionID }, parts: [{ type: 'text', text: 'p' }] }],
-  });
+  // The wake listener now opens on the first system-transform fire.
+  const fire = (plugin, sessionID) => plugin['experimental.chat.system.transform']({ sessionID }, { system: [] });
 
   const okPlugin = await createOpenCodeAdapter({
     client,
@@ -118,9 +119,10 @@ test('per-hook re-registration: every per-turn boundary re-asserts the wake_ref,
   // render (getContext returns '' here), exactly like the SessionStart register.
   const logs = [];
   const client = { app: { log: async (entry) => { logs.push(entry); } }, session: { promptAsync: async () => ({}) } };
-  const fire = (plugin, sessionID) => plugin['experimental.chat.messages.transform']({}, {
-    messages: [{ info: { role: 'user', sessionID }, parts: [{ type: 'text', text: 'p' }] }],
-  });
+  // SessionStart opens the wake server (system-transform); each user turn
+  // (chat.message) re-asserts the wake_ref.
+  const start = (plugin, sessionID) => plugin['experimental.chat.system.transform']({ sessionID }, { system: [] });
+  const turn = (plugin, sessionID) => plugin['chat.message']({ sessionID }, { parts: [] });
   let reregisters = 0;
   const plugin = await createOpenCodeAdapter({
     client,
@@ -135,13 +137,13 @@ test('per-hook re-registration: every per-turn boundary re-asserts the wake_ref,
   })({ directory: '/workspace' });
 
   // SessionStart opens the server (registration happens in the open), not a reregister.
-  await fire(plugin, 's1');
+  await start(plugin, 's1');
   await pollLogs(logs, 'wake listener opened');
   assert.equal(reregisters, 0, 'SessionStart registers via the server open, never reregister');
 
   // Every subsequent per-turn boundary re-asserts the wake_ref.
-  await fire(plugin, 's1');
-  await fire(plugin, 's1');
+  await turn(plugin, 's1');
+  await turn(plugin, 's1');
   assert.ok(reregisters >= 2, `each per-turn boundary re-registers (got ${reregisters})`);
   assert.ok(await pollLogs(logs, 'wake re-register'), 'the re-register is breadcrumbed');
 });
@@ -297,8 +299,7 @@ test('wake injection renders through the native read path and lands via promptAs
     },
   })({ directory: '/workspace' });
 
-  const output = { messages: [{ info: { role: 'user', sessionID: 'sess-w' }, parts: [{ type: 'text', text: 'prompt' }] }] };
-  await plugin['experimental.chat.messages.transform']({}, output);
+  await plugin['experimental.chat.system.transform']({ sessionID: 'sess-w' }, { system: [] });
   await poll(async () => promptParts.length === 0 || true); // listener spin-up
   await wait(50);
   assert.equal(promptParts.length, 0, 'no injection before any wake frame');
@@ -330,8 +331,8 @@ test('a session without the runtime still starts and the wake server degrades si
     },
   })({ directory: '/workspace' });
   // Must not reject: no listener, no wake, per-turn boundary still delivers.
-  const output = { messages: [{ info: { role: 'user', sessionID: 'sess-x' }, parts: [{ type: 'text', text: 'prompt' }] }] };
-  await plugin['experimental.chat.messages.transform']({}, output);
+  await plugin['experimental.chat.system.transform']({ sessionID: 'sess-x' }, { system: [] });
+  await plugin['chat.message']({ sessionID: 'sess-x' }, { parts: [] });
   await plugin.event({ event: { type: 'session.idle', sessionID: 'sess-x' } });
   await plugin.event({ event: { type: 'session.deleted', sessionID: 'sess-x' } });
 });
@@ -370,10 +371,9 @@ test('wake pulls the drained render (delta + tip) and injects it with the SDK sh
     },
   })({ directory: '/workspace' });
 
-  // First transform fire is SessionStart: it sets loamWake.sessionId and starts
-  // the (injected) wake server, capturing onWake.
-  const output = { messages: [{ info: { role: 'user', sessionID: 'sess-wake2' }, parts: [{ type: 'text', text: 'prompt' }] }] };
-  await plugin['experimental.chat.messages.transform']({}, output);
+  // First system-transform fire is SessionStart: it sets loamWake.sessionId and
+  // starts the (injected) wake server, capturing onWake.
+  await plugin['experimental.chat.system.transform']({ sessionID: 'sess-wake2' }, { system: [] });
   await poll(() => captured !== null);
 
   // A wake injects the drained body verbatim, in the generated-SDK shape — not
@@ -409,7 +409,7 @@ test('wake pulls the drained render (delta + tip) and injects it with the SDK sh
   await poll(() => inputs.length === 3);
 });
 
-test('the first transform registers the wake server even when the render is empty', async () => {
+test('the first system-transform registers the wake server even when the render is empty', async () => {
   // Registration must not be hostage to a contentful first render: a session
   // whose first getContext returns empty (failed hook, quiet federation) must
   // still open its wake listener, or it can never be woken for the whole session.
@@ -427,13 +427,13 @@ test('the first transform registers the wake server even when the render is empt
     },
   })({ directory: '/workspace' });
 
-  const output = { messages: [{ info: { role: 'user', sessionID: 'sess-empty' }, parts: [{ type: 'text', text: 'prompt' }] }] };
-  await plugin['experimental.chat.messages.transform']({}, output);
+  const output = { system: [] };
+  await plugin['experimental.chat.system.transform']({ sessionID: 'sess-empty' }, output);
   await poll(() => registered !== null);
 
   assert.deepEqual(registered, { sessionId: 'sess-empty' }, 'the wake server opens against the session even with an empty render');
-  // The empty render still injects nothing — the context gate governs only the prepend.
-  assert.equal(output.messages[0].parts.length, 1, 'an empty render prepends no context');
+  // The empty render still pushes nothing — the baseline gate governs the push.
+  assert.equal(output.system.length, 0, 'an empty render pushes no context');
 });
 
 test('buildHookArgs passes --session-id for a mailbox drain and omits it without one', () => {
@@ -467,8 +467,7 @@ test('the wake drain carries the registered session id into getContext', async (
     },
   })({ directory: '/workspace' });
 
-  const output = { messages: [{ info: { role: 'user', sessionID: 'sess-wake' }, parts: [{ type: 'text', text: 'p' }] }] };
-  await plugin['experimental.chat.messages.transform']({}, output);
+  await plugin['experimental.chat.system.transform']({ sessionID: 'sess-wake' }, { system: [] });
   await poll(() => captured !== null);
 
   await captured();
@@ -492,12 +491,121 @@ test('per-turn drains the mailbox with the session id; SessionStart renders the 
     wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', port: 0, registered: true, close: async () => {} }),
   })({ directory: '/workspace' });
 
-  const message = () => ({ messages: [{ info: { role: 'user', sessionID: 'sess-turn' }, parts: [{ type: 'text', text: 'p' }] }] });
-  await plugin['experimental.chat.messages.transform']({}, message()); // SessionStart
-  await plugin['experimental.chat.messages.transform']({}, message()); // per-turn
+  await plugin['experimental.chat.system.transform']({ sessionID: 'sess-turn' }, { system: [] }); // SessionStart
+  await plugin['chat.message']({ sessionID: 'sess-turn' }, { parts: [] }); // per-turn
 
   const start = contextCalls.find((call) => call.event === 'SessionStart');
   const turn = contextCalls.find((call) => call.event === 'UserPromptSubmit');
   assert.equal(start.sessionId, null, 'SessionStart renders the full snapshot, no drain');
   assert.equal(turn.sessionId, 'sess-turn', 'per-turn drains the mailbox with the session id');
+});
+
+test('two sessions on one plugin instance each receive the full baseline in the system prompt (#209 point 3)', async () => {
+  // OpenCode runs one server for many sessions. The baseline is cached per
+  // session id, so a second session gets its own SessionStart block — not the
+  // instance-wide "already started, skip" of the old sessionStarted flag.
+  const bySession = {};
+  const plugin = await createOpenCodeAdapter({
+    client: { session: { promptAsync: async () => ({}) } },
+    getContext: async ({ workspace }) => `<LOAM_IMPORTANT>\nYou have loam.\n${workspace}\n</LOAM_IMPORTANT>`,
+    wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', port: 0, registered: true, close: async () => {} }),
+  })({ directory: '/workspace' });
+
+  const outA = { system: [] };
+  const outB = { system: [] };
+  await plugin['experimental.chat.system.transform']({ sessionID: 's-a' }, outA);
+  await plugin['experimental.chat.system.transform']({ sessionID: 's-b' }, outB);
+  bySession.a = outA.system;
+  bySession.b = outB.system;
+  assert.ok(bySession.a[0]?.includes('You have loam'), 'session A gets the full baseline');
+  assert.ok(bySession.b[0]?.includes('You have loam'), 'session B gets the full baseline, not skipped');
+});
+
+test('the baseline spawns the runtime once per session and is byte-identical across calls', async () => {
+  let renders = 0;
+  const plugin = await createOpenCodeAdapter({
+    client: { session: { promptAsync: async () => ({}) } },
+    getContext: async () => { renders += 1; return `<LOAM_IMPORTANT>\nYou have loam. render ${renders}\n</LOAM_IMPORTANT>`; },
+    wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', port: 0, registered: true, close: async () => {} }),
+  })({ directory: '/workspace' });
+
+  const first = { system: [] };
+  const second = { system: [] };
+  await plugin['experimental.chat.system.transform']({ sessionID: 's1' }, first);
+  await plugin['experimental.chat.system.transform']({ sessionID: 's1' }, second);
+  assert.equal(renders, 1, 'the SessionStart render is cached: the runtime spawns once per session');
+  assert.equal(first.system[0], second.system[0], 'the baseline is byte-identical across calls (prompt caching)');
+});
+
+test('chat.message mints a valid persisted part that sorts before its sibling', async () => {
+  // OpenCode 1.18.27 validates user parts before save: id, sessionID, messageID
+  // are required, and the injected part must sort first in the message.
+  const contextCalls = [];
+  const plugin = await createOpenCodeAdapter({
+    client: { session: { promptAsync: async () => ({}) } },
+    getContext: async (opts) => { contextCalls.push(opts); return '<LOAM_IMPORTANT>\n## Federation\nrefresh\n</LOAM_IMPORTANT>'; },
+    wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', port: 0, registered: true, close: async () => {} }),
+  })({ directory: '/workspace' });
+
+  const sibling = { id: 'prt_00112233445566778899', sessionID: 'msg-sess', messageID: 'msg_abc', type: 'text', text: 'user prompt' };
+  const out = { message: { id: 'msg_abc' }, parts: [sibling] };
+  await plugin['chat.message']({ sessionID: 'msg-sess' }, out);
+  const call = contextCalls.find((c) => c.event === 'UserPromptSubmit');
+  assert.equal(call.sessionId, 'msg-sess', 'the drain keys off the input session id, not loamWake.sessionId');
+  assert.equal(out.parts.length, 2, 'the render is prepended as a persisted part');
+  const injected = out.parts[0];
+  assert.ok(injected.text.includes('## Federation'), 'the injected part leads');
+  assert.ok(typeof injected.id === 'string' && injected.id.startsWith('prt_'), 'it carries a part id (required before save)');
+  assert.equal(injected.sessionID, 'msg-sess', 'it carries a sessionID');
+  assert.equal(injected.messageID, 'msg_abc', 'it carries a messageID');
+  assert.ok(injected.id < sibling.id, 'the minted id sorts before the sibling, so the block leads the message');
+  assert.equal(injected.id, 'prt_00112233445500000000000000', 'same 12-hex time prefix, all-zero tail');
+  assert.equal(injected.synthetic, true, 'synthetic keeps the part out of the TUI while still reaching the model');
+});
+
+test('chat.message with no sibling part injects nothing (no invalid part)', async () => {
+  // Without a sibling part there is no safe id to mint from; emitting a bare part
+  // would fail OpenCode's pre-save schema, so the hook skips (the system prompt
+  // still carries the baseline).
+  const plugin = await createOpenCodeAdapter({
+    client: { session: { promptAsync: async () => ({}) } },
+    getContext: async () => '<LOAM_IMPORTANT>\n## Federation\nrefresh\n</LOAM_IMPORTANT>',
+    wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', port: 0, registered: true, close: async () => {} }),
+  })({ directory: '/workspace' });
+
+  const out = { parts: [{ type: 'text', text: 'user prompt' }] };
+  await plugin['chat.message']({ sessionID: 'no-ref-sess' }, out);
+  assert.equal(out.parts.length, 1, 'no sibling id, no injected part');
+});
+
+test('chat.message with an empty render leaves the parts untouched', async () => {
+  const plugin = await createOpenCodeAdapter({
+    client: { session: { promptAsync: async () => ({}) } },
+    getContext: async () => '',
+    wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', port: 0, registered: true, close: async () => {} }),
+  })({ directory: '/workspace' });
+
+  const out = { parts: [{ id: 'prt_00112233445566778899', sessionID: 'empty-sess', messageID: 'm', type: 'text', text: 'user prompt' }] };
+  await plugin['chat.message']({ sessionID: 'empty-sess' }, out);
+  assert.equal(out.parts.length, 1, 'an empty render adds no part');
+});
+
+test('the compaction hook re-supplies the cached baseline', async () => {
+  const plugin = await createOpenCodeAdapter({
+    client: { session: { promptAsync: async () => ({}) } },
+    getContext: async () => '<LOAM_IMPORTANT>\nYou have loam.\n</LOAM_IMPORTANT>',
+    wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', port: 0, registered: true, close: async () => {} }),
+  })({ directory: '/workspace' });
+
+  // Cache the baseline for the session first.
+  await plugin['experimental.chat.system.transform']({ sessionID: 'compact-sess' }, { system: [] });
+  const out = { context: [] };
+  await plugin['experimental.session.compacting']({ sessionID: 'compact-sess' }, out);
+  assert.equal(out.context.length, 1, 'the baseline survives compaction');
+  assert.ok(out.context[0].includes('You have loam'), 'the retained context carries the router block');
+
+  // A session with no cached baseline pushes nothing.
+  const bare = { context: [] };
+  await plugin['experimental.session.compacting']({ sessionID: 'unknown-sess' }, bare);
+  assert.equal(bare.context.length, 0, 'no baseline, nothing pushed');
 });

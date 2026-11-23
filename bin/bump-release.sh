@@ -163,6 +163,25 @@ stage_literal() {
   ' "$src" > "$STAGE/$(printf '%s' "$file" | tr '/' '_')" || fail "$file: rewrite failed"
 }
 
+# Cargo.lock holds one [[package]] block per crate; only loam's version moves.
+stage_cargo_lock() {
+  local src="$ROOT/Cargo.lock"
+  [[ -f "$src" ]] || fail "missing Cargo.lock"
+  local staged="$STAGE/Cargo.lock" count
+  count="$(awk -v old="version = \"$OLD\"" -v new="version = \"$NEW\"" -v out="$staged" '
+    /^\[\[package\]\]$/ { in_loam = 0 }
+    $0 == "name = \"loam\"" { in_loam = 1 }
+    {
+      line = $0
+      if (in_loam && line == old) { n++; line = new; in_loam = 0 }
+      print line > out
+    }
+    END { print n + 0 }
+  ' "$src")" || fail "Cargo.lock: rewrite failed"
+  [[ "$count" == "1" ]] \
+    || fail "Cargo.lock: expected the loam package at $OLD exactly once, found $count"
+}
+
 # Cargo.toml needs a whole-line match: a dependency pin such as
 # `chrono = { version = "0.4" }` would otherwise collide with a runtime
 # version of 0.4.
@@ -182,22 +201,51 @@ stage_cargo_line() {
   ' "$src" > "$STAGE/cli_Cargo.toml" || fail "$file: rewrite failed"
 }
 
+# package-lock.json carries the package's own version twice: the root field and
+# packages[""]. Editing both is what `npm install --package-lock-only` would do
+# for a version-only change, without needing npm at bump time. A dependency can
+# legitimately share the version string (e.g. node_modules/sisteransi at
+# 1.0.5), so a file-wide literal replace is wrong here. Match by position in
+# npm's fixed 2-space layout instead: the root `version` at indent 2, and the
+# `version` at indent 6 inside the `"": {` block at indent 4. Each must occur
+# exactly once; every other line is copied through untouched.
+stage_lockfile() {
+  local file="package-lock.json"
+  local src="$ROOT/$file"
+  [[ -f "$src" ]] || fail "missing $file"
+
+  local staged="$STAGE/$file"
+  local counts
+  counts="$(awk -v old="\"version\": \"$OLD\"" -v new="\"version\": \"$NEW\"" -v out="$staged" '
+    function swap(line) { sub(/"version": "[^"]*"/, new, line); return line }
+    {
+      line = $0
+      if (line == "    \"\": {") in_root_pkg = 1
+      else if (in_root_pkg && line ~ /^    }/) in_root_pkg = 0
+
+      if (line == "  " old || line == "  " old ",") { root++; line = swap(line) }
+      else if (in_root_pkg && (line == "      " old || line == "      " old ",")) { pkg++; line = swap(line) }
+      print line > out
+    }
+    END { print root + 0, pkg + 0 }
+  ' "$src")" || fail "$file: rewrite failed"
+
+  [[ "$counts" == "1 1" ]] \
+    || fail "$file: expected the root and packages[\"\"] version to be $OLD once each, found (root pkg) = ($counts)"
+}
+
 if [[ "$DOMAIN" == "plugin" ]]; then
   stage_literal "package.json"                    1 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
-  # The lockfile carries the package's own version twice: the root field and
-  # packages[""]. Editing both is what `npm install --package-lock-only` would
-  # do for a version-only change, without needing npm at bump time. If a
-  # dependency ever pins this exact version the count guard fails loudly rather
-  # than rewriting it.
-  stage_literal "package-lock.json"               2 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
+  stage_lockfile
   stage_literal ".claude-plugin/marketplace.json" 2 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
   stage_literal "plugins/loam-adapter/.codex-plugin/plugin.json" 1 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
   stage_literal ".cursor-plugin/plugin.json"      1 "\"version\": \"$OLD\"" "\"version\": \"$NEW\""
 else
   stage_cargo_line
-  # Cargo.lock is generated with one exact copy of the crate version. Refuse
-  # if a dependency shares it rather than rewriting an unrelated package.
-  stage_literal "Cargo.lock" 1 "version = \"$OLD\"" "version = \"$NEW\""
+  # Cargo.lock: rewrite only the version line of the [[package]] named loam.
+  # A dependency may share the version string (e.g. cfg-if 1.0.4), so a plain
+  # string match is not enough; refuse unless exactly one loam entry matches.
+  stage_cargo_lock
   # RUNTIME_VERSION is the package-baked runtime target the channel ledger
   # records; it must move in lockstep with cli/Cargo.toml [package] (check.rs
   # gates the two into agreement). Same exact-string staging as Cargo.lock.

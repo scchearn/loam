@@ -13,7 +13,7 @@ export const SKILLS_CLI_VERSION = '1.5.20';
 // `cli/Cargo.toml [package]` (T9), and `cli/src/check.rs` gates the two into
 // agreement. It is NOT read from the skills tree — a stale skills `CLI_VERSION`
 // can never again freeze the runtime. See plans/runtime-channel-ledger.md.
-export const RUNTIME_VERSION = '0.11.0-next.20';
+export const RUNTIME_VERSION = '1.1.0';
 
 // Core semver with optional semver-2.0.0 prerelease; build metadata (`+...`)
 // stays rejected (npm refuses it and `+` in tag-derived URLs is unsafe).
@@ -47,12 +47,12 @@ export const EXIT_CODES = Object.freeze({
 export const HELP_TEXT = `Loam CLI
 
 Three verbs, one job each:
-  npx @scchearn/loam install     First-time install; re-run repairs a same-version install.
+  npx @scchearn/loam install     First-time install; interactive runs can enable optional integrations.
   npx @scchearn/loam update      Bump an existing install to this version, and nothing else.
   npx @scchearn/loam setup       Configure an existing install: federation, integrations, harnesses.
 
 Usage:
-  npx @scchearn/loam install [--yes] [--dry-run]
+  npx @scchearn/loam install [--integration <id>]... [--yes] [--dry-run]
   npx @scchearn/loam update [--yes] [--dry-run]
   npx @scchearn/loam setup [--federation enable|disable] [--integration <id>]... [--purge] [--yes] [--dry-run]
   npx @scchearn/loam doctor
@@ -62,8 +62,11 @@ Usage:
 
 Commands:
   install     First-time installation of global Loam skills, runtime, harness
-              adapters, and shared integration. Idempotent — re-running repairs a
-              damaged install at the same version; a healthy install is a fast no-op.
+              adapters, and shared integration. Interactive runs can enable optional
+              integrations; --yes leaves them disabled unless explicitly requested.
+              Idempotent — re-running
+              repairs a damaged install at the same version; a healthy install is a
+              fast no-op.
   update      Move an existing install to this package's version: skills pin,
               runtime binary, regenerated adapters, refreshed service definitions.
               Refuses with a hint when no install exists; changes nothing else.
@@ -77,7 +80,7 @@ Options:
   --yes           Accept changes without interactive confirmation.
   --dry-run       Preview changes without mutation or downloads.
   --federation    With setup, enable or disable the federation connector service.
-  --integration   With setup, select an optional integration to enable (repeatable).
+  --integration   With setup, or install for an explicit first-run choice, select an optional integration (repeatable).
   --purge         With uninstall, destroy the federation profile in the config dir.
                   With setup --federation disable, also remove large derived caches.
   --help          Show this help without network access.

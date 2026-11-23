@@ -914,7 +914,7 @@ fn has_overview_section(index: &str) -> bool {
 }
 
 /// Workspace-relative `.md` pages that the root hub is expected to catalogue.
-fn durable_pages(wiki_root: &Path) -> Vec<String> {
+pub(crate) fn durable_pages(wiki_root: &Path) -> Vec<String> {
     let mut pages = Vec::new();
     collect_pages(wiki_root, wiki_root, &mut pages);
     pages.sort();
@@ -947,7 +947,7 @@ fn is_derived(page: &str) -> bool {
     page.starts_with("code/") || page.starts_with("log-archive/")
 }
 
-const CODE_HUB: &str = "code/_index.md";
+pub(crate) const CODE_HUB: &str = "code/_index.md";
 
 /// The code graph reaches the root through exactly one reserved hub page.
 /// Ordinary code pages belong in that hub, never in `index.md`.
@@ -1146,7 +1146,7 @@ fn find_from(haystack: &[char], start: usize, needle: &str) -> Option<usize> {
         .find(|index| haystack[*index..*index + needle.len()] == needle[..])
 }
 
-fn stem(page: &str) -> String {
+pub(crate) fn stem(page: &str) -> String {
     page.rsplit('/')
         .next()
         .unwrap_or(page)
@@ -1154,7 +1154,7 @@ fn stem(page: &str) -> String {
         .to_owned()
 }
 
-fn relative(base: &Path, path: &Path) -> String {
+pub(crate) fn relative(base: &Path, path: &Path) -> String {
     let base = fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     path.strip_prefix(&base)
@@ -1162,7 +1162,7 @@ fn relative(base: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))
 }
 
-fn join_display(root: &str, page: &str) -> String {
+pub(crate) fn join_display(root: &str, page: &str) -> String {
     if root.is_empty() {
         page.to_owned()
     } else {

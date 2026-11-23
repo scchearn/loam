@@ -86,6 +86,15 @@ The wiki layer is stored in `<wiki path>`. The agent owns and maintains those fi
 - Use `[[wikilinks]]` in grouped sections so the index acts as a hub note.
 - Keep entries grouped by section.
 
+## Guidance-file rules
+
+- Root `AGENTS.md` carries a `## Memory` section whose fenced `loam:memory-map` region lists the durable page slugs by page type — the *what exists* altitude above `index.md`'s *what each is about*.
+- Loam owns only the bytes between the markers and regenerates them; the heading and the prose above the opening marker are human-editable.
+- Marker strings and generation rules come from `loam-auditing-guidance/references/templates.md` → "Template: Memory (Loam memory map)". That is the single source; do not fork it.
+- Seed the region at scaffold time. With no durable pages yet, the bare marker pair is a complete and current region.
+- Refresh it with `/loam::auditing-guidance` or `loam lint --only guidance --fix` whenever pages are added or removed.
+- `CLAUDE.md` stays exactly `@AGENTS.md`; the block is never written there.
+
 ## Log rules
 
 - `log.md` is append-only.
@@ -139,6 +148,7 @@ Periodically check for:
 - missing reciprocal backlinks where the relationship is clearly material
 - outdated index entries
 - a legacy root `overview.md` that should be consolidated into `index.md`
+- a missing or stale `loam:memory-map` region in root `AGENTS.md` (`guidance-map-missing` / `guidance-map-stale`)
 - `log.md` exceeding 500 lines (rotate per the Log rules above)
 
 ## Non-negotiable rules

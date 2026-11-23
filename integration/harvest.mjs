@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, stat as fsStat } from 'node:fs/promises';
 
 import { canonicalWorkspace } from './ingest.mjs';
+import { commitMemoryWrites, readMemoryCommitConfig, snapshotMemory } from './memory-commit.mjs';
 import {
   readHarvestConfig, readHarvestState, writeHarvestState,
   harvestLastRunPath, pruneHarvestSessions,
@@ -197,7 +198,7 @@ async function pruneWindowFiles(root, retainWindows) {
 export async function runHarvest({
   harness, workspace, sessionId, globalRoot, skillsRoot, env = process.env,
   probeFullState, backend, readWindow, launch, acquireLease: acquire, releaseLease: release,
-  writeSkip, launchModel: modelLauncher, openCodeSession,
+  writeSkip, launchModel: modelLauncher, openCodeSession, memoryCommit, waitForWriter,
 } = {}) {
   const config = await readHarvestConfig(globalRoot, env);
   const canonical = await canonicalWorkspace(workspace);
@@ -336,6 +337,11 @@ export async function runHarvest({
         hard_deadline: new Date(Date.now() + config.timeout_seconds * 1000).toISOString(),
       });
     }
+    // Snapshot before the harvester runs so the commit covers only this run's writes.
+    const memory = memoryCommit || { snapshotMemory, commitMemoryWrites };
+    const memorySnapshot = await memory.snapshotMemory({
+      wikiRoot: wiki.root, globalRoot, config: await readMemoryCommitConfig(globalRoot, env), env,
+    });
     const launched = await launchFn({
       harness, workspace: canonical, sessionId, globalRoot, skillsRoot,
       lease, windowPath, config, env, openCodeSession, root,
@@ -347,7 +353,32 @@ export async function runHarvest({
     if (launched?.orphaned === true) {
       return { reason: 'busy', cursorChanged: false };
     }
+    if (launched?.background) {
+      // Background launches resolve `completion` at start, not finish. Never commit
+      // (or advance the cursor) until the writer is confirmed terminal.
+      const deadline = Date.parse(lease.hard_deadline) || Date.now() + config.timeout_seconds * 1000;
+      const waiter = waitForWriter || defaultWaitForWriter;
+      let writer;
+      try {
+        writer = await waiter({ launched, lease, workspace: canonical, env, openCodeSession, deadline });
+      } catch { writer = { state: 'unknown' }; }
+      // Same rule as ingest's finalizeWorkerRun: only 'live'/'unknown' keep the lease;
+      // 'terminal' and 'dead' (seen live, then gone) mean the writer has exited.
+      if (writer?.state !== 'terminal' && writer?.state !== 'dead') {
+        leaseHandled = true; // retain the lease: a writer may still be running
+        await atomicJson(harvestLastRunPath(globalRoot, canonical), {
+          schema: 1, completed_at: Date.now(), status: 'skipped', reason: 'busy',
+          session_id: sessionId, memory_commit: 'commit_skipped:writer_unconfirmed',
+        });
+        return { reason: 'busy', cursorChanged: false, memory_commit: 'commit_skipped:writer_unconfirmed' };
+      }
+    }
 
+    const sessionTag = hash(sessionId).slice(0, 8);
+    const commit = await memory.commitMemoryWrites({
+      snapshot: memorySnapshot, kind: 'harvest', env,
+      summary: (written) => `${exchanges.length} ${exchanges.length === 1 ? 'turn' : 'turns'} from session ${sessionTag}, ${written.length} memory ${written.length === 1 ? 'file' : 'files'}`,
+    });
     const boundaryCursor = window.boundaryCursor ?? 0;
     const previousCursor = Number(effectiveState.cursor?.value || 0);
     const nextCursor = Math.max(previousCursor, boundaryCursor);
@@ -363,13 +394,29 @@ export async function runHarvest({
       schema: 1, completed_at: Date.now(), status: 'ok', reason: 'ok',
       session_id: sessionId, turns: exchanges.length, conversation_bytes: conversationBytes,
       zero_admission: exchanges.length === 0,
+      ...commit,
     });
     await pruneHarvestSessions(globalRoot, canonical, config);
     await pruneWindowFiles(root, config.retain_sessions);
-    return { reason: 'ok', sessionId, cursorChanged: true, boundaryCursor: nextCursor, turns: exchanges.length, conversation_bytes: conversationBytes };
+    return { reason: 'ok', sessionId, ...commit, cursorChanged: true, boundaryCursor: nextCursor, turns: exchanges.length, conversation_bytes: conversationBytes };
   } finally {
     if (!leaseHandled) await releaseFn(root, lease.lease_id);
   }
+}
+
+async function defaultWaitForWriter({ launched, lease, workspace, env, openCodeSession, deadline }) {
+  const { waitForClaude, stopClaude, waitForOpenCode } = await import('./ingest.mjs');
+  const claude = lease.launch_mode === 'claude_bg';
+  const wait = (limit) => (claude
+    ? waitForClaude(workspace, lease, limit, env)
+    : waitForOpenCode(openCodeSession, launched.sessionId, limit));
+  let manager = await wait(deadline);
+  if (manager.state === 'live') {
+    if (claude) await stopClaude(workspace, lease, env);
+    else if (typeof openCodeSession?.abort === 'function') { try { await openCodeSession.abort(launched.sessionId); } catch {} }
+    manager = await wait(Date.now() + 5000);
+  }
+  return manager;
 }
 
 export async function harvestStatus({ globalRoot, workspace, env = process.env } = {}) {

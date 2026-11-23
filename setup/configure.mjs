@@ -10,6 +10,7 @@ import {
 } from './federation.mjs';
 import { catalogEntry, CATALOG } from './integrations/catalog.mjs';
 import { readLedger, resolveRuntimePath } from '../integration/ledger.mjs';
+import { provisionSealTrust } from './seal.mjs';
 import { announce, finish, stepStart, stepDone, stepDetail, confirmAction } from './wizard.mjs';
 
 // `setup` is the configurator for an EXISTING install: it toggles federation and
@@ -133,13 +134,20 @@ async function configureFederation(action, { discovery, install, parsed, options
   return { ok: true };
 }
 
-async function configureIntegration(id, mode, { discovery, install, parsed, options }) {
+function retryCommand(id, mode) {
+  return mode === 'enable'
+    ? `npx @scchearn/loam setup --integration ${id}`
+    : `npx @scchearn/loam setup --disable-integration ${id}`;
+}
+
+export async function configureIntegration(id, mode, { discovery, install, parsed, options }) {
   const output = options.output || process.stdout;
   const errorOutput = options.errorOutput || process.stderr;
   const entry = catalogEntry(id);
   if (!entry) {
     const known = CATALOG.map((e) => e.id).join(', ') || 'none available in this release';
     errorOutput.write(`Unknown integration: ${id} (available: ${known})\n`);
+    if (mode === 'enable') errorOutput.write(`Retry with: ${retryCommand(id, mode)}\n`);
     return { ok: false };
   }
   const ctx = {
@@ -152,6 +160,7 @@ async function configureIntegration(id, mode, { discovery, install, parsed, opti
     // Tool install/health spawns go through toolRunner (injected in tests, real
     // spawn in production); the cache-removal prompt uses confirm/input.
     toolRunner: options.toolRunner,
+    env: options.env || discovery.env,
     confirm: options.integrationConfirm,
     input: options.input,
     output,
@@ -159,12 +168,21 @@ async function configureIntegration(id, mode, { discovery, install, parsed, opti
   if (mode === 'enable' && entry.egress) {
     stepDetail(output, `${entry.label} sends queries to a third-party service (egress) — enabling is your consent.`);
   }
-  const result = mode === 'enable' ? await entry.enable(ctx) : await entry.disable(ctx);
+  let result;
+  try {
+    result = mode === 'enable' ? await entry.enable(ctx) : await entry.disable(ctx);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    errorOutput.write(`Integration ${id} ${mode} failed: ${detail}\n`);
+    if (mode === 'enable') errorOutput.write(`Retry with: ${retryCommand(id, mode)}\n`);
+    return { ok: false };
+  }
   if (!result?.ready) {
     const leftovers = result?.leftovers?.length
       ? ` — leftovers: ${result.leftovers.map((l) => l.harness ? `${l.kind}:${l.harness}` : (l.path || l.kind)).join(', ')}`
       : '';
     errorOutput.write(`Integration ${id} ${mode} failed: ${result?.detail || result?.category || 'unknown'}${leftovers}\n`);
+    if (mode === 'enable') errorOutput.write(`Retry with: ${retryCommand(id, mode)}\n`);
     return { ok: false };
   }
   stepDone(output, `Integration ${id} ${mode === 'enable' ? 'enabled' : 'disabled'}`);
@@ -224,6 +242,25 @@ export async function runConfigure(parsed, options = {}) {
     // The runtime version is the ledger target now (schema-2 install.json drops
     // runtime_version); the schema-1 field is a display fallback only.
     const ledger = await readLedger({ home: discovery.home, platform: discovery.platform });
+
+    // Provision the agent seal key on any existing install, before the
+    // component-flag early return. Silent unless something was created; a skip
+    // (older runtime, no ssh-keygen) never fails or prints.
+    if (!parsed.dryRun) {
+      const runtimePath = (await resolveRuntimePath({
+        globalRoot: discovery.globalRoot,
+        home: discovery.home,
+        platform: discovery.platform,
+      }));
+      if (runtimePath) {
+        const seal = await provisionSealTrust({
+          runtimePath,
+          cwd: discovery.globalRoot,
+          runner: options.sealRunner,
+        });
+        if (seal.ready && seal.created.length) stepDone(output, `Seal key ready — ${seal.principal}`);
+      }
+    }
 
     // The integration actions to apply, as {id, mode}. Flag-driven from
     // --integration (enable) and --disable-integration (disable).

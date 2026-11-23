@@ -10,6 +10,7 @@ import { resolveRuntimePath } from '../integration/ledger.mjs';
 import { verifyGlobalSkills, skillsAgentsFor } from './skills.mjs';
 import { isOwnedCommand, nativeHookCommand, renderOpenCodePlugin } from './harnesses.mjs';
 import { federationDefinitionExists, verifyFederationService } from './federation.mjs';
+import { verifyShim } from './shim.mjs';
 
 async function fileExists(path) {
   try {
@@ -52,13 +53,13 @@ async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, 
     // top-level export as a plugin factory); the adapter factory rides on it.
     const adapter = await module.LoamPlugin.createOpenCodeAdapter({
       getContext: async () => context,
-      // The envelope check fires the transform, which starts the notify
+      // The envelope check fires the system-transform, which starts the notify
       // listener on its first fire; a real listener would keep the process
       // alive, so verification uses a stub.
       wakeServer: async () => ({ wakeRef: 'notify-tcp://127.0.0.1:0', registered: false, close: async () => {} }),
     })({ directory: workspace });
-    const output = { messages: [{ info: { role: 'user' }, parts: [{ type: 'text', text: 'prompt' }] }] };
-    await adapter['experimental.chat.messages.transform']({}, output);
+    const output = { system: [] };
+    await adapter['experimental.chat.system.transform']({ sessionID: 'verify' }, output);
     const previous = process.env.LOAM_INGEST_BACKGROUND;
     const previousGlobal = process.env.LOAM_INGEST_GLOBAL_ROOT;
     process.env.LOAM_INGEST_BACKGROUND = '0';
@@ -74,7 +75,7 @@ async function verifyAdapterEnvelope(id, assetPath, workspace, integrationPath, 
         else process.env.LOAM_INGEST_GLOBAL_ROOT = previousGlobal;
       }
     }
-    return output.messages[0].parts.filter((part) => part.type === 'text' && part.text === context).length === 1
+    return output.system.filter((entry) => entry === context).length === 1
       && typeof adapter.event === 'function';
   }
   const result = await module.handleCursorHook({ cwd: workspace }, { getContext: async () => context });
@@ -138,7 +139,20 @@ async function verifyHarness(id, harness, { packageRoot, globalRoot, install, wo
   // The injected hook command runs the config-dir store binary; compare against
   // the ledger's store_path (schema-1 install.json runtime_path as migration
   // fallback), never a dropped schema-2 field.
-  const runtimePath = (await resolveRuntimePath({ globalRoot, home, platform })) ?? install.runtime_path;
+  // An invalid ledger makes this strict resolver throw; report the harness as
+  // not ready (so install/update proceeds to replace the ledger) rather than
+  // letting it escape verification.
+  let runtimePath;
+  try {
+    runtimePath = (await resolveRuntimePath({ globalRoot, home, platform })) ?? install.runtime_path;
+  } catch (error) {
+    return {
+      ...harness,
+      ready: false,
+      category: 'runtime_ledger_invalid',
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
   try {
     if (id === 'claude' || id === 'codex') {
       if (!harness.marketplaceReady || !harness.marketplaceRoot) return { ...harness, ready: false, category: 'plugin_incomplete' };
@@ -242,6 +256,7 @@ export async function verifyInstallation({
         platform: discovery.platform,
         arch: discovery.arch,
         home: discovery.home,
+        env: discovery.env || process.env,
         install,
       })
     : { ready: false, category: 'install_metadata_missing' };
@@ -253,6 +268,16 @@ export async function verifyInstallation({
       timeoutMs: runtimeTimeoutMs,
     });
   }
+  const shim = install
+    ? await verifyShim({
+        home: discovery.home,
+        globalRoot: discovery.globalRoot,
+        platform: discovery.platform,
+        env: discovery.env || process.env,
+        integrationPath: install.integration_path,
+        expectedRuntimePath: runtime.runtimePath,
+      })
+    : { ready: false, category: 'install_metadata_missing' };
   const harnesses = {};
   for (const [id, harness] of Object.entries(discovery.harnesses)) {
     harnesses[id] = await verifyHarness(id, harness, {
@@ -306,10 +331,11 @@ export async function verifyInstallation({
     };
   }
   return {
-    ready: Boolean(pluginVersionReady && skills.ready && runtime.ready && harnessReady && migration.ready && ingestExclusions.ready && federation.ready),
+    ready: Boolean(pluginVersionReady && skills.ready && runtime.ready && shim.ready && harnessReady && migration.ready && ingestExclusions.ready && federation.ready),
     install,
     skills,
     runtime,
+    shim,
     harnesses,
     ingestExclusions,
     harvestAgent,
