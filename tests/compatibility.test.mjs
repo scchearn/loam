@@ -21,10 +21,12 @@ const ingestWorkerPath = join(packageRoot, 'adapters', 'ingest-worker.mjs');
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 async function runHook(env, payload = {}, path = marketplaceStopPath) {
+  // Never inherit the developer's LOAM_* / HCOM_* (HCOM_LAUNCHED_BY would flip the delegated-lane gate).
+  const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(LOAM_|HCOM_)/.test(key)));
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path], {
       cwd: packageRoot,
-      env: { ...process.env, ...env },
+      env: { ...inherited, ...env },
     });
     let stdout = '';
     let stderr = '';
@@ -342,7 +344,7 @@ test('packaged SubagentStart and SubagentStop handlers emit one inert JSON respo
   const home = await mkdtemp(join(tmpdir(), 'loam-subagent-output-'));
   for (const path of [marketplaceSubagentStartPath, marketplaceSubagentStopPath]) {
     const result = await runHook({
-      HOME: home, USERPROFILE: home, LOAM_HOME: join(home, '.agents', 'loam'), PLUGIN_ROOT: marketplaceRoot,
+      HOME: home, USERPROFILE: home, LOAM_HOME: join(home, '.agents', 'loam'), LOAM_CONFIG_DIR: join(home, 'config'), PLUGIN_ROOT: marketplaceRoot,
     }, { cwd: home, turn_id: 'turn-missing', agent_id: 'agent-missing', agent_type: 'loam_ingestor' }, path);
     assert.equal(result.code, 0, result.stderr);
     assert.equal(result.stdout, '{}\n');
@@ -493,6 +495,7 @@ test('marketplace Stop writes exact hook JSON when logging is unavailable', asyn
     HOME: home,
     USERPROFILE: home,
     LOAM_HOME: join(home, '.agents', 'loam'),
+    LOAM_CONFIG_DIR: join(home, 'config'),
     PLUGIN_ROOT: marketplaceRoot,
   }, { cwd: home }, marketplaceStopPath);
 

@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { EXIT_CODES, HELP_TEXT, PACKAGE_VERSION } from '../setup/constants.mjs';
 import { parseArgs } from '../setup/args.mjs';
 
-export async function main(argv = process.argv.slice(2), output = process.stdout, errorOutput = process.stderr) {
+export async function main(argv = process.argv.slice(2), output = process.stdout, errorOutput = process.stderr, context = {}) {
   try {
     const parsed = parseArgs(argv);
     if (parsed.command === 'help') {
@@ -28,6 +28,10 @@ export async function main(argv = process.argv.slice(2), output = process.stdout
     if (parsed.command === 'setup') {
       const { runConfigure } = await import('../setup/configure.mjs');
       return await runConfigure(parsed, { output, errorOutput });
+    }
+    if (parsed.command === 'ingest') {
+      const { runIngest } = await import('../setup/ingest-config.mjs');
+      return await runIngest(parsed, { output, errorOutput, ...context });
     }
     if (parsed.command === 'doctor') {
       const { runDoctor } = await import('../setup/doctor.mjs');

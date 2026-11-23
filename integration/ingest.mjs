@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import path from 'node:path';
 import { join, resolve } from 'node:path';
 
 import { assertInside, resolveSkillsRoot } from './paths.mjs';
+import { configRoot } from './config-store.mjs';
 import { readInstallMetadata } from './metadata.mjs';
 import { checkReadiness, invokeRuntime, probeFullState } from './runtime.mjs';
 import {
@@ -23,8 +26,12 @@ export function claudeSessionName(workspace) { return `loam-ingest-${hash(worksp
 export function runRoot(globalRoot, workspace) { return join(resolve(globalRoot), 'run', hash(workspace).slice(0, 16)); }
 async function json(path, fallback = null) { try { return JSON.parse(await readFile(path, 'utf8')); } catch { return fallback; } }
 async function jsonRecord(path) {
-  try { return { present: true, value: JSON.parse(await readFile(path, 'utf8')) }; }
-  catch (error) { return error?.code === 'ENOENT' ? { present: false } : { present: true, malformed: true }; }
+  try {
+    const text = await readFile(path, 'utf8');
+    // Rust `read_config` treats an empty or whitespace-only file as absent.
+    if (text.trim() === '') return { present: false };
+    return { present: true, value: JSON.parse(text) };
+  } catch (error) { return error?.code === 'ENOENT' ? { present: false } : { present: true, malformed: true }; }
 }
 async function ensureRoot(root) { await mkdir(root, { recursive: true, mode: 0o700 }); }
 async function delay(ms) { await new Promise((resolvePromise) => setTimeout(resolvePromise, ms)); }
@@ -64,18 +71,80 @@ async function sendNotification(notify, configuredVisibility, event) {
   finally { clearTimeout(timer); }
 }
 
-export async function readIngestConfig(globalRoot, env = process.env) {
-  const file = await json(join(resolve(globalRoot), 'config.json'), {});
-  const section = file?.background_ingest || {};
-  const enabled = env.LOAM_INGEST_BACKGROUND === '0'
-    ? false : env.LOAM_INGEST_BACKGROUND === '1' ? true : section.enabled !== false;
+function sectionOf(record) {
+  const section = record?.value?.background_ingest;
+  return section && typeof section === 'object' && !Array.isArray(section) ? section : {};
+}
+
+function expandHome(entry, env) {
+  if (entry === '~') return env.HOME || env.USERPROFILE || homedir();
+  if (/^~[\\/]/u.test(entry)) return join(env.HOME || env.USERPROFILE || homedir(), entry.slice(2));
+  return entry;
+}
+
+function contained(root, candidate, pathApi, caseFold) {
+  const [a, b] = caseFold ? [root.toLowerCase(), candidate.toLowerCase()] : [root, candidate];
+  const rel = pathApi.relative(a, b);
+  return rel === '' || (!rel.startsWith('..') && !pathApi.isAbsolute(rel));
+}
+
+// Resolves whether background ingest is on for `workspace` and why.
+// Precedence: env 0 -> env 1 -> delegated hcom lane -> config off -> allowlist
+// -> config on -> default off. Config dir (`configRoot()/config.json`, the file
+// Rust's `read_config` reads) wins over the legacy `<globalRoot>/config.json`,
+// whose `enabled: false` stays a kill switch.
+export async function readIngestConfig(globalRoot, env = process.env, workspace, { platform = process.platform } = {}) {
+  const configDir = configRoot({ env });
+  const configPath = configDir ? join(configDir, 'config.json') : null;
+  const [primary, legacy] = await Promise.all([
+    configPath ? jsonRecord(configPath) : { present: false },
+    jsonRecord(join(resolve(globalRoot), 'config.json')),
+  ]);
+  const configError = primary.malformed ? 'config_malformed' : legacy.malformed ? 'legacy_config_malformed' : null;
+  const section = sectionOf(primary);
+  const old = sectionOf(legacy);
+  const tuned = (key, fallback) => numeric(section[key], numeric(old[key], fallback));
+
+  const ignored = [];
+  const entries = [];
+  const pathApi = platform === 'win32' ? path.win32 : path.posix;
+  if (section.workspaces !== undefined && !Array.isArray(section.workspaces)) ignored.push(section.workspaces);
+  for (const raw of Array.isArray(section.workspaces) ? section.workspaces : []) {
+    const expanded = typeof raw === 'string' ? expandHome(raw.trim(), env) : '';
+    if (!expanded || !pathApi.isAbsolute(expanded)) { ignored.push(raw); continue; }
+    entries.push(expanded);
+  }
+
+  let enabledBy = 'default_off';
+  const delegated = typeof env.HCOM_LAUNCHED_BY === 'string' && env.HCOM_LAUNCHED_BY.trim() !== '' && env.HCOM_LAUNCHED_BY.trim() !== 'user';
+  if (env.LOAM_INGEST_BACKGROUND === '0') enabledBy = 'env_off';
+  else if (env.LOAM_INGEST_BACKGROUND === '1') enabledBy = 'env_on';
+  else if (delegated) enabledBy = 'delegated_lane';
+  else if (section.enabled === false || old.enabled === false) enabledBy = 'config_off';
+  else {
+    let listed = false;
+    if (workspace && entries.length) {
+      const native = platform === process.platform;
+      const canon = async (value) => (native ? canonicalWorkspace(value) : pathApi.resolve(value));
+      const target = await canon(workspace);
+      for (const entry of entries) {
+        if (contained(await canon(entry), target, pathApi, platform === 'win32')) { listed = true; break; }
+      }
+    }
+    if (listed) enabledBy = 'allowlist';
+    else if (section.enabled === true) enabledBy = 'config_on';
+  }
   return {
-    enabled,
-    min_interval_seconds: numeric(env.LOAM_INGEST_MIN_INTERVAL, numeric(section.min_interval_seconds, DEFAULTS.min_interval_seconds)),
-    timeout_seconds: numeric(env.LOAM_INGEST_TIMEOUT, numeric(section.timeout_seconds, DEFAULTS.timeout_seconds)),
-    lease_ttl_seconds: numeric(env.LOAM_INGEST_LEASE_TTL, numeric(section.lease_ttl_seconds, DEFAULTS.lease_ttl_seconds)),
-    visibility: visibility(section.visibility),
-    require_visible_worker: section.require_visible_worker === true,
+    enabled: ['env_on', 'allowlist', 'config_on'].includes(enabledBy),
+    enabled_by: enabledBy,
+    config_path: configPath,
+    config_error: configError,
+    ignored_entries: ignored,
+    min_interval_seconds: numeric(env.LOAM_INGEST_MIN_INTERVAL, tuned('min_interval_seconds', DEFAULTS.min_interval_seconds)),
+    timeout_seconds: numeric(env.LOAM_INGEST_TIMEOUT, tuned('timeout_seconds', DEFAULTS.timeout_seconds)),
+    lease_ttl_seconds: numeric(env.LOAM_INGEST_LEASE_TTL, tuned('lease_ttl_seconds', DEFAULTS.lease_ttl_seconds)),
+    visibility: visibility(section.visibility ?? old.visibility),
+    require_visible_worker: (section.require_visible_worker ?? old.require_visible_worker) === true,
   };
 }
 
@@ -101,12 +170,16 @@ function recursion(payload, env) {
 }
 
 export async function gate({ harness, payload = {}, globalRoot, env = process.env, now = Date.now() } = {}) {
-  const config = await readIngestConfig(globalRoot, env);
-  if (!config.enabled) return { action: 'skip', reason: 'disabled' };
+  const workspace = await canonicalWorkspace(payloadWorkspace(payload));
+  const config = await readIngestConfig(globalRoot, env, workspace);
+  if (!config.enabled) {
+    return config.enabled_by === 'delegated_lane'
+      ? { action: 'skip', reason: 'disabled', delegated: true }
+      : { action: 'skip', reason: 'disabled' };
+  }
   // Mark the recursion refusal distinctly from a config-disabled skip so the
   // hook-finish producer can emit claude_recursion_guard only for the former.
   if (recursion(payload, env)) return { action: 'skip', reason: 'disabled', recursion: true };
-  const workspace = await canonicalWorkspace(payloadWorkspace(payload));
   const root = runRoot(globalRoot, workspace);
   await ensureRoot(root);
   const last = await json(join(root, 'last-run.json'), null);
@@ -993,7 +1066,7 @@ export async function prepareWorkerRun({
 } = {}) {
   const canonical = await canonicalWorkspace(workspace);
   const root = runRoot(globalRoot, canonical);
-  const config = await readIngestConfig(globalRoot, env);
+  const config = await readIngestConfig(globalRoot, env, canonical);
   await ensureRoot(root);
   const leaseResult = await acquireLease(root, canonical, harness, config, openCodeSession, env);
   if (['held', 'orphan_live', 'orphan_unknown'].includes(leaseResult.status)) return { action: 'skip', result: { reason: 'busy' } };
@@ -1273,6 +1346,10 @@ export async function runWorker(options = {}) {
   }
 }
 
+function ingestEnablement(c) {
+  return { enabled: c.enabled, enabled_by: c.enabled_by, config_path: c.config_path, config_error: c.config_error, ignored_entries: c.ignored_entries };
+}
+
 export async function ingestStatus({ globalRoot, workspace, env = process.env } = {}) {
   const canonical = await canonicalWorkspace(workspace);
   const root = runRoot(globalRoot, canonical);
@@ -1291,7 +1368,7 @@ export async function ingestStatus({ globalRoot, workspace, env = process.env } 
   try { exclusions = { ready: true, path: await resolveExclusions(env.LOAM_INGEST_SKILLS_ROOT) }; }
   catch (error) { exclusions = { ready: false, reason: error.reason || 'exclusions_unavailable' }; }
   return {
-    schema: 1, workspace: canonical, enabled: (await readIngestConfig(globalRoot, env)).enabled,
+    schema: 1, workspace: canonical, ...ingestEnablement(await readIngestConfig(globalRoot, env, canonical)),
     lease, lease_state: leaseState, intent: lease?.launch_mode ? lease : null,
     intent_state: intentState.state,
     orphan: intentState.state === 'live' || intentState.state === 'unknown',

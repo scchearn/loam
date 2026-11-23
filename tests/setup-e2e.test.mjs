@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1286,4 +1286,101 @@ test('seal: update makes exactly one seal call', async () => {
   assert.equal(code, 0, capture.text());
   assert.equal(seal.calls.length, 1);
   assert.doesNotMatch(capture.text(), /Seal key ready/);
+});
+
+// One-time background-ingest opt-in notice (plan T6).
+async function runInstallCapture(fixture, extra = {}) {
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['install', '--yes']), {
+    ...fixture, packageRoot, output: capture.output, errorOutput: capture.output, ...extra,
+  });
+  assert.equal(code, 0, capture.text());
+  return capture.text();
+}
+
+test('ingest notice: upgrade over an earlier install prints once and records an empty section', async () => {
+  const fixture = await baseFixture();
+  const configPath = join(fixture.home, '.config', 'loam', 'config.json');
+  await runInstallCapture(fixture);
+  // Simulate an earlier (pre-opt-in) install: no background_ingest section, other keys kept.
+  await writeFile(configPath, JSON.stringify({ keep: { me: true } }));
+
+  const first = await runInstallCapture(fixture);
+  assert.match(first, /npx @scchearn\/loam ingest enable \[path\]/u);
+  assert.ok(first.includes(configPath), first);
+  assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')), { keep: { me: true }, background_ingest: { workspaces: [] } });
+
+  const second = await runInstallCapture(fixture);
+  assert.doesNotMatch(second, /ingest enable/u);
+});
+
+test('ingest notice: fresh install prints nothing and a later run stays silent', async () => {
+  const fixture = await baseFixture();
+  const first = await runInstallCapture(fixture);
+  assert.doesNotMatch(first, /ingest enable/u);
+  const second = await runInstallCapture(fixture);
+  assert.doesNotMatch(second, /ingest enable/u);
+});
+
+test('ingest notice: an existing background_ingest section suppresses it untouched', async () => {
+  const fixture = await baseFixture();
+  const configPath = join(fixture.home, '.config', 'loam', 'config.json');
+  await runInstallCapture(fixture);
+  const section = { background_ingest: { workspaces: ['/some/where'] } };
+  await writeFile(configPath, JSON.stringify(section));
+  const text = await runInstallCapture(fixture);
+  assert.doesNotMatch(text, /ingest enable/u);
+  assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')), section);
+});
+
+test('ingest notice: a malformed config.json never fails setup or gets rewritten', async () => {
+  const fixture = await baseFixture();
+  const configPath = join(fixture.home, '.config', 'loam', 'config.json');
+  await runInstallCapture(fixture);
+  await writeFile(configPath, '{ not json');
+  await runInstallCapture(fixture);
+  assert.equal(await readFile(configPath, 'utf8'), '{ not json');
+});
+
+test('ingest notice: update (full-transaction call site) prints the notice once', async () => {
+  const fixture = await baseFixture();
+  const configPath = join(fixture.home, '.config', 'loam', 'config.json');
+  await runInstallCapture(fixture);
+  await writeFile(configPath, JSON.stringify({ keep: 1 }));
+  const capture = outputCapture();
+  const code = await runSetup(parseArgs(['update']), {
+    ...fixture, packageRoot, output: capture.output, errorOutput: capture.output,
+  });
+  assert.equal(code, 0, capture.text());
+  assert.match(capture.text(), /ingest enable \[path\]/u);
+  assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')), { keep: 1, background_ingest: { workspaces: [] } });
+  const again = outputCapture();
+  await runSetup(parseArgs(['update']), { ...fixture, packageRoot, output: again.output, errorOutput: again.output });
+  assert.doesNotMatch(again.text(), /ingest enable/u);
+});
+
+test('ingest notice: a ledger with no install.json still counts as an earlier install', async () => {
+  const fixture = await baseFixture();
+  const configPath = join(fixture.home, '.config', 'loam', 'config.json');
+  await runInstallCapture(fixture);
+  await rm(join(fixture.home, '.agents', 'loam', 'install.json'), { force: true });
+  await writeFile(configPath, JSON.stringify({ keep: 1 }));
+  const text = await runInstallCapture(fixture);
+  assert.match(text, /ingest enable \[path\]/u);
+});
+
+test('ingest notice: setup (configurator) prints it for an existing install', async () => {
+  const { runConfigure } = await import('../setup/configure.mjs');
+  const fixture = await baseFixture();
+  const configPath = join(fixture.home, '.config', 'loam', 'config.json');
+  await runInstallCapture(fixture);
+  await writeFile(configPath, JSON.stringify({ keep: 1 }));
+  const capture = outputCapture();
+  const code = await runConfigure(
+    { command: 'setup', federation: null, integrations: [], dryRun: false, yes: false, purge: false },
+    { ...fixture, packageRoot, select: async () => ({}), output: capture.output, errorOutput: capture.output },
+  );
+  assert.equal(code, 0, capture.text());
+  assert.match(capture.text(), /ingest enable \[path\]/u);
+  assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')), { keep: 1, background_ingest: { workspaces: [] } });
 });

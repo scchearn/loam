@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
 import { appendFile, chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
@@ -14,6 +15,20 @@ import {
   readIngestConfig, runRoot, runWorker, startWorker,
 } from '../integration/ingest.mjs';
 import { bootIdentity, childIdentity, processDescriptor, resolveExecutable, startTracked } from '../integration/ingest-process.mjs';
+
+// Background ingest is opt-in; tests that exercise the run path opt in through the environment.
+// Every real gate read pins LOAM_CONFIG_DIR to an empty temp dir so no test reads the developer's config.
+const PIN = Object.freeze({ LOAM_CONFIG_DIR: mkdtempSync(join(tmpdir(), 'loam-ingest-pin-')) });
+const ON = Object.freeze({ ...PIN, LOAM_INGEST_BACKGROUND: '1' });
+
+// process.env minus LOAM_* and HCOM_* (the dev shell exports HCOM_LAUNCHED_BY=user), config dir pinned.
+function hermeticEnv(extra = {}) {
+  const base = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!/^(LOAM_|HCOM_)/.test(key)) base[key] = value;
+  }
+  return { ...base, ...PIN, ...extra };
+}
 
 async function fixture() {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'loam-ingest-')));
@@ -101,12 +116,14 @@ test('fingerprint validation rejects controls/traversal and normalizes Windows s
   }
 });
 
-test('boundary gate defaults on without an environment override or config file', async () => {
+test('boundary gate defaults off without an environment override or config file', async () => {
   const workspace = await mkdtemp(join(tmpdir(), 'loam-gate-'));
   const globalRoot = join(await mkdtemp(join(tmpdir(), 'loam-gate-parent-')), 'missing-global');
   const options = { harness: 'claude', payload: { cwd: workspace, event_id: 'same-event' }, globalRoot };
 
-  const result = await gate({ ...options, env: {} });
+  assert.deepEqual(await gate({ ...options, env: { ...PIN } }), { action: 'skip', reason: 'disabled' });
+  await assert.rejects(() => realpath(globalRoot), (error) => error.code === 'ENOENT');
+  const result = await gate({ ...options, env: { ...ON } });
   assert.equal(result.action, 'spawn_worker');
   assert.equal(result.config.enabled, true);
   assert.equal((await stat(globalRoot)).isDirectory(), true);
@@ -117,30 +134,30 @@ test('explicitly disabled boundary gate rejects before creating state or probing
   const workspace = await mkdtemp(join(tmpdir(), 'loam-gate-disabled-'));
   const globalRoot = join(await mkdtemp(join(tmpdir(), 'loam-gate-disabled-parent-')), 'missing-global');
 
-  assert.deepEqual(await gate({ harness: 'claude', payload: { cwd: workspace }, globalRoot, env: { LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
+  assert.deepEqual(await gate({ harness: 'claude', payload: { cwd: workspace }, globalRoot, env: { ...PIN, LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
   await assert.rejects(() => realpath(globalRoot), (error) => error.code === 'ENOENT');
 });
 
-test('boundary gate honors config and environment precedence and blocks worker recursion', async () => {
+test('boundary gate honors environment precedence and blocks worker recursion', async () => {
   const workspace = await mkdtemp(join(tmpdir(), 'loam-gate-precedence-'));
   const globalRoot = await mkdtemp(join(tmpdir(), 'loam-gate-precedence-global-'));
   const options = { harness: 'claude', payload: { cwd: workspace, event_id: 'same-event' }, globalRoot };
 
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { enabled: false } }));
-  assert.deepEqual(await gate({ ...options, env: {} }), { action: 'skip', reason: 'disabled' });
-  assert.equal((await gate({ ...options, env: { LOAM_INGEST_BACKGROUND: '1' } })).action, 'spawn_worker');
+  assert.deepEqual(await gate({ ...options, env: { ...PIN } }), { action: 'skip', reason: 'disabled' });
+  assert.equal((await gate({ ...options, env: { ...ON } })).action, 'spawn_worker');
 
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { enabled: true } }));
-  assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
-  assert.deepEqual(await gate({ ...options, env: { LOAM_INGEST_WORKER: '1' } }), { action: 'skip', reason: 'disabled', recursion: true });
-  assert.deepEqual(await gate({ ...options, payload: { cwd: workspace, agent_type: 'loam:ingestor' }, env: {} }), { action: 'skip', reason: 'disabled', recursion: true });
-  assert.equal((await gate({ ...options, payload: { cwd: workspace, agent_type: 'other-agent' }, env: {} })).action, 'spawn_worker');
+  assert.deepEqual(await gate({ ...options, env: { ...PIN, LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
+  assert.deepEqual(await gate({ ...options, env: { ...ON, LOAM_INGEST_WORKER: '1' } }), { action: 'skip', reason: 'disabled', recursion: true });
+  assert.deepEqual(await gate({ ...options, payload: { cwd: workspace, agent_type: 'loam:ingestor' }, env: { ...ON } }), { action: 'skip', reason: 'disabled', recursion: true });
+  assert.equal((await gate({ ...options, payload: { cwd: workspace, agent_type: 'other-agent' }, env: { ...ON } })).action, 'spawn_worker');
 });
 
 test('boundary debounce trusts only coherent successful or nothing-to-do outcomes', async () => {
   const workspace = await realpath(await mkdtemp(join(tmpdir(), 'loam-gate-outcomes-')));
   const globalRoot = await mkdtemp(join(tmpdir(), 'loam-gate-outcomes-global-'));
-  const options = { harness: 'codex', payload: { cwd: workspace }, globalRoot, env: {}, now: 1_000 };
+  const options = { harness: 'codex', payload: { cwd: workspace }, globalRoot, env: { ...ON }, now: 1_000 };
   await writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: { min_interval_seconds: 300 } }));
   await mkdir(runRoot(globalRoot, workspace), { recursive: true });
 
@@ -194,7 +211,7 @@ test('notification launch is non-blocking and terminal status follows persisted 
   let markLaunchCalled;
   const launchCalled = new Promise((resolvePromise) => { markLaunchCalled = resolvePromise; });
   const resultPromise = runWorker({
-    harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
+    harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills, env: { ...ON },
     readiness: { ready: true, runtimePath: '/private/loam' },
     runtimeRunner: async ({ args }) => args[0] === 'state'
       ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
@@ -249,7 +266,7 @@ test('silent and failing notifications cannot change ingestion state or exceed t
     await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility } }));
     const calls = [];
     const result = await runWorker({
-      harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
+      harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills, env: { ...ON },
       readiness: { ready: true, runtimePath: '/private/loam' },
       runtimeRunner: async ({ args }) => args[0] === 'state'
         ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
@@ -275,7 +292,7 @@ test('detached worker launch forwards the hook-run correlation id', () => {
     skillsRoot: '/skills',
     workerPath: '/worker.mjs',
     hookRunId: 17,
-    env: {},
+    env: { ...ON },
     spawn: (input) => { request = input; return 'started'; },
   });
   assert.equal(result, 'started');
@@ -292,7 +309,7 @@ test('Codex native boundary records one intent and falls back exactly once on th
   await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native', min_interval_seconds: 0 } }));
   const spawns = [];
   const options = {
-    harness: 'codex', globalRoot: root, skillsRoot: skills, env: {},
+    harness: 'codex', globalRoot: root, skillsRoot: skills, env: { ...ON },
     payload: { cwd: workspace, session_id: 'session-1', stop_hook_active: false },
     hookRunId: 41,
     spawn: (request) => { spawns.push(request); return { pid: 123 }; },
@@ -344,12 +361,12 @@ test('Codex native cheap skips, bound intents, stale intents, and corrupt state 
   let spawns = 0;
   const base = {
     harness: 'codex', globalRoot: root, skillsRoot: skills, now: 100,
-    payload: { cwd: workspace, session_id: 'session-2' }, env: {},
+    payload: { cwd: workspace, session_id: 'session-2' }, env: { ...ON },
     spawn: () => { spawns += 1; return { pid: 1 }; },
     ...actionableRuntime(wiki),
   };
 
-  assert.deepEqual(await dispatchBoundary({ ...base, env: { LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
+  assert.deepEqual(await dispatchBoundary({ ...base, env: { ...PIN, LOAM_INGEST_BACKGROUND: '0' } }), { action: 'skip', reason: 'disabled' });
   await assert.rejects(() => readFile(join(intentRoot, 'native-intent.json')), { code: 'ENOENT' });
 
   const first = await dispatchBoundary(base);
@@ -384,7 +401,7 @@ test('Codex native fallback launch failure clears its claim for a later attempt'
   const { root, workspace, wiki, skills } = await fixture();
   await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native' } }));
   const options = {
-    harness: 'codex', globalRoot: root, skillsRoot: skills, env: {},
+    harness: 'codex', globalRoot: root, skillsRoot: skills, env: { ...ON },
     payload: { cwd: workspace, session_id: 'retry-session' },
     ...actionableRuntime(wiki),
   };
@@ -411,7 +428,7 @@ test('Codex native boundary skips every no-work state before recording an intent
     await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native', min_interval_seconds: 0 } }));
     const state = item.state({ wiki });
     const result = await dispatchBoundary({
-      harness: 'codex', payload: { cwd: workspace }, globalRoot: root, skillsRoot: skills, env: {},
+      harness: 'codex', payload: { cwd: workspace }, globalRoot: root, skillsRoot: skills, env: { ...ON },
       readiness: { ready: true, runtimePath: '/private/loam' },
       runtimeRunner: async ({ args }) => args[0] === 'state'
         ? { code: 0, stdout: JSON.stringify(state), stderr: '' }
@@ -435,7 +452,7 @@ test('Codex native boundary fails closed when its zero-token preflight is unavai
     const { root, workspace, skills } = await fixture();
     await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native', min_interval_seconds: 0 } }));
     const result = await dispatchBoundary({
-      harness: 'codex', payload: { cwd: workspace }, globalRoot: root, skillsRoot: skills, env: {},
+      harness: 'codex', payload: { cwd: workspace }, globalRoot: root, skillsRoot: skills, env: { ...ON },
       readiness: item.readiness || { ready: true, runtimePath: '/private/loam' },
       runtimeRunner: async () => item.response,
     });
@@ -457,7 +474,7 @@ test('Codex native agent revalidates if work disappears after the boundary prefl
     : { code: 0, stdout: JSON.stringify(pending ? [{ path: 'src/a.js', mtime: '1', reason: 'new' }] : []), stderr: '' };
   const boundary = await dispatchBoundary({
     harness: 'codex', payload: { cwd: workspace }, globalRoot: root, skillsRoot: skills,
-    readiness, runtimeRunner, env: {},
+    readiness, runtimeRunner, env: { ...ON },
   });
   assert.equal(boundary.native_continuation.decision, 'block');
   assert.equal((await bindNativeAgent({ globalRoot: root, workspace, agentId: 'agent-race' })).status, 'bound');
@@ -465,10 +482,10 @@ test('Codex native agent revalidates if work disappears after the boundary prefl
   pending = false;
   assert.deepEqual(await prepareNativeAgentRun({
     globalRoot: root, workspace, agentId: 'agent-race', skillsRoot: skills,
-    readiness, runtimeRunner, env: {},
+    readiness, runtimeRunner, env: { ...ON },
   }), { action: 'skip', reason: 'nothing_to_do' });
   await assert.rejects(() => readFile(join(runRoot(root, workspace), 'lease.json')), { code: 'ENOENT' });
-  const finalized = await finalizeNativeAgentRun({ globalRoot: root, workspace, agentId: 'agent-race', env: {} });
+  const finalized = await finalizeNativeAgentRun({ globalRoot: root, workspace, agentId: 'agent-race', env: { ...ON } });
   assert.equal(finalized.reason, 'nothing_to_do');
   assert.equal(finalized.owns_claim, true);
 });
@@ -483,7 +500,7 @@ test('Codex native race admits only the first lease holder in either ordering', 
     const options = {
       harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
       readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner,
-      env: { LOAM_INGEST_BACKGROUND: '1' },
+      env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' },
     };
 
     const first = await prepareWorkerRun(options);
@@ -507,7 +524,7 @@ test('Codex loam_ingestor binding prepares first and finalizes from verified sta
 
   const boundary = {
     harness: 'codex', payload: { cwd: workspace, session_id: 'parent-1' },
-    globalRoot: root, skillsRoot: skills, readiness, runtimeRunner, env: {},
+    globalRoot: root, skillsRoot: skills, readiness, runtimeRunner, env: { ...ON },
   };
   assert.equal((await dispatchBoundary(boundary)).native_continuation.decision, 'block');
   const bound = await bindNativeAgent({ globalRoot: root, workspace, agentId: 'agent-1' });
@@ -522,7 +539,7 @@ test('Codex loam_ingestor binding prepares first and finalizes from verified sta
 
   const prepared = await prepareNativeAgentRun({
     globalRoot: root, workspace, agentId: 'agent-1', skillsRoot: skills,
-    readiness, runtimeRunner, env: {},
+    readiness, runtimeRunner, env: { ...ON },
   });
   assert.deepEqual(prepared, { action: 'run' });
   const lease = JSON.parse(await readFile(join(runRoot(root, workspace), 'lease.json'), 'utf8'));
@@ -534,14 +551,14 @@ test('Codex loam_ingestor binding prepares first and finalizes from verified sta
 
   ingested = true;
   const finalized = await finalizeNativeAgentRun({
-    globalRoot: root, workspace, agentId: 'agent-1', runtimeRunner, env: {},
+    globalRoot: root, workspace, agentId: 'agent-1', runtimeRunner, env: { ...ON },
   });
   assert.equal(finalized.reason, 'ok');
   assert.equal(finalized.owns_claim, true);
   const stored = JSON.parse(await readFile(join(runRoot(root, workspace), 'last-run.json'), 'utf8'));
   assert.equal(stored.status, 'ok');
   await assert.rejects(() => readFile(join(runRoot(root, workspace), 'lease.json')), { code: 'ENOENT' });
-  assert.deepEqual(await finalizeNativeAgentRun({ globalRoot: root, workspace, agentId: 'agent-1', env: {} }), { reason: 'busy' });
+  assert.deepEqual(await finalizeNativeAgentRun({ globalRoot: root, workspace, agentId: 'agent-1', env: { ...ON } }), { reason: 'busy' });
 });
 
 test('Codex loam_ingestor preparation skips after fallback wins and missing or malformed intents stay inert', async () => {
@@ -554,7 +571,7 @@ test('Codex loam_ingestor preparation skips after fallback wins and missing or m
     : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' };
   const options = {
     harness: 'codex', payload: { cwd: workspace, session_id: 'parent-2' }, globalRoot: root,
-    skillsRoot: skills, readiness, runtimeRunner, env: {}, spawn: () => ({ pid: 1 }),
+    skillsRoot: skills, readiness, runtimeRunner, env: { ...ON }, spawn: () => ({ pid: 1 }),
   };
   assert.equal((await dispatchBoundary(options)).native_continuation.decision, 'block');
   assert.equal((await dispatchBoundary({ ...options, payload: { ...options.payload, stop_hook_active: true } })).native_fallback, true);
@@ -564,12 +581,12 @@ test('Codex loam_ingestor preparation skips after fallback wins and missing or m
 
   const fallback = await prepareWorkerRun({
     harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
-    readiness, runtimeRunner, env: {},
+    readiness, runtimeRunner, env: { ...ON },
   });
   assert.equal(fallback.action, 'run');
   assert.deepEqual(await prepareNativeAgentRun({
     globalRoot: root, workspace, agentId: 'agent-late', skillsRoot: skills,
-    readiness, runtimeRunner, env: {},
+    readiness, runtimeRunner, env: { ...ON },
   }), { action: 'skip', reason: 'busy' });
   await finalizeWorkerRun(fallback, { launch: { background: false }, result: { code: 0 } });
 
@@ -587,11 +604,11 @@ test('Codex loam_ingestor stop aborts an unprepared bound intent without trustin
   await nativeInstall(root);
   await writeFile(join(root, 'config.json'), JSON.stringify({ background_ingest: { visibility: 'native' } }));
   assert.equal((await dispatchBoundary({
-    harness: 'codex', payload: { cwd: workspace }, globalRoot: root, skillsRoot: skills, env: {},
+    harness: 'codex', payload: { cwd: workspace }, globalRoot: root, skillsRoot: skills, env: { ...ON },
     ...actionableRuntime(wiki),
   })).native_continuation.decision, 'block');
   await bindNativeAgent({ globalRoot: root, workspace, agentId: 'agent-abort' });
-  const aborted = await finalizeNativeAgentRun({ globalRoot: root, workspace, agentId: 'agent-abort', env: {} });
+  const aborted = await finalizeNativeAgentRun({ globalRoot: root, workspace, agentId: 'agent-abort', env: { ...ON } });
   assert.equal(aborted.reason, 'unavailable');
   assert.equal(aborted.owns_claim, true);
 });
@@ -617,7 +634,7 @@ test('worker leases before full state and issues the exact exclusions-aware diff
   };
   const result = await runWorker({
     harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
-    readiness, runtimeRunner, env: { LOAM_INGEST_BACKGROUND: '1' },
+    readiness, runtimeRunner, env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' },
     modelRunner: async ({ lease }) => {
       modelCalls += 1;
       assert.equal(lease.launch_state, 'planned');
@@ -656,9 +673,9 @@ test('worker preparation and finalization expose one reusable safety lifecycle',
   const prepared = await lifecycle.prepareWorkerRun({
     harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
     readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner,
-    env: { LOAM_INGEST_BACKGROUND: '1' },
+    env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' },
   });
-  assert.equal(prepared.action, 'run');
+  assert.equal(prepared.action, 'run', JSON.stringify(prepared));
   assert.equal(prepared.intent.lease_id, prepared.lease.lease_id);
   assert.equal(prepared.intent.actionable_fingerprint.length, 64);
   const persistedIntent = JSON.parse(await readFile(join(runRoot(root, workspace), 'lease.json'), 'utf8'));
@@ -692,7 +709,7 @@ test('worker preparation and finalization expose one reusable safety lifecycle',
     harness: 'codex', workspace, globalRoot: skippedRoot, skillsRoot: skills,
     readiness: { ready: true, runtimePath: '/private/loam' },
     runtimeRunner: async () => ({ code: 0, stdout: JSON.stringify({ wiki_root: '', hints: [] }), stderr: '' }),
-    env: { LOAM_INGEST_BACKGROUND: '1' },
+    env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' },
   });
   assert.deepEqual(skipped, {
     action: 'skip',
@@ -707,7 +724,7 @@ test('worker preparation and finalization expose one reusable safety lifecycle',
 test('worker preparation preserves skip classifications and never strands its lease', async () => {
   const { prepareWorkerRun } = await import('../integration/ingest.mjs');
   const cases = [
-    { name: 'disabled', expected: 'disabled', detail: undefined, config: { enabled: false }, env: {} },
+    { name: 'disabled', expected: 'disabled', detail: undefined, config: { enabled: false }, env: { ...PIN } },
     { name: 'backoff', expected: 'too_soon', detail: 'backoff', previous: { schema: 1, backoff_until: Date.now() + 60_000 } },
     { name: 'debounced', expected: 'too_soon', detail: 'debounced', previous: { schema: 1, status: 'ok', completed_at: Date.now() } },
     { name: 'runtime', expected: 'unavailable', detail: 'runtime_missing', readiness: { ready: false, category: 'runtime_missing' } },
@@ -782,7 +799,7 @@ test('maintenance worker distinguishes missing wiki and missing codegraph before
     let modelCalls = 0;
     const result = await runWorker({
       harness: 'codex', workspace, globalRoot: join(root, item.name), skillsRoot: skills,
-      readiness: { ready: true, runtimePath: '/private/loam' }, env: { LOAM_INGEST_BACKGROUND: '1' },
+      readiness: { ready: true, runtimePath: '/private/loam' }, env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' },
       runtimeRunner: async ({ args }) => {
         calls.push(args);
         return { code: 0, stdout: JSON.stringify({ ...item.state, hints: item.state.hints }), stderr: '' };
@@ -824,7 +841,7 @@ test('a complete no-progress attempt backs off without fingerprint suppression s
   const run = () => runWorker({
     harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
     readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner,
-    env: { LOAM_INGEST_BACKGROUND: '1' },
+    env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' },
     modelRunner: async () => { modelCalls += 1; return { completion: Promise.resolve({ code: 0 }) }; },
   });
   assert.equal((await run()).reason, 'ok');
@@ -845,7 +862,7 @@ test('a second admitted worker rechecks backoff after acquiring the lease', asyn
   const options = {
     harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
     readiness: { ready: true, runtimePath: '/private/loam' }, runtimeRunner,
-    env: { LOAM_INGEST_BACKGROUND: '1' },
+    env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' },
     modelRunner: async () => {
       modelCalls += 1;
       return { completion: Promise.resolve({ code: 1 }) };
@@ -862,7 +879,7 @@ test('OpenCode creates a child, records identity before prompt, and verifies ter
   let statusCalls = 0;
   const result = await runWorker({
     harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
-    readiness: { ready: true, runtimePath: '/private/loam' }, env: { LOAM_INGEST_BACKGROUND: '1' },
+    readiness: { ready: true, runtimePath: '/private/loam' }, env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' },
     runtimeRunner: async ({ args }) => args[0] === 'state'
       ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
       : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
@@ -895,7 +912,7 @@ test('a dead worker and dead child lease is recovered before the first runtime p
   const calls = [];
   const result = await runWorker({
     harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
-    readiness: { ready: true, runtimePath: '/private/loam' }, env: { LOAM_INGEST_BACKGROUND: '1' },
+    readiness: { ready: true, runtimePath: '/private/loam' }, env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' },
     runtimeRunner: async ({ args }) => {
       calls.push(args);
       return args[0] === 'state'
@@ -968,7 +985,7 @@ test('an expired unknown OpenCode orphan is reclaimed before a new run', async (
   let launches = 0;
   const result = await runWorker({
     harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
-    readiness: { ready: true, runtimePath: '/private/loam' }, env: { LOAM_INGEST_BACKGROUND: '1' },
+    readiness: { ready: true, runtimePath: '/private/loam' }, env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' },
     runtimeRunner: async ({ args }) => args[0] === 'state'
       ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
       : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
@@ -988,7 +1005,7 @@ test('OpenCode live child keeps the lease and intent when abort/requery cannot v
   const { root, workspace, wiki, skills } = await fixture();
   const result = await runWorker({
     harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
-    readiness: { ready: true, runtimePath: '/private/loam' }, env: { LOAM_INGEST_BACKGROUND: '1', LOAM_INGEST_TIMEOUT: '1' },
+    readiness: { ready: true, runtimePath: '/private/loam' }, env: { ...PIN, LOAM_INGEST_BACKGROUND: '1', LOAM_INGEST_TIMEOUT: '1' },
     runtimeRunner: async ({ args }) => args[0] === 'state'
       ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
       : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
@@ -1008,7 +1025,7 @@ test('OpenCode prompt transport failure keeps ownership after child identity was
   const { root, workspace, wiki, skills } = await fixture();
   const result = await runWorker({
     harness: 'opencode', workspace, globalRoot: root, skillsRoot: skills,
-    readiness: { ready: true, runtimePath: '/private/loam' }, env: { LOAM_INGEST_BACKGROUND: '1' },
+    readiness: { ready: true, runtimePath: '/private/loam' }, env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' },
     runtimeRunner: async ({ args }) => args[0] === 'state'
       ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
       : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
@@ -1038,7 +1055,7 @@ test('published adapters load only the staged integration after the source tree 
   }
   const previousPath = process.env.LOAM_INTEGRATION_PATH;
   process.env.LOAM_INTEGRATION_PATH = join(integrationRoot, 'loam.mjs');
-  const env = { ...process.env, LOAM_INGEST_BACKGROUND: '0', LOAM_INGEST_GLOBAL_ROOT: join(root, 'global'), LOAM_INGEST_SKILLS_ROOT: join(root, 'skills') };
+  const env = { ...hermeticEnv(), LOAM_INTEGRATION_PATH: join(integrationRoot, 'loam.mjs'), LOAM_INGEST_BACKGROUND: '0', LOAM_INGEST_GLOBAL_ROOT: join(root, 'global'), LOAM_INGEST_SKILLS_ROOT: join(root, 'skills') };
   try {
     const claude = await import(`${pathToFileURL(join(adapterRoot, 'claude-stop.mjs')).href}?test=claude`);
     assert.equal((await claude.main({ env, payload: { cwd: root } })).reason, 'disabled');
@@ -1121,7 +1138,7 @@ test('Windows batch launch executes from a spaced path', { skip: process.platfor
       command: batch,
       args: ['alpha beta', 'gamma'],
       cwd: root,
-      env: { ...process.env },
+      env: hermeticEnv(),
       timeoutMs: 10_000,
     });
     const result = await started.completion;
@@ -1156,7 +1173,7 @@ process.exit(args[0] === '--bg' ? 1 : 0);
   const result = await runWorker({
     harness: 'claude', workspace, globalRoot: root, skillsRoot: skills,
     readiness: { ready: true, runtimePath: '/private/loam' },
-    env: { ...process.env, PATH: [bin, process.env.PATH || ''].filter(Boolean).join(delimiter), LOAM_TEST_CALLS: calls, LOAM_INGEST_BACKGROUND: '1' },
+    env: hermeticEnv({ PATH: [bin, process.env.PATH || ''].filter(Boolean).join(delimiter), LOAM_TEST_CALLS: calls, LOAM_INGEST_BACKGROUND: '1' }),
     runtimeRunner: async ({ args }) => args[0] === 'state'
       ? { code: 0, stdout: JSON.stringify({ wiki_root: wiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
       : { code: 0, stdout: JSON.stringify([{ path: 'src/a.js', mtime: '1', reason: 'new' }]), stderr: '' },
@@ -1225,7 +1242,7 @@ process.exit(0);
       harness: 'claude', workspace, globalRoot, skillsRoot: skills,
       readiness: { ready: true, runtimePath: '/private/loam' },
       env: {
-        ...process.env,
+        ...hermeticEnv(),
         PATH: [bin, process.env.PATH || ''].filter(Boolean).join(delimiter),
         LOAM_TEST_CALLS: calls,
         LOAM_TEST_AGENT: state,
@@ -1299,7 +1316,7 @@ process.exit(0);
     harness: 'claude', workspace, globalRoot: root, skillsRoot: skills,
     readiness: { ready: true, runtimePath: '/private/loam' },
     env: {
-      ...process.env,
+      ...hermeticEnv(),
       PATH: [bin, process.env.PATH || ''].filter(Boolean).join(delimiter),
       LOAM_TEST_CALLS: calls,
       LOAM_TEST_AGENT: join(bin, 'current.txt'),
@@ -1357,7 +1374,7 @@ process.exit(0);
           harness: 'claude', workspace, globalRoot: root, skillsRoot: skills,
           readiness: { ready: true, runtimePath: '/private/loam' },
           env: {
-            ...process.env,
+            ...hermeticEnv(),
             PATH: [bin, process.env.PATH || ''].filter(Boolean).join(delimiter),
             LOAM_TEST_CALLS: calls,
             LOAM_TEST_AGENT_VIEW_MODE: mode,
@@ -1400,7 +1417,7 @@ test('separate workspaces proceed independently while a live workspace lease rem
   let launches = 0;
   const result = await runWorker({
     harness: 'codex', workspace: second, globalRoot: root, skillsRoot: skills,
-    readiness: { ready: true, runtimePath: '/private/loam' }, env: { LOAM_INGEST_BACKGROUND: '1' },
+    readiness: { ready: true, runtimePath: '/private/loam' }, env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' },
     runtimeRunner: async ({ args }) => args[0] === 'state'
       ? { code: 0, stdout: JSON.stringify({ wiki_root: secondWiki, hints: [{ kind: 'code_ingest_pending', evidence: { pending_count: 1 } }] }), stderr: '' }
       : { code: 0, stdout: JSON.stringify([{ path: 'src/b.js', mtime: '1', reason: 'new' }]), stderr: '' },
@@ -1424,7 +1441,7 @@ test('a live model child on a dead worker lease prevents a second launch', async
   let launches = 0;
   const result = await runWorker({
     harness: 'codex', workspace, globalRoot: root, skillsRoot: skills,
-    env: { LOAM_INGEST_BACKGROUND: '1' },
+    env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' },
     runtimeRunner: async () => { throw new Error('must not probe while child is live'); },
     modelRunner: async () => { launches += 1; },
   });
@@ -1437,7 +1454,7 @@ test('ingestStatus always returns JSON-shaped state, including malformed leases'
   const leaseRoot = runRoot(root, workspace);
   await mkdir(leaseRoot, { recursive: true });
   await writeFile(join(leaseRoot, 'lease.json'), '{malformed');
-  const status = await ingestStatus({ globalRoot: root, workspace, env: { LOAM_INGEST_BACKGROUND: '1' } });
+  const status = await ingestStatus({ globalRoot: root, workspace, env: { ...PIN, LOAM_INGEST_BACKGROUND: '1' } });
   assert.equal(JSON.parse(JSON.stringify(status)).lease_state, 'unknown');
   assert.equal(status.intent_state, 'unknown');
 });
@@ -1468,7 +1485,7 @@ test('ingest_commit: git log -1 --name-only lists only memory paths and source e
   try {
     const before = ws.commitCount();
     const result = await runWorker({
-      harness: 'opencode', workspace: ws.root, globalRoot, skillsRoot: skills, env: ws.env,
+      harness: 'opencode', workspace: ws.root, globalRoot, skillsRoot: skills, env: { ...ws.env, ...ON },
       ...actionableRuntime(ws.wiki),
       modelRunner: async () => { await ingestorWrites(ws.root); return { completion: Promise.resolve({ code: 0 }) }; },
     });
@@ -1483,7 +1500,7 @@ test('ingest_commit: git log -1 --name-only lists only memory paths and source e
     assert.equal(stored.memory_commit, 'committed');
     assert.equal(stored.memory_commit_hash, ws.head());
     assert.deepEqual([...stored.memory_commit_files].sort(), names);
-    const status = await ingestStatus({ globalRoot, workspace: ws.root, env: ws.env });
+    const status = await ingestStatus({ globalRoot, workspace: ws.root, env: { ...ws.env, ...ON } });
     assert.equal(status.last_run.memory_commit, 'committed');
     assert.equal(status.last_run.memory_commit_hash, ws.head());
   } finally { await ws.cleanup(); }
@@ -1499,7 +1516,7 @@ test('ingest_commit: a linked worktree on a feature branch commits only there', 
     const mainHead = ws.head();
     const treeWorkspace = await realpath(tree);
     const result = await runWorker({
-      harness: 'opencode', workspace: treeWorkspace, globalRoot, skillsRoot: skills, env: ws.env,
+      harness: 'opencode', workspace: treeWorkspace, globalRoot, skillsRoot: skills, env: { ...ws.env, ...ON },
       ...actionableRuntime(join(treeWorkspace, 'wiki')),
       modelRunner: async () => { await ingestorWrites(treeWorkspace); return { completion: Promise.resolve({ code: 0 }) }; },
     });
@@ -1521,12 +1538,12 @@ test('ingest_commit: Codex native prepare/finalize carries the snapshot and comm
     const { readiness, runtimeRunner } = actionableRuntime(ws.wiki);
     const boundary = {
       harness: 'codex', payload: { cwd: ws.root, session_id: 'parent-1' },
-      globalRoot, skillsRoot: skills, readiness, runtimeRunner, env: ws.env,
+      globalRoot, skillsRoot: skills, readiness, runtimeRunner, env: { ...ws.env, ...ON },
     };
     assert.equal((await dispatchBoundary(boundary)).native_continuation.decision, 'block');
     assert.equal((await bindNativeAgent({ globalRoot, workspace: ws.root, agentId: 'agent-1' })).status, 'bound');
     assert.deepEqual(await prepareNativeAgentRun({
-      globalRoot, workspace: ws.root, agentId: 'agent-1', skillsRoot: skills, readiness, runtimeRunner, env: ws.env,
+      globalRoot, workspace: ws.root, agentId: 'agent-1', skillsRoot: skills, readiness, runtimeRunner, env: { ...ws.env, ...ON },
     }), { action: 'run' });
     const dir = runRoot(globalRoot, ws.root);
     const agentFile = (await readdir(dir)).find((name) => name.startsWith('native-agent-'));
@@ -1537,7 +1554,7 @@ test('ingest_commit: Codex native prepare/finalize carries the snapshot and comm
     const before = ws.commitCount();
     await ingestorWrites(ws.root);
     const finalized = await finalizeNativeAgentRun({
-      globalRoot, workspace: ws.root, agentId: 'agent-1', runtimeRunner, env: ws.env,
+      globalRoot, workspace: ws.root, agentId: 'agent-1', runtimeRunner, env: { ...ws.env, ...ON },
     });
     assert.equal(finalized.reason, 'ok');
     assert.equal(ws.commitCount(), before + 1);
@@ -1555,7 +1572,7 @@ test('ingest_commit: LOAM_MEMORY_COMMITS=0 performs no git staging or commit', a
   try {
     const indexBefore = await readFile(join(ws.root, '.git', 'index'));
     const before = ws.commitCount();
-    const env = { ...ws.env, LOAM_MEMORY_COMMITS: '0' };
+    const env = { ...ws.env, ...ON, LOAM_MEMORY_COMMITS: '0' };
     const result = await runWorker({
       harness: 'opencode', workspace: ws.root, globalRoot, skillsRoot: skills, env,
       ...actionableRuntime(ws.wiki),
@@ -1595,4 +1612,340 @@ test('ingest_commit: a live orphan child (busy) never commits and keeps the leas
     try { last = JSON.parse(await readFile(join(runPath, 'last-run.json'), 'utf8')); } catch { /* none recorded */ }
     assert.notEqual(last.memory_commit, 'committed');
   } finally { await ws.cleanup(); }
+});
+
+// ---- opt-in gate: config-dir allowlist, precedence, delegated lane, diagnostics ----
+// Hermetic by construction: env is built from scratch (never spread from process.env,
+// which may carry LOAM_* and HCOM_* from the developer shell).
+
+async function optInFixture() {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'loam-optin-')));
+  const configDir = join(root, 'config');
+  const globalRoot = join(root, 'global');
+  const home = join(root, 'home');
+  const workspace = join(root, 'projects', 'app');
+  await mkdir(configDir, { recursive: true });
+  await mkdir(globalRoot, { recursive: true });
+  await mkdir(home, { recursive: true });
+  await mkdir(workspace, { recursive: true });
+  const env = (extra = {}) => ({ LOAM_CONFIG_DIR: configDir, HOME: home, ...extra });
+  const writeConfig = (section, extra = {}) => writeFile(join(configDir, 'config.json'), JSON.stringify({ ...extra, background_ingest: section }));
+  const writeLegacy = (section) => writeFile(join(globalRoot, 'config.json'), JSON.stringify({ background_ingest: section }));
+  const verdict = async (extraEnv = {}, ws = workspace) => {
+    const result = await gate({ harness: 'claude', payload: { cwd: ws }, globalRoot, env: env(extraEnv) });
+    return result.action === 'spawn_worker' ? 'spawn' : `skip:${result.reason}${result.delegated ? ':delegated' : ''}`;
+  };
+  return { root, configDir, globalRoot, home, workspace, env, writeConfig, writeLegacy, verdict };
+}
+
+test('opt-in gate: default off, enabled, allowlist, ancestors and trailing separators', async () => {
+  const f = await optInFixture();
+  assert.equal(await f.verdict(), 'skip:disabled');
+  assert.equal((await readIngestConfig(f.globalRoot, f.env(), f.workspace)).enabled_by, 'default_off');
+
+  await f.writeConfig({ enabled: true });
+  assert.equal(await f.verdict(), 'spawn');
+  assert.equal((await readIngestConfig(f.globalRoot, f.env(), f.workspace)).enabled_by, 'config_on');
+
+  await f.writeConfig({ workspaces: [f.workspace] });
+  assert.equal(await f.verdict(), 'spawn');
+  assert.equal((await readIngestConfig(f.globalRoot, f.env(), f.workspace)).enabled_by, 'allowlist');
+  assert.equal((await readIngestConfig(f.globalRoot, f.env(), f.workspace)).config_path, join(f.configDir, 'config.json'));
+
+  await f.writeConfig({ workspaces: [join(f.root, 'projects')] });
+  assert.equal(await f.verdict(), 'spawn');
+  await f.writeConfig({ workspaces: [`${f.workspace}/`] });
+  assert.equal(await f.verdict(), 'spawn');
+
+  const other = join(f.root, 'elsewhere');
+  await mkdir(other);
+  assert.equal(await f.verdict({}, other), 'skip:disabled');
+  // Sibling sharing a name prefix is not contained.
+  const sibling = join(f.root, 'projects', 'app-two');
+  await mkdir(sibling);
+  assert.equal(await f.verdict({}, sibling), 'skip:disabled');
+  // A workspace-less read never matches the allowlist.
+  assert.equal((await readIngestConfig(f.globalRoot, f.env())).enabled, false);
+});
+
+test('opt-in gate: precedence between env, delegated lane, kill switches and allowlist', async () => {
+  const f = await optInFixture();
+  await f.writeConfig({ enabled: false, workspaces: [f.workspace] });
+  assert.equal(await f.verdict(), 'skip:disabled');
+  assert.equal((await readIngestConfig(f.globalRoot, f.env(), f.workspace)).enabled_by, 'config_off');
+
+  await f.writeConfig({ workspaces: [f.workspace] });
+  await f.writeLegacy({ enabled: false });
+  assert.equal(await f.verdict(), 'skip:disabled');
+  assert.equal(await f.verdict({ LOAM_INGEST_BACKGROUND: '1' }), 'spawn');
+  await rm(join(f.globalRoot, 'config.json'));
+
+  assert.equal(await f.verdict({ LOAM_INGEST_BACKGROUND: '0' }), 'skip:disabled');
+  assert.equal((await readIngestConfig(f.globalRoot, f.env({ LOAM_INGEST_BACKGROUND: '0' }), f.workspace)).enabled_by, 'env_off');
+  assert.equal((await readIngestConfig(f.globalRoot, f.env({ LOAM_INGEST_BACKGROUND: '1' }), f.workspace)).enabled_by, 'env_on');
+
+  assert.equal(await f.verdict({ HCOM_LAUNCHED_BY: 'lead' }), 'skip:disabled:delegated');
+  assert.equal((await readIngestConfig(f.globalRoot, f.env({ HCOM_LAUNCHED_BY: 'lead' }), f.workspace)).enabled_by, 'delegated_lane');
+  assert.equal(await f.verdict({ HCOM_LAUNCHED_BY: 'user' }), 'spawn');
+  assert.equal(await f.verdict({ HCOM_LAUNCHED_BY: '' }), 'spawn');
+  assert.equal(await f.verdict({ HCOM_LAUNCHED_BY: 'lead', LOAM_INGEST_BACKGROUND: '1' }), 'spawn');
+  assert.equal(await f.verdict({ HCOM_LAUNCHED_BY: 'lead', LOAM_INGEST_BACKGROUND: '0' }), 'skip:disabled');
+
+  await f.writeConfig({ enabled: true });
+  assert.equal(await f.verdict({ HCOM_LAUNCHED_BY: 'lead' }), 'skip:disabled:delegated');
+});
+
+test('opt-in gate: entries are validated, expanded and ignored with a report', async () => {
+  const f = await optInFixture();
+  await f.writeConfig({ workspaces: ['.', 'relative', '', 42, f.workspace] });
+  const config = await readIngestConfig(f.globalRoot, f.env(), f.workspace);
+  assert.equal(config.enabled, true);
+  assert.deepEqual(config.ignored_entries, ['.', 'relative', '', 42]);
+
+  await f.writeConfig({ workspaces: ['.'] });
+  assert.equal(await f.verdict(), 'skip:disabled');
+
+  await f.writeConfig({ workspaces: ['~/code'] });
+  const homeWs = join(f.home, 'code', 'x');
+  await mkdir(homeWs, { recursive: true });
+  assert.equal(await f.verdict({}, homeWs), 'spawn');
+  assert.deepEqual((await readIngestConfig(f.globalRoot, f.env(), homeWs)).ignored_entries, []);
+
+  // Non-existent listed path is tolerated and simply does not match.
+  await f.writeConfig({ workspaces: [join(f.root, 'does-not-exist')] });
+  assert.equal(await f.verdict(), 'skip:disabled');
+});
+
+test('opt-in gate: symlinked entries and symlinked workspaces canonicalize', async () => {
+  const f = await optInFixture();
+  const { symlink } = await import('node:fs/promises');
+  const link = join(f.root, 'entry-link');
+  await symlink(f.workspace, link);
+  await f.writeConfig({ workspaces: [link] });
+  assert.equal(await f.verdict(), 'spawn');
+  await f.writeConfig({ workspaces: [f.workspace] });
+  assert.equal(await f.verdict({}, link), 'spawn');
+});
+
+test('opt-in gate: Windows matching is case-insensitive and separator-tolerant', async () => {
+  const f = await optInFixture();
+  await f.writeConfig({ workspaces: ['C:\\Work\\Proj', 'rel\\dir'] });
+  const config = await readIngestConfig(f.globalRoot, f.env(), 'c:\\work\\proj\\Sub', { platform: 'win32' });
+  assert.equal(config.enabled, true);
+  assert.equal(config.enabled_by, 'allowlist');
+  assert.deepEqual(config.ignored_entries, ['rel\\dir']);
+  const miss = await readIngestConfig(f.globalRoot, f.env(), 'C:\\Work\\Proj2', { platform: 'win32' });
+  assert.equal(miss.enabled, false);
+});
+
+test('opt-in gate: malformed config is reported and never silently enabled', async () => {
+  const f = await optInFixture();
+  await writeFile(join(f.configDir, 'config.json'), '{ not json');
+  const config = await readIngestConfig(f.globalRoot, f.env(), f.workspace);
+  assert.equal(config.enabled, false);
+  assert.equal(config.enabled_by, 'default_off');
+  assert.equal(typeof config.config_error, 'string');
+  assert.ok(config.config_error.length > 0);
+  assert.equal(await f.verdict(), 'skip:disabled');
+  assert.equal(await f.verdict({ LOAM_INGEST_BACKGROUND: '1' }), 'spawn');
+
+  await f.writeConfig({ enabled: true });
+  assert.equal((await readIngestConfig(f.globalRoot, f.env(), f.workspace)).config_error, null);
+});
+
+test('opt-in gate: empty or whitespace config file is absent, not malformed', async () => {
+  const f = await optInFixture();
+  for (const text of ['', '  \n\t ']) {
+    await writeFile(join(f.configDir, 'config.json'), text);
+    const config = await readIngestConfig(f.globalRoot, f.env(), f.workspace);
+    assert.equal(config.config_error, null);
+    assert.equal(config.enabled_by, 'default_off');
+  }
+  await writeFile(join(f.globalRoot, 'config.json'), '');
+  assert.equal((await readIngestConfig(f.globalRoot, f.env(), f.workspace)).config_error, null);
+});
+
+test('opt-in gate: a legacy enabled:false kill switch beats config-dir enabled:true and allowlist', async () => {
+  const f = await optInFixture();
+  await f.writeConfig({ enabled: true, workspaces: [f.workspace] });
+  await f.writeLegacy({ enabled: false });
+  const config = await readIngestConfig(f.globalRoot, f.env(), f.workspace);
+  assert.equal(config.enabled_by, 'config_off');
+  assert.equal(config.enabled, false);
+  assert.equal(await f.verdict({ LOAM_INGEST_BACKGROUND: '1' }), 'spawn');
+});
+
+test('opt-in gate: tuning keys read from legacy and config dir, config dir wins', async () => {
+  const f = await optInFixture();
+  await f.writeLegacy({ min_interval_seconds: 11, timeout_seconds: 22 });
+  await f.writeConfig({ min_interval_seconds: 33 });
+  const config = await readIngestConfig(f.globalRoot, f.env(), f.workspace);
+  assert.equal(config.min_interval_seconds, 33);
+  assert.equal(config.timeout_seconds, 22);
+});
+
+test('opt-in gate: worker, native prepare and status honour the allowlist without env override', async () => {
+  const f = await optInFixture();
+  const { workspace: ws, wiki, skills } = await fixture();
+  const common = { workspace: ws, globalRoot: f.globalRoot, skillsRoot: skills, ...actionableRuntime(wiki) };
+
+  // Unlisted: skipped at the run step.
+  const off = await runWorker({ ...common, harness: 'opencode', env: f.env() });
+  assert.equal(off.reason, 'disabled');
+  // Bind a native agent through a forced-on boundary, then prepare it under the allowlist-only env.
+  const boundNative = async (agentId) => {
+    const nativeRoot = await mkdtemp(join(tmpdir(), 'loam-optin-native-'));
+    await nativeInstall(nativeRoot);
+    const { readiness, runtimeRunner } = actionableRuntime(wiki);
+    const boundary = await dispatchBoundary({
+      harness: 'codex', payload: { cwd: ws }, globalRoot: nativeRoot, skillsRoot: skills,
+      readiness, runtimeRunner, env: { ...ON },
+    });
+    assert.equal(boundary.native_continuation.decision, 'block');
+    assert.equal((await bindNativeAgent({ globalRoot: nativeRoot, workspace: ws, agentId })).status, 'bound');
+    return { ...common, globalRoot: nativeRoot, agentId };
+  };
+  const offNative = await prepareNativeAgentRun({ ...(await boundNative('agent-1')), env: f.env() });
+  assert.equal(offNative.action, 'skip');
+  assert.equal(offNative.reason, 'disabled');
+  const offStatus = await ingestStatus({ workspace: ws, globalRoot: f.globalRoot, env: f.env() });
+  assert.equal(offStatus.enabled, false);
+  assert.equal(offStatus.enabled_by, 'default_off');
+
+  // Listed: reaches the run step (prepareWorkerRun returns a run action) and status agrees.
+  await f.writeConfig({ workspaces: [ws] });
+  const prepared = await prepareWorkerRun({ ...common, harness: 'opencode', env: f.env() });
+  assert.equal(prepared.action, 'run', JSON.stringify(prepared));
+  await rm(prepared.root, { recursive: true, force: true });
+  const ran = await runWorker({ ...common, harness: 'opencode', env: f.env(), modelRunner: async () => ({ completion: Promise.resolve({ code: 0 }) }) });
+  assert.notEqual(ran.reason, 'disabled', JSON.stringify(ran));
+  await rm(runRoot(f.globalRoot, ws), { recursive: true, force: true }).catch(() => {});
+  const onNative = await prepareNativeAgentRun({ ...(await boundNative('agent-2')), env: f.env() });
+  assert.equal(onNative.action, 'run', JSON.stringify(onNative));
+  const onStatus = await ingestStatus({ workspace: ws, globalRoot: f.globalRoot, env: f.env() });
+  assert.equal(onStatus.enabled, true);
+  assert.equal(onStatus.enabled_by, 'allowlist');
+  assert.ok(Array.isArray(onStatus.ignored_entries));
+  assert.equal(onStatus.config_error, null);
+});
+
+// ---- end-to-end: every harness stop path is inert without opt-in ----
+
+async function withProcessEnv(overrides, fn) {
+  const saved = new Map();
+  for (const key of Object.keys(process.env)) {
+    if (/^(LOAM_|HCOM_)/.test(key)) { saved.set(key, process.env[key]); delete process.env[key]; }
+  }
+  for (const [key, value] of Object.entries(overrides)) {
+    if (!saved.has(key)) saved.set(key, undefined);
+    process.env[key] = value;
+  }
+  try { return await fn(); } finally {
+    for (const key of Object.keys(process.env)) if (/^(LOAM_|HCOM_)/.test(key)) delete process.env[key];
+    for (const [key, value] of saved) if (value !== undefined) process.env[key] = value;
+  }
+}
+
+test('e2e: Codex stop returns {} with no block on both the stop_hook_active fallback and the normal path', async () => {
+  const f = await optInFixture();
+  const { dispatchBoundary: dispatch, readIngestConfig: readConfig } = await import('../integration/ingest.mjs');
+  const { resolveGlobalRoot, resolveSkillsRoot } = await import('../integration/paths.mjs');
+  const codex = await import(`${pathToFileURL(resolve('adapters/codex-stop.mjs')).href}?e2e=codex`);
+  const loadIngest = async () => ({ resolveGlobalRoot, resolveSkillsRoot, readIngestConfig: readConfig, dispatchBoundary: dispatch });
+  const env = f.env({ LOAM_INGEST_GLOBAL_ROOT: f.globalRoot, LOAM_INGEST_SKILLS_ROOT: join(f.root, 'skills'), LOAM_HOME: f.globalRoot });
+  const errors = [];
+  const errorOutput = { write: (text) => errors.push(text) };
+  for (const stop_hook_active of [false, true]) {
+    const result = await codex.main({
+      env, loadIngest, errorOutput,
+      input: { cwd: f.workspace, session_id: `e2e-${stop_hook_active}`, stop_hook_active },
+    });
+    assert.deepEqual(result, {});
+  }
+  assert.deepEqual(errors, []);
+  // Anchor: the empty response comes from the opt-in gate, not from an unavailable runtime.
+  const verdict = (extra) => gate({ harness: 'codex', payload: { cwd: f.workspace }, globalRoot: f.globalRoot, env: { ...env, ...extra } });
+  assert.deepEqual(await verdict({}), { action: 'skip', reason: 'disabled' });
+  assert.equal((await verdict({ LOAM_INGEST_BACKGROUND: '1' })).action, 'spawn_worker');
+  await assert.rejects(() => readdir(join(f.globalRoot, 'ingest')), { code: 'ENOENT' }, 'no ingest state is created for an unlisted workspace');
+});
+
+test('e2e: Claude stop reports disabled for an unlisted workspace', async () => {
+  const f = await optInFixture();
+  await withProcessEnv({ LOAM_INTEGRATION_PATH: resolve('integration/loam.mjs') }, async () => {
+    const claude = await import(`${pathToFileURL(resolve('adapters/claude-stop.mjs')).href}?e2e=claude`);
+    const env = f.env({ LOAM_INGEST_GLOBAL_ROOT: f.globalRoot, LOAM_INGEST_SKILLS_ROOT: join(f.root, 'skills') });
+    assert.deepEqual(await claude.main({ env, payload: { cwd: f.workspace } }), { action: 'skip', reason: 'disabled' });
+  });
+});
+
+test('e2e: OpenCode session.idle creates no child session for an unlisted workspace', async () => {
+  const f = await optInFixture();
+  const { LoamPlugin } = await import('../adapters/opencode.mjs');
+  const run = async () => {
+    const verdicts = [];
+    const workers = [];
+    const created = [];
+    let finished;
+    const settled = new Promise((resolvePromise) => { finished = resolvePromise; });
+    const plugin = await LoamPlugin.createOpenCodeAdapter({
+      client: {
+        session: {
+          create: async (input) => { created.push(input); return { data: { id: 'child' } }; },
+          promptAsync: async () => ({}),
+          status: async () => ({ data: {} }),
+        },
+      },
+      ingestion: {
+        gate: async (args) => { const out = await gate(args); verdicts.push(out); return out; },
+        resolveGlobalRoot: () => f.globalRoot,
+        resolveSkillsRoot: () => join(f.root, 'skills'),
+        runWorker: async (args) => { workers.push(args); finished(); return { reason: 'ok' }; },
+      },
+      hookRuns: {
+        resolveGlobalRoot: () => f.globalRoot,
+        beginHookRun: async () => ({ id: 1 }),
+        finishHookRun: async () => undefined,
+        startHookWorker: async () => undefined,
+        finishHookWorker: async () => undefined,
+      },
+    })({ directory: f.workspace });
+    await plugin.event({ event: { type: 'session.idle', sessionID: 'parent-e2e', id: 'e2e' } });
+    return { verdicts, workers, created, settled };
+  };
+  const base = { LOAM_CONFIG_DIR: f.configDir, LOAM_INGEST_GLOBAL_ROOT: f.globalRoot, HOME: f.home };
+  await withProcessEnv(base, async () => {
+    const off = await run();
+    assert.deepEqual(off.verdicts.map((v) => [v.action, v.reason]), [['skip', 'disabled']]);
+    assert.equal(off.workers.length, 0);
+    assert.equal(off.created.length, 0);
+  });
+  await f.writeConfig({ workspaces: [f.workspace] });
+  await withProcessEnv(base, async () => {
+    const on = await run();
+    assert.equal(on.verdicts[0].action, 'spawn_worker', 'control: the same path runs once the workspace is listed');
+    await on.settled;
+    assert.equal(on.workers.length, 1);
+  });
+});
+
+test('e2e: an intent recorded before upgrade reaching prepareNativeAgentRun for an unlisted workspace skips disabled', async () => {
+  const f = await optInFixture();
+  const { workspace: ws, wiki, skills } = await fixture();
+  const nativeRoot = await mkdtemp(join(tmpdir(), 'loam-preupgrade-'));
+  await nativeInstall(nativeRoot);
+  const { readiness, runtimeRunner } = actionableRuntime(wiki);
+  // The intent was recorded while ingest was default-on (modelled by a forced-on boundary).
+  const boundary = await dispatchBoundary({
+    harness: 'codex', payload: { cwd: ws }, globalRoot: nativeRoot, skillsRoot: skills, readiness, runtimeRunner, env: { ...ON },
+  });
+  assert.equal(boundary.native_continuation.decision, 'block');
+  assert.equal((await bindNativeAgent({ globalRoot: nativeRoot, workspace: ws, agentId: 'agent-pre' })).status, 'bound');
+  // After upgrade there is no opt-in: the subagent's prepare step must skip.
+  const prepared = await prepareNativeAgentRun({
+    globalRoot: nativeRoot, workspace: ws, agentId: 'agent-pre', skillsRoot: skills, readiness, runtimeRunner, env: f.env(),
+  });
+  assert.equal(prepared.action, 'skip');
+  assert.equal(prepared.reason, 'disabled');
+  await assert.rejects(() => readFile(join(runRoot(nativeRoot, ws), 'lease.json')), { code: 'ENOENT' });
 });

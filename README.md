@@ -268,9 +268,23 @@ request to the matching workflow:
   that graph after planned changes.
 - **Setup:** scaffold a wiki or initialize an Obsidian vault.
 
-Background memory maintenance is enabled by default. To opt out, set
+Background memory maintenance (session harvest) is enabled by default. To opt out, set
 `LOAM_HARVEST_BACKGROUND=0` or set `background_harvest.enabled: false` in
 `config.json` (`~/.agents/loam/config.json`, or under `$LOAM_HOME`).
+
+### Background code ingest (opt-in)
+
+Background code ingest is off by default from plugin 1.1.1 (after re-running
+setup). Opt a workspace in with `npx @scchearn/loam ingest enable [path]`,
+remove it with `ingest disable`, and check why it is or is not running with
+`ingest status [path]`. The list lives in `background_ingest.workspaces` in the
+config-dir `config.json` (`~/.config/loam/config.json`, macOS
+`~/Library/Application Support/loam/config.json`, Windows
+`%APPDATA%\loam\config.json`, or `$LOAM_CONFIG_DIR`) and survives uninstall;
+only `--purge` removes it. To opt in everywhere, set
+`background_ingest.enabled: true` (this also restores the old behaviour for
+existing installs). `LOAM_INGEST_BACKGROUND=0` or `=1` overrides config, and
+delegated hcom lanes are always skipped.
 
 The background workers commit only the memory paths they wrote, in place on
 your current branch, as `loam(harvest): ...` or `loam(ingest): ...`. They never

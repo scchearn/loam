@@ -40,10 +40,25 @@ must not use it to resolve workspace state.
 
 ## Background code ingestion
 
-Background code ingestion is enabled by default and boundary-triggered only.
-Set `LOAM_INGEST_BACKGROUND=0` to opt out unconditionally, or set
-`background_ingest.enabled` to `false` in global config;
-`LOAM_INGEST_BACKGROUND=1` overrides a disabled config. Claude Stop, Codex
+Background code ingestion is opt-in (off by default from plugin 1.1.1, after
+re-running setup) and boundary-triggered only. Opt a workspace in with
+`npx @scchearn/loam ingest enable [path]`; `disable` removes it and
+`ingest status [path]` explains why ingest is or is not running
+(`enabled_by`, `config_path`, `config_error`, `ignored_entries`). The setting
+lives in `background_ingest` in the config-dir `config.json`
+(`~/.config/loam/config.json`, macOS
+`~/Library/Application Support/loam/config.json`, Windows
+`%APPDATA%\loam\config.json`, or `$LOAM_CONFIG_DIR`), so it survives
+uninstall and update; only `--purge` removes it. Precedence, highest first:
+`LOAM_INGEST_BACKGROUND=0`, `LOAM_INGEST_BACKGROUND=1`, a delegated hcom lane
+(`HCOM_LAUNCHED_BY` set and not `user`, always skipped), `enabled: false`
+(also read from legacy `<globalRoot>/config.json`), a listed workspace in
+`workspaces`, `enabled: true` (every workspace), then off. `enabled` is
+therefore true (everywhere), false (kill switch beating the list), or absent
+(the list decides). Entries must be absolute (`~` expands); relative ones are
+ignored and reported. A listed path covers itself and everything below it, so
+worktrees inside a listed repo are covered and worktrees elsewhere are not; the
+gate uses the session's starting directory. Claude Stop, Codex
 Stop, and OpenCode `session.idle` may start a same-harness worker; Cursor has no
 idle worker. The worker acquires a workspace lease before probing, requires
 full state and `code_ingest_pending.evidence.pending_count > 0`, resolves the
